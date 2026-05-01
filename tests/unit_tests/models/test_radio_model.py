@@ -442,7 +442,11 @@ class TestApplyTemporalGrouping:
         return SimpleNamespace(patch_dim=self.PATCH_DIM, temporal_patch_dim=self.TEMPORAL_PATCH_DIM)
 
     def _make_global(self, num_frames_list, hidden=8):
-        """Build an [1, total_patches, hidden] tensor and matching imgs_sizes."""
+        """Build an [1, total_patches, hidden] tensor and matching imgs_sizes.
+
+        imgs_sizes stores pixel dimensions so that dividing by PATCH_DIM gives
+        PATCH_DIM patches per spatial dimension (i.e. PATCH_DIM**2 patches total).
+        """
         per_img = self.PATCH_DIM * self.PATCH_DIM
         chunks = []
         for i, _ in enumerate(num_frames_list):
@@ -450,7 +454,10 @@ class TestApplyTemporalGrouping:
                 chunks.append(torch.full((per_img, hidden), float(i * 100 + f)))
         global_t = torch.cat(chunks, dim=0).unsqueeze(0)
         total_frames = sum(num_frames_list)
-        imgs_sizes = torch.tensor([[self.PATCH_DIM, self.PATCH_DIM]] * total_frames)
+        pixel_dim = (
+            self.PATCH_DIM * self.PATCH_DIM
+        )  # pixel size = PATCH_DIM patches × PATCH_DIM px/patch
+        imgs_sizes = torch.tensor([[pixel_dim, pixel_dim]] * total_frames)
         return global_t, imgs_sizes
 
     @pytest.mark.internal

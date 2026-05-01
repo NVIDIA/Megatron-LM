@@ -275,18 +275,28 @@ def _compute_tubelet_aware_split_points(num_frames, temporal_patch_size, cp_size
     return split_points
 
 
-def _split_num_frames(num_frames, lb, ub):
-    """Return per-media frame counts clipped to the range ``[lb, ub)``."""
+def _split_num_frames(num_frames, lb, ub, temporal_patch_size=1):
+    """Return per-media frame counts for entries in the range ``[lb, ub)``.
+
+    When ``temporal_patch_size > 1``, ``lb`` and ``ub`` are tubelet indices and
+    the returned counts are the corresponding original frame counts.
+    """
+    T = temporal_patch_size
     new_num_frames = []
-    frame_idx = 0
+    tub_idx = 0
     for nf in num_frames:
-        media_start = frame_idx
-        media_end = frame_idx + nf
-        overlap_start = max(media_start, lb)
-        overlap_end = min(media_end, ub)
+        num_tub = math.ceil(nf / T)
+        media_tub_start = tub_idx
+        media_tub_end = tub_idx + num_tub
+        overlap_start = max(media_tub_start, lb)
+        overlap_end = min(media_tub_end, ub)
         if overlap_start < overlap_end:
-            new_num_frames.append(overlap_end - overlap_start)
-        frame_idx = media_end
+            if overlap_end == media_tub_end:
+                owned_frames = nf - (overlap_start - media_tub_start) * T
+            else:
+                owned_frames = (overlap_end - overlap_start) * T
+            new_num_frames.append(owned_frames)
+        tub_idx = media_tub_end
     return new_num_frames
 
 
@@ -429,7 +439,9 @@ def split_to_context_parallel_ranks_dynamic_res(
 
         lb = split_points[cp_rank]
         ub = split_points[cp_rank + 1]
-        local_num_frames = _split_num_frames(num_frames_list, lb, ub)
+        local_num_frames = _split_num_frames(
+            num_frames_list, lb, ub, temporal_patch_size=temporal_patch_size
+        )
     else:
         seq_per_rank = total_frames // cp_size
         lb = cp_rank * seq_per_rank

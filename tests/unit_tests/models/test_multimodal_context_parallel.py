@@ -325,21 +325,24 @@ class TestDynamicResCPDistributed:
         patch_dim = 16
         per_img_seq = patch_dim * patch_dim
         hidden = 3 * patch_dim * patch_dim
-        # 4 frames per video × 2 videos = 8 frames total ⇒ 8 imgs in imgs_sizes.
         num_videos = 2
         frames_per_video = 4
-        num_frames_total = num_videos * frames_per_video
+        temporal_patch_size = 2
+        # After temporal grouping each video has frames_per_video//T tubelets.
+        # split_to_context_parallel_ranks_dynamic_res receives post-grouping
+        # tubelet data: one entry per tubelet in imgs_sizes / cu_seqlens.
+        total_tubelets = num_videos * (frames_per_video // temporal_patch_size)  # = 4
 
         chunks = [
             torch.full((per_img_seq, hidden), float(i), dtype=torch.float32, device="cuda")
-            for i in range(num_frames_total)
+            for i in range(total_tubelets)
         ]
         global_t = torch.cat(chunks, dim=0).unsqueeze(0)
         global_imgs_sizes = torch.tensor(
-            [[patch_dim, patch_dim]] * num_frames_total, dtype=torch.int32, device="cuda"
+            [[patch_dim, patch_dim]] * total_tubelets, dtype=torch.int32, device="cuda"
         )
         cu_seqlens = torch.tensor(
-            [i * per_img_seq for i in range(num_frames_total + 1)], dtype=torch.int32, device="cuda"
+            [i * per_img_seq for i in range(total_tubelets + 1)], dtype=torch.int32, device="cuda"
         )
         global_packed_seq_params = PackedSeqParams(
             qkv_format="thd",
@@ -359,7 +362,7 @@ class TestDynamicResCPDistributed:
                 global_packed_seq_params,
                 patch_dim=patch_dim,
                 num_frames=num_frames,
-                temporal_patch_size=2,
+                temporal_patch_size=temporal_patch_size,
             )
         )
 
@@ -368,7 +371,7 @@ class TestDynamicResCPDistributed:
         # Per-rank frame counts: 4 tubelets ÷ 2 ranks = 2 tubelets/rank ⇒ 4 frames/rank.
         assert local_num_frames is not None
         assert int(local_num_frames.sum().item()) == 4
-        # Each rank owns 2 frames worth of patches.
+        # Each rank owns 2 tubelets worth of patches (one tubelet = per_img_seq patches).
         assert local_t.shape == (1, 2 * per_img_seq, hidden)
         assert local_imgs_sizes.shape == (2, 2)
 

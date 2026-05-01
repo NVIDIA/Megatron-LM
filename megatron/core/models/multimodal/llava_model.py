@@ -1113,7 +1113,7 @@ class LLaVAModel(MegatronModule):
         # that sentinel as if ``sound_clips`` were ``None`` to avoid running the
         # sound encoder on a dummy. The ``.item()`` call below is a deliberate
         # CUDA sync but only runs in the sentinel-shaped case.
-        has_sounds = sound_clips is not None and sound_clips.numel() > 1
+        has_sounds = sound_clips is not None and sound_clips.numel() > 0
         if has_sounds and sound_clips.shape == torch.Size([1, 1]):
             has_sounds = sound_clips[0, 0].item() != 0
 
@@ -1253,16 +1253,24 @@ def _load_state_dict_hook_ignore_extra_state(
 # pylint: disable-next=line-too-long
 # Based on https://github.com/OpenGVLab/InternVL/blob/c7c5af1a8930b4862afe8ed14672307082ef61fa/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L218
 # Copyright (c) 2023 OpenGVLab.
-def pixel_shuffle(x, scale_factor=0.5, version=2):
+def pixel_shuffle(x, scale_factor=0.5, version=2, h=None, w=None):
     """Pixel shuffle based on InternVL but adapted for our use case.
 
     Args:
         x (torch.Tensor): Vision model outputs [num_tiles, img_seq_len, h_vision]
         version (int): Implementation version.
+        h (int, optional): Height in patches for non-square grids.
+        w (int, optional): Width in patches for non-square grids.
 
     Returns:
         Shuffled vision model outputs [num_tiles, (sq ** 2) * (scale ** 2), h_vision / (scale ** 2)]
     """
+    if h is not None or w is not None:
+        assert h is not None and w is not None, "h and w must both be provided"
+        assert h * w == x.shape[1], f"h*w ({h}*{w}={h*w}) must equal patches ({x.shape[1]})"
+        r = int(1 / scale_factor)
+        n, patches, c = x.shape
+        return x.reshape(n, patches // (r * r), c * r * r)
     h = w = int(x.shape[1] ** 0.5)  # sq
     x = x.reshape(x.shape[0], h, w, -1)  # [num_tiles, sq, sq, h_vision]
 

@@ -141,7 +141,7 @@ class TestHasSoundsSentinel:
     @staticmethod
     def _has_sounds(sound_clips):
         """Mirror of the logic at the top of ``LLaVAModel.forward`` post-fix."""
-        has = sound_clips is not None and sound_clips.numel() > 1
+        has = sound_clips is not None and sound_clips.numel() > 0
         if has and sound_clips.shape == torch.Size([1, 1]):
             has = sound_clips[0, 0].item() != 0
         return has
@@ -190,6 +190,8 @@ def _build_preprocess_stub(
     return SimpleNamespace(
         pre_process=True,
         post_process=True,
+        add_decoder=True,
+        img_seq_len=576,
         sound_token_index=sound_token_index,
         sound_model=sound_model,
         vision_model=None,
@@ -235,10 +237,11 @@ class TestPreprocessDataSoundReplacement:
         stub = _build_preprocess_stub(sound_pad_to_clip_duration=False)
         inputs = _make_inputs(batch=1, text_seq=8, embed_dim=4, sound_position=4)
 
-        # Two sound clips conceptually (per sample), but here just one sound
-        # token and one clip with padding length 3 (real) of capacity 5.
+        # One sound clip per sample: capacity 5 slots but only 1 real embedding
+        # (4 padding slots dropped). One sound token in input_ids maps to the
+        # 1 real embedding; the remaining 4 capacity slots are ignored.
         sound_embeddings = torch.full((5, 1, 4), 7.0)  # [s, b, h], capacity 5
-        sound_embeddings_len = torch.tensor([3])  # only the first 3 are real
+        sound_embeddings_len = torch.tensor([1])  # only the first 1 is real
 
         final_embedding, _final_labels, _final_loss_mask = LLaVAModel._preprocess_data(
             stub,
@@ -344,6 +347,8 @@ class TestPreprocessDataSoundReplacement:
         stub = SimpleNamespace(
             pre_process=True,
             post_process=True,
+            add_decoder=True,
+            img_seq_len=576,
             sound_token_index=DEFAULT_SOUND_TOKEN_INDEX,
             sound_model=SimpleNamespace(config=SimpleNamespace()),  # no attr
             vision_model=None,
