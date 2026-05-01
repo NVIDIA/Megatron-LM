@@ -80,6 +80,14 @@ def get_hf_model_type(model_path):
         # `myparakeet-clone` are intentionally rejected.
         if any(seg.startswith("parakeet") for seg in model_id.split("/")):
             return "parakeet"
+        # Any other `nemo://` model can't be resolved by AutoConfig below;
+        # raise a clear error rather than letting `split("hf://")[1]` raise
+        # an IndexError with no context.
+        if lowered.startswith("nemo://"):
+            raise NotImplementedError(
+                f"nemo:// scheme is currently only supported for parakeet models, "
+                f"got {model_path}"
+            )
 
     hf_config = AutoConfig.from_pretrained(model_path.split("hf://")[1])
     model_type = hf_config.architectures[0].lower()

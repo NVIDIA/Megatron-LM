@@ -326,6 +326,26 @@ class TestParakeetDispatch:
                 hf_module.get_hf_model_type(path)
 
     @pytest.mark.internal
+    def test_nemo_scheme_non_parakeet_raises_clear_error(self, monkeypatch):
+        """A non-parakeet ``nemo://`` model must raise NotImplementedError with a
+        clear message instead of falling through to ``split("hf://")[1]`` and
+        producing an opaque IndexError."""
+        from megatron.core.models.huggingface import module as hf_module
+
+        class _ShouldNotCall:
+            @classmethod
+            def from_pretrained(cls, name):  # pragma: no cover - guard
+                raise AssertionError(
+                    f"AutoConfig.from_pretrained should not be called for nemo://, got {name!r}"
+                )
+
+        monkeypatch.setattr(hf_module, "AutoConfig", _ShouldNotCall)
+        monkeypatch.setattr(hf_module, "HAVE_TRANSFORMERS", True)
+
+        with pytest.raises(NotImplementedError, match="nemo:// scheme"):
+            hf_module.get_hf_model_type("nemo://nvidia/some-future-asr-model")
+
+    @pytest.mark.internal
     def test_build_hf_model_dispatches_parakeet(self, monkeypatch):
         from megatron.core.models.huggingface import module as hf_module
 

@@ -233,7 +233,6 @@ class RADIOViTModel(VisionModule):
             vp_stage=self.vp_stage,
         )
 
-        self.force_cpe_eval_mode = force_cpe_eval_mode
         if self.force_eval_mode:
             self.eval()
 
