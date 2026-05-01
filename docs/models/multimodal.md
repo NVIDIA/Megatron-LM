@@ -42,7 +42,7 @@ See [examples/mimo](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mim
 
 ## Diffusion Models
 
-For multimodal diffusion models (image generation, text-to-image). Refer to [Nvidia Diffusion Models](https://developer.nvidia.com/blog/understanding-diffusion-models-an-essential-guide-for-aec-professionals/). The Developer Program, NIM, and NeMo can offer production-ready implementations of:
+For multimodal diffusion models (image generation, text-to-image). Refer to [Nvidia Diffusion Models](https://github.com/NVIDIA-NeMo/DFM/ ). The Developer Program, NIM, and NeMo can offer production-ready implementations of:
 
 - Stable Diffusion variants
 - Text-to-image generation
