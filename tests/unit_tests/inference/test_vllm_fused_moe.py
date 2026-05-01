@@ -290,7 +290,7 @@ class TestMoeSum:
         num_local_experts,
     ):
         """PyTorch reference for _moe_sum: reduce topk with local-expert filtering."""
-        out = torch.zeros(max_tokens, K, device="cuda", dtype=torch.bfloat16)
+        out = torch.zeros(max_tokens, K, device="cuda", dtype=torch.float32)
         for t in range(max_tokens):
             acc = torch.zeros(K, device="cuda", dtype=torch.float32)
             for k in range(topk):
@@ -300,7 +300,7 @@ class TestMoeSum:
                     v = input[t * topk + k].float()
                     w = topk_weights[t, k].item()
                     acc += v * w
-            out[t] = acc.bfloat16()
+            out[t] = acc
         return out
 
     @pytest.mark.parametrize(
