@@ -207,6 +207,8 @@ class RADIOViTModel(VisionModule):
 
         self.ln_pre = None
         self.ln_post = None
+        self.pg_collection = pg_collection
+        self.vp_stage = vp_stage
         if ln_pre_impl is not None:
             self.ln_pre = build_module(
                 ln_pre_impl,
@@ -227,6 +229,8 @@ class RADIOViTModel(VisionModule):
             spec=transformer_layer_spec,
             pre_process=True,
             post_process=False,
+            pg_collection=self.pg_collection,
+            vp_stage=self.vp_stage,
         )
 
         self.force_cpe_eval_mode = force_cpe_eval_mode
@@ -323,6 +327,11 @@ class RADIOViTModel(VisionModule):
         Returns:
             x (torch.Tensor): output after final transformer block of shape [b, s, h].
         """
+        if not HAVE_EINOPS:
+            raise ImportError(
+                "einops is required for RADIOViTModel, please install it with `pip install einops`"
+            )
+
         if not self.dynamic_resolution:
             input_size = x.shape[2:]
             py = x.shape[-2] // self.patch_dim
