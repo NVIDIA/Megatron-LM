@@ -1,8 +1,7 @@
 ---
 name: run-unit-tests
 description: How to run Megatron-LM unit tests on a GPU node. Covers environment setup with uv, launching tests through torch.distributed.run, marker filters, CI parity, and common gotchas. All Megatron-LM unit tests initialize a torch distributed group, so every invocation requires GPU access and is launched through torch.distributed.run.
-TRIGGER when: user asks to run unit tests, debug a unit test failure, reproduce a CI test failure locally, set up the unit-test environment, or invoke pytest on Megatron-LM.
-DO NOT TRIGGER when: user is asking about functional or end-to-end tests, CI infrastructure, or recipe files (use ci-test-system instead); user is asking about container or dependency setup (use build-and-dependency instead).
+when_to_use: Running unit tests; debugging a unit test failure; reproducing a CI test failure locally; setting up the unit-test environment; invoking pytest on Megatron-LM; 'run unit tests', 'pytest fails', 'reproduce test failure'.
 ---
 
 # Run Megatron-LM Unit Tests

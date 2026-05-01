@@ -50,11 +50,19 @@ jobs:
           trigger_phrase: "/claude review"
           show_full_output: true
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Read"
             --model "claude-opus-4-6"
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
+
+            Mandatory workflow — never skip or reorder:
+            1. Read the PR diff first (gh pr diff).
+            2. Based on the changed files and areas, identify relevant skills from skills/<name>/SKILL.md.
+               Common skill names: build-and-dependency, ci-test-system, run-unit-tests, run-on-slurm,
+               nightly-sync, create-issue, respond-to-issue, split-pr, onboard-gb200-1node-tests.
+            3. Read the SKILL.md files for all relevant areas using the Read tool.
+            4. Only then perform the review using the skill context.
 
             You are doing a light code review. Keep it concise and actionable.
 
@@ -134,12 +142,20 @@ jobs:
           trigger_phrase: "/claude strict-review"
           show_full_output: true
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Read"
             --model "claude-opus-4-6"
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
             BASE REF: origin/${{ steps.pr-info.outputs.base_ref }}
+
+            Mandatory workflow — never skip or reorder:
+            1. Read the PR diff first (gh pr diff).
+            2. Based on the changed files and areas, identify relevant skills from skills/<name>/SKILL.md.
+               Common skill names: build-and-dependency, ci-test-system, run-unit-tests, run-on-slurm,
+               nightly-sync, create-issue, respond-to-issue, split-pr, onboard-gb200-1node-tests.
+            3. Read the SKILL.md files for all relevant areas using the Read tool.
+            4. Only then perform the review using the skill context.
 
             You are performing a strict, comprehensive code review on a **Megatron-LM** Pull Request.
             Megatron-LM is NVIDIA's large-scale distributed training framework for LLMs.

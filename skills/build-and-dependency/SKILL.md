@@ -1,8 +1,7 @@
 ---
 name: build-and-dependency
 description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, updating uv.lock, and linting.
-TRIGGER when: user asks to add, remove, or update a dependency; user edits or asks about pyproject.toml or uv.lock; uv.lock has a merge conflict; user asks to set up a dev environment or pull/build the CI container; user hits a container build error or uv error; user asks to run linting or autoformat.
-DO NOT TRIGGER when: user is only running tests, investigating CI failures, or opening a PR (use ci-test-system instead).
+when_to_use: Adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'run linting', 'autoformat'.
 ---
 
 # Build & Dependency Guide

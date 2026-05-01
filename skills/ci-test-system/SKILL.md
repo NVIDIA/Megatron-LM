@@ -1,8 +1,7 @@
 ---
 name: ci-test-system
 description: Test system, CI pipeline, and CI failure investigation for Megatron-LM. Covers test layout, recipe YAML structure, adding unit and functional tests, CI scope labels, triggering internal GitLab CI, pipeline structure, and debugging CI failures.
-TRIGGER when: user asks to run tests, add a test, investigate a CI failure, understand the CI pipeline, or work with test recipes; user opens or pushes to a PR and needs to know which CI label to attach; user wants to trigger the internal GitLab CI pipeline; user asks to download golden values or references a pipeline/run ID in the context of golden values.
-DO NOT TRIGGER when: user is only setting up the dev environment or managing dependencies (use build-and-dependency instead).
+when_to_use: Running or adding tests; investigating a CI failure; understanding the CI pipeline; working with test recipes; which CI label to attach; triggering the internal GitLab CI pipeline; downloading golden values; 'CI is red', 'test failed', 'how do I trigger CI', 'add a test case'.
 ---
 
 # Test System & CI Guide
