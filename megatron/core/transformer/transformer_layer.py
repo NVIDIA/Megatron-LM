@@ -1383,6 +1383,18 @@ class MoETransformerLayer(TransformerLayer):
         ):
             self.transition_cudagraph_scope('partial')
 
+    def _resolve_token_dispatcher_attr(self, attr_name: str) -> tuple[Any, str]:
+        parent_attr_name, _, leaf_attr_name = attr_name.rpartition('.')
+        obj = self.mlp.token_dispatcher
+        for parent_name in parent_attr_name.split('.') if parent_attr_name else ():
+            obj = getattr(obj, parent_name)
+        return obj, leaf_attr_name or attr_name
+
+    def _restore_token_dispatcher_attrs(self):
+        for attr_name, attr in self.token_dispatcher_attrs.items():
+            obj, name = self._resolve_token_dispatcher_attr(attr_name)
+            setattr(obj, name, attr)
+
     def _forward_mlp_router(self, hidden_states, padding_mask=None):
         """
         Executes the router phase of the MoE block.
@@ -1412,13 +1424,12 @@ class MoETransformerLayer(TransformerLayer):
         )
 
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
-            hier_attr_name = attr_name.split('.')
-            attr = self.mlp.token_dispatcher
-            for name in hier_attr_name:
-                attr = getattr(attr, name)
+            obj, name = self._resolve_token_dispatcher_attr(attr_name)
+            attr = getattr(obj, name)
             if torch.is_tensor(attr):
-                if attr_name in self.token_dispatcher_attrs:
-                    self.token_dispatcher_attrs[attr_name].copy_(attr)
+                cached_attr = self.token_dispatcher_attrs.get(attr_name)
+                if torch.is_tensor(cached_attr) and not cached_attr.requires_grad:
+                    cached_attr.copy_(attr)
                 else:
                     self.token_dispatcher_attrs[attr_name] = attr.detach()
 
@@ -1433,12 +1444,12 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
-        for attr_name, attr in self.token_dispatcher_attrs.items():
-            hier_attr_name = attr_name.split('.')
-            obj = self.mlp.token_dispatcher
-            for name in hier_attr_name[:-1]:
-                obj = getattr(obj, name)
-            setattr(obj, hier_attr_name[-1], attr)
+        # During partial CUDA graph replay, use the probs returned from the graph in order
+        # to retain the router autograd edge. Rebinding it to the live router output ensures
+        # the backward DDP hook of router.weight is properly triggered.
+        if '_comm_manager.token_probs' in self.token_dispatcher_attrs:
+            self.token_dispatcher_attrs['_comm_manager.token_probs'] = probs
+        self._restore_token_dispatcher_attrs()
 
         self.mlp.fwd_execution_map = "expert_compute"
         return self.mlp(None, intermediate_tensors=(hidden_states, probs))
@@ -1456,8 +1467,7 @@ class MoETransformerLayer(TransformerLayer):
         # Restore token dispatcher attributes. During graph warmup, the router capture leaves these
         # attrs pointing into cudagraph pool memory; restoring them here ensures the postprocess
         # graph captures with valid pointers.
-        for name, attr in self.token_dispatcher_attrs.items():
-            setattr(self.mlp.token_dispatcher, name, attr)
+        self._restore_token_dispatcher_attrs()
 
         self.mlp.fwd_execution_map = "postprocess"
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
@@ -1491,8 +1501,6 @@ class MoETransformerLayer(TransformerLayer):
             # graph and wait on it, so we block only until the router's D2H copies complete.
             self._router_dtoh_event.record()
             self._router_dtoh_event.synchronize()
-            for name, attr in self.token_dispatcher_attrs.items():
-                setattr(self.mlp.token_dispatcher, name, attr)
 
             expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs)
             return self._forward_mlp_postprocess(
