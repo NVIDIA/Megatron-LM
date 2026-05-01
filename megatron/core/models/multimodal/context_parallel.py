@@ -294,9 +294,10 @@ def split_to_context_parallel_ranks_dynamic_res(
     global_t,
     global_imgs_sizes,
     global_packed_seq_params,
+    *,
+    patch_dim,
     fp8_enabled=False,
     fp8_recipe=None,
-    patch_dim=16,
     num_frames=None,
     temporal_patch_size=1,
 ):
@@ -306,8 +307,20 @@ def split_to_context_parallel_ranks_dynamic_res(
     so each rank owns an integer number of images. When ``temporal_patch_size > 1``,
     splits also respect tubelet boundaries and ``num_frames`` is required.
 
-    ``fp8_recipe`` is forwarded to :func:`get_padding` so the FP8 padding multiple
-    matches the active recipe (32 for ``mxfp8``, 16 otherwise).
+    Args:
+        global_t: ``[1, total_patches, C * patch_dim * patch_dim]`` patched tokens
+            (pre-embedder). The last dim must equal ``3 * patch_dim * patch_dim``.
+        global_imgs_sizes: ``[num_imgs, 2]`` per-image (H, W) in pixels.
+        global_packed_seq_params: ``PackedSeqParams`` with per-image ``cu_seqlens_q``.
+        patch_dim: Patch size of the vision backbone (e.g. 14 for SigLIP, 16 for
+            many ViTs). Required because dummy padding tensors are sized in patch
+            units and the default would silently mismatch some backbones.
+        fp8_enabled: If True, pad each rank's local sequence to the FP8 multiple
+            (16 by default; 32 for ``mxfp8``).
+        fp8_recipe: Forwarded to :func:`get_padding` so the FP8 padding multiple
+            matches the active recipe.
+        num_frames: Per-media frame count, required when ``temporal_patch_size > 1``.
+        temporal_patch_size: Tubelet size for temporal compression.
 
     Returns:
         (local_t, local_imgs_sizes, local_packed_seq_params, has_padding,
@@ -334,11 +347,21 @@ def split_to_context_parallel_ranks_dynamic_res(
     else:
         num_padded_imgs = max(0, cp_size - num_imgs)
 
+    # This function operates on pre-embedder patches, so the hidden dim is
+    # exactly ``3 * patch_dim * patch_dim``. Both the dummy padding image and
+    # the FP8 right-pad tensor below assume this layout.
+    expected_hidden = 3 * patch_dim * patch_dim
+    assert int(global_t.shape[2]) == expected_hidden, (
+        f"split_to_context_parallel_ranks_dynamic_res expects pre-embedder patches "
+        f"with hidden dim 3*patch_dim*patch_dim={expected_hidden}, got "
+        f"{int(global_t.shape[2])} (patch_dim={patch_dim})."
+    )
+
     dummy_img_size = torch.tensor(
         [[patch_dim, patch_dim]], device=global_imgs_sizes.device, dtype=global_imgs_sizes.dtype
     )
-    hidden_dim = int(global_t.shape[2])
-    dummy_seqlen = int(patch_dim * patch_dim * 3 / hidden_dim)
+    hidden_dim = expected_hidden
+    dummy_seqlen = 1
     dummy_img = torch.zeros(
         [1, dummy_seqlen, hidden_dim], device=global_t.device, dtype=global_t.dtype
     )
@@ -410,7 +433,9 @@ def split_to_context_parallel_ranks_dynamic_res(
     else:
         seq_per_rank = total_frames // cp_size
         lb = cp_rank * seq_per_rank
-        ub = (cp_rank + 1) * seq_per_rank if cp_rank < cp_size - 1 else len(cu_seqlens)
+        # The last rank absorbs the remainder so the union of [lb, ub) ranges
+        # exactly covers the [0, total_frames) image set.
+        ub = (cp_rank + 1) * seq_per_rank if cp_rank < cp_size - 1 else total_frames
         local_num_frames = None
 
     seqlens_local = torch.cat([torch.tensor([0], device=seqlens.device), seqlens[lb:ub]])
