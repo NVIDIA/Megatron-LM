@@ -41,10 +41,10 @@ jobs:
     runs-on: ubuntu-latest
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
-      is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
-      is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
-      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8-ephemeral' }}
-      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-gpu-x4' || 'ubuntu-latest' }}
+      is_external_contributor: false
+      is_maintainer: true
+      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8' }}
+      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-gpu-x4' || 'nvidia-ci-gcp-gpu-x4' }}
     permissions:
       issues: write
       pull-requests: write
