@@ -116,8 +116,14 @@ class LanguageModelEmbedding(MegatronModule):
             embeddings = word_embeddings
 
         if not self.reduce_scatter_embeddings:
-            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-            embeddings = embeddings.transpose(0, 1).contiguous()
+            # Data format change [b s h] -> [s b h]. A contiguous [1, s, h] can be re-viewed as
+            # a contiguous [s, 1, h] via squeeze/unsqueeze (strides (H,H,1) satisfy contiguity for
+            # the new shape) — no kernel needed. This requires the source to be contiguous; for
+            # non-contiguous or batch>1 inputs we fall through to the materializing copy path.
+            if embeddings.size(0) == 1 and embeddings.is_contiguous():
+                embeddings = embeddings.squeeze(0).unsqueeze(1)
+            else:
+                embeddings = embeddings.transpose(0, 1).contiguous()
 
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
