@@ -1455,6 +1455,7 @@ def get_default_pg_collection() -> ProcessGroupCollection:
     pg_collection.ep = parallel_state.get_expert_model_parallel_group()
     pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
     pg_collection.cp = parallel_state.get_context_parallel_group()
+    pg_collection.dp = parallel_state.get_data_parallel_group()
     pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
     pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
     pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
