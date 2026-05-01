@@ -2089,12 +2089,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_seqlen_q = self.num_speculative_tokens + 1
             max_seqlen_k = 1
 
-        # Scalars consumed by set_state_data() after the single H2D completes.
-        self._pending_mha_transfer = {
-            "padded_active_request_count": padded_bs,
-            "max_seqlen_q": max_seqlen_q,
-            "max_seqlen_k": max_seqlen_k,
-        }
+        # Bind state_data to GPU views now. set_state_data() only creates Python
+        # slice references into the GPU buffer (no GPU reads), so it's safe to
+        # call before the H2D in transfer_bookkeeping_to_gpu(). This guarantees
+        # that callers reading state_data["block_table"] etc. between
+        # initialize_attention_state() and transfer_bookkeeping_to_gpu() see
+        # populated entries (the actual data fill happens at the H2D).
+        mha.set_state_data(
+            padded_active_request_count=padded_bs,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
 
         if self.is_hybrid_model:
             # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
@@ -2123,6 +2128,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.moe_routing_metadata.enable_static_buffer_recording()
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
+
+        # Flush any Mamba ops queued by add_dummy_requests_for_cudagraph_capture
+        # (warmup) or add_dummy_requests_for_expert_parallel_step (EP dummy step).
+        # The earlier call at the top drained ops queued by add_request() before
+        # this function ran; this call covers ops queued during the function.
+        # No-op when the queue is already empty (regular non-warmup steps).
+        self._execute_pending_mamba_ops()
+
+        # Run the H2D transfer here so callers that bypass the controller
+        # (e.g. unit tests that call `model.forward()` directly after
+        # `initialize_attention_state()`) see populated GPU bookkeeping. The
+        # text-generation controller still calls `transfer_bookkeeping_to_gpu`
+        # explicitly; that second call is a cheap idempotent re-copy.
+        self.transfer_bookkeeping_to_gpu()
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -2182,18 +2201,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 8 redundant launch overheads vs. the prior per-field copies.
         self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
 
-        # MHA metadata: buffers already covered by the coalesced H2D above.
-        # All that's left is pointing state_data at the correct GPU slices and
-        # stashing the per-step max_seqlen scalars.
-        if hasattr(self, '_pending_mha_transfer') and self._pending_mha_transfer is not None:
-            mha = self.active_attn_metadata["mha_metadata"]
-            d = self._pending_mha_transfer
-            mha.set_state_data(
-                padded_active_request_count=d["padded_active_request_count"],
-                max_seqlen_q=d["max_seqlen_q"],
-                max_seqlen_k=d["max_seqlen_k"],
-            )
-            self._pending_mha_transfer = None
+        # MHA metadata GPU views were already bound to state_data in
+        # initialize_attention_state(); the H2D above populates the underlying
+        # bytes. Nothing else to do here for MHA.
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
