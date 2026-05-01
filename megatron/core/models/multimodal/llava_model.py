@@ -220,9 +220,9 @@ class LLaVAModel(MegatronModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
         if self.add_decoder:
-            if language_model_type.startswith(
-                'nemotron5-hybrid'
-            ) or language_model_type.startswith('nemotron6-moe'):
+            if language_model_type.startswith('nemotron5-hybrid') or language_model_type.startswith(
+                'nemotron6-moe'
+            ):
                 self.language_model = HybridModel(
                     config=language_transformer_config,
                     hybrid_stack_spec=language_transformer_layer_spec,
@@ -659,9 +659,10 @@ class LLaVAModel(MegatronModule):
                     sound_new_position_ids = new_position_ids[
                         sound_batch_indices, sound_token_indices
                     ]
-                    if (
-                        self.sound_model is not None
-                        and self.sound_model.config.sound_pad_to_clip_duration
+                    if self.sound_model is not None and getattr(
+                        getattr(self.sound_model, "config", None),
+                        "sound_pad_to_clip_duration",
+                        False,
                     ):
                         flat_sound = sound_embeddings.permute(1, 0, 2).reshape(-1, embed_dim)
                     else:
@@ -1105,19 +1106,27 @@ class LLaVAModel(MegatronModule):
         else:
             image_embeddings = self.encoder_hidden_state
 
-        # Sound processing
-        has_sounds = (
-            sound_clips is not None
-            and sound_clips.numel() > 1
-            and not (sound_clips.shape == torch.Size([1, 1]) and sound_clips[0, 0].item() == 0)
-        )
+        # Sound processing.
+        #
+        # The data path may pass a ``[1, 1]`` zero tensor as a "no sound this batch"
+        # sentinel (so the field is always a tensor, simplifying collation). Treat
+        # that sentinel as if ``sound_clips`` were ``None`` to avoid running the
+        # sound encoder on a dummy. The ``.item()`` call below is a deliberate
+        # CUDA sync but only runs in the sentinel-shaped case.
+        has_sounds = sound_clips is not None and sound_clips.numel() > 1
+        if has_sounds and sound_clips.shape == torch.Size([1, 1]):
+            has_sounds = sound_clips[0, 0].item() != 0
 
         if use_inference_kv_cache:
             sound_embeddings = None
             sound_embeddings_len = None
         elif self.add_encoder and not has_sounds:
-            device = sound_clips.device if sound_clips is not None else "cuda"
-            dtype = sound_clips.dtype if sound_clips is not None else torch.float32
+            if sound_clips is not None:
+                device = sound_clips.device
+                dtype = sound_clips.dtype
+            else:
+                device = torch.cuda.current_device()
+                dtype = torch.float32
             sound_embeddings = torch.tensor([], dtype=dtype, device=device).reshape(0, 0, 0)
             sound_embeddings_len = torch.tensor([], dtype=torch.long, device=device).reshape(0)
         elif self.add_encoder and has_sounds:
