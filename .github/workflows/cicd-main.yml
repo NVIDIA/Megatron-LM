@@ -972,7 +972,6 @@ jobs:
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-        || github.event_name == 'merge_group'
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
@@ -998,6 +997,7 @@ jobs:
     if: |
       (
         (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
+        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
         || success()
       )
       && !cancelled()

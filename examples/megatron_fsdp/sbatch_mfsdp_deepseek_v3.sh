@@ -23,7 +23,7 @@ TP=${TP:-1}
 EP=${EP:-8}
 MBS=${MBS:-4}
 GBS=${GBS:-2048}
-COMMENT=${COMMENT:-"hybridep-selective-recompute"}
+COMMENT=${COMMENT:-""}
 
 PRETRAIN_ARGS=(
     --distributed-timeout-minutes 60

@@ -67,6 +67,7 @@ class TextGenerationControllerTestBase:
         expert_model_parallel_size: int = 1,
         num_moe_experts: int = None,
         hybrid_layer_pattern: str = None,
+        cuda_graph_impl: str = 'none',
     ):
         if use_training_random_init:
             # This is necessary to induce the training behavior which permutes the random seed
@@ -102,6 +103,7 @@ class TextGenerationControllerTestBase:
                 if hybrid_layer_pattern
                 else {}
             ),
+            cuda_graph_impl=cuda_graph_impl,
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
@@ -315,12 +317,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict])
         top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])
-        request_metadata = {
-            "temperature": temp_values,
-            "top_k": top_k_values,
-            "top_p": top_p_values,
-        }
-        self.text_generation_controller._request_metadata = request_metadata
+        context.active_request_metadata["temperature"][:batch_size].copy_(temp_values)
+        context.active_request_metadata["top_k"][:batch_size].copy_(top_k_values)
+        context.active_request_metadata["top_p"][:batch_size].copy_(top_p_values)
         self.text_generation_controller._sampling_backend = backend
 
         context.padded_active_token_count = batch_size
@@ -333,7 +332,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
-        self.text_generation_controller._dynamic_step_sample_logits(logits)
+        self.text_generation_controller._all_logits_cuda = logits
+        self.text_generation_controller._dynamic_step_sample_logits()
         sampled_logits = self.text_generation_controller._sampled_tokens_cuda[:batch_size]
         vocab_indices = torch.arange(self.vocab_size).cuda()
 
@@ -857,15 +857,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Prepare sampling params
         top_n = 5
-        request_metadata = {
-            "top_n_logprobs": torch.full((batch_size,), top_n, dtype=torch.int32).cuda(),
-            "skip_prompt_log_probs": torch.full(
-                (batch_size,), float(skip_prompt_log_probs), dtype=torch.float32
-            ).cuda(),
-        }
-        self.text_generation_controller._request_metadata = request_metadata
-        self.text_generation_controller._active_request_count = batch_size
-        self.text_generation_controller._active_request_slice = slice(0, batch_size)
+        context.active_request_metadata["top_n_logprobs"][:batch_size].fill_(top_n)
+        context.active_request_metadata["skip_prompt_log_probs"][:batch_size].fill_(
+            skip_prompt_log_probs
+        )
 
         if materialize_only_last_token_logits:
             # Decode mode: logits for last tokens only
@@ -881,7 +876,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
             # Calculate top-n logprobs
             top_n_results = self.text_generation_controller._dynamic_step_calculate_top_n_logprobs(
-                logits, log_probs_tensor
+                log_probs_tensor
             )
 
             # Validate results
@@ -926,7 +921,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
             # Calculate top-n logprobs
             top_n_results = self.text_generation_controller._dynamic_step_calculate_top_n_logprobs(
-                logits, log_probs_tensor
+                log_probs_tensor
             )
 
             # Validate results
@@ -1010,10 +1005,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Mock logits matching input shape
         logits = torch.randn(1, 6, self.vocab_size, device='cuda')
+        self.text_generation_controller._all_logits_cuda = logits
 
-        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
-            logits, input_ids
-        )
+        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
 
         # Verify acceptance counts
         accepted_counts = self.text_generation_controller._accepted_token_counts_per_request[:2]
@@ -1242,10 +1236,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
         # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
 
+        self.text_generation_controller._all_logits_cuda = logits
         try:
-            self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
-                logits, input_ids
-            )
+            self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
         except RuntimeError as e:
             if "prob_dist must be 1 or 2 dim" in str(e):
                 pytest.fail("MTP logits were not flattened before calling multinomial sampling.")
