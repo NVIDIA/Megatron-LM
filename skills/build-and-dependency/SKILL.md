@@ -1,7 +1,7 @@
 ---
 name: build-and-dependency
-description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, updating uv.lock, and linting.
-when_to_use: Adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'run linting', 'autoformat'.
+description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, and updating uv.lock.
+when_to_use: Adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'ModuleNotFoundError'.
 ---
 
 # Build & Dependency Guide
@@ -179,25 +179,6 @@ uv lock                               # re-resolve on top of your pyproject.toml
 
 ---
 
-## Linting
-
-Run before opening a PR:
-
-```bash
-# Check mode (no changes applied)
-BASE_REF=main CHECK_ONLY=true SKIP_DOCS=false bash tools/autoformat.sh
-
-# Fix mode
-BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh
-```
-
-Tools invoked: `black`, `isort`, `pylint`, `ruff`, `mypy`.
-
-After editing imports in any Python files, always run `uv run isort` on those
-files before committing (repo CLAUDE.md requirement).
-
----
-
 ## Common Pitfalls
 
 | Problem | Cause | Fix |
@@ -206,6 +187,5 @@ files before committing (repo CLAUDE.md requirement).
 | `ModuleNotFoundError` after pip install | pip installed outside the uv-managed venv | Use `uv add` and `uv sync`, never bare `pip install` |
 | `uv: command not found` inside container | Wrong container image | Use the `megatron-lm` image built from `Dockerfile.ci.dev` |
 | `No space left on device` during uv ops | Cache fills container's `/root/.cache/` | Mount a host cache dir via `-v $HOME/.cache/uv:/root/.cache/uv` |
-| Pre-commit fails with linting errors | Code style violations | Run `BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh` |
 | `docker build` fails with secret-related error | `Dockerfile.ci.dev` has a `jet` stage that requires an internal secret | Add `--target main` to stop before the `jet` stage |
 | `access forbidden` when pulling | Registry URL includes an explicit port (e.g. `:5005`) | Use `${GITLAB_HOST}/adlr/...` with no port — the sed extracts the hostname only |
