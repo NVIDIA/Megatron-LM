@@ -18,7 +18,7 @@
 
 ### 🧩 Compatibility
 
-- PyTorch **[DeviceMesh](https://docs.pytorch.org/docs/stable/distributed.html#devicemesh)**, **[DTensor](https://docs.pytorch.org/docs/stable/distributed.tensor.html)**, and **[Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)**
+- PyTorch **[DeviceMesh](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.device_mesh.DeviceMesh)**, **[DTensor](https://docs.pytorch.org/docs/stable/distributed.tensor.html)**, and **[Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)**
 - **[Megatron Core](https://github.com/NVIDIA/Megatron-LM)**
 - **[TransformerEngine](https://github.com/NVIDIA/TransformerEngine)**
 - **[NVIDIA NeMo Framework Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo)**
