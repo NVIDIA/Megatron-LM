@@ -1,0 +1,166 @@
+ENV_VARS:
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 16
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 16
+  TORCHINDUCTOR_WORKER_START: fork
+  QUANTIZATION_TYPE_DEBUG: 1
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 64
+  USE_MNNVL: 1
+TEST_TYPE: "release"
+MODEL_ARGS:
+  # Distributed args
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 64
+  --expert-tensor-parallel-size: 1
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --sequence-parallel: true
+  --ddp-num-buckets: 10
+  --ddp-pad-buckets-for-high-nccl-busbw: true
+  --high-priority-stream-groups: ep
+  --distributed-timeout-minutes: 10
+  --disable-gloo-process-groups: true
+
+  # Training args
+  --micro-batch-size: 1
+  --global-batch-size: 3072
+  --train-samples: 12207031
+  --cross-entropy-loss-fusion: true
+  --cross-entropy-fusion-impl: native
+  --attention-backend: flash
+  --enable-cuda-graph: true
+  --cuda-graph-scope: mamba attn moe_router
+  --te-rng-tracker: true
+  --manual-gc: true
+  --manual-gc-interval: 10
+  --no-create-attention-mask-in-dataloader: true
+  --num-workers: 1
+  --exit-interval: 51000
+  --override-opt_param-scheduler: true
+
+  # Network size args
+  --use-mcore-models: true
+  --spec: megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
+  --is-hybrid-model: true
+  --mamba-num-heads: 128
+  --num-layers: 88
+  --hidden-size: 4096
+  --ffn-hidden-size: 2688
+  --num-attention-heads: 32
+  --group-query-attention: true
+  --num-query-groups: 2
+  --kv-channels: 128
+  --hybrid-override-pattern: MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME
+  --position-embedding-type: none
+  --normalization: RMSNorm
+  --untie-embeddings-and-output-weights: true
+  --init-method-std: 0.014
+  --disable-bias-linear: true
+  --squared-relu: true
+  --use-fused-weighted-squared-relu: true
+
+  # Data args
+  --seq-length: 8192
+  --max-position-embeddings: 8192
+  --data-path: ${DATA_BLEND}
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --tiktoken-pattern: v2
+  --tokenizer-type: ${TOKENIZER_TYPE}
+  --tokenizer-model: ${TOKENIZER_MODEL_PATH}
+  --no-mmap-bin-files: true
+
+  # MoE args
+  --num-experts: 512
+  --moe-router-topk: 22
+  --moe-router-topk-scaling-factor: 5.0
+  --moe-router-score-function: sigmoid
+  --moe-router-enable-expert-bias: true
+  --moe-router-dtype: fp32
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-aux-loss-coeff: 1e-4
+  --moe-token-dispatcher-type: flex
+  --moe-flex-dispatcher-backend: hybridep
+  --moe-hybridep-num-sms: 32
+  --moe-grouped-gemm: true
+  --moe-permute-fusion: true
+  --moe-latent-size: 1024
+  --moe-shared-expert-intermediate-size: 5376
+  --moe-shared-expert-compute-before-router: true
+
+  # MTP args
+  --mtp-spec: megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
+  --mtp-num-layers: 2
+  --mtp-hybrid-override-pattern: \"*E\"
+  --calculate-per-token-loss: true
+  --mtp-loss-scaling-factor: 0.3
+
+  # Mixed precision / quantization args
+  --bf16: true
+  --keep-mtp-spec-in-bf16: true
+  --keep-mamba-stack-attention-linear-in-bf16: true
+  --keep-mamba-out-proj-in-mxfp8: true
+  --keep-moe-latent-projections-in-bf16: true
+  --first-last-layers-bf16: true
+  --num-layers-at-start-in-bf16: 0
+  --num-layers-at-end-in-bf16: 14
+  --fp4-format: e2m1
+  --fp4-recipe: nvfp4
+
+  # Regularization args
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+
+  # Learning rate args
+  --lr: 4.5e-4
+  --min-lr: 4.5e-6
+  --lr-decay-style: WSD
+  --lr-warmup-samples: 24414063
+  --lr-decay-samples: 3048706055
+  --lr-wsd-decay-style: minus_sqrt
+  --lr-wsd-decay-samples: 610351563
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+
+  # Checkpointing args
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --ckpt-format: torch_dist
+  --ckpt-fully-parallel-save: true
+  --ckpt-fully-parallel-load: true
+  --ckpt-assume-constant-structure: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
+  --save-interval: 1000
+  --save-retain-interval: 5000
+
+  # Validation args
+  --eval-interval: 1000
+  --eval-iters: 14
+
+  # Logging args
+  --log-interval: 100
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-throughput: true
+  --log-progress: true
+  --log-energy: true
+  --log-memory-interval: 500
+  --logging-level: 20
+  --timing-log-option: minmax
+  --check-weight-hash-across-dp-replicas-interval: 20000
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

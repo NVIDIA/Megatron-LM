@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -15,15 +15,15 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_block import MambaStack
-from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -35,6 +35,7 @@ from megatron.core.transformer.cuda_graphs import (
     _CudagraphGlobalRecord,
 )
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -462,7 +463,7 @@ class TestLLaVACudaGraph:
                 del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
 
 
-class TestParallelMambaBlockCudagraphs:
+class TestParallelHybridBlockCudagraphs:
     def setup_method(self, method):
         # initialize parallel state
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
@@ -486,8 +487,8 @@ class TestParallelMambaBlockCudagraphs:
                 use_cpu_initialization=True,
                 cuda_graph_impl="local",
             )
-            modules = mamba_stack_spec.submodules
-            return MambaStack(
+            modules = hybrid_stack_spec.submodules
+            return HybridStack(
                 transformer_config,
                 modules,
                 layer_type_list=layer_type_list,
@@ -575,7 +576,6 @@ class TestTECudaGraphHelper:
         # Initialize num_microbatches calculator
         init_num_microbatches_calculator(
             rank=0,
-            rampup_batch_size=None,
             global_batch_size=micro_batch_size * num_microbatches,
             micro_batch_size=micro_batch_size,
             data_parallel_size=1,
@@ -1087,6 +1087,171 @@ class TestPartialCudaGraph:
         if moe_dispatcher_type == "hybridep":
             reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
+
+
+class _SimpleModule(MegatronModule):
+    """Minimal MegatronModule for testing CudaGraphManager with function_name."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.linear = torch.nn.Linear(config.hidden_size, config.hidden_size)
+
+    def my_op(self, x):
+        return self.linear(x)
+
+
+class _SimpleNonModule:
+    """non-nn.Module base_module for testing the function_name= form of `CudaGraphManager`."""
+
+    def __init__(self, config):
+        self.weight = torch.randn(config.hidden_size, config.hidden_size, device="cuda")
+
+    def my_op(self, x):
+        return x @ self.weight
+
+
+def _make_simple_module(config):
+    return _SimpleModule(config).cuda().eval()
+
+
+def _make_simple_non_module(config):
+    return _SimpleNonModule(config)
+
+
+class TestInlineCaptureManager:
+    """Tests for CudaGraphManager with inline_capture, function_name, eager, and cache_key."""
+
+    def _make_config(self):
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            inference_rng_tracker=True,
+        )
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        )
+
+    def teardown_method(self, method):
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        CudaGraphManager.global_mempool = None
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "make_module",
+        [
+            pytest.param(_make_simple_module, id="nn_module"),
+            pytest.param(_make_simple_non_module, id="plain_class"),
+        ],
+    )
+    @torch.inference_mode()
+    def test_inline_capture_matches_eager(self, make_module):
+        """Inline-captured graph output must match eager execution."""
+        config = self._make_config()
+        module = make_module(config)
+
+        # Get eager reference before wrapping
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        eager_out = module.my_op(x).clone()
+
+        mgr = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+
+        # First call captures, second replays
+        graph_out_1 = module.my_op(x)
+        graph_out_2 = module.my_op(x)
+        assert torch.equal(eager_out, graph_out_1)
+        assert torch.equal(eager_out, graph_out_2)
+        assert len(mgr.cudagraph_runners) == 1
+        assert mgr.cudagraph_runners[0].fwd_graph_recorded
+
+    @torch.inference_mode()
+    def test_eager_bypass(self):
+        """eager=True must bypass graph capture entirely."""
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+
+        mgr = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        _ = module.my_op(x, eager=True)
+        _ = module.my_op(x, eager=True)
+        assert len(mgr.cudagraph_runners) == 0, "eager=True should not create runners"
+
+    @torch.inference_mode()
+    def test_cache_key_routing(self):
+        """Different cache_keys must create separate runners."""
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+
+        mgr = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        module.my_op(x, cache_key="key_a")
+        module.my_op(x, cache_key="key_b")
+
+        assert len(mgr.cudagraph_runners) == 2
+        assert mgr.custom_cudagraphs_lookup_table["key_a"] is not None
+        assert mgr.custom_cudagraphs_lookup_table["key_b"] is not None
+        assert (
+            mgr.custom_cudagraphs_lookup_table["key_a"]
+            is not mgr.custom_cudagraphs_lookup_table["key_b"]
+        )
+
+        # Same key reuses the runner
+        module.my_op(x, cache_key="key_a")
+        assert len(mgr.cudagraph_runners) == 2
+
+    @torch.inference_mode()
+    def test_num_warmup_steps_override(self):
+        """num_warmup_steps on the manager must override the config value on runners."""
+        config = self._make_config()
+        config.cuda_graph_warmup_steps = 3
+        module = _SimpleModule(config).cuda().eval()
+
+        mgr = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        module.my_op(x, cache_key="test")
+
+        runner = mgr.cudagraph_runners[0]
+        assert (
+            runner.num_warmup_steps == 0
+        ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
 
 
 if __name__ == "__main__":

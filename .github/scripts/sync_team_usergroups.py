@@ -20,6 +20,7 @@ Slack user groups to match.
 """
 
 import os
+import re
 import sys
 import argparse
 import requests
@@ -198,8 +199,9 @@ def get_user_email(username):
         if resp.status_code == 200:
             commits = resp.json()
             for commit in commits:
-                # Get email from commit author
                 commit_data = commit.get('commit', {})
+
+                # Get email from commit author metadata
                 author_data = commit_data.get('author', {})
                 email = author_data.get('email')
 
@@ -210,6 +212,16 @@ def get_user_email(username):
                         return email
                     elif public_email is None:
                         public_email = email
+
+                # Check Signed-off-by lines in the commit message for @nvidia.com emails
+                message = commit_data.get('message', '')
+                sob_matches = re.findall(
+                    r'Signed-off-by:.*<([^>]+@nvidia\.com)>', message
+                )
+                if sob_matches:
+                    _email_cache[username] = sob_matches[0]
+                    print(f"Found @nvidia.com email for {username} from Signed-off-by")
+                    return sob_matches[0]
 
         # 3. Use public email if found, otherwise fallback
         if public_email:

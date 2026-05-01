@@ -13,6 +13,7 @@ import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -42,7 +43,8 @@ from megatron.core.utils import (
     to_local_if_dtensor,
     unwrap_model,
 )
-from megatron.legacy.model.module import param_is_not_shared
+
+from megatron.core.transformer.module import param_is_not_shared
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -765,25 +767,33 @@ def get_nvtx_range():
         time: If True, also track with Megatron timers (default: False)
         log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
     """
-    try:
-        from torch.cuda import nvtx
+    from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
-        @contextmanager
-        def nvtx_range(msg, time=False, log_level=1):
-            if time:
-                timers = get_timers()
-                timers(msg, log_level=log_level).start()
-            try:
-                nvtx.range_push(msg)
-                yield
-            finally:
-                nvtx.range_pop()
-                if time:
-                    timers(msg, log_level=log_level).stop()
-
-        return nvtx_range
-    except:
-        @contextmanager
-        def dummy_range(msg, time=False, log_level=1):
+    @contextmanager
+    def nvtx_range(msg, time=False, log_level=1):
+        if time:
+            timers = get_timers()
+            timers(msg, log_level=log_level).start()
+        try:
+            nvtx_range_push(msg)
             yield
-        return dummy_range
+        finally:
+            nvtx_range_pop(msg)
+            if time:
+                timers(msg, log_level=log_level).stop()
+
+    return nvtx_range
+
+
+def has_nvrx_installed():
+    """Checks if nvidia-resiliency-ext is installed."""
+    try:
+        import nvidia_resiliency_ext
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
+def has_nvrx_checkpointing_async_support():
+    """Checks whether the installed NVRx package exposes the async checkpointing API Megatron uses."""
+    return has_nvrx_async_support()

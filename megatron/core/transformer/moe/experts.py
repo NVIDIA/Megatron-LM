@@ -34,6 +34,10 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
 )
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
+    NVLSAllGatherVDispatcher,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -55,11 +59,7 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
-from megatron.core.inference.moe import (
-    InferenceGroupedGemmBackend,
-    mcore_fused_moe,
-    resolve_inference_grouped_gemm_backend,
-)
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,7 @@ class GroupedLinearFc2Builder(Protocol):
 
 
 @dataclass
-class TEGroupedMLPSubmodules:
+class GroupedMLPSubmodules:
     """
     The dataclass for ModuleSpecs of TEGroupedMLP submodules
     including  linear fc1, activation function, linear fc2.
@@ -164,7 +164,7 @@ class TEGroupedMLP(MegatronModule):
         self,
         num_local_experts: int,
         config: TransformerConfig,
-        submodules: TEGroupedMLPSubmodules,
+        submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
@@ -471,7 +471,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self,
         num_local_experts: int,
         config: TransformerConfig,
-        submodules: MLPSubmodules,
+        submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
@@ -486,13 +486,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
 
-        self.is_inference_cuda_graphed_iteration = False
-
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
+        self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -516,14 +515,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         if func == squared_relu:
             return McoreActivationType.SQUARED_RELU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
-
-    def set_inference_cuda_graphed_iteration(self):
-        """Enable CUDA-graphed iteration mode."""
-        self.is_inference_cuda_graphed_iteration = True
-
-    def unset_inference_cuda_graphed_iteration(self):
-        """Disable CUDA-graphed iteration mode."""
-        self.is_inference_cuda_graphed_iteration = False
 
     def _build_concatenated_mxfp8_weights(self):
         """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
@@ -558,14 +549,22 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
-            setattr(
-                self,
-                buf_name,
-                MXFP8Tensor(
-                    data=torch.stack(q_list, dim=0).contiguous(),
-                    scale=torch.stack(s_list, dim=0).contiguous(),
-                ),
-            )
+            stacked_data = torch.stack(q_list, dim=0).contiguous()
+            stacked_scale = torch.stack(s_list, dim=0).contiguous()
+
+            setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
+
+            # Redirect per-expert weight .data to views into the stacked buffer,
+            # mirroring _build_concatenated_weights. This frees the original
+            # allocations while keeping the Parameter objects intact.
+            for i in range(self.num_local_experts):
+                w = getattr(linear, f'weight{i}')
+                if isinstance(w, MXFP8Tensor):
+                    w.data = stacked_data[i]
+                    w.scale = stacked_scale[i]
+                elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
+                    w.data.data = stacked_data[i]
+                    w.data.scale = stacked_scale[i]
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
@@ -626,12 +625,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._flashinfer_activation_type,
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
+            output=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )[0]
         return output, None
 
-    def _mcore_fused_moe_forward(
-        self, hidden_states, probs, routing_map=None, tokens_per_expert=None, skip_permute=False
-    ):
+    def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
@@ -642,10 +640,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._mcore_activation_type,
             num_local_experts=self.num_local_experts,
             local_expert_start=local_expert_start,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
             routing_map=routing_map,
-            tokens_per_expert=tokens_per_expert,
-            skip_permute=skip_permute,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )
         return output, None
 
@@ -681,36 +679,25 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            if self.config.fp8_recipe == "mxfp8":
+            w = self.linear_fc1.weight0
+            if isinstance(w, MXFP8Tensor) or (
+                hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
+            ):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
-        resolved_backend = resolve_inference_grouped_gemm_backend(
-            self.inference_grouped_gemm_backend,
-            self.is_inference_cuda_graphed_iteration,
-            is_mxfp8=self.config.fp8_recipe == "mxfp8",
-        )
-
-        if resolved_backend == InferenceGroupedGemmBackend.FLASHINFER:
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
-            assert (
-                self.is_inference_cuda_graphed_iteration
-            ), "FlashInfer forward path is only used in CUDA-graphed inference iterations."
+            assert not self.training, "FlashInfer forward path is only used in inference mode."
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
-        elif resolved_backend == InferenceGroupedGemmBackend.TORCH:
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
             return self._mcore_fused_moe_forward(
-                permuted_local_hidden_states,
-                permuted_probs,
-                routing_map=routing_map,
-                tokens_per_expert=tokens_per_expert,
-                skip_permute=(not self.is_inference_cuda_graphed_iteration),
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
-        elif resolved_backend == InferenceGroupedGemmBackend.TE:
-            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
 
 class SequentialMLP(MegatronModule):

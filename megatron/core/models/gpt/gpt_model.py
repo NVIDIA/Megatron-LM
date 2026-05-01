@@ -223,6 +223,8 @@ class GPTModel(LanguageModule):
                 pg_collection=self.pg_collection,
             )
 
+            self._setup_mtp_cuda_graphs()
+
         # Output
         if self.post_process:
 
@@ -489,7 +491,6 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        is_spec_decode: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -503,9 +504,6 @@ class GPTModel(LanguageModule):
             padding_mask (Tensor, optional): Padding mask for MoE routing.
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from routing computations.
-            is_spec_decode (bool, optional): Explicitly override whether speculative
-                decoding is active.  When ``None`` (default) the flag is inferred from
-                ``inference_context.num_speculative_tokens``.
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -565,7 +563,6 @@ class GPTModel(LanguageModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
-            is_spec_decode=is_spec_decode,
         )
 
     def _postprocess(
@@ -587,7 +584,6 @@ class GPTModel(LanguageModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
-        is_spec_decode=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -601,12 +597,11 @@ class GPTModel(LanguageModule):
         # Check if speculative decoding is active. When it is, MTP must be
         # computed *after* verification so that it is conditioned on verified
         # tokens rather than stale speculative tokens from the previous step.
-        if is_spec_decode is None:
-            is_spec_decode = (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
-            )
+        is_spec_decode = (
+            in_inference_mode
+            and inference_context.is_dynamic_batching()
+            and inference_context.num_speculative_tokens > 0
+        )
 
         # logits and loss
         output_weight = None
@@ -709,49 +704,6 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
-
-    @torch.inference_mode()
-    def compute_mtp_single_step(
-        self,
-        hidden_states: Tensor,
-        next_token_ids: Tensor,
-        position_ids: Tensor,
-        depth: int,
-        runtime_gather_output: bool = True,
-    ) -> tuple:
-        """Compute a single MTP depth for speculative decoding.
-
-        This is called after speculative token verification to compute MTP
-        predictions conditioned on verified tokens only.
-
-        Args:
-            hidden_states (Tensor): Hidden states at last accepted positions [N, 1, H].
-            next_token_ids (Tensor): Correct next token IDs [1, N].
-            position_ids (Tensor): Position IDs for the next tokens [1, N].
-            depth (int): MTP depth index (0-indexed).
-            runtime_gather_output (bool): Whether to gather output across TP.
-
-        Returns:
-            tuple: (new_hidden_states [N, 1, H], logits [N, 1, vocab_size]).
-        """
-        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
-        mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
-            hidden_states=hidden_states,
-            next_token_ids=next_token_ids,
-            position_ids=position_ids,
-            embedding=self.embedding,
-        )
-
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-
-        logits, _ = self.output_layer(
-            mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
-        logits = self._scale_logits(logits)
-
-        return mtp_hidden, logits
 
     def build_schedule_plan(
         self,

@@ -2,8 +2,9 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Optional
 
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
@@ -20,6 +21,13 @@ class MimoModelConfig:
             Dictionary mapping modality names to their special token IDs.
             For example, {"vision": -200, "audio":32000}, these represent placeholders
             in the input_ids to insert the modality embeddings at the correct positions.
+        module_to_grid_map (Optional[Dict[str, HyperCommGrid]]):
+            Dictionary mapping module keys (e.g., "vision", "language") to their
+            corresponding HyperCommGrid configurations. The language model must use
+            the key MIMO_LANGUAGE_MODULE_KEY.
+            When grids span the same ranks → colocated (same or different TP/DP).
+            When grids span disjoint ranks → non-colocated (pipeline parallel).
+            When None → colocated with legacy global parallel_state.
         kv_format (str):
             Key-value format for attention: "sbhd" (seq-batch-head-dim) or "thd" (total-head-dim).
             Default is "sbhd".
@@ -35,4 +43,20 @@ class MimoModelConfig:
     language_model_spec: ModuleSpec = field(default_factory=ModuleSpec)
     modality_submodules_spec: Dict[str, ModuleSpec] = field(default_factory=dict)
     special_token_ids: Dict[str, int] = field(default_factory=dict)
+    module_to_grid_map: Optional[Dict[str, HyperCommGrid]] = None
     kv_format: str = "sbhd"
+
+    def __post_init__(self):
+        if not self.module_to_grid_map:
+            return
+        # Local import avoids circular imports at dataclass-module import time.
+        from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+
+        expected_keys = set(self.modality_submodules_spec.keys()) | {MIMO_LANGUAGE_MODULE_KEY}
+        grid_keys = set(self.module_to_grid_map.keys())
+        if grid_keys != expected_keys:
+            raise ValueError(
+                f"module_to_grid_map keys must match modality module names + "
+                f"'{MIMO_LANGUAGE_MODULE_KEY}'. Missing: {expected_keys - grid_keys}, "
+                f"Extra: {grid_keys - expected_keys}"
+            )

@@ -103,12 +103,28 @@ def validate_yaml(args, defaults={}):
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    is_global_batch_size_explicitly_specified = getattr(
+        args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
+        raise ValueError(
+            'Cannot specify both --step-batch-size-schedule and --global-batch-size'
+        )
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         if args.rank == 0:
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+
+    # Eval batch size.
+    if getattr(args, 'eval_global_batch_size', None) is None:
+        args.eval_global_batch_size = args.global_batch_size
+    if getattr(args, 'eval_micro_batch_size', None) is None:
+        args.eval_micro_batch_size = args.micro_batch_size
+    assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0, \
+        f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
+        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
 
     # num_layers_per_virtual_pipeline_stage is not insde model parallel for checkpointing
     if args.num_layers_per_virtual_pipeline_stage is not None:
@@ -179,8 +195,6 @@ def validate_yaml(args, defaults={}):
             'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
-        assert args.rampup_batch_size is None, \
-            'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
@@ -421,5 +435,8 @@ def load_yaml(yaml_path):
         config_namespace = json.loads(json.dumps(config), object_hook=lambda item: SimpleNamespace(**item))
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
+        config_namespace._is_global_batch_size_explicitly_specified = (
+            getattr(config_namespace, "global_batch_size", None) is not None
+        )
         return config_namespace
 

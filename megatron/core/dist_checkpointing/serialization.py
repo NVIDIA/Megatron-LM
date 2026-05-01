@@ -21,7 +21,6 @@ from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
 from .dict_utils import merge
 from .mapping import (
-    CheckpointingException,
     CommonStateDict,
     ShardedObject,
     ShardedStateDict,
@@ -30,7 +29,6 @@ from .mapping import (
 )
 from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
-from .strategies.base import AsyncSaveShardedStrategy
 from .strategies.common import load_common, save_common
 from .strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
@@ -38,8 +36,10 @@ from .validation import (
     StrictHandling,
     determine_global_metadata,
     parse_strict_flag,
+    save_integrity_manifest,
     validate_integrity_and_strict_load,
     verify_checkpoint,
+    verify_integrity_manifest,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ def load(
     common_strategy: None = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
+    verify_integrity: bool = False,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -91,6 +92,10 @@ def load(
             incur any performance overhead. Other recommended values
             are: `False` (StrictHandling.LOG_UNEXPECTED) which logs only unexpected keys
             or `StrictHandling.RETURN_ALL` which returns all mismatch keys.
+        verify_integrity (bool, optional): if True, re-hashes every checkpoint file
+            and compares against the SHA-256 manifest. Raises `CheckpointingException` on any
+            mismatch. Requires that the checkpoint was previously saved with
+            `verify_integrity=True`.
 
     Returns:
         StateDict or Tuple[StateDict, Set[str], Set[str]]: in most cases only
@@ -99,6 +104,8 @@ def load(
     assert common_strategy is None
 
     verify_checkpoint(checkpoint_dir)
+    if verify_integrity:
+        verify_integrity_manifest(checkpoint_dir)
     if sharded_strategy is None:
         sharded_strategy = TorchDistLoadShardedStrategy()
 
@@ -141,7 +148,13 @@ def load(
         ckpt_sharded_metadata,
     )
 
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
+    ckpt_args = common_state_dict.get("args")
+    async_strategy = (
+        getattr(ckpt_args, "async_strategy", "mcore")
+        if getattr(ckpt_args, "async_save", False)
+        else "mcore"
+    )
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -295,6 +308,8 @@ def save(
         Callable[[CommonStateDict], StateDict]
     ] = None,
     content_metadata: Optional[dict] = None,
+    async_strategy: Optional[str] = "nvrx",
+    verify_integrity: bool = False,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -340,6 +355,11 @@ def save(
             modify the original state dict
         content_metadata (dict, optional): metadata to identify the checkpoint content.
             Useful for framework specific versioning.
+        verify_integrity (bool, optional): if True, compute SHA-256 hashes for every
+            file in the checkpoint directory after all data has been written. This manifest can
+            later be verified on load with `load(..., verify_integrity=True)`.
+            Adds I/O overhead proportional to the total checkpoint size (one extra
+            read pass over all files on rank 0).
 
     Returns:
         AsyncRequest (optional): if `async_sharded_save` is True, returns
@@ -386,17 +406,22 @@ def save(
             )
         torch.distributed.barrier()
 
+    def integrity_finalize_fn():
+        if torch.distributed.get_rank() == 0:
+            save_integrity_manifest(checkpoint_dir)
+        torch.distributed.barrier()
+
     if not async_sharded_save:
         sharded_strategy.save(sharded_state_dict, checkpoint_dir)
         metadata_finalize_fn()
+        if verify_integrity:
+            integrity_finalize_fn()
         return None
 
-    if not isinstance(sharded_strategy, AsyncSaveShardedStrategy):
-        raise CheckpointingException(
-            f'Cannot apply async_save to non-async strategy {sharded_strategy}'
-        )
-    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
+    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
     async_request.finalize_fns.append(metadata_finalize_fn)
+    if verify_integrity:
+        async_request.finalize_fns.append(integrity_finalize_fn)
     return async_request
 
 
