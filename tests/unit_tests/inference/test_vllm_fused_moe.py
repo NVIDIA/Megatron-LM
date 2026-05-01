@@ -704,7 +704,7 @@ class TestVllmFusedMoeCudaGraph:
         expected = _ref_sequential_moe(
             static_hidden, static_probs, fc1, fc2, static_routing_map, num_experts, 0, max_tokens
         )
-        torch.testing.assert_close(static_out, expected, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(static_out.float(), expected, atol=5e-2, rtol=5e-2)
 
     @pytest.mark.parametrize(
         "max_tokens,valid_tokens_list",
@@ -778,7 +778,7 @@ class TestVllmFusedMoeCudaGraph:
                 static_hidden, static_probs, fc1, fc2, static_routing_map, num_experts, 0, vt
             )
             torch.testing.assert_close(
-                static_out[:vt],
+                static_out[:vt].float(),
                 expected[:vt],
                 atol=5e-2,
                 rtol=5e-2,
@@ -868,7 +868,7 @@ class TestVllmFusedMoeCudaGraph:
                 max_tokens,
             )
             torch.testing.assert_close(
-                static_out,
+                static_out.float(),
                 expected,
                 atol=5e-2,
                 rtol=5e-2,
