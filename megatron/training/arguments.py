@@ -1614,6 +1614,33 @@ def validate_args(args, defaults={}):
             "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
         )
 
+    # ------------------------------------------------------------------
+    # Resolve FusedA2AConfig: merges CLI > ENV > config file > defaults.
+    # Done once here so every downstream consumer gets a single, validated
+    # object instead of re-reading env/files at model-construction time.
+    # Result is stored on args.fused_a2a_config and automatically picked up
+    # by core_transformer_config_from_args → TransformerConfig.fused_a2a_config.
+    # ------------------------------------------------------------------
+    from megatron.core.transformer.moe.fused_a2a_config_loader import (
+        resolve_fused_a2a_config_from_sources,
+    )
+    args.fused_a2a_config = resolve_fused_a2a_config_from_sources(
+        cli_args=args,
+        config_file_path=getattr(args, 'moe_a2a_config_file', None),
+    )
+    # If --moe-a2a-num-sms is not explicitly set, propagate --moe-deepep-num-sms into the
+    # resolved config so _DeepepManager has a single authoritative source.
+    if (
+        args.fused_a2a_config.num_sms is None
+        and getattr(args, 'moe_deepep_num_sms', None) is not None
+    ):
+        args.fused_a2a_config = type(args.fused_a2a_config)(
+            chunk_size=args.fused_a2a_config.chunk_size,
+            num_sms=args.moe_deepep_num_sms,
+        )
+    if args.fused_a2a_config.chunk_size is not None or args.fused_a2a_config.num_sms is not None:
+        print_rank_0(f'[MoE A2A] Effective FusedA2AConfig: {args.fused_a2a_config}')
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -3092,6 +3119,33 @@ def _add_moe_args(parser):
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
+
+    # ------------------------------------------------------------------
+    # DeepEP / Fused All-to-All tuning arguments
+    # Resolved once at startup in validate_args via resolve_fused_a2a_config_from_sources.
+    # Precedence: CLI > ENV (MOE_A2A_CHUNK_SIZE / MOE_A2A_NUM_SMS) > CONFIG FILE > DEFAULTS.
+    # ------------------------------------------------------------------
+    group.add_argument(
+        '--moe-deepep-num-sms', type=int, default=None,
+        help='Number of SMs to use for DeepEP all-to-all kernels. '
+             'Overrides the TransformerConfig default (20). '
+             'Superseded by --moe-a2a-num-sms when both are set.')
+    group.add_argument(
+        '--moe-a2a-chunk-size', type=int, default=None,
+        help='Chunk size for fused all-to-all MoE communication (DeepEP). '
+             'When not set, the kernel uses its built-in default. '
+             'Precedence: CLI > ENV(MOE_A2A_CHUNK_SIZE) > config file > default.')
+    group.add_argument(
+        '--moe-a2a-num-sms', type=int, default=None,
+        help='Number of SMs for fused all-to-all MoE kernels (DeepEP). '
+             'Takes priority over --moe-deepep-num-sms when both are set. '
+             'Precedence: CLI > ENV(MOE_A2A_NUM_SMS) > config file > --moe-deepep-num-sms > 20.')
+    group.add_argument(
+        '--moe-a2a-config-file', type=str, default=None,
+        help='Path to a JSON or YAML file with fused all-to-all MoE tuning parameters '
+             '(chunk_size, num_sms). CLI flags and environment variables take precedence '
+             'over values in this file.')
+
     return parser
 
 def _add_mla_args(parser):
