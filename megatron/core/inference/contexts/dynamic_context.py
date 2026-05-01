@@ -642,6 +642,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     ep_group=self.expert_model_parallel_group,
                 )
 
+        self.smallest_non_decode_cuda_graph_size = min(
+            inference_config.cuda_graph_mixed_prefill_count, self.max_requests
+        )
+
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
 
