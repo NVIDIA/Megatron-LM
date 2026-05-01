@@ -117,6 +117,7 @@ html_extra_path = ["project.json", "versions1.json"]
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
+    "http://localhost.*",
 ]
 
 # PyTorch docs use a JS-rendered frontend; anchor IDs are injected at runtime
