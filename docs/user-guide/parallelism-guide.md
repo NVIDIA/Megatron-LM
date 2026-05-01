@@ -119,7 +119,7 @@ Distribute experts across GPUs in Mixture-of-Experts models.
 
 ## Parallelism Selection Guide
 
-Recommended configurations:
+For a list of supported configurations, refer to [Megatron Bridge Supported Models](https://github.com/NVIDIA-NeMo/Megatron-Bridge#supported-models).
 
 ### Language Models
 
