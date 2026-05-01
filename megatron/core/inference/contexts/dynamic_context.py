@@ -35,6 +35,10 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    NCCLAllGatherDispatcher,
+    NVLSAllGatherVDispatcher,
+)
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
@@ -589,9 +593,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
-        # CUDA graph config list
+        # CUDA graph config list.
+        self._nccl_ep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
+        )
+        # We disable non-decode cuda graphs for the nccl dispatcher.
+        # The NCCL dispatcher uses allgathers. Thus there is a need to
+        # run the same sized cuda-graph on every EP rank. This is difficult to
+        # generalize for non-decode steps.
         self.use_cuda_graphs_for_non_decode_steps = (
-            inference_config.use_cuda_graphs_for_non_decode_steps
+            inference_config.use_cuda_graphs_for_non_decode_steps and not self._nccl_ep_dispatcher
         )
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
@@ -607,9 +619,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        self.smallest_non_decode_cuda_graph_size = min(
-            inference_config.cuda_graph_mixed_prefill_count, self.max_requests
-        )
+        # Allocate per-step dispatcher buffers upfront so update_metadata never
+        # triggers an allocation inside a captured CUDA graph.
+        if get_pg_size(self.expert_model_parallel_group) > 1:
+            if self._nccl_ep_dispatcher:
+                NCCLAllGatherDispatcher.allocate_buffers()
+            else:
+                # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
+                moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+                NVLSAllGatherVDispatcher.allocate_buffers(
+                    per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
+                    // tp_size,
+                    topk=model_config.moe_router_topk,
+                    hidden_size=moe_hidden_size,
+                    ep_group=self.expert_model_parallel_group,
+                )
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -620,6 +644,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         elif inference_config.use_flashinfer_fused_rope is None:
             inference_config.use_flashinfer_fused_rope = HAVE_FLASHINFER
         self.use_flashinfer_fused_rope = inference_config.use_flashinfer_fused_rope
+        self.inference_grouped_gemm_backend = model_config.inference_grouped_gemm_backend
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
@@ -844,7 +869,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             label: torch.empty(
                 (self.max_requests,), dtype=dtype, device=torch.cuda.current_device()
             )
-            for label, dtype, _ in self.request_metadata_types
+            for label, dtype in self.request_metadata_types
         }
 
         # Per-token state.
@@ -859,6 +884,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
+
+        # Static tensor addresses of active slices to enable fast inference kernels.
+        self.active_request_metadata = {
+            label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
+        }
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
@@ -1061,6 +1091,23 @@ class DynamicInferenceContext(BaseInferenceContext):
     def get_active_request_count(self):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
+
+    def build_active_slices(self, batch_size: int):
+        """Build the active slices of specific tensors. This is run on every forward step.
+
+        If the context is reordered to active -> paused -> finished, this can be graphed.
+        """
+        padded_slice = slice(self.paused_request_count, self.paused_request_count + batch_size)
+
+        # Request metadata all needs to be sliced.
+        for label in self.request_metadata:
+            self.active_request_metadata[label][:batch_size].copy_(
+                self.request_metadata[label][padded_slice], non_blocking=True
+            )
+
+    def pad_active_slices(self):
+        """Pad the active slices of specific tensors."""
+        pass
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1391,7 +1438,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
-        for i, (label, dtype, _) in enumerate(self.request_metadata_types):
+        for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
                 metadata_cols[i], dtype=dtype, device=torch.cuda.current_device()
             )
@@ -1621,52 +1668,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         # EP dummy requests are added AFTER the EP sync below.
         if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
+        elif is_expert_parallel_dummy_cuda_graph_step:
+            self.add_dummy_requests_for_expert_parallel_step(
+                InferenceBatchDimensions(
+                    token_count=self.num_speculative_tokens + 1,
+                    prefill_req_count=0,
+                    decode_req_count=1,
+                )
+            )
 
-        if is_expert_parallel_dummy_cuda_graph_step:
-            # No real requests on this EP rank. Pass empty dimensions so the EP
-            # all-reduce in match_graph_config picks up the real ranks' values.
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=0, prefill_req_count=0, decode_req_count=0
-            )
-        else:
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=self.active_token_count,
-                prefill_req_count=self.num_prefill_requests,
-                decode_req_count=self.num_decode_requests,
-            )
+        batch_dimensions = InferenceBatchDimensions(
+            token_count=self.active_token_count,
+            prefill_req_count=self.num_prefill_requests,
+            decode_req_count=self.num_decode_requests,
+        )
 
         self.batch_dimensions = batch_dimensions
 
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
-            smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
             strict=self.is_hybrid_model,
-            decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
-            num_speculative_tokens=self.num_speculative_tokens,
+            match_ep_token_counts=self._nccl_ep_dispatcher,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
         if construct_graph_dimensions is not None:
             assert self._using_cuda_graph_this_step
-
-        if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
-            # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
-            # could not find a compatible cuda graph for the dummy forward step.
-            # Now, we need not do the remaining setup. The controller
-            # will directly call the model forward pass with a single token.
-            return
-
-        # Add dummy requests AFTER the EP sync so they match the resolved graph.
-        if is_expert_parallel_dummy_cuda_graph_step:
-            self.add_dummy_requests_for_expert_parallel_step(best_graph)
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=self.active_token_count,
-                prefill_req_count=self.num_prefill_requests,
-                decode_req_count=self.num_decode_requests,
-            )
-            self.batch_dimensions = batch_dimensions
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
@@ -1701,6 +1730,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
+
+        self.build_active_slices(self.padded_active_request_count)
+        self.pad_active_slices()
 
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
@@ -1776,6 +1808,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.moe_routing_metadata.enable_static_buffer_recording()
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
+
+        # Flip NCCLAllGather dispatcher's path selector to not use allgathers.
+        # _nccl_ep_dispatcher already implies ep_size > 1, so no extra EP guard.
+        if self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher._use_allgather_v = not self.using_cuda_graph_this_step()
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""
@@ -1912,6 +1949,20 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return torch.cat([decode_indices, prefill_last_indices])
 
+    @property
+    def num_last_token_logits(self) -> int:
+        """Number of rows produced by `last_token_logits` for the current step.
+
+        Single source of truth for the bound: one row per request, with
+        `(num_speculative_tokens + 1)` rows per decode request when MTP is active.
+        """
+        if self.num_speculative_tokens > 0:
+            return (
+                self.num_decode_requests * (self.num_speculative_tokens + 1)
+                + self.num_prefill_requests
+            )
+        return self.total_request_count - self.paused_request_count
+
     def last_token_logits(self, logits: Tensor) -> Tensor:
         """Select the logit positions needed for token generation.
 
@@ -1925,7 +1976,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             logits (Tensor): Output logits of forward pass, shape [1, S, H].
 
         Return:
-            (Tensor) Selected logits, shape [N, H].
+            (Tensor) Selected logits, shape [N, H], where N == num_last_token_logits.
         """
         # todo: @lmcafee, remove these asserts?
         assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
@@ -1937,12 +1988,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.num_speculative_tokens > 0:
             selected = self.speculative_required_logit_indices(logits.device)
+            assert selected.numel() == self.num_last_token_logits
             return logits_2d[selected, :]
 
         paused = self.paused_request_count
         total = self.total_request_count
         query_lengths = self.request_query_lengths[paused:total]
         last_token_idxs = torch.cumsum(query_lengths, dim=0) - 1
+        assert last_token_idxs.numel() == self.num_last_token_logits
         return logits_2d[last_token_idxs, :]
 
     def _compute_prefix_match(
@@ -2183,7 +2236,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metadata = req.tracked_metadata
         metadata_types = req.get_metadata_types()
         for m, m_type in zip(metadata, metadata_types):
-            label, _, _ = m_type
+            label, _ = m_type
             if not isinstance(m, torch.Tensor):
                 m = torch.as_tensor(
                     m,
