@@ -33,7 +33,7 @@ dependency.
 **Option A — NVIDIA-internal: pull a CI-built image**
 
 > ⚠️ Requires access to the internal GitLab instance.
-> See `tools/trigger_internal_ci.md` for setup (adding the git remote, obtaining a token).
+> See @tools/trigger_internal_ci.md for setup (adding the git remote, obtaining a token).
 
 The internal GitLab CI publishes images to its container registry.
 Derive the registry host from your configured `gitlab` remote — the same
