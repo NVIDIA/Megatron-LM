@@ -120,6 +120,10 @@ def _apply_rope(
             ), "Fused MLA RoPE apply is not imported successfully"
         else:
             rotary_pos_emb, mscale = rotary_pos_emb_module(total_seq_len, packed_seq=False)
+            # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+            # concentration factor (mscale) is NOT part of the DSv4 model contract --
+            # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+            mscale = 1.0
     if rotary_pos_emb is not None and ratio > 1:
         rotary_pos_emb = rotary_pos_emb[:total_seq_len:ratio][:rotary_seq_len]
     if rotary_pos_cos is not None and ratio > 1:

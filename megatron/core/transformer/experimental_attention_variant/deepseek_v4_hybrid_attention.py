@@ -330,6 +330,10 @@ class DSv4HybridAttention(Attention):
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+                # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+                # concentration factor (mscale) is NOT part of the DSv4 model contract --
+                # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+                mscale = 1.0
         if self.config.apply_rope_fusion:
             core_attn_out = fused_mla_rope_inplace(
                 core_attn_out,
@@ -527,6 +531,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+                # concentration factor (mscale) is NOT part of the DSv4 model contract --
+                # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+                mscale = 1.0
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
