@@ -289,7 +289,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
     ):
         if backend == "flashinfer":
             pytest.importorskip("flashinfer")
-        batch_size = 12
+        batch_size = 15
         self.setup_model(
             torch.float32,
             batch_size=batch_size,
@@ -302,11 +302,14 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context = self.text_generation_controller.inference_wrapped_model.inference_context
 
         # Prepare sampling params in human-readable format, to aid with test maintenance.
+        # The temperature=0 / top_k=1 bucket exercises the greedy path: torch short-circuits
+        # to argmax, flashinfer relies on its temperature clamp to avoid divide-by-zero.
         sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
             (SamplingParams(temperature=0.1, top_p=0.01), [9, 6, 10]),
             (SamplingParams(temperature=5.0, top_k=15), [0, 3, 2]),
             (SamplingParams(top_p=0.8), [4, 1, 7]),
             (SamplingParams(temperature=10.0, top_k=5), [11, 5, 8]),
+            (SamplingParams(temperature=0.0, top_k=1), [12, 13, 14]),
         ]
         # For non-torch backends, test simultaneous top_k and top_p sampling.
         if backend != "torch":
