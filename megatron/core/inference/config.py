@@ -277,7 +277,8 @@ class InferenceConfig:
     decode-only steps via a side CUDA stream for the sample D2H (the same
     overlap pattern vLLM v1 uses). Initial scope: decode-only, no speculative
     MTP, no hybrid (Mamba) models. Those configurations are rejected at engine
-    construction when this flag is True."""
+    construction when this flag is True. Default False until validated against
+    the broader test matrix."""
 
     # =================================
     # Logging config
