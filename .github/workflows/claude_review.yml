@@ -59,7 +59,7 @@ jobs:
             Mandatory workflow — never skip or reorder:
             1. Read the PR diff first (gh pr diff).
             2. Based on the changed files and areas, identify relevant skills from skills/<name>/SKILL.md.
-               Common skill names: build-and-dependency, ci-test-system, run-unit-tests, run-on-slurm,
+               Common skill names: build-and-dependency, testing, cicd, linting-and-formatting, run-on-slurm,
                nightly-sync, create-issue, respond-to-issue, split-pr, onboard-gb200-1node-tests.
             3. Read the SKILL.md files for all relevant areas using the Read tool.
             4. Only then perform the review using the skill context.
@@ -152,7 +152,7 @@ jobs:
             Mandatory workflow — never skip or reorder:
             1. Read the PR diff first (gh pr diff).
             2. Based on the changed files and areas, identify relevant skills from skills/<name>/SKILL.md.
-               Common skill names: build-and-dependency, ci-test-system, run-unit-tests, run-on-slurm,
+               Common skill names: build-and-dependency, testing, cicd, linting-and-formatting, run-on-slurm,
                nightly-sync, create-issue, respond-to-issue, split-pr, onboard-gb200-1node-tests.
             3. Read the SKILL.md files for all relevant areas using the Read tool.
             4. Only then perform the review using the skill context.
