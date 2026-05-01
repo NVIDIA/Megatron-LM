@@ -156,6 +156,7 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 2. Use fixtures from `tests/unit_tests/conftest.py`.
 3. Apply markers as needed:
    - `@pytest.mark.internal` — skipped on `legacy` tag
+   - `@pytest.mark.flaky_in_dev` — skipped in `dev` environment (CI default; use this to disable a flaky test without blocking the standard pipeline)
    - `@pytest.mark.flaky` — skipped in `lts` environment
    - `@pytest.mark.experimental` — `latest` tag only
 4. Verify locally (see Running Unit Tests Locally above).
