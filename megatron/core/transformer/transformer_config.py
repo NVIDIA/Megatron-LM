@@ -289,41 +289,6 @@ class TransformerConfig(ModelParallelConfig):
     top-k indices."""
 
     ####################
-    # DeepSeek-v4 hybrid attention (CSA / HCA)
-    ####################
-    csa_window_size: int = 128
-    """Sliding-window size used by CSA / HCA core attention."""
-
-    csa_compress_ratios: Optional[List[int]] = None
-    """Per-layer compression ratios for CSA / HCA. The list length must equal
-    ``num_layers``. Valid values: 0 (window only), 4 (CSA), 128 (HCA). For pure CSA / HCA
-    layers in a hybrid model the entry is normally derived from the layer-allocation
-    pattern but may also be set here directly."""
-
-    csa_compress_rotary_base: float = 40000.0
-    """RoPE base for compressed KV positions in CSA / HCA."""
-
-    csa_dense_mode: bool = False
-    """If True, the CSA layer attends to all valid compressed positions and disables the
-    learned indexer (used as a warmup phase before sparse training)."""
-
-    csa_attention_sink: bool = True
-    """Whether to use the per-head learnable attention sink in CSA / HCA core attention."""
-
-    csa_compress_ratio_for_c: int = 4
-    """Default compression ratio for layers marked 'C' (CSA) in the hybrid pattern."""
-
-    csa_compress_ratio_for_h: int = 128
-    """Default compression ratio for layers marked 'H' (HCA) in the hybrid pattern."""
-
-    o_groups: int = 1
-    """Number of groups for the grouped output projection used by DSv4 hybrid attention."""
-
-    o_lora_rank: int = 128
-    """Per-group lora rank for the grouped output projection used by DSv4 hybrid
-    attention. The intermediate output is ``o_groups * o_lora_rank`` wide."""
-
-    ####################
     # linear attention
     ####################
     linear_attention_freq: Optional[Union[int, List[int]]] = None
@@ -2374,6 +2339,41 @@ class MLATransformerConfig(TransformerConfig):
     """Enable fused q/kv down-projection and fused input layernorm when backend supports.
        Otherwise fall back to the unfused MLA.
     """
+
+    ####################
+    # DeepSeek-v4 hybrid attention (CSA / HCA)
+    ####################
+    csa_window_size: int = 128
+    """Sliding-window size used by CSA / HCA core attention."""
+
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compression ratios for CSA / HCA. The list length must equal
+    ``num_layers``. Valid values: 0 (window only), 4 (CSA), 128 (HCA). For pure CSA / HCA
+    layers in a hybrid model the entry is normally derived from the layer-allocation
+    pattern but may also be set here directly."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in CSA / HCA."""
+
+    csa_dense_mode: bool = False
+    """If True, the CSA layer attends to all valid compressed positions and disables the
+    learned indexer (used as a warmup phase before sparse training)."""
+
+    csa_attention_sink: bool = True
+    """Whether to use the per-head learnable attention sink in CSA / HCA core attention."""
+
+    csa_compress_ratio_for_c: int = 4
+    """Default compression ratio for layers marked 'C' (CSA) in the hybrid pattern."""
+
+    csa_compress_ratio_for_h: int = 128
+    """Default compression ratio for layers marked 'H' (HCA) in the hybrid pattern."""
+
+    o_groups: int = 1
+    """Number of groups for the grouped output projection used by DSv4 hybrid attention."""
+
+    o_lora_rank: int = 128
+    """Per-group lora rank for the grouped output projection used by DSv4 hybrid
+    attention. The intermediate output is ``o_groups * o_lora_rank`` wide."""
 
     def __post_init__(self):
         super().__post_init__()
