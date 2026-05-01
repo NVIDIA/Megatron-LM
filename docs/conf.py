@@ -118,3 +118,9 @@ linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
 ]
+
+# PyTorch docs use a JS-rendered frontend; anchor IDs are injected at runtime
+# and are not present in the static HTML that linkcheck fetches.
+linkcheck_anchors_ignore_for_url = [
+    r"https://docs\.pytorch\.org/.*",
+]
