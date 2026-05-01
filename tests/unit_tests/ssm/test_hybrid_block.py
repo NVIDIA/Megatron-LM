@@ -119,20 +119,9 @@ class TestHybridBlock:
     @pytest.mark.parametrize(
         "recompute_kwargs",
         [
-            dict(
-                recompute_granularity="full",
-                recompute_method="block",
-                recompute_num_layers=2,
-            ),
-            dict(
-                recompute_granularity="full",
-                recompute_method="uniform",
-                recompute_num_layers=2,
-            ),
-            dict(
-                recompute_granularity="selective",
-                recompute_modules=["core_attn", "mlp"],
-            ),
+            dict(recompute_granularity="full", recompute_method="block", recompute_num_layers=2),
+            dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=2),
+            dict(recompute_granularity="selective", recompute_modules=["core_attn", "mlp"]),
         ],
         ids=["full_block", "full_uniform", "selective"],
     )
@@ -155,25 +144,21 @@ class TestHybridBlock:
         # All three in-tree MoE recipes that use `recompute_modules=[..., 'mlp']`
         # set `--disable-bias-linear: true`, so we match that usage pattern here.
         arch_kwargs = {}
-        if (
-            recompute_kwargs.get("recompute_granularity") == "selective"
-            and "mlp" in recompute_kwargs.get("recompute_modules", [])
-        ):
+        if recompute_kwargs.get(
+            "recompute_granularity"
+        ) == "selective" and "mlp" in recompute_kwargs.get("recompute_modules", []):
             arch_kwargs["add_bias_linear"] = False
 
         def build_inputs():
             torch.manual_seed(seed)
             hs = torch.randn(
-                (sequence_length, micro_batch_size, 256),
-                device="cuda",
-                requires_grad=True,
+                (sequence_length, micro_batch_size, 256), device="cuda", requires_grad=True
             )
             am = torch.ones(
-                (micro_batch_size, 1, sequence_length, sequence_length),
-                dtype=bool,
-                device="cuda",
+                (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
             )
             return hs, am
+
         hs, am = build_inputs()
 
         def run(block, hs, am):
@@ -198,9 +183,7 @@ class TestHybridBlock:
         # --- Recompute ---
         model_parallel_cuda_manual_seed(seed)
         torch.manual_seed(seed)
-        rec = self.get_hybrid_block(
-            layer_pattern, **arch_kwargs, **recompute_kwargs
-        ).cuda()
+        rec = self.get_hybrid_block(layer_pattern, **arch_kwargs, **recompute_kwargs).cuda()
         rec.train()
         rec_logits, rec_grads = run(rec, hs, am)
 
