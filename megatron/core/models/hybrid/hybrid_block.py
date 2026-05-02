@@ -27,10 +27,7 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_block import (
-    checkpoint_with_recipe,
-    iterate_recompute_layers,
-)
+from megatron.core.transformer.transformer_block import checkpointed_foward
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
@@ -216,83 +213,6 @@ class HybridStack(MegatronModule):
                 return layer.mamba_state_shapes_per_request()
         return None
 
-    def _checkpointed_forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        rotary_pos_emb: Optional[Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
-        padding_mask: Optional[Tensor],
-        use_inner_quantization_context: bool,
-    ) -> Tensor:
-        """Forward over self.layers with `recompute_granularity = 'full'`.
-
-        Mirrors `TransformerBlock._checkpointed_forward` but adapted to
-        HybridStack's heterogeneous layer dispatch (TransformerLayer vs
-        MambaLayer / others) and reduced argument set.
-        """
-
-        def custom(start: int, end: int):
-            def custom_forward(hidden_states, attention_mask, rotary_pos_emb, padding_mask):
-                for index in range(start, end):
-                    layer = self.layers[index]
-
-                    if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
-                    else:
-                        inner_quantization_context = nullcontext()
-
-                    with inner_quantization_context:
-                        if isinstance(layer, TransformerLayer):
-                            hidden_states, _ = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=None,
-                                rotary_pos_emb=rotary_pos_emb,
-                                sequence_len_offset=None,
-                                packed_seq_params=packed_seq_params,
-                                padding_mask=padding_mask,
-                            )
-                        else:  # MambaLayer, MLP, MoE, GDN
-                            hidden_states = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=None,
-                                packed_seq_params=packed_seq_params,
-                            )
-
-                    if isinstance(hidden_states, tuple):
-                        hidden_states = hidden_states[0]
-                return hidden_states
-
-            return custom_forward
-
-        def chunk_runner(start: int, end: int, use_checkpoint: bool):
-            nonlocal hidden_states
-            cf = custom(start, end)
-            args = (hidden_states, attention_mask, rotary_pos_emb, padding_mask)
-            if use_checkpoint:
-                hidden_states = checkpoint_with_recipe(cf, self.config, self.pg_collection, *args)
-            else:
-                hidden_states = cf(*args)
-
-        iterate_recompute_layers(
-            chunk_runner=chunk_runner,
-            num_layers=self.num_layers_per_pipeline_rank,
-            config=self.config,
-            hidden_states_requires_grad=lambda: hidden_states.requires_grad,
-        )
-        return hidden_states
-
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -387,10 +307,14 @@ class HybridStack(MegatronModule):
 
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
-                hidden_states = self._checkpointed_forward(
+                hidden_states = checkpointed_foward(
+                    self,
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
+                    context=None,
+                    context_mask=None,
                     rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),

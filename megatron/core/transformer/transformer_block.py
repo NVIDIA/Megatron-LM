@@ -2,7 +2,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Set, Union, cast
+from typing import Any, Callable, List, Optional, Set, Union, Tuple, cast
 
 import torch
 from torch import Tensor
@@ -26,6 +26,7 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
+    TransformerLayer,
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -327,6 +328,144 @@ def iterate_recompute_layers(
         raise ValueError("Invalid activation recompute method.")
 
 
+def checkpointed_foward(
+    self: "TransformerBlock | HybridStack",
+    hidden_states: Tensor,
+    attention_mask: Tensor,
+    context: Optional[Tensor],
+    context_mask: Optional[Tensor],
+    rotary_pos_emb: Tensor,
+    attention_bias: Optional[Tensor],
+    packed_seq_params: PackedSeqParams,
+    use_inner_quantization_context: bool,
+    padding_mask: Optional[Tensor] = None,
+    extract_layer_indices: Optional[Set[int]] = None,
+    layer_offset: int = 0,
+) -> Tensor | Tuple[Tensor, Tensor]:
+    """Forward method with activation checkpointing.
+
+    Args:
+        extract_layer_indices (Set[int], optional): Global layer
+            indices (across all pipeline stages) from which to
+            extract features.
+        layer_offset (int): The global layer offset for the current
+            pipeline stage. Used to convert local layer indices to
+            global indices when checking extract_layer_indices.
+
+    Returns:
+        If extract_layer_indices is empty: hidden_states tensor
+        If extract_layer_indices is non-empty: (hidden_states, intermediate_hidden_states) tuple
+    """
+    if extract_layer_indices is None:
+        extract_layer_indices = set()
+    intermediate_hidden_states: List[Tensor] = []
+
+    def custom(start: int, end: int):
+        def custom_forward(
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            padding_mask=None,
+        ):
+            for index in range(start, end):
+                # Use self.layers[index] (not self._get_layer) so this
+                # function works for both TransformerBlock and HybridStack.
+                layer = self.layers[index]
+
+                # Get appropriate inner quantization context
+                if use_inner_quantization_context:
+                    if self.config.fp8:
+                        inner_quantization_context = get_fp8_context(
+                            self.config, layer.layer_number - 1
+                        )
+                    # TODO: check if fp4 is supported in this case
+                    elif self.config.fp4:
+                        inner_quantization_context = get_fp4_context(
+                            self.config, layer.layer_number - 1
+                        )
+                    else:
+                        inner_quantization_context = nullcontext()
+                else:
+                    inner_quantization_context = nullcontext()
+
+                # Build the full TransformerLayer kwarg set; for non-TL
+                # layers (currently MambaLayer in HybridStack) pop the kwargs
+                # they don't accept and treat the return as a single tensor.
+                layer_kwargs = dict(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    context=context,
+                    context_mask=context_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=attention_bias,
+                    inference_context=None,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                )
+                with inner_quantization_context:
+                    if isinstance(layer, TransformerLayer):
+                        hidden_states, context = layer(**layer_kwargs)
+                    else:  # MambaLayer (HybridStack `M` slot)
+                        for k in (
+                            "context",
+                            "context_mask",
+                            "attention_bias",
+                            "padding_mask",
+                        ):
+                            layer_kwargs.pop(k, None)
+                        hidden_states = layer(**layer_kwargs)
+                        context = None
+
+                # Some layer paths may still return a tuple (defensive).
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
+            return hidden_states, context
+
+        return custom_forward
+
+    def chunk_runner(start: int, end: int, use_checkpoint: bool):
+        nonlocal hidden_states, context
+        cf = custom(start, end)
+        args = (
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            padding_mask,
+        )
+        if use_checkpoint:
+            hidden_states, context = checkpoint_with_recipe(
+                cf, self.config, self.pg_collection, *args
+            )
+        else:
+            # Note: original block-branch no-checkpoint path omitted padding_mask
+            # (relied on its default=None); restored here for consistency.
+            hidden_states, context = cf(*args)
+
+        if self.config.recompute_method == "uniform":
+            if (end - 1 + layer_offset) in extract_layer_indices:
+                intermediate_hidden_states.append(hidden_states)
+        else:
+            if (start + layer_offset) in extract_layer_indices:
+                intermediate_hidden_states.append(hidden_states)
+
+    iterate_recompute_layers(
+        chunk_runner=chunk_runner,
+        num_layers=self.num_layers_per_pipeline_rank,
+        config=self.config,
+        hidden_states_requires_grad=lambda: hidden_states.requires_grad,
+    )
+
+    # Return intermediate hidden states if feature extraction was requested
+    if len(extract_layer_indices) > 0:
+        return hidden_states, intermediate_hidden_states
+
+    return hidden_states
+
+
 class TransformerBlock(GraphableMegatronModule, MegatronModule):
     """Transformer class."""
 
@@ -506,125 +645,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
-
-    def _checkpointed_forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        context: Tensor,
-        context_mask: Tensor,
-        rotary_pos_emb: Tensor,
-        attention_bias: Tensor,
-        packed_seq_params: PackedSeqParams,
-        use_inner_quantization_context: bool,
-        padding_mask: Optional[Tensor] = None,
-        extract_layer_indices: Optional[Set[int]] = None,
-        layer_offset: int = 0,
-    ):
-        """Forward method with activation checkpointing.
-
-        Args:
-            extract_layer_indices (Set[int], optional): Global layer
-                indices (across all pipeline stages) from which to
-                extract features.
-            layer_offset (int): The global layer offset for the current
-                pipeline stage. Used to convert local layer indices to
-                global indices when checking extract_layer_indices.
-
-        Returns:
-            If extract_layer_indices is empty: hidden_states tensor
-            If extract_layer_indices is non-empty: (hidden_states, intermediate_hidden_states) tuple
-        """
-        if extract_layer_indices is None:
-            extract_layer_indices = set()
-        intermediate_hidden_states: List[Tensor] = []
-
-        def custom(start: int, end: int):
-            def custom_forward(
-                hidden_states,
-                attention_mask,
-                context,
-                context_mask,
-                rotary_pos_emb,
-                padding_mask=None,
-            ):
-                for index in range(start, end):
-                    layer = self._get_layer(index)
-
-                    # Get appropriate inner quantization context
-                    if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        # TODO: check if fp4 is supported in this case
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
-                    else:
-                        inner_quantization_context = nullcontext()
-
-                    with inner_quantization_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            attention_bias=attention_bias,
-                            inference_context=None,
-                            packed_seq_params=packed_seq_params,
-                            padding_mask=padding_mask,
-                        )
-                return hidden_states, context
-
-            return custom_forward
-
-        def chunk_runner(start: int, end: int, use_checkpoint: bool):
-            nonlocal hidden_states, context
-            cf = custom(start, end)
-            args = (
-                hidden_states,
-                attention_mask,
-                context,
-                context_mask,
-                rotary_pos_emb,
-                padding_mask,
-            )
-            if use_checkpoint:
-                hidden_states, context = checkpoint_with_recipe(
-                    cf, self.config, self.pg_collection, *args
-                )
-            else:
-                # Note: original block-branch no-checkpoint path omitted padding_mask
-                # (relied on its default=None); restored here for consistency.
-                hidden_states, context = cf(*args)
-
-            # Feature extraction.
-            if self.config.recompute_method == 'uniform':
-                # For uniform, only the last layer of each chunk can have features collected.
-                # For fine-grained extraction, use 'block'.
-                if (end - 1 + layer_offset) in extract_layer_indices:
-                    intermediate_hidden_states.append(hidden_states)
-            else:  # 'block' — chunk size 1, so start == end - 1
-                if (start + layer_offset) in extract_layer_indices:
-                    intermediate_hidden_states.append(hidden_states)
-
-        iterate_recompute_layers(
-            chunk_runner=chunk_runner,
-            num_layers=self.num_layers_per_pipeline_rank,
-            config=self.config,
-            hidden_states_requires_grad=lambda: hidden_states.requires_grad,
-        )
-
-        # Return intermediate hidden states if feature extraction was requested
-        if len(extract_layer_indices) > 0:
-            return hidden_states, intermediate_hidden_states
-
-        return hidden_states
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -808,7 +828,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         with rng_context, outer_quantization_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
-                checkpointed_result = self._checkpointed_forward(
+                checkpointed_result = checkpointed_foward(
+                    self,
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     context=context,
