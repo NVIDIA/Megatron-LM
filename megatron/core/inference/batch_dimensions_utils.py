@@ -142,9 +142,9 @@ class InferenceBatchDimensions:
     @staticmethod
     def adjust_batch_dims_for_expert_parallelism(
         local_batch_dims,
-        strict: bool,
-        decode_only_cuda_graphs: bool,
-        smallest_non_decode_cuda_graph_size: int,
+        strict: bool = False,
+        decode_only_cuda_graphs: bool = True,
+        smallest_non_decode_cuda_graph_size: int = 0,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         num_speculative_tokens: int = 0,
         ep_zmq_communicator=None,
@@ -529,9 +529,9 @@ class CUDAGraphBatchDimensionBuilder:
     def match_graph_config(
         real_batch_dim: InferenceBatchDimensions,
         cuda_graph_batch_dimensions_list: List[InferenceBatchDimensions],
-        smallest_non_decode_cuda_graph_size: int,
+        smallest_non_decode_cuda_graph_size: int = 0,
         strict: bool = False,
-        decode_only_cuda_graphs: bool = False,
+        decode_only_cuda_graphs: bool = True,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         num_speculative_tokens: int = 0,
         ep_zmq_communicator=None,
