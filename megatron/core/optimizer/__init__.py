@@ -10,6 +10,28 @@ import torch
 from torch.optim import SGD as CPUSGD
 from torch.optim import AdamW as CPUAdam
 
+from megatron.core import parallel_state
+from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+from megatron.core.optimizer_param_scheduler import (ParamGroupOverride,
+                                                     combine_param_group_overrides,
+                                                     param_group_override_to_tuple)
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
+
+from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
+from ..transformer.module import MegatronModule
+from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
+from .distrib_optimizer import DistributedOptimizer
+from .emerging_optimizers import (_EMERGING_OPTIMIZERS, HAVE_EMERGING_OPTIMIZERS,
+                                  _create_emerging_optimizer)
+from .grad_scaler import ConstantGradScaler, DynamicGradScaler
+from .layer_wise_optimizer import LayerWiseDistributedOptimizer
+from .optimizer import (ChainedOptimizer, Float16OptimizerWithFloat16Params, FP32Optimizer,
+                        MegatronOptimizer, param_group_identifier_keys)
+# Subclass aliases kept for backward compatibility; all are OptimizerConfig.
+from .optimizer_config import (AdamOptimizerConfig, OptimizerConfig, ParamKey, ParamPredicate,
+                               ParamWithNamePredicate, SGDOptimizerConfig)
+
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
     from transformer_engine.pytorch.optimizers import FusedSGD as SGD
@@ -47,44 +69,8 @@ HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
 
-from megatron.core import parallel_state
-from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
-from megatron.core.optimizer_param_scheduler import (
-    ParamGroupOverride,
-    combine_param_group_overrides,
-    param_group_override_to_tuple,
-)
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
-from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
-from ..transformer.module import MegatronModule
-from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
-from .distrib_optimizer import DistributedOptimizer
-from .emerging_optimizers import (
-    _EMERGING_OPTIMIZERS,
-    HAVE_EMERGING_OPTIMIZERS,
-    _create_emerging_optimizer,
-)
-from .grad_scaler import ConstantGradScaler, DynamicGradScaler
-from .layer_wise_optimizer import LayerWiseDistributedOptimizer
-from .optimizer import (
-    ChainedOptimizer,
-    Float16OptimizerWithFloat16Params,
-    FP32Optimizer,
-    MegatronOptimizer,
-    param_group_identifier_keys,
-)
 
-# Subclass aliases kept for backward compatibility; all are OptimizerConfig.
-from .optimizer_config import (
-    AdamOptimizerConfig,
-    OptimizerConfig,
-    ParamKey,
-    ParamPredicate,
-    ParamWithNamePredicate,
-    SGDOptimizerConfig,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -492,8 +478,8 @@ def _get_megatron_optimizer_based_on_param_groups(
         raise ValueError(
             "skip_megatron_wrapping=True is incompatible with use_precision_aware_optimizer."
         )
-    if skip_megatron_wrapping and config.optimizer_cpu_offload:
-        raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
+    # NOTE: skip_megatron_wrapping + optimizer_cpu_offload is allowed for Muon,
+    # where LayerWiseDistributedOptimizer handles CPU offloading itself.
 
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
@@ -822,6 +808,12 @@ def _get_megatron_emerging_optimizer(
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
             fallback_config.use_distributed_optimizer = False
+            if use_layer_wise:
+                # Disable per-optimizer CPU offload (HybridDeviceOptimizer) for the
+                # Adam fallback when LayerWiseDistributedOptimizer is active.
+                # CPU offloading is handled uniformly by LayerWiseDistributedOptimizer
+                # for all sub-optimizers (Muon + Adam), preventing double-offloading.
+                fallback_config.optimizer_cpu_offload = False
             result = _get_megatron_optimizer_based_on_param_groups(
                 config=fallback_config,
                 model_chunks=model_chunks,
