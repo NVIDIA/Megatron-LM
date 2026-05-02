@@ -1071,8 +1071,58 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         return hidden_states
 
-    def _checkpointed_forward(self, forward_func, *args, **kwargs):
-        def checkpoint_handler():
+    def _checkpointed_forward(
+        self,
+        hidden_states: Tensor,
+        decoder_input: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+    ):
+        """Forward through ``_proj_and_transformer_layer`` with activation
+        recomputation.
+
+        Mirrors ``transformer_block._checkpointed_forward``: non-tensor
+        objects (``attention_bias``, ``inference_params``,
+        ``packed_seq_params``) are captured by closure, while only tensor
+        / ``None`` arguments flow through ``tensor_parallel.checkpoint``
+        (whose ``save_for_backward`` only accepts tensors and ``None``).
+        """
+
+        def custom_forward(
+            hidden_states,
+            decoder_input,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+        ):
+            return self._proj_and_transformer_layer(
+                hidden_states=hidden_states,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                inference_params=inference_params,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+
+        def checkpoint_handler(forward_func):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             if self.config.fp8:
                 from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -1082,12 +1132,29 @@ class MultiTokenPredictionLayer(MegatronModule):
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
-                    *args,
-                    **kwargs,
+                    hidden_states,
+                    decoder_input,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    sequence_len_offset,
                 )
             else:
                 return tensor_parallel.checkpoint(
-                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                    decoder_input,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    sequence_len_offset,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -1097,13 +1164,26 @@ class MultiTokenPredictionLayer(MegatronModule):
             assert (
                 self.config.recompute_num_layers == 1
             ), "recompute_num_layers must be 1 for MTP recompute"
-            outputs = checkpoint_handler()
+            outputs = checkpoint_handler(custom_forward)
         elif self.config.recompute_method == 'block':
             # TODO: implement block-based recompute for MTP
             warnings.warn(
                 "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute."
             )
-            outputs = forward_func(*args, **kwargs)
+            outputs = self._proj_and_transformer_layer(
+                hidden_states=hidden_states,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                inference_params=inference_params,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -1162,7 +1242,6 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         if self.config.recompute_granularity == 'full' and self.training:
             hidden_states = self._checkpointed_forward(
-                self._proj_and_transformer_layer,
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
