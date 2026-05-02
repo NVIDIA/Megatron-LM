@@ -25,7 +25,11 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import (
+    get_attention_mask,
+    set_decode_expert_padding,
+    set_moe_metadata_sync,
+)
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -613,6 +617,7 @@ class TextGenerationController:
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
+        set_moe_metadata_sync(unwrapped_model)
 
         # Derive the MTP padded batch size from the existing padded graph dimensions.
         # For MoE models this is post EP sync. In eager mode MTP uses locally SP-aligned
@@ -1058,7 +1063,7 @@ class TextGenerationController:
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
-        required_logit_indices = context.speculative_required_logit_indices(logits.device)
+        required_logit_indices = context.speculative_required_logit_indices()
 
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.
@@ -1583,38 +1588,16 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
+    @torch.inference_mode()
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
         on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
-        # if no cuda graphs, directly use dummy forward
-        if not context.cuda_graph_batch_dimensions_list:
-            self.inference_wrapped_model.dummy_forward()
-
-            # Disable MoE padding for MTP computation.
-            # No CUDA graphs in this path (cuda_graph_batch_dimensions_list is empty).
-            if self.model_config.moe_pad_experts_for_cuda_graph_inference:
-                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-                set_decode_expert_padding(unwrapped_model, False)
-
-            self._dummy_serial_mtp_forward()
-
-            return
 
         # attempt to use cuda-graph if possible
         input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
-
-        # _dynamic_step_context_init tries to find a cuda-graph that is compatible
-        # with all EP ranks. It can also return no match, in which case
-        # we run in eager mode.
-
-        if context.using_cuda_graph_this_step():
-            # we found a cuda-graph to run
-            self._dynamic_step_forward_logits(input_ids, position_ids)
-        else:
-            # fallback to eager dummy forward
-            self.inference_wrapped_model.dummy_forward()
+        self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
