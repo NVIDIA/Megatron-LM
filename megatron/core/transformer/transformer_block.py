@@ -2,7 +2,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Set, Union, Tuple, cast
+from typing import Any, Callable, List, Optional, Set, Tuple, Union, cast
 
 import torch
 from torch import Tensor
@@ -362,12 +362,7 @@ def checkpointed_foward(
 
     def custom(start: int, end: int):
         def custom_forward(
-            hidden_states,
-            attention_mask,
-            context,
-            context_mask,
-            rotary_pos_emb,
-            padding_mask=None,
+            hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask=None
         ):
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
@@ -408,12 +403,7 @@ def checkpointed_foward(
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
-                        for k in (
-                            "context",
-                            "context_mask",
-                            "attention_bias",
-                            "padding_mask",
-                        ):
+                        for k in ("context", "context_mask", "attention_bias", "padding_mask"):
                             layer_kwargs.pop(k, None)
                         hidden_states = layer(**layer_kwargs)
                         context = None
@@ -428,14 +418,7 @@ def checkpointed_foward(
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
         cf = custom(start, end)
-        args = (
-            hidden_states,
-            attention_mask,
-            context,
-            context_mask,
-            rotary_pos_emb,
-            padding_mask,
-        )
+        args = (hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask)
         if use_checkpoint:
             hidden_states, context = checkpoint_with_recipe(
                 cf, self.config, self.pg_collection, *args
