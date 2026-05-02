@@ -1,6 +1,10 @@
-## How to use ?
+# Optimizer CPU Offloading
 
-Add these flags to enable optimizer cpu offload in MCore.
+MCore provides two mutually exclusive options for reducing optimizer GPU memory usage by leveraging CPU memory. They cannot be combined.
+
+## Option 1: `--optimizer-cpu-offload`
+
+Runs the entire optimizer step on CPU. Gradients are copied to CPU, the optimizer updates parameters there, and the updated parameters are copied back to GPU.
 
 ```bash
 --optimizer-cpu-offload
@@ -8,6 +12,13 @@ Add these flags to enable optimizer cpu offload in MCore.
 --use-precision-aware-optimizer
 ```
 
-## Configuration Recommendations
+Gradient copy, CPU optimizer step, and parameter copy can be time-consuming. Use `--overlap-cpu-optimizer-d2h-h2d` to overlap these transfers with computation.
 
-Gradient copy from GPU to CPU, CPU optimizer step, and subsequent parameter copy from CPU to GPU can be time-consuming operations, and it is recommended to use the flag `--overlap-cpu-optimizer-d2h-h2d` to execute them concurrently.
+## Option 2: `--offload-optimizer-states`
+
+A lighter-weight alternative that keeps the optimizer step on GPU but moves optimizer states to CPU between steps to save GPU memory. Requires the distributed optimizer and Adam (TE FusedAdam).
+
+```bash
+--use-distributed-optimizer
+--offload-optimizer-states
+```
