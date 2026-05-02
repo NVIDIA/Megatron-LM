@@ -361,7 +361,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         mamba_inference_state_config=mamba_inference_state_config,
         pg_collection=pg_collection,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
-        materialize_only_last_token_logits=(not args.return_log_probs),
+        materialize_only_last_token_logits=not (args.return_log_probs and not args.skip_prompt_log_probs),
         track_generated_token_events=args.inference_dynamic_batching_track_generated_token_events,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
