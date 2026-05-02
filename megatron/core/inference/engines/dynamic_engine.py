@@ -215,6 +215,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 model_config.mtp_use_repeated_layer
                 or self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
+        self.enable_async_scheduling = inference_config.enable_async_scheduling
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -307,6 +308,102 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Coordinator state.
         self.use_coordinator = False
+
+        # Async-scheduling pipeline state. When `_async_scheduling_active()` is
+        # True, `_async_step()` keeps a one-iteration-deep pipeline: this
+        # iteration's bookkeeping runs in parallel with the next iteration's
+        # forward+sample GPU work. The pending state holds the prior step's
+        # launched output until its bookkeeping runs.
+        self._async_pending_step_state: Optional[Dict] = None
+        self._async_pending_context_state: Optional[Dict] = None
+        self._async_pending_step_time: float = 0.0
+        # Tracks the is_decode_only flag of the launched (but not yet
+        # bookkeeped) step. Surfaced as `self.is_decode_only` when its
+        # result is returned, so callers that read `engine.is_decode_only`
+        # to bucket the step_time (e.g., the example dynamic_inference
+        # script's prefill/decode buckets) see the value matching the
+        # result, not the next launch.
+        self._async_pending_is_decode_only: Optional[bool] = None
+
+        # Side CUDA stream + event + pinned host buffer for the sample D2H.
+        # When async-scheduling is active, the D2H of sample[N] runs on
+        # `_sample_d2h_stream` after the sample kernel finishes on the
+        # default stream. CPU returns to the caller without waiting; the
+        # next iter calls `_sample_d2h_event.synchronize()` only when it
+        # actually needs to read the values, which by then are typically
+        # already in `_sample_d2h_pinned` because the GPU was busy running
+        # forward[N+1] kernels in the meantime. Same pattern vLLM v1 uses
+        # in `AsyncGPUModelRunnerOutput`.
+        self._sample_d2h_stream: Optional[torch.cuda.Stream] = None
+        self._sample_d2h_event: Optional[torch.cuda.Event] = None
+        self._sample_d2h_pinned: Optional[torch.Tensor] = None
+
+    def _async_scheduling_active(self) -> bool:
+        """Predicate: should this step use the async-scheduling overlap path?
+
+        Async scheduling overlaps GPU forward[N] kernels with CPU bookkeep[N-1]
+        work via a side CUDA stream for the sample D2H. Eligibility:
+        - User opted in via `enable_async_scheduling` config.
+        - Step is decode-only (initial scope; prefill admits new requests
+          which the deferred-bookkeeping path doesn't handle).
+        - num_speculative_tokens == 0 (initial scope; the intra-step
+          verify/rewind path interferes with the overlap design).
+        Hybrid (Mamba) is rejected at config-time, so no runtime check.
+        """
+        return (
+            self.enable_async_scheduling
+            and self.context.is_decode_only()
+            and self.num_speculative_tokens == 0
+        )
+
+    def _ensure_async_overlap_resources(self) -> None:
+        """Lazy-init the side stream, event, and pinned host buffer used by
+        the async-scheduling overlap path. Idempotent."""
+        if self._sample_d2h_stream is None:
+            self._sample_d2h_stream = torch.cuda.Stream()
+            self._sample_d2h_event = torch.cuda.Event()
+            self._sample_d2h_pinned = torch.empty(
+                self.context.max_requests, dtype=torch.int64, device='cpu', pin_memory=True
+            )
+
+    def _build_async_pre_step_context_state(self, will_log_this_step: bool) -> Dict:
+        """Snapshot fields `async_bookkeep` reads from `pre_step_context_state`."""
+        if will_log_this_step:
+            return {
+                "is_decode_only": self.context.is_decode_only(),
+                "max_requests": self.context.max_requests,
+                "total_request_count": self.context.total_request_count,
+                "paused_request_count": self.context.paused_request_count,
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
+        return {
+            "active_token_count": self.context.active_token_count,
+            "step_count": self.context.step_count,
+        }
+
+    def _build_async_context_state(
+        self, pre_step_context_state: Dict, will_log_this_step: bool
+    ) -> Dict:
+        """Combine pre-step fields with post-step engine fields."""
+        if will_log_this_step:
+            kvcache_util_stats = (
+                self.context.get_kvcache_utilization_stats()
+                if self.metrics_writer is not None
+                else None
+            )
+            post = {
+                "waiting_request_count": len(self.waiting_request_ids),
+                "finished_request_count": self.finished_request_count,
+                "evicted_request_count": self.evicted_request_count,
+                "kv_stats": kvcache_util_stats,
+                "total_active_block_count": self.context.kv_block_allocator.active_count,
+                "total_paused_block_count": self.context.kv_block_allocator.paused_count,
+                "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+                "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+            }
+            return {**pre_step_context_state, **post}
+        return {**pre_step_context_state, "kv_stats": None}
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -639,6 +736,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
+            # Give the context a CPU-side MAX-reduction primitive so
+            # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
+            if hasattr(self.context, "set_ep_zmq_communicator"):
+                self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
@@ -1189,10 +1290,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.ttft = (
                             first_token_event.timestamp - request.event_add_engine.timestamp
                         )
-                    if request.tpot is None:
-                        request.tpot = []
-                    per_token_step_time = step_time / len(tokens)
-                    request.tpot.extend([per_token_step_time] * len(tokens))
+                    # TPOT is observability-only. step_time is 0.0 on
+                    # non-logging steps (async_forward skips the event sync),
+                    # so gate the update to keep the metric a truthful sparse
+                    # sample instead of polluting it with zeros.
+                    if step_time > 0:
+                        if request.tpot is None:
+                            request.tpot = []
+                        per_token_step_time = step_time / len(tokens)
+                        request.tpot.extend([per_token_step_time] * len(tokens))
 
                 # Check for stop words (after token is appended).
                 # With speculative decoding, a stop word may end before the last
@@ -1671,56 +1777,74 @@ class DynamicInferenceEngine(AbstractEngine):
         # schedule requests
         self.schedule_waiting_requests()
 
-        # Saving pre-step state, for printing output below.
+        # The print block (async_bookkeep) and metrics block both fire on this
+        # condition after step_count is incremented. Predict it up-front so we
+        # can skip the GPU-timing sync and the context_state dict builds that
+        # only exist to feed those logging/metrics blocks.
+        will_log_this_step = (
+            self.logging_step_interval > 0
+            and (self.context.step_count + 1) % self.logging_step_interval == 0
+        )
+
         is_decode_only = self.context.is_decode_only()
-        pre_step_context_state = {
-            "is_decode_only": is_decode_only,
-            "max_requests": self.context.max_requests,
-            "total_request_count": self.context.total_request_count,
-            "paused_request_count": self.context.paused_request_count,
-            "active_token_count": self.context.active_token_count,
-            "step_count": self.context.step_count,
-        }
+        if will_log_this_step:
+            pre_step_context_state = {
+                "is_decode_only": is_decode_only,
+                "max_requests": self.context.max_requests,
+                "total_request_count": self.context.total_request_count,
+                "paused_request_count": self.context.paused_request_count,
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
+        else:
+            # active_token_count and step_count are still consumed by
+            # post_process_requests' pre_fwd_* args (for add_event_generated_token);
+            # the other four fields are only read in the gated print block.
+            pre_step_context_state = {
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
 
         # Generate tokens.
         nvtx_range_push("Prefill" if not is_decode_only else "Decode")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
-        self.step_start_event.record()
+        if will_log_this_step:
+            self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
-        self.step_end_event.record()
-        self.step_end_event.synchronize()
-        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        if will_log_this_step:
+            self.step_end_event.record()
+            self.step_end_event.synchronize()
+            step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        else:
+            step_time = 0.0
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
-        if (
-            self.logging_step_interval > 0
-            and self.context.step_count > 0
-            and self.context.step_count % self.logging_step_interval == 0
-            and self.metrics_writer is not None
-        ):
-            kvcache_util_stats = self.context.get_kvcache_utilization_stats()
+        if will_log_this_step:
+            kvcache_util_stats = (
+                self.context.get_kvcache_utilization_stats()
+                if self.metrics_writer is not None
+                else None
+            )
+            post_step_context_state = {
+                "waiting_request_count": len(self.waiting_request_ids),
+                "finished_request_count": self.finished_request_count,
+                "evicted_request_count": self.evicted_request_count,
+                "kv_stats": kvcache_util_stats,
+                "total_active_block_count": self.context.kv_block_allocator.active_count,
+                "total_paused_block_count": self.context.kv_block_allocator.paused_count,
+                "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+                "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+            }
+            context_state = {**pre_step_context_state, **post_step_context_state}
         else:
-            kvcache_util_stats = None
-
-        post_step_context_state = {
-            "waiting_request_count": len(self.waiting_request_ids),
-            "finished_request_count": self.finished_request_count,
-            "evicted_request_count": self.evicted_request_count,
-            "kv_stats": kvcache_util_stats,
-            "padded_active_token_count": self.context.padded_active_token_count,
-            "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
-            "total_active_block_count": self.context.kv_block_allocator.active_count,
-            "total_paused_block_count": self.context.kv_block_allocator.paused_count,
-            "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
-            "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
-        }
-
-        context_state = {**pre_step_context_state, **post_step_context_state}
+            # Keep kv_stats=None so the metrics-block gate at `async_bookkeep`
+            # (`if context_state["kv_stats"] is not None`) remains well-typed.
+            context_state = {**pre_step_context_state, "kv_stats": None}
 
         return result, context_state, step_time
 
@@ -1956,6 +2080,127 @@ class DynamicInferenceEngine(AbstractEngine):
             "cuda_graph_request_count": cuda_graph_request_count,
         }
 
+    async def _async_step(self) -> Optional[Tuple[Optional[Dict], Dict, float]]:
+        """Pipelined async-scheduling step. One-iter pipeline delay:
+        `engine.step()` returns the bookkeep result for the *prior* iter's
+        launch. The first call primes (returns a no-op result tuple).
+        Per iter:
+          1. Synchronize on prior iter's D2H event (cheap; the GPU was busy
+             with prior forward kernels in the meantime).
+          2. Bookkeep prior iter's sample synchronously (no queue, no defer).
+          3. Schedule waiting requests.
+          4. Launch forward[k] (returns immediately; kernels queued).
+          5. Initiate D2H of sample[k] on the side stream and record event.
+          6. Save state for next iter.
+
+        Steps 1+2 of the *next* call run while the GPU is still executing
+        forward[k] kernels — that's where the overlap comes from.
+
+        Returns None when the engine has nothing in the pipeline and no
+        active work to launch.
+        """
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
+            raise EngineSuspendedError(self.context.step_count)
+
+        self._ensure_async_overlap_resources()
+
+        # 1+2. Bookkeep prior iter's sample inline.
+        prior_result: Optional[Dict]
+        prior_context_state: Optional[Dict]
+        prior_step_time: float
+        prior_is_decode_only: Optional[bool]
+        if self._async_pending_step_state is not None:
+            prior_active_count = self._async_pending_step_state["active_request_count"]
+            self._sample_d2h_event.synchronize()
+            prior_sample_cpu = self._sample_d2h_pinned[:prior_active_count].clone()
+            prior_result = self.controller._bookkeep_decode_step(
+                self._async_pending_step_state, prefetched_sample_cpu=prior_sample_cpu
+            )
+            prior_context_state = self._async_pending_context_state
+            prior_step_time = self._async_pending_step_time
+            prior_is_decode_only = self._async_pending_is_decode_only
+        else:
+            prior_result = None
+            prior_context_state = None
+            prior_step_time = 0.0
+            prior_is_decode_only = None
+
+        # 3. Schedule waiting requests.
+        self.schedule_waiting_requests()
+
+        # 4. Launch forward[k] (returns immediately).
+        will_log_this_step = (
+            self.logging_step_interval > 0
+            and (self.context.step_count + 1) % self.logging_step_interval == 0
+        )
+        is_decode_only = self.context.is_decode_only()
+        pre_step_context_state = self._build_async_pre_step_context_state(will_log_this_step)
+        nvtx_range_push("Prefill" if not is_decode_only else "Decode")
+        if will_log_this_step:
+            self.step_start_event.record()
+        cur_step_state = self.controller._launch_decode_step()
+        if will_log_this_step:
+            self.step_end_event.record()
+            self.step_end_event.synchronize()
+            cur_step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        else:
+            cur_step_time = 0.0
+        if cur_step_state is not None:
+            self.context.step_count += 1
+            self.context.prefix_cache_lru_clock += 1
+
+        # 5. Initiate D2H of sample[k] on the side stream.
+        if cur_step_state is not None:
+            cur_active_count = cur_step_state["active_request_count"]
+            with torch.cuda.stream(self._sample_d2h_stream):
+                # Make the side stream wait for the sample kernel on the
+                # default stream before issuing the D2H.
+                self._sample_d2h_stream.wait_stream(torch.cuda.current_stream())
+                self._sample_d2h_pinned[:cur_active_count].copy_(
+                    self.controller._sampled_tokens_cuda[:cur_active_count], non_blocking=True
+                )
+                self._sample_d2h_event.record(self._sample_d2h_stream)
+
+        cur_context_state = self._build_async_context_state(
+            pre_step_context_state, will_log_this_step
+        )
+
+        # 6. Save state for next iter (or clear on drain).
+        if cur_step_state is not None:
+            self._async_pending_step_state = cur_step_state
+            self._async_pending_context_state = cur_context_state
+            self._async_pending_step_time = cur_step_time
+            self._async_pending_is_decode_only = is_decode_only
+        else:
+            self._async_pending_step_state = None
+            self._async_pending_context_state = None
+            self._async_pending_step_time = 0.0
+            self._async_pending_is_decode_only = None
+
+        nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
+
+        # Surface the returned result's is_decode_only to callers so that
+        # `engine.is_decode_only` matches `last_step_data` after the call.
+        # Use prior's flag when we have a prior result; on the first-iter
+        # prime (no prior, but we launched), use the current flag since the
+        # caller sees the no-op tuple paired with cur's context_state.
+        if prior_is_decode_only is not None:
+            self.is_decode_only = prior_is_decode_only
+        else:
+            self.is_decode_only = is_decode_only
+
+        # Engine has nothing to do — neither a prior bookkeep nor a current
+        # launch. Signal the caller to skip async_bookkeep work.
+        if prior_result is None and cur_step_state is None:
+            return None
+
+        # First-iter prime: no prior result yet, but we did launch. Return a
+        # no-op tuple so async_bookkeep has a context_state to consume.
+        if prior_context_state is None:
+            prior_context_state = cur_context_state
+
+        return prior_result, prior_context_state, prior_step_time
+
     async def async_step(
         self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
@@ -1964,13 +2209,32 @@ class DynamicInferenceEngine(AbstractEngine):
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
 
+        Dispatches to the pipelined `_async_step()` driver when async
+        scheduling is active or a prior launch is still pending — that way
+        the engine continues to drain the pipeline even if the predicate
+        flips off (e.g., a prefill becomes pending mid-decode).
+
         Returns:
             A tuple comprised of:
                 1. Requests that ran in the last step and are still active.
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
-        last_step_data = await self.async_forward()
+        if self._async_scheduling_active() or self._async_pending_step_state is not None:
+            last_step_data = await self._async_step()
+            if last_step_data is None:
+                # No pipeline state and no work to launch: fall back to a
+                # no-op bookkeep so the engine consumer sees the same
+                # "empty step" shape as the serial path.
+                return await self.async_bookkeep(
+                    None,
+                    self._build_async_context_state(
+                        self._build_async_pre_step_context_state(False), False
+                    ),
+                    0.0,
+                )
+        else:
+            last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
         # Keep for compatibility with current test suite.
         return ret

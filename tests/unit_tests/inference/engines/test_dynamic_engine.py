@@ -145,6 +145,7 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
+    enable_async_scheduling: bool = False
 
     def __post_init__(self):
 
@@ -273,6 +274,7 @@ class DynamicInferenceEngineTestBase:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
+                enable_async_scheduling=test_config.enable_async_scheduling,
             ),
         )
 
@@ -663,6 +665,47 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"request {request.request_id}, "
                 f"result ({request.generated_tokens}) != "
                 f"expected ({expected_generated_tokens})."
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 4])
+    def test_async_scheduling_decode_only_parity(self, num_cuda_graphs) -> None:
+        """Async-scheduling overlap path produces the same tokens as sync.
+
+        Decode-only, GPT-only, non-speculative — the supported configuration.
+        We compare against the same expected_generated_tokens table as
+        test_simple's gpt path, since async scheduling must not change the
+        generated tokens.
+        """
+        num_tokens_to_generate = 16
+        env = self._run_test(
+            num_tokens_to_generate=num_tokens_to_generate,
+            model_provider="gpt",
+            num_cuda_graphs=num_cuda_graphs,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=128,
+            enable_async_scheduling=True,
+        )
+
+        expected_generated_tokens_list = [
+            [69, 85, 55, 74, 56, 89, 64, 59, 55, 67, 15, 58, 6, 37, 54, 47],
+            [29, 54, 33, 72, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 98, 76],
+            [35, 78, 54, 16, 79, 98, 22, 5, 60, 0, 1, 76, 77, 11, 25, 7],
+            [25, 75, 57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0, 64, 45],
+            [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 89, 20, 49, 28, 38, 81],
+            [33, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
+            [82, 78, 78, 65, 26, 5, 69, 36, 37, 99],
+            [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 80, 20, 43],
+        ]
+        assert len(env.requests) == len(expected_generated_tokens_list)
+        for request, expected in zip(env.requests, expected_generated_tokens_list):
+            assert request.generated_tokens == expected, (
+                f"request {request.request_id}, async result {request.generated_tokens} "
+                f"!= expected {expected}"
             )
 
     @pytest.mark.skipif(
