@@ -492,6 +492,7 @@ class LLaVAModel(MegatronModule):
         num_image_tiles,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        is_packed_dynamic_res: bool = False,
         sound_embeddings: Optional[torch.Tensor] = None,
         sound_embeddings_len: Optional[torch.Tensor] = None,
         sound_timestamps: Optional[torch.Tensor] = None,
@@ -546,7 +547,9 @@ class LLaVAModel(MegatronModule):
         if use_inference_kv_cache:
             return language_embeddings, loss_mask, labels
 
-        img_seq_len = self.img_seq_len
+        # Packed dynamic-res path: each image's token count is in num_image_tiles (one entry
+        # per image) and there is exactly 1 embedding per "tile", so img_seq_len collapses to 1.
+        img_seq_len = 1 if is_packed_dynamic_res else self.img_seq_len
         batch_size, text_seq_len = input_ids.shape
 
         has_labels = labels is not None
@@ -980,6 +983,7 @@ class LLaVAModel(MegatronModule):
             or "sound_tokens_count" in inference_context.key_value_memory_dict
         )
         has_images = images is not None and images.shape[0] > 0
+        is_packed_dynamic_res = False
 
         # If running inference, we can skip image token computation
         # if they were computed already earlier for this sample.
@@ -994,6 +998,7 @@ class LLaVAModel(MegatronModule):
             use_temporal = (
                 self.temporal_patch_dim > 1 and imgs_sizes is not None and num_frames is not None
             )
+            is_packed_dynamic_res = False
             if use_temporal:
                 # CP-aware vision split: each rank processes only its share of
                 # frames/tubelets. Embeddings are gathered back to global shape
@@ -1066,20 +1071,85 @@ class LLaVAModel(MegatronModule):
                     image_embeddings.shape[0], dtype=torch.int, device=image_embeddings.device
                 )
             else:
-                if getattr(self, "dynamic_resolution", False) or imgs_sizes is not None:
+                # Packed dynamic-resolution image path: imgs_sizes carries per-image
+                # (H, W) so RADIO returns a packed [1, sum(patches_i+ct_len), h_vision].
+                # We must split per-image, strip class tokens, pixel-shuffle each chunk
+                # with its own (ps_h, ps_w), then reassemble.
+                is_packed_dynamic_res = (
+                    imgs_sizes is not None
+                    and vision_packed_seq_params is not None
+                    and imgs_sizes.shape[0] > 0
+                )
+                if is_packed_dynamic_res:
                     image_embeddings = self.vision_model(
-                        images, imgs_sizes=imgs_sizes, packed_seq_params=vision_packed_seq_params
+                        images,
+                        imgs_sizes=imgs_sizes,
+                        packed_seq_params=vision_packed_seq_params,
+                    )  # [1, sum(patches_i + ct_len), h_vision]
+                    P = int(self.vision_model.patch_dim)
+                    sizes = (
+                        [tuple(sz) for sz in imgs_sizes.tolist()]
+                        if torch.is_tensor(imgs_sizes)
+                        else list(imgs_sizes)
+                    )
+                    patch_counts = [(int(h) // P) * (int(w) // P) for h, w in sizes]
+                    ct_len = (
+                        self.vision_model.class_token_len
+                        if getattr(self.vision_model, "add_class_token", False)
+                        else 0
+                    )
+                    seq_lens = [p + ct_len for p in patch_counts]
+                    chunks = torch.split(image_embeddings.squeeze(0), seq_lens, dim=0)
+                    if self._drop_vision_class_token and ct_len > 0:
+                        chunks = [c[ct_len:] for c in chunks]
+
+                    if self._pixel_shuffle:
+                        shuffled_chunks = []
+                        for chunk, (h, w) in zip(chunks, sizes):
+                            ps_h, ps_w = int(h) // P, int(w) // P
+                            chunk_b = chunk.unsqueeze(0)  # [1, patches_i, h_vision]
+                            shuffled = pixel_shuffle(chunk_b, h=ps_h, w=ps_w)
+                            shuffled_chunks.append(shuffled.squeeze(0))
+                        cat = torch.cat(shuffled_chunks, dim=0)
+                    else:
+                        cat = torch.cat(list(chunks), dim=0)
+                    image_embeddings = cat.unsqueeze(0).contiguous()
+                    _tile_counts = [p // 4 if self._pixel_shuffle else p for p in patch_counts]
+                    num_image_tiles = torch.tensor(
+                        _tile_counts, dtype=torch.int, device=image_embeddings.device
                     )
                 else:
-                    image_embeddings = self.vision_model(
-                        images
-                    )  # [num_tiles, img_seq_len, h_vision]
-                if self._drop_vision_class_token:
-                    image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
+                    if getattr(self, "dynamic_resolution", False) or imgs_sizes is not None:
+                        image_embeddings = self.vision_model(
+                            images,
+                            imgs_sizes=imgs_sizes,
+                            packed_seq_params=vision_packed_seq_params,
+                        )
+                    else:
+                        image_embeddings = self.vision_model(
+                            images
+                        )  # [num_tiles, img_seq_len, h_vision]
+                    if self._drop_vision_class_token:
+                        image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
 
-            if self._pixel_shuffle:
+            # Packed dynamic-res path already pixel-shuffled per-image above; skip outer call.
+            # For the single-image (non-packed) case pass h/w from imgs_sizes if available.
+            skip_outer_pixel_shuffle = (not use_temporal) and is_packed_dynamic_res
+            if self._pixel_shuffle and not skip_outer_pixel_shuffle:
+                ps_h = ps_w = None
+                if (
+                    imgs_sizes is not None
+                    and image_embeddings.shape[0] == 1
+                    and imgs_sizes.shape[0] == 1
+                ):
+                    H = int(imgs_sizes[0, 0].item())
+                    W = int(imgs_sizes[0, 1].item())
+                    P = int(self.vision_model.patch_dim)
+                    ps_h, ps_w = H // P, W // P
+                    if ps_h * ps_w != image_embeddings.shape[1]:
+                        ps_h = ps_w = None
                 image_embeddings = pixel_shuffle(
-                    image_embeddings
+                    image_embeddings, h=ps_h, w=ps_w
                 )  # [num_tiles, img_seq_len_shuffled, h_vision_shuffled]
 
             # contiguous() required as `permute` can sparsify the tensor and this breaks pipelining
@@ -1178,6 +1248,7 @@ class LLaVAModel(MegatronModule):
             inference_context,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
+            is_packed_dynamic_res=is_packed_dynamic_res,
             sound_embeddings=sound_embeddings,
             sound_embeddings_len=sound_embeddings_len,
             sound_timestamps=sound_timestamps,
