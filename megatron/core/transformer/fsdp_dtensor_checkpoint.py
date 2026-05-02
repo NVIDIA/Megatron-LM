@@ -390,8 +390,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
     if optimizer_state_dict is not None:
         optimizer_state_dict = optimizer_state_dict.copy()
-        # ChainedOptimizer state dicts use integer keys; single optimizer dicts have "state"
-        # directly.
+        # Megatron Optimizer vs. Megatron ChainedOptimizer
         if "state" in optimizer_state_dict:
             _split_swiglu_in_single_opt_state(optimizer_state_dict)
         else:
@@ -574,8 +573,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     # ---- Optimizer state dict --------------------------------------------
     if optimizer_state_dict is not None:
         optimizer_state_dict = optimizer_state_dict.copy()
-        # ChainedOptimizer state dicts use integer keys; single optimizer dicts have "state"
-        # directly.
+        # Megatron Optimizer vs. Megatron ChainedOptimizer
         if "state" in optimizer_state_dict:
             _split_gdn_in_single_opt_state(optimizer_state_dict)
         else:
