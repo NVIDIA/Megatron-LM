@@ -802,12 +802,15 @@ class _CudaGraphRunner(torch.nn.Module):
         # Save buffers, grads, and other variables that may be affected by graph warmup.
         # For example, megatron/core/transformer/moe/router.py's expert_bias is a persistent
         # buffer updated each forward pass by '_apply_expert_bias()'. So we need to ensure
-        # graph capture's forward passes do not corrupt its value.
-        buffer_backup = []
-        for buf in self.base_module.buffers():
-            buffer_backup.append(buf.clone())
+        # graph capture's forward passes do not corrupt its value. Inference is not affected
+        # (no known buffer mutators) and would add new buffers (lazy MoE _fc1_weight/
+        # _fc2_weight) that misalign the positional restore.
 
         if self.training and torch.is_grad_enabled():
+            buffer_backup = []
+            for buf in self.base_module.buffers():
+                buffer_backup.append(buf.clone())
+
             grad_backup = []
             for param in self.base_module.parameters():
                 grad_backup.append(param.main_grad.clone() if hasattr(param, "main_grad") else None)
@@ -1014,9 +1017,9 @@ class _CudaGraphRunner(torch.nn.Module):
                 if main_grad_copy is not None:
                     param.main_grad.copy_(main_grad_copy)
 
-        # restore cached buffers
-        for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
-            buf.copy_(buf_copy)
+            # restore cached buffers
+            for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
+                buf.copy_(buf_copy)
 
         if is_moe:
             for name in tracker:
@@ -1622,13 +1625,17 @@ class CudaGraphManager(torch.nn.Module):
                     # Reuse graph input-output buffers for inference
                     local_args, local_kwargs = args, kwargs
                     if not runner.is_first_layer:
-                        # Find previous layer's runner in the global record
+                        # Find previous layer's runner in the global record.
+                        # Method-wrapped managers (e.g. the MTP wrapper around
+                        # `compute_mtp_single_step`) have a base_module without
+                        # `layer_number`; `getattr(..., None)` makes those rows
+                        # harmlessly skipped by the predicate.
                         try:
                             previous_runner = next(
                                 r
                                 for r in _CudagraphGlobalRecord.cudagraph_inference_record
                                 if (
-                                    r[0].base_module.layer_number
+                                    getattr(r[0].base_module, 'layer_number', None)
                                     == runner.base_module.layer_number - 1
                                     and r[0].fwd_graph is not None
                                     and ArgMetadata(r[3]['hidden_states'])

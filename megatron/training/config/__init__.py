@@ -19,3 +19,4 @@ from megatron.training.config.resilience_config import (
 )
 
 from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.config.instantiate_utils import TargetAllowlist, target_allowlist

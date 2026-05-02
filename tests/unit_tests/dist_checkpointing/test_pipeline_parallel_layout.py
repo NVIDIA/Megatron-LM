@@ -153,6 +153,7 @@ def create_args():
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
+    args.verify_integrity = False
 
     yield args
 
