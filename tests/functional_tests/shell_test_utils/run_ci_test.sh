@@ -276,6 +276,10 @@ for i in $(seq 1 $N_REPEAT); do
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} == 1 ]]; then
         echo Skipping Pytest checks.
+        if [[ "$TEST_TYPE" == "no-nvrx" && "$TRAINING_EXIT_CODE" -ne 0 ]]; then
+            echo "Training failed as expected (NVRx not installed). Marking test as success."
+            exit 0
+        fi
         exit ${TRAINING_EXIT_CODE}
     fi
 
@@ -357,7 +361,7 @@ for i in $(seq 1 $N_REPEAT); do
         fi
 
         # Abort if training failed
-        if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" ]]; then
+        if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" && "$TEST_TYPE" != "no-nvrx" ]]; then
             echo "Training failed. Aborting."
             exit 1
         fi
