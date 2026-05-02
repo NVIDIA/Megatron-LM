@@ -333,6 +333,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     self._local_muon_update(p, p.grad, group)
             return loss
 
+        # Track all parameters to update ordered by parameter group index.
         # (param, pre_ns_grad, is_gathered, lr, group_kwargs)
         all_updates: list = []
 
@@ -347,6 +348,11 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                 p_local = p.to_local()
                 needs_gather = param_idx in gather_param_indices
                 if p_local.numel() == 0 and not needs_gather:
+                    # If this parameter is not split by Megatron-FSDP,
+                    # and is empty on this DP rank, then we can skip this
+                    # update for all TP ranks, as tensor parallelism uses
+                    # even sharding, so empty implies that FSDP did not
+                    # assign any fraction of the parameter to this DP rank.
                     continue
 
                 state = self.state[p]
@@ -364,17 +370,26 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
 
                 all_updates.append((p, pre_ns_grad, needs_gather, lr, group_kwargs))
 
-        # Phase 2: AG all boundary params — all collectives here, no NS interleaved.
+        # Phase 2: AG all boundary gradients.
         for i, (p, pre_ns_grad, needs_gather, lr, group_kwargs) in enumerate(all_updates):
             if not needs_gather:
                 continue
+            # Un-shard the un-evenly sharded gradient.
             if gather_uneven_dtensor_to_full_tensor is None:
                 raise RuntimeError(
                     "Megatron-FSDP `gather_uneven_dtensor_to_full_tensor` is required "
                     "to gather un-evenly sharded parameters for Muon step()."
                 )
             pre_ns_grad_dtensor = self._dtensor_from_local_like(p, pre_ns_grad.contiguous())
+            # Compute the global shape and offset for re-sharding the gradient.
+            if not hasattr(pre_ns_grad_dtensor._local_tensor, "__create_chunk_list__"):
+                update_uneven_dtensor_chunk_metadata(pre_ns_grad_dtensor)
+            # Unsharded Gradient DTensor
             full_pre_ns_grad = gather_uneven_dtensor_to_full_tensor(pre_ns_grad_dtensor).to_local()
+            # Mirror the uneven sharding metadata to Megatron-FSDP DTensor parameters.
+            # By doing this, we can avoid unnecessary AG, as the parameters and gradients
+            # are globally and locally symmetrical in shape and offset.
+            self._copy_dtensor_chunk_metadata(p, pre_ns_grad_dtensor)
             all_updates[i] = (p, full_pre_ns_grad, True, lr, group_kwargs)
 
         # Phase 3: NS orthogonalization and weight update (fully local).
@@ -382,24 +397,24 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
 
         with utils.fp32_matmul_precision(self.fp32_matmul_prec):
             for p, pre_ns_grad, is_gathered, lr, group_kwargs in all_updates:
-                p_local = p.to_local()
                 if is_gathered:
                     orth_update = super(FSDPTensorParallelMuon, self).orthogonalize(
                         p, pre_ns_grad, **group_kwargs
                     )
                     sharded_update = self._reshard_full_update_like(p, orth_update)
-                    self.pre_weight_update_fn_inplace(p, sharded_update)
-                    p.add_(sharded_update, alpha=-lr)
-                    self.post_weight_update_fn_inplace(p)
+                    self.pre_weight_update_fn_inplace(p._local_tensor, sharded_update._local_tensor)
+                    p.add_(sharded_update, alpha=-lr)  # DTensors
+                    self.post_weight_update_fn_inplace(p._local_tensor)
                 else:
                     orth_update = (
                         super(FSDPTensorParallelMuon, self)
                         .orthogonalize(p, pre_ns_grad, **group_kwargs)
-                        .to(dtype=p_local.dtype)
+                        .to(dtype=p._local_tensor.dtype)
                     )
-                    self.pre_weight_update_fn_inplace(p_local, orth_update)
-                    p_local.add_(orth_update, alpha=-lr)
-                    self.post_weight_update_fn_inplace(p_local)
+                    # Apply a Tensor step.
+                    self.pre_weight_update_fn_inplace(p._local_tensor, orth_update)
+                    p._local_tensor.add_(orth_update, alpha=-lr)
+                    self.post_weight_update_fn_inplace(p._local_tensor)
 
         return loss
 
@@ -437,29 +452,32 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         if hasattr(src._local_tensor, "__create_write_items__"):
             dst._local_tensor.__create_write_items__ = src._local_tensor.__create_write_items__
 
-    def _dtensor_from_local_like(self, value, local_tensor: torch.Tensor):
+    def _dtensor_from_local_like(self, dtensor_ref, local_tensor: torch.Tensor):
         dtensor = _DTensor.from_local(
             local_tensor=local_tensor,
-            device_mesh=value.device_mesh,
-            placements=value.placements,
-            shape=value.shape,
-            stride=value.stride(),
+            device_mesh=dtensor_ref.device_mesh,
+            placements=dtensor_ref.placements,
+            shape=dtensor_ref.shape,
+            stride=dtensor_ref.stride(),
         )
-        self._copy_dtensor_chunk_metadata(dtensor, value)
+        self._copy_dtensor_chunk_metadata(dtensor, dtensor_ref)
         return dtensor
 
-    def _reshard_full_update_like(self, value, full_update: torch.Tensor):
-        if not hasattr(value._local_tensor, "__create_chunk_list__"):
-            if update_uneven_dtensor_chunk_metadata is None:
-                raise RuntimeError("DTensor support is required for Megatron-FSDP Muon.")
-            update_uneven_dtensor_chunk_metadata(value)
-        value_metadata = value._local_tensor.__create_chunk_list__()[0]
+    def _reshard_full_update_like(self, dtensor_ref, full_update: torch.Tensor):
+        if not hasattr(dtensor_ref._local_tensor, "__create_chunk_list__"):
+            raise ValueError(
+                f"{dtensor_ref} is not a Megatron-FSDP DTensor parameter "
+                "with DTensor._local_tensor.__create_chunk_list__. "
+                "Verify that `update_uneven_dtensor_chunk_metadata` "
+                "has been called on this uneven DTensor."
+            )
+        shard_metadata = dtensor_ref._local_tensor.__create_chunk_list__()[0]
         slices = tuple(
             slice(offset, offset + size)
-            for offset, size in zip(value_metadata.offsets, value_metadata.sizes)
+            for offset, size in zip(shard_metadata.offsets, shard_metadata.sizes)
         )
-        local_update = full_update[slices].contiguous().to(dtype=value.to_local().dtype)
-        return self._dtensor_from_local_like(value, local_update)
+        local_update = full_update[slices].contiguous().to(dtype=dtensor_ref._local_tensor.dtype)
+        return self._dtensor_from_local_like(dtensor_ref, local_update)
 
     @torch.no_grad()  # type: ignore[misc]
     def _local_muon_update(

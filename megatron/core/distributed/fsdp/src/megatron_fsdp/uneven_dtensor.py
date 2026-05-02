@@ -293,7 +293,8 @@ def uneven_dtensor_to_full_tensor(dtensor: DTensor) -> torch.Tensor:
     if not isinstance(dtensor, DTensor):
         raise TypeError(f"Input must be a DTensor, got {type(dtensor).__name__}.")
 
-    # Ensure chunk metadata is available for uneven shards
+    # Ensure chunk metadata is available for uneven shards. If the metadata exists,
+    # skip the all-gather collectives required to produce the metadata.
     if not hasattr(dtensor._local_tensor, "__create_chunk_list__"):
         update_uneven_dtensor_chunk_metadata(dtensor)
 

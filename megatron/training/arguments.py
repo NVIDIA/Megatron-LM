@@ -1461,11 +1461,11 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
 
         if args.use_distributed_optimizer:
-            # Megatron-FSDP already shards optimizer state itself (ZeRO-1/2/3
-            # via `--data-parallel-sharding-strategy`). Layering
-            # `LayerWiseDistributedOptimizer` on top would double-shard and,
-            # in practice, trips `TypeErrors` in its constructor call from
-            # `_build_megatron_fsdp_emerging_optimizer`.
+            # Megatron-FSDP is not compatible with LayerwiseDistributedOptimizer.
+            # Already un-evenly shards parameters, so composing per-parameter
+            # distribution with un-even distribution will assign parameters
+            # to inconsistent DP ranks, e.g. DP ranks with empty parameters
+            # can be incorrectly chosen by the layer-wise distribution.
             if not args.use_megatron_fsdp:
                 args.use_layer_wise_distributed_optimizer = True
                 args.use_distributed_optimizer = False
@@ -1475,8 +1475,8 @@ def validate_args(args, defaults={}):
             assert args.optimizer == "muon", (
                 "Emerging optimizer with Megatron-FSDP is currently only supported for Muon."
             )
-            # Megatron-FSDP itself requires `fsdp_dtensor` (asserted above), so
-            # the emerging-optimizer path must accept it here to avoid a
+            # Megatron-FSDP itself requires `fsdp_dtensor` (asserted above),
+            # so the emerging-optimizer path must accept it here to avoid a
             # contradictory assertion pair.
             assert args.ckpt_format == "fsdp_dtensor", (
                 "Emerging optimizer with Megatron-FSDP requires "
