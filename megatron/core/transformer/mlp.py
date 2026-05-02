@@ -25,7 +25,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import sh_ten_merge_fn
+from megatron.core.transformer.utils import cat_with_oom_fallback
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
@@ -427,7 +427,7 @@ def apply_swiglu_sharded_factory(
         original_sh_ten.key,
         original_sh_ten.data,
         sh_ten_build_fn,
-        sh_ten_merge_fn,
+        cat_with_oom_fallback,
         original_sh_ten.replica_id,
         flattened_range=original_sh_ten.flattened_range,
     )

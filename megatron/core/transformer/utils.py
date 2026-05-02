@@ -77,7 +77,7 @@ def erf_gelu(x):
 
 
 @torch.no_grad()
-def sh_ten_merge_fn(sub_state_dict):
+def cat_with_oom_fallback(sub_state_dict):
     """Merge sharded tensor pieces, falling back to CPU if device-side cat OOMs."""
     try:
         return torch.cat(sub_state_dict)
