@@ -216,7 +216,9 @@ def pipeline(
                     ]
                     total_steps_evaluated = 1
                 else:
-                    total_steps_evaluated = golden_value.end_step / golden_value.step_interval + 1
+                    total_steps_evaluated = (
+                        golden_value.end_step - golden_value.start_step
+                    ) / golden_value.step_interval + 1
 
                     actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
                     golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
