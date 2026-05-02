@@ -646,10 +646,11 @@ class TestDynamicContext:
         # 3. The active requests will also have some requests that have to be paused because of reaching max token limit within block
         # 4. Some of these requests will be resumed.
         # Setup is as follows :
-        # Request ids 0, 1 are paused
-        # Request ids 2, 4, 9 are active requests
-        # Request ids 3 7 8 have completed
-        # Request ids 5 and 6 will require on more block later on because they finished their current block
+        # Indices 0-7 active, indices 8-9 paused
+        # Request ids 0, 1 are paused (at indices 8, 9)
+        # Request ids 2, 4, 9 are active requests that stay active
+        # Request ids 3, 7, 8 have completed
+        # Request ids 5 and 6 will require one more block later on because they finished their current block
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -684,30 +685,34 @@ class TestDynamicContext:
             dynamic_context.kv_block_allocator.total_avail,
             dynamic_context.kv_block_allocator.total_avail + 10,
         )
-        dynamic_context.request_to_kv_block_ids[3][
+        dynamic_context.request_to_kv_block_ids[1][
             1
         ] = dynamic_context.kv_block_allocator.total_avail  # Assign one extra block  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
-        # For 0, 1, 5, 6, the total number of tokens in last block is block size -1, so that they will all need extra blocks
-        dynamic_context.request_kv_length_offsets[0:2] = dynamic_context.block_size_tokens - 1
-        dynamic_context.request_kv_length_offsets[5:7] = dynamic_context.block_size_tokens - 1
-        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size
-        dynamic_context.request_kv_length_offsets[3] = dynamic_context.block_size_bytes + 10
+        # IDs 5, 6 (at indices 3, 4) and IDs 0, 1 (paused at indices 8, 9)
+        # have block_size-1 tokens in their last block, so they all need extra blocks.
+        dynamic_context.request_kv_length_offsets[3:5] = dynamic_context.block_size_tokens - 1
+        dynamic_context.request_kv_length_offsets[8:10] = dynamic_context.block_size_tokens - 1
+        # ID 3 (at index 1) is completed and required 2 blocks.
+        dynamic_context.request_kv_length_offsets[1] = dynamic_context.block_size_bytes + 10
         dynamic_context.request_query_lengths[0:total_request_count] = (
             1  # Everything is in decode phase
         )
 
-        dynamic_context.request_ids[0:total_request_count] = torch.arange(0, total_request_count)
+        # Layout: [active(IDs 2-9) | paused(IDs 0,1)]
+        dynamic_context.request_ids[0:total_request_count] = torch.tensor(
+            [2, 3, 4, 5, 6, 7, 8, 9, 0, 1], device='cuda'
+        )
         dynamic_context.request_kv_block_counts[0:total_request_count] = 1
-        dynamic_context.request_kv_block_counts[3] = 2  # 3rd block alone requies 2 blocks
+        dynamic_context.request_kv_block_counts[1] = 2  # ID 3 (index 1) requires 2 blocks
         dynamic_context.request_last_kv_block_id[0:total_request_count] = torch.arange(
             0, total_request_count
         )
-        dynamic_context.request_last_kv_block_id[3] = 11
+        dynamic_context.request_last_kv_block_id[1] = 11  # ID 3 (index 1)
         dynamic_context.request_last_kv_block_offset[0:total_request_count] = 10
-        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size
-        dynamic_context.request_last_kv_block_offset[0:2] = dynamic_context.block_size_tokens - 1
-        dynamic_context.request_last_kv_block_offset[5:7] = dynamic_context.block_size_tokens - 1
+        # IDs 5, 6 (indices 3, 4) and paused IDs 0, 1 (indices 8, 9)
+        dynamic_context.request_last_kv_block_offset[3:5] = dynamic_context.block_size_tokens - 1
+        dynamic_context.request_last_kv_block_offset[8:10] = dynamic_context.block_size_tokens - 1
 
         if is_hybrid_model:
             # Dummy fill for states to be non-zero before update
@@ -721,45 +726,48 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=next_tokens
         )
 
-        # Then set up the test data
-        dynamic_context.request_ids[0:10] = torch.tensor(
-            [0, 1, 5, 6, 4, 2, 9, 7, 8, 9], device=torch.cuda.current_device()
-        )
-
-        # Now verify the values
-        assert dynamic_context.request_ids[0:10].cpu().numpy().tolist() == [
-            0,
-            1,
-            5,
-            6,
-            4,
-            2,
-            9,
-            7,
-            8,
-            9,
-        ]
-
+        # Verify structural invariants.
         assert dynamic_context.paused_request_count == 0
         assert dynamic_context.total_request_count == 7
         assert dynamic_context.active_token_count == 7
 
-        # The first four are zero because they have all obtained a new block
-        assert dynamic_context.request_last_kv_block_offset[0:10].cpu().numpy().tolist() == [
-            0,
-            0,
-            0,
-            0,
-            11,
-            11,
-            11,
-            10,
-            10,
-            10,
-        ]
+        # Layout invariant: [active | paused | dead].
+        active_count = dynamic_context.total_request_count - dynamic_context.paused_request_count
+        active_ids = set(dynamic_context.request_ids[:active_count].cpu().tolist())
+        paused_ids = set(
+            dynamic_context.request_ids[active_count : dynamic_context.total_request_count]
+            .cpu()
+            .tolist()
+        )
+        assert active_ids == {0, 1, 2, 4, 5, 6, 9}  # IDs 3, 7, 8 finished
+        assert paused_ids == set()  # no paused requests
+        # Dead zone should not contain any surviving IDs (stale data cleared).
+        dead_ids = set(
+            dynamic_context.request_ids[dynamic_context.total_request_count : 10].cpu().tolist()
+        )
+        assert dead_ids.isdisjoint(active_ids)
+
+        # IDs that stayed active have offset 10+1=11; IDs that got new blocks
+        # have offset (127+1)%128=0. Check only the live region [0:total).
+        live_offsets = (
+            dynamic_context.request_last_kv_block_offset[: dynamic_context.total_request_count]
+            .cpu()
+            .tolist()
+        )
+        for i, rid in enumerate(
+            dynamic_context.request_ids[: dynamic_context.total_request_count].cpu().tolist()
+        ):
+            if rid in {2, 4, 9}:
+                assert (
+                    live_offsets[i] == 11
+                ), f"request {rid} at index {i}: expected offset 11, got {live_offsets[i]}"
+            else:
+                assert (
+                    live_offsets[i] == 0
+                ), f"request {rid} at index {i}: expected offset 0, got {live_offsets[i]}"
         assert dynamic_context.token_to_input_ids[
             : dynamic_context.active_token_count
-        ].cpu().numpy().tolist() == [0, 1, 5, 6, 4, 2, 9]
+        ].cpu().numpy().tolist() == [2, 9, 4, 5, 6, 0, 1]
 
         assert dynamic_context.token_to_pos_ids[
             : dynamic_context.active_token_count
@@ -1813,6 +1821,143 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_chunked_prefill_continuation_while_paused(self):
+        """
+        Adding the next chunk of a chunked-prefill request while another
+        request is paused must not corrupt the [active | paused | dead]
+        layout. The new chunk has to land at the active boundary, with
+        paused entries shifting one slot to the right and the hidden
+        chunked-prefill record (sitting at total_request_count) rolling
+        into the new active slot so its KV blocks survive.
+
+        The scheduler reaches this path via the is_continuing_chunked_prefill
+        bypass in schedule_chunked_prefill, which lets add_request fire even
+        when paused_request_count > 0.
+        """
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.05,
+            block_size_tokens=128,
+            max_tokens=None,
+            enable_chunked_prefill=True,
+            max_requests=16,
+        )
+        bs = dynamic_context.block_size_tokens
+
+        # Two decode requests; index 0 will be parked at the block boundary
+        # so update_requests is forced to pause it.
+        req10 = DynamicInferenceRequest(
+            request_id=10,
+            prompt_tokens=torch.arange(0, 4, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        req11 = DynamicInferenceRequest(
+            request_id=11,
+            prompt_tokens=torch.arange(0, 4, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(req10)
+        dynamic_context.add_request(req11)
+
+        # Pretend prefill already happened: both requests are now in decode
+        # mode. Index 0 sits at the block boundary (offset == bs - 1) so the
+        # next forward step will demand a new block for it.
+        dynamic_context.request_in_prefill_status_tensor[0:2] = 0
+        dynamic_context.request_query_lengths[0:2] = 1
+        dynamic_context.request_kv_length_offsets[0] = bs - 1
+        dynamic_context.request_kv_length_offsets[1] = 5
+        dynamic_context.request_last_kv_block_offset[0] = bs - 1
+        dynamic_context.request_last_kv_block_offset[1] = 5
+        # Clear active_token_count populated by the two prefill add_requests
+        # so the chunked prefill below installs its own active tokens cleanly.
+        dynamic_context.active_token_count = 0
+
+        # Add chunk 1 of a chunked prefill request.
+        req999 = DynamicInferenceRequest(
+            request_id=999,
+            prompt_tokens=torch.arange(0, 200, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.chunked_prefill_request_id = 999
+        dynamic_context.add_request(req999, prefill_chunk_length=8)
+
+        # Snapshot the chunked prefill's KV block before update_requests so
+        # we can later assert it follows the request to its post-rotation slot.
+        chunked_kv_block_before = dynamic_context.request_to_kv_block_ids[2, 0].item()
+        assert chunked_kv_block_before != -1
+
+        # Drain the active block pool so request 10 cannot resume after
+        # being paused; keep the paused-pool capacity high so request 10
+        # isn't immediately evicted out of the system either.
+        dynamic_context.kv_block_allocator.total_avail = 0
+        dynamic_context.kv_block_allocator.paused_count = 100
+
+        # update_requests pauses request 10, keeps request 11 active, and
+        # hides chunked 999 just past total_request_count.
+        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask, new_tokens=new_tokens
+        )
+
+        # Verify the engineered post-step layout:
+        #   index 0: active decode 11
+        #   index 1: paused decode 10
+        #   index 2: hidden chunked 999 (just past total_request_count)
+        assert dynamic_context.paused_request_count == 1
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[0].item() == 11
+        assert dynamic_context.request_ids[1].item() == 10
+        assert dynamic_context.request_ids[2].item() == 999
+
+        # Now simulate the scheduler dispatching the next chunk for 999
+        # while paused_request_count > 0 — the bug path.
+        req999.finished_chunk_token_count = 8
+        dynamic_context.add_request(req999, prefill_chunk_length=8)
+
+        # The new chunk must land at the active boundary (index 1), the
+        # paused decode must shift to index 2, and the chunked's KV block
+        # must follow the request to its new slot.
+        assert dynamic_context.total_request_count == 3
+        assert dynamic_context.paused_request_count == 1
+        new_active_count = (
+            dynamic_context.total_request_count - dynamic_context.paused_request_count
+        )
+        assert new_active_count == 2
+
+        assert dynamic_context.request_ids[0].item() == 11, (
+            f"Active decode 11 should stay at index 0, got "
+            f"{dynamic_context.request_ids[0].item()}"
+        )
+        assert dynamic_context.request_ids[1].item() == 999, (
+            f"New chunked chunk should land at the active boundary "
+            f"(index 1); without the fix it would land at total (index 2) "
+            f"in the paused region. Got request "
+            f"{dynamic_context.request_ids[1].item()}"
+        )
+        assert dynamic_context.request_ids[2].item() == 10, (
+            f"Paused decode 10 should be shifted to index 2, got request "
+            f"{dynamic_context.request_ids[2].item()}"
+        )
+
+        # KV block of the chunked's first chunk must follow the request, or
+        # the next forward step would see a clobbered block table.
+        assert (
+            dynamic_context.request_to_kv_block_ids[1, 0].item()
+            == chunked_kv_block_before
+        ), (
+            f"Chunked prefill's KV block must follow the request to its "
+            f"new position; expected {chunked_kv_block_before} at index 1, "
+            f"got {dynamic_context.request_to_kv_block_ids[1, 0].item()}"
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_update_requests_speculative(self):
         """Test update_requests correctly interleaves sampled and speculative tokens."""
 
@@ -2739,11 +2884,12 @@ class TestDynamicContext:
         # Both blocks should be safely shared with ref count 2
         assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
 
-        # Mock the state to make req1 paused and req2 active
+        # Mock the state to make req2 active and req1 paused.
+        # Layout: [active | paused] => request_ids[0] = active (req2), request_ids[1] = paused (req1).
         ctx.paused_request_count = 1
         ctx.total_request_count = 2
-        ctx.request_ids[0] = 1
-        ctx.request_ids[1] = 2
+        ctx.request_ids[0] = 2
+        ctx.request_ids[1] = 1
         ctx.request_kv_block_counts[0] = 2
         ctx.request_kv_block_counts[1] = 2
 

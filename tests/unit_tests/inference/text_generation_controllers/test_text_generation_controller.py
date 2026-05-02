@@ -317,9 +317,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict])
         top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])
-        context.active_request_metadata["temperature"][:batch_size].copy_(temp_values)
-        context.active_request_metadata["top_k"][:batch_size].copy_(top_k_values)
-        context.active_request_metadata["top_p"][:batch_size].copy_(top_p_values)
+        context.request_metadata["temperature"][:batch_size].copy_(temp_values)
+        context.request_metadata["top_k"][:batch_size].copy_(top_k_values)
+        context.request_metadata["top_p"][:batch_size].copy_(top_p_values)
         self.text_generation_controller._sampling_backend = backend
 
         context.padded_active_token_count = batch_size
@@ -857,10 +857,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Prepare sampling params
         top_n = 5
-        context.active_request_metadata["top_n_logprobs"][:batch_size].fill_(top_n)
-        context.active_request_metadata["skip_prompt_log_probs"][:batch_size].fill_(
-            skip_prompt_log_probs
-        )
+        context.request_metadata["top_n_logprobs"][:batch_size].fill_(top_n)
+        context.request_metadata["skip_prompt_log_probs"][:batch_size].fill_(skip_prompt_log_probs)
 
         if materialize_only_last_token_logits:
             # Decode mode: logits for last tokens only
@@ -909,7 +907,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             context.active_token_count = total_tokens
             context.num_prefill_requests = batch_size
             context.request_query_lengths = torch.tensor(
-                [0] * context.paused_request_count + query_lengths, dtype=torch.int32, device='cuda'
+                query_lengths + [0] * context.paused_request_count, dtype=torch.int32, device='cuda'
             )
 
             # Create logits for all tokens
