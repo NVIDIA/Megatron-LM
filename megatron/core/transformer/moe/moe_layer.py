@@ -336,9 +336,11 @@ class MoELayer(BaseMoELayer):
 
                 check_flashinfer_jit_cache_installed()
             elif config.inference_grouped_gemm_backend == 'torch':
-                assert hasattr(torch.nn.functional, 'grouped_mm'), (
+                assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
+                    torch, '_grouped_mm'
+                ), (
                     "inference_grouped_gemm_backend='torch' requires "
-                    "torch.nn.functional.grouped_mm (available since PyTorch 2.10)."
+                    "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
             self._setup_inference_mode(pg_collection)
 
