@@ -13,6 +13,7 @@ from megatron.training.config.training_config import (
     CheckpointConfig,
 )
 from megatron.training.config.resilience_config import (
+    FaultInjectorConfig,
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
