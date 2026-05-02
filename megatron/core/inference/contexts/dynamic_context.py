@@ -565,6 +565,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             "to have consistency between cuda graph sizes and the block table size."
         )
 
+        # Phantom padding: when EP-sync requires all EP ranks to agree on (P, D) request counts,
+        # a rank may end up with padded_batch_dimensions whose total exceeds max_requests.
+        # Example: rank A w/ P=4 D=max-4; rank B w/ P=0 D=max.
+        # The sync in this case would give P=4 D=max, which exceeds max_requests.
+        # Phantom padding reserves spare request slots to prevent this issue.
+        # If the MoE dispatcher can handle variable token counts natively, this flag is not needed.
+        self._enable_phantom_padding = True
+
+        model_sync_needs_reservation = (
+            self._enable_phantom_padding
+            and self.expert_model_parallel_group is not None
+            and get_pg_size(self.expert_model_parallel_group) > 1
+            and (self.is_hybrid_model or self.num_speculative_tokens > 0)
+        )
+        prefill_reservation = (
+            (inference_config.cuda_graph_mixed_prefill_count or 1)
+            if model_sync_needs_reservation
+            else 0
+        )
+        self.max_schedulable_requests = self.max_requests - prefill_reservation
+
         # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
 
         self.graph_attn_metadata = {}
@@ -576,6 +597,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
+            dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
+            enable_phantom_padding=self._enable_phantom_padding,
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
@@ -584,6 +607,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
+            dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
+            enable_phantom_padding=self._enable_phantom_padding,
         )
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
@@ -1705,7 +1730,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     padded_decode_req_count = min(
                         self.max_requests, self.round_up_requests(self.num_decode_requests)
                     )
-                    padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
+                    padded_token_count = min(
+                        self.max_tokens, padded_decode_req_count * (self.num_speculative_tokens + 1)
+                    )
                 else:
                     padded_token_count = min(
                         self.max_tokens,
@@ -1715,7 +1742,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = min(
+                    self.max_tokens, self.round_up_tokens(self.active_token_count)
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
@@ -2092,9 +2121,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request
+        # because we allocate a single set of Mamba state tensors for each request.
         request_can_be_added = (
-            self.total_request_count < self.max_requests and self.paused_request_count == 0
+            self.total_request_count < self.max_schedulable_requests
+            and self.paused_request_count == 0
         )
 
         (_, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
