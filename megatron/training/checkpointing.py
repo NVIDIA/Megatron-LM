@@ -33,6 +33,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
+    get_async_strategy,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
@@ -71,19 +72,6 @@ try:
 except Exception:
     has_nvidia_modelopt = False
 
-
-try:
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
-        FileSystemWriterAsync,
-    )
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
-        save_state_dict_async_plan,
-    )
-
-    HAVE_NVRX = True
-except (ImportError, ModuleNotFoundError):
-
-    HAVE_NVRX = False
 
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
@@ -678,7 +666,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                                          validate_access_integrity=validate_sharding_integrity,
                                                          preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                                                          content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                                                         async_strategy=args.async_strategy)
+                                                         async_strategy=args.async_strategy,
+                                                         verify_integrity=args.verify_integrity)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -693,6 +682,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
+                _, async_modules = get_async_strategy(args.async_strategy)
+                FileSystemWriterAsync = async_modules["FileSystemWriterAsync"]
+                save_state_dict_async_plan = async_modules["save_state_dict_async_plan"]
                 _cpu_shm = getattr(args, 'async_ckpt_use_cpu_shm', False)
                 _writer_kwargs = {}
                 if _cpu_shm:
@@ -717,7 +709,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 save_state_dict_ret = save_state_dict_async_plan(
                     state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
                 )
-                async_save_request = get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
+                async_save_request = get_save_and_finalize_callbacks(
+                    fs_storage_writer, save_state_dict_ret, args.async_strategy
+                )
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
                 torch.distributed.checkpoint.save(
@@ -1249,6 +1243,7 @@ def _load_global_dist_base_checkpoint(
         load_strategy,
         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
         strict=args.dist_ckpt_strictness,
+        verify_integrity=args.verify_integrity,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
