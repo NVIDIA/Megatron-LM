@@ -109,7 +109,9 @@ def read_tb_logs_as_list(
     files += glob.glob(f"{path}/results/events*tfevents*")
 
     if not files:
-        logger.error(f"File not found matching: {path}/events* || {path}/results/events*")
+        logger.error(
+            f"File not found matching: {path}/events* || {path}/results/events*"
+        )
         return None
 
     files.sort(key=lambda x: os.path.getmtime(os.path.join(path, pathlib.Path(x).name)))
@@ -117,7 +119,9 @@ def read_tb_logs_as_list(
 
     if index == -1:
         for event_file in files:
-            ea = event_accumulator.EventAccumulator(event_file, size_guidance=SIZE_GUIDANCE)
+            ea = event_accumulator.EventAccumulator(
+                event_file, size_guidance=SIZE_GUIDANCE
+            )
             ea.Reload()
             accumulators.append(ea)
     else:
@@ -160,7 +164,7 @@ def read_tb_logs_as_list(
 
 
 def read_golden_values_from_json(
-    golden_values_path: Union[str, pathlib.Path]
+    golden_values_path: Union[str, pathlib.Path],
 ) -> Dict[str, GoldenValueMetric]:
     with open(golden_values_path) as f:
         if os.path.exists(golden_values_path):
@@ -173,7 +177,9 @@ def read_golden_values_from_json(
 def _filter_checks(
     checks: List[Union[ApproximateTest, DeterministicTest]], filter_for_type_of_check
 ):
-    return [test for test in checks if test.type_of_test_result == filter_for_type_of_check]
+    return [
+        test for test in checks if test.type_of_test_result == filter_for_type_of_check
+    ]
 
 
 def pipeline(
@@ -209,17 +215,27 @@ def pipeline(
 
                 if metric_name == "iteration-time":
                     actual_value_list = [
-                        np.median([np.inf if type(v) is str else v for v in actual_value_list])
+                        np.median(
+                            [np.inf if type(v) is str else v for v in actual_value_list]
+                        )
                     ]
                     golden_value_list = [
-                        np.median([np.inf if type(v) is str else v for v in golden_value_list])
+                        np.median(
+                            [np.inf if type(v) is str else v for v in golden_value_list]
+                        )
                     ]
                     total_steps_evaluated = 1
                 else:
-                    total_steps_evaluated = golden_value.end_step / golden_value.step_interval + 1
+                    total_steps_evaluated = (
+                        golden_value.end_step - golden_value.start_step
+                    ) / golden_value.step_interval + 1
 
-                    actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
-                    golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
+                    actual_value_list = [
+                        np.inf if type(v) is str else v for v in actual_value_list
+                    ]
+                    golden_value_list = [
+                        np.inf if type(v) is str else v for v in golden_value_list
+                    ]
 
                 actual = np.array(actual_value_list)
                 golden = np.array(golden_value_list)
@@ -233,28 +249,38 @@ def pipeline(
                 ):
                     passing = bool(np.all(is_close))
                 else:
-                    num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
+                    num_failing_steps_allowed = min(
+                        max(total_steps_evaluated // 100, 1), 50
+                    )
                     passing = np.mean(is_close) >= 1 - (
                         num_failing_steps_allowed / total_steps_evaluated
                     )
 
                 if not passing:
                     logger.info(
-                        "Actual values: %s", ", ".join([str(v) for v in (*actual_value_list,)])
+                        "Actual values: %s",
+                        ", ".join([str(v) for v in (*actual_value_list,)]),
                     )
                     logger.info(
-                        "Golden values: %s", ", ".join([str(v) for v in (*golden_value_list,)])
+                        "Golden values: %s",
+                        ", ".join([str(v) for v in (*golden_value_list,)]),
                     )
                     raise test.error_message(metric_name)
 
                 result = f"{test.type_of_test_result.name} test for metric {metric_name}: PASSED"
                 result_code = 0
 
-            except (NotApproximateError, NotDeterminsticError, MissingTensorboardLogsError) as e:
+            except (
+                NotApproximateError,
+                NotDeterminsticError,
+                MissingTensorboardLogsError,
+            ) as e:
                 result = str(e)
                 result_code = 1
             except SkipMetricError:
-                logger.info(f"{test.type_of_test_result.name} test for {metric_name}: SKIPPED")
+                logger.info(
+                    f"{test.type_of_test_result.name} test for {metric_name}: SKIPPED"
+                )
                 continue
 
             log_emitter = logger.info if result_code == 0 else logger.error
