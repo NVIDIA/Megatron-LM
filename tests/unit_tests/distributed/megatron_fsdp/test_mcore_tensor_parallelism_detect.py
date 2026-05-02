@@ -203,6 +203,64 @@ def test_detect_parallelism_teliner_parallel_mode_variants():
     assert fsdp._detect_parallelism_type("weight", TELinear("none")) == "replicated"
 
 
+def test_detect_parallelism_param_level_tp_attributes():
+    """Parameters with tensor_model_parallel/partition_dim set directly on them
+    (rather than on the owning module) should be detected via the param-level fallback.
+    This is the pattern used by MambaMixer's conv1d, A_log, dt_bias, D parameters.
+    """
+    fsdp = _make_fsdp_for_unit_tests()
+
+    class PlainModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(4, 4))
+
+    module = PlainModule()
+
+    # Without param-level attrs -> None (no inference possible)
+    assert fsdp._detect_parallelism_type("weight", module) is None
+
+    # With param-level column (partition_dim=0)
+    module.weight.tensor_model_parallel = True
+    module.weight.partition_dim = 0
+    assert fsdp._detect_parallelism_type("weight", module, module.weight) == "column"
+
+    # With param-level row (partition_dim=1)
+    module.weight.partition_dim = 1
+    assert fsdp._detect_parallelism_type("weight", module, module.weight) == "row"
+
+    # Row-parallel bias should be replicated
+    bias = nn.Parameter(torch.empty(4))
+    bias.tensor_model_parallel = True
+    bias.partition_dim = 1
+    module.bias = bias
+    assert fsdp._detect_parallelism_type("bias", module, module.bias) == "replicated"
+
+
+def test_detect_parallelism_param_level_tp_overrides_norm_fallback():
+    """A Norm-like module whose weight has param-level TP attributes should be
+    classified by the param-level check, NOT the norm-name fallback.
+    This is the pattern used by MambaMixer's ExtendedRMSNorm, whose weight is
+    TP-sharded (partition_dim=0) rather than replicated.
+    """
+    fsdp = _make_fsdp_for_unit_tests()
+
+    class ExtendedRMSNorm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(8))
+
+    module = ExtendedRMSNorm()
+
+    # Without param-level attrs, norm fallback should return "replicated"
+    assert fsdp._detect_parallelism_type("weight", module) == "replicated"
+
+    # With param-level TP attrs, should return "column" instead
+    module.weight.tensor_model_parallel = True
+    module.weight.partition_dim = 0
+    assert fsdp._detect_parallelism_type("weight", module, module.weight) == "column"
+
+
 def test_detect_parallelism_returns_none_when_cannot_infer():
     fsdp = _make_fsdp_for_unit_tests()
 
@@ -251,3 +309,82 @@ def test_annotate_tensor_parallelism_sets_attribute_on_params():
     # For unknown module type, _detect_parallelism_type should return None
     # and _annotate_tensor_parallelism must not set the attribute.
     assert not hasattr(root.plain.weight, "_tensor_parallel_mode")
+
+
+def test_annotate_tensor_parallelism_mamba_mixer_like_module():
+    """Simulate a MambaMixer-like module hierarchy where TP attributes are set on
+    parameters rather than modules. Verify that _annotate_tensor_parallelism
+    correctly classifies all parameters.
+    """
+    fsdp = _make_fsdp_for_unit_tests()
+
+    class ColumnParallelLinear(nn.Module):
+        """Stands in for in_proj (module-level TP, detected via registry)."""
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(8, 4))
+
+    class RowParallelLinear(nn.Module):
+        """Stands in for out_proj (module-level TP, detected via registry)."""
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(4, 8))
+
+    class ExtendedRMSNorm(nn.Module):
+        """Norm with param-level TP (should NOT fall through to norm fallback)."""
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(8))
+            self.weight.tensor_model_parallel = True
+            self.weight.partition_dim = 0
+
+    class MambaMixer(nn.Module):
+        """Simulates MambaMixer with conv1d and raw TP-sharded parameters."""
+
+        def __init__(self):
+            super().__init__()
+            self.in_proj = ColumnParallelLinear()
+            self.out_proj = RowParallelLinear()
+            self.norm = ExtendedRMSNorm()
+
+            # conv1d: standard nn.Conv1d with param-level TP attrs
+            self.conv1d = nn.Conv1d(8, 8, 4, groups=8)
+            self.conv1d.weight.tensor_model_parallel = True
+            self.conv1d.weight.partition_dim = 0
+            self.conv1d.bias.tensor_model_parallel = True
+            self.conv1d.bias.partition_dim = 0
+
+            # Raw parameters with param-level TP attrs
+            self.A_log = nn.Parameter(torch.empty(4))
+            self.A_log.tensor_model_parallel = True
+            self.A_log.partition_dim = 0
+
+            self.dt_bias = nn.Parameter(torch.empty(4))
+            self.dt_bias.tensor_model_parallel = True
+            self.dt_bias.partition_dim = 0
+
+            self.D = nn.Parameter(torch.empty(4))
+            self.D.tensor_model_parallel = True
+            self.D.partition_dim = 0
+
+    mixer = MambaMixer()
+    fsdp._annotate_tensor_parallelism(mixer)
+
+    # Module-level detection (via registry)
+    assert mixer.in_proj.weight._tensor_parallel_mode == "column"
+    assert mixer.out_proj.weight._tensor_parallel_mode == "row"
+
+    # Param-level detection for conv1d
+    assert mixer.conv1d.weight._tensor_parallel_mode == "column"
+    assert mixer.conv1d.bias._tensor_parallel_mode == "column"
+
+    # Param-level detection for raw parameters on MambaMixer
+    assert mixer.A_log._tensor_parallel_mode == "column"
+    assert mixer.dt_bias._tensor_parallel_mode == "column"
+    assert mixer.D._tensor_parallel_mode == "column"
+
+    # Param-level detection overrides norm fallback
+    assert mixer.norm.weight._tensor_parallel_mode == "column"

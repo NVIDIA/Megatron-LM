@@ -759,6 +759,17 @@ class MegatronFSDP(torch.nn.Module):
             if self.enable_fine_grained_param_gather_hook:
                 param_list = list(module.parameters(recurse=False))
 
+            extra_forward_param_modules = getattr(module, "_fsdp_extra_forward_param_modules", ())
+            if isinstance(extra_forward_param_modules, nn.Module):
+                extra_forward_param_modules = (extra_forward_param_modules,)
+            if extra_forward_param_modules:
+                seen_param_ids = {id(param) for param in param_list}
+                for extra_module in extra_forward_param_modules:
+                    for extra_param in extra_module.parameters():
+                        if id(extra_param) not in seen_param_ids:
+                            param_list.append(extra_param)
+                            seen_param_ids.add(id(extra_param))
+
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
                 params=param_list,

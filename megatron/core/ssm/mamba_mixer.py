@@ -316,6 +316,9 @@ class MambaMixer(MegatronModule):
                 else:
                     nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
 
+        # The fused Mamba path reads conv1d weights directly instead of calling conv1d.forward().
+        self._fsdp_extra_forward_param_modules = (self.conv1d,)
+
         self.activation = "silu"
         self.act = nn.SiLU()
 
@@ -408,6 +411,7 @@ class MambaMixer(MegatronModule):
             A_log_cp1=self.A_log,
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
+            mixer=self,
         )
         self.tp_group = pg_collection.tp
 
@@ -700,17 +704,22 @@ class MambaMixer(MegatronModule):
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
 
+        conv1d_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
+        conv1d_bias = self.cp.get_conv1d_bias()
+        dt_bias = self.cp.get_dt_bias().float()
+        D = (
+            rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+            if self.D_has_hdim
+            else self.cp.get_D()
+        )
+
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
-            rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-            self.cp.get_conv1d_bias(),
-            self.cp.get_dt_bias().float(),
+            conv1d_weight,
+            conv1d_bias,
+            dt_bias,
             A,
-            D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.cp.get_D()
-            ),
+            D=D,
             chunk_size=self.chunk_size,
             activation=self.activation,
             headdim=None if self.D_has_hdim else self.headdim,
