@@ -156,9 +156,10 @@ if __name__ == "__main__":
                         )
                     )
                 )
-                input_ids = tokenizer.apply_chat_template(
-                    new_conversations, return_tensors="pt", add_generation_prompt=True
+                encoding = tokenizer.apply_chat_template(
+                    new_conversations, return_tensors="pt", add_generation_prompt=True, return_dict=True
                 )
+                input_ids = encoding["input_ids"]
                 with torch.no_grad():
                     output_ids = simple_generate(
                         unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
