@@ -547,8 +547,7 @@ class TestMultiTokenPrediction:
         total_seq_length = sum(seq_lengths)
 
         args = self.create_test_args(
-            tp=1, cp=1, sequence_length=total_seq_length,
-            micro_batch_size=1, full_recompute=True,
+            tp=1, cp=1, sequence_length=total_seq_length, micro_batch_size=1, full_recompute=True
         )
         set_args(args)
 
