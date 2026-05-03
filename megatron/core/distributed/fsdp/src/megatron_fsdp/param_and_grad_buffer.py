@@ -2499,7 +2499,14 @@ class ParamAndGradBuffer:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-                            m.to_empty(device=self.device, recurse=False)
+                            # Materialize only meta tensors in a module, preserving
+                            # non-meta tensors that are already initialized on device.
+                            m._apply(
+                                lambda t: (
+                                    torch.empty_like(t, device=self.device) if t.is_meta else t
+                                ),
+                                recurse=False,
+                            )
                             if (
                                 HAVE_TE
                                 and is_te_min_version("0.9.0")
