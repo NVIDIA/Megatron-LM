@@ -2062,7 +2062,6 @@ def _add_network_size_args(parser):
         "softmax_scale",
         "gated_linear_unit",
         "bias_activation_fusion",
-        "activation_func_fp8_input_store",
         "test_mode",
         "memory_efficient_layer_norm",
         "fused_single_qkv_rope",
