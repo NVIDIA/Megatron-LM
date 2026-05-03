@@ -1122,29 +1122,41 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
             )
 
-        def checkpoint_handler(forward_func):
+        def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             if self.config.fp8:
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
+                # FP8 path: TE's checkpoint accepts non-tensor kwargs natively
+                # (it stashes them on ``ctx.kwargs`` rather than via
+                # ``save_for_backward``), so forward ``_proj_and_transformer_layer``
+                # directly with the same kwargs the non-recompute path uses.
                 return te_checkpoint(
-                    forward_func,
+                    self._proj_and_transformer_layer,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
-                    hidden_states,
-                    decoder_input,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    sequence_len_offset,
+                    hidden_states=hidden_states,
+                    decoder_input=decoder_input,
+                    attention_mask=attention_mask,
+                    context=context,
+                    context_mask=context_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    attention_bias=attention_bias,
+                    inference_params=inference_params,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
                 )
             else:
+                # tensor_parallel.checkpoint stashes args via autograd's
+                # ``save_for_backward``, which only accepts tensors and ``None``.
+                # Pass tensor / ``None`` args positionally and capture the
+                # non-tensor objects (``attention_bias``, ``inference_params``,
+                # ``packed_seq_params``) via the ``custom_forward`` closure.
                 return tensor_parallel.checkpoint(
-                    forward_func,
+                    custom_forward,
                     self.config.distribute_saved_activations,
                     hidden_states,
                     decoder_input,
@@ -1164,7 +1176,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             assert (
                 self.config.recompute_num_layers == 1
             ), "recompute_num_layers must be 1 for MTP recompute"
-            outputs = checkpoint_handler(custom_forward)
+            outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
             # TODO: implement block-based recompute for MTP
             warnings.warn(
