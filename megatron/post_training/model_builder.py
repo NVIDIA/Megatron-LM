@@ -104,6 +104,13 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
 
     args_dict = vars(get_args()).copy()
     del args_dict["kv_channels"]  # not recalculated if present
+    # Setting teacher Flextron fields to false if training with Flextron, can be overridden
+    if "flextron" in args_dict:
+        config["flextron"] = False
+    if "enable_router" in args_dict:
+        config["enable_router"] = False
+    if "freeze_model" in args_dict:
+        config["freeze_model"] = False
     args_dict.update(config)
 
     # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
@@ -207,8 +214,8 @@ def modelopt_gpt_hybrid_builder(
         raise ValueError(
             "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
         )
-    if args.spec is not None:
-        raise ValueError("ModelOpt integration does not support custom args.spec.")
+    if args.spec is not None and not args.export_default_te_spec:
+        raise ValueError("ModelOpt integration does not support custom args.spec when TE spec is not enabled via --export-default-te-spec.")
 
     # Llama-4 Scout/Maverick support
     config.qk_l2_norm = args.export_qk_l2_norm
