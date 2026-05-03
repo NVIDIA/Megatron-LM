@@ -22,6 +22,13 @@ from importlib.metadata import version
 from typing import Callable, Optional, Sequence, Union
 
 try:
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    HAVE_MEGATRON_CORE = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_MEGATRON_CORE = False
+
+try:
     import einops
 
     HAVE_EINOPS = True
@@ -89,6 +96,23 @@ def is_submodule(module, parent_module, strict=True):
         if m is module:
             return True
     return False
+
+
+def find_megatron_fsdp(model):
+    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+    # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
+    # this module during its own initialization, so a top-level import of
+    # MegatronFSDP here would fail with a partially-initialized module error.
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
+    except (ImportError, ModuleNotFoundError):
+        return None
+    m = model
+    while m is not None:
+        if isinstance(m, MegatronFSDP):
+            return m
+        m = getattr(m, 'module', None)
+    return None
 
 
 def get_mesh_names(
@@ -831,3 +855,12 @@ def using_tensor_parallel(dist_index, is_expert_parallel: bool = False) -> bool:
     """
     tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_parallel)
     return tp_mesh.mesh.numel() > 1
+
+
+def get_unwrapped_transformer_config_attribute(config, key: str):
+    """
+    Get `key` from config with getattr method, return None otherwise.
+    """
+    if HAVE_MEGATRON_CORE and isinstance(config, TransformerConfig):
+        return getattr(config, key)
+    return None
