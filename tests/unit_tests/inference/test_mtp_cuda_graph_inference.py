@@ -525,6 +525,9 @@ class TestMTPCudaGraphInference:
                 ]
 
                 ctrl._compute_serial_mtp_and_sample()
+                # CUDA graph replay is asynchronous, and this test reuses the controller's
+                # staging buffers immediately for the eager comparison.
+                torch.cuda.synchronize()
 
                 return [
                     ctrl._sampled_mtp_tokens_cuda[d, :active_request_count].clone()
