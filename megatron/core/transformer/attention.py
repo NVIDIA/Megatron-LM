@@ -389,6 +389,71 @@ class Attention(MegatronModule, ABC):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+        # Per-layer RotaryEmbedding (used when rotary_base_per_layer is set in config).
+        self.rotary_pos_emb = None
+        if getattr(self.config, 'rotary_base_per_layer', None):
+            rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
+            self._build_per_layer_rotary_pos_emb(rotary_base)
+
+    def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
+        """Build self.rotary_pos_emb using a layer-specific rotary base."""
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+        seq_len_interpolation_factor = self.config.rotary_scaling_factor
+        if self.config.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = RotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=self.config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                rope_scaling=self.config.rope_scaling,
+                rope_scaling_factor=self.config.rope_scaling_factor,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
+            )
+        elif self.config.position_embedding_type == 'yarn':
+            self.rotary_pos_emb = YarnRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=self.config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                original_max_position_embeddings=getattr(
+                    self.config, "yarn_original_max_position_embeddings"
+                ),
+                beta_fast=getattr(self.config, "yarn_beta_fast"),
+                beta_slow=getattr(self.config, "yarn_beta_slow"),
+                mscale=getattr(self.config, "yarn_mscale"),
+                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                correction_range_round_to_int=getattr(
+                    self.config, "yarn_correction_range_round_to_int"
+                ),
+                use_cpu_initialization=self.config.use_cpu_initialization,
+            )
+        elif (
+            self.config.position_embedding_type == 'mrope'
+            and not self.config.multi_latent_attention
+        ):
+            self.rotary_pos_emb = MultimodalRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=self.config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+            )
+            self.mrope_section = self.config.mrope_section
+            assert (
+                self.mrope_section is not None
+            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+        else:
+            raise NotImplementedError(
+                f"rotary_base_per_layer does not support "
+                f"position_embedding_type={self.config.position_embedding_type!r} "
+                f"(only 'rope' / 'yarn' / 'mrope' are supported)."
+            )
+
     def _checkpointed_attention_forward(
         self,
         query,
@@ -1025,6 +1090,11 @@ class Attention(MegatronModule, ABC):
         )
         if no_rope:
             rotary_pos_emb = None
+
+        # Per-layer theta: override the model-level RoPE with this layer's own embedding.
+        if self.rotary_pos_emb is not None and rotary_pos_emb is not None:
+            seq_len = rotary_pos_emb.shape[0]
+            rotary_pos_emb = self.rotary_pos_emb(seq_len)
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
