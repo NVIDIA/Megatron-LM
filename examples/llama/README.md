@@ -6,7 +6,7 @@
 - [3. Training Setup](#3-training-setup)
 - [4. Configuration](#4-configuration)
 - [5. Test Datasets](#5-test-datasets)
-- [6. FP8 Debugging](#6-fp8-debugging)
+- [6. FP8 Training Considerations](#6-fp8-training-considerations)
 
 ## 1. Overview
 <a id="overview" name="overview"></a>
@@ -98,7 +98,7 @@ Key training parameters:
 
 You can modify these parameters directly in the `train_llama3_8b_h100_fp8.sh` script.
 
-This configuration follows those defined in NeMo Framework's performance scripts, which can be found at [https://github.com/NVIDIA/NeMo/tree/main/scripts/performance](https://github.com/NVIDIA/NeMo/tree/main/scripts/performance). 
+This configuration follows those defined in NeMo Framework's [performance scripts](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/scripts/performance).
 
 ### FP8 Performance
 
