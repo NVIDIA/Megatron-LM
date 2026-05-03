@@ -318,9 +318,11 @@ class VocabParallelEmbedding(torch.nn.Module):
                 output = reduce_scatter_to_sequence_parallel_region(
                     output_parallel, group=self.tp_group
                 )
-        else:
+        elif self.tp_group.size() > 1:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+        else:
+            output = output_parallel
         return output
 
     def sharded_state_dict(
