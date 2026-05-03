@@ -1153,6 +1153,19 @@ wheels = [
 ]
 
 [[package]]
+name = "deprecation"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "packaging", version = "26.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5a/d3/8ae2869247df154b64c1884d7346d412fed0c49df84db635aab2d1c40e62/deprecation-2.1.0.tar.gz", hash = "sha256:72b3bde64e5d778694b0cf68178aed03d15e15477116add3fb773e581f9518ff", size = 173788, upload-time = "2020-04-20T14:23:38.738Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/02/c3/253a89ee03fc9b9682f1541728eb66db7db22148cd94f89ab22528cd1e1b/deprecation-2.1.0-py2.py3-none-any.whl", hash = "sha256:a10811591210e1fb0e768a8c25517cabeabcba6f0bf96564f8ff45189f90b14a", size = 11178, upload-time = "2020-04-20T14:23:36.581Z" },
+]
+
+[[package]]
 name = "dill"
 version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2725,8 +2738,8 @@ requires-dist = [
     { name = "flask-restful", marker = "extra == 'training'" },
     { name = "hypercorn", marker = "extra == 'dev'" },
     { name = "mamba-ssm", marker = "extra == 'ssm'", specifier = "~=2.2" },
-    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=6.0" },
-    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'lts'", specifier = "~=6.0" },
+    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
+    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'lts'", specifier = "~=7.0" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
     { name = "multi-storage-client", marker = "extra == 'lts'", specifier = "~=0.27" },
     { name = "numpy" },
@@ -2812,25 +2825,28 @@ test = [
 
 [[package]]
 name = "megatron-energon"
-version = "6.0.1"
+version = "7.3.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
     { name = "click" },
+    { name = "filetype" },
+    { name = "mfusepy" },
     { name = "multi-storage-client" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
     { name = "pillow" },
     { name = "pyyaml" },
+    { name = "rapidyaml" },
     { name = "s3fs", version = "2026.2.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.14' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "s3fs", version = "2026.3.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev') or (python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-lts') or (python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "tqdm" },
     { name = "webdataset" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/06/19/7cbb748913db83662c9e4a82164e2a008482048809d3aa163440aa3824bd/megatron_energon-6.0.1.tar.gz", hash = "sha256:39dddd2c91ddf2938ad5440a061363930b09a0c09ee1b459764df149cac34f21", size = 141410, upload-time = "2025-03-17T12:11:22.452Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fb/fb/bcc8a5b457887b1b477789464e8d16468d977deb73a931874e714e7ace6d/megatron_energon-7.3.2.tar.gz", hash = "sha256:24b6605731c374afa3369fae3fa284c8923ee7a11dc2d137d278b98cc1bb4713", size = 206666, upload-time = "2026-02-04T12:41:15.245Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/71/d8/d67bac7beaba18d595b3a7d038661b6f27d69fa2099b2fabe85a63343054/megatron_energon-6.0.1-py3-none-any.whl", hash = "sha256:2214250bdc7956791556f3a48b221601fd63d36844644cff9110c312b1cd47a5", size = 202240, upload-time = "2025-03-17T12:11:20.657Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/9b/857fc9cc81c209abb90a9cbf127ceeebdf7761683cb1797fc7d3b27f18ad/megatron_energon-7.3.2-py3-none-any.whl", hash = "sha256:151aeed2dbdfb1c168529c07dd3d123271658b2e557fc64625b4dbd2f3a9f31a", size = 283532, upload-time = "2026-02-04T12:41:12.25Z" },
 ]
 
 [package.optional-dependencies]
@@ -2840,7 +2856,15 @@ av-decode = [
     { name = "ebmlite" },
     { name = "filetype" },
     { name = "sortedcontainers" },
-    { name = "soundfile" },
+]
+
+[[package]]
+name = "mfusepy"
+version = "3.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/47/746287c8962274f73ee25edb3840d80899464bfffbe2c435424c2d60a071/mfusepy-3.1.1.tar.gz", hash = "sha256:338ece54513d7d1a5e9492837679a0c7432ecf96a03490a2683a1ce1d19570e1", size = 34549, upload-time = "2026-03-13T00:36:52.636Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c5/d5/56bc9326bf75f7ea0f4fe1178f5c9f20d1a1e15e288ecf66088513538ccd/mfusepy-3.1.1-py3-none-any.whl", hash = "sha256:69fb70cfc7f7cce595e6ff586f8451d8298f01f18286a157f24f564b24ec5a37", size = 28264, upload-time = "2026-03-13T00:36:51.843Z" },
 ]
 
 [[package]]
@@ -3278,16 +3302,16 @@ resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a9/75/10dd1f8116a8b796cb2c737b674e02d02e80454bda953fa7e65d8c12b016/numpy-2.0.2.tar.gz", hash = "sha256:883c987dee1880e2a864ab0dc9892292582510604156762362d9326444636e78", size = 18902015, upload-time = "2024-08-26T20:19:40.945Z" }
@@ -4313,16 +4337,16 @@ resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a1/d4/1fc4078c65507b51b96ca8f8c3ba19e6a61c8253c72794544580a7b6c24d/packaging-25.0.tar.gz", hash = "sha256:d443872c98d677bf60f6a1f2f8c1cb748e8fe762d2bf9d3148b5599295b0fc4f", size = 165727, upload-time = "2025-04-19T11:48:59.673Z" }
@@ -4371,16 +4395,16 @@ resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
@@ -5402,6 +5426,44 @@ wheels = [
 ]
 
 [[package]]
+name = "rapidyaml"
+version = "0.11.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "deprecation" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4a/3c/1255c270d39f54818aa7b6cd7b15711af74ae00a593e4226a98326accae4/rapidyaml-0.11.1.tar.gz", hash = "sha256:d0dd657ac031a69b22b03b812730e50825dffb5176c98e4f00723562c9e17435", size = 477760, upload-time = "2026-03-26T20:11:24.254Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/85/67/dc6ab5ee38aa8f94e773ad4cdf56114c87c083a33ae2b5ae65f5d090b634/rapidyaml-0.11.1-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:71b71b35a6e1b80f756a603a7c2580d03c3c15206907975eecfa866bc465d37d", size = 5118362, upload-time = "2026-03-26T20:10:34.048Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/ab/957837dc122e377aedd20735b1d72ec21da26a27f7bd2899fdd4d92cd037/rapidyaml-0.11.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:39855c8d26f73f738a4a62eca487323b635ed233d7ae9d0d64a38a7468e31f82", size = 5142234, upload-time = "2026-03-26T20:10:35.285Z" },
+    { url = "https://files.pythonhosted.org/packages/38/dd/8b76d6bf2bd8cf8a365c6b63fe1d7d964806c2f3e817bae314c8af93dee3/rapidyaml-0.11.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:70c847cdb075b5c9e930112b8d1c3dba45ebec818b4f2d11ec415b2cbc47abbd", size = 5118360, upload-time = "2026-03-26T20:10:36.507Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/9a/fefd1893581fd32a7b44053c6ba85260ad15f670a0e0f0d87536efd17fa0/rapidyaml-0.11.1-cp312-cp312-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:fec167d983ffe758426501d967cdd5879c02a240649b6dd190a80f3c681863dc", size = 287407, upload-time = "2026-03-26T20:10:37.992Z" },
+    { url = "https://files.pythonhosted.org/packages/82/73/ab2f34bb546fce8838c62da5900326fcf699c2df12d411961c9ea0bce452/rapidyaml-0.11.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f308ba57b08241b54ac2bc62d668c211ca64511d866a75d5aae7e7301c5bd147", size = 266375, upload-time = "2026-03-26T20:10:38.883Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/2e/b7308e69f9785cc3f627394ecdfdd74e1c5314b385c842b2d531f34e7f72/rapidyaml-0.11.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3bdeba481e3790895e05137c3f55f317706c9c3a0e7d9ae1db7dbbf781f212a6", size = 278602, upload-time = "2026-03-26T20:10:39.916Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/e0/71f84b2089ed78c513b90ecb8fcf17eeb07b67868012eb6e364353f42e68/rapidyaml-0.11.1-cp312-cp312-win32.whl", hash = "sha256:0f1b90fa01e69b8915a3d84a5d49c7a34870c2ca3f7eee5bf9ea52f32e878a8f", size = 251967, upload-time = "2026-03-26T20:10:41.158Z" },
+    { url = "https://files.pythonhosted.org/packages/da/e1/726f24df16506e0dafc0371e6e63b1ac98548f35d203ea6e87c8b402c7b5/rapidyaml-0.11.1-cp312-cp312-win_amd64.whl", hash = "sha256:2038802b708a7f48bb6804c4276989b2fe80398f6f4ed27790aba889e851c3dd", size = 298856, upload-time = "2026-03-26T20:10:42.176Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/ce/65ac759492c7e505ccdf671f91b01c8a03a6101a4179ba1c0051eed868c1/rapidyaml-0.11.1-cp312-cp312-win_arm64.whl", hash = "sha256:dd877fb2d5560bde24651c5367bc2e90813d9977da341cf5301be59f69e7975f", size = 297272, upload-time = "2026-03-26T20:10:43.143Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/ec/f73f015f5acc5c77f9e597d9fdc75ebf498d911f9fc4bf72698fddc207bc/rapidyaml-0.11.1-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:a977474e2e8d9127330830c66c22c4d2500ffb3226bd32734da6dcb1a5c1a192", size = 5047376, upload-time = "2026-03-26T20:10:44.183Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/f0/b0f1229917fb383f2e7b9def413676bab2caeb26496f355a7b0385dbe775/rapidyaml-0.11.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:39ac20fca7f13a60b343885c32a7bf9094a873731eebf8dbed9aeeb62ebe68a9", size = 5071258, upload-time = "2026-03-26T20:10:45.349Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/f5/b76f034f8d6beede4e0bd99e693c62fb8318eac74fc2caaa9f11f9607f11/rapidyaml-0.11.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:8a69dc73408e9ed5207d21f16facc508a78f4afaed93c2a2af41982759ac219d", size = 5047372, upload-time = "2026-03-26T20:10:46.655Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/ab/047f803294e6c0c725a1e8947435a26b2776f7a0bb6df2b3ab566c3516b0/rapidyaml-0.11.1-cp313-cp313-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:493ac3ab513e7fbabfe2fd7d7e538567194f67771c1c91b6ccf35e8f12fff55c", size = 287720, upload-time = "2026-03-26T20:10:47.804Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/a5/1b9e72dfb3615b7d2e731be690570927713fe73fa29607dcb4f4f3230d27/rapidyaml-0.11.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5ff9fb1ab32d83200a6423f166324fa1a61fda1150d356aeba38cb8e57c624db", size = 266021, upload-time = "2026-03-26T20:10:49.041Z" },
+    { url = "https://files.pythonhosted.org/packages/93/40/080cd559b58b94d155d79c8698f4fc4c9151eb023835271758663e64fb21/rapidyaml-0.11.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b93df1ac0ceec0f0af4ea989043fc1139000d6456b2e245c424965b75b08ed39", size = 278458, upload-time = "2026-03-26T20:10:49.944Z" },
+    { url = "https://files.pythonhosted.org/packages/43/59/b031e11f3228de2d59f4306adf06f440a4daeaf55a7ca4332b08de4f53c1/rapidyaml-0.11.1-cp313-cp313-win32.whl", hash = "sha256:5c36864c1a7fabcbfdfc85f553cb69798492c87cdcbeb9cd4d05fd7e4e4f677f", size = 251777, upload-time = "2026-03-26T20:10:50.884Z" },
+    { url = "https://files.pythonhosted.org/packages/22/fb/a2bb92d5714058f5c7b4fb5237bb5172d820f4452a56761aa99230d92633/rapidyaml-0.11.1-cp313-cp313-win_amd64.whl", hash = "sha256:9a990bb296574599d1a0de88ba59b5ed7d9f985cf08a2dd0e9168469cac2a52a", size = 298677, upload-time = "2026-03-26T20:10:51.825Z" },
+    { url = "https://files.pythonhosted.org/packages/49/0c/523f903a9302e71945fe9a59ea27a26026d3fcef4480029e25f49ad08e63/rapidyaml-0.11.1-cp313-cp313-win_arm64.whl", hash = "sha256:44534878072cf1089ac74cee5b4a70ce897592157c87fee66a4e04adcd51facf", size = 296775, upload-time = "2026-03-26T20:10:53.134Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/e4/ebfd2ad4b2715c5f839d407030aac839650853679e763bbeea56e3286126/rapidyaml-0.11.1-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:254e323f14d065a7bd4f3e42d56763643fcc953e8e4457d85d6ceccaa94b62c6", size = 5635232, upload-time = "2026-03-26T20:10:54.247Z" },
+    { url = "https://files.pythonhosted.org/packages/73/39/f6d94ff44e95ec0f409da80995cb63921506929e6591df02be01197c73d8/rapidyaml-0.11.1-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:ec199745c7dd63a14ec654fed4e8d8fa4e01fa3a61c333056f46426299aeec91", size = 5659207, upload-time = "2026-03-26T20:10:55.851Z" },
+    { url = "https://files.pythonhosted.org/packages/01/eb/cb3877c219dee9b1cb1d6a46e94c5c16ea4815a5aaef39d9692a38cc4f32/rapidyaml-0.11.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:2fecd28a1c367d1717698c45b59148a8e611399f46e7e0bfb296ccb3e0814a00", size = 5635229, upload-time = "2026-03-26T20:10:57.184Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/b7/55168039438bf952176d2163482eeb2b7dfdae4b540860b51ef27967eeed/rapidyaml-0.11.1-cp314-cp314-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:63af5e3ab735ecd931ada8cbd50f14188ad9a5b7951536f063e888d9441d7d2c", size = 287717, upload-time = "2026-03-26T20:10:58.561Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/e6/6746fc15c45138478446a1fe30e17d0faf56e27172905f7bc82818146433/rapidyaml-0.11.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d03040af7f7de6700716478d86da26426d9a6b5da07869a707e102584a086ca9", size = 266250, upload-time = "2026-03-26T20:10:59.494Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/d6/8418591f66cc239446562095568b339ed4a5ea956c2f7ae3304c9f7ebe83/rapidyaml-0.11.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b66e055a005a15e3c9b2b3e32b0371f9b6983dbf9b660dd9ff8f21fc028a52d4", size = 278431, upload-time = "2026-03-26T20:11:00.46Z" },
+    { url = "https://files.pythonhosted.org/packages/88/ab/ea88aab4b89708ddd0cb112c36dd81afb87dd1c868349d436f8c660a1cfd/rapidyaml-0.11.1-cp314-cp314-win32.whl", hash = "sha256:4e8cc921e90a705b72f0728c1625c9f10b2966b8774649c4c586152491a25bd0", size = 260421, upload-time = "2026-03-26T20:11:01.516Z" },
+    { url = "https://files.pythonhosted.org/packages/65/d4/7d5d16ca07b3ae8a996873ec2fec7c8807d83cb420dc1d5682c152d51c53/rapidyaml-0.11.1-cp314-cp314-win_amd64.whl", hash = "sha256:8d2bed1bdb83045d94cbde2133fc8df8869d2ab6b097339cfb974e2cd3917230", size = 308328, upload-time = "2026-03-26T20:11:02.847Z" },
+    { url = "https://files.pythonhosted.org/packages/36/50/563a53d9ce5291f021d6132797b9fa9ba0077b3aa162eb48da616494da66/rapidyaml-0.11.1-cp314-cp314-win_arm64.whl", hash = "sha256:22a92d7c225a3ed3d45cbe12a2de005d8e7b07520471aac8d43687fb5ac449b7", size = 307523, upload-time = "2026-03-26T20:11:03.733Z" },
+]
+
+[[package]]
 name = "ray"
 version = "2.55.1"
 source = { registry = "https://pypi.org/simple" }
@@ -6053,26 +6115,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e8/c4/ba2f8066cceb6f23394729afe52f3bf7adec04bf9ed2c820b39e19299111/sortedcontainers-2.4.0.tar.gz", hash = "sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88", size = 30594, upload-time = "2021-05-16T22:03:42.897Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/46/9cb0e58b2deb7f82b84065f37f3bffeb12413f947f9388e4cac22c4621ce/sortedcontainers-2.4.0-py2.py3-none-any.whl", hash = "sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0", size = 29575, upload-time = "2021-05-16T22:03:41.177Z" },
-]
-
-[[package]]
-name = "soundfile"
-version = "0.13.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "cffi" },
-    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e1/41/9b873a8c055582859b239be17902a85339bec6a30ad162f98c9b0288a2cc/soundfile-0.13.1.tar.gz", hash = "sha256:b2c68dab1e30297317080a5b43df57e302584c49e2942defdde0acccc53f0e5b", size = 46156, upload-time = "2025-01-25T09:17:04.831Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/64/28/e2a36573ccbcf3d57c00626a21fe51989380636e821b341d36ccca0c1c3a/soundfile-0.13.1-py2.py3-none-any.whl", hash = "sha256:a23c717560da2cf4c7b5ae1142514e0fd82d6bbd9dfc93a50423447142f2c445", size = 25751, upload-time = "2025-01-25T09:16:44.235Z" },
-    { url = "https://files.pythonhosted.org/packages/ea/ab/73e97a5b3cc46bba7ff8650a1504348fa1863a6f9d57d7001c6b67c5f20e/soundfile-0.13.1-py2.py3-none-macosx_10_9_x86_64.whl", hash = "sha256:82dc664d19831933fe59adad199bf3945ad06d84bc111a5b4c0d3089a5b9ec33", size = 1142250, upload-time = "2025-01-25T09:16:47.583Z" },
-    { url = "https://files.pythonhosted.org/packages/a0/e5/58fd1a8d7b26fc113af244f966ee3aecf03cb9293cb935daaddc1e455e18/soundfile-0.13.1-py2.py3-none-macosx_11_0_arm64.whl", hash = "sha256:743f12c12c4054921e15736c6be09ac26b3b3d603aef6fd69f9dde68748f2593", size = 1101406, upload-time = "2025-01-25T09:16:49.662Z" },
-    { url = "https://files.pythonhosted.org/packages/58/ae/c0e4a53d77cf6e9a04179535766b3321b0b9ced5f70522e4caf9329f0046/soundfile-0.13.1-py2.py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:9c9e855f5a4d06ce4213f31918653ab7de0c5a8d8107cd2427e44b42df547deb", size = 1235729, upload-time = "2025-01-25T09:16:53.018Z" },
-    { url = "https://files.pythonhosted.org/packages/57/5e/70bdd9579b35003a489fc850b5047beeda26328053ebadc1fb60f320f7db/soundfile-0.13.1-py2.py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:03267c4e493315294834a0870f31dbb3b28a95561b80b134f0bd3cf2d5f0e618", size = 1313646, upload-time = "2025-01-25T09:16:54.872Z" },
-    { url = "https://files.pythonhosted.org/packages/fe/df/8c11dc4dfceda14e3003bb81a0d0edcaaf0796dd7b4f826ea3e532146bba/soundfile-0.13.1-py2.py3-none-win32.whl", hash = "sha256:c734564fab7c5ddf8e9be5bf70bab68042cd17e9c214c06e365e20d64f9a69d5", size = 899881, upload-time = "2025-01-25T09:16:56.663Z" },
-    { url = "https://files.pythonhosted.org/packages/14/e9/6b761de83277f2f02ded7e7ea6f07828ec78e4b229b80e4ca55dd205b9dc/soundfile-0.13.1-py2.py3-none-win_amd64.whl", hash = "sha256:1e70a05a0626524a69e9f0f4dd2ec174b4e9567f4d8b6c11d38b5c289be36ee9", size = 1019162, upload-time = "2025-01-25T09:16:59.573Z" },
 ]
 
 [[package]]
