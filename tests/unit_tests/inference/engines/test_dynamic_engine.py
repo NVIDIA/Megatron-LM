@@ -133,6 +133,7 @@ class DynamicEngineTestConfig:
     )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
+    inference_moe_token_dispatcher_type: str = "nccl"
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -330,6 +331,9 @@ class DynamicInferenceEngineTestBase:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                inference_moe_token_dispatcher_type=(
+                    test_config.inference_moe_token_dispatcher_type
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -401,6 +405,9 @@ class DynamicInferenceEngineTestBase:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                inference_moe_token_dispatcher_type=(
+                    test_config.inference_moe_token_dispatcher_type
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -2294,7 +2301,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -2417,7 +2426,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2501,7 +2512,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2586,7 +2599,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2709,8 +2724,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Wrap the real MTP step similarly.
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def deterministic_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             logits[..., 0] = 100.0
             return hidden_states, logits
@@ -2863,8 +2882,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
             real_mtp = model.compute_mtp_single_step
 
-            def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-                hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+            def deterministic_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+            ):
+                hidden_states, logits = real_mtp(
+                    hidden_states,
+                    next_token_ids,
+                    position_ids,
+                    depth,
+                    eager=eager,
+                    cache_key=cache_key,
+                )
                 logits.zero_()
                 logits[..., 0] = 100.0
                 return hidden_states, logits
@@ -2940,7 +2968,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3153,7 +3183,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3273,7 +3305,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3403,7 +3437,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3656,7 +3692,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_wrong(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_wrong(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             wrong_toks = (next_token_ids + 5).clamp(max=test_config.vocab_size - 1)
             logits = torch.zeros(
@@ -3752,7 +3790,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
             logits = torch.zeros(
@@ -3864,8 +3904,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def deterministic_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             logits[..., 0] = 100.0
             return hidden_states, logits
@@ -3973,8 +4017,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Deterministic MTP: also predict token 0 → all speculative tokens accepted.
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def deterministic_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             logits[..., 0] = 100.0
             return hidden_states, logits
@@ -4045,8 +4093,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # During prefill, no MTP runs, so request 2 is unaffected.
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def heterogeneous_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def heterogeneous_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             n = logits.size(0)
             logits.zero_()
             if n >= 2:
@@ -4144,8 +4196,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def deterministic_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             logits[..., 0] = 100.0
             return hidden_states, logits
@@ -4247,9 +4303,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def mtp_with_rejection(hidden_states, next_token_ids, position_ids, depth):
+        def mtp_with_rejection(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
             # Run real MTP to exercise Mamba intermediate state saving.
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             if rejection_mode == "all_accepted":
                 # Predict token 0 (same as base) → accepted.
