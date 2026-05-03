@@ -133,6 +133,7 @@ class DynamicEngineTestConfig:
     )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
+    inference_moe_token_dispatcher_type: str = "nccl"
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -330,6 +331,9 @@ class DynamicInferenceEngineTestBase:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                inference_moe_token_dispatcher_type=(
+                    test_config.inference_moe_token_dispatcher_type
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -401,6 +405,9 @@ class DynamicInferenceEngineTestBase:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                inference_moe_token_dispatcher_type=(
+                    test_config.inference_moe_token_dispatcher_type
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
