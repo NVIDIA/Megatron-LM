@@ -1083,7 +1083,7 @@ class TextGenerationController:
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
-        required_logit_indices = context.speculative_required_logit_indices(logits.device)
+        required_logit_indices = context.speculative_required_logit_indices()
 
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.

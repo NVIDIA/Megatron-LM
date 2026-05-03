@@ -1,8 +1,7 @@
 ---
 name: run-on-slurm
 description: How to launch distributed Megatron-LM training jobs on a SLURM cluster. Covers a minimal sbatch skeleton, environment-variable setup for torch.distributed.run, CUDA_DEVICE_MAX_CONNECTIONS rules across hardware and parallelism modes, container conventions, monitoring, and per-rank failure diagnosis.
-TRIGGER when: user asks to submit a SLURM job for Megatron-LM, write or debug an sbatch script, configure multi-node distributed training, set MASTER_ADDR / MASTER_PORT / WORLD_SIZE, or diagnose a SLURM job failure.
-DO NOT TRIGGER when: user is running on a single GPU node without SLURM; user is asking about CI test infrastructure (use ci-test-system); user is asking about container builds or dependency management (use build-and-dependency).
+when_to_use: Submitting a SLURM job; writing or debugging an sbatch script; configuring multi-node distributed training; setting MASTER_ADDR / MASTER_PORT / WORLD_SIZE; diagnosing a SLURM job failure; 'how do I run on the cluster', 'sbatch', 'multi-node training'.
 ---
 
 # Run Megatron-LM on SLURM
