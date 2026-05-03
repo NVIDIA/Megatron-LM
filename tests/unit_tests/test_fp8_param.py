@@ -150,7 +150,7 @@ class TestFP8Param:
 
         if use_cuda_graph:
             args.cuda_graph_impl = "transformer_engine"
-            args.cuda_graph_warmup_steps = 0
+            args.cuda_graph_warmup_steps = 1
 
         for key, value in kwargs.items():
             assert hasattr(args, key)
@@ -276,8 +276,7 @@ class TestFP8Param:
                 optimizer.zero_grad()
 
             # Capture CUDA graphs after warmup if helper is provided.
-            # Hard coded cuda_graph_warmup_steps = 0.
-            cuda_graph_warmup_steps = 0
+            cuda_graph_warmup_steps = 1
             if self.cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
                 if should_disable_forward_pre_hook(args):
                     disable_forward_pre_hook(gpt_model, param_sync=False)
