@@ -33,7 +33,7 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
     try:
         if args.ckpt_format == "torch":
             # Non-sharded
-            state_dict, _, _ = _load_base_checkpoint(checkpoint_path, rank0=False)
+            state_dict, _, _, _ = _load_base_checkpoint(checkpoint_path, args, rank0=False)
             if state_dict is None:
                 return False
             if "modelopt_state" not in state_dict:
@@ -107,7 +107,7 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
         # Non-sharded
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
-            state_dict, _, _ = _load_base_checkpoint(args.load, rank0=False)
+            state_dict, _, _, _ = _load_base_checkpoint(load_dir, args, rank0=False)
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
             return
