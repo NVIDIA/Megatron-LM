@@ -2092,6 +2092,16 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    # Destroy NCCL subgroups before nulling references — without this their
+    # NVLS multicast bindings leak across re-inits and eventually surface as
+    # a spurious OOM in transport/nvls.cc. Entry 0 is the default group.
+    global _global_process_group_list
+    if _global_process_group_list is not None:
+        pg_map = torch.distributed.distributed_c10d._world.pg_map
+        for group in _global_process_group_list[1:]:
+            if group is not None and pg_map.get(group, None) is not None:
+                torch.distributed.destroy_process_group(group)
+
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
 
@@ -2232,7 +2242,6 @@ def destroy_model_parallel():
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
-    global _global_process_group_list
     _global_process_group_list = None
 
     SymmetricMemoryManager.destroy()

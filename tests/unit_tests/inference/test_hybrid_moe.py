@@ -65,8 +65,11 @@ _EP_SIZE = 4
 # For _EP_SIZE=4 this gives C(4+4-1, 4) = 35 test cases.
 #
 # Edge states (PREFILL_AT_MAX_TOKENS, DECODE_AT_MAX_REQUESTS, MIXED_GIANT_PREFILL)
-# are not swept combinatorially — one rank in the edge state against a fixed
-# peer is sufficient.
+# are NOT swept combinatorially: the NVLS dispatcher matches cuda-graph dims
+# independently per rank, so a combo mixing edge and non-edge ranks deadlocks
+# (some ranks capture cuda graphs while others run eager — the EP collective
+# inside the graph never gets its peer). One rank in the edge state against a
+# fixed peer is sufficient and is covered by the dedicated NCCL tests below.
 _STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZE))
 
 
