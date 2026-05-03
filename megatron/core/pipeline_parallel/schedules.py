@@ -2066,10 +2066,6 @@ def forward_backward_pipelining_without_interleaving(
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
-    if config.overlap_p2p_comm:
-        raise ValueError(
-            "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
-        )
 
     tp_group, cp_group, cp_size = None, None, None
 
@@ -2078,6 +2074,37 @@ def forward_backward_pipelining_without_interleaving(
     is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection) or isinstance(
         p2p_communicator, MultiModulePipelineCommunicator
     )
+
+    if config.overlap_p2p_comm:
+        if forward_only:
+            raise NotImplementedError(
+                "v1 non-interleaved overlap only supports training, not forward_only=True"
+            )
+        if is_multimodule:
+            raise NotImplementedError(
+                "v1 non-interleaved overlap does not support multimodule pipelines"
+            )
+        if adjust_tensor_shapes_fn is not None:
+            raise NotImplementedError(
+                "v1 non-interleaved overlap does not support adjust_tensor_shapes_fn"
+            )
+        if config.overlap_p2p_comm_warmup_flush:
+            raise NotImplementedError(
+                "v1 non-interleaved overlap only supports steady-state overlap, "
+                "not overlap_p2p_comm_warmup_flush"
+            )
+        if config.batch_p2p_comm:
+            raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
+        if config.use_ring_exchange_p2p:
+            raise NotImplementedError(
+                "v1 non-interleaved overlap does not support use_ring_exchange_p2p"
+            )
+        if config.variable_seq_lengths:
+            raise NotImplementedError(
+                "v1 non-interleaved overlap does not support variable_seq_lengths"
+            )
+        if config.mtp_standalone:
+            raise NotImplementedError("v1 non-interleaved overlap does not support mtp_standalone")
 
     if p2p_communicator is None and pg_collection is None:
         # Default: single-module with parallel_state groups
@@ -2210,6 +2237,13 @@ def forward_backward_pipelining_without_interleaving(
             recv_tensor_shapes, send_tensor_shapes
         )
 
+    if config.overlap_p2p_comm:
+        if len(recv_tensor_shapes) != len(send_tensor_shapes):
+            raise NotImplementedError(
+                "v1 non-interleaved overlap expects matching recv/send tensor shape counts, "
+                f"got recv={len(recv_tensor_shapes)} vs send={len(send_tensor_shapes)}"
+            )
+
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
@@ -2219,6 +2253,10 @@ def forward_backward_pipelining_without_interleaving(
         input_tensors = []
         output_tensors = []
     forward_data_store = []
+
+    pending_next_input_tensor = None
+    pending_bwd_fwd_handles = None
+    pending_fwd_bwd_handles = None
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
@@ -2277,32 +2315,50 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
-            ),
-            current_microbatch=i + num_warmup_microbatches,
-            is_last_stage=p2p_communicator.is_pp_last_stage,
-        )
-        total_num_tokens += num_tokens
-
         if forward_only:
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=i + num_warmup_microbatches,
+                is_last_stage=p2p_communicator.is_pp_last_stage,
+            )
+            total_num_tokens += num_tokens
             p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
             if not last_iteration:
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
-        else:
+        elif not config.overlap_p2p_comm:
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=i + num_warmup_microbatches,
+                is_last_stage=p2p_communicator.is_pp_last_stage,
+            )
+            total_num_tokens += num_tokens
+
             output_tensor_grad = p2p_communicator.send_forward_recv_backward(
                 output_tensor, send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
@@ -2336,6 +2392,99 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
+        else:
+            if i > 0:
+                pending_bwd_fwd_handles.wait_recv_prev()
+                input_tensor = pending_next_input_tensor
+                pending_next_input_tensor = None
+
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=i + num_warmup_microbatches,
+                is_last_stage=p2p_communicator.is_pp_last_stage,
+            )
+            total_num_tokens += num_tokens
+
+            if i > 0 and pending_fwd_bwd_handles is not None:
+                # When deallocate_pipeline_outputs=True, the previous iteration already
+                # waited on wait_send_next() before deallocation, so this is a safe no-op.
+                pending_fwd_bwd_handles.wait_send_next()
+
+            output_tensor_grad, pending_fwd_bwd_handles = (
+                p2p_communicator.send_forward_recv_backward(
+                    output_tensor,
+                    send_tensor_shapes,
+                    p2p_communicator.is_pp_last_stage,
+                    overlap_p2p_comm=True,
+                )
+            )
+
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+
+            if config.deallocate_pipeline_outputs:
+                # The send must complete before output_tensor is deallocated.
+                # wait_send_next() clears the handle list, so the next iteration can
+                # safely call wait_send_next() again as a no-op.
+                pending_fwd_bwd_handles.wait_send_next()
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+
+            pending_fwd_bwd_handles.wait_recv_next()
+
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
+
+            if num_warmup_microbatches == 0 and last_iteration:
+                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                    enable_grad_sync()
+
+            input_tensor_grad = backward_func(
+                input_tensor, output_tensor, output_tensor_grad, config
+            )
+
+            if i > 0 and pending_bwd_fwd_handles is not None:
+                pending_bwd_fwd_handles.wait_send_prev()
+                pending_bwd_fwd_handles = None
+
+            if last_iteration:
+                input_tensor = None
+                p2p_communicator.send_backward(
+                    input_tensor_grad, p2p_communicator.is_pp_first_stage
+                )
+            else:
+                pending_next_input_tensor, pending_bwd_fwd_handles = (
+                    p2p_communicator.send_backward_recv_forward(
+                        input_tensor_grad,
+                        recv_tensor_shapes,
+                        p2p_communicator.is_pp_first_stage,
+                        overlap_p2p_comm=True,
+                    )
+                )
+
+    if config.overlap_p2p_comm and not forward_only:
+        if pending_fwd_bwd_handles is not None:
+            pending_fwd_bwd_handles.wait_send_next()
+            pending_fwd_bwd_handles = None
+        if pending_bwd_fwd_handles is not None:
+            pending_bwd_fwd_handles.wait_recv_prev()
+            pending_bwd_fwd_handles.wait_send_prev()
+            pending_bwd_fwd_handles = None
+            pending_next_input_tensor = None
+        assert pending_fwd_bwd_handles is None
+        assert pending_bwd_fwd_handles is None
+        assert pending_next_input_tensor is None
 
     # Run cooldown backward passes.
     if not forward_only:

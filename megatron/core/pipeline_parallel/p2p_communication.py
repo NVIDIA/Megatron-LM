@@ -11,7 +11,84 @@ from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_
 from megatron.core.utils import nvtx_decorator
 
 # Types
-Shape = Union[List[int], torch.Size]
+Shape = Union[List[int], Tuple[int, ...], torch.Size]
+
+
+class P2PAsyncHandleSet:
+    """Lightweight container for async P2P communication handles."""
+
+    def __init__(self):
+        self.send_prev: List = []
+        self.send_next: List = []
+        self.recv_prev: List = []
+        self.recv_next: List = []
+
+    def extend_from_raw_reqs(self, raw_reqs):
+        """Aggregate direction-specific handles from the raw req mapping."""
+        if raw_reqs is None:
+            return
+
+        if not isinstance(raw_reqs, dict):
+            raise NotImplementedError(
+                "v1 overlap handle aggregation only supports dict-style raw reqs "
+                "(from _p2p_ops); batch_p2p_comm and ring_exchange are not supported"
+            )
+
+        if "send_prev" in raw_reqs:
+            self.send_prev.append(raw_reqs["send_prev"])
+        if "send_next" in raw_reqs:
+            self.send_next.append(raw_reqs["send_next"])
+        if "recv_prev" in raw_reqs:
+            self.recv_prev.append(raw_reqs["recv_prev"])
+        if "recv_next" in raw_reqs:
+            self.recv_next.append(raw_reqs["recv_next"])
+
+    def wait_send_prev(self):
+        for req in self.send_prev:
+            req.wait()
+        self.send_prev = []
+
+    def wait_send_next(self):
+        for req in self.send_next:
+            req.wait()
+        self.send_next = []
+
+    def wait_recv_prev(self):
+        for req in self.recv_prev:
+            req.wait()
+        self.recv_prev = []
+
+    def wait_recv_next(self):
+        for req in self.recv_next:
+            req.wait()
+        self.recv_next = []
+
+    def wait_all(self):
+        self.wait_send_prev()
+        self.wait_send_next()
+        self.wait_recv_prev()
+        self.wait_recv_next()
+
+
+def _normalize_tensor_shapes(tensor_shapes):
+    """Normalize tensor_shapes to always be a list of shapes."""
+    if is_single_shape(tensor_shapes):
+        return [tensor_shapes], True
+    return list(tensor_shapes), False
+
+
+def _normalize_optional_tensors(tensors, expected_len, name):
+    """Wrap a single tensor into a one-element list and validate length."""
+    unwrap_output = not isinstance(tensors, list)
+    tensor_list = [tensors] if unwrap_output else list(tensors)
+
+    if len(tensor_list) != expected_len:
+        raise ValueError(
+            f"{name} length ({len(tensor_list)}) does not match "
+            f"tensor_shapes length ({expected_len})"
+        )
+
+    return tensor_list, unwrap_output
 
 
 def _batched_p2p_ops(
@@ -303,7 +380,7 @@ class P2PCommunicator:
                 tensors sent and received in a single function call are
                 the same shape).
 
-            wait_on_reqs (boolean, optional, default=False):
+            wait_on_reqs (boolean, optional, default=True):
                 For non-batched p2p communication, wait on each request
                 before returning.
 
@@ -525,68 +602,104 @@ class P2PCommunicator:
 
     @nvtx_decorator()
     def send_forward_recv_backward(
-        self, output_tensors, tensor_shapes, is_last_stage: bool
-    ) -> Union[torch.Tensor, list[torch.Tensor]]:
-        """Batched send and recv with next rank in pipeline."""
+        self, output_tensors, tensor_shapes, is_last_stage: bool, overlap_p2p_comm: bool = False
+    ) -> Union[
+        torch.Tensor,
+        list[torch.Tensor],
+        Tuple[Union[torch.Tensor, list[torch.Tensor]], P2PAsyncHandleSet],
+    ]:
+        """Batched send and recv with next rank in pipeline.
+
+        When overlap_p2p_comm is True, the communication is issued
+        asynchronously and the method returns (output_tensor_grads, handle_set).
+        """
         config = self.config
-        unwrap_output_tensors = False
-        if not isinstance(output_tensors, list):
-            unwrap_output_tensors = True
-            output_tensors = [output_tensors]
-        if not isinstance(tensor_shapes, list):
-            tensor_shapes = [tensor_shapes]
-        output_tensor_grads = []
-        for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
-            if is_last_stage:
-                output_tensor_grad = None
-            else:
+        tensor_shape_list, _ = _normalize_tensor_shapes(tensor_shapes)
+        output_tensor_list, unwrap_output = _normalize_optional_tensors(
+            output_tensors, expected_len=len(tensor_shape_list), name="output_tensors"
+        )
+
+        if is_last_stage:
+            output_tensor_grads = [None] * len(tensor_shape_list)
+            handle_set = P2PAsyncHandleSet()
+        else:
+            output_tensor_grads = []
+            handle_set = P2PAsyncHandleSet()
+            for output_tensor, tensor_shape in zip(output_tensor_list, tensor_shape_list):
                 if config.timers is not None:
                     config.timers('forward-send-backward-recv', log_level=2).start()
-                _, output_tensor_grad, _ = self._communicate(
+                _, output_tensor_grad, raw_reqs = self._communicate(
                     tensor_send_next=output_tensor,
                     tensor_send_prev=None,
                     recv_prev=False,
                     recv_next=True,
                     tensor_shape=tensor_shape,
+                    wait_on_reqs=(not overlap_p2p_comm),
                 )
                 if config.timers is not None:
                     config.timers('forward-send-backward-recv').stop()
-            output_tensor_grads.append(output_tensor_grad)
-        if unwrap_output_tensors:
-            return output_tensor_grads[0]
+                output_tensor_grads.append(output_tensor_grad)
+                if overlap_p2p_comm:
+                    handle_set.extend_from_raw_reqs(raw_reqs)
+
+        if unwrap_output:
+            output_tensor_grads = output_tensor_grads[0]
+
+        if overlap_p2p_comm:
+            return output_tensor_grads, handle_set
         return output_tensor_grads
 
     @nvtx_decorator()
     def send_backward_recv_forward(
-        self, input_tensor_grads, tensor_shapes, is_first_stage: bool
-    ) -> Union[torch.Tensor, list[torch.Tensor]]:
-        """Batched send and recv with previous rank in pipeline."""
+        self,
+        input_tensor_grads,
+        tensor_shapes,
+        is_first_stage: bool,
+        overlap_p2p_comm: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        list[torch.Tensor],
+        Tuple[Union[torch.Tensor, list[torch.Tensor]], P2PAsyncHandleSet],
+    ]:
+        """Batched send and recv with previous rank in pipeline.
+
+        When overlap_p2p_comm is True, the communication is issued
+        asynchronously and the method returns (input_tensors, handle_set).
+        """
         config = self.config
-        unwrap_input_tensor_grads = False
-        if not isinstance(input_tensor_grads, list):
-            unwrap_input_tensor_grads = True
-            input_tensor_grads = [input_tensor_grads]
-        if not isinstance(tensor_shapes, list):
-            tensor_shapes = [tensor_shapes]
-        input_tensors = []
-        for input_tensor_grad, tensor_shape in zip(input_tensor_grads, tensor_shapes):
-            if is_first_stage:
-                input_tensor = None
-            else:
+        tensor_shape_list, _ = _normalize_tensor_shapes(tensor_shapes)
+        input_tensor_grad_list, unwrap_output = _normalize_optional_tensors(
+            input_tensor_grads, expected_len=len(tensor_shape_list), name="input_tensor_grads"
+        )
+
+        if is_first_stage:
+            input_tensors = [None] * len(tensor_shape_list)
+            handle_set = P2PAsyncHandleSet()
+        else:
+            input_tensors = []
+            handle_set = P2PAsyncHandleSet()
+            for input_tensor_grad, tensor_shape in zip(input_tensor_grad_list, tensor_shape_list):
                 if config.timers is not None:
                     config.timers('backward-send-forward-recv', log_level=2).start()
-                input_tensor, _, _ = self._communicate(
+                input_tensor, _, raw_reqs = self._communicate(
                     tensor_send_next=None,
                     tensor_send_prev=input_tensor_grad,
                     recv_prev=True,
                     recv_next=False,
                     tensor_shape=tensor_shape,
+                    wait_on_reqs=(not overlap_p2p_comm),
                 )
                 if config.timers is not None:
                     config.timers('backward-send-forward-recv').stop()
-            input_tensors.append(input_tensor)
-        if unwrap_input_tensor_grads:
-            return input_tensors[0]
+                input_tensors.append(input_tensor)
+                if overlap_p2p_comm:
+                    handle_set.extend_from_raw_reqs(raw_reqs)
+
+        if unwrap_output:
+            input_tensors = input_tensors[0]
+
+        if overlap_p2p_comm:
+            return input_tensors, handle_set
         return input_tensors
 
     @nvtx_decorator()
