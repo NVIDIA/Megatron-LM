@@ -22,6 +22,8 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
+    FUSION_START = "["
+    FUSION_END = "]"
     VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
 
     @classmethod
@@ -137,8 +139,8 @@ def get_hybrid_total_layer_count(pattern: str) -> int:
         Total number of layers in the main decoder pattern.
     """
     main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0]
-    _validate_pattern(main_pattern, "main", allow_pipe=True)
-    return len(main_pattern.replace(Symbols.PIPE, ''))
+    _validate_pattern(main_pattern, "main", allow_pipe=True, allow_brackets=True)
+    return count_pattern_layers(main_pattern)
 
 
 def get_hybrid_total_pipeline_segment_count(pattern: str) -> int:
@@ -204,7 +206,49 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     depth. The main pattern may contain "|" pipe symbols for pipeline stage
     boundaries.
 
+    A matching pair of "[" and "]" square brackets indicates that a fusion optimization should be
+    applied. Currently, this only works for an Attention/sequence mixer variant followed by an MLP
+    variant, e.g., "*-" for Attention+MLP or "ME" for Mamba+MoE. The contents in the pairs may not
+    cross pipeline and MTP boundaries.
+
     Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+
+    Semantics of layer counting in the presence of fusion:
+
+    - A fused group `[XY]` counts as one (1) physical transformer block. Every
+      function in this module that returns a "number of layers" (such as
+      `get_hybrid_total_layer_count`, `count_pattern_layers`, or the length of
+      the list returned by `validate_segment_layers`) follows this convention.
+      Pipeline parallelism, VPP/fVPP offsets, and `config.num_layers` all use
+      the physical-block count.
+    - `get_hybrid_layer_counts` returns per-type sub-layer counts (it counts
+      each character inside `[...]` separately). This is the right count for
+      FLOPs or parameter budgeting – a fused `[*-]` does attention + MLP
+      compute, so `{"*": 1, "-": 1}` accurately reflects the work done.
+
+    Pipeline-parallelism caveats when fusion is used:
+
+    - Auto-split PP (a pipeless pattern with `pipeline_model_parallel_size >
+      1`) slices `layer_type_list` into equal-sized physical-block chunks.
+      Ranks whose chunk lands on fused blocks do more compute per block than
+      ranks that get stand-alone blocks, which widens the PP bubble. Use
+      explicit "|" separators to place fused blocks by compute rather than by
+      block count.
+    - `--decoder-first-pipeline-num-layers` / `--decoder-last-pipeline-num-layers`
+      count physical blocks, not sub-layers. Fusing blocks on only the first
+      or last stage therefore silently skews compute relative to the middle
+      stages.
+    - fVPP with explicit "|" gives full control over per-segment layout, but
+      note that two patterns with the same sub-layer compute can have
+      *different* physical-block counts (e.g., `*-M*` = 4 blocks vs. `[*-]M*`
+      = 3 blocks). VPP scheduling is driven by physical-block segments, so
+      fused and unfused segments are not schedule-equivalent even when their
+      FLOPs match.
+    - Per-layer metrics (grad norms, router stats, loss contributions) are
+      keyed on `layer.layer_number`, which is the physical-block index. A
+      fused block's attention and MLP sub-layers share the same layer number,
+      so dashboards that separate metrics per sub-layer type will conflate
+      them inside a fused block.
 
     Args:
         pattern: Unified pattern string, e.g., "M*M*/MM/MM" or just "M*M*"
@@ -228,22 +272,30 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
 
         >>> parse_hybrid_pattern("M-M-|M-M*-/MM/MM")
         ParsedHybridPattern(main_pattern="M-M-|M-M*-", mtp_pattern="MM", mtp_num_depths=2)
+
+        >>> parse_hybrid_pattern("[M-][M-]|[M-]M[*-]/MM/MM")
+        ParsedHybridPattern(main_pattern="[M-][M-]|[M-]M[*-]", mtp_pattern="MM", mtp_num_depths=2)
     """
     if pattern is None:
         return ParsedHybridPattern(main_pattern=None, mtp_pattern=None, mtp_num_depths=0)
+
+    # Validate bracket structure before splitting on '/', otherwise a fusion
+    # group that crosses the MTP boundary looks like two unrelated unmatched
+    # bracket errors.
+    _validate_brackets(pattern, "hybrid")
 
     parts = pattern.split(Symbols.MTP_SEPARATOR)
 
     if len(parts) == 1:
         # No MTP separator found - pattern is main decoder only
         main_pattern = parts[0]
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, "main", allow_pipe=True, allow_brackets=True)
         return ParsedHybridPattern(main_pattern=main_pattern, mtp_pattern=None, mtp_num_depths=0)
 
     # First part is main decoder pattern
     main_pattern = parts[0]
     if main_pattern:
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, "main", allow_pipe=True, allow_brackets=True)
 
     # Remaining parts are MTP patterns (one per depth)
     mtp_parts = parts[1:]
@@ -264,7 +316,7 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
                 f"Full pattern: '{pattern}'"
             )
 
-    _validate_pattern(mtp_pattern, "MTP", allow_pipe=False)
+    _validate_pattern(mtp_pattern, "MTP", allow_pipe=False, allow_brackets=True)
 
     return ParsedHybridPattern(
         main_pattern=main_pattern if main_pattern else None,
@@ -273,18 +325,27 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     )
 
 
-def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False) -> None:
+def _validate_pattern(
+    pattern: str, pattern_name: str, allow_pipe: bool = False, allow_brackets: bool = False
+) -> None:
     """Validate that a pattern contains only valid layer symbols.
 
     Args:
         pattern: Layer pattern string to validate
         pattern_name: Name of pattern for error messages (e.g., "main" or "MTP")
         allow_pipe: Whether to allow the pipe '|' separator (for main patterns)
+        allow_brackets: Whether to allow fusion bracket markers '[' and ']'
 
     Raises:
-        ValueError: If pattern contains invalid symbols
+        ValueError: If pattern contains invalid symbols or brackets are malformed
     """
-    valid_chars = Symbols.VALID_LAYERS | {Symbols.PIPE} if allow_pipe else Symbols.VALID_LAYERS
+    valid_chars = Symbols.VALID_LAYERS.copy()
+    if allow_pipe:
+        valid_chars.add(Symbols.PIPE)
+    if allow_brackets:
+        valid_chars.add(Symbols.FUSION_START)
+        valid_chars.add(Symbols.FUSION_END)
+
     for char in pattern:
         if char not in valid_chars:
             raise ValueError(
@@ -292,39 +353,300 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
                 f"Valid symbols are: {valid_chars}"
             )
 
+    if allow_brackets:
+        _validate_brackets(pattern, pattern_name)
+
     # Disallow Attention + MLA/DSA hybridity.
     if Symbols.ATTENTION in pattern and Symbols.DS_ATTENTION in pattern:
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+
+
+def _validate_brackets(pattern: str, pattern_name: str) -> None:
+    """Validate that fusion brackets in `pattern` are well-formed.
+
+    This only enforces syntactic well-formedness. Semantic constraints on
+    fusion groups (exactly two layers, sequence-mixer followed by channel-mixer)
+    are validated later, at the point where the fused layer is actually
+    constructed.
+
+    Rules:
+        - Brackets must be balanced: every '[' must have a matching ']'.
+        - No nesting: '[' inside an open bracket group is invalid.
+        - No empty groups: '[]' with no layer symbols inside is invalid.
+        - A bracket group must contain at least 2 layer symbols (fusion of one
+          layer is meaningless).
+        - Bracket groups may not span across pipe ('|') or MTP ('/') boundaries.
+
+    Args:
+        pattern: The pattern string (already validated for character legality).
+        pattern_name: Human-readable name for error messages.
+
+    Raises:
+        ValueError: On any bracket violation.
+    """
+    depth = 0
+    group_layer_count = 0
+
+    for i, char in enumerate(pattern):
+        if char == Symbols.FUSION_START:
+            if depth > 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, nested '[' at position {i} is not allowed. "
+                    f"Pattern: '{pattern}'"
+                )
+            depth += 1
+            group_layer_count = 0
+        elif char == Symbols.FUSION_END:
+            if depth <= 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, unmatched ']' at position {i}. "
+                    f"Pattern: '{pattern}'"
+                )
+            if group_layer_count == 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, empty fusion group '[]' at position {i}. "
+                    f"Pattern: '{pattern}'"
+                )
+            if group_layer_count < 2:
+                raise ValueError(
+                    f"In {pattern_name} pattern, fusion group ending at position {i} "
+                    f"contains only {group_layer_count} layer – need at least 2. "
+                    f"Pattern: '{pattern}'"
+                )
+            depth -= 1
+        elif char == Symbols.PIPE:
+            if depth > 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, pipe '|' at position {i} appears "
+                    f"inside a fusion group '[...|...]'. Fusion groups may not cross "
+                    f"pipeline boundaries. Pattern: '{pattern}'"
+                )
+        elif char == Symbols.MTP_SEPARATOR:
+            if depth > 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, MTP separator '/' at position {i} appears "
+                    f"inside a fusion group '[.../...]'. Fusion groups may not cross "
+                    f"multi-token prediction boundaries. Pattern: '{pattern}'"
+                )
+        else:
+            # Must be a valid layer symbol.
+            if depth > 0:
+                group_layer_count += 1
+
+    if depth > 0:
+        raise ValueError(
+            f"In {pattern_name} pattern, unmatched '[' with no closing ']'. "
+            f"Pattern: '{pattern}'"
+        )
+    # This should never happen with the above logic.
+    if depth < 0:
+        raise ValueError(
+            f"In {pattern_name} pattern, found more ']' than '[' brackets. Pattern: '{pattern}'"
+        )
+
+
+def strip_brackets(pattern: str) -> str:
+    """Remove fusion bracket markers from a pattern string.
+
+    Returns the pattern with all '[' and ']' characters removed, leaving only
+    layer symbols and (if present) pipe and MTP separators.
+
+    Args:
+        pattern: A pattern string that may contain fusion brackets.
+
+    Returns:
+        The pattern with brackets stripped.
+
+    Examples:
+        >>> strip_brackets("[*-]M[*-]M")
+        '*-M*-M'
+        >>> strip_brackets("M*M*")
+        'M*M*'
+    """
+    return pattern.replace(Symbols.FUSION_START, '').replace(Symbols.FUSION_END, '')
+
+
+def count_pattern_layers(pattern: str) -> int:
+    """Count the number of physical layer blocks in a pattern.
+
+    Each fusion group `[...]` counts as a single layer (because its sub-layers
+    are fused into one transformer block at runtime), regardless of how many
+    sub-layer symbols it contains. Pipe and MTP separators are ignored.
+
+    Args:
+        pattern: A pattern string that may contain fusion brackets and/or
+            pipe/MTP separators. Assumed to have already passed bracket
+            validation.
+
+    Returns:
+        Number of physical layer blocks the pattern represents.
+
+    Examples:
+        >>> count_pattern_layers("M*M*")
+        4
+        >>> count_pattern_layers("[*-]M[*-]M")  # 2 fused + 2 mamba
+        4
+        >>> count_pattern_layers("[*-]M|[*-]M")
+        4
+    """
+    count = 0
+    in_group = False
+    for char in pattern:
+        if char == Symbols.FUSION_START:
+            in_group = True
+            count += 1  # whole group counts as one block
+        elif char == Symbols.FUSION_END:
+            in_group = False
+        elif char in (Symbols.PIPE, Symbols.MTP_SEPARATOR):
+            continue
+        elif not in_group and char in Symbols.VALID_LAYERS:
+            count += 1
+    return count
+
+
+def get_sub_layer_offset(main_pattern: str, physical_offset: int) -> int:
+    """Count sub-layers corresponding to the first `physical_offset` physical blocks.
+
+    A fused group `[XY]` counts as one physical block but contains `len(XY)`
+    sub-layers; a stand-alone symbol counts as one of each. Pipe '|' separators
+    are ignored – sub-layer indices are global across pipeline segments, so
+    this helper returns the value `HybridStack` needs to emit checkpoint keys
+    in the canonical unfused layout regardless of fusion placement.
+
+    This is the sub-layer analogue of the physical-block offset returned by
+    `select_pipeline_segment`.
+
+    Args:
+        main_pattern: Main decoder pattern (may contain '|' and '[...]').
+            Assumed already validated (`_validate_pattern` with
+            `allow_pipe=True, allow_brackets=True`).
+        physical_offset: Number of physical blocks preceding the point of
+            interest (e.g., the value returned by `select_pipeline_segment`
+            for the current pipeline segment). Must be non-negative.
+
+    Returns:
+        Sub-layer count across the `physical_offset` earliest physical blocks.
+
+    Examples:
+        >>> get_sub_layer_offset("M*M*", 0)
+        0
+        >>> get_sub_layer_offset("M*M*", 2)
+        2
+        >>> get_sub_layer_offset("[M-]M", 1)
+        2
+        >>> get_sub_layer_offset("[M-]M", 2)
+        3
+        >>> get_sub_layer_offset("M|[*-]", 2)
+        3
+    """
+    if physical_offset <= 0:
+        return 0
+
+    sub_count = 0
+    physical_count = 0
+    in_group = False
+    group_sub_count = 0
+
+    for char in main_pattern:
+        if physical_count >= physical_offset:
+            break
+        if char == Symbols.FUSION_START:
+            in_group = True
+            group_sub_count = 0
+        elif char == Symbols.FUSION_END:
+            in_group = False
+            sub_count += group_sub_count
+            physical_count += 1
+        elif char == Symbols.PIPE:
+            continue
+        elif in_group:
+            group_sub_count += 1
+        elif char in Symbols.VALID_LAYERS:
+            sub_count += 1
+            physical_count += 1
+    return sub_count
+
+
+def parse_fusion_groups(pattern: str) -> List[Tuple[int, int]]:
+    """Extract fusion groups from a bracket-annotated pattern string.
+
+    Each `[...]` group maps to a `(start, end)` tuple of layer indices
+    (inclusive) in the *bracket-stripped* pattern.
+
+    Args:
+        pattern: A single segment pattern (no pipe separators) that may
+            contain fusion brackets.
+
+    Returns:
+        List of `(start_layer_index, end_layer_index)` tuples (inclusive).
+        Empty list when the pattern has no brackets.
+
+    Examples:
+        >>> parse_fusion_groups("[*-]M[*-]M")
+        [(0, 1), (3, 4)]
+        >>> parse_fusion_groups("M*M*")
+        []
+    """
+    _validate_brackets(pattern, "fusion")
+
+    groups: List[Tuple[int, int]] = []
+    layer_index = 0
+    group_start: Optional[int] = None
+
+    for char in pattern:
+        if char == Symbols.FUSION_START:
+            group_start = layer_index
+        elif char == Symbols.FUSION_END:
+            assert group_start is not None
+            # end is inclusive – the last layer index in the group
+            groups.append((group_start, layer_index - 1))
+            group_start = None
+        elif char in Symbols.VALID_LAYERS:
+            layer_index += 1
+
+    return groups
 
 
 def validate_segment_layers(segment: str) -> List[str]:
     """Validate and convert a single pipeline segment pattern to a layer type list.
 
     This is used after the main pattern has been split by '|' into segments.
-    Each segment should contain only valid layer symbols (no '|').
+    Each segment should contain only valid layer symbols (no '|'). Fusion
+    bracket markers ('[', ']') are permitted and collapse their contents into
+    a single multi-character list entry: `"[*-]M"` becomes `['*-', 'M']`.
+    Each entry in the returned list therefore corresponds to exactly one
+    physical transformer block – a single-character entry is a stand-alone
+    layer, a multi-character entry is a fused layer where each character
+    names one fused sub-layer.
 
     Args:
-        segment: A single pipeline segment pattern string (e.g., "M-M*-")
+        segment: A single pipeline segment pattern string (e.g., "[*-]M[*-]M")
 
     Returns:
-        List of layer type characters.
+        List of layer entries. Each entry is a string of length 1 (normal
+        layer) or length ≥ 2 (fused layer, one character per fused sub-layer).
 
     Raises:
-        ValueError: If segment contains invalid layer symbols.
+        ValueError: If segment contains invalid layer symbols or malformed brackets.
     """
-    layer_type_list = list(segment)
-    for layer_char in layer_type_list:
-        if layer_char not in Symbols.VALID_LAYERS:
-            raise ValueError(
-                f"In hybrid layer pattern segment, '{layer_char}' is not "
-                f"one of {Symbols.VALID_LAYERS}"
-            )
+    _validate_pattern(segment, "segment", allow_pipe=False, allow_brackets=True)
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in segment and Symbols.DS_ATTENTION in segment:
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
-
-    return layer_type_list
+    result: List[str] = []
+    group_chars: List[str] = []
+    in_group = False
+    for char in segment:
+        if char == Symbols.FUSION_START:
+            in_group = True
+            group_chars.clear()
+        elif char == Symbols.FUSION_END:
+            in_group = False
+            result.append(''.join(group_chars))
+            group_chars.clear()
+        elif in_group:
+            group_chars.append(char)
+        else:
+            result.append(char)
+    return result
 
 
 def select_pipeline_segment(
@@ -397,6 +719,23 @@ def select_pipeline_segment(
         layer_type_list = validate_segment_layers(full_pattern)
         num_layers = len(layer_type_list)
 
+        # Auto-split PP counts physical blocks, but a fused block does more
+        # compute per block than a stand-alone one. A pipeline rank whose
+        # slice lands on fused blocks can become a straggler and widen the PP
+        # bubble. Warn once so users know to insert explicit '|' separators
+        # if they need compute-aware balancing.
+        if any(len(entry) > 1 for entry in layer_type_list):
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Auto-split PP on a hybrid pattern that contains fusion groups "
+                "'[...]' may produce imbalanced compute across ranks: fused "
+                "layers do more work per physical block than stand-alone "
+                "ones, so ranks whose slice lands on fused blocks become "
+                "stragglers. Consider inserting explicit '|' separators in "
+                "--hybrid-layer-pattern to control per-stage compute.",
+            )
+
         if first_stage_layers is not None or last_stage_layers is not None:
             first = first_stage_layers or 0
             last = last_stage_layers or 0
@@ -467,7 +806,7 @@ def select_pipeline_segment(
             f"the current PP/VPP configuration."
         )
 
-    layer_offset = sum(len(segments[i]) for i in range(segment_index))
+    layer_offset = sum(count_pattern_layers(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]
 
     layer_type_list = validate_segment_layers(my_segment)
@@ -488,11 +827,18 @@ def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str,
     """
     Returns maps from global layer index to the corresponding layer index
     for each valid layer type (those in Symbols.VALID_LAYERS) given a layer type list.
+
+    Each entry of `layer_type_list` is expected to be a 1-character layer
+    symbol (a normal layer) or a multi-character string (a fused layer where
+    each character names one fused sub-layer). Fused sub-layers all share the
+    same global layer index – they are contained in one physical block – but
+    contribute to their respective per-type maps independently.
     """
     layer_types = [symbol for symbol in Symbols.name_sorted_valid_layer_symbols()]
     layer_maps = {layer_type: {} for layer_type in layer_types}
-    for global_layer_idx, layer_type in enumerate(layer_type_list):
-        layer_map = layer_maps[layer_type]
-        local_layer_idx = len(layer_map)
-        layer_map[global_layer_idx] = local_layer_idx
+    for global_layer_idx, layer_entry in enumerate(layer_type_list):
+        for layer_type in layer_entry:
+            layer_map = layer_maps[layer_type]
+            local_layer_idx = len(layer_map)
+            layer_map[global_layer_idx] = local_layer_idx
     return layer_maps
