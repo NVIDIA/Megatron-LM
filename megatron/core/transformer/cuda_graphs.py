@@ -1422,6 +1422,7 @@ class CudaGraphManager(torch.nn.Module):
         pg_collection=None,
         inline_capture=False,
         num_warmup_steps=None,
+        mempool=None,
     ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
@@ -1433,6 +1434,7 @@ class CudaGraphManager(torch.nn.Module):
                 `inference_context` is present in the kwargs of the forward call.
                 Setting this argument to True always forces the inline capture path to be taken.
             num_warmup_steps: If set, overrides the per-runner warmup step count.
+            mempool: Optional CUDA graph mempool to use instead of the shared `global_mempool`.
         """
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
@@ -1495,6 +1497,7 @@ class CudaGraphManager(torch.nn.Module):
             # Cudagraph stream capture requires no operations on the default stream prior to the
             # capture, so change to a side stream.
             torch.cuda.set_stream(torch.cuda.Stream())
+        self.mempool = mempool if mempool is not None else CudaGraphManager.global_mempool
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -1548,7 +1551,7 @@ class CudaGraphManager(torch.nn.Module):
                 else:
                     runner = _CudaGraphRunner(
                         megatron_module,
-                        CudaGraphManager.global_mempool,
+                        self.mempool,
                         args,
                         kwargs,
                         self.func,
@@ -1568,7 +1571,7 @@ class CudaGraphManager(torch.nn.Module):
             else:
                 runner = _CudaGraphRunner(
                     megatron_module,
-                    CudaGraphManager.global_mempool,
+                    self.mempool,
                     args,
                     kwargs,
                     self.func,
