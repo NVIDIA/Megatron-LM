@@ -14,6 +14,7 @@ from megatron.training.config.resilience_config import RerunStateMachineConfig, 
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.yaml_utils import safe_yaml_representers
+from megatron.training.models.hybrid import HybridModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -217,7 +218,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    # model: GPTModelConfig | MambaModelConfig  # TODO (@maanug): add support
+    model: HybridModelConfig  # TODO (@maanug): add support for GPTModelConfig 
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
