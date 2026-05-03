@@ -919,6 +919,7 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_weight=fc2_single_grouped_weight,
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=self.config.delay_wgrad_compute,
+            scale_bias=self.linear_fc2.use_bias,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -1019,13 +1020,19 @@ class TEGroupedMLP(MegatronModule):
             )
         else:
             stash_context = nullcontext()
+        # Pass permuted_probs to FC2 to use fused dprop, dbias
+        extra_inputs_fc2 = (
+            (tokens_per_expert, permuted_probs)
+            if self.linear_fc2.use_bias
+            else (tokens_per_expert,)
+        )
         with stash_context:
             # Call fused impl
             output = ops(
                 permuted_local_hidden_states,
                 tokens_per_expert,  # FC1
                 permuted_probs,  # Scaled SwiGLU
-                tokens_per_expert,  # FC2
+                *extra_inputs_fc2,  # FC2
             )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
