@@ -177,6 +177,13 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import (
     get_megatron_optimizer,
+    AdamOptimizerConfig,
+    SGDOptimizerConfig,
+    OptimizerConfig,
+    ParamKey,
+    ParamWithNamePredicate,
+)
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer
     OptimizerConfig,
     ParamKey,
 )
@@ -1680,6 +1687,35 @@ def setup_model_and_optimizer(
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
+        if 'muon' not in config.optimizer:
+            if args.embedding_init_method_std is not None:
+                # Restore "spike no more" behavior by defaulting embedding params to wd_mult=0.
+                embedding_wd_skip_key = ParamKey(
+                    with_name_predicate=ParamWithNamePredicate(
+                        name="spike_no_more_embedding_params",
+                        fn=lambda _param, name: "embedding" in name,
+                    )
+                )
+                config_overrides = {
+                    **(config_overrides or {}),
+                    embedding_wd_skip_key: {"wd_mult": 0.0},
+                }
+
+            optimizer = get_megatron_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.use_gloo_process_groups,
+                dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            )
+        else:
+            optimizer = get_megatron_muon_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.use_gloo_process_groups,
+                layer_wise_distributed_optimizer='dist' in config.optimizer,
+            )
         optimizer = get_megatron_optimizer(
             config,
             model,

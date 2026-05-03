@@ -18,6 +18,7 @@ from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
+    ParamWithNamePredicate,
     _get_param_groups,
     check_config_overrides_consistency,
     get_megatron_optimizer,
@@ -209,6 +210,44 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
     assert param_groups[1]['max_lr'] == 20
     assert param_groups[2]['min_lr'] is None
     assert param_groups[2]['max_lr'] == 0.01
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_embedding_name_wd_override(mock_get_world_size):
+    """Embedding-name predicate sets wd_mult=0 for embedding params only."""
+
+    class EmbeddingNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(8, 4)
+            self.fc = nn.Linear(4, 2)
+
+    net = EmbeddingNet()
+    config = OptimizerConfig(optimizer='adam', lr=0.01)
+    config_overrides = {
+        ParamKey(
+            with_name_predicate=ParamWithNamePredicate(
+                name="spike_no_more_embedding_params",
+                fn=lambda _param, name: "embedding" in name,
+            )
+        ): ParamGroupOverride(wd_mult=0.0)
+    }
+
+    param_groups = _get_param_groups([net], config, config_overrides)
+
+    embedding_weight = net.embedding.weight
+    fc_weight = net.fc.weight
+
+    embedding_group = next(
+        pg for pg in param_groups if any(p is embedding_weight for p in pg['params'])
+    )
+    fc_group = next(pg for pg in param_groups if any(p is fc_weight for p in pg['params']))
+
+    assert embedding_group['wd_mult'] == 0.0
+    assert fc_group['wd_mult'] == 1.0
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
