@@ -27,6 +27,7 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.transformer_block import checkpointed_foward
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
@@ -299,33 +300,49 @@ class HybridStack(MegatronModule):
                 return nullcontext()
 
         with outer_fp8_context:
-            for layer in self.layers:
-                # Layers have 1-indexed layer numbers attribute.
-                inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
-                with inner_quant_context:
-                    if isinstance(layer, TransformerLayer):
-                        hidden_states, _ = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
-                            packed_seq_params=packed_seq_params,
-                            padding_mask=padding_mask,
-                        )
-                    else:  # MambaLayer, Expert, or MLP
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                        )
+            if self.config.recompute_granularity == 'full' and self.training:
+                hidden_states = checkpointed_foward(
+                    self,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    context=None,
+                    context_mask=None,
+                    rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=None,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                    use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                )
+            else:
+                for layer in self.layers:
+                    # Layers have 1-indexed layer numbers attribute.
+                    inner_quant_context = get_inner_quant_context(
+                        self.config, layer.layer_number - 1
+                    )
+                    with inner_quant_context:
+                        if isinstance(layer, TransformerLayer):
+                            hidden_states, _ = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                rotary_pos_emb=rotary_pos_emb,
+                                sequence_len_offset=sequence_len_offset,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                            )
+                        else:  # MambaLayer, Expert, or MLP
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                            )
 
-                # The attention layer (currently a simplified transformer layer)
-                # outputs a tuple of (hidden_states, context). Context is intended
-                # for cross-attention, and is not needed in our model.
-                if isinstance(hidden_states, tuple):
-                    hidden_states = hidden_states[0]
+                    # The attention layer (currently a simplified transformer layer)
+                    # outputs a tuple of (hidden_states, context). Context is intended
+                    # for cross-attention, and is not needed in our model.
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
