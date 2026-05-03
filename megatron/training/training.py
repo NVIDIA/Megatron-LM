@@ -3109,6 +3109,8 @@ def train(
                     buffered_rollouts=buffered_rollouts,
                     is_correction=args.rl_inference_logprobs_is_correction,
                     optimizer_is_on_cpu=args.rl_offload_optimizer_during_inference,
+                    partial_rollouts=args.rl_partial_rollouts,
+                    langrl_env_config=args.langrl_env_config,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.

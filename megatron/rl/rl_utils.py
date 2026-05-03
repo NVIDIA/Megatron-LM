@@ -71,6 +71,7 @@ from megatron.rl.agent.api import (
     RewardEvaluationResult,
     Rollout,
     RolloutGroup,
+    RolloutStream,
     Rollouts,
     TokenRollout,
 )
@@ -585,23 +586,61 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
             enforce_order=args.rl_enforce_generation_order,
         )
-        _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
+        _ROLLOUT_GENERATOR = RolloutStream(agent.get_grouped_rollouts(request))
     return _ROLLOUT_GENERATOR
 
 
-def get_environment_rollouts(
-    model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
+def need_environment_rollouts(
+    buffered_rollouts,
+    iteration,
+    runtime_state,
+    grpo_iterations,
+    grpo_prompts_per_step,
+    grpo_group_size,
+    global_batch_size,
+    partial_rollouts
 ):
-    """Sample environment rollouts from an LLM.
+    """Determine whether get_environment_rollouts (inference) must be called.
 
-    Args:
-        model: Model to sample from.
-        inference_model: Inference model to use for inference.
-        n_prompts: Number of prompts to sample for across *all* data parallel workers.
-        samples_per_group: Amount of trajectories per prompt.
+    When partial rollouts are enabled, speculatively drain rank 0's RolloutStream
+    in an attempt to obtain enough groups so that inference does not have to be run.
+    The verdict of whether or not inference is needed must be broadcast from rank 0.
 
     Returns:
-        GroupedRollouts object which is a nested list with each element being a list of rollouts of a group.
+        (need_new_rollouts, need_inference):
+            need_new_rollouts denotes whether we should enter get_environment_rollouts.
+            need_inference denotes whether we should enter colocated_inference to collect rollouts.
+    """
+    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size
+    if (
+        buffered_rollouts is not None and
+        iteration != runtime_state.last_collection_iteration +
+        (grpo_iterations * global_batches_per_collection)
+    ):
+        return False, False
+
+    if not partial_rollouts or _ROLLOUT_GENERATOR is None:
+        return True, True
+
+    rank = torch.distributed.get_rank()
+    loop = get_asyncio_loop()
+
+    has_enough = False
+    if rank == 0:
+        _ROLLOUT_GENERATOR.drain(grpo_prompts_per_step, loop)
+        has_enough = _ROLLOUT_GENERATOR.buffered >= grpo_prompts_per_step
+
+    flag = torch.tensor([has_enough], device='cuda', dtype=torch.bool)
+    torch.distributed.broadcast(flag, src=0)
+
+    return True, not flag.item()
+
+
+def colocated_inference(model, inference_model, optimizer, n_prompts, samples_per_group, rank):
+    """Enter inference mode and collect rollouts via the colocated inference engine.
+
+    Handles optimizer offload/restore, model weight swap, and CUDA graph management.
+    Returns the collected rollouts on rank 0, None on other ranks.
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
@@ -640,6 +679,7 @@ def get_environment_rollouts(
     pg_size = get_pg_size(inference_pg_collection.ep)
     assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
 
+    rollouts = None
     with nvtx_range("rl/rollout-collection", time=True):
         loop = get_asyncio_loop()
         with megatron_rl_inference_mode(
@@ -656,8 +696,6 @@ def get_environment_rollouts(
                     args, inference_interface, n_prompts, samples_per_group
                 )
 
-            # NOTE(jbarker): we need to double check this when using PP>1
-            rank = torch.distributed.get_rank()
             with nvtx_range("rl/collect-rollouts", time=True):
                 if rank == 0:
                     log_single_rank(
@@ -679,24 +717,78 @@ def get_environment_rollouts(
                                 assert False, "Unexpected group left in generator."
                             except StopAsyncIteration:
                                 break
-                else:
-                    # Just set up space to collect the rollouts
-                    rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
-        with nvtx_range("rl/sync-rollouts", time=True):
-            # Wait for Rollouts to be collected
-            # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
-            torch.distributed.broadcast_object_list(rollouts, src=0)
-        logger.debug(f"Got rollouts on rank {rank}")
+    if args.rl_offload_optimizer_during_inference:
+        with nvtx_range("rl/restore-optimizer-after-inference", time=True):
+            with nvtx_range("rl/restore/grad-buffers", time=True):
+                model[0].restore_grad_buffers()
+            with nvtx_range("rl/restore/optimizer-state", time=True):
+                optimizer.restore_from_cpu()
 
-    if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
-        with open(
-            lang_rl_log_dir
-            + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
-            + f'{Path(args.langrl_env_config).stem}.json',
-            'w',
-        ) as f:
-            json.dump([[r.model_dump() for r in group] for group in rollouts], f)
+    return rollouts
+
+
+def get_environment_rollouts(
+    model: LanguageModule,
+    inference_model: LanguageModule,
+    optimizer: MegatronOptimizer,
+    n_prompts: int,
+    samples_per_group: int,
+    run_inference: bool,
+    iteration: int,
+    langrl_env_config: str,
+):
+    """Collect rollouts and broadcast to all ranks.
+
+    When `run_inference` is True, uses colocated_inference to collect rollouts through inference.
+    Otherwise, obtains buffered rollouts from the RolloutStream.
+
+    Args:
+        model: Model to sample from.
+        inference_model: Inference model to use for inference.
+        n_prompts: Number of prompts to sample for across *all* data parallel workers.
+        samples_per_group: Amount of trajectories per prompt.
+        run_inference: Whether to run colocated inference or consume buffered rollouts.
+        iteration: Current training iteration (used for log filenames).
+        langrl_env_config: Path to env config (its stem is used in log filenames).
+
+    Returns:
+        GroupedRollouts object which is a nested list
+        where each element being a list of rollouts of a group.
+    """
+    nvtx_range = get_nvtx_range()
+    # NOTE(jbarker): we need to double check this when using PP>1
+    rank = torch.distributed.get_rank()
+
+    if run_inference:
+        rollouts = colocated_inference(
+            model, inference_model, optimizer, n_prompts, samples_per_group, rank
+        )
+    else:
+        loop = get_asyncio_loop()
+        rollouts = None
+        if rank == 0:
+            rollouts = [
+                loop.run_until_complete(anext(_ROLLOUT_GENERATOR)) for _ in range(n_prompts)
+            ]
+
+    if rank != 0:
+        rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
+    with nvtx_range("rl/sync-rollouts", time=True):
+        torch.distributed.broadcast_object_list(rollouts, src=0)
+    logger.debug(f"Got rollouts on rank {rank}")
+
+    if lang_rl_log_dir:
+        actual_inference_model = inference_model if inference_model is not None else model
+        inference_pg_collection = get_attr_wrapped_model(actual_inference_model[0], "pg_collection")
+        if rank == get_pg_rank(inference_pg_collection.tp):
+            with open(
+                lang_rl_log_dir
+                + f'/rollouts_rank{rank}_iteration{iteration}_'
+                + f'{Path(langrl_env_config).stem}.json',
+                'w',
+            ) as f:
+                json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
 
@@ -1668,6 +1760,8 @@ def get_grpo_data_iterator(
     global_batch_size: int,
     sequence_packing: bool,
     is_correction: bool,
+    partial_rollouts: bool,
+    langrl_env_config: str,
     buffered_rollouts: RerunDataIterator | None = None,
     optimizer_is_on_cpu: bool = False,
 ) -> RerunDataIterator:
@@ -1697,17 +1791,23 @@ def get_grpo_data_iterator(
     runtime_state = get_rl_runtime_state()
     tokenizer = get_tokenizer()
 
-    # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
-    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size
-    if (
-        buffered_rollouts is None or
-        iteration == runtime_state.last_collection_iteration +
-        (grpo_iterations * global_batches_per_collection)
-    ):
+    need_new_rollouts, need_infer = need_environment_rollouts(
+        buffered_rollouts,
+        iteration,
+        runtime_state,
+        grpo_iterations,
+        grpo_prompts_per_step,
+        grpo_group_size,
+        global_batch_size,
+        partial_rollouts,
+    )
 
+    if need_new_rollouts:
         rollouts = get_environment_rollouts(
-            model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
+            model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size, need_infer,
+            iteration=iteration, langrl_env_config=langrl_env_config,
         )
+
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
             ref_state_dict=ref_state_dict,
