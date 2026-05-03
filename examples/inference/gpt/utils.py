@@ -3,6 +3,7 @@
 import copy
 import itertools
 import json
+import os
 import random
 import time
 from argparse import ArgumentParser, Namespace
@@ -106,18 +107,13 @@ def get_time_offsets(
 
     random.seed(seed)
 
-    import simpy  # Guard against this import in test case
-
-    # Generate random time offsets.
-    def arrival(r):
-        while True:
-            yield env.timeout(random.expovariate(r))
-            time_offsets.append(env.now)
-
+    # Generate Poisson arrival times (exponential inter-arrival times).
     time_offsets = []
-    env = simpy.Environment()
-    env.process(arrival(incoming_requests_per_sec))
-    env.run(incoming_requests_duration)
+    t = 0.0
+    while t < incoming_requests_duration:
+        t += random.expovariate(incoming_requests_per_sec)
+        if t < incoming_requests_duration:
+            time_offsets.append(t)
 
     # Ensure at least a single request.
     if len(time_offsets) == 0:
@@ -230,10 +226,14 @@ def get_requests_from_file(
 def build_requests(
     args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
 ) -> list[Request]:
-    # Check if we have any prompts (from command line or JSONL)
     if args.prompts:
         if args.prompt_file:
             raise ValueError("Cannot use both --prompts and --prompt-file")
+        if len(args.prompts) == 1 and os.path.exists(args.prompts[0]):
+            raise ValueError(
+                f"--prompts value looks like a file path: '{args.prompts[0]}'. "
+                "Did you mean --prompt-file?"
+            )
         return get_cli_requests(args, tokenizer, sampling_params)
     elif args.prompt_file:
         return get_requests_from_file(args, tokenizer, sampling_params)
