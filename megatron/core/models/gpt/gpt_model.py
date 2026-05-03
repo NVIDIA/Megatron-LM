@@ -176,7 +176,7 @@ class GPTModel(LanguageModule):
                 cp_group=self.pg_collection.cp,
             )
 
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -381,7 +381,7 @@ class GPTModel(LanguageModule):
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -551,6 +551,11 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        # Pass input_ids to decoder for hash-based MoE routing
+        decoder_extra_block_kwargs = extra_block_kwargs or {}
+        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+            decoder_extra_block_kwargs['input_ids'] = input_ids
+
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
@@ -563,7 +568,7 @@ class GPTModel(LanguageModule):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             padding_mask=padding_mask,
-            **(extra_block_kwargs or {}),
+            **decoder_extra_block_kwargs,
         )
 
         return self._postprocess(
