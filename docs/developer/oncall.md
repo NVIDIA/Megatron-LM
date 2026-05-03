@@ -50,9 +50,9 @@ Below is the checklist that the oncall needs to go through for each PR.
 
 ## Issues and Discussion Questions
 
-If you do not know the answer to an issue or discussion question: that's ok! **Delegate to someone who does.**
+If you do not know the answer to an issue or discussion question, that's ok, **Delegate to someone who does.**
 
 On a daily basis, track the following:
 
-- [new issues](https://github.com/NVIDIA/Megatron-LM/issues): check to see if there are any new issues before they become out of SLA!
-- [out of SLA issues](https://github.com/orgs/NVIDIA-NeMo/projects/20/views/4?sliceBy%5Bvalue%5D=NVIDIA%2FMegatron-LM): useful dashboard that tracks all out of SLA issues
+- [new issues](https://github.com/NVIDIA/Megatron-LM/issues): check to see if there are any new issues before they become out of SLA.
+
