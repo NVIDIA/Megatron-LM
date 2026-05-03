@@ -985,8 +985,8 @@ def validate_args(args, defaults={}):
         args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
     if args.fp8_param_gather:
-        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
-            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
+        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp, \
+            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, or megatron fsdp'
 
     # FP4 and FP8 are mutually exclusive
     if args.fp4 and args.fp8:
@@ -1750,7 +1750,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
-    kw_args['fp8_param'] = args.fp8_param_gather
+    kw_args['fp8_param'] = getattr(args, 'fp8_param', False) or args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
     if args.swiglu:
         kw_args['activation_func'] = F.silu
@@ -1828,6 +1828,10 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
+    group.add_argument('--fp8-param', action='store_true',
+                       help='Initialize model parameters in fp8 format. '
+                            'Use for inference with --fp8-recipe=mxfp8. '
+                            'For training, use --fp8-param-gather instead.')
     # TE precision config file
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '
