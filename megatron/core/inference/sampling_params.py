@@ -50,6 +50,7 @@ class SamplingParams:
             warnings.warn(
                 "return_prompt_top_n_logprobs is deprecated, use skip_prompt_log_probs instead",
                 DeprecationWarning,
+                stacklevel=2,
             )
             assert (
                 not self.skip_prompt_log_probs

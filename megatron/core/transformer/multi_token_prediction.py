@@ -1093,7 +1093,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         elif self.config.recompute_method == 'block':
             # TODO: implement block-based recompute for MTP
             warnings.warn(
-                "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute."
+                "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute.",
+                stacklevel=3,
             )
             outputs = forward_func(*args, **kwargs)
         else:
@@ -1408,7 +1409,8 @@ class MultiTokenPredictionBlock(MegatronModule):
                 warnings.warn(
                     "Repeated MTP mode expects exactly 1 layer spec, got "
                     f"{len(self.submodules.layer_specs)} instead. "
-                    f"The first layer will be applied {self.config.mtp_num_layers} times."
+                    f"The first layer will be applied {self.config.mtp_num_layers} times.",
+                    stacklevel=2,
                 )
             self.layers = torch.nn.ModuleList(
                 [build_layer_legacy(self.submodules.layer_specs[0], layer_number=1)]

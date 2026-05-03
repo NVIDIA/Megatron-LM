@@ -36,7 +36,7 @@ try:
 except ImportError:
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn("Apex is not installed. Falling back to Torch Norm")
+    warnings.warn("Apex is not installed. Falling back to Torch Norm", stacklevel=2)
     LNImpl = WrappedTorchNorm
     HAVE_APEX = False
 
@@ -93,7 +93,9 @@ def __getattr__(name):
         warnings.warn(
             """Attribute bert_layer_specs.bert_layer_with_transformer_engine_spec is on a
             deprecation track and will be removed in future releases. Please migrate to
-            bert_layer_specs.get_bert_layer_with_transformer_engine_spec()."""
+            bert_layer_specs.get_bert_layer_with_transformer_engine_spec().""",
+            DeprecationWarning,
+            stacklevel=2,
         )
 
         return get_bert_layer_with_transformer_engine_spec()

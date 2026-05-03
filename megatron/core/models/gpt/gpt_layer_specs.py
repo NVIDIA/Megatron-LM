@@ -65,7 +65,7 @@ except ImportError:
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn("Apex is not installed. Falling back to Torch Norm")
+    warnings.warn("Apex is not installed. Falling back to Torch Norm", stacklevel=2)
     LNImpl = WrappedTorchNorm
     HAVE_APEX = False
 
@@ -208,7 +208,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated'
-            " and will be removed soon. Please update your code accordingly."
+            " and will be removed soon. Please update your code accordingly.",
+            DeprecationWarning,
+            stacklevel=2,
         )
 
     if use_kitchen:
@@ -395,7 +397,9 @@ def get_gpt_layer_local_submodules(
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "get_gpt_layer_local_spec" has been deprecated'
-            " and will be removed soon. Please update your code accordingly."
+            " and will be removed soon. Please update your code accordingly.",
+            DeprecationWarning,
+            stacklevel=2,
         )
 
     mlp = get_mlp_module_spec_for_backend(
@@ -471,7 +475,9 @@ def _get_mlp_module_spec(
 ):
     warnings.warn(
         """This private function is on a deprecation track. Please switch to `get_mlp_module_spec`
-        since it will be removed in a future release."""
+        since it will be removed in a future release.""",
+        DeprecationWarning,
+        stacklevel=2,
     )
 
     return get_mlp_module_spec(
@@ -490,7 +496,9 @@ def get_mlp_module_spec(
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "_get_mlp_module_spec" has been deprecated'
-            " and will be removed soon. Please update your code accordingly."
+            " and will be removed soon. Please update your code accordingly.",
+            DeprecationWarning,
+            stacklevel=2,
         )
     if use_te_op_fuser:
         if not is_te_min_version("1.13.0"):
