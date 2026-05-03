@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -41,14 +42,41 @@ logger = logging.getLogger(__name__)
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
+    A HybridModel is constructed via either of two equivalent paths:
+
+    1. **Recipe path (recommended).** Pass ``layer_type_list`` and
+       ``layer_config_list`` (typically produced by
+       :meth:`HybridModelConfig.compile`) plus the recipe-level kwargs.
+       This is the path used by ``--model-recipe`` and is the supported
+       way to build new HybridModels.
+    2. **Legacy string-pattern path.** Pass ``hybrid_layer_pattern`` (a
+       single-character pattern string). Retained for backwards
+       compatibility; new code should use the recipe path.
+
     Args:
-        config (TransformerConfig): Model config
-        hybrid_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
+        config (TransformerConfig): Model config (the stack-level
+            :class:`TransformerConfig`; per-layer configs flow in via
+            ``layer_config_list`` on the recipe path).
+        hybrid_stack_spec (ModuleSpec, optional): Module specs for the
+            various layer types. Required on the legacy string-pattern path.
+            On the recipe path, defaults to the production
+            ``hybrid_stack_spec`` in
+            :mod:`megatron.core.models.hybrid.hybrid_layer_specs` when not
+            supplied.
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
-        hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
-            pipeline stage boundaries.
+        layer_type_list (list, optional): Per-layer symbol list (recipe
+            path). Mutually exclusive with ``hybrid_layer_pattern``. Each
+            entry maps to a layer in :mod:`Symbols.VALID_LAYERS`.
+        layer_config_list (list, optional): Per-layer
+            :class:`TransformerConfig` instances (recipe path), parallel to
+            ``layer_type_list``. Each layer is constructed from its own
+            config; ``config`` is reserved for stack-level concerns
+            (final norm, embedding init).
+        hybrid_layer_pattern (str): Legacy string-pattern path. Unified
+            hybrid layer pattern with optional MTP and pipeline stage
+            boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
             The main pattern may contain "|" to define pipeline stage boundaries.
             Examples:
@@ -89,10 +117,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        hybrid_stack_spec: ModuleSpec,
-        vocab_size: int,
-        max_sequence_length: int,
+        hybrid_stack_spec: Optional[ModuleSpec] = None,
+        vocab_size: Optional[int] = None,
+        max_sequence_length: Optional[int] = None,
         hybrid_layer_pattern: Optional[str] = None,
+        layer_type_list: Optional[list] = None,
+        layer_config_list: Optional[list] = None,
         hybrid_attention_ratio: Optional[float] = None,
         hybrid_mlp_ratio: Optional[float] = None,
         hybrid_override_pattern: Optional[str] = None,
@@ -123,7 +153,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             HybridModel.mup_warning_printed = True
 
-        self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
@@ -135,6 +164,48 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+
+        recipe_path = layer_type_list is not None
+        if not recipe_path and (vocab_size is None or max_sequence_length is None):
+            raise ValueError(
+                "vocab_size and max_sequence_length are required on the legacy "
+                "(hybrid_layer_pattern) construction path; pass both explicitly. "
+                "On the recipe path, the EmbeddingLayerConfig marker supplies them."
+            )
+        if recipe_path:
+            if hybrid_layer_pattern is not None:
+                raise ValueError(
+                    "layer_type_list (Python DSL recipe) and "
+                    "hybrid_layer_pattern (string DSL) are mutually exclusive; "
+                    "pass exactly one."
+                )
+            if layer_config_list is None:
+                raise ValueError(
+                    "layer_type_list was passed without layer_config_list; "
+                    "they must be passed together."
+                )
+            if len(layer_config_list) != len(layer_type_list):
+                raise ValueError(
+                    f"layer_type_list (len={len(layer_type_list)}) and "
+                    f"layer_config_list (len={len(layer_config_list)}) "
+                    f"must have the same length."
+                )
+
+        # When using a recipe, fall back to the default hybrid_stack_spec so that
+        # users do not need to construct or pass a ModuleSpec.
+        if recipe_path and hybrid_stack_spec is None:
+            from megatron.core.models.hybrid.hybrid_layer_specs import (
+                hybrid_stack_spec as _default_hybrid_stack_spec,
+            )
+
+            hybrid_stack_spec = _default_hybrid_stack_spec
+        elif hybrid_stack_spec is None:
+            raise ValueError(
+                "hybrid_stack_spec is required when using the legacy string-pattern path "
+                "(hybrid_layer_pattern). Pass a ModuleSpec, or use a Python recipe via "
+                "the --model-recipe path."
+            )
+        self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
 
         # Backward compatibility for deprecated hybrid parameters
         if hybrid_override_pattern is not None:
@@ -175,24 +246,47 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config.num_layers, attn_ratio, mlp_ratio
                 )
 
-        # Parse unified pattern to extract main and MTP components, and
-        # determine the pipeline segment for this model instance.
-        from megatron.core.models.hybrid.hybrid_layer_allocation import (
-            parse_hybrid_pattern,
-            select_pipeline_segment,
-        )
+        if recipe_path:
+            # Recipe path: layer_type_list and layer_config_list are precomputed
+            # by HybridModelConfig.compile() upstream. Pipeline parallelism and
+            # MTP are not part of the recipe DSL — recipes that need either
+            # must use the legacy hybrid_layer_pattern string DSL. The PP > 1
+            # check below catches launcher/CLI mismatches where a PP group
+            # was constructed despite the recipe being PP-free.
+            pp_size = (
+                torch.distributed.get_world_size(self.pg_collection.pp)
+                if self.pg_collection.pp is not None
+                else 1
+            )
+            if pp_size > 1:
+                raise NotImplementedError(
+                    "The Python DSL recipe path does not support pipeline "
+                    "parallelism. Use hybrid_layer_pattern (string DSL "
+                    "with '|' separators) for PP."
+                )
+            layer_offset = 0
+            self.mtp_pattern = None
+            self.mtp_num_depths = 0
+        else:
+            # Parse unified pattern to extract main and MTP components, and
+            # determine the pipeline segment for this model instance.
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                parse_hybrid_pattern,
+                select_pipeline_segment,
+            )
 
-        parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
-        self.mtp_pattern = parsed.mtp_pattern
-        self.mtp_num_depths = parsed.mtp_num_depths
+            parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
+            self.mtp_pattern = parsed.mtp_pattern
+            self.mtp_num_depths = parsed.mtp_num_depths
 
-        layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
-            self.pg_collection.pp,
-            vp_stage,
-            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-        )
+            layer_type_list, layer_offset = select_pipeline_segment(
+                parsed.main_pattern or '',
+                self.pg_collection.pp,
+                vp_stage,
+                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            )
+            layer_config_list = None
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -255,6 +349,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.config,
             pre_process=self.pre_process,
             layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
