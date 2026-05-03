@@ -1,15 +1,18 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from typing import Callable, List, Optional
+import math
+from collections import defaultdict
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
+from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
@@ -19,6 +22,13 @@ from .optimizer import (
     MegatronOptimizer,
 )
 from .optimizer_config import OptimizerConfig
+from .param_layout import (
+    FullParamLayout,
+    PerBufferParamLayout,
+    pad_bucket_end,
+    pad_param_start,
+    pad_to_divisor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +49,304 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     6. allgather updated params to every rank
     """
 
+    @staticmethod
+    def tag_params(model_chunks, eopt_name, config_overrides=None):
+        """Tag each trainable parameter with ``use_layerwise_distributed_optimizer``.
+
+        Parameters managed by the emerging optimizer (e.g. Muon for 2D weights) are
+        tagged ``True``; parameters routed to a fallback optimizer (e.g. Adam for
+        biases, norms, embeddings) are tagged ``False``.  The tag is read by
+        :func:`group_params_for_buffers` to separate them into distinct buffers.
+
+        Must be called before DDP construction so that buffer grouping reflects
+        the optimizer routing.
+
+        Args:
+            model_chunks: Model chunks whose parameters will be tagged.
+            eopt_name: Name of the emerging optimizer (e.g. ``'muon'``).
+            config_overrides: Optimizer config overrides (same dict passed to
+                :func:`_get_megatron_emerging_optimizer`).
+        """
+        from .emerging_optimizers import _EMERGING_OPTIMIZERS
+
+        all_overrides = dict(config_overrides or {})
+        if eopt_name in _EMERGING_OPTIMIZERS:
+            all_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+
+        for model_chunk in model_chunks:
+            for name, param in model_chunk.named_parameters():
+                if not param.requires_grad:
+                    continue
+                opt_name = eopt_name
+                for param_key, override in all_overrides.items():
+                    if param_key.matches(param, name) and 'optimizer' in override:
+                        opt_name = override['optimizer']
+                        break
+                param.use_layerwise_distributed_optimizer = opt_name in _EMERGING_OPTIMIZERS
+
+    @staticmethod
+    def _shard_divisor(data_parallel_world_size: int, ddp_config) -> int:
+        """Per-shard alignment divisor.
+
+        Guarantees that ``dp_size * shard_size`` satisfies bucket-end alignment
+        and that every shard start is 64-element aligned (required by
+        :func:`pad_param_start`).
+        """
+        dp_size = data_parallel_world_size
+        if ddp_config.pad_buckets_for_high_nccl_busbw:
+            bucket_divisor = math.lcm(dp_size, 128, 2**16)
+        else:
+            bucket_divisor = math.lcm(dp_size, 128)
+        return math.lcm(64, bucket_divisor // dp_size)
+
+    @staticmethod
+    def _compute_per_buffer_param_layout(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+        param_indices: Optional[List[int]] = None,
+    ) -> 'PerBufferParamLayout':
+        """Compute parameter layout with shard-aligned buckets via size-matching.
+
+        Assigns parameters to ``dp_size`` equal-sized shards within each bucket
+        so that no parameter is ever split across a shard boundary.
+
+        **Algorithm** (operates in reverse model / backprop order):
+
+        1. Separate shared-embedding parameters (isolated buckets, emitted first).
+        2. Pool the remaining parameters in backprop order, indexed by numel.
+        3. Pop the next unassigned parameter (size *S*) and assign it to shard 0.
+        4. For shards 1 … ``dp_size - 1``, assign the next unassigned parameter
+           of size *S* (also in backprop order).  If none is available, insert
+           padding of size *S*.  Every shard grows by exactly *S* elements, so
+           all shards stay the same size.
+        5. When the bucket total reaches *bucket_size*, finalise the bucket
+           (pad shard size to :meth:`_shard_divisor`) and start a new one.
+        6. Repeat from 3 until all parameters are assigned.
+
+        Because repeated layers produce many parameters of the same shape,
+        size-matching naturally keeps whole parameters together without any
+        name-parsing heuristic.  For a model with *N* identical transformer
+        layers, padding overhead is zero.
+
+        Args:
+            params: Parameters in model-definition (forward) order.
+            bucket_size: Approximate elements per bucket (``None`` → single bucket).
+            data_parallel_world_size: Size of the data-parallel group.
+            ddp_config: :class:`DistributedDataParallelConfig`.
+            param_indices: Optional per-param dtype indices (passed through).
+
+        Returns:
+            :class:`PerBufferParamLayout` with shard-aligned buckets.
+        """
+        dp_size = data_parallel_world_size
+        shard_div = LayerWiseDistributedOptimizer._shard_divisor(dp_size, ddp_config)
+
+        # -- 0. Separate shared-embedding params. -------------------------
+        shared_emb_params: List[torch.nn.Parameter] = []
+        regular_params: List[torch.nn.Parameter] = []
+        total_param_numel = 0
+        for p in params:
+            total_param_numel += p.data.nelement()
+            if getattr(p, 'shared_embedding', False):
+                shared_emb_params.append(p)
+            else:
+                regular_params.append(p)
+
+        # -- 1. Build backprop-order pool & per-size index. ---------------
+        pool = list(reversed(regular_params))
+        assigned: set[int] = set()  # id(param) of assigned params
+
+        size_groups: Dict[int, List[torch.nn.Parameter]] = defaultdict(list)
+        for param in pool:
+            size_groups[param.data.nelement()].append(param)
+        size_cursors: Dict[int, int] = defaultdict(int)
+
+        overall_cursor = 0
+
+        def _next_unassigned() -> Optional[torch.nn.Parameter]:
+            nonlocal overall_cursor
+            while overall_cursor < len(pool):
+                if id(pool[overall_cursor]) not in assigned:
+                    return pool[overall_cursor]
+                overall_cursor += 1
+            return None
+
+        def _next_with_size(S: int) -> Optional[torch.nn.Parameter]:
+            """Next unassigned param of size *S* in backprop order."""
+            group = size_groups[S]
+            c = size_cursors[S]
+            while c < len(group):
+                if id(group[c]) not in assigned:
+                    size_cursors[S] = c
+                    return group[c]
+                c += 1
+            size_cursors[S] = c
+            return None
+
+        # -- 2. Output accumulators. --------------------------------------
+        param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = {}
+        bucket_indices: List[Tuple[int, int]] = []
+        per_bucket_numel_unpadded: List[int] = []
+        buf_cursor = 0  # write position in the contiguous buffer
+        bucket_id = 0
+
+        # -- 3. Emit isolated buckets for shared-embedding params. --------
+        for param in reversed(shared_emb_params):
+            pos = pad_param_start(buf_cursor)
+            numel = param.data.nelement()
+            param_index_map[param] = (pos, pos + numel, bucket_id)
+            unpadded = (pos + numel) - buf_cursor
+            bucket_end = pad_bucket_end(
+                pos + numel, dp_size, ddp_config.pad_buckets_for_high_nccl_busbw
+            )
+            bucket_indices.append((buf_cursor, bucket_end))
+            per_bucket_numel_unpadded.append(unpadded)
+            buf_cursor = bucket_end
+            bucket_id += 1
+
+        # -- 4. Size-matching loop for regular params. --------------------
+        #   Per-shard state: list of (param | None, numel) assignments.
+        shard_assignments: List[List[Tuple[Optional[torch.nn.Parameter], int]]] = [
+            [] for _ in range(dp_size)
+        ]
+        shard_pos = 0  # position within each shard (identical for all shards)
+        bucket_unpadded = 0
+        size_match_padding_numel = 0  # elements used for empty-shard-slot padding
+
+        def _finalize_bucket() -> None:
+            nonlocal buf_cursor, bucket_id, shard_assignments, shard_pos, bucket_unpadded
+            if shard_pos == 0:
+                return
+            padded_shard_size = pad_to_divisor(shard_pos, shard_div)
+            bucket_start = buf_cursor
+
+            for shard_idx in range(dp_size):
+                shard_start = bucket_start + shard_idx * padded_shard_size
+                pos = shard_start
+                for param, numel in shard_assignments[shard_idx]:
+                    pos = pad_param_start(pos)
+                    if param is not None:
+                        param_index_map[param] = (pos, pos + numel, bucket_id)
+                    pos += numel
+
+            bucket_end = bucket_start + dp_size * padded_shard_size
+            bucket_indices.append((bucket_start, bucket_end))
+            per_bucket_numel_unpadded.append(bucket_unpadded)
+            buf_cursor = bucket_end
+            bucket_id += 1
+
+            shard_assignments = [[] for _ in range(dp_size)]
+            shard_pos = 0
+            bucket_unpadded = 0
+
+        while True:
+            param = _next_unassigned()
+            if param is None:
+                break
+
+            S = param.data.nelement()
+            assigned.add(id(param))
+            shard_assignments[0].append((param, S))
+            bucket_unpadded += S
+
+            for shard_idx in range(1, dp_size):
+                match = _next_with_size(S)
+                if match is not None:
+                    assigned.add(id(match))
+                    shard_assignments[shard_idx].append((match, S))
+                    bucket_unpadded += S
+                else:
+                    shard_assignments[shard_idx].append((None, S))
+                    size_match_padding_numel += S
+
+            shard_pos = pad_param_start(shard_pos) + S
+
+            if bucket_size is not None:
+                bucket_total = dp_size * pad_to_divisor(shard_pos, shard_div)
+                if bucket_total >= bucket_size:
+                    _finalize_bucket()
+
+        _finalize_bucket()
+
+        # -- 5. Log padding overhead. ------------------------------------
+        total_buffer_numel = bucket_indices[-1][1] if bucket_indices else 0
+        total_padding = total_buffer_numel - total_param_numel
+        alignment_and_shard_end_padding = total_padding - size_match_padding_numel
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Layerwise param layout: {len(params)} params, "
+            f"{len(bucket_indices)} buckets, "
+            f"dp_size={dp_size}, "
+            f"total_param_numel={total_param_numel}, "
+            f"total_buffer_numel={total_buffer_numel}, "
+            f"total_padding={total_padding} "
+            f"(size_match={size_match_padding_numel}, "
+            f"alignment+shard_end={alignment_and_shard_end_padding}), "
+            f"overhead={total_padding / max(total_param_numel, 1) * 100:.1f}%",
+        )
+
+        return PerBufferParamLayout(
+            param_index_map=param_index_map,
+            bucket_indices=bucket_indices,
+            per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+            param_indices=param_indices if param_indices is not None else [],
+        )
+
+    @staticmethod
+    def compute_full_param_layout(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+        expert_data_parallel_world_size: Optional[int] = None,
+    ) -> 'FullParamLayout':
+        """Compute parameter layouts for all buffer groups with shard-aligned buckets.
+
+        Groups parameters by :class:`BufferKey` via :func:`group_params_for_buffers`,
+        then delegates to :meth:`_compute_per_buffer_param_layout` (shard-aligned) for
+        buffers with ``use_layerwise_distributed_optimizer=True``, or to
+        :meth:`DistributedOptimizer._compute_per_buffer_param_layout` (standard) for
+        the remaining buffers.
+
+        Args:
+            params: All parameters to lay out.
+            bucket_size: Approximate elements per bucket (``None`` → single bucket).
+            data_parallel_world_size: DP group size for dense parameters.
+            ddp_config: :class:`DistributedDataParallelConfig`.
+            expert_data_parallel_world_size: Expert DP group size (defaults to
+                ``data_parallel_world_size``).
+
+        Returns:
+            :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
+        """
+        from .distrib_optimizer import DistributedOptimizer
+
+        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        layouts = {}
+        for buffer_key, (group_params, param_indices) in buffer_groups.items():
+            if buffer_key.is_expert_parallel:
+                dp_world_size = (
+                    expert_data_parallel_world_size
+                    if expert_data_parallel_world_size is not None
+                    else data_parallel_world_size
+                )
+            else:
+                dp_world_size = data_parallel_world_size
+
+            if buffer_key.use_layerwise_distributed_optimizer:
+                layout = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
+                    group_params, bucket_size, dp_world_size, ddp_config, param_indices
+                )
+            else:
+                layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                    group_params, bucket_size, dp_world_size, ddp_config, param_indices
+                )
+            layouts[buffer_key] = layout
+        return FullParamLayout(layouts=layouts)
+
     def __init__(
         self,
         optimizers: List[MegatronOptimizer],
@@ -55,15 +363,35 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             config: OptimizerConfig.
             pg_collection: ProcessGroupCollection.
             init_state_fn_list: List of init state functions.
-            model_chunks: DDP-wrapped model chunks (needed for overlap_param_gather).
+            model_chunks: DDP-wrapped model chunks.
         """
 
         self.pg_collection = pg_collection
-        self.shard_params(optimizers)
+
+        full_param_layouts = None
+        if model_chunks is not None:
+            full_param_layouts = [
+                chunk.full_param_layout
+                for chunk in model_chunks
+                if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
+            ] or None
+        self.shard_params(optimizers, full_param_layouts)
+
+        # When a full_param_layout is available, ddp_config.use_distributed_optimizer
+        # is True and model params are views into the DDP param buffer.  After the
+        # optimizer step copies updated fp32 main params → bf16 model params, the
+        # buffer is already up-to-date in-place.  We can use DDP's buffer-based
+        # all-gather (start_param_sync) instead of the flatten/unflatten allgather_params
+        # path.
+        self.use_buffer_param_sync = full_param_layouts is not None
+        self.model_chunks = model_chunks
 
         # Set up overlap param gather using DDP bucket infrastructure.
         self.overlap_param_gather = config.overlap_param_gather
-        if self.overlap_param_gather:
+        if self.overlap_param_gather and not self.use_buffer_param_sync:
+            # Legacy path: set up per-bucket param lists for variable-size all-gather.
+            # When use_buffer_param_sync is True, the standard distributed optimizer
+            # all-gather path is used and this setup is not needed.
             assert (
                 model_chunks is not None
             ), "model_chunks must be provided if overlap_param_gather is True"
@@ -98,32 +426,109 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # This way each rank do some duplicated work but allgather_v is no longer needed
         # All current distopt optimization can also be potentially applied
 
-    def shard_params(self, optimizers):
-        """Shard all params into lists by rank."""
-        # list of parameter are sorted by numel and assigned to ranks in ping-pong style
-        # example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list will be
-        # [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]]
+    def shard_params(self, optimizers, full_param_layouts=None):
+        """Shard params across ranks according to the computed param layout.
 
-        # simplify when dp_cp group size is 1
-        if get_pg_size(self.pg_collection.dp_cp) == 1:
+        Each param's shard assignment is derived from the :class:`FullParamLayout`
+        stored on the DDP model chunks.  Within each bucket the buffer is divided
+        into ``dp_size`` equal shards; a param's shard index is determined by its
+        position in the buffer.
+
+        Falls back to the legacy ping-pong-by-numel strategy when no layout is
+        available (e.g. ``dp_size == 1`` or no DDP wrapper).
+
+        Args:
+            optimizers: Optimizers whose param groups will be narrowed to
+                the local rank's shard.
+            full_param_layouts: List of :class:`FullParamLayout` (one per model
+                chunk).  ``None`` triggers the legacy fallback.
+        """
+        # Simplify when dp_cp group size is 1.
+        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
+        if dp_cp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
 
-        dp_cp_idx, expt_dp_idx = 0, 0
-        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
         expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
-        # create ping-pong style loop so memory is more balanced
+
+        if full_param_layouts is not None:
+            self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
+        else:
+            self._shard_params_ping_pong(optimizers, dp_cp_size, expt_dp_size)
+
+    def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
+        """Derive shard assignments from the param layout."""
+        dp_cp_rank = get_pg_rank(self.pg_collection.dp_cp)
+        expt_dp_rank = get_pg_rank(self.pg_collection.expt_dp)
+
+        self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
+        self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
+
+        # Map each param to its shard index.
+        param_to_shard: Dict[torch.nn.Parameter, int] = {}
+        for full_layout in full_param_layouts:
+            for buffer_key, layout in full_layout.layouts.items():
+                dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
+                for param, (start, end, bucket_id) in layout.param_index_map.items():
+                    bstart, bend = layout.bucket_indices[bucket_id]
+                    shard_size = (bend - bstart) // dp_size
+                    shard_idx = (start - bstart) // shard_size
+                    param_to_shard[param] = shard_idx
+
+        # Collect all param groups and assign params to per-rank lists.
+        param_groups = []
+        for optimizer in optimizers:
+            param_groups += optimizer.param_groups
+        param_groups_this_rank = [[] for _ in param_groups]
+
+        for group_index, group in enumerate(param_groups):
+            is_expert = group.get("is_expert_parallel", False)
+            local_rank = expt_dp_rank if is_expert else dp_cp_rank
+            params_list = self.expt_dp_params_list if is_expert else self.dp_cp_params_list
+
+            for p in group["params"]:
+                assert p in param_to_shard, (
+                    f"Optimizer param (shape={tuple(p.shape)}, numel={p.numel()}) not found "
+                    f"in any param layout. Ensure all optimizer params are included in the "
+                    f"full_param_layout passed to DDP."
+                )
+                shard_idx = param_to_shard[p]
+                params_list[shard_idx].append(p)
+                if shard_idx == local_rank:
+                    param_groups_this_rank[group_index].append(p)
+
+        # Now we modify the group to only handle local params.
+        for group, local_params in zip(param_groups, param_groups_this_rank):
+            group["params"] = local_params
+
+        # Simplify when expt_dp group size is 1 or expert parallel is off.
+        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+            self.expt_dp_params_list = None
+
+    def _shard_params_ping_pong(self, optimizers, dp_cp_size, expt_dp_size):
+        """Legacy ping-pong-by-numel shard assignment (no layout available).
+
+        Legacy: this method is a fallback for when no ``full_param_layout``
+        is provided.  Once all call sites supply a layout, this can be removed
+        in favor of :meth:`_shard_params_from_layout`.
+
+        List of parameters are sorted by numel and assigned to ranks in ping-pong style.
+        Example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list
+        will be [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]].
+        """
+        dp_cp_idx, expt_dp_idx = 0, 0
+        # Create ping-pong style loop so memory is more balanced.
         dp_cp_loop = list(range(dp_cp_size)) + list(range(dp_cp_size))[::-1]
         expt_dp_loop = list(range(expt_dp_size)) + list(range(expt_dp_size))[::-1]
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
-        # get all param groups
+        # Get all param groups.
         param_groups = []
         for optimizer in optimizers:
             param_groups += optimizer.param_groups
 
-        # sort param in all groups by param numel and assign to each rank evenly
+        # Sort param in all groups by param numel and assign to each rank evenly.
         param_list = []
         for group_index, group in enumerate(param_groups):
             for p in group["params"]:
@@ -131,7 +536,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         param_list.sort(key=lambda x: x[0].numel())
         param_groups_this_rank = [[] for g in param_groups]
 
-        # assign params to rank in ping-pong style loop
+        # Assign params to rank in ping-pong style loop.
         for p, group_index in param_list:
             if param_groups[group_index].get("is_expert_parallel", False):
                 if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.pg_collection.expt_dp):
@@ -144,16 +549,22 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 self.dp_cp_params_list[dp_cp_loop[dp_cp_idx]].append(p)
                 dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
 
-        # now we modify the group to only handle local params
+        # Now we modify the group to only handle local params.
         for groups, params in zip(param_groups, param_groups_this_rank):
             groups["params"] = params
 
-        # simplify when expt_dp group size is 1 or expert parallel is off
+        # Simplify when expt_dp group size is 1 or expert parallel is off.
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 
     def set_bucket_layerwise_params_list(self, model_chunks):
         """Map sharded params to DDP buckets for async all-gather.
+
+        Legacy: only used by the variable-size all-gather path
+        (``use_buffer_param_sync=False``).  Once all call sites supply a
+        ``full_param_layout``, this can be removed — the standard distributed
+        optimizer buffer all-gather handles param sync without per-bucket
+        param lists.
 
         For each bucket in each model chunk's bucket groups, build per-rank param lists
         by cross-referencing the layer-wise sharded param lists with the bucket's params.
@@ -193,7 +604,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @torch.no_grad()
     def allgather_params(self) -> None:
-        """All-gather updated params from all ranks."""
+        """All-gather updated params from all ranks.
+
+        Legacy: only used when ``use_buffer_param_sync=False``.  Once all
+        call sites supply a ``full_param_layout``, this can be removed — the
+        standard distributed optimizer buffer all-gather (via
+        ``start_param_sync``) replaces this flatten/unflatten path.
+        """
 
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
@@ -281,10 +698,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """step function for layer-wise optimizer."""
         update_successful, grad_norm, num_zeros_in_grad = super().step()
 
-        # All gather updated params. If overlap_param_gather is True, the allgather
+        # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
         if not self.overlap_param_gather:
-            self.allgather_params()
+            if self.use_buffer_param_sync:
+                # Model params are views into the DDP param buffer
+                # (ddp_config.use_distributed_optimizer=True).  The optimizer step
+                # already copied updated fp32 main params → bf16 model params (=
+                # buffer views), so the buffer is up-to-date.  Trigger the standard
+                # buffer all-gather.
+                for model_chunk in self.model_chunks:
+                    model_chunk.start_param_sync(force_sync=True)
+            else:
+                self.allgather_params()
 
         return update_successful, grad_norm, num_zeros_in_grad
 

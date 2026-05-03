@@ -52,6 +52,7 @@ from typing import Any, Optional, Dict
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from .log_handler import CustomHandler
 
@@ -1465,6 +1466,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             ddp_config = get_megatron_ddp_config(args)
             ddp_config.bucket_size = bucket_size
 
+            # Layer-wise distributed optimizer uses reduce-scatter like the
+            # standard distributed optimizer.
+            if getattr(args, 'use_layer_wise_distributed_optimizer', False):
+                ddp_config.use_distributed_optimizer = True
+
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             # If bucket_size is not provided as an input, use sane default.
             # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
@@ -1477,6 +1483,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
+
+        # Tag parameters for the layer-wise distributed optimizer before DDP
+        # wrapping so that buffer grouping separates layerwise and standard params.
+        if getattr(args, 'use_layer_wise_distributed_optimizer', False):
+            LayerWiseDistributedOptimizer.tag_params(model, args.optimizer)
 
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
@@ -1500,7 +1511,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
                 # Pre-compute parameter layouts for the distributed optimizer.
                 # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if args.use_distributed_optimizer and DP is DDP:
+                if (args.use_distributed_optimizer or getattr(args, 'use_layer_wise_distributed_optimizer', False)) and DP is DDP:
                     all_params = [
                         p for p in model_chunk.parameters() if p.requires_grad
                     ]
@@ -1510,8 +1521,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                         if disable_bucketing or pp_rank > 0
                         else ddp_config.bucket_size
                     )
+                    if getattr(args, 'use_layer_wise_distributed_optimizer', False):
+                        compute_layout_fn = LayerWiseDistributedOptimizer.compute_full_param_layout
+                    else:
+                        compute_layout_fn = DistributedOptimizer.compute_full_param_layout
                     chunk_kwargs["full_param_layout"] = (
-                        DistributedOptimizer.compute_full_param_layout(
+                        compute_layout_fn(
                             all_params,
                             effective_bucket_size,
                             mpu.get_data_parallel_world_size(with_context_parallel=True),
@@ -3898,6 +3913,6 @@ def should_disable_forward_pre_hook(args):
     return (
         not args.use_megatron_fsdp
         and has_optimizer
-        and (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
+        and (args.use_distributed_optimizer or getattr(args, 'use_layer_wise_distributed_optimizer', False))
         and args.overlap_param_gather
     )

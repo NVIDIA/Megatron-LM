@@ -322,8 +322,9 @@ class _ParamAndGradBucketGroup:
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
         if not self.ddp_config.use_distributed_optimizer:
-            # Layer-wise optimizer path: use all_gather for variable-size
-            # param gather.
+            # Legacy layer-wise optimizer path: use all_gather for variable-size
+            # param gather.  Once all layerwise call sites set
+            # ddp_config.use_distributed_optimizer=True, this branch can be removed.
             #
             # Each rank may own a different number of params per bucket, so
             # layerwise_param_flat_sizes can vary across ranks.  PyTorch's NCCL
@@ -759,11 +760,13 @@ def group_params_for_buffers(
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
-    Each distinct buffer is identified by a BufferKey with three dimensions:
+    Each distinct buffer is identified by a BufferKey with four dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
     - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False),
       which requires a separate buffer with a different data-parallel group.
+    - use_layerwise_distributed_optimizer: whether the parameter uses the layer-wise distributed
+      optimizer, which requires shard-aligned layouts.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -790,15 +793,22 @@ def group_params_for_buffers(
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
         is_expert_parallel = not getattr(param, 'allreduce', True)
+        use_layerwise_distributed_optimizer = getattr(
+            param, 'use_layerwise_distributed_optimizer', False
+        )
 
-        key = BufferKey(param_dtype, grad_dtype, is_expert_parallel)
+        key = BufferKey(
+            param_dtype, grad_dtype, is_expert_parallel, use_layerwise_distributed_optimizer
+        )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
         key_to_params[key] = param_list
 
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
-        offset_key = BufferKey(param.dtype, grad_dtype, is_expert_parallel)
+        offset_key = BufferKey(
+            param.dtype, grad_dtype, is_expert_parallel, use_layerwise_distributed_optimizer
+        )
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1
         indices = key_to_indices.get(key, [])
