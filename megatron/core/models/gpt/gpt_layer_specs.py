@@ -38,7 +38,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
-from megatron.core.typed_torch import copy_signature
+from megatron.core.typed_torch import copy_signature, not_none
 from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
@@ -313,7 +313,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=backend.column_parallel_layer_norm_linear(),
+                    linear_qkv=not_none(backend.column_parallel_layer_norm_linear()),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=(
@@ -525,11 +525,7 @@ def get_mlp_module_spec_for_backend(
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         module = TEFusedMLP if use_te_op_fuser else MLP
-        if backend.fuse_layernorm_and_linear():
-            linear_fc1 = backend.column_parallel_layer_norm_linear()
-            assert linear_fc1 is not None
-        else:
-            linear_fc1 = backend.column_parallel_linear()
+        linear_fc1 = backend.column_parallel_layer_norm_linear() or backend.column_parallel_linear()
         return ModuleSpec(
             module=module,
             submodules=MLPSubmodules(

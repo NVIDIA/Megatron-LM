@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import warnings
 from functools import partial
-from typing import Optional, cast
+from typing import cast
+
+from typing_extensions import final, override
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
@@ -33,29 +35,31 @@ class _TENormWithResidual:
         return TENorm(*args, has_residual=True, **kwargs)
 
 
+@final
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
-    def linear(self) -> type:
+    @override
+    def linear(self) -> type[TELinear]:
         """Which linear module TE backend uses"""
         return TELinear
 
-    def column_parallel_linear(self) -> type:
+    @override
+    def column_parallel_linear(self) -> type[TEColumnParallelLinear]:
         """Which column parallel linear module TE backend uses"""
         return TEColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    @override
+    def row_parallel_linear(self) -> type[TERowParallelLinear]:
         """Which row parallel linear module TE backend uses"""
         return TERowParallelLinear
 
-    def fuse_layernorm_and_linear(self) -> bool:
-        """TE backend chooses a single module for layernorm and linear"""
-        return True
-
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    @override
+    def column_parallel_layer_norm_linear(self) -> type[TELayerNormColumnParallelLinear]:
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 
+    @override
     def layer_norm(
         self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
     ) -> LayerNormBuilder:
@@ -68,10 +72,12 @@ class TESpecProvider(BackendSpecProvider):
         # Keep returning a class so this path stays aligned with build_module's class handling.
         return _TENormWithResidual if has_residual else TENorm
 
-    def core_attention(self) -> type:
+    @override
+    def core_attention(self) -> type[TEDotProductAttention]:
         """Which module to use for attention"""
         return TEDotProductAttention
 
+    @override
     def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         if moe_use_grouped_gemm and TEColumnParallelGroupedLinear is not None:
@@ -107,6 +113,7 @@ class TESpecProvider(BackendSpecProvider):
                 ),
             )
 
+    @override
     def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
