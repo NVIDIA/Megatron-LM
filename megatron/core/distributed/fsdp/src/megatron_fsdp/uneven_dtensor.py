@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Iterable, List, Union
+from typing import Iterable, List, Optional, Union
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
@@ -23,7 +24,9 @@ from torch.distributed.checkpoint.metadata import (
     TensorProperties,
 )
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
-from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
+from torch.distributed.checkpoint.state_dict import get_state_dict as _get_state_dict
+from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement, Replicate, Shard, _StridedShard
 
 
 def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
@@ -481,3 +484,35 @@ def split_dtensor(
             update_uneven_dtensor_chunk_metadata(new_dtensor)
 
         yield new_dtensor
+
+
+def make_uneven_dtensor(
+    local_tensor: torch.Tensor, shape: torch.Size, dp_mesh: DeviceMesh, placements: List[Placement]
+):
+    assert dp_mesh.ndim == 1, "Only 1D mesh is supported for now"
+    return DTensor.from_local(
+        local_tensor=local_tensor.view(-1, *shape[1:]),
+        device_mesh=dp_mesh,
+        placements=placements,
+        run_check=False,
+        shape=shape,
+        stride=torch.empty(shape, device="meta").stride(),
+    )
+
+
+def get_state_dict(
+    model: nn.Module,
+    optimizers: Union[torch.optim.Optimizer, Iterable[torch.optim.Optimizer]],
+    *,
+    submodules: Optional[set[nn.Module]] = None,
+    options: Optional["StateDictOptions"] = None,
+) -> tuple[dict[str, "ValueType"], "OptimizerStateType"]:
+    for param in model.parameters():
+        assert isinstance(param, DTensor), "Expected all parameters to be DTensors"
+
+    model_state_dict, optimizer_state_dict = _get_state_dict(
+        model=model, optimizers=optimizers, submodules=submodules, options=options
+    )
+    preprocess_state_dict_for_uneven_dtensor(model_state_dict)
+    preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
+    return model_state_dict, optimizer_state_dict

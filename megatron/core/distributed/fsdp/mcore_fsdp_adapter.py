@@ -14,6 +14,7 @@
 
 import logging
 import random
+from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 try:
@@ -50,11 +51,14 @@ try:
         MegatronFSDP,
         MixedPrecisionPolicy,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import FSDPModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
     IMPORT_MEGATRON_FSDP_ERROR = import_megatron_fsdp_error
     HAVE_MEGATRON_FSDP = False
+
+from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +106,18 @@ class FullyShardedDataParallel(_BaseDataParallel):
     ):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
+
+        if ddp_config.use_fully_shard_api:
+            self._init_with_fully_shard(
+                config,
+                ddp_config,
+                module,
+                fsdp_unit_modules,
+                disable_bucketing,
+                device,
+                pg_collection,
+            )
+            return
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -189,10 +205,100 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.sync_rng_states_across_tp_group()
 
+    def _init_with_fully_shard(
+        self,
+        config: TransformerConfig,
+        ddp_config: DistributedDataParallelConfig,
+        module: torch.nn.Module,
+        fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
+        disable_bucketing: bool = False,
+        device: Optional[torch.device] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        if ddp_config.use_megatron_fsdp:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import (
+                fully_shard,
+            )
+        else:
+            from torch.distributed.fsdp import fully_shard
+
+        if (
+            fsdp_unit_modules is None
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            fsdp_unit_modules = [TransformerLayer]
+
+        edp_mesh = _init_dp_mesh(pg_collection, edp=True)
+        dp_mesh = _init_dp_mesh(pg_collection, edp=False)
+
+        mp_policy = MixedPrecisionPolicy(
+            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
+            # Grandfathered Argument: grad_reduce_in_fp32
+            main_grads_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_main_grads_dtype
+            ),
+            grad_comm_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_grad_comm_dtype
+            ),
+        )
+        kwargs = {
+            "mp_policy": mp_policy,
+            "enable_unshard_prefetch": ddp_config.overlap_param_gather,
+            "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
+        }
+
+        for m in module.modules():
+            if isinstance(m, (TEGroupedMLP, SequentialMLP)):
+                fully_shard(m, mesh=edp_mesh, **kwargs)
+        if fsdp_unit_modules is not None:
+            for m in module.modules():
+                if isinstance(m, tuple(fsdp_unit_modules)):
+                    fully_shard(m, mesh=dp_mesh, **kwargs)
+        fully_shard(module, mesh=dp_mesh, **kwargs)
+
+        if ddp_config.check_for_nan_in_grad:
+            module._set_nan_check(True)
+
+        super().__init__(config=config, module=module)
+
+        noop = lambda *args, **kwargs: None
+
+        def not_implemented_op():
+            raise NotImplementedError(
+                "This operation is not implemented for the fully_shard API path. "
+            )
+
+        from unittest.mock import Mock
+
+        self.param_and_grad_buffer = Mock()
+        self.param_and_grad_buffer.parameter_groups = []
+        self.param_and_grad_buffer.copy_main_weights_to_model_weights = (
+            self.module._copy_main_weights_to_model_weights
+        )
+        self.ddp_config = ddp_config
+        self.no_sync = nullcontext
+        self.start_param_sync = noop
+        self.start_grad_sync = noop
+        self.finish_grad_sync = noop
+        self.scale_gradients = self.module._scale_gradients
+        self.zero_grad_buffer = self.module._zero_grad_buffer
+        self.broadcast_params = not_implemented_op
+        self.synchronize_param_gather = noop
+        self.module.state_dict_for_save_checkpoint = not_implemented_op
+        self.state_dict_for_save_checkpoint = not_implemented_op
+
     def load_state_dict(self, state_dict, strict=True):
         """
         Load the state dictionary into the module.
         """
+        if self.ddp_config.use_fully_shard_api:
+            super().load_state_dict(state_dict, strict=strict)
+            return
+
         custom_state_dict = {}
         for key, value in state_dict.items():
             if self.config.fp8 and key.endswith('._extra_state'):
@@ -416,6 +522,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         Stop communication for the module.
         """
+        if self.ddp_config.use_fully_shard_api:
+            raise NotImplementedError(
+                "stop_communication is not implemented for the fully_shard API path. "
+            )
+
         self.module.synchronize_gradient_reduce()
         self.module.synchronize_param_gather()
 
@@ -432,6 +543,51 @@ class FullyShardedDataParallel(_BaseDataParallel):
             broadcast_list = [None]
         torch.distributed.broadcast_object_list(broadcast_list, group=self.tp_group, group_src=0)
         _load_rng_state_dict(broadcast_list[0])
+
+
+def _reset_parameters(module):
+    """
+    Recursively reset parameters for the module and its submodules.
+    This is used to ensure that all ranks start with the same initial parameters
+    before sharding, which is important for correctness when using FSDP.
+    """
+    parent_fsdp_module_map = {}
+    for m in module.modules():
+        if isinstance(m, FSDPModule):
+            for child in m.module.modules():
+                parent_fsdp_module_map[child] = m
+
+    for m in module.modules():
+        if hasattr(m, "reset_parameters"):
+            parent_fsdp_module_map[m].unshard()
+            m.reset_parameters()
+            parent_fsdp_module_map[m].reshard()
+
+
+def _init_dp_mesh(pg_collection, edp=False):
+    assert HAVE_DTENSOR, (
+        "DTensor support is required to initialize the device mesh. "
+        "Please install a compatible version of PyTorch."
+    )
+
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    if edp:
+        mesh = DeviceMesh.from_group(
+            device_type="cuda",
+            group=pg_collection.expt_dp,
+            mesh=dist.get_process_group_ranks(pg_collection.expt_dp),
+            mesh_dim_names=("edp",),
+        )
+    else:
+        mesh = DeviceMesh.from_group(
+            device_type="cuda",
+            group=pg_collection.dp_cp,
+            mesh=dist.get_process_group_ranks(pg_collection.dp_cp),
+            mesh_dim_names=("dp",),
+        )
+
+    return mesh
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
