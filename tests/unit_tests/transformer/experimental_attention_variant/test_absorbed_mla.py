@@ -121,7 +121,10 @@ class MockCoreAttention(torch.nn.Module):
 
 
 def get_mock_mla_config(
-    tensor_model_parallel_size: int, context_parallel_size: int
+    tensor_model_parallel_size: int,
+    context_parallel_size: int,
+    sequence_parallel: bool,
+    recompute_mla_up_proj: bool,
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
