@@ -975,6 +975,7 @@ def validate_args(args, defaults={}):
     args.main_params_dtype = map_dtype(args.main_params_dtype)
     args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
+    args.inference_logits_dtype = map_dtype(args.inference_logits_dtype)
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
 
@@ -1790,6 +1791,7 @@ def core_transformer_config_from_args(args, config_class=None):
             kw_args['experimental_attention_variant'] = 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
+    kw_args['inference_logits_dtype'] = args.inference_logits_dtype
 
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
@@ -1951,6 +1953,12 @@ def _add_inference_args(parser):
                        help="Enable chunked prefill (disabled by default)")
     group.add_argument('--num-speculative-tokens', type=int, default=0,
                        help='Number of speculative tokens generated during decode')
+    group.add_argument('--inference-logits-dtype', type=str, default='fp32',
+                       choices=['fp32', 'fp16', 'bf16'],
+                       help='Dtype for logits during inference. fp32 (default) '
+                       'improves sampling determinism by reducing tie-breaking '
+                       'non-determinism in argmax/multinomial.',
+                       dest='inference_logits_dtype')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,
@@ -2075,6 +2083,7 @@ def _add_network_size_args(parser):
         "cuda_graph_retain_backward_graph",
         "disable_parameter_transpose_cache",
         "inference_sampling_seed",
+        "inference_logits_dtype",
         "use_inference_optimized_layers",
         "heterogeneous_block_specs",
         "hetereogenous_dist_checkpoint",

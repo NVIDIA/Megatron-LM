@@ -15,6 +15,7 @@ COMMON_OPTIONS="\
     --use-mcore-models \
     --transformer-impl transformer_engine \
     --${PRECISION:-bf16} \
+    --inference-logits-dtype bf16 \
     --te-rng-tracker \
     --inference-dynamic-batching-buffer-size-gb 20 \
     --data-parallel-random-init \

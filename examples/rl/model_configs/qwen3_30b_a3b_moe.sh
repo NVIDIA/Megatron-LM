@@ -43,6 +43,7 @@ MODEL_OPTIONS="
 --seq-length 8192 \
 --inference-max-seq-length 8192 \
 --bf16 \
+--inference-logits-dtype bf16 \
 --tensor-model-parallel-size $TP  \
 --pipeline-model-parallel-size $PP  \
 --expert-model-parallel-size $EP \
