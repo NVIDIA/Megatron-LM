@@ -559,7 +559,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.output_layer.sequence_parallel = True
 
         if labels is None:
-            # [s b h] => [b s h]
+            # [s b h] -> [b s h]. A contiguous [s, 1, h] can be re-viewed as a contiguous
+            # [1, s, h] via squeeze/unsqueeze (strides (s*H, H, 1) satisfy contiguity for the
+            # new shape) without a kernel call. Dynamic batching always produces batch_size=1
+            # (requests are packed along the sequence dim), so this fast path is hit per
+            # inference step. Falls through to a materializing copy for non-contiguous or
+            # batch>1 inputs.
+            if logits.size(1) == 1 and logits.is_contiguous():
+                return logits.squeeze(1).unsqueeze(0)
             return logits.transpose(0, 1).contiguous()
 
         loss = self.compute_language_model_loss(labels, logits)
