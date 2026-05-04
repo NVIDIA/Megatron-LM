@@ -363,9 +363,7 @@ def _apply_model_recipe_to_args(args):
         "rotary_percent": compiled.rotary_percent,
         "rotary_base": compiled.rotary_base,
         "rotary_seq_len_interpolation_factor": compiled.seq_len_interpolation_factor,
-        "untie_embeddings_and_output_weights": (
-            not compiled.share_embeddings_and_output_weights
-        ),
+        "untie_embeddings_and_output_weights": compiled.untie_embeddings_and_output_weights,
         "fp16_lm_cross_entropy": compiled.fp16_lm_cross_entropy,
     }
     for attr, value in recipe_values.items():
