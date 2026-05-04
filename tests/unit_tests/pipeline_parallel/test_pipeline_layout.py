@@ -135,6 +135,7 @@ def create_args():
     args.vocab_file = None
     args.add_position_embedding = False
     args.ckpt_assume_constant_structure = False
+    args.stream_ckpt_dequant = True
     args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = "assume_ok_unexpected"
     args.fp16 = False
