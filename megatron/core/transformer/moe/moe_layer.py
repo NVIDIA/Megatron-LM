@@ -49,6 +49,13 @@ if HAVE_FLASHINFER:
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
+try:
+    import triton  # pylint: disable=unused-import
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 else:
@@ -336,9 +343,16 @@ class MoELayer(BaseMoELayer):
 
                 check_flashinfer_jit_cache_installed()
             elif config.inference_grouped_gemm_backend == 'torch':
-                assert hasattr(torch.nn.functional, 'grouped_mm'), (
+                assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
+                    torch, '_grouped_mm'
+                ), (
                     "inference_grouped_gemm_backend='torch' requires "
-                    "torch.nn.functional.grouped_mm (available since PyTorch 2.10)."
+                    "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
+                )
+            elif config.inference_grouped_gemm_backend == 'vllm':
+                assert HAVE_TRITON, (
+                    "inference_grouped_gemm_backend='vllm' requires Triton. "
+                    "Install triton (pip install triton)."
                 )
             self._setup_inference_mode(pg_collection)
 
@@ -371,6 +385,16 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
         )
 
+        # Wire shared-expert overlap into the inference dispatcher (NVLS only).
+        # The dispatcher launches the shared-expert forward on SharedExpertMLP.stream
+        # concurrently with AGV+experts+RSV and adds it back in combine_postprocess.
+        if (
+            dispatcher_type == 'nvls'
+            and self.use_shared_expert
+            and self.config.moe_shared_expert_overlap
+        ):
+            self._inference_token_dispatcher.set_shared_experts(self.shared_experts)
+
     def train(self, mode: bool = True):
         """Swap token dispatcher when switching between train and eval modes."""
         super().train(mode)
@@ -380,7 +404,9 @@ class MoELayer(BaseMoELayer):
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
             else:
                 self.token_dispatcher = self._inference_token_dispatcher
-                self.shared_expert_overlap = False
+                self.shared_expert_overlap = (
+                    self._inference_token_dispatcher.shared_experts is not None
+                )
         return self
 
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):

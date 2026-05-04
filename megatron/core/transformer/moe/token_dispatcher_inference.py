@@ -21,6 +21,8 @@ update_metadata method, invoked from the first instance's token_dispatch so the
 per-step metadata kernel is captured inside the CUDA graph.
 """
 
+import operator
+from functools import reduce
 from typing import List, Optional
 
 import torch
@@ -38,8 +40,10 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 
@@ -58,6 +62,12 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     # so that experts.py can always call _valid_tokens() on this base class.
     _valid_tokens_tensor: Optional[torch.Tensor] = None
 
+    # Host-side estimate of the total valid token count across all EP ranks.
+    # Computed as local_tokens * ep_size to avoid a device-to-host sync (which
+    # would break CUDA graph capture).  This may differ from _valid_tokens_tensor
+    # when ranks have unequal token counts.
+    _host_valid_tokens_estimate: Optional[int] = None
+
     def __init__(self, *args, runs_metadata_sync: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._runs_metadata_sync = runs_metadata_sync
@@ -65,6 +75,10 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     @classmethod
     def _valid_tokens(cls) -> torch.Tensor:
         return cls._valid_tokens_tensor
+
+    @classmethod
+    def _get_host_valid_tokens_estimate(cls) -> Optional[int]:
+        return cls._host_valid_tokens_estimate
 
     def update_metadata(self, local_tokens: int) -> None:
         """Per-step metadata refresh fired from the first instance's token_dispatch.
@@ -141,9 +155,13 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
             cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(local_tokens_per_rank.sum())
+            total = local_tokens_per_rank.sum()
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(total)
+            InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = int(total.item())
         else:
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(ep_size * local_tokens)
+            total = ep_size * local_tokens
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(total)
+            InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = total
 
     def token_dispatch(self, hidden_states, probs):
         """Gather hidden_states, probs, and routing_map from all EP ranks.
@@ -284,7 +302,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _per_rank_worst_case_token_count: int = 2048  # round_up_tokens(max_tokens) // tp_size
 
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
-    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=bf16.
+    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=fp32.
     _symm_agv_hidden: Optional[dict] = None  # {"tensor": ..., "handle": ...}
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
@@ -340,29 +358,44 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         global_max = per_rank_worst_case_token_count * ep_size
         device = torch.cuda.current_device()
 
+        # Each buffer self-sizes from its exact tensor footprint so non-default
+        # max_tokens / hidden_size / ep_size combinations don't silently overflow
+        # the symmetric-memory cap.
+        _MB = 1024 * 1024
+
+        def _size_mb(shape, dtype) -> int:
+            nbytes = reduce(operator.mul, shape, 1) * torch.tensor([], dtype=dtype).element_size()
+            return max(1, (nbytes + _MB - 1) // _MB)
+
+        agv_h_shape = [global_max, hidden_size]
+        agv_r_shape = [global_max, topk]
+        agv_p_shape = [global_max, topk]
+        rsv_shape = [global_max, hidden_size]
+        meta_shape = [ep_size]
+
         cls._symm_agv_hidden = SymmetricMemoryManager.get_buffer(
-            "ep_agv_h", process_group=ep_group
-        ).maybe_get_tensor([global_max, hidden_size], dtype=torch.bfloat16)
+            "ep_agv_h", process_group=ep_group, size_mb=_size_mb(agv_h_shape, torch.bfloat16)
+        ).maybe_get_tensor(agv_h_shape, dtype=torch.bfloat16)
 
         cls._symm_agv_routing = SymmetricMemoryManager.get_buffer(
-            "ep_agv_r", process_group=ep_group
-        ).maybe_get_tensor([global_max, topk], dtype=torch.int64)
+            "ep_agv_r", process_group=ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
+        ).maybe_get_tensor(agv_r_shape, dtype=torch.int64)
 
         cls._symm_agv_probs = SymmetricMemoryManager.get_buffer(
-            "ep_agv_p", process_group=ep_group
-        ).maybe_get_tensor([global_max, topk], dtype=torch.float32)
+            "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
+        ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group
-        ).maybe_get_tensor([global_max, hidden_size], dtype=torch.bfloat16)
+            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
+        ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(
-            "ep_meta", process_group=ep_group
-        ).maybe_get_tensor([ep_size], dtype=torch.int32)
+            "ep_meta", process_group=ep_group, size_mb=_size_mb(meta_shape, torch.int32)
+        ).maybe_get_tensor(meta_shape, dtype=torch.int32)
 
         failed = [
-            name
+            (name, SymmetricMemoryManager.get_buffer(name).init_failure_reason)
             for name, buf in (
                 ("ep_agv_h", cls._symm_agv_hidden),
                 ("ep_agv_r", cls._symm_agv_routing),
@@ -373,9 +406,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             if buf["handle"] is None
         ]
         if failed:
+            details = "; ".join(f"{name}: {reason or 'unknown'}" for name, reason in failed)
             raise RuntimeError(
-                f"NVLSAllGatherVDispatcher: symmetric memory allocation failed for "
-                f"{failed}. This dispatcher requires Hopper+ GPUs with NVLink. "
+                f"NVLSAllGatherVDispatcher: symmetric memory init failed [{details}]. "
+                f"This dispatcher requires Hopper+ GPUs fully connected via NVLink, and torch built"
+                f"with torch.distributed._symmetric_memory plus triton installed. "
                 f"Use inference_moe_token_dispatcher_type='nccl' on non-NVLS systems."
             )
 
@@ -399,6 +434,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             cls._symm_agv_routing["tensor"].fill_(-1)
 
@@ -420,12 +456,25 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         self.topk = config.moe_router_topk
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
+        # When shared_expert_overlap is enabled, the shared expert forward is launched
+        # on SharedExpertMLP.stream in dispatch_preprocess and joined in combine_postprocess.
+        self._shared_expert_output: Optional[torch.Tensor] = None
 
     # ── Dispatch path ─────────────────────────────────────────────────────────────
 
     def dispatch_preprocess(self, hidden_states, routing_map, probs):
-        """Store routing map and local token count; no communication."""
+        """Store routing map and local token count; no inter-rank communication.
+
+        If shared_expert_overlap is enabled (set_shared_experts has been called),
+        launch the entire shared-expert forward on SharedExpertMLP.stream so it
+        runs concurrently with AGV dispatch, expert GEMMs, and RSV combine.
+        """
         self.hidden_shape = hidden_states.shape
+        if self.shared_experts is not None:
+            stream = SharedExpertMLP.stream
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                self._shared_expert_output = apply_module(self.shared_experts)(hidden_states)
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self._local_tokens = hidden_states.shape[0]
@@ -458,6 +507,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
+        # Cap AGV CTAs when overlapping the shared expert so the AGV does not
+        # starve the shared-expert GEMMs running on the side stream.
+        agv_kwargs = {"max_num_blocks": 16} if self.shared_experts is not None else {}
         multimem_all_gatherv_3tensor(
             agv_h["tensor"],
             agv_r["tensor"],
@@ -471,6 +523,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             per_rank_max_tokens=per_rank_max,
+            **agv_kwargs,
         )
 
         topk = probs.shape[1]
@@ -494,7 +547,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
         Args:
-            hidden_states: [global_max, hidden_size] bf16 expert outputs.
+            hidden_states: [global_max, hidden_size] expert outputs (fp32 when
+                written directly to the RSV buffer, bf16 otherwise).
 
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
@@ -509,7 +563,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         output = torch.empty(
             self._local_tokens,
             hidden_states.shape[1],
-            dtype=hidden_states.dtype,
+            dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
         multimem_reduce_scatter_v(
@@ -523,5 +577,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         return output.to(torch.bfloat16)
 
     def combine_postprocess(self, hidden_states):
-        """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H])."""
-        return hidden_states.view(self.hidden_shape)
+        """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H]).
+
+        If shared_expert_overlap is enabled, join SharedExpertMLP.stream and add
+        the shared-expert output produced concurrently during dispatch+combine.
+        """
+        output = hidden_states.view(self.hidden_shape)
+        if self._shared_expert_output is not None:
+            torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
+            output = output + self._shared_expert_output
+            self._shared_expert_output = None
+        return output
