@@ -578,9 +578,8 @@ class TestDynamicContext:
         mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0].item()
         assert mamba_idx >= 0
 
-        # Mamba state zeroing is deferred until transfer_bookkeeping_to_gpu().
+        # Mamba state zeroing runs as part of the attention-state init.
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
         assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx] == 0)
         assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx] == 0)
 
@@ -1096,7 +1095,6 @@ class TestDynamicContext:
 
         # Populate gpu_view for calculate_log_probs (which reads from gpu_view).
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
 
         # logits and new_tokens must be on GPU (calculate_log_probs uses gpu_view).
         prefill_logits = torch.randn(
@@ -1147,7 +1145,6 @@ class TestDynamicContext:
 
         # Populate gpu_view again after update_requests modified bookkeeping state.
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
 
         # Generate new logits for the decode step. Now each request contributes 1 token.
         decode_logits = torch.randn(
@@ -1196,7 +1193,6 @@ class TestDynamicContext:
         # This step will involve both prefill (for the new request) and decode (for existing requests).
 
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
 
         total_active_tokens_mixed_step = dynamic_context.active_token_count
         mixed_step_logits = torch.randn(

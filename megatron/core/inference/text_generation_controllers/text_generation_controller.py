@@ -593,17 +593,16 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
 
-        # Initialize attention state (100% CPU computation).
+        # Initialize attention state. Three-phase orchestration:
+        # CPU-side prepare -> graphable body (per-bucket CudaGraphManager) ->
+        # CPU-side finalize. The unified-buffer H2D and the GPU compute that
+        # builds the per-step active tensors and runs Mamba update both
+        # happen inside the captured body.
         range_push("initialize_attention_state")
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
-        range_pop()
-
-        # Single batch CPU-to-GPU transfer of bookkeeping state.
-        range_push("transfer_bookkeeping_to_gpu")
-        context.transfer_bookkeeping_to_gpu()
         range_pop()
 
         set_moe_metadata_sync(unwrapped_model)
