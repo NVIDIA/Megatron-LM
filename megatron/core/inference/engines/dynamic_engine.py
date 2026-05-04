@@ -1491,6 +1491,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 if req.kv_cache_epoch is None:
                     req.kv_cache_epoch = [(0, self._generation_epoch)]
 
+    def _defer_waiting_request_admission_for_async(self) -> bool:
+        """Return whether waiting requests must wait for pending async reconciliation."""
+        if not self.waiting_request_ids:
+            return False
+        if not self.controller.has_pending_async_forward():
+            return False
+        self.controller._async_add_deferral_count += 1
+        return True
+
     def schedule_non_chunked_prefill(self):
         """
         Perform the same original scheduling logic for non-chunked runs
@@ -1692,7 +1701,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Do not admit new requests while a speculative decode forward is pending:
         # the GPU context for that forward was built from the previous active set.
-        if not self.controller.has_pending_async_forward():
+        if not self._defer_waiting_request_admission_for_async():
             self.schedule_waiting_requests()
 
         # The print block (async_bookkeep) and metrics block both fire on this

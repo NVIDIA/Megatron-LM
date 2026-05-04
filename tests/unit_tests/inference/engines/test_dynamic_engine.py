@@ -1042,6 +1042,141 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ), async_env.engine.controller._async_disable_reason
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_lifecycle_add_deferral_matrix(self, monkeypatch) -> None:
+        """New admissions wait while a speculative async forward is pending."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        engine = env.engine
+        controller = engine.controller
+
+        assert not engine._defer_waiting_request_admission_for_async()
+        assert controller._async_add_deferral_count == 0
+
+        engine._add_request(env.requests[0])
+        monkeypatch.setattr(controller, "has_pending_async_forward", lambda: False)
+        assert not engine._defer_waiting_request_admission_for_async()
+        with torch.inference_mode():
+            engine.schedule_waiting_requests()
+        assert list(engine.waiting_request_ids) == []
+        assert engine.context.total_request_count == 1
+        assert controller._async_add_deferral_count == 0
+
+        engine._add_request(env.requests[1])
+        monkeypatch.setattr(controller, "has_pending_async_forward", lambda: True)
+        assert engine._defer_waiting_request_admission_for_async()
+        assert list(engine.waiting_request_ids) == [1]
+        assert engine.context.total_request_count == 1
+        assert controller._async_add_deferral_count == 1
+
+        monkeypatch.setattr(controller, "has_pending_async_forward", lambda: False)
+        assert not engine._defer_waiting_request_admission_for_async()
+        with torch.inference_mode():
+            engine.schedule_waiting_requests()
+        assert list(engine.waiting_request_ids) == []
+        assert engine.context.total_request_count == 2
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_staggered_add_preserves_pending_forward_e2e(self) -> None:
+        """Staggered GPT arrivals defer admission instead of discarding pending forwards."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=6,
+                model_provider="gpt",
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                termination_id=-1,
+                top_k=1,
+                enable_async_scheduling=True,
+            )
+        )
+
+        env.engine._add_request(env.requests[0])
+        env.requests[0].state = "pending"
+        self._run_step(env)
+        self._run_step(env)
+        assert env.engine.controller.has_pending_async_forward()
+
+        env.engine._add_request(env.requests[1])
+        env.requests[1].state = "pending"
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+
+        controller = env.engine.controller
+        assert controller._async_add_deferral_count > 0
+        assert controller._async_discarded_forward_count == 0
+        assert [request.status for request in env.requests] == [Status.COMPLETED, Status.COMPLETED]
+        assert [len(request.generated_tokens) for request in env.requests] == [6, 6]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    def test_async_scheduling_staggered_add_mtp_preserves_pending_forward_e2e(
+        self, model_provider: str
+    ) -> None:
+        """Staggered MTP arrivals defer admission instead of discarding pending forwards."""
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=8,
+                model_provider=model_provider,
+                num_speculative_tokens=2,
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                termination_id=-1,
+                top_k=1,
+                enable_async_scheduling=True,
+            )
+        )
+
+        env.engine._add_request(env.requests[0])
+        env.requests[0].state = "pending"
+        self._run_step(env)
+        self._run_step(env)
+        assert env.engine.controller.has_pending_async_forward()
+
+        env.engine._add_request(env.requests[1])
+        env.requests[1].state = "pending"
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+
+        controller = env.engine.controller
+        assert controller._async_add_deferral_count > 0
+        assert controller._async_discarded_forward_count == 0
+        assert [request.status for request in env.requests] == [Status.COMPLETED, Status.COMPLETED]
+        assert [len(request.generated_tokens) for request in env.requests] == [8, 8]
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
