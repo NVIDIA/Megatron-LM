@@ -156,7 +156,7 @@ def load(
         else "mcore"
     )
     loaded_state_dict = sharded_strategy.load(
-      sharded_state_dict, checkpoint_dir, async_strategy, use_dtensor_format
+        sharded_state_dict, checkpoint_dir, async_strategy, use_dtensor_format
     )
 
     merge(common_state_dict, loaded_state_dict)

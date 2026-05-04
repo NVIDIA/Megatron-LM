@@ -761,7 +761,9 @@ class TorchDistSaveShardedStrategy:
                 dcp_state_dict = sharded_state_dict
             return torch.distributed.checkpoint.save(dcp_state_dict, checkpoint_id=checkpoint_dir)
         else:
-            async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy="mcore")
+            async_request = self.async_save(
+                sharded_state_dict, checkpoint_dir, async_strategy="mcore"
+            )
             async_request.execute_sync()
             del async_request
 
