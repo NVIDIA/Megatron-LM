@@ -30,7 +30,7 @@ from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.models import Serializable, HybridModelConfig
 from megatron.core._rank_utils import safe_get_world_size
-from megatron.training.utils import print_rank_0
+from megatron.training.utils import print_rank_0, warn_rank_0
 from megatron.core.transformer.enums import AttnBackend
 
 T = TypeVar("T", bound="ConfigContainerBase")
@@ -342,6 +342,11 @@ class PretrainConfigContainer(ConfigContainerBase):
         # Deterministic mode validations and settings
         self._validate_and_apply_deterministic_mode()
 
+        # Run validations
+        self._validate_and_sync_distributed_optimizer_settings()
+        self._validate_mixed_precision_consistency()
+        self._validate_fine_grained_activation_offloading()
+
     def _validate_and_apply_megatron_fsdp_configs(self) -> None:
         """
         Validate Megatron-FSDP configuration when Megatron-FSDP is used.
@@ -420,3 +425,97 @@ class PretrainConfigContainer(ConfigContainerBase):
 
         # Enable deterministic algorithms in torch
         torch.use_deterministic_algorithms(True)
+
+    def _validate_and_sync_distributed_optimizer_settings(self) -> None:
+        """Validate and synchronize distributed optimizer settings between DDP and optimizer configs.
+
+        This function ensures that distributed optimizer settings are consistent across
+        DDP and optimizer configurations. If either setting is enabled, both will be
+        enabled to maintain consistency.
+        """
+        ddp_setting = self.ddp.use_distributed_optimizer
+        optimizer_setting = self.optimizer.use_distributed_optimizer
+
+        if ddp_setting or optimizer_setting:
+            if ddp_setting != optimizer_setting:
+                warn_rank_0(
+                    f"Distributed optimizer settings were not in sync: "
+                    f"ddp.use_distributed_optimizer={ddp_setting}, "
+                    f"optimizer.use_distributed_optimizer={optimizer_setting}. "
+                    f"Automatically enabling distributed optimizer for both settings."
+                )
+            self.ddp.use_distributed_optimizer = True
+            self.optimizer.use_distributed_optimizer = True
+
+    def _validate_mixed_precision_consistency(self) -> None:
+        """Validate that mixed precision settings are consistent between model and optimizer configs.
+
+        Raises:
+            AssertionError: If precision settings are inconsistent in a way that would
+                indicate ambiguous behavior.
+        """
+        model_cfg = self.model
+        optimizer_cfg = self.optimizer
+
+        # Mutually exclusive: cannot have both bf16 and fp16 enabled
+        assert not (model_cfg.bf16 and model_cfg.fp16), (
+            "Model config cannot have both bf16=True and fp16=True. Please set only one precision mode."
+        )
+        assert not (optimizer_cfg.bf16 and optimizer_cfg.fp16), (
+            "Optimizer config cannot have both bf16=True and fp16=True. Please set only one precision mode."
+        )
+
+        # Validate across model and optimizer configs
+        if optimizer_cfg.use_precision_aware_optimizer:
+            # For bf16 training: optimizer.bf16 must match model.bf16
+            if model_cfg.bf16:
+                assert optimizer_cfg.bf16, (
+                    "optimizer.bf16=True must be set when model.bf16=True and use_precision_aware_optimizer=True."
+                )
+            # For fp16 training: optimizer.fp16 must match model.fp16
+            if model_cfg.fp16:
+                assert optimizer_cfg.fp16, (
+                    "optimizer.fp16=True must be set when model.fp16=True and use_precision_aware_optimizer=True."
+                )
+            # For fp32 training (neither bf16 nor fp16 on model)
+            if not model_cfg.bf16 and not model_cfg.fp16:
+                assert not optimizer_cfg.bf16 and not optimizer_cfg.fp16, (
+                    "optimizer.bf16 and optimizer.fp16 must both be False when "
+                    "model is using fp32 precision (model.bf16=False, model.fp16=False) and "
+                    "use_precision_aware_optimizer=True."
+                )
+
+    def _validate_fine_grained_activation_offloading(self) -> None:
+        """Validate fine-grained activation offloading configuration.
+
+        This function ensures that fine-grained activation offloading is only enabled
+        with compatible configurations (transformer_engine implementation) and that
+        necessary environment variables are set for newer TE versions.
+
+        Args:
+            config: The configuration container to validate.
+
+        Raises:
+            ValueError: If fine-grained activation offloading is enabled with incompatible settings.
+        """
+        from megatron.core.utils import is_te_min_version
+
+        model_cfg = self.model
+
+        if not model_cfg.fine_grained_activation_offloading:
+            return
+
+        # Fine-grained activation offloading requires transformer_engine implementation
+        if model_cfg.transformer_impl != "transformer_engine":
+            raise ValueError(
+                "Fine-grained activation offloading is only supported with transformer_engine implementation. "
+                f"Current transformer_impl: {model_cfg.transformer_impl}"
+            )
+
+        # For TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 must be set to avoid offloading weights
+        if is_te_min_version("2.10.0"):
+            if os.getenv("NVTE_CPU_OFFLOAD_V1", "0") != "1":
+                raise ValueError(
+                    "For fine-grained activation offloading with TE >= 2.10.0, "
+                    "NVTE_CPU_OFFLOAD_V1 environment variable should be set to 1 to avoid offloading weights."
+                )
