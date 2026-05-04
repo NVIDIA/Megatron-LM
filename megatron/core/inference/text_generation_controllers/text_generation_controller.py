@@ -201,6 +201,11 @@ class TextGenerationController:
         self._async_pending_forward_request_ids = None
         self._async_row_mapped_forward_count = 0
         self._async_discarded_forward_count = 0
+        self._async_add_deferral_count = 0
+        self._async_finish_boundary_count = 0
+        self._async_mtp_finish_boundary_count = 0
+        self._async_pause_boundary_count = 0
+        self._async_evict_boundary_count = 0
         self._async_sample_slot_count = 2
         self._async_current_sample_slot = 0
         self._async_next_sample_slot = 0
@@ -1769,6 +1774,7 @@ class TextGenerationController:
         if active_request_count <= 0:
             return "no active requests"
         if context.paused_request_count != 0:
+            self._async_pause_boundary_count += 1
             return "paused requests are present"
 
         if self._has_active_stop_words_callback is not None:
@@ -1793,6 +1799,7 @@ class TextGenerationController:
             not supports_finish_boundaries
             and (active_metadata["termination_id"][active_slice] >= 0).any()
         ):
+            self._async_mtp_finish_boundary_count += 1
             return "data-dependent termination id"
 
         active_sequence_lengths = context.get_active_sequence_lengths()
@@ -1802,6 +1809,7 @@ class TextGenerationController:
             not supports_finish_boundaries
             and torch.ge(active_sequence_lengths + tokens_per_request, max_sequence_lengths).any()
         ):
+            self._async_mtp_finish_boundary_count += 1
             return "request can finish by length"
 
         if (
@@ -2443,6 +2451,19 @@ class TextGenerationController:
             active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
         )
         range_pop()
+
+        if finished_request_ids.numel() > 0:
+            if self.num_speculative_tokens > 0:
+                self._async_mtp_finish_boundary_count += 1
+            else:
+                self._async_finish_boundary_count += 1
+        if update_result is not None:
+            newly_paused_request_ids = update_result.get("newly_paused_request_ids")
+            if newly_paused_request_ids is not None and newly_paused_request_ids.numel() > 0:
+                self._async_pause_boundary_count += 1
+            evict_request_ids = update_result.get("evict_request_ids")
+            if evict_request_ids is not None and evict_request_ids.numel() > 0:
+                self._async_evict_boundary_count += 1
 
         returned_sample = (
             sampled_tokens_cpu.clone() if sample_ready_event is not None else sampled_tokens_cpu

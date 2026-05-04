@@ -883,6 +883,165 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             request.generated_tokens for request in serial_env.requests
         ]
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_lifecycle_controller_disable_reason_matrix(self, monkeypatch) -> None:
+        """Pin currently unsupported lifecycle disable reasons for async scheduling."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=1,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        monkeypatch.setattr(context, "is_decode_only", lambda: True)
+        monkeypatch.setattr(context, "using_cuda_graph_this_step", lambda: True)
+
+        context.total_request_count = 2
+        context.paused_request_count = 1
+        assert controller._async_scheduling_disabled_reason() == "paused requests are present"
+        assert controller._async_pause_boundary_count > 0
+
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+        mtp_env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=1,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_speculative_tokens=2,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        mtp_controller = mtp_env.engine.controller
+        mtp_context = mtp_env.engine.context
+        monkeypatch.setattr(mtp_context, "is_decode_only", lambda: True)
+        monkeypatch.setattr(mtp_context, "using_cuda_graph_this_step", lambda: True)
+        with torch.inference_mode():
+            mtp_context.total_request_count = 1
+            mtp_context.paused_request_count = 0
+            mtp_context.active_token_count = 3
+            mtp_context.num_prefill_requests = 0
+            mtp_context.active_request_metadata["top_k"][0] = 1
+            mtp_context.active_request_metadata["top_p"][0] = 0.0
+            mtp_context.active_request_metadata["return_log_probs"][0] = False
+            mtp_context.active_request_metadata["top_n_logprobs"][0] = 0
+            mtp_context.active_request_metadata["termination_id"][0] = 7
+
+        assert (
+            mtp_controller._async_scheduling_disabled_reason(allow_mtp=True)
+            == "data-dependent termination id"
+        )
+
+        with torch.inference_mode():
+            mtp_context.active_request_metadata["termination_id"][0] = -1
+        monkeypatch.setattr(
+            mtp_context, "get_active_sequence_lengths", lambda: torch.tensor([7], device='cpu')
+        )
+        monkeypatch.setattr(
+            mtp_context, "get_max_sequence_lengths", lambda: torch.tensor([8], device='cpu')
+        )
+        assert (
+            mtp_controller._async_scheduling_disabled_reason(allow_mtp=True)
+            == "request can finish by length"
+        )
+        assert mtp_controller._async_mtp_finish_boundary_count >= 2
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_lifecycle_pending_forward_counter_matrix(self) -> None:
+        """Lifecycle counters are present and async pending forwards are observable."""
+        env = self._run_test(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            enable_async_scheduling=True,
+            termination_id=-1,
+            top_k=1,
+        )
+        controller = env.engine.controller
+        assert controller._async_forward_launch_count > 0
+        assert controller._async_decode_graph_launch_count > 0
+        assert controller._async_add_deferral_count == 0
+        assert controller._async_finish_boundary_count >= 0
+        assert controller._async_mtp_finish_boundary_count >= 0
+        assert controller._async_pause_boundary_count >= 0
+        assert controller._async_evict_boundary_count >= 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_lifecycle_engine_parity_harness(self) -> None:
+        """Reusable lifecycle parity shape compares async-on and async-off outputs."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=1,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        assert (
+            async_env.engine.controller._async_forward_launch_count > 0
+        ), async_env.engine.controller._async_disable_reason
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
