@@ -25,11 +25,23 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttention,
+    CompressedSparseAttentionSubmodules,
+    Compressor,
+    CompressorSubmodules,
+    CSAIndexer,
+    CSAIndexerSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.dsv4_hybrid_attention import (
+    DSv4HybridSelfAttention,
+    DSv4HybridSelfAttentionSubmodules,
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -56,6 +68,49 @@ moe = get_moe_module_spec(
     num_experts=8,  # Can be any positive integer (must not be None).
     moe_grouped_gemm=True,
 )
+
+
+def _make_dsv4_hybrid_attention_spec():
+    """Build a self_attention spec for a DSv4 hybrid (CSA/HCA) layer.
+
+    The same spec is used for both 'C' and 'H' symbols; the per-layer compress
+    ratio is selected at module-build time from ``config.csa_compress_ratios``.
+    """
+    compressor_spec = ModuleSpec(
+        module=Compressor,
+        submodules=CompressorSubmodules(linear_wkv=TELinear, linear_wgate=TELinear, norm=TENorm),
+    )
+
+    indexer_spec = ModuleSpec(
+        module=CSAIndexer,
+        submodules=CSAIndexerSubmodules(
+            linear_wq_b=TELinear, linear_weights_proj=TELinear, compressor=compressor_spec
+        ),
+    )
+
+    core_attention = ModuleSpec(
+        module=CompressedSparseAttention,
+        submodules=CompressedSparseAttentionSubmodules(
+            compressor=compressor_spec, indexer=indexer_spec
+        ),
+    )
+
+    return ModuleSpec(
+        module=DSv4HybridSelfAttention,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=DSv4HybridSelfAttentionSubmodules(
+            linear_q_down_proj=TELinear,
+            linear_q_up_proj=TEColumnParallelLinear,
+            linear_kv_proj=TEColumnParallelLinear,
+            core_attention=core_attention,
+            linear_proj=TERowParallelLinear,
+            q_layernorm=TENorm,
+            kv_layernorm=TENorm,
+        ),
+    )
+
+
+_dsv4_hybrid_self_attention_spec = _make_dsv4_hybrid_attention_spec()
 
 # Inference-optimized MoE spec
 moe_inference = get_inference_optimized_moe_spec()
@@ -161,6 +216,22 @@ hybrid_stack_spec = ModuleSpec(
                         kv_layernorm=IdentityOp,
                     ),
                 ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        csa_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=_dsv4_hybrid_self_attention_spec,
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        hca_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=_dsv4_hybrid_self_attention_spec,
                 self_attn_bda=get_bias_dropout_add,
             ),
         ),
