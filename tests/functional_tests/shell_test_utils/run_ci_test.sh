@@ -54,6 +54,8 @@ set -exo pipefail
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
+TEST_EVALUATION=$(cat $TRAINING_PARAMS_PATH |
+    /usr/local/bin/yq '.TEST_EVALUATION // "pass"')
 ENABLE_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
 N_REPEAT=$(cat $TRAINING_PARAMS_PATH |
@@ -62,7 +64,8 @@ MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.MODE // "pretraining"')
 
 MODES=("pretraining" "inference")
-TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "checkpoint-consistency" "release" "no-nvrx")
+TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "checkpoint-consistency" "release")
+TEST_EVALUATION_TYPES=("pass", "xpass")
 
 if [[ "$TEST_TYPE" == "release" ]]; then
     export ONE_LOGGER_JOB_CATEGORY=production
@@ -273,8 +276,8 @@ for i in $(seq 1 $N_REPEAT); do
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} == 1 ]]; then
         echo Skipping Pytest checks.
-        if [[ "$TEST_TYPE" == "no-nvrx" && "$TRAINING_EXIT_CODE" -ne 0 ]]; then
-            echo "Training failed as expected (NVRx not installed). Marking test as success."
+        if [[ "$TEST_EVALUATION" == "xpass" && "$TRAINING_EXIT_CODE" -ne 0 ]]; then
+            echo "Training failed as expected. Marking test as success."
             exit 0
         fi
         exit ${TRAINING_EXIT_CODE}
@@ -282,6 +285,10 @@ for i in $(seq 1 $N_REPEAT); do
 
     if [[ ! " ${TEST_TYPES[*]} " =~ " ${TEST_TYPE} " ]]; then
         echo "Test type $TEST_TYPE not yet implemented."
+    fi
+
+    if [[ ! " ${TEST_EVALUATION_TYPES[*]} " =~ " ${TEST_EVALUATION} " ]]; then
+        echo "Test type $TEST_EVALUATION not yet implemented."
     fi
 
     if [[ ! " ${MODES[*]} " =~ " ${MODE} " ]]; then
@@ -358,7 +365,7 @@ for i in $(seq 1 $N_REPEAT); do
         fi
 
         # Abort if training failed
-        if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" && "$TEST_TYPE" != "no-nvrx" ]]; then
+        if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" && "$TEST_EVALUATION" != "xpass" ]]; then
             echo "Training failed. Aborting."
             exit 1
         fi
