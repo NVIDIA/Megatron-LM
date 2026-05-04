@@ -407,10 +407,14 @@ class ModelParallelConfig:
        the user adds a level 1 timer that is not called by all ranks.
     """
 
-    def __post_init__(self):
+    def finalize(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
+
+        This function serves the same purpose as a `__post_init__()` function, however it
+        can be called voluntarily. For example, a user may construct the dataclass, make
+        modifications to attributes (via dot-access), and then run this function afterwards.
         """
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:

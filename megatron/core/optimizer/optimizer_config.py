@@ -386,7 +386,7 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
-    def __post_init__(self):
+    def finalize(self):
         """Check the validity of the config."""
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.

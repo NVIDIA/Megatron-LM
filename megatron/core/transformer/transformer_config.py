@@ -1034,12 +1034,16 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
-    def __post_init__(self):
+    def finalize(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
+
+        This function serves the same purpose as a `__post_init__()` function, however it
+        can be called voluntarily. For example, a user may construct the dataclass, make
+        modifications to attributes (via dot-access), and then run this function afterwards.
         """
-        super().__post_init__()
+        super().finalize()
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
@@ -2372,7 +2376,7 @@ class MLATransformerConfig(TransformerConfig):
     """
 
     def __post_init__(self):
-        super().__post_init__()
+        super().finalize()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 

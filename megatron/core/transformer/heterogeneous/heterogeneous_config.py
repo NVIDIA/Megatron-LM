@@ -199,7 +199,7 @@ class HeterogeneousTransformerConfig(TransformerConfig):
     heterogeneous transformer."""
 
     def __post_init__(self):
-        super().__post_init__()
+        super().finalize()
 
         self.heterogeneous_block_specs = True
 
