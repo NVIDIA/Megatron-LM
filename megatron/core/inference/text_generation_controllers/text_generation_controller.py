@@ -79,6 +79,15 @@ class _AsyncDecodeGraph:
     h2d_done_events: Tuple[torch.cuda.Event, ...]
 
 
+@dataclass
+class _AsyncForwardGraph:
+    """Captured bookkeeping/forward graph for one already-sampled decode shape."""
+
+    batch_dimensions: InferenceBatchDimensions
+    graph: torch.cuda.CUDAGraph
+    h2d_done_event: torch.cuda.Event
+
+
 # pylint: disable=line-too-long
 class TextGenerationController:
     """The text generation controller (the main sampling loop)
@@ -179,8 +188,10 @@ class TextGenerationController:
         self._async_forward_launch_count = 0
         self._async_decode_graph_launch_count = 0
         self._async_chained_decode_graph_launch_count = 0
+        self._async_forward_graph_launch_count = 0
         self._async_decode_graph_capture_failed_reason = None
         self._async_decode_graphs: Dict[InferenceBatchDimensions, _AsyncDecodeGraph] = {}
+        self._async_forward_graphs: Dict[InferenceBatchDimensions, _AsyncForwardGraph] = {}
         self._async_pending_sampled_tokens_cpu = None
         self._async_pending_sampled_mtp_tokens_cpu = None
         self._async_pending_sample_ready_event = None
@@ -795,6 +806,8 @@ class TextGenerationController:
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
             # logits shape: [1, seq_len, vocab_size]
+            if isinstance(logits, tuple):
+                logits = logits[0]
 
         if not context.config.materialize_only_last_token_logits:
             assert logits_seq_len == input_ids.shape[1]
@@ -1414,19 +1427,25 @@ class TextGenerationController:
             return
 
         self._async_decode_graphs.clear()
+        self._async_forward_graphs.clear()
         self._async_decode_graph_capture_failed_reason = None
         model = self.inference_wrapped_model.model
         toggle_cuda_graphs(model, set_to="none")
         try:
             for batch_dimensions in context.cuda_graph_batch_dimensions_list:
-                if (
-                    batch_dimensions.prefill_req_count != 0
-                    or batch_dimensions.token_count != batch_dimensions.decode_req_count
-                ):
+                if batch_dimensions.prefill_req_count != 0:
                     continue
-                self._capture_async_decode_graph(batch_dimensions)
+                if batch_dimensions.token_count == batch_dimensions.decode_req_count:
+                    self._capture_async_decode_graph(batch_dimensions)
+                elif (
+                    self.num_speculative_tokens > 0
+                    and batch_dimensions.token_count
+                    == batch_dimensions.decode_req_count * (self.num_speculative_tokens + 1)
+                ):
+                    self._capture_async_forward_graph(batch_dimensions)
         except RuntimeError as exc:
             self._async_decode_graphs.clear()
+            self._async_forward_graphs.clear()
             self._async_decode_graph_capture_failed_reason = str(exc)
         finally:
             toggle_cuda_graphs(model, set_to="local")
@@ -1496,10 +1515,60 @@ class TextGenerationController:
         )
         self._select_async_sample_slot(0)
 
+    def _capture_async_forward_graph(
+        self, batch_dimensions: InferenceBatchDimensions
+    ) -> None:
+        """Capture H2D bookkeeping and forward for a decode-only MTP batch dimension."""
+        context = self.inference_wrapped_model.inference_context
+        context.reset()
+
+        input_ids, position_ids = self._dynamic_step_context_init(
+            construct_graph_dimensions=batch_dimensions
+        )
+
+        with torch.inference_mode():
+            # Warm eager forward once so capture does not include one-time allocations.
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+
+            if not context.prepare_async_decode_next_step():
+                raise RuntimeError(f"failed to prepare async forward graph {batch_dimensions}")
+
+            next_input_ids, next_position_ids = context.current_input_and_position_ids()
+
+            for _ in range(3):
+                context.transfer_bookkeeping_to_gpu(
+                    include_token_to_input_ids=False,
+                    refresh_request_staging=False,
+                )
+                self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            h2d_done_event = torch.cuda.Event(external=True)
+            with torch.cuda.graph(graph):
+                context.transfer_bookkeeping_to_gpu(
+                    include_token_to_input_ids=False,
+                    refresh_request_staging=False,
+                )
+                h2d_done_event.record(torch.cuda.current_stream())
+                self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+
+        self._async_forward_graphs[batch_dimensions] = _AsyncForwardGraph(
+            batch_dimensions=batch_dimensions,
+            graph=graph,
+            h2d_done_event=h2d_done_event,
+        )
+
     def _get_async_decode_graph(self) -> Optional[_AsyncDecodeGraph]:
         """Return the captured async decode graph for the current padded decode shape."""
         context = self.inference_wrapped_model.inference_context
         return self._async_decode_graphs.get(context.padded_batch_dimensions)
+
+    def _get_async_forward_graph(self) -> Optional[_AsyncForwardGraph]:
+        """Return the captured async forward graph for the current padded decode shape."""
+        context = self.inference_wrapped_model.inference_context
+        return self._async_forward_graphs.get(context.padded_batch_dimensions)
 
     def _launch_async_decode_graph(self, async_decode_graph: _AsyncDecodeGraph) -> int:
         """Enqueue a captured async decode graph on the current stream."""
@@ -1519,6 +1588,16 @@ class TextGenerationController:
             self.inference_wrapped_model.inference_context.padded_active_request_count
         )
         return sample_slot
+
+    def _launch_async_forward_graph(self, async_forward_graph: _AsyncForwardGraph) -> None:
+        """Enqueue a captured bookkeeping/forward graph on the current stream."""
+        async_forward_graph.graph.replay()
+        self._async_forward_launch_count += 1
+        self._async_forward_graph_launch_count += 1
+        self._async_pending_forward = True
+        self._async_pending_cuda_graph_request_count = (
+            self.inference_wrapped_model.inference_context.padded_active_request_count
+        )
 
     def _try_launch_async_decode_graph(
         self, active_request_count: int
@@ -2349,6 +2428,7 @@ class TextGenerationController:
         async_sampled_tokens_cpu = None
         async_sampled_mtp_tokens_cpu = None
         async_sample_already_launched = False
+        async_forward_graph = None
         input_ids = None
         pending_async_sample = self._async_pending_sampled_tokens_cpu is not None
 
@@ -2468,6 +2548,7 @@ class TextGenerationController:
                 async_next_prepared = self._try_prepare_async_decode_after_sampling()
                 if async_next_prepared:
                     self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
+                    async_forward_graph = self._get_async_forward_graph()
             else:
                 self._dynamic_step_sample_logits()
 
@@ -2477,24 +2558,30 @@ class TextGenerationController:
                     async_sampled_mtp_tokens_cpu,
                     async_sample_ready_event,
                 ) = self._async_transfer_samples_to_cpu(active_request_count)
-                range_push("async_transfer_bookkeeping_to_gpu")
-                async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
-                    include_token_to_input_ids=False,
-                    refresh_request_staging=False,
-                    record_done_event=True,
-                )
-                range_pop()
-                range_push("async_forward_launch")
-                next_input_ids, next_position_ids = context.current_input_and_position_ids()
-                self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
-                self._async_forward_launch_count += 1
-                self._async_pending_forward = True
-                self._async_pending_cuda_graph_request_count = (
-                    context.padded_active_request_count
-                    if context.using_cuda_graph_this_step()
-                    else None
-                )
-                range_pop()
+                if async_forward_graph is not None:
+                    range_push("async_forward_graph_launch")
+                    self._launch_async_forward_graph(async_forward_graph)
+                    async_h2d_done_event = async_forward_graph.h2d_done_event
+                    range_pop()
+                else:
+                    range_push("async_transfer_bookkeeping_to_gpu")
+                    async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
+                        include_token_to_input_ids=False,
+                        refresh_request_staging=False,
+                        record_done_event=True,
+                    )
+                    range_pop()
+                    range_push("async_forward_launch")
+                    next_input_ids, next_position_ids = context.current_input_and_position_ids()
+                    self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+                    self._async_forward_launch_count += 1
+                    self._async_pending_forward = True
+                    self._async_pending_cuda_graph_request_count = (
+                        context.padded_active_request_count
+                        if context.using_cuda_graph_this_step()
+                        else None
+                    )
+                    range_pop()
 
             log_probs = None
             top_n_logprobs = None
