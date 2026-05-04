@@ -41,7 +41,14 @@ class LayerConfig:
     :class:`TransformerConfig`.
     """
 
-    common_config: CommonLayerConfig = field(default_factory=CommonLayerConfig)
+    common_config: Optional[CommonLayerConfig] = None
+    """Per-layer common config; ``None`` (the default) means
+    "inherit from the recipe's :attr:`HybridModelConfig.common_config`",
+    which :meth:`HybridModelConfig.compile` substitutes in. Pass an
+    explicit :class:`CommonLayerConfig` to override (e.g. via
+    :meth:`CommonLayerConfig.update`). After ``compile()`` runs, this
+    field is always non-None."""
+
     extra: Dict[str, Any] = field(default_factory=dict)
     """Per-layer passthrough kwargs forwarded to this layer's
     :class:`TransformerConfig`. Same semantics as
@@ -173,9 +180,6 @@ class AttentionLayerConfig(LayerConfig):
     attention_softmax_in_fp32: Optional[bool] = None
     """Run attention masking and softmax in fp32; ``None`` keeps the default."""
 
-    apply_query_key_layer_scaling: Optional[bool] = None
-    """Scale Q*K^T by layer number for fp16 stability."""
-
     add_qkv_bias: Optional[bool] = None
     """Bias only in QKV projections, overriding ``add_bias_linear`` for QKV."""
 
@@ -195,7 +199,6 @@ class AttentionLayerConfig(LayerConfig):
             "kv_channels": self.kv_channels,
             "attention_dropout": self.attention_dropout,
             "attention_softmax_in_fp32": self.attention_softmax_in_fp32,
-            "apply_query_key_layer_scaling": self.apply_query_key_layer_scaling,
             "add_qkv_bias": self.add_qkv_bias,
             "masked_softmax_fusion": self.masked_softmax_fusion,
         }
@@ -401,7 +404,11 @@ class EmbeddingLayerConfig:
     selection, and rotary settings.
     """
 
-    common_config: CommonLayerConfig = field(default_factory=CommonLayerConfig)
+    common_config: Optional[CommonLayerConfig] = None
+    """Per-marker common config; ``None`` (the default) means "inherit from
+    the recipe's :attr:`HybridModelConfig.common_config`", which
+    :meth:`HybridModelConfig.compile` substitutes in. After ``compile()``
+    runs, this field is always non-None."""
 
     vocab_size: int = 0
     """Vocabulary size (post-padding)."""
@@ -424,33 +431,19 @@ class EmbeddingLayerConfig:
     scatter_embedding_sequence_parallel: bool = True
     """Scatter the embedding output along the sequence-parallel dim."""
 
-    # YARN scaling (consumed only when ``position_embedding_type == "yarn"``).
-    # These are not :class:`TransformerConfig` dataclass fields today; they are
-    # attached as ad-hoc attributes by :meth:`HybridModelConfig.compile` to
-    # match the existing :func:`getattr` lookups in
-    # :class:`HybridModel.__init__`. When upstream lifts them onto
-    # :class:`TransformerConfig`, this block can collapse to plain ``extra``
-    # passthroughs and the setattr loop in ``compile()`` goes away.
-    yarn_rotary_scaling_factor: Optional[float] = None
-    """YARN scaling factor (s)."""
-
-    yarn_original_max_position_embeddings: Optional[int] = None
-    """Original max position embeddings the model was trained with."""
-
-    yarn_beta_fast: Optional[float] = None
-    """YARN beta-fast schedule parameter."""
-
-    yarn_beta_slow: Optional[float] = None
-    """YARN beta-slow schedule parameter."""
-
-    yarn_mscale: Optional[float] = None
-    """YARN m-scale parameter."""
-
-    yarn_mscale_all_dim: Optional[float] = None
-    """YARN m-scale-all-dim parameter."""
-
-    yarn_correction_range_round_to_int: Optional[bool] = None
-    """Round YARN correction range to int."""
+    yarn: Optional[Dict[str, Any]] = None
+    """YARN scaling parameters (consumed only when
+    ``position_embedding_type == "yarn"``). These are not
+    :class:`TransformerConfig` dataclass fields today; they are attached
+    as ad-hoc attributes by :meth:`HybridModelConfig.compile` to match
+    the :func:`getattr` lookups in :class:`HybridModel.__init__`.
+    Recognised keys: ``yarn_rotary_scaling_factor``,
+    ``yarn_original_max_position_embeddings``, ``yarn_beta_fast``,
+    ``yarn_beta_slow``, ``yarn_mscale``, ``yarn_mscale_all_dim``,
+    ``yarn_correction_range_round_to_int``. Unknown keys raise at compile
+    time. When upstream lifts these onto :class:`TransformerConfig`, this
+    field collapses to a plain ``extra`` passthrough and the setattr
+    loop in ``compile()`` goes away."""
 
     extra: Dict[str, Any] = field(default_factory=dict)
     """Passthrough kwargs forwarded to the stack-level
