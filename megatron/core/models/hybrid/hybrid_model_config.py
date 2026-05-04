@@ -311,26 +311,40 @@ class HybridModelConfig:
         stack_kwargs["calculate_per_token_loss"] = loss.calculate_per_token_loss
         # Marker-level passthroughs: Embedding and CrossEntropy markers may
         # set TransformerConfig fields the curated DSL surface doesn't cover.
-        # ``extra`` may not name a curated TC field — that would silently shadow
-        # the field set above and obscure the recipe's authoritative source.
+        # Same shadowing rule as CommonLayerConfig.extra and LayerConfig.extra:
+        # ``extra`` cannot name a curated field on the same marker.
         from megatron.core.models.hybrid.common_layer_config import validate_extra_kwargs
 
         if embedding.extra:
             validate_extra_kwargs(embedding.extra, "EmbeddingLayerConfig.extra")
+            curated = {
+                f.name
+                for f in dataclasses.fields(embedding)
+                if f.name not in ("common_config", "extra")
+            }
+            shadowed = sorted(set(embedding.extra) & curated)
+            if shadowed:
+                raise ValueError(
+                    f"EmbeddingLayerConfig.extra cannot name curated fields: {shadowed}. "
+                    f"Set them on the dataclass attribute directly."
+                )
             stack_kwargs.update(embedding.extra)
         if loss.extra:
             validate_extra_kwargs(loss.extra, "CrossEntropyLayerConfig.extra")
-            curated = {
+            # CrossEntropy's curated fields are renamed when projected onto
+            # TransformerConfig (``loss_fusion`` → ``cross_entropy_loss_fusion``
+            # etc.); reject both the recipe-side dataclass names and the
+            # TC-side names ``compile`` writes into ``stack_kwargs`` above.
+            curated = {f.name for f in dataclasses.fields(loss) if f.name != "extra"} | {
                 "cross_entropy_loss_fusion",
                 "cross_entropy_fusion_impl",
                 "calculate_per_token_loss",
             }
-            shadowed = curated & set(loss.extra)
+            shadowed = sorted(set(loss.extra) & curated)
             if shadowed:
                 raise ValueError(
-                    f"CrossEntropyLayerConfig.extra cannot override curated fields "
-                    f"{sorted(shadowed)}; set them on the marker directly "
-                    f"(e.g. CrossEntropyLayerConfig(loss_fusion=...))."
+                    f"CrossEntropyLayerConfig.extra cannot name curated fields: {shadowed}. "
+                    f"Set them on the dataclass attribute directly."
                 )
             stack_kwargs.update(loss.extra)
         stack_kwargs = {k: v for k, v in stack_kwargs.items() if v is not None}

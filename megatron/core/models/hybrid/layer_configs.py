@@ -15,7 +15,7 @@ the layer pattern but are not "layers" the :class:`HybridStack`
 constructs; they encode model-wrapping metadata (vocab/sequence shape).
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, ClassVar, Dict, Optional, Union
 
 from megatron.core.models.hybrid.common_layer_config import (
@@ -104,19 +104,26 @@ class LayerConfig:
                 kwargs.setdefault(k, v)
         kwargs.update(self._layer_specific_kwargs())
         if self.extra:
-            validate_extra_kwargs(self.extra, f"{type(self).__name__}.extra")
-            # Reject ``extra`` keys that would shadow model-wide parallelism
-            # values. Process groups are constructed once from the recipe's
-            # topology; a per-layer extra that disagreed would produce a TC
-            # whose sharding claims contradict the live process groups —
-            # invalid sharding or runtime errors. Job-level fields always win.
+            origin = f"{type(self).__name__}.extra"
+            validate_extra_kwargs(self.extra, origin)
+            # Reject ``extra`` keys that shadow this layer's curated fields
+            # (silent dataclass shadowing) or model-wide parallelism (process
+            # groups are global; a per-layer disagreement is invalid sharding).
+            # Layer ``extra`` may still override a value carried over from
+            # common scope — more-specific scope wins.
+            curated = {f.name for f in fields(self) if f.name not in ("common_config", "extra")}
+            shadowed = sorted(set(self.extra) & curated)
+            if shadowed:
+                raise ValueError(
+                    f"{origin} cannot name curated fields: {shadowed}. "
+                    f"Set them on the dataclass attribute directly."
+                )
             if parallelism:
-                shadowed = set(parallelism) & set(self.extra)
+                shadowed = sorted(set(parallelism) & set(self.extra))
                 if shadowed:
                     raise ValueError(
-                        f"{type(self).__name__}.extra cannot override model-wide "
-                        f"parallelism fields {sorted(shadowed)}; set them on "
-                        f"HybridModelConfig instead."
+                        f"{origin} cannot override model-wide parallelism fields "
+                        f"{shadowed}; set them on HybridModelConfig instead."
                     )
             kwargs.update(self.extra)
         # Test-friendly fallback: ``compile()`` always supplies a placeholder,
