@@ -544,7 +544,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         output = torch.empty(
             self._local_tokens,
             hidden_states.shape[1],
-            dtype=hidden_states.dtype,
+            dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
         multimem_reduce_scatter_v(
