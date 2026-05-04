@@ -2068,7 +2068,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_expert_parallel_dummy_cuda_graph_step,
         ):
-            self.run_attn_init_graph_body(eager=not self.using_cuda_graph_this_step())
+            use_graph = self.using_cuda_graph_this_step()
+            self.run_attn_init_graph_body(
+                eager=not use_graph,
+                cache_key=self.padded_batch_dimensions if use_graph else None,
+            )
             self.finalize_attn_init()
 
     def prepare_attn_init(
@@ -2224,16 +2228,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._context_op_metadata_cpu[2] = batch_dimensions.decode_req_count
         self._context_op_metadata_cpu[3] = batch_dimensions.prefill_req_count
 
-        # Set graph-mode ``max_seqlen`` bounds. Graph capture bakes these in;
-        # non-graph steps refine them in ``finalize_attn_init`` once the
-        # ``active_*`` buffers are populated.
-        if self.using_cuda_graph_this_step():
-            if self.padded_batch_dimensions.prefill_req_count == 0:
-                self._max_seqlen_q = self.num_speculative_tokens + 1
-            else:
-                # Force the prefill kernel to launch for prefill graphs.
-                self._max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
-            self._max_seqlen_k = self.max_sequence_length
 
 
         # Flip NCCLAllGather dispatcher's path selector to not use allgathers.
@@ -2247,7 +2241,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return True
 
-    def run_attn_init_graph_body(self, eager: bool = False) -> None:
+    def run_attn_init_graph_body(self, eager: bool = False, cache_key=None) -> None:
         """Graphable body of :meth:`initialize_attention_state`.
 
         Wrapped by :class:`CudaGraphManager` in the text-generation controller
@@ -2257,9 +2251,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         ``prepare_attn_init``, so the body is capturable as-is.
 
         Args:
-            eager: ``True`` on non-graphed steps. Has no semantic effect on
-                the GPU work itself; reserved for future hooks.
+            eager: ``True`` on non-graphed steps. The graph-mode
+                ``max_seqlen`` bounds are baked in only when False; eager
+                mode lets ``finalize_attn_init`` compute precise values.
+            cache_key: Per-bucket cache key consumed by ``CudaGraphManager``
+                for inline capture; the body itself ignores it.
         """
+        if not eager:
+            # Set max_seqlens at capture time. On replay, this can be safely skipped.
+            # Eager mode falls through to ``finalize_attn_init``, which computes precise values.
+            if self.padded_batch_dimensions.prefill_req_count == 0:
+                self._max_seqlen_q = self.num_speculative_tokens + 1
+            else:
+                # Force the prefill kernel to launch for prefill graphs.
+                self._max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
+            self._max_seqlen_k = self.max_sequence_length
+
         # Single coalesced H2D for the unified bookkeeping buffer; captured in
         # the graph so replays always copy the current CPU contents.
         self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
