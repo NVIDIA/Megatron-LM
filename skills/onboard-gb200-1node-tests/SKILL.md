@@ -1,10 +1,9 @@
 ---
 name: onboard-gb200-1node-tests
-description: Onboard 1-node GitHub MR functional tests for GB200 from existing mr-scoped 2-node tests. Use when the user asks to add GB200 github-mr tests, create single-node variants of existing tests, or expand CI coverage for GB200.
+description: Onboard 1-node GitHub MR functional tests for GB200 from existing mr-scoped 2-node tests.
+when_to_use: Adding GB200 github-mr tests; creating single-node variants of existing tests; expanding CI coverage for GB200; 'add GB200 MR tests', 'onboard GB200 1-node', 'create single-node variant'.
 user_invocable: true
 argument: "[model-yaml]  # optional: gpt, moe, or both (default: both)"
-TRIGGER when: user asks to add GB200 mr-github tests, create 1-node variants of functional tests, or onboard tests for GitHub CI on GB200.
-DO NOT TRIGGER when: user is asking about H100 tests or making unrelated changes to existing test configs.
 ---
 
 # Onboard GB200 1-Node GitHub MR Tests
