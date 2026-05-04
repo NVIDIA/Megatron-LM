@@ -311,11 +311,12 @@ class InferenceConfig:
 
     disable_ep_consensus: bool = False
     """If True, the engine skips the EP-group consensus all-reduce in
-    `run_engine_with_coordinator` and steps purely on local state. Pause
-    transitions take effect as soon as PAUSE is delivered to the rank, with no
-    cross-EP coordination or dummy_forward participation. Only safe when EP
-    coordination is not required (e.g. ep_world_size == 1, or workloads where
-    EP peers do not need to advance in lockstep).
+    `run_engine_with_coordinator` and decides whether to step based on local
+    state alone. The rank still calls `controller.dummy_forward()` whenever
+    `local_pending == 0`, so EP collectives (NCCL all-to-all, etc.) stay in
+    sync — without this, a peer running a real forward would deadlock waiting
+    on this rank's all-to-all participation. Trades off the consensus
+    all-reduce CPU cost for unconditional dummy_forwards on idle ranks.
     """
 
     verbose: InitVar[bool] = False

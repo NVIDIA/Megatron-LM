@@ -2331,7 +2331,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         self.waiting_request_ids
                     )
                     if self.disable_ep_consensus:
-                        # No cross-EP coordination: act on local state only.
+                        # Skip the EP consensus all-reduce; act on local state only.
+                        # NOTE: even with no consensus we must still participate in EP
+                        # collectives (NCCL all-to-all, etc.) every iteration. A peer with
+                        # real work will block at its all-to-all kernel waiting for this
+                        # rank, so when there is no local work we run dummy_forward()
+                        # rather than sleeping. Sleeping here would deadlock EP > 1.
                         if self.state == EngineState.PAUSING:
                             await self._world_barrier()
                             self.state = EngineState.PAUSED
@@ -2339,7 +2344,18 @@ class DynamicInferenceEngine(AbstractEngine):
                         elif local_pending > 0:
                             await self.async_step()
                         else:
-                            await asyncio.sleep(0.02)
+                            self.step_start_event.record()
+                            nvtx_range_push("EP-dummy-forward")
+                            self.controller.dummy_forward()
+                            self.step_end_event.record()
+                            self.step_end_event.synchronize()
+                            nvtx_range_pop("EP-dummy-forward")
+                            self.context.step_count += 1
+                            self.context.prefix_cache_lru_clock += 1
+                            # The consensus path yields via _ep_establish_consensus;
+                            # without it we must still let other coroutines (signal
+                            # delivery, request scheduling) run between steps.
+                            await asyncio.sleep(0)
                         continue
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
