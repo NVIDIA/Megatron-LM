@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
+import torch
 from typing import Any, Type, TypeVar
 
 import yaml
@@ -30,6 +31,7 @@ from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.models import Serializable, HybridModelConfig
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.training.utils import print_rank_0
+from megatron.core.transformer.enums import AttnBackend
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -337,6 +339,9 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp:
             self._validate_and_apply_megatron_fsdp_configs()
 
+        # Deterministic mode validations and settings
+        self._validate_and_apply_deterministic_mode()
+
     def _validate_and_apply_megatron_fsdp_configs(self) -> None:
         """
         Validate Megatron-FSDP configuration when Megatron-FSDP is used.
@@ -390,3 +395,28 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
         assert not self.dist.use_tp_pp_dp_mapping, "use_tp_pp_dp_mapping is not supported with Megatron FSDP"
 
+    def _validate_and_apply_deterministic_mode(self) -> None:
+        """Apply and validate deterministic mode requirements.
+
+        This enforces restrictions and settings that must hold when
+        the model is configured to run in deterministic mode.
+        """
+        if not getattr(self.model, "deterministic_mode", False):
+            return
+
+        # Disallow flash attention when running deterministically
+        if getattr(self.model, "attention_backend", None) == AttnBackend.flash:
+            raise AssertionError("Flash attention can not be used in deterministic mode.")
+
+        # Disallow cross-entropy loss fusion as it is not deterministic
+        assert not getattr(self.model, "cross_entropy_loss_fusion", False), (
+            "Cross Entropy Fusion is currently not deterministic."
+        )
+
+        all_reduce_choices = ("Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS")
+        assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, (
+            f"NCCL_ALGO must be one of {all_reduce_choices}."
+        )
+
+        # Enable deterministic algorithms in torch
+        torch.use_deterministic_algorithms(True)
