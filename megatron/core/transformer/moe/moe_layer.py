@@ -49,6 +49,13 @@ if HAVE_FLASHINFER:
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
+try:
+    import triton  # pylint: disable=unused-import
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 else:
@@ -341,6 +348,11 @@ class MoELayer(BaseMoELayer):
                 ), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
+                )
+            elif config.inference_grouped_gemm_backend == 'vllm':
+                assert HAVE_TRITON, (
+                    "inference_grouped_gemm_backend='vllm' requires Triton. "
+                    "Install triton (pip install triton)."
                 )
             self._setup_inference_mode(pg_collection)
 
