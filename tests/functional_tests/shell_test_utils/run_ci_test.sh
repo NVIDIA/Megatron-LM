@@ -100,9 +100,6 @@ if [[ "$MODE" == "pretraining" && "$TEST_TYPE" != "release" ]]; then
 
         if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
             /usr/local/bin/yq -i '.MODEL_ARGS."--save-interval" = 2' $TRAINING_PARAMS_PATH
-        elif [[ "$TEST_TYPE" == "no-nvrx" ]]; then
-            pip3 uninstall -y nvidia-resiliency-ext
-            python3 -m pip uninstall -y nvidia-resiliency-ext
         fi
 
     elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "false" && "$IS_NEMO_TEST" == "true" ]]; then

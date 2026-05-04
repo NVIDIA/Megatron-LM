@@ -4,6 +4,9 @@ ENV_VARS:
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   ENABLE_LIGHTWEIGHT_MODE: true
+BEFORE_SCRIPT: |
+  pip uninstall -y nvidia-resiliency-ext  || true
+  python -m pip uninstall -y nvidia-resiliency-ext || true
 MODEL_ARGS:
   # Add network size args
   --untie-embeddings-and-output-weights: true
