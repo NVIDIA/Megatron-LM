@@ -66,6 +66,13 @@ functional:configure:
         RELEASE_ARGS=()
       fi
     - |
+      # NOTE: $FUNCTIONAL_TEST_SCOPE is supplied by external scheduled-pipeline
+      # configurations and currently uses legacy values (mr, mr-slim, nightly,
+      # weekly, unit-tests, release). These are accepted by the parser via
+      # LEGACY_SCOPE_ALIASES in tests/test_utils/python_scripts/recipe_parser.py
+      # which rewrites them to the L-tier vocabulary (L0/L1/L2/L3). Migrating
+      # the scheduled-pipeline variables to L-tier names is an out-of-repo
+      # follow-up; until then the alias keeps everything working.
       ARGS=(
         "--scope $FUNCTIONAL_TEST_SCOPE"
         "--n-repeat $FUNCTIONAL_TEST_REPEAT"
