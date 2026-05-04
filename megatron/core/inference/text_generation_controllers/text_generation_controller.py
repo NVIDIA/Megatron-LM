@@ -189,6 +189,7 @@ class TextGenerationController:
         self._async_decode_graph_launch_count = 0
         self._async_chained_decode_graph_launch_count = 0
         self._async_forward_graph_launch_count = 0
+        self._async_deferred_mtp_release_count = 0
         self._async_decode_graph_capture_failed_reason = None
         self._async_decode_graphs: Dict[InferenceBatchDimensions, _AsyncDecodeGraph] = {}
         self._async_forward_graphs: Dict[InferenceBatchDimensions, _AsyncForwardGraph] = {}
@@ -2429,6 +2430,8 @@ class TextGenerationController:
         async_sampled_mtp_tokens_cpu = None
         async_sample_already_launched = False
         async_forward_graph = None
+        deferred_mtp_blocks_to_release = None
+        deferred_mtp_release_mask = None
         input_ids = None
         pending_async_sample = self._async_pending_sampled_tokens_cpu is not None
 
@@ -2541,14 +2544,18 @@ class TextGenerationController:
                 self._compute_serial_mtp_and_sample()
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
 
-                # Phase 4: Release freed blocks. Deferred from Phase 2 so the
-                # data-dependent boolean-mask sync overlaps with MTP GPU work.
-                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
-
                 async_next_prepared = self._try_prepare_async_decode_after_sampling()
                 if async_next_prepared:
                     self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
                     async_forward_graph = self._get_async_forward_graph()
+                    deferred_mtp_blocks_to_release = blocks_to_release
+                    deferred_mtp_release_mask = remove_mask
+                else:
+                    # No async forward will cover this CPU work, so release before
+                    # ordinary request bookkeeping runs.
+                    context.kv_block_allocator.release_memory_blocks(
+                        blocks_to_release[remove_mask]
+                    )
             else:
                 self._dynamic_step_sample_logits()
 
@@ -2582,6 +2589,14 @@ class TextGenerationController:
                         else None
                     )
                     range_pop()
+
+            if deferred_mtp_blocks_to_release is not None:
+                range_push("mtp_deferred_release_memory_blocks")
+                context.kv_block_allocator.release_memory_blocks(
+                    deferred_mtp_blocks_to_release[deferred_mtp_release_mask]
+                )
+                self._async_deferred_mtp_release_count += 1
+                range_pop()
 
             log_probs = None
             top_n_logprobs = None
