@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+    MambaMetadata,
+    PrefixCachedMambaMetadata,
+)
 
 
 class TestMambaMetadata:
@@ -14,14 +17,7 @@ class TestMambaMetadata:
         """Fixture to initialize MambaMetadata with standard constraints."""
         max_requests = 16
         max_tokens = 2048
-        # Per-step intermediate-state cap (token budget / block_size + margin);
-        # value is irrelevant to these update() tests, which don't extract state.
-        max_intermediate_count = 17
-        metadata = MambaMetadata(
-            max_requests=max_requests,
-            max_tokens=max_tokens,
-            max_intermediate_count=max_intermediate_count,
-        )
+        metadata = MambaMetadata(max_requests=max_requests, max_tokens=max_tokens)
 
         yield metadata
         metadata.reset()
@@ -29,14 +25,12 @@ class TestMambaMetadata:
     @pytest.mark.internal
     @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
     def test_decode_indices_dtype(self, dtype):
-        metadata = MambaMetadata(
-            max_requests=4, max_tokens=16, max_intermediate_count=1, decode_indices_dtype=dtype
-        )
+        metadata = MambaMetadata(max_requests=4, max_tokens=16, decode_indices_dtype=dtype)
 
         assert metadata._batch_indices_decode_buffer.dtype == dtype
 
     def test_free_unbound_live_slot(self):
-        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+        metadata = MambaMetadata(max_requests=2, max_tokens=4)
 
         slot = int(metadata.allocate_slot())
         assert metadata.mamba_state_free_slot_count == 1
@@ -47,7 +41,7 @@ class TestMambaMetadata:
         assert int(metadata.allocate_slot()) == slot
 
     def test_allocated_slots_do_not_alias_free_slot_stack(self):
-        metadata = MambaMetadata(max_requests=3, max_tokens=4, max_intermediate_count=1)
+        metadata = MambaMetadata(max_requests=3, max_tokens=4)
 
         slot_to_release = metadata.allocate_slot()
         allocated_slot = metadata.allocate_slot()
@@ -66,7 +60,7 @@ class TestMambaMetadata:
         assert set(allocated_slots.tolist()) == {0, 2}
 
     def test_detached_live_slot_survives_request_cleanup(self):
-        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+        metadata = MambaMetadata(max_requests=2, max_tokens=4)
         slot = int(metadata.allocate_slot())
         metadata.request_to_mamba_state_idx[0] = slot
 
@@ -82,7 +76,7 @@ class TestMambaMetadata:
         assert int(metadata.allocate_slot()) == slot
 
     def test_reset_preserves_detached_live_slot(self):
-        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+        metadata = MambaMetadata(max_requests=2, max_tokens=4)
         detached_slot = int(metadata.allocate_slot())
         request_slot = int(metadata.allocate_slot())
         metadata.request_to_mamba_state_idx[:2] = torch.tensor(
@@ -99,9 +93,7 @@ class TestMambaMetadata:
         assert int(metadata.allocate_slot()) == detached_slot
 
     def test_reserved_dummy_slot_is_not_request_owned(self):
-        metadata = MambaMetadata(
-            max_requests=2, max_tokens=4, max_intermediate_count=1, reserve_dummy_state_slot=True
-        )
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, reserve_dummy_state_slot=True)
 
         assert metadata.dummy_state_indices.tolist() == [metadata.max_requests]
         assert torch.all(metadata.request_to_mamba_state_idx == -1)
@@ -598,9 +590,16 @@ class TestGDPIntermediateChunkIndices:
     GDP_CHUNK = 64
 
     def _metadata(self, max_requests=8, max_tokens=2048, max_intermediate_count=16):
-        return MambaMetadata(
+        # Intermediate extraction lives on the prefix-cached subclass; the scratch
+        # buffers are irrelevant here, so keep them minimal.
+        return PrefixCachedMambaMetadata(
             max_requests=max_requests,
             max_tokens=max_tokens,
+            num_mamba_layers=1,
+            conv_states_shape=(1,),
+            ssm_states_shape=(1,),
+            conv_states_dtype=torch.float32,
+            ssm_states_dtype=torch.float32,
             max_intermediate_count=max_intermediate_count,
             d_conv=4,
             gdp_num_householder=self.NUM_HOUSEHOLDER,
@@ -685,7 +684,7 @@ class TestGDPIntermediateChunkIndices:
 
     @pytest.mark.internal
     def test_not_built_when_the_model_has_no_gdp_layers(self):
-        metadata = MambaMetadata(max_requests=4, max_tokens=512, max_intermediate_count=4, d_conv=4)
+        metadata = MambaMetadata(max_requests=4, max_tokens=512, d_conv=4)
         dims = InferenceBatchDimensions(token_count=256, prefill_req_count=1, decode_req_count=0)
         metadata.update(
             active_mamba_indices=torch.tensor([0], dtype=torch.int32, device=metadata.device),

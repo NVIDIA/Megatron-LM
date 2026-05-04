@@ -965,13 +965,12 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                     f"matched={len(m.matched_block_ids)} backed_off={m.backed_off_blocks} "
                     f"skip={m.prefix_skip_tokens} "
                     f"mamba={getattr(req, '_mamba_num_matched_blocks', 'n/a')} "
-                    # The hash map exists only when prefix caching is on; the oracle run has
-                    # no registry at all.
-                    f"registry={len(getattr(alloc, 'kv_hash_to_block_id', ()))}"
+                    # The registry is filled only when prefix caching is on; the oracle run
+                    # registers nothing.
+                    f"registry={len(context.prefix_cache_registry.kv_hash_to_block_id)}"
                 )
                 return m
 
-            alloc = context.kv_block_allocator
             context._compute_prefix_match = _traced_match
 
             def add(request_id, prompt):
@@ -1129,7 +1128,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         def step_and_sample():
             nonlocal max_ref_seen
             env.engine.step_modern()
-            max_ref_seen = max(max_ref_seen, int(context.kv_block_allocator.block_ref_counts.max()))
+            max_ref_seen = max(max_ref_seen, int(context.kv_block_allocator.pc_state.block_ref_counts.max()))
 
         with self._record_mtp_kv_writes(context) as (_written, shared_writes):
             add_request(0)
