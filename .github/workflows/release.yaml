@@ -87,14 +87,13 @@ jobs:
              || needs.pre-flight.outputs.is_merge_group == 'true'
              || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       )
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@aec765e36e669857d21ba514865a42588724830e
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@b7091aadca729136b12c48d45b832633c681b131
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       validate-only: ${{ github.event_name != 'workflow_dispatch' }}
       dry-run: ${{ inputs.dry-run || false }}
       version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
       restrict-to-admins: true
-      app-id: ${{ vars.BOT_ID }}
       library-name: Megatron Core
       bump-targets: |
         [
@@ -102,9 +101,7 @@ jobs:
           {"python-package": "megatron_fsdp", "src-dir": "megatron/core/distributed/fsdp/src/"}
         ]
     secrets:
-      BOT_KEY: ${{ secrets.BOT_KEY }}
-      SSH_KEY: ${{ secrets.SSH_KEY }}
-      SSH_PWD: ${{ secrets.SSH_PWD }}
+      PAT: ${{ secrets.PAT }}
 
   build-test-publish-wheels:
     needs: [pre-flight, bump]
@@ -132,7 +129,7 @@ jobs:
       github.repository == 'NVIDIA/Megatron-LM'
       && (success() || !failure())
       && !cancelled()
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@aec765e36e669857d21ba514865a42588724830e
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@b7091aadca729136b12c48d45b832633c681b131
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       release-version: ${{ needs.bump.outputs.release-version }}
