@@ -928,16 +928,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         # transferred to GPU each step via transfer_bookkeeping_to_gpu().
         # Layout matches ContextGPUView._buf so a single cudaMemcpyAsync
         # suffices. Int64 token fields come first (8-byte aligned automatically),
-        # then int32 token fields, then int32 request-staging fields.
-        #   token_to_input_ids                         (int64, max_tokens)
-        #   token_to_pos_ids                           (int64, max_tokens)
-        #   token_to_block_idx                         (int32, max_tokens)
-        #   token_to_local_position_within_kv_block    (int32, max_tokens)
-        #   token_to_request_idx                       (int32, max_tokens)
-        #   token_to_position_in_request               (int32, max_tokens)
-        #   request_in_prefill_status  (staging)       (int32, max_requests)
-        #   request_query_lengths      (staging)       (int32, max_requests)
-        #   request_kv_length_offsets  (staging)       (int32, max_requests)
+        # then int32 token fields, then int32/float32 request-staging fields.
+        #   token_to_input_ids                         (int64,   max_tokens)
+        #   token_to_pos_ids                           (int64,   max_tokens)
+        #   token_to_block_idx                         (int32,   max_tokens)
+        #   token_to_local_position_within_kv_block    (int32,   max_tokens)
+        #   token_to_request_idx                       (int32,   max_tokens)
+        #   token_to_position_in_request               (int32,   max_tokens)
+        #   request_in_prefill_status        (staging) (int32,   max_requests)
+        #   request_query_lengths            (staging) (int32,   max_requests)
+        #   request_kv_length_offsets        (staging) (int32,   max_requests)
+        #   temperature                      (staging) (float32, max_requests)
+        #   top_k                            (staging) (int32,   max_requests)
+        #   top_p                            (staging) (float32, max_requests)
+        #   active_request_last_token_idxs   (alias)   (int32,   max_requests)
         #
         # Token fields are aliased with the source-of-truth attributes
         # (`self.token_to_input_ids`, etc.) because the forward pass reads
@@ -948,7 +952,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # slice from the persistent `request_*` tensors above.
         _tok_int64_bytes = self.max_tokens * 8
         _tok_int32_bytes = self.max_tokens * 4
-        _req_int32_bytes = self.max_requests * 4
+        # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
+        _req_4byte_bytes = self.max_requests * 4
         # MHA section: 5 fields (int32) shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata. max_bs == max_requests.
         _mha_query_lengths_bytes = self.max_requests * 4
@@ -983,7 +988,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         _total_bytes = (
             2 * _tok_int64_bytes
             + 4 * _tok_int32_bytes
-            + 3 * _req_int32_bytes
+            + 7 * _req_4byte_bytes
             + _mha_query_lengths_bytes
             + _mha_cu_query_seq_lengths_bytes
             + _mha_kv_seq_lengths_bytes
@@ -1043,19 +1048,40 @@ class DynamicInferenceContext(BaseInferenceContext):
         # CPU (refreshed from persistent tensors in transfer_bookkeeping_to_gpu);
         # read-only on GPU via matching slots in ContextGPUView._buf.
         self._staging_request_in_prefill_status = self._cpu_bookkeeping_buf[
-            _off : _off + _req_int32_bytes
+            _off : _off + _req_4byte_bytes
         ].view(torch.int32)
-        _off += _req_int32_bytes
+        _off += _req_4byte_bytes
         self._staging_request_query_lengths = self._cpu_bookkeeping_buf[
-            _off : _off + _req_int32_bytes
+            _off : _off + _req_4byte_bytes
         ].view(torch.int32)
-        _off += _req_int32_bytes
+        _off += _req_4byte_bytes
         self._staging_request_kv_length_offsets = self._cpu_bookkeeping_buf[
-            _off : _off + _req_int32_bytes
+            _off : _off + _req_4byte_bytes
         ].view(torch.int32)
-        _off += _req_int32_bytes
+        _off += _req_4byte_bytes
 
-        self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
+        # Sampling-parameter staging slots, refreshed from `active_request_metadata`
+        # in transfer_bookkeeping_to_gpu(). FlashInfer reads these via
+        # `gpu_view.{temperature, top_k, top_p}`.
+        self._staging_temperature = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
+            torch.float32
+        )
+        _off += _req_4byte_bytes
+        self._staging_top_k = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
+            torch.int32
+        )
+        _off += _req_4byte_bytes
+        self._staging_top_p = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
+            torch.float32
+        )
+        _off += _req_4byte_bytes
+
+        # Per-request last-token row indices. Aliased with the matching gpu_view slot:
+        # build_active_slices/pad_active_slices populate this CPU view.
+        self.active_request_last_token_idxs = self._cpu_bookkeeping_buf[
+            _off : _off + _req_4byte_bytes
+        ].view(torch.int32)
+        _off += _req_4byte_bytes
 
         # Static tensor addresses to make `last_token_logits` graphable with speculative decoding.
         max_logit_idxs = self.max_requests * (self.num_speculative_tokens + 1)
@@ -2244,7 +2270,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         All copies use non_blocking=True with pinned CPU memory. CUDA stream
         ordering guarantees the forward pass sees completed transfers.
 
-        The 9 bookkeeping fields are backed by one contiguous pinned CPU buffer
+        The bookkeeping fields are backed by one contiguous pinned CPU buffer
         and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
         Request-level staging slots are refreshed from the persistent CPU
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
@@ -2255,9 +2281,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         padded_active = max(n_active, self.padded_active_request_count)
 
         # Refresh request-level staging slots from the persistent CPU source.
-        # CPU-to-CPU slice assignment on pinned memory (~7.5 KB total for 3
-        # int32 fields at max_requests=624). Negligible vs. the launch overhead
-        # we save by merging 9 H2D memcpys into 1.
+        # CPU-to-CPU slice assignment on pinned memory (~15 KB total for 6
+        # 4-byte fields at max_requests=624). Negligible vs. the launch overhead
+        # we save by merging the H2D memcpys into 1.
         self._staging_request_in_prefill_status[:n_active] = self.request_in_prefill_status_tensor[
             active_slice
         ]
@@ -2265,6 +2291,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
             active_slice
         ]
+        # Sampling-parameter staging slots: read from `active_request_metadata`,
+        # which `build_active_slices` + `pad_active_slices` already populated for
+        # `[:padded_active]` (active values + neutral padding defaults).
+        self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
+            :padded_active
+        ]
+        self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][:padded_active]
+        self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][:padded_active]
+
         # Full-iteration CUDA graphs may have captured GPU consumers with the
         # padded graph request count. Keep those padded staging rows bounded so
         # graph replay never builds indices from stale request lengths.

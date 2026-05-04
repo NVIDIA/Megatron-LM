@@ -66,16 +66,18 @@ class FlashInferSampling(Sampling):
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
 
-        # Read GPU sampling parameters directly from `context.active_request_metadata`.
-        md = context.active_request_metadata
+        # Read GPU sampling parameters from the per-step gpu_view mirror. The
+        # CPU source-of-truth (`active_request_metadata`) is pinned but resident
+        # on CPU, so reading it here would mix devices with `logits`.
+        gv = context.gpu_view
         if token_to_request_index is None:
-            temperature = md["temperature"][:n]
-            top_k = md["top_k"][:n]
-            top_p = md["top_p"][:n]
+            temperature = gv.temperature[:n]
+            top_k = gv.top_k[:n]
+            top_p = gv.top_p[:n]
         else:
-            temperature = md["temperature"][token_to_request_index]
-            top_k = md["top_k"][token_to_request_index]
-            top_p = md["top_p"][token_to_request_index]
+            temperature = gv.temperature[token_to_request_index]
+            top_k = gv.top_k[token_to_request_index]
+            top_p = gv.top_p[token_to_request_index]
 
         # Clamp temperature to avoid division by 0.
         temperature = temperature.clamp(min=1e-6)

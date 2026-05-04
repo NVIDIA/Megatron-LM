@@ -1052,7 +1052,7 @@ class TextGenerationController:
         gather_indices = (
             None
             if context.config.materialize_only_last_token_logits
-            else context.active_request_last_token_idxs
+            else context.gpu_view.active_request_last_token_idxs
         )
         self._sampled_tokens_cuda = self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
