@@ -92,9 +92,7 @@ class TestModelConfigDefaults:
         assert cfg.post_wrap_hooks[0] == hook2
 
     def test_builder_classvar_accessible(self):
-        assert (
-            DummyModelConfig.builder == "tests.unit_tests.models.common.test_base.DummyModelBuilder"
-        )
+        assert DummyModelConfig.builder == f"{DummyModelBuilder.__module__}.DummyModelBuilder"
 
 
 # =============================================================================

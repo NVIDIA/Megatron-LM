@@ -86,6 +86,7 @@ class TestGetDefaultHybridStackSpec:
         mock_spec = Mock(spec=ModuleSpec)
         config = Mock()
         config.restore_modelopt_state = False
+        config.transformer.transformer_impl = "transformer_engine"
         with patch(
             "megatron.training.models.hybrid.transformer_engine_hybrid_stack_spec",
             return_value=mock_spec,
@@ -98,12 +99,31 @@ class TestGetDefaultHybridStackSpec:
         mock_spec = Mock(spec=ModuleSpec)
         config = Mock()
         config.restore_modelopt_state = True
+        # Ensure inference branch is not taken.
+        config.transformer.transformer_impl = "transformer_engine"
         with patch(
             "megatron.training.models.hybrid.modelopt_hybrid_stack_spec", return_value=mock_spec
         ) as mock_fn:
             result = get_default_hybrid_stack_spec(config)
         mock_fn.assert_called_once()
         assert result is mock_spec
+
+    def test_returns_inference_spec_when_transformer_impl_is_inference_optimized(self):
+        # The inference branch takes precedence over restore_modelopt_state.
+        config = Mock()
+        config.restore_modelopt_state = True
+        config.transformer.transformer_impl = "inference_optimized"
+        with (
+            patch("megatron.training.models.hybrid.hybrid_inference_stack_spec") as mock_inference,
+            patch("megatron.training.models.hybrid.modelopt_hybrid_stack_spec") as mock_modelopt,
+            patch(
+                "megatron.training.models.hybrid.transformer_engine_hybrid_stack_spec"
+            ) as mock_te,
+        ):
+            result = get_default_hybrid_stack_spec(config)
+        assert result is mock_inference
+        mock_modelopt.assert_not_called()
+        mock_te.assert_not_called()
 
 
 # =============================================================================

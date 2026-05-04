@@ -319,13 +319,28 @@ class TestDdpWrap:
 
     def setup_method(self):
         self.pg = _make_pg()
+        # Set explicit ddp_config attributes so the bucket-size init and
+        # distributed-optimizer branches don't fire by accident.
         self.ddp_config = Mock()
+        self.ddp_config.num_buckets = None
+        self.ddp_config.bucket_size = 40000000
+        self.ddp_config.overlap_grad_reduce = True
+        self.ddp_config.use_distributed_optimizer = False
         self.model = [_make_model_module(), _make_model_module()]
+        # Patch mpu so the default-bucket-size computation has integer return values.
+        self._mpu_patcher = patch("megatron.training.models.dist_utils.mpu")
+        mpu_mock = self._mpu_patcher.start()
+        mpu_mock.get_data_parallel_world_size.return_value = 1
+        mpu_mock.get_pipeline_model_parallel_rank.return_value = 0
+        mpu_mock.get_expert_data_parallel_world_size.return_value = 1
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    def teardown_method(self):
+        self._mpu_patcher.stop()
+
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -343,10 +358,10 @@ class TestDdpWrap:
                 pg_collection=self.pg,
             )
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -360,10 +375,10 @@ class TestDdpWrap:
         mock_fsdp.assert_not_called()
         mock_torch_fsdp.assert_not_called()
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -379,10 +394,10 @@ class TestDdpWrap:
         mock_ddp.assert_not_called()
         mock_torch_fsdp.assert_not_called()
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -398,10 +413,10 @@ class TestDdpWrap:
         mock_ddp.assert_not_called()
         mock_fsdp.assert_not_called()
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -417,10 +432,10 @@ class TestDdpWrap:
         wrapped1.broadcast_params.assert_called_once()
         wrapped2.broadcast_params.assert_called_once()
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -436,10 +451,10 @@ class TestDdpWrap:
         wrapped1.broadcast_params.assert_not_called()
         wrapped2.broadcast_params.assert_not_called()
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -454,10 +469,10 @@ class TestDdpWrap:
         call_kwargs = mock_ddp.call_args.kwargs
         assert call_kwargs["disable_bucketing"] is False
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -471,10 +486,10 @@ class TestDdpWrap:
         second_call_kwargs = mock_ddp.call_args_list[1].kwargs
         assert second_call_kwargs["disable_bucketing"] is True
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -487,10 +502,10 @@ class TestDdpWrap:
         for c in mock_ddp.call_args_list:
             assert c.kwargs["disable_bucketing"] is True
 
-    @patch("megatron.bridge.models.common.unimodal.TorchFullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.FullyShardedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.DistributedDataParallel")
-    @patch("megatron.bridge.models.common.unimodal.get_model_config")
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
@@ -503,12 +518,312 @@ class TestDdpWrap:
         assert isinstance(result, list)
         assert len(result) == 2
 
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.HAVE_FSDP2", False)
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_torch_fsdp2_asserts_when_have_fsdp2_false(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_torch_fsdp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        with pytest.raises(AssertionError, match="Torch FSDP2"):
+            _ddp_wrap(
+                self.model,
+                False,
+                self.ddp_config,
+                False,
+                use_torch_fsdp2=True,
+                pg_collection=self.pg,
+            )
+
+
+# =============================================================================
+# Section 5b — TestDdpWrapBucketSize
+# =============================================================================
+
+
+class TestDdpWrapBucketSize:
+    """_ddp_wrap() initialises ddp_config.bucket_size based on num_buckets, dp world size, and overlap_grad_reduce."""
+
+    def setup_method(self):
+        self.pg = _make_pg()
+        self.model = [_make_model_module()]
+        self._mpu_patcher = patch("megatron.training.models.dist_utils.mpu")
+        self._mpu = self._mpu_patcher.start()
+        self._mpu.get_data_parallel_world_size.return_value = 1
+        self._mpu.get_pipeline_model_parallel_rank.return_value = 0
+        self._mpu.get_expert_data_parallel_world_size.return_value = 1
+
+    def teardown_method(self):
+        self._mpu_patcher.stop()
+
+    def _ddp_config(self, **overrides):
+        cfg = Mock()
+        cfg.num_buckets = None
+        cfg.bucket_size = None
+        cfg.overlap_grad_reduce = True
+        cfg.use_distributed_optimizer = False
+        for k, v in overrides.items():
+            setattr(cfg, k, v)
+        return cfg
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_num_buckets_divides_total_param_count(self, *_):
+        param = torch.zeros(100)
+        chunk = Mock()
+        chunk.parameters.return_value = [param]
+        chunk.modules.return_value = []
+        ddp_config = self._ddp_config(num_buckets=4)
+        _ddp_wrap([chunk], False, ddp_config, False, pg_collection=self.pg)
+        # 100 // 4 = 25
+        assert ddp_config.bucket_size == 25
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_bucket_size_default_uses_dp_world_size(self, *_):
+        ddp_config = self._ddp_config()
+        # dp world size 100 → 1_000_000 * 100 = 100M, bigger than 40M floor
+        self._mpu.get_data_parallel_world_size.return_value = 100
+        _ddp_wrap(self.model, False, ddp_config, False, pg_collection=self.pg)
+        assert ddp_config.bucket_size == 100_000_000
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_bucket_size_default_minimum_floor(self, *_):
+        ddp_config = self._ddp_config()
+        # dp world size 1 → 1M, floor at 40M wins
+        self._mpu.get_data_parallel_world_size.return_value = 1
+        _ddp_wrap(self.model, False, ddp_config, False, pg_collection=self.pg)
+        assert ddp_config.bucket_size == 40_000_000
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_overlap_grad_reduce_false_zeros_bucket_size(self, *_):
+        ddp_config = self._ddp_config(bucket_size=12345, overlap_grad_reduce=False)
+        _ddp_wrap(self.model, False, ddp_config, False, pg_collection=self.pg)
+        assert ddp_config.bucket_size is None
+
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_torch_fsdp2_skips_bucket_size_init(self, *_):
+        ddp_config = self._ddp_config(bucket_size=999)
+        _ddp_wrap(self.model, False, ddp_config, False, use_torch_fsdp2=True, pg_collection=self.pg)
+        # bucket_size is left unmodified for torch_fsdp2 path
+        assert ddp_config.bucket_size == 999
+
+
+# =============================================================================
+# Section 5c — TestDdpWrapFullParamLayout
+# =============================================================================
+
+
+class TestDdpWrapFullParamLayout:
+    """_ddp_wrap() pre-computes ``full_param_layout`` only when use_distributed_optimizer is set and DP is DistributedDataParallel."""
+
+    def setup_method(self):
+        self.pg = _make_pg()
+        self._mpu_patcher = patch("megatron.training.models.dist_utils.mpu")
+        self._mpu = self._mpu_patcher.start()
+        self._mpu.get_data_parallel_world_size.return_value = 4
+        self._mpu.get_pipeline_model_parallel_rank.return_value = 0
+        self._mpu.get_expert_data_parallel_world_size.return_value = 2
+        self._opt_patcher = patch("megatron.training.models.dist_utils.DistributedOptimizer")
+        self._opt = self._opt_patcher.start()
+        self._opt.compute_full_param_layout.return_value = "LAYOUT"
+
+    def teardown_method(self):
+        self._mpu_patcher.stop()
+        self._opt_patcher.stop()
+
+    def _ddp_config(self, **overrides):
+        cfg = Mock()
+        cfg.num_buckets = None
+        cfg.bucket_size = 8_000
+        cfg.overlap_grad_reduce = True
+        cfg.use_distributed_optimizer = True
+        for k, v in overrides.items():
+            setattr(cfg, k, v)
+        return cfg
+
+    def _make_chunk_with_params(self):
+        p = Mock()
+        p.requires_grad = True
+        chunk = Mock()
+        chunk.parameters.return_value = [p]
+        chunk.modules.return_value = []
+        return chunk, p
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_layout_passed_to_ddp_when_distributed_optimizer(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        chunk, param = self._make_chunk_with_params()
+        ddp_config = self._ddp_config()
+        _ddp_wrap([chunk], False, ddp_config, False, pg_collection=self.pg)
+        self._opt.compute_full_param_layout.assert_called_once()
+        # full_param_layout passed through to DDP construction.
+        assert mock_ddp.call_args.kwargs["full_param_layout"] == "LAYOUT"
+        # Layout call receives the requires_grad params, dp world size, ddp_config,
+        # and expert dp world size as a kwarg.
+        layout_args = self._opt.compute_full_param_layout.call_args
+        assert layout_args.args[0] == [param]
+        assert layout_args.args[2] == 4  # dp world size
+        assert layout_args.args[3] is ddp_config
+        assert layout_args.kwargs["expert_data_parallel_world_size"] == 2
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_layout_not_computed_when_distributed_optimizer_false(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        chunk, _ = self._make_chunk_with_params()
+        ddp_config = self._ddp_config(use_distributed_optimizer=False)
+        _ddp_wrap([chunk], False, ddp_config, False, pg_collection=self.pg)
+        self._opt.compute_full_param_layout.assert_not_called()
+        assert "full_param_layout" not in mock_ddp.call_args.kwargs
+
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_layout_not_computed_for_megatron_fsdp(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_fsdp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        chunk, _ = self._make_chunk_with_params()
+        ddp_config = self._ddp_config()
+        _ddp_wrap([chunk], False, ddp_config, False, use_megatron_fsdp=True, pg_collection=self.pg)
+        self._opt.compute_full_param_layout.assert_not_called()
+        assert "full_param_layout" not in mock_fsdp.call_args.kwargs
+
+    @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_layout_not_computed_for_torch_fsdp2(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_torch_fsdp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        chunk, _ = self._make_chunk_with_params()
+        ddp_config = self._ddp_config()
+        _ddp_wrap([chunk], False, ddp_config, False, use_torch_fsdp2=True, pg_collection=self.pg)
+        self._opt.compute_full_param_layout.assert_not_called()
+        assert "full_param_layout" not in mock_torch_fsdp.call_args.kwargs
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_effective_bucket_size_none_when_chunk_idx_nonzero(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        chunk1, _ = self._make_chunk_with_params()
+        chunk2, _ = self._make_chunk_with_params()
+        ddp_config = self._ddp_config()
+        _ddp_wrap([chunk1, chunk2], False, ddp_config, False, pg_collection=self.pg)
+        # Both calls compute layout, but the second uses effective_bucket_size=None
+        # because disable_bucketing is True for chunk_idx > 0.
+        first_call, second_call = self._opt.compute_full_param_layout.call_args_list
+        assert first_call.args[1] == 8_000
+        assert second_call.args[1] is None
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_effective_bucket_size_none_when_overlap_param_gather(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        chunk, _ = self._make_chunk_with_params()
+        ddp_config = self._ddp_config()
+        _ddp_wrap([chunk], False, ddp_config, True, pg_collection=self.pg)
+        # disable_bucketing=True via overlap_param_gather → effective_bucket_size=None
+        assert self._opt.compute_full_param_layout.call_args.args[1] is None
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_effective_bucket_size_none_when_pp_rank_nonzero(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        self._mpu.get_pipeline_model_parallel_rank.return_value = 1
+        chunk, _ = self._make_chunk_with_params()
+        ddp_config = self._ddp_config()
+        _ddp_wrap([chunk], False, ddp_config, False, pg_collection=self.pg)
+        assert self._opt.compute_full_param_layout.call_args.args[1] is None
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_only_requires_grad_params_passed_to_layout(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        p_grad = Mock()
+        p_grad.requires_grad = True
+        p_no_grad = Mock()
+        p_no_grad.requires_grad = False
+        chunk = Mock()
+        chunk.parameters.return_value = [p_grad, p_no_grad]
+        chunk.modules.return_value = []
+        ddp_config = self._ddp_config()
+        _ddp_wrap([chunk], False, ddp_config, False, pg_collection=self.pg)
+        passed_params = self._opt.compute_full_param_layout.call_args.args[0]
+        assert passed_params == [p_grad]
+
 
 # =============================================================================
 # Section 6 — TestUnimodalBuildDistributedModels
 # =============================================================================
 
-_MODULE = "megatron.bridge.models.common.unimodal"
+_MODULE = "megatron.training.models.dist_utils"
 
 
 class TestUnimodalBuildDistributedModels:
