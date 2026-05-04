@@ -42,7 +42,7 @@ MODEL_ARGS:
 
   # Network size args
   --use-mcore-models: true
-  --spec: megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
+  --spec: megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
   --is-hybrid-model: true
   --mamba-num-heads: 128
   --num-layers: 88
@@ -90,7 +90,7 @@ MODEL_ARGS:
   --moe-shared-expert-compute-before-router: true
 
   # MTP args
-  --mtp-spec: megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
+  --mtp-spec: megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
   --mtp-num-layers: 2
   --mtp-hybrid-override-pattern: \"*E\"
   --calculate-per-token-loss: true
