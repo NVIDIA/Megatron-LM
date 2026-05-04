@@ -229,6 +229,48 @@ class TestCommonLayerConfig:
         tc = layer.to_transformer_config(num_layers=2)
         assert tc.add_qkv_bias is True
 
+    def test_dsa_mla_knobs_curated(self):
+        """The MLA-defining knobs are curated on :class:`DSALayerConfig` so
+        DeepSeek-style models don't need ``extra={...}`` for every field.
+        Each is ``None`` by default and falls through to the underlying
+        :class:`TransformerConfig` MLA defaults; setting them explicitly
+        overrides those defaults."""
+        common = _make_common()
+        # DeepSeek-V3-style values (representative — not the exact card).
+        layer = DSALayerConfig(
+            common_config=common,
+            num_attention_heads=128,
+            q_lora_rank=1536,
+            kv_lora_rank=512,
+            qk_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=128,
+            rotary_scaling_factor=40.0,
+        )
+        tc = layer.to_transformer_config(num_layers=2)
+        assert tc.multi_latent_attention is True
+        assert tc.q_lora_rank == 1536
+        assert tc.kv_lora_rank == 512
+        assert tc.qk_head_dim == 128
+        assert tc.qk_pos_emb_head_dim == 64
+        assert tc.v_head_dim == 128
+        assert tc.rotary_scaling_factor == 40.0
+
+    def test_dsa_mla_knobs_default_to_transformer_config_defaults(self):
+        """Unset MLA knobs on :class:`DSALayerConfig` fall through to the
+        underlying TransformerConfig defaults — recipe authors don't have
+        to repeat the model-card defaults to opt in."""
+        common = _make_common()
+        layer = DSALayerConfig(common_config=common, num_attention_heads=4)
+        tc = layer.to_transformer_config(num_layers=2)
+        # TC's MLA defaults (transformer_config.py around line 2297+).
+        assert tc.q_lora_rank == 512
+        assert tc.kv_lora_rank == 512
+        assert tc.qk_head_dim == 128
+        assert tc.qk_pos_emb_head_dim == 64
+        assert tc.v_head_dim == 128
+        assert tc.rotary_scaling_factor == 40
+
 
 @pytest.mark.internal
 class TestLayerConfigSymbols:
