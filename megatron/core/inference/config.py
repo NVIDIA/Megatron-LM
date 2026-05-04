@@ -297,10 +297,10 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
-    request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
+    request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
-    consisting of the string label, the target dtype, and whether to store the data on GPU.
+    consisting of the string label and the target dtype.
     """
 
     use_synchronous_zmq_collectives: bool = False
