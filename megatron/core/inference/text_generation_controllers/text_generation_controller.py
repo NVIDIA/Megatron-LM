@@ -198,6 +198,9 @@ class TextGenerationController:
         self._async_pending_sample_ready_event = None
         self._async_pending_h2d_done_event = None
         self._async_pending_sample_cuda_graph_request_count = None
+        self._async_pending_forward_request_ids = None
+        self._async_row_mapped_forward_count = 0
+        self._async_discarded_forward_count = 0
         self._async_sample_slot_count = 2
         self._async_current_sample_slot = 0
         self._async_next_sample_slot = 0
@@ -1320,18 +1323,80 @@ class TextGenerationController:
         """Whether a speculative async forward has already been launched for the next step."""
         return self._async_pending_forward
 
-    def _dynamic_step_required_token_logits(self) -> Tensor:
+    def _active_request_ids_cpu(self) -> Tensor:
+        """Return the current active request IDs in row order."""
+        context = self.inference_wrapped_model.inference_context
+        return context.request_ids[context.paused_request_count : context.total_request_count].clone()
+
+    def _record_async_pending_forward_requests(self) -> None:
+        """Remember the request-row order that a speculative forward is computing."""
+        self._async_pending_forward_request_ids = self._active_request_ids_cpu()
+
+    def _pending_async_forward_matches_current_rows(self) -> bool:
+        """Return whether a pending speculative forward still has current row order."""
+        pending_request_ids = self._async_pending_forward_request_ids
+        if pending_request_ids is None:
+            return True
+        return torch.equal(pending_request_ids, self._active_request_ids_cpu())
+
+    def _resolve_pending_async_forward_rows(self) -> tuple[bool, Optional[Tensor], bool]:
+        """Map current active rows back to the pending speculative forward rows.
+
+        Returns:
+            tuple[bool, Optional[Tensor], bool]: ``(usable, row_indices, row_mapped)``.
+            ``row_indices`` is ``None`` when the pending forward already matches
+            current active row order.
+        """
+        pending_request_ids = self._async_pending_forward_request_ids
+        self._async_pending_forward_request_ids = None
+        if pending_request_ids is None:
+            return True, None, False
+
+        current_request_ids = self._active_request_ids_cpu()
+        if current_request_ids.numel() == 0:
+            self._async_discarded_forward_count += 1
+            return False, None, False
+        if torch.equal(pending_request_ids, current_request_ids):
+            return True, None, False
+
+        pending_row_by_request_id = {
+            int(request_id): row
+            for row, request_id in enumerate(pending_request_ids.tolist())
+        }
+        mapped_rows = []
+        for request_id in current_request_ids.tolist():
+            row = pending_row_by_request_id.get(int(request_id))
+            if row is None:
+                self._async_discarded_forward_count += 1
+                return False, None, False
+            mapped_rows.append(row)
+
+        row_indices = torch.tensor(
+            mapped_rows,
+            dtype=torch.long,
+            device=torch.cuda.current_device(),
+        )
+        self._async_row_mapped_forward_count += 1
+        return True, row_indices, True
+
+    def _dynamic_step_required_token_logits(self, row_indices: Optional[Tensor] = None) -> Tensor:
         """Return the per-active-request logits consumed by sampling."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         if context.config.materialize_only_last_token_logits:
-            return self._all_logits_cuda.squeeze(0)[:active_request_count, :]
-        return context.last_token_logits(
-            self._all_logits_cuda[:, : context.padded_active_token_count, :]
-        )
+            required_token_logits = self._all_logits_cuda.squeeze(0)
+            if row_indices is None:
+                required_token_logits = required_token_logits[:active_request_count, :]
+        else:
+            required_token_logits = context.last_token_logits(
+                self._all_logits_cuda[:, : context.padded_active_token_count, :]
+            )
+        if row_indices is not None:
+            required_token_logits = required_token_logits.index_select(0, row_indices)
+        return required_token_logits
 
     def _dynamic_step_sample_logits_greedy_to_next_input_ids(
-        self, sample_count: Optional[int] = None
+        self, sample_count: Optional[int] = None, row_indices: Optional[Tensor] = None
     ) -> None:
         """Greedy-sample logits and write sampled ids directly into next-step GPU inputs."""
         context = self.inference_wrapped_model.inference_context
@@ -1340,7 +1405,7 @@ class TextGenerationController:
             if sample_count is None
             else sample_count
         )
-        required_token_logits = self._dynamic_step_required_token_logits()
+        required_token_logits = self._dynamic_step_required_token_logits(row_indices=row_indices)
         torch.max(
             required_token_logits[:active_request_count],
             dim=-1,
@@ -1585,6 +1650,7 @@ class TextGenerationController:
         self._async_forward_launch_count += 1
         self._async_decode_graph_launch_count += 1
         self._async_pending_forward = True
+        self._record_async_pending_forward_requests()
         self._async_pending_cuda_graph_request_count = (
             self.inference_wrapped_model.inference_context.padded_active_request_count
         )
@@ -1596,6 +1662,7 @@ class TextGenerationController:
         self._async_forward_launch_count += 1
         self._async_forward_graph_launch_count += 1
         self._async_pending_forward = True
+        self._record_async_pending_forward_requests()
         self._async_pending_cuda_graph_request_count = (
             self.inference_wrapped_model.inference_context.padded_active_request_count
         )
@@ -1713,6 +1780,7 @@ class TextGenerationController:
 
         active_metadata = context.active_request_metadata
         active_slice = slice(0, active_request_count)
+        supports_finish_boundaries = self.num_speculative_tokens == 0
         if (active_metadata["top_k"][active_slice] != 1).any():
             return "non-greedy top_k"
         if (active_metadata["top_p"][active_slice] != 0.0).any():
@@ -1721,13 +1789,19 @@ class TextGenerationController:
             return "logprobs requested"
         if (active_metadata["top_n_logprobs"][active_slice] > 0).any():
             return "top-n logprobs requested"
-        if (active_metadata["termination_id"][active_slice] >= 0).any():
+        if (
+            not supports_finish_boundaries
+            and (active_metadata["termination_id"][active_slice] >= 0).any()
+        ):
             return "data-dependent termination id"
 
         active_sequence_lengths = context.get_active_sequence_lengths()
         max_sequence_lengths = context.get_max_sequence_lengths()
         tokens_per_request = self.num_speculative_tokens + 1
-        if torch.ge(active_sequence_lengths + tokens_per_request, max_sequence_lengths).any():
+        if (
+            not supports_finish_boundaries
+            and torch.ge(active_sequence_lengths + tokens_per_request, max_sequence_lengths).any()
+        ):
             return "request can finish by length"
 
         request_slice = slice(context.paused_request_count, context.total_request_count)
@@ -2433,6 +2507,9 @@ class TextGenerationController:
         deferred_mtp_blocks_to_release = None
         deferred_mtp_release_mask = None
         input_ids = None
+        pending_forward_reused = False
+        pending_forward_row_indices = None
+        pending_forward_row_mapped = False
         pending_async_sample = self._async_pending_sampled_tokens_cpu is not None
 
         if pending_async_sample:
@@ -2455,9 +2532,14 @@ class TextGenerationController:
                     cuda_graph_request_count = self._async_pending_cuda_graph_request_count
                     self._async_pending_forward = False
                     self._async_pending_cuda_graph_request_count = None
-                    if self.num_speculative_tokens > 0:
+                    (
+                        pending_forward_reused,
+                        pending_forward_row_indices,
+                        pending_forward_row_mapped,
+                    ) = self._resolve_pending_async_forward_rows()
+                    if pending_forward_reused and self.num_speculative_tokens > 0:
                         input_ids, _ = context.current_input_and_position_ids()
-                else:
+                if not pending_forward_reused:
                     input_ids, position_ids = self._dynamic_step_context_init()
 
                     cuda_graph_request_count = (
@@ -2491,14 +2573,15 @@ class TextGenerationController:
                     )
                     range_pop()
 
-                (
-                    async_next_prepared,
-                    async_sampled_tokens_cpu,
-                    async_sampled_mtp_tokens_cpu,
-                    async_sample_ready_event,
-                    async_h2d_done_event,
-                    async_sample_already_launched,
-                ) = self._try_launch_async_decode_graph(active_request_count)
+                if not pending_forward_row_mapped:
+                    (
+                        async_next_prepared,
+                        async_sampled_tokens_cpu,
+                        async_sampled_mtp_tokens_cpu,
+                        async_sample_ready_event,
+                        async_h2d_done_event,
+                        async_sample_already_launched,
+                    ) = self._try_launch_async_decode_graph(active_request_count)
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -2512,7 +2595,7 @@ class TextGenerationController:
 
         with torch.inference_mode():
             range_push("sampling")
-            if async_next_prepared:
+            if async_next_prepared or pending_forward_reused:
                 return_log_probs = False
                 return_top_n_logprobs = False
             else:
@@ -2523,6 +2606,11 @@ class TextGenerationController:
             if async_next_prepared:
                 if not async_sample_already_launched:
                     self._dynamic_step_sample_logits_greedy_to_next_input_ids()
+            elif pending_forward_reused and self.num_speculative_tokens == 0:
+                self._dynamic_step_sample_logits_greedy_to_next_input_ids(
+                    row_indices=pending_forward_row_indices
+                )
+                async_next_prepared = self._try_prepare_async_decode_after_sampling()
             elif self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
@@ -2583,6 +2671,7 @@ class TextGenerationController:
                     self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
                     self._async_forward_launch_count += 1
                     self._async_pending_forward = True
+                    self._record_async_pending_forward_requests()
                     self._async_pending_cuda_graph_request_count = (
                         context.padded_active_request_count
                         if context.using_cuda_graph_this_step()
@@ -2646,6 +2735,7 @@ class TextGenerationController:
                     self._async_pending_forward
                     and self._async_pending_sampled_tokens_cpu is None
                     and next_active_request_count > 0
+                    and self._pending_async_forward_matches_current_rows()
                 ):
                     (
                         _,

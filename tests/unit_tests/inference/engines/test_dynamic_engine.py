@@ -739,6 +739,43 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_scheduling_decode_finish_boundary_cuda_graph_e2e(self) -> None:
+        """Async scheduling keeps pending forward rows correct when requests finish."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            use_fixed_output_lengths=True,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+
+        assert (
+            async_env.engine.controller._async_forward_launch_count > 0
+        ), async_env.engine.controller._async_disable_reason
+        assert (
+            async_env.engine.controller._async_row_mapped_forward_count > 0
+        ), async_env.engine.controller._async_disable_reason
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_async_scheduling_decode_only_mtp_cuda_graph_e2e(
         self, model_provider: str
