@@ -73,7 +73,7 @@ training = [
     "sentencepiece",
     "tiktoken",
     "wandb",
-    "transformers",
+    "transformers<5",
     "accelerate",
 ]
 
@@ -83,7 +83,7 @@ mlm = [
     "sentencepiece",
     "tiktoken",
     "wandb",
-    "transformers",
+    "transformers<5",
     "accelerate",
 ]
 
