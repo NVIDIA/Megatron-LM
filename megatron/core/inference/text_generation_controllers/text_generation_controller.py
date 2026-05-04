@@ -138,6 +138,10 @@ class TextGenerationController:
         """
         self._get_stop_word_finished_ids_callback = callback
 
+    def set_has_active_stop_words_callback(self, callback):
+        """Set a callback to test whether active requests use stop words."""
+        self._has_active_stop_words_callback = callback
+
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
@@ -150,6 +154,7 @@ class TextGenerationController:
 
         # Callback to get request IDs that should be marked as finished due to stop words
         self._get_stop_word_finished_ids_callback = None
+        self._has_active_stop_words_callback = None
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.config.params_dtype
@@ -160,6 +165,7 @@ class TextGenerationController:
         self._async_pending_forward = False
         self._async_pending_cuda_graph_request_count = None
         self._async_disable_reason = None
+        self._async_forward_launch_count = 0
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -169,7 +175,9 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = None
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
-        self._async_sample_values_cuda = torch.empty(max_requests, dtype=logits_dtype, device=device)
+        self._async_sample_values_cuda = torch.empty(
+            max_requests, dtype=logits_dtype, device=device
+        )
         self._async_sampled_tokens_cpu = torch.empty(
             max_requests, dtype=torch.int64, device='cpu', pin_memory=True
         )
@@ -1225,7 +1233,9 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         if context.config.materialize_only_last_token_logits:
             return self._all_logits_cuda.squeeze(0)[:active_request_count, :]
-        return context.last_token_logits(self._all_logits_cuda[:, : context.padded_active_token_count, :])
+        return context.last_token_logits(
+            self._all_logits_cuda[:, : context.padded_active_token_count, :]
+        )
 
     def _dynamic_step_sample_logits_greedy_to_next_input_ids(self) -> None:
         """Greedy-sample logits and write sampled ids directly into next-step GPU inputs."""
@@ -1244,7 +1254,9 @@ class TextGenerationController:
             self._sampled_tokens_cuda[:active_request_count]
         )
 
-    def _async_transfer_samples_to_cpu(self, active_request_count: int) -> Tuple[Tensor, torch.cuda.Event]:
+    def _async_transfer_samples_to_cpu(
+        self, active_request_count: int
+    ) -> Tuple[Tensor, torch.cuda.Event]:
         """Copy sampled tokens to pinned CPU memory without blocking the default stream."""
         current_stream = torch.cuda.current_stream()
         self._async_sample_source_ready_event.record(current_stream)
@@ -1287,14 +1299,19 @@ class TextGenerationController:
             return "not decode-only"
         if not context.using_cuda_graph_this_step():
             return "not using cuda graph"
-        if self._get_stop_word_finished_ids_callback is not None:
-            return "stop words are unsupported"
 
         active_request_count = context.total_request_count - context.paused_request_count
         if active_request_count <= 0:
             return "no active requests"
         if context.paused_request_count != 0:
             return "paused requests are present"
+
+        if self._has_active_stop_words_callback is not None:
+            active_request_ids = context.request_ids[
+                context.paused_request_count : context.total_request_count
+            ].tolist()
+            if self._has_active_stop_words_callback(active_request_ids):
+                return "stop words are unsupported"
 
         active_metadata = context.active_request_metadata
         active_slice = slice(0, active_request_count)
@@ -1316,8 +1333,7 @@ class TextGenerationController:
 
         request_slice = slice(context.paused_request_count, context.total_request_count)
         if (
-            context.request_last_kv_block_offset[request_slice]
-            >= context.block_size_tokens - 1
+            context.request_last_kv_block_offset[request_slice] >= context.block_size_tokens - 1
         ).any():
             return "request is at a kv block boundary"
 
@@ -2059,9 +2075,7 @@ class TextGenerationController:
                 return_log_probs = False
                 return_top_n_logprobs = False
             else:
-                return_log_probs, return_top_n_logprobs = (
-                    self._dynamic_step_log_probs_bookkeeping()
-                )
+                return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
                 self._dynamic_step_sample_bookkeeping()
 
@@ -2108,6 +2122,7 @@ class TextGenerationController:
                 range_push("async_forward_launch")
                 next_input_ids, next_position_ids = context.current_input_and_position_ids()
                 self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+                self._async_forward_launch_count += 1
                 self._async_pending_forward = True
                 self._async_pending_cuda_graph_request_count = (
                     context.padded_active_request_count

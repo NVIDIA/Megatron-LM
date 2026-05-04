@@ -146,6 +146,11 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
+    enable_async_scheduling: bool = False
+    termination_id: Optional[int] = None
+    top_k: int = 0
+    top_p: float = 0.0
+    temperature: float = 1.0
 
     def __post_init__(self):
 
@@ -213,10 +218,17 @@ class DynamicInferenceEngineTestBase:
             sampling_params = SamplingParams(
                 num_tokens_to_generate=num_tokens_to_generate,
                 termination_id=(
-                    -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
+                    test_config.termination_id
+                    if test_config.termination_id is not None
+                    else (
+                        -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
+                    )
                 ),
                 return_log_probs=test_config.return_log_probs,
                 skip_prompt_log_probs=test_config.skip_prompt_log_probs,
+                top_k=test_config.top_k,
+                top_p=test_config.top_p,
+                temperature=test_config.temperature,
             )
             if not hasattr(sampling_params, "num_tokens_total"):
                 # Remove this if statement branch in megatron-core 0.16
@@ -274,6 +286,7 @@ class DynamicInferenceEngineTestBase:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
+                enable_async_scheduling=test_config.enable_async_scheduling,
             ),
         )
 
@@ -671,6 +684,37 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"result ({request.generated_tokens}) != "
                 f"expected ({expected_generated_tokens})."
             )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_only_cuda_graph_e2e(self) -> None:
+        """Async scheduling matches serial decode output and launches speculative forwards."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+
+        assert (
+            async_env.engine.controller._async_forward_launch_count > 0
+        ), async_env.engine.controller._async_disable_reason
+        assert [request.generated_tokens for request in async_env.requests] == [
+            request.generated_tokens for request in serial_env.requests
+        ]
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

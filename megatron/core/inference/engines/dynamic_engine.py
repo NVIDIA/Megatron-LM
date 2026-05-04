@@ -231,6 +231,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller.set_stop_word_finished_ids_callback(
             self._get_and_clear_stop_word_finished_ids
         )
+        self.controller.set_has_active_stop_words_callback(self._has_active_stop_words)
 
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.logging_step_interval > 0 and self.metrics_writer is not None:
@@ -1388,6 +1389,16 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the IDs that we're returning (they'll be marked as finished)
         self.stop_word_finished_request_ids -= result
         return result
+
+    def _has_active_stop_words(self, active_request_ids: list[int]) -> bool:
+        """Return whether any active request depends on stop-word handling."""
+        for request_id in active_request_ids:
+            if request_id in self.stop_word_finished_request_ids:
+                return True
+            request_entry = self.requests.get(request_id)
+            if request_entry is not None and request_entry.record[-1].stop_word_ids:
+                return True
+        return False
 
     def _check_stop_words_for_request_post_append(
         self, request: DynamicInferenceRequest
