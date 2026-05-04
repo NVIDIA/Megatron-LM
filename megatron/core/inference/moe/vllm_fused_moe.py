@@ -466,10 +466,11 @@ def _moe_sum_kernel(
     num_local_experts: tl.constexpr,
     K,
     topk: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
 ):
-    """Reduce topk dimension with valid_tokens gating and routing weight application.
+    """Reduce topk dimension with routing weight application.
 
     input:  [max_tokens * topk, K] bf16
     output: [max_tokens, K] — dtype matches the output buffer (fp32 or bf16)
@@ -478,20 +479,28 @@ def _moe_sum_kernel(
     over topk slots k where the expert is local.  Non-local slots are skipped
     (their values in `input` are undefined because FC2 only processes
     local-expert blocks).
-    For token t >= valid_tokens: output[t] = 0.
+    Rows for t >= valid_tokens are not written; downstream consumers
+    (e.g. reduce-scatter-v) only read the first valid_tokens rows.
     Routing weight multiplication and accumulation in fp32 for numerical accuracy.
+
+    Persistent grid: launches BLOCK_M CTAs that stride over valid_tokens.
+    CUDA-graph safe (grid is static); the loop bound is loaded device-side.
     """
-    token_id = tl.program_id(0).to(tl.int64)
+    pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    is_valid = token_id < valid_tokens
 
-    for k_idx in range(NUM_K_BLOCKS):
-        offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < K
+    for token_id in tl.range(pid, valid_tokens, BLOCK_M):
+        token_id_i64 = token_id.to(tl.int64)
+        base = token_id_i64 * topk * K
 
-        acc = tl.zeros([BLOCK_K], dtype=tl.float32)
-        if is_valid:
-            base = token_id * topk * K
+        # k_idx outer / topk inner keeps the live accumulator at one BLOCK_K tile.
+        # Swapping (topk outer) would need NUM_K_BLOCKS persistent accumulators
+        # (~NUM_K_BLOCKS * BLOCK_K * 4 B), which spills / cuts occupancy at large K.
+        for k_idx in range(NUM_K_BLOCKS):
+            offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+
+            acc = tl.zeros([BLOCK_K], dtype=tl.float32)
             for t in range(topk):
                 eid = tl.load(routing_map_ptr + token_id * topk + t)
                 lid = eid - local_expert_start
@@ -500,7 +509,7 @@ def _moe_sum_kernel(
                     w = tl.load(topk_weights_ptr + token_id * topk + t)
                     acc += v.to(tl.float32) * w
 
-        tl.store(output_ptr + token_id * K + offs_k, acc, mask=k_mask)
+            tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
 
 
 def _moe_sum(
@@ -521,15 +530,17 @@ def _moe_sum(
     Accumulates in fp32. When `out` is None, allocates and returns an fp32
     buffer. When `out` is provided (e.g. the RSV symmetric memory tensor),
     writes directly into it — tl.store handles the cast to the buffer's dtype.
-    Rows beyond valid_tokens are zeroed. Only accumulates contributions from
-    local experts; non-local topk slots are skipped (their values in `input`
-    are undefined).
+    Only writes the first valid_tokens rows; rows beyond are left untouched
+    (downstream RSV reads only the valid range). Only accumulates contributions
+    from local experts; non-local topk slots are skipped (their values in
+    `input` are undefined).
     """
     if out is None:
         out = torch.empty(max_tokens, K, dtype=torch.float32, device=input.device)
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
     NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
-    _moe_sum_kernel[(max_tokens,)](
+    BLOCK_M = _get_num_sms(input.device)
+    _moe_sum_kernel[(BLOCK_M,)](
         input,
         out,
         topk_weights,
@@ -539,6 +550,7 @@ def _moe_sum(
         num_local_experts,
         K,
         topk=topk,
+        BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         NUM_K_BLOCKS=NUM_K_BLOCKS,
     )
