@@ -1275,6 +1275,8 @@ class TextGenerationController:
             return "disabled"
         if not self._enable_cuda_graph:
             return "requires local cuda graphs"
+        if CudaGraphScope.full_iteration_inference not in self.model_config.cuda_graph_scope:
+            return "requires full-iteration inference cuda graphs"
         if self.model_is_pipeline_parallel:
             return "pipeline parallel is unsupported"
         if self.model_config.expert_model_parallel_size > 1:
