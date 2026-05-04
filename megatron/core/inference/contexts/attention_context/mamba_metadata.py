@@ -337,7 +337,7 @@ class MambaMetadata:
         self,
         active_mamba_indices: torch.Tensor,
         token_to_request_idx: torch.Tensor,
-        cpu_cu_query: torch.Tensor,
+        cpu_query_lengths: torch.Tensor,
         batch_dimensions: InferenceBatchDimensions,
         padded_batch_dimensions: InferenceBatchDimensions,
         enable_chunked_prefill: bool,
@@ -355,7 +355,10 @@ class MambaMetadata:
         Args:
             active_mamba_indices: CPU tensor of Mamba slot indices for active requests.
             token_to_request_idx: CPU tensor mapping tokens to request indices.
-            cpu_cu_query: CPU cumulative query lengths from MHA metadata computation.
+            cpu_query_lengths: CPU per-request query lengths (source of truth on the
+                context). The cumulative form is computed locally as needed; the MHA
+                kernels use the GPU-computed ``cu_active_request_query_lengths``
+                produced by :meth:`DynamicInferenceContext._compute_active_mha_metadata`.
             batch_dimensions: Dimensions of the current batch.
             padded_batch_dimensions: Dimensions of the padded batch.
             enable_chunked_prefill: Whether chunked prefill is enabled.
@@ -372,6 +375,15 @@ class MambaMetadata:
         padded_prefill_count = padded_batch_dimensions.prefill_req_count
         padded_token_count = padded_batch_dimensions.token_count
         chunk_size = self.mamba_chunk_size
+        active_count = real_decode_count + real_prefill_count
+
+        # Local cumulative query lengths (CPU). Cheap (O(active_count)) and avoids
+        # depending on the GPU-side cumulative tensor.
+        cpu_cu_query = torch.zeros(active_count + 1, dtype=torch.int32)
+        if active_count > 0:
+            torch.cumsum(
+                cpu_query_lengths[:active_count], dim=0, out=cpu_cu_query[1:]
+            )
 
         result = {
             "padded_decode_count": padded_decode_count,
@@ -402,8 +414,8 @@ class MambaMetadata:
             # seq_idx: normalized token-to-request mapping for prefill tokens.
             prefill_start_req = real_decode_count
             end_prefill_req = real_decode_count + real_prefill_count
-            start_token = cpu_cu_query[prefill_start_req].item()
-            end_token = cpu_cu_query[end_prefill_req].item()
+            start_token = int(cpu_cu_query[prefill_start_req].item())
+            end_token = int(cpu_cu_query[end_prefill_req].item())
             seq_len = end_token - start_token
 
             if seq_len > 0:
@@ -422,7 +434,7 @@ class MambaMetadata:
                     - cpu_cu_query[prefill_start_req]
                 )
             if real_prefill_count < padded_prefill_count:
-                last_val = cu_seqlens_view[real_prefill_count].item()
+                last_val = int(cu_seqlens_view[real_prefill_count].item())
                 cu_seqlens_view[real_prefill_count + 1 : padded_prefill_count + 1] = last_val
 
             cu_seqlens_list = cu_seqlens_view[: real_prefill_count + 1].tolist()
@@ -489,10 +501,11 @@ class MambaMetadata:
 
         # device_decode_prefill scalars.
         if padded_decode_count > 0 and padded_prefill_count > 0:
-            result["decode_prefill_0"] = cpu_cu_query[real_decode_count].item()
+            decode_split = int(cpu_cu_query[real_decode_count].item())
+            result["decode_prefill_0"] = decode_split
             result["decode_prefill_1"] = (
-                cpu_cu_query[real_decode_count + real_prefill_count].item()
-                - cpu_cu_query[real_decode_count].item()
+                int(cpu_cu_query[real_decode_count + real_prefill_count].item())
+                - decode_split
             )
 
         return result

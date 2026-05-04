@@ -22,6 +22,11 @@ class ContextGPUView:
     slice of that buffer. This matches the pinned-CPU-buffer layout in
     :class:`DynamicInferenceContext` so that the per-step H2D transfer is a
     single ``cudaMemcpyAsync`` instead of one per field.
+
+    Per-step MHA fields that the forward pass reads (cumulative query lengths,
+    kv sequence lengths, padded block table) are derived on GPU from these
+    sources after the H2D, so they live as separate static tensors on the
+    context — not in this view.
     """
 
     def __init__(
@@ -34,9 +39,9 @@ class ContextGPUView:
     ):
         # Field layout (must match DynamicInferenceContext's CPU buffer layout):
         #   int64 token fields first (auto 8-byte alignment), then int32 token
-        #   fields, then int32 request fields, then int32 MHA fields, then
-        #   int32 Mamba fields (hybrid models only; omitted when
-        #   max_mamba_chunks == 0).
+        #   fields, then int32/float32 request fields, then the
+        #   request-to-kv-block-ids matrix, then int32 Mamba fields (hybrid
+        #   models only; omitted when max_mamba_chunks == 0).
         tok_int64_bytes = max_tokens * 8  # 2 fields of int64 = 8 bytes/elem
         tok_int32_bytes = max_tokens * 4  # 4 fields of int32 = 4 bytes/elem
         # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
@@ -44,20 +49,8 @@ class ContextGPUView:
         # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
         req_4byte_bytes = max_requests * 4
 
-        # MHA section: 5 fields shared by both graphed and non-graphed MHAMetadata
-        # (only one is active per step, so sharing storage is fine).
-        #   mha_query_lengths          int32 (max_bs,)         = max_bs   * 4
-        #   mha_cu_query_seq_lengths   int32 (max_bs + 1,)     = (max_bs+1) * 4
-        #   mha_kv_seq_lengths         int32 (max_bs,)         = max_bs   * 4
-        #   mha_cu_kv_seq_lengths      int32 (max_bs + 1,)     = (max_bs+1) * 4
-        #   mha_block_table            int32 (max_bs, max_kv_blocks)
-        # max_bs == max_requests in DynamicInferenceContext.
-        max_bs = max_requests
-        mha_query_lengths_bytes = max_bs * 4
-        mha_cu_query_seq_lengths_bytes = (max_bs + 1) * 4
-        mha_kv_seq_lengths_bytes = max_bs * 4
-        mha_cu_kv_seq_lengths_bytes = (max_bs + 1) * 4
-        mha_block_table_bytes = max_bs * max_kv_blocks * 4
+        # Per-request KV block table (max_bs == max_requests).
+        request_to_kv_block_ids_bytes = max_requests * max_kv_blocks * 4
 
         # Mamba section: 9 int32 fields, only present for hybrid models.
         #   mamba_batch_indices_decode    int32 (max_bs,)
@@ -69,6 +62,7 @@ class ContextGPUView:
         #   mamba_seq_idx_for_varlen      int32 (max_mamba_chunks,)
         #   mamba_conv_seq_idx            int32 (max_tokens,)
         #   mamba_conv_seq_start          int32 (max_tokens,)
+        max_bs = max_requests
         if max_mamba_chunks > 0:
             mamba_batch_indices_decode_bytes = max_bs * 4
             mamba_batch_indices_prefill_bytes = max_bs * 4
@@ -94,11 +88,7 @@ class ContextGPUView:
             2 * tok_int64_bytes
             + 4 * tok_int32_bytes
             + 7 * req_4byte_bytes
-            + mha_query_lengths_bytes
-            + mha_cu_query_seq_lengths_bytes
-            + mha_kv_seq_lengths_bytes
-            + mha_cu_kv_seq_lengths_bytes
-            + mha_block_table_bytes
+            + request_to_kv_block_ids_bytes
             + mamba_batch_indices_decode_bytes
             + mamba_batch_indices_prefill_bytes
             + mamba_seq_idx_bytes
@@ -154,30 +144,19 @@ class ContextGPUView:
         )
         off += req_4byte_bytes
 
-        # MHA flash-attention metadata (shared between GraphedMHAMetadata and
-        # NonGraphedMHAMetadata — only one is active per step).
-        self.mha_query_lengths = self._buf[off : off + mha_query_lengths_bytes].view(torch.int32)
-        off += mha_query_lengths_bytes
-        self.mha_cu_query_seq_lengths = self._buf[off : off + mha_cu_query_seq_lengths_bytes].view(
-            torch.int32
-        )
-        off += mha_cu_query_seq_lengths_bytes
-        self.mha_kv_seq_lengths = self._buf[off : off + mha_kv_seq_lengths_bytes].view(torch.int32)
-        off += mha_kv_seq_lengths_bytes
-        self.mha_cu_kv_seq_lengths = self._buf[off : off + mha_cu_kv_seq_lengths_bytes].view(
-            torch.int32
-        )
-        off += mha_cu_kv_seq_lengths_bytes
-        self.mha_block_table = (
-            self._buf[off : off + mha_block_table_bytes]
+        # Per-request KV block table — source for the GPU-side ``active_request_to_kv_block_ids``
+        # padding, also read directly by RoPE / KV-append helpers via
+        # ``gpu_view.request_to_kv_block_ids[req_idx, ...]``.
+        self.request_to_kv_block_ids = (
+            self._buf[off : off + request_to_kv_block_ids_bytes]
             .view(torch.int32)
             .view(max_bs, max_kv_blocks)
         )
-        off += mha_block_table_bytes
+        off += request_to_kv_block_ids_bytes
 
         # Mamba varlen metadata (hybrid models only). Each GPU view matches a
         # pinned CPU view in DynamicInferenceContext._cpu_bookkeeping_buf; the
-        # per-step coalesced H2D copy covers both MHA and Mamba alongside the
+        # per-step coalesced H2D copy covers the Mamba alongside the
         # token/request bookkeeping.
         if max_mamba_chunks > 0:
             self.mamba_batch_indices_decode = self._buf[
