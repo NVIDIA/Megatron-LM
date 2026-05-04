@@ -42,12 +42,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import (
-    Counter,
-    await_process_call,
-    set_inference_cuda_graphed_iteration_for_ep_inference,
-    unset_inference_cuda_graphed_iteration_for_ep_inference,
-)
+from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
@@ -62,7 +57,9 @@ from megatron.core.utils import (
     internal_api,
     nvtx_range_pop,
     nvtx_range_push,
+    round_up_to_nearest_multiple,
     trace_async_exceptions,
+    unwrap_model,
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator
@@ -356,13 +353,21 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
-        is_inference_optimized_ep = (
-            model_config.transformer_impl == "inference_optimized"
-            and model_config.expert_model_parallel_size > 1
+
+        # MTP warmup preparation: capture MTP CUDA graphs alongside the
+        # decoder graphs within the same loop rather than in a separate pass.
+        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        mtp_warmup_enabled = (
+            controller.num_mtp_heads > 0
+            and (controller.num_speculative_tokens or 0) > 0
+            and hasattr(unwrapped, 'mtp')
         )
-        if is_inference_optimized_ep:
-            unwrapped_model = controller.inference_wrapped_model.model
-            set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
+        if mtp_warmup_enabled:
+            tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
+            sp_enabled = model_config.sequence_parallel and tp_size > 1
+            mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
+            mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
+            mtp_seen_batch_sizes = set()
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
@@ -382,18 +387,42 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
-            model_config = controller.inference_wrapped_model.model.config
             if model_config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
             # Forward pass -> logits.
-            controller._dynamic_step_forward_logits(input_ids, position_ids)
+            with torch.inference_mode():
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-            context.reset()
+                # MTP CUDA graph warmup for this batch dimension.
+                if mtp_warmup_enabled:
+                    n = cuda_graph_batch_dimension.req_count
+                    # pylint: disable-next=possibly-used-before-assignment
+                    if sp_enabled:
+                        n = round_up_to_nearest_multiple(n, tp_size)
+                    # pylint: disable-next=possibly-used-before-assignment
+                    if n > 0 and n not in mtp_seen_batch_sizes:
+                        mtp_seen_batch_sizes.add(n)
+                        device = torch.cuda.current_device()
+                        batch_dim = n // tp_size if sp_enabled else n
+                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                        for depth in mtp_warmup_depths:
+                            unwrapped.compute_mtp_single_step(
+                                hidden_states=torch.zeros(
+                                    (batch_dim, 1, model_config.hidden_size),
+                                    device=device,
+                                    dtype=model_config.params_dtype,
+                                ),
+                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                                depth=depth,
+                                cache_key=("mtp", n, depth),
+                            )
 
-        # Disable inference dispatcher after graph capture
-        if is_inference_optimized_ep:
-            unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
+                context.reset()
+
+        if mtp_warmup_enabled and mtp_seen_batch_sizes:
+            logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
         time_end = time.time()
@@ -596,6 +625,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
+            # Give the context a CPU-side MAX-reduction primitive so
+            # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
+            if hasattr(self.context, "set_ep_zmq_communicator"):
+                self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
@@ -1146,10 +1179,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.ttft = (
                             first_token_event.timestamp - request.event_add_engine.timestamp
                         )
-                    if request.tpot is None:
-                        request.tpot = []
-                    per_token_step_time = step_time / len(tokens)
-                    request.tpot.extend([per_token_step_time] * len(tokens))
+                    # TPOT is observability-only. step_time is 0.0 on
+                    # non-logging steps (async_forward skips the event sync),
+                    # so gate the update to keep the metric a truthful sparse
+                    # sample instead of polluting it with zeros.
+                    if step_time > 0:
+                        if request.tpot is None:
+                            request.tpot = []
+                        per_token_step_time = step_time / len(tokens)
+                        request.tpot.extend([per_token_step_time] * len(tokens))
 
                 # Check for stop words (after token is appended).
                 # With speculative decoding, a stop word may end before the last
@@ -1628,56 +1666,74 @@ class DynamicInferenceEngine(AbstractEngine):
         # schedule requests
         self.schedule_waiting_requests()
 
-        # Saving pre-step state, for printing output below.
+        # The print block (async_bookkeep) and metrics block both fire on this
+        # condition after step_count is incremented. Predict it up-front so we
+        # can skip the GPU-timing sync and the context_state dict builds that
+        # only exist to feed those logging/metrics blocks.
+        will_log_this_step = (
+            self.logging_step_interval > 0
+            and (self.context.step_count + 1) % self.logging_step_interval == 0
+        )
+
         is_decode_only = self.context.is_decode_only()
-        pre_step_context_state = {
-            "is_decode_only": is_decode_only,
-            "max_requests": self.context.max_requests,
-            "total_request_count": self.context.total_request_count,
-            "paused_request_count": self.context.paused_request_count,
-            "active_token_count": self.context.active_token_count,
-            "step_count": self.context.step_count,
-        }
+        if will_log_this_step:
+            pre_step_context_state = {
+                "is_decode_only": is_decode_only,
+                "max_requests": self.context.max_requests,
+                "total_request_count": self.context.total_request_count,
+                "paused_request_count": self.context.paused_request_count,
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
+        else:
+            # active_token_count and step_count are still consumed by
+            # post_process_requests' pre_fwd_* args (for add_event_generated_token);
+            # the other four fields are only read in the gated print block.
+            pre_step_context_state = {
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
 
         # Generate tokens.
         nvtx_range_push("Prefill" if not is_decode_only else "Decode")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
-        self.step_start_event.record()
+        if will_log_this_step:
+            self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
-        self.step_end_event.record()
-        self.step_end_event.synchronize()
-        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        if will_log_this_step:
+            self.step_end_event.record()
+            self.step_end_event.synchronize()
+            step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        else:
+            step_time = 0.0
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
-        if (
-            self.logging_step_interval > 0
-            and self.context.step_count > 0
-            and self.context.step_count % self.logging_step_interval == 0
-            and self.metrics_writer is not None
-        ):
-            kvcache_util_stats = self.context.get_kvcache_utilization_stats()
+        if will_log_this_step:
+            kvcache_util_stats = (
+                self.context.get_kvcache_utilization_stats()
+                if self.metrics_writer is not None
+                else None
+            )
+            post_step_context_state = {
+                "waiting_request_count": len(self.waiting_request_ids),
+                "finished_request_count": self.finished_request_count,
+                "evicted_request_count": self.evicted_request_count,
+                "kv_stats": kvcache_util_stats,
+                "total_active_block_count": self.context.kv_block_allocator.active_count,
+                "total_paused_block_count": self.context.kv_block_allocator.paused_count,
+                "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+                "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+            }
+            context_state = {**pre_step_context_state, **post_step_context_state}
         else:
-            kvcache_util_stats = None
-
-        post_step_context_state = {
-            "waiting_request_count": len(self.waiting_request_ids),
-            "finished_request_count": self.finished_request_count,
-            "evicted_request_count": self.evicted_request_count,
-            "kv_stats": kvcache_util_stats,
-            "padded_active_token_count": self.context.padded_active_token_count,
-            "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
-            "total_active_block_count": self.context.kv_block_allocator.active_count,
-            "total_paused_block_count": self.context.kv_block_allocator.paused_count,
-            "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
-            "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
-        }
-
-        context_state = {**pre_step_context_state, **post_step_context_state}
+            # Keep kv_stats=None so the metrics-block gate at `async_bookkeep`
+            # (`if context_state["kv_stats"] is not None`) remains well-typed.
+            context_state = {**pre_step_context_state, "kv_stats": None}
 
         return result, context_state, step_time
 
