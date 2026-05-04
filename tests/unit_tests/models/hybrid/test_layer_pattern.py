@@ -428,6 +428,44 @@ class TestHybridModelConfigCompile:
         # Default untie=False → share=True at the call site.
         assert compiled.untie_embeddings_and_output_weights is False
 
+    def test_compiled_recipe_topology_is_none_when_recipe_leaves_unset(self):
+        """When the recipe leaves a topology field at ``None`` the
+        :class:`CompiledRecipe` must carry ``None`` on the corresponding
+        attribute — not the substituted concrete value used for per-layer
+        TC construction. The launcher's args projection relies on this to
+        decide whether to overwrite a CLI flag."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        # No topology pinned on the recipe.
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+        assert compiled.tensor_model_parallel_size is None
+        assert compiled.context_parallel_size is None
+        assert compiled.expert_model_parallel_size is None
+        assert compiled.expert_tensor_parallel_size is None
+        # The stack TC still carries concrete values (TC requires them).
+        assert compiled.config.tensor_model_parallel_size == 1
+
+    def test_compiled_recipe_topology_carries_recipe_pin(self):
+        """When the recipe pins a topology field, that value surfaces on
+        :class:`CompiledRecipe` so the launcher's args projection can write
+        through to ``args``."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, loss],
+            tensor_model_parallel_size=4,
+            context_parallel_size=2,
+        ).compile()
+        assert compiled.tensor_model_parallel_size == 4
+        assert compiled.context_parallel_size == 2
+        assert compiled.expert_model_parallel_size is None
+        assert compiled.expert_tensor_parallel_size is None
+
     def test_common_config_auto_inherited_into_layers_without_explicit_common(self):
         """A recipe author who omits ``common_config=common`` on a layer
         should still get the recipe's common_config injected — otherwise the
@@ -612,12 +650,15 @@ class TestHeterogeneousMoE:
         sparse = MoELayerConfig(common_config=common, num_experts=4, top_k=2, ffn_hidden_size=128)
         loss = CrossEntropyLayerConfig()
         # Pattern: [emb, a, dense, a, sparse, loss] — 4 decoder layers, 2 MoE.
+        # Heterogeneous MoE requires explicit stack-TC pins.
         compiled = HybridModelConfig(
             common_config=common,
             layer_pattern=[emb, a, dense, a, sparse, loss],
             tensor_model_parallel_size=2,
             expert_model_parallel_size=2,
             expert_tensor_parallel_size=1,
+            stack_moe_num_experts=8,
+            stack_moe_ffn_hidden_size=256,
         ).compile()
         tcs = compiled.layer_config_list
         # Decoder indices: 0=att, 1=dense MoE, 2=att, 3=sparse MoE.
@@ -643,6 +684,7 @@ class TestHeterogeneousMoE:
             tensor_model_parallel_size=2,
             expert_model_parallel_size=2,
             expert_tensor_parallel_size=1,
+            stack_moe_num_experts=8,
         ).compile()
         dense_tc, sparse_tc = compiled.layer_config_list[1], compiled.layer_config_list[3]
         assert dense_tc.expert_model_parallel_size == 2
@@ -664,6 +706,7 @@ class TestHeterogeneousMoE:
             tensor_model_parallel_size=2,
             expert_model_parallel_size=2,
             expert_tensor_parallel_size=1,
+            stack_moe_num_experts=8,
         ).compile()
         # Indices 0 and 2 are attention layers in the pattern above.
         att_tc_0, att_tc_2 = compiled.layer_config_list[0], compiled.layer_config_list[2]
@@ -689,10 +732,30 @@ class TestHeterogeneousMoE:
         ).compile()
         assert compiled.config.num_moe_experts == 128
 
-    def test_heterogeneous_moe_stack_num_experts_uses_max(self):
-        """For heterogeneous MoE, the stack TC takes ``max(num_experts)`` —
-        the "widest config" choice. MTP body MoE inherits the largest sane
-        sizing; capacity buffers are sized for the worst case."""
+    def test_heterogeneous_moe_without_override_raises(self):
+        """Heterogeneous MoE without an explicit ``stack_moe_num_experts``
+        pin is rejected: the stack TC is read by MTP and the inference
+        capacity-factor calc, and silently picking a value that matches
+        no actual layer would mislead both consumers."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        dense = MoELayerConfig(common_config=common, num_experts=128, top_k=2)
+        sparse = MoELayerConfig(common_config=common, num_experts=64, top_k=2)
+        loss = CrossEntropyLayerConfig()
+        recipe = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, dense, a, sparse, loss],
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        )
+        with pytest.raises(ValueError, match="stack_moe_num_experts"):
+            recipe.compile()
+
+    def test_heterogeneous_moe_with_override_uses_pinned_num_experts(self):
+        """An explicit ``stack_moe_num_experts`` pins the stack-TC value
+        for MTP / inference consumers in a heterogeneous-MoE recipe."""
         common = _make_common()
         emb = self._embedding(common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
@@ -705,28 +768,31 @@ class TestHeterogeneousMoE:
             tensor_model_parallel_size=2,
             expert_model_parallel_size=2,
             expert_tensor_parallel_size=1,
+            stack_moe_num_experts=128,
         ).compile()
         assert compiled.config.num_moe_experts == 128
 
-    def test_stack_moe_ffn_hidden_size_derived_from_matching_layer(self):
-        """The stack TC's ``moe_ffn_hidden_size`` matches the MoE layer
-        that supplied ``num_moe_experts`` (rather than TC defaulting it
-        from ``ffn_hidden_size``, which is the wrong size for MoE
-        consumers)."""
+    def test_heterogeneous_moe_ffn_hidden_size_requires_override(self):
+        """Same rule for ``moe_ffn_hidden_size``: heterogeneous values
+        require an explicit pin."""
         common = _make_common()
         emb = self._embedding(common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
-        # The "wide" MoE layer (most experts) supplies the stack values.
         wide = MoELayerConfig(common_config=common, num_experts=128, top_k=2, ffn_hidden_size=1024)
-        narrow = MoELayerConfig(common_config=common, num_experts=64, top_k=2, ffn_hidden_size=512)
+        narrow = MoELayerConfig(common_config=common, num_experts=128, top_k=2, ffn_hidden_size=512)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
+        recipe = HybridModelConfig(
             common_config=common,
             layer_pattern=[emb, a, wide, a, narrow, loss],
             tensor_model_parallel_size=2,
             expert_model_parallel_size=2,
             expert_tensor_parallel_size=1,
-        ).compile()
+        )
+        with pytest.raises(ValueError, match="stack_moe_ffn_hidden_size"):
+            recipe.compile()
+        # With both overrides set, compile succeeds with the pinned values.
+        recipe.stack_moe_ffn_hidden_size = 1024
+        compiled = recipe.compile()
         assert compiled.config.num_moe_experts == 128
         assert compiled.config.moe_ffn_hidden_size == 1024
 
