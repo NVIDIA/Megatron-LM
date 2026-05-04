@@ -2546,8 +2546,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.pool_size - block_allocator.pool_avail
             if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
-                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+                block_ref_counts = block_allocator.pc_state.block_ref_counts
+                blocks_hashed_active = int((block_ref_counts > 0).sum().item())
+                blocks_ref_count = block_ref_counts.sum().item()
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
@@ -3338,7 +3339,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -3609,7 +3610,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
 
                 if prefill_chunk_length >= remaining_len:
@@ -4067,7 +4068,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # where Mamba state is still cached).
                 kv_alloc = self.context.kv_block_allocator
                 output_str += " ... prefix cache util: KV %d/%d blocks cached (%d evictable)" % (
-                    len(kv_alloc.kv_hash_to_block_id),
+                    len(self.context.prefix_cache_registry.kv_hash_to_block_id),
                     kv_alloc.pool_size,
                     int(kv_alloc.get_evictable_block_count()),
                 )
