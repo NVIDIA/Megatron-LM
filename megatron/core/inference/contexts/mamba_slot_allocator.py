@@ -1,27 +1,25 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
+from .prefix_cache_registry import PrefixCacheRegistry
+
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
 
-# Maximum intermediate state extraction offsets per request. The 3 candidates
-# are: KV divergence boundary, last block-aligned boundary, and penultimate
-# block boundary (see compute_and_store_offsets for details).
-MAX_INTERMEDIATE_OFFSETS_PER_REQUEST = 3
-
 
 class MambaSlotAllocator:
-    """Manages Mamba state caching for prefix caching in hybrid models.
+    """Owns the Mamba prefix cache pool: cached conv/ssm state plus the block-to-slot map.
 
-    Owns the Mamba cache slot pool, block-to-slot mappings, hash-to-block
-    mapping, and intermediate state tracking. Accesses KV allocator state
-    (ref counts, timestamps, block hashes) via the parent context.
+    Constructed only when prefix caching is enabled and `prefix_caching_mamba_gb > 0`.
+    The intermediate-state extraction buffers and per-request commit bookkeeping
+    live on `PrefixCachedMambaMetadata` (accessed via `context.mamba_metadata`);
+    this allocator owns just the cache pool resources and the commit orchestration.
 
     Args:
         context: The DynamicInferenceContext that owns this allocator.
@@ -31,6 +29,7 @@ class MambaSlotAllocator:
         ssm_states_shape: Shape of per-slot SSM state (excluding layer/slot dims).
         conv_states_dtype: Dtype for conv state tensors.
         ssm_states_dtype: Dtype for SSM state tensors.
+        prefix_cache_registry: Host hash registry; the Mamba evict callback is wired here.
     """
 
     def __init__(
@@ -42,10 +41,13 @@ class MambaSlotAllocator:
         ssm_states_shape: tuple,
         conv_states_dtype: torch.dtype,
         ssm_states_dtype: torch.dtype,
+        prefix_cache_registry: PrefixCacheRegistry,
     ):
         self.context = context
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
+        self.registry = prefix_cache_registry
+        self.registry.set_mamba_evict_callback(self._on_mamba_evicted)
 
         gpu_device = torch.cuda.current_device()
         num_blocks = context.kv_block_allocator.total_count
@@ -58,7 +60,8 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
-        # State tensors (GPU - accessed by Mamba CUDA kernels).
+        # Cache state tensors (GPU - accessed by Mamba CUDA kernels for restore;
+        # written by commit_intermediate_states for new entries).
         self.conv_states = torch.zeros(
             (num_mamba_layers, max_slots) + conv_states_shape,
             dtype=conv_states_dtype,
@@ -70,48 +73,10 @@ class MambaSlotAllocator:
             device=gpu_device,
         )
 
-        # Hash-to-block mapping: only blocks with cached Mamba state
-        self.hash_to_block_id: Dict[int, int] = {}
-
-        # Per-request intermediate state storage.
-        # offsets_cpu and counts_cpu: CPU source of truth.  GPU copies are
-        # populated by transfer_bookkeeping_to_gpu() since Triton kernels read them.
-        # block_ids and eos_cache_block_id: CPU only (consumed by CPU code).
-        k = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
-        self._intermediate_offsets_cpu = torch.zeros(
-            (context.max_requests, k), dtype=torch.int32, device='cpu'
-        )
-        self._intermediate_counts_cpu = torch.zeros(
-            context.max_requests, dtype=torch.int32, device='cpu'
-        )
-        self._intermediate_offsets_gpu = torch.zeros(
-            (context.max_requests, k), dtype=torch.int32, device=gpu_device
-        )
-        self._intermediate_counts_gpu = torch.zeros(
-            context.max_requests, dtype=torch.int32, device=gpu_device
-        )
-        # CPU-only: consumed by _collect_commit_data() which needs .tolist() anyway.
-        self._intermediate_block_ids_cpu = torch.full(
-            (context.max_requests, k), -1, dtype=torch.int32, device='cpu'
-        )
-        self._eos_cache_block_id_cpu = torch.full(
-            (context.max_requests,), -1, dtype=torch.int32, device='cpu'
-        )
-        # CPU flag to skip GPU sync when no intermediates exist
-        self._has_intermediates = False
-
-        # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
-        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
-        self.intermediate_ssm_out = torch.zeros(
-            (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
-            dtype=ssm_states_dtype,
-            device=gpu_device,
-        )
-        self.intermediate_conv_out = torch.zeros(
-            (num_mamba_layers, self.max_intermediate_count) + conv_states_shape,
-            dtype=conv_states_dtype,
-            device=gpu_device,
-        )
+        # The host hash -> block_id dict for Mamba-cached blocks lives on
+        # `self.registry.mamba_hash_to_block_id`. The intermediate extraction buffers and
+        # per-request commit bookkeeping live on `context.mamba_metadata`.
+        # This allocator only owns the cache pool / state tensors.
 
     # =========================================================================
     # Slot allocation
@@ -192,9 +157,13 @@ class MambaSlotAllocator:
             List of freed slot indices.
         """
         kv_alloc = self.context.kv_block_allocator
+        # pc_state is guaranteed non-None here: MambaSlotAllocator is only built
+        # when prefix caching is enabled (see DynamicInferenceContext init), so
+        # the KV allocator's pc_state is always present.
+        pc_state = kv_alloc.pc_state
         # Find blocks that have mamba slots and ref_count == 0
         has_slot_mask = self.block_to_slot[: kv_alloc.total_count] >= 0
-        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.total_count] == 0
+        ref_zero_mask = pc_state.block_ref_counts[: kv_alloc.total_count] == 0
         candidates = has_slot_mask & ref_zero_mask
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
@@ -203,7 +172,7 @@ class MambaSlotAllocator:
 
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-            timestamps = kv_alloc.block_timestamps[candidate_ids]
+            timestamps = pc_state.block_timestamps[candidate_ids]
             sorted_indices = torch.argsort(timestamps)[:num_needed]
             evict_ids = candidate_ids[sorted_indices]
         else:
@@ -211,17 +180,17 @@ class MambaSlotAllocator:
 
         # Batch gather slots + hashes (2 GPU syncs)
         slots = self.block_to_slot[evict_ids].tolist()
-        hashes = kv_alloc.block_hashes[evict_ids].tolist()
+        hashes = pc_state.block_hashes[evict_ids].tolist()
 
-        # Batch cleanup GPU mappings
+        # Clear block <-> slot mappings up front.
+        # The registry's evict callback then runs `_on_mamba_evicted -> _invalidate_blocks_batch`,
+        # which short-circuits because `block_to_slot[bid] < 0` for all evicted blocks:
+        # so the slots are NOT returned to the free pool (the caller takes ownership of them).
         self.block_to_slot[evict_ids] = -1
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=self.block_to_slot.device)
         self.slot_to_block[slot_tensor] = -1
 
-        # Clean up hash dict (CPU loop)
-        for h in hashes:
-            if h > 0 and h in self.hash_to_block_id:
-                del self.hash_to_block_id[h]
+        self.registry.evict_mamba(hashes)
 
         return slots
 
@@ -263,7 +232,7 @@ class MambaSlotAllocator:
         """Free cache slots and clear mappings for multiple blocks at once.
 
         Vectorized version of invalidate_block that avoids per-block .item()
-        GPU syncs. Used by on_kv_blocks_deregistered for bulk eviction.
+        GPU syncs. Used by ``_on_mamba_evicted`` for bulk slot release.
 
         Args:
             block_ids_list: List of block IDs to invalidate.
@@ -283,22 +252,18 @@ class MambaSlotAllocator:
         self.free_slots[self.free_count : self.free_count + n] = valid_slots.to(torch.int32)
         self.free_count += n
 
-    def on_kv_blocks_deregistered(self, block_ids_list: list, hashes_to_delete: set) -> None:
-        """Handle KV block deregistration by cleaning up Mamba state.
+    def _on_mamba_evicted(self, block_ids: list) -> None:
+        """Registry callback: free GPU slots for the given block IDs.
 
-        Called by KVBlockAllocator._deregister_blocks via callback.
+        Fired by `PrefixCacheRegistry` after the host Mamba dict drops entries:
+        either as a cascade from KV eviction (KV blocks gone means their cached Mamba state 
+        is also gone) or from an explicit `registry.evict_mamba` call.
 
-        Args:
-            block_ids_list: List of deregistered block IDs.
-            hashes_to_delete: Set of hashes being deregistered (excludes -1).
+        `_invalidate_blocks_batch` no-ops on blocks whose `block_to_slot` is already `-1`,
+        which lets `_evict_lru_slots_batch` suppress the free-pool return by clearing mappings
+        before firing the registry call.
         """
-        if self.hash_to_block_id:
-            mamba_keys = hashes_to_delete & self.hash_to_block_id.keys()
-            if mamba_keys:
-                from collections import deque
-
-                deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
-                self._invalidate_blocks_batch(block_ids_list)
+        self._invalidate_blocks_batch(block_ids)
 
     # =========================================================================
     # State store/restore
@@ -372,159 +337,42 @@ class MambaSlotAllocator:
             block_ids: List of block IDs.
             hashes: List of hash values (same length as block_ids).
         """
-        updates = {h: bid for bid, h in zip(block_ids, hashes) if h > 0}
-        if updates:
-            self.hash_to_block_id.update(updates)
+        self.registry.register_mamba(block_ids, hashes)
 
     # =========================================================================
-    # Intermediate state tracking
-    # =========================================================================
-
-    def compute_and_store_offsets(
-        self,
-        req,
-        current_id: int,
-        skip_tokens: int,
-        prefill_chunk_length: int,
-        num_matched_blocks: int,
-        matched_block_ids: list,
-        overall_required_blocks: int,
-    ) -> None:
-        """Compute intermediate state extraction offsets and store per-request.
-
-        Args:
-            req: The inference request.
-            current_id: Context request index.
-            skip_tokens: Number of tokens being skipped (mamba match).
-            prefill_chunk_length: Total prefill chunk length before skipping.
-            num_matched_blocks: Number of KV-matched blocks.
-            matched_block_ids: List of matched KV block IDs.
-            overall_required_blocks: Total blocks needed for this request.
-        """
-        ctx = self.context
-        prompt_len = len(req.prompt_tokens)
-        num_kv_matched = num_matched_blocks
-        kv_div_abs = num_kv_matched * ctx.block_size_tokens
-        last_aligned_abs = (prompt_len // ctx.block_size_tokens) * ctx.block_size_tokens
-        seq_len = prefill_chunk_length - skip_tokens  # effective prefill length
-
-        # Compute relative offsets (relative to prefill start after skip)
-        kv_div_rel = kv_div_abs - skip_tokens
-        last_aligned_rel = last_aligned_abs - skip_tokens
-        penultimate_abs = (overall_required_blocks - 1) * ctx.block_size_tokens
-        penultimate_rel = penultimate_abs - skip_tokens
-
-        # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
-        mamba_chunk_size = 128
-
-        # Build offset list: include if > 0, < seq_len, and % mamba_chunk_size == 0
-        offsets_set = set()
-        for offset in [kv_div_rel, last_aligned_rel, penultimate_rel]:
-            if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
-                offsets_set.add(offset)
-
-        offsets = sorted(offsets_set)
-        count = len(offsets)
-
-        # CPU bookkeeping writes (no GPU kernel launches).
-        if count > 0:
-            abs_tokens_cpu = torch.tensor([skip_tokens + o for o in offsets], dtype=torch.int64)
-            block_indices_cpu = abs_tokens_cpu // ctx.block_size_tokens - 1
-            bids_cpu = ctx.request_to_kv_block_ids[current_id][block_indices_cpu]
-
-            self._intermediate_offsets_cpu[current_id, :count] = torch.tensor(
-                offsets, dtype=torch.int32
-            )
-            self._intermediate_block_ids_cpu[current_id, :count] = bids_cpu.to(torch.int32)
-            self._has_intermediates = True
-        self._intermediate_counts_cpu[current_id] = count
-
-        # Block-aligned EOS: prompt_len is exactly block-aligned
-        if last_aligned_abs == prompt_len and prompt_len > 0:
-            last_block_idx = prompt_len // ctx.block_size_tokens - 1
-            if last_block_idx >= 0:
-                self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
-                    last_block_idx
-                ]
-                self._has_intermediates = True
-            else:
-                self._eos_cache_block_id_cpu[current_id] = -1
-        else:
-            self._eos_cache_block_id_cpu[current_id] = -1
-
-    def get_intermediate_cpu_data(self):
-        """Get intermediate offsets and counts as CPU tensor slices for current prefill batch.
-
-        Returns:
-            Tuple of (offsets_cpu, counts_cpu) where:
-                offsets_cpu: [prefill_count, 3] int32 CPU tensor
-                counts_cpu: [prefill_count] int32 CPU tensor
-            Returns (None, None) if no prefill requests or no intermediates.
-        """
-        if not self._has_intermediates:
-            return None, None
-
-        ctx = self.context
-        prefill_count = ctx.batch_dimensions.prefill_req_count
-        if prefill_count == 0:
-            return None, None
-
-        active_start = ctx.paused_request_count
-        decode_count = ctx.batch_dimensions.decode_req_count
-        prefill_start = active_start + decode_count
-
-        offsets = self._intermediate_offsets_cpu[prefill_start : prefill_start + prefill_count]
-        counts = self._intermediate_counts_cpu[prefill_start : prefill_start + prefill_count]
-        return offsets, counts
-
-    def transfer_intermediate_to_gpu(self, prefill_start: int, prefill_count: int):
-        """Copy intermediate offsets/counts slice from CPU to GPU for Mamba kernels.
-
-        Returns the GPU tensor views for the forward-pass kernels to consume.
-        """
-        if prefill_count == 0:
-            return None, None
-        offsets_cpu = self._intermediate_offsets_cpu[prefill_start : prefill_start + prefill_count]
-        counts_cpu = self._intermediate_counts_cpu[prefill_start : prefill_start + prefill_count]
-        offsets_gpu = self._intermediate_offsets_gpu[prefill_start : prefill_start + prefill_count]
-        counts_gpu = self._intermediate_counts_gpu[prefill_start : prefill_start + prefill_count]
-        offsets_gpu.copy_(offsets_cpu, non_blocking=True)
-        counts_gpu.copy_(counts_cpu, non_blocking=True)
-        return offsets_gpu, counts_gpu
-
-    # =========================================================================
-    # Intermediate state commit
+    # Commit (copies intermediate buffers + live EOS state into cache slots)
     # =========================================================================
 
     def commit_intermediate_states(self) -> None:
-        """Commit intermediate states from pre-allocated output buffers to cache.
+        """Move intermediate states recorded this step into the cache pool.
 
-        Called after the forward pass (including CUDA graph replay) completes.
-        Batched pipeline: collect data, allocate slots, copy states, register hashes.
+        Pulls per-request commit data from `context.mamba_metadata`,
+        allocates slots for the new entries, copies the GPU intermediates into the cache pool,
+        copies live EOS state where applicable, and registers Mamba hashes.
         """
         collected = self._collect_commit_data()
         if collected is None:
             return
         intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes = collected
 
-        # Allocate all slots in one batch (intermediates + EOS)
+        # Allocate all slots in one batch (intermediates + EOS).
         all_bids = intermediate_bids + eos_bids
         all_slots = self.allocate_slots_batch(all_bids)
 
-        # Copy intermediate states from output buffers to cache
+        # Copy intermediate states from metadata's output buffers to cache.
         n_intermediate = len(intermediate_bids)
         self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
 
-        # Copy EOS states from live buffers to cache
+        # Copy EOS states from live buffers to cache.
         self.store_from_live_batch(all_slots[n_intermediate:], eos_ctx_indices)
 
-        # Register hashes for all committed blocks
+        # Register hashes for all committed blocks.
         self.register_block_hashes_batch(all_bids, all_hashes)
 
-        self._clear_intermediate_state()
+        self.context.mamba_metadata.clear_intermediate_state(self.context)
 
     def _collect_commit_data(self):
-        """Extract commit data from GPU intermediate state tracking.
+        """Pull per-request commit data from metadata and KV-side block hashes.
 
         Returns:
             Tuple of (intermediate_bids, src_offsets, eos_bids, eos_ctx_indices,
@@ -535,25 +383,23 @@ class MambaSlotAllocator:
         metadata = ctx.mamba_metadata
         prefill_count = ctx.batch_dimensions.prefill_req_count
         if prefill_count == 0:
-            self._clear_intermediate_state()
+            metadata.clear_intermediate_state(ctx)
             return None
 
-        active_start = ctx.paused_request_count
-        decode_count = ctx.batch_dimensions.decode_req_count
-        prefill_start = active_start + decode_count
+        prefill_start = ctx.paused_request_count + ctx.batch_dimensions.decode_req_count
 
         # Block IDs and EOS block IDs live on CPU (no GPU sync needed).
         intermediate_count = metadata.intermediate_count
         per_request_counts = metadata.per_request_intermediate_counts
 
-        all_block_ids_cpu = self._intermediate_block_ids_cpu[
+        all_block_ids_cpu = metadata._intermediate_block_ids_cpu[
             prefill_start : prefill_start + prefill_count
         ].tolist()
-        eos_bids_cpu = self._eos_cache_block_id_cpu[
+        eos_bids_cpu = metadata._eos_cache_block_id_cpu[
             prefill_start : prefill_start + prefill_count
         ].tolist()
 
-        # Flatten intermediate block IDs and source offsets
+        # Flatten intermediate block IDs and source offsets.
         intermediate_bids = []
         src_offsets = []
         if intermediate_count > 0:
@@ -564,7 +410,7 @@ class MambaSlotAllocator:
                     src_offsets.append(ssm_offset + j)
                 ssm_offset += count
 
-        # Collect EOS block IDs and their context indices
+        # Collect EOS block IDs and their context indices.
         eos_bids = []
         eos_ctx_indices = []
         for req_batch_idx in range(prefill_count):
@@ -574,64 +420,48 @@ class MambaSlotAllocator:
                 eos_ctx_indices.append(prefill_start + req_batch_idx)
 
         if not intermediate_bids and not eos_bids:
-            self._clear_intermediate_state()
+            metadata.clear_intermediate_state(ctx)
             return None
 
-        # Single batch hash fetch for all block IDs (1 GPU sync)
+        # Single batch hash fetch for all block IDs (1 GPU sync). pc_state is
+        # guaranteed non-None: MambaSlotAllocator exists only when prefix
+        # caching is enabled.
         all_bids_for_hash = intermediate_bids + eos_bids
-        device = ctx.kv_block_allocator.block_hashes.device
+        pc_state = ctx.kv_block_allocator.pc_state
+        device = pc_state.block_hashes.device
         bid_tensor = torch.tensor(all_bids_for_hash, dtype=torch.int64, device=device)
-        all_hashes = ctx.kv_block_allocator.block_hashes[bid_tensor].tolist()
+        all_hashes = pc_state.block_hashes[bid_tensor].tolist()
 
         return intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes
 
     def _copy_intermediate_to_cache(self, src_offsets: list, slots: list) -> None:
-        """Copy intermediate states from output buffers to cache slots.
+        """Copy intermediate states from metadata's GPU buffers to cache slots.
 
         Uses fancy-indexed GPU D2D copy (2 kernel launches instead of 2N).
 
         Args:
-            src_offsets: Source indices into intermediate_ssm_out/intermediate_conv_out.
+            src_offsets: Source indices into metadata's intermediate buffers.
             slots: Destination cache slot indices.
         """
         if not src_offsets:
             return
+        metadata = self.context.mamba_metadata
         device = self.ssm_states.device
         src_idx = torch.tensor(src_offsets, dtype=torch.int64, device=device)
         dst_idx = torch.tensor(slots, dtype=torch.int64, device=device)
-        self.ssm_states[:, dst_idx] = self.intermediate_ssm_out[:, src_idx]
-        self.conv_states[:, dst_idx] = self.intermediate_conv_out[:, src_idx]
-
-    def _clear_intermediate_state(self) -> None:
-        """Clear all per-request intermediate state tracking."""
-        ctx = self.context
-        prefill_count = ctx.batch_dimensions.prefill_req_count
-        if prefill_count > 0:
-            active_start = ctx.paused_request_count
-            decode_count = ctx.batch_dimensions.decode_req_count
-            prefill_start = active_start + decode_count
-            end = prefill_start + prefill_count
-            self._intermediate_counts_cpu[prefill_start:end].fill_(0)
-            self._intermediate_offsets_cpu[prefill_start:end].fill_(0)
-            self._intermediate_block_ids_cpu[prefill_start:end].fill_(-1)
-            self._eos_cache_block_id_cpu[prefill_start:end].fill_(-1)
-        self._has_intermediates = False
+        self.ssm_states[:, dst_idx] = metadata.intermediate_ssm_out[:, src_idx]
+        self.conv_states[:, dst_idx] = metadata.intermediate_conv_out[:, src_idx]
 
     # =========================================================================
     # Reset
     # =========================================================================
 
     def reset(self) -> None:
-        """Reset all state (mappings, free pool, cache, intermediate tracking)."""
+        """Reset slot pool, cache state, and the Mamba host registry."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
         self.free_slots = torch.arange(self.max_slots, dtype=torch.int32, device='cpu')
         self.free_count = self.max_slots
-        self.hash_to_block_id.clear()
-        self.intermediate_ssm_out.zero_()
-        self.intermediate_conv_out.zero_()
-        self._intermediate_offsets_cpu.fill_(0)
-        self._intermediate_counts_cpu.fill_(0)
-        self._intermediate_block_ids_cpu.fill_(-1)
-        self._eos_cache_block_id_cpu.fill_(-1)
-        self._has_intermediates = False
+        self.registry.clear_mamba()
+        # Intermediate buffers + CPU bookkeeping live on the metadata.
+        self.context.mamba_metadata.reset_intermediate_state()
