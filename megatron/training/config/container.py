@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
+import warnings
 import torch
 from typing import Any, Type, TypeVar
 
@@ -373,6 +374,12 @@ class PretrainConfigContainer(ConfigContainerBase):
                 # optimizer state in the CPU memory of DP rank 0.
                 assert self.checkpoint.ckpt_format == "torch_dist"
 
+        # Cross-validation between training and scheduler configs
+        self._validate_training_scheduler_compatibility()
+
+        # Calculate scheduler steps for both iteration-based and sample-based training
+        self._calculate_scheduler_steps()
+
     def _validate_and_apply_megatron_fsdp_configs(self) -> None:
         """
         Validate Megatron-FSDP configuration when Megatron-FSDP is used.
@@ -545,3 +552,85 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "For fine-grained activation offloading with TE >= 2.10.0, "
                     "NVTE_CPU_OFFLOAD_V1 environment variable should be set to 1 to avoid offloading weights."
                 )
+
+    def _validate_training_scheduler_compatibility(self) -> None:
+        """Cross-validation between training and scheduler configs."""
+        has_train_samples = self.train.train_samples is not None
+
+        if has_train_samples:
+            # Sample-based training validation
+            assert self.scheduler.lr_decay_iters is None, (
+                "Use lr_decay_samples for sample-based training, not lr_decay_iters"
+            )
+            assert self.scheduler.lr_warmup_iters == 0, (
+                "Use lr_warmup_samples for sample-based training, not lr_warmup_iters"
+            )
+            assert not (self.scheduler.lr_warmup_fraction is not None and self.scheduler.lr_warmup_samples != 0), (
+                "Can only specify one of lr_warmup_fraction or lr_warmup_samples"
+            )
+        else:
+            # Iteration-based training validation
+            assert self.scheduler.lr_decay_samples is None, (
+                "Use lr_decay_iters for iteration-based training, not lr_decay_samples"
+            )
+            assert self.scheduler.lr_warmup_samples == 0, (
+                "Use lr_warmup_iters for iteration-based training, not lr_warmup_samples"
+            )
+            assert not (self.scheduler.lr_warmup_fraction is not None and self.scheduler.lr_warmup_iters != 0), (
+                "Can only specify one of lr_warmup_fraction or lr_warmup_iters"
+            )
+
+    def _calculate_scheduler_steps(self) -> None:
+        """Calculate scheduler steps for both iteration-based and sample-based training."""
+        is_sample_based = self.train.train_samples is not None
+
+        if is_sample_based:
+            if self.scheduler.lr_decay_samples is None:
+                self.scheduler.lr_decay_samples = self.train.train_samples
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_samples
+            self.scheduler.wd_incr_steps = self.train.train_samples
+
+            if self.scheduler.lr_wsd_decay_samples is not None:
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
+
+            # Warmup calculation for sample-based training
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
+        else:
+            # Iteration-based training
+            if self.scheduler.lr_decay_iters is None:
+                self.scheduler.lr_decay_iters = self.train.train_iters
+            if self.scheduler.lr_wsd_decay_iters is None and self.scheduler.lr_decay_style == "WSD":
+                self.scheduler.lr_wsd_decay_iters = self.scheduler.lr_decay_iters
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
+            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+
+            if self.scheduler.lr_wsd_decay_iters is not None:
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
+
+        # Enforce the Megatron Core invariant: lr_warmup_steps must be < lr_decay_steps.
+        # This can be violated when train_iters is small (e.g. smoke runs) while
+        # lr_warmup_iters is tuned for a full-length training run.
+        if self.scheduler.lr_decay_steps <= 0:
+            raise ValueError(
+                f"lr_decay_steps must be > 0, got {self.scheduler.lr_decay_steps}. "
+                "Please increase train_iters/train_samples or lr_decay_iters/lr_decay_samples."
+            )
+        if self.scheduler.lr_warmup_steps >= self.scheduler.lr_decay_steps:
+            capped = self.scheduler.lr_decay_steps - 1
+            warnings.warn(
+                f"lr_warmup_steps ({self.scheduler.lr_warmup_steps}) >= lr_decay_steps "
+                f"({self.scheduler.lr_decay_steps}); capping lr_warmup_steps to {capped}. "
+                "Reduce lr_warmup_iters (or lr_warmup_samples) for short training runs.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.scheduler.lr_warmup_steps = capped
+
