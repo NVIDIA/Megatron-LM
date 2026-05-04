@@ -27,11 +27,13 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         if recipe is None:
             recipe = load_recipe(args.model_recipe)
 
-        # Spec selection precedence: explicit recipe.stack_spec wins over
-        # transformer_impl-based auto-pick. ``None`` falls through to
-        # HybridModel's default hybrid_stack_spec.
-        if recipe.stack_spec is not None:
-            recipe_stack_spec = import_module(recipe.stack_spec)
+        # Spec selection: ``--spec`` (CLI) overrides everything; otherwise
+        # auto-pick by ``transformer_impl``. ``None`` falls through to
+        # HybridModel's default hybrid_stack_spec. Same precedence as the
+        # legacy path below — recipe-built models get spec selection from
+        # the launcher, not from the recipe itself.
+        if getattr(args, 'spec', None) is not None:
+            recipe_stack_spec = import_module(args.spec)
         elif recipe.config.transformer_impl == "inference_optimized":
             assert (
                 not recipe.config.inference_fuse_tp_communication
