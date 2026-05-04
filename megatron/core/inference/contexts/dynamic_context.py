@@ -1112,7 +1112,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Static GPU tensors for the per-step MHA derived metadata. Computed on
         # GPU after the coalesced H2D from ``gpu_view.request_query_lengths`` /
         # ``gpu_view.request_kv_length_offsets`` / ``gpu_view.request_to_kv_block_ids``.
-        # Replaces the previous ``_cpu_mha_*`` CPU compute path.
         gpu_device = torch.cuda.current_device()
         # ``[0]`` is fixed at 0 forever; only ``[1:n+1]`` is rewritten each step.
         self.cu_active_request_query_lengths = torch.zeros(
