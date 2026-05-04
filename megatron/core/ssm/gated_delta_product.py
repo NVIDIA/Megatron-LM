@@ -1250,19 +1250,16 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         Padding requests are zero-length sequences with a `-1` state slot; they
         produce zero output and touch no state."""
         metadata = context.mamba_metadata
-        slot_allocator = context.mamba_slot_allocator
         cu_seqlens = metadata.cu_seqlens
         batch_indices = metadata.batch_indices_prefill
 
-        # Per-layer intermediate extraction buffers (prefix caching). Present
-        # only when a slot allocator was configured; otherwise extraction is
-        # disabled below and the scan skips returning its per-chunk states.
+        # Per-layer intermediate extraction buffers. Present only when prefix caching is enabled.
         intermediate_ssm_out = None
         intermediate_conv_out = None
-        if slot_allocator is not None:
+        if metadata.intermediate_ssm_out is not None:
             gdp_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
-            intermediate_ssm_out = slot_allocator.intermediate_ssm_out[gdp_layer_idx]
-            intermediate_conv_out = slot_allocator.intermediate_conv_out[gdp_layer_idx]
+            intermediate_ssm_out = metadata.intermediate_ssm_out[gdp_layer_idx]
+            intermediate_conv_out = metadata.intermediate_conv_out[gdp_layer_idx]
 
         # No batch-invariant term, unlike MambaMixer's equivalent flag: `forward`
         # already rejects batch_invariant_mode for this mixer outright.
