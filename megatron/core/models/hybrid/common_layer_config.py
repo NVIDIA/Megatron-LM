@@ -355,8 +355,17 @@ class CommonLayerConfig:
             )
         # Escape-hatch passthrough: validate keys then merge over curated kwargs
         # for any TransformerConfig field not exposed as a first-class attribute.
+        # Reject keys that name a curated CommonLayerConfig attribute — those
+        # would silently shadow the dataclass field.
         if self.extra:
             validate_extra_kwargs(self.extra, "CommonLayerConfig.extra")
+            curated = {f.name for f in dataclasses.fields(self) if f.name != "extra"}
+            shadowed = sorted(set(self.extra) & curated)
+            if shadowed:
+                raise ValueError(
+                    f"CommonLayerConfig.extra cannot name curated fields: {shadowed}. "
+                    f"Set them on the dataclass attribute directly."
+                )
             kwargs.update(self.extra)
         return kwargs
 

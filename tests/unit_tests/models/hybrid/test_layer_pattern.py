@@ -295,6 +295,35 @@ class TestLayerConfigSymbols:
         ):
             assert cls.SYMBOL in Symbols.VALID_LAYERS
 
+    def test_mlp_layer_compiles_and_emits_dash_symbol(self):
+        """The recipe-DSL ``MLPLayerConfig`` produces the same ``-`` symbol
+        the legacy string DSL writes, and yields a per-layer TC with the
+        author-specified ``ffn_hidden_size``. This proves the MLP path is
+        not dead code in the recipe pipeline."""
+        common = _make_common()
+        emb = EmbeddingLayerConfig(common_config=common, vocab_size=32, max_sequence_length=8)
+        m = MambaLayerConfig(common_config=common)
+        mlp = MLPLayerConfig(common_config=common, ffn_hidden_size=192)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common, layer_pattern=[emb, m, mlp, loss]
+        ).compile()
+        assert compiled.layer_type_list == [Symbols.MAMBA, Symbols.MLP]
+        assert compiled.layer_config_list[1].ffn_hidden_size == 192
+
+    def test_gdn_layer_compiles_and_emits_g_symbol(self):
+        """The recipe-DSL ``GDNLayerConfig`` produces the same ``G`` symbol
+        the legacy string DSL writes, and yields a per-layer TC carrying
+        the author-specified attention-head count. This proves the GDN
+        path is not dead code in the recipe pipeline."""
+        common = _make_common()
+        emb = EmbeddingLayerConfig(common_config=common, vocab_size=32, max_sequence_length=8)
+        g = GDNLayerConfig(common_config=common, num_attention_heads=8)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, g, loss]).compile()
+        assert compiled.layer_type_list == [Symbols.GDN]
+        assert compiled.layer_config_list[0].num_attention_heads == 8
+
 
 @pytest.mark.internal
 class TestLayerConfigToTransformerConfig:
@@ -823,6 +852,29 @@ class TestExtraPassthrough:
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig(loss_fusion=True, extra={"cross_entropy_loss_fusion": False})
         with pytest.raises(ValueError, match="cross_entropy_loss_fusion"):
+            HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+
+    def test_common_extra_cannot_shadow_curated_field(self):
+        """Same shadowing rule across all four ``extra`` sites: ``extra`` may
+        not name a curated dataclass field on the same config."""
+        common = _make_common(extra={"hidden_size": 999})
+        with pytest.raises(ValueError, match="hidden_size"):
+            common.to_transformer_config_kwargs()
+
+    def test_layer_extra_cannot_shadow_curated_field(self):
+        common = _make_common()
+        layer = AttentionLayerConfig(
+            common_config=common, num_attention_heads=4, extra={"num_attention_heads": 8}
+        )
+        with pytest.raises(ValueError, match="num_attention_heads"):
+            layer.to_transformer_config(num_layers=2)
+
+    def test_embedding_extra_cannot_shadow_curated_field(self):
+        common = _make_common()
+        emb = self._embedding(common, vocab_size=100, extra={"vocab_size": 999})
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        with pytest.raises(ValueError, match="vocab_size"):
             HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
 
 

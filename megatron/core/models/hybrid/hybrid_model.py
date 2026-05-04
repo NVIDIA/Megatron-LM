@@ -184,12 +184,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "layer_type_list was passed without layer_config_list; "
                     "they must be passed together."
                 )
-            if len(layer_config_list) != len(layer_type_list):
-                raise ValueError(
-                    f"layer_type_list (len={len(layer_type_list)}) and "
-                    f"layer_config_list (len={len(layer_config_list)}) "
-                    f"must have the same length."
-                )
 
         # When using a recipe, fall back to the default hybrid_stack_spec so that
         # users do not need to construct or pass a ModuleSpec.
