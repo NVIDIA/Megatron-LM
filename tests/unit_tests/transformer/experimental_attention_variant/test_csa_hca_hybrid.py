@@ -109,12 +109,14 @@ class TestIndexHelpers:
         # ratio=4, seq=8 -> 2 compressed positions
         idxs = _get_compress_topk_idxs_cached(ratio=4, seqlen=8, offset=8, device_str="cpu")
         assert idxs.shape == (8, 2)
-        # Positions 0..3 cannot see compressed entry 0 yet (1//4 == 0)
-        assert (idxs[0:4] == -1).all().item()
-        # Positions 4..7 can see compressed entry 0 (offset=8 -> index 8)
-        assert (idxs[4:8, 0] == 8).all().item()
-        # No position can see compressed entry 1 because 8//4 == 2 only at i=8
-        assert (idxs[:, 1] == -1).all().item()
+        # Compressed entry j is visible to query position i once (i+1)//ratio > j.
+        # Positions 0..2 cannot see entry 0 yet ((i+1)//4 == 0 for i in 0..2).
+        assert (idxs[0:3] == -1).all().item()
+        # Positions 3..7 see entry 0 (offset=8 -> index 8).
+        assert (idxs[3:8, 0] == 8).all().item()
+        # Entry 1 is only visible at i=7 (where (7+1)//4 == 2 > 1); index 8+1=9.
+        assert (idxs[0:7, 1] == -1).all().item()
+        assert idxs[7, 1].item() == 9
 
     def test_compress_indices_batch_expand(self):
         idxs = get_compress_topk_idxs(
