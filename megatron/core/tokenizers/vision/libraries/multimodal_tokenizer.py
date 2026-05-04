@@ -256,9 +256,8 @@ class MegatronMultimodalTokenizer:
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
             return_assistant_token_mask=False,
-            return_tensors="np",
             chat_template=self._prompt_config.custom_chat_template,
-        )[0]
+        )
 
         if not return_target:
             return tokens
