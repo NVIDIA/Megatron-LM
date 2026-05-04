@@ -8,7 +8,8 @@ The Python DSL composes a model from a (possibly nested) list of
 :class:`CrossEntropyLayerConfig` markers) into a flat list of layer configs.
 :func:`load_recipe` resolves a recipe spec — either a dotted Python module
 path or a filesystem path, with an optional ``:func`` suffix — and returns
-a compiled :class:`CompiledRecipe` ready to feed into :class:`HybridModel`.
+the :class:`HybridModelConfig` ready to feed into :class:`HybridModel` via
+``HybridModel(recipe=...)``.
 """
 
 import hashlib
@@ -19,7 +20,7 @@ import sys
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-from megatron.core.models.hybrid.hybrid_model_config import CompiledRecipe, HybridModelConfig
+from megatron.core.models.hybrid.hybrid_model_config import HybridModelConfig
 from megatron.core.models.hybrid.layer_configs import (
     CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
@@ -173,8 +174,13 @@ def _ensure_hybrid_model_config(value, origin: str, source: str) -> HybridModelC
     return value
 
 
-def load_recipe(spec: str) -> CompiledRecipe:
-    """Resolve a recipe spec and return a compiled :class:`CompiledRecipe`.
+def load_recipe(spec: str) -> HybridModelConfig:
+    """Resolve a recipe spec and return its :class:`HybridModelConfig`.
+
+    The recipe is the public contract: pass it directly to
+    :class:`HybridModel` via ``HybridModel(recipe=...)`` or to the
+    ``--model-recipe`` argparse adapter, both of which own the lowering
+    internally.
 
     ``spec`` accepts three forms:
 
@@ -201,5 +207,4 @@ def load_recipe(spec: str) -> CompiledRecipe:
     """
     module_or_path, func_name = _split_spec(spec)
     module = _import_from_spec(module_or_path)
-    recipe = _resolve_recipe_object(module, func_name, origin=spec)
-    return recipe.compile()
+    return _resolve_recipe_object(module, func_name, origin=spec)

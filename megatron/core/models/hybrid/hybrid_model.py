@@ -13,6 +13,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid.hybrid_model_config import HybridModelConfig, _RecipeLowering
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -42,38 +43,32 @@ logger = logging.getLogger(__name__)
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
-    A HybridModel is constructed via either of two equivalent paths:
+    A HybridModel is constructed via either of two paths:
 
-    1. **Recipe path (recommended).** Pass ``layer_type_list`` and
-       ``layer_config_list`` (typically produced by
-       :meth:`HybridModelConfig.compile`) plus the recipe-level kwargs.
-       This is the path used by ``--model-recipe`` and is the supported
-       way to build new HybridModels.
-    2. **Legacy string-pattern path.** Pass ``hybrid_layer_pattern`` (a
-       single-character pattern string). Retained for backwards
-       compatibility; new code should use the recipe path.
+    1. **Recipe path (recommended).** Use the
+       :meth:`from_recipe` classmethod with a :class:`HybridModelConfig`.
+       The recipe is the public contract; lowering to the underlying
+       :class:`TransformerConfig`-based representation happens internally.
+       This is the path used by ``--model-recipe``.
+    2. **Legacy string-pattern path.** Pass ``config`` and
+       ``hybrid_layer_pattern`` (a single-character pattern string) to
+       ``__init__``. Retained for backwards compatibility — including
+       pipeline parallelism and MTP, which the recipe DSL does not yet
+       cover. New code should prefer :meth:`from_recipe`.
 
     Args:
-        config (TransformerConfig): Model config (the stack-level
-            :class:`TransformerConfig`; per-layer configs flow in via
-            ``layer_config_list`` on the recipe path).
+        config (TransformerConfig): Stack-level :class:`TransformerConfig`
+            for the legacy path (ignored on the recipe path, where
+            lowering produces it).
         hybrid_stack_spec (ModuleSpec, optional): Module specs for the
             various layer types. Required on the legacy string-pattern path.
             On the recipe path, defaults to the production
             ``hybrid_stack_spec`` in
             :mod:`megatron.core.models.hybrid.hybrid_layer_specs` when not
             supplied.
-        vocab_size (int): Vocabulary size
-        max_sequence_length (int): maximum size of sequence.
-            This is used for positional embedding
-        layer_type_list (list, optional): Per-layer symbol list (recipe
-            path). Mutually exclusive with ``hybrid_layer_pattern``. Each
-            entry maps to a layer in :mod:`Symbols.VALID_LAYERS`.
-        layer_config_list (list, optional): Per-layer
-            :class:`TransformerConfig` instances (recipe path), parallel to
-            ``layer_type_list``. Each layer is constructed from its own
-            config; ``config`` is reserved for stack-level concerns
-            (final norm, embedding init).
+        vocab_size (int): Vocabulary size (legacy path).
+        max_sequence_length (int): maximum size of sequence (legacy path).
+            This is used for positional embedding.
         hybrid_layer_pattern (str): Legacy string-pattern path. Unified
             hybrid layer pattern with optional MTP and pipeline stage
             boundaries.
@@ -121,8 +116,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         vocab_size: Optional[int] = None,
         max_sequence_length: Optional[int] = None,
         hybrid_layer_pattern: Optional[str] = None,
-        layer_type_list: Optional[list] = None,
-        layer_config_list: Optional[list] = None,
         hybrid_attention_ratio: Optional[float] = None,
         hybrid_mlp_ratio: Optional[float] = None,
         hybrid_override_pattern: Optional[str] = None,
@@ -139,6 +132,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        # Internal: populated by :meth:`from_recipe` to thread the lowering's
+        # per-layer configs into the recipe path. Recipe authors must not
+        # construct or pass ``_RecipeLowering`` directly — its shape is an
+        # implementation detail of the current TransformerConfig backend.
+        _recipe_lowering: Optional[_RecipeLowering] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -165,24 +163,27 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
 
-        recipe_path = layer_type_list is not None
-        if not recipe_path and (vocab_size is None or max_sequence_length is None):
-            raise ValueError(
-                "vocab_size and max_sequence_length are required on the legacy "
-                "(hybrid_layer_pattern) construction path; pass both explicitly. "
-                "On the recipe path, the EmbeddingLayerConfig marker supplies them."
-            )
+        recipe_path = _recipe_lowering is not None
         if recipe_path:
+            # Recipe path: per-layer symbols and configs come from the
+            # internal lowering ``HybridModel.from_recipe`` produced.
+            layer_type_list: Optional[list] = _recipe_lowering.layer_type_list
+            layer_config_list: Optional[list] = _recipe_lowering.layer_config_list
             if hybrid_layer_pattern is not None:
                 raise ValueError(
-                    "layer_type_list (Python DSL recipe) and "
+                    "from_recipe (Python DSL) and "
                     "hybrid_layer_pattern (string DSL) are mutually exclusive; "
                     "pass exactly one."
                 )
-            if layer_config_list is None:
+        else:
+            layer_type_list = None
+            layer_config_list = None
+            if vocab_size is None or max_sequence_length is None:
                 raise ValueError(
-                    "layer_type_list was passed without layer_config_list; "
-                    "they must be passed together."
+                    "vocab_size and max_sequence_length are required on the legacy "
+                    "(hybrid_layer_pattern) construction path; pass both explicitly. "
+                    "On the recipe path, HybridModel.from_recipe supplies them from "
+                    "the EmbeddingLayerConfig marker."
                 )
 
         # When using a recipe, fall back to the default hybrid_stack_spec so that
@@ -241,8 +242,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 )
 
         if recipe_path:
-            # Recipe path: layer_type_list and layer_config_list are precomputed
-            # by HybridModelConfig.compile() upstream. Pipeline parallelism and
+            # Recipe path: per-layer symbols and configs were lowered from
+            # HybridModelConfig by from_recipe(). Pipeline parallelism and
             # MTP are not part of the recipe DSL — recipes that need either
             # must use the legacy hybrid_layer_pattern string DSL. The PP > 1
             # check below catches launcher/CLI mismatches where a PP group
@@ -396,6 +397,73 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+    @classmethod
+    def from_recipe(
+        cls,
+        recipe: HybridModelConfig,
+        *,
+        hybrid_stack_spec: Optional[ModuleSpec] = None,
+        pre_process: bool = True,
+        post_process: bool = True,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+    ) -> "HybridModel":
+        """Construct a :class:`HybridModel` from a :class:`HybridModelConfig`.
+
+        This is the public recipe path: ``HybridModelConfig`` is the source
+        of truth for everything about the model (architecture, embeddings,
+        loss behaviour, parallelism pins). Only construction-time concerns
+        — process groups, pipeline staging, optional stack-spec override —
+        come in as kwargs.
+
+        The lowering from DSL → :class:`TransformerConfig` is performed
+        internally and is an implementation detail: the lowering output's
+        shape will change when ``TransformerConfig`` / ``TransformerLayer``
+        are eventually retired, but this signature will not.
+
+        Args:
+            recipe: The recipe to build. Typically returned by a
+                ``make_recipe()`` entry point and resolved via
+                :func:`load_recipe` from the ``--model-recipe`` flag.
+            hybrid_stack_spec: Optional override for the per-layer module
+                spec. Defaults to the production
+                :data:`hybrid_layer_specs.hybrid_stack_spec`.
+            pre_process: Include the embedding layer (used with PP).
+            post_process: Include the output layer (used with PP).
+            pg_collection: Process-group collection for distributed
+                construction.
+            vp_stage: Virtual pipeline stage index.
+
+        Note:
+            Pipeline parallelism is not part of the recipe DSL.
+            :class:`HybridModel` raises if it is constructed under a PP
+            group greater than 1 via this path.
+        """
+        lowering = recipe._lower()
+        return cls(
+            config=lowering.config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=lowering.vocab_size,
+            max_sequence_length=lowering.max_sequence_length,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=lowering.fp16_lm_cross_entropy,
+            parallel_output=lowering.parallel_output,
+            share_embeddings_and_output_weights=(
+                not lowering.untie_embeddings_and_output_weights
+            ),
+            position_embedding_type=lowering.position_embedding_type,
+            rotary_percent=lowering.rotary_percent,
+            rotary_base=lowering.rotary_base,
+            scatter_embedding_sequence_parallel=(
+                lowering.scatter_embedding_sequence_parallel
+            ),
+            seq_len_interpolation_factor=lowering.seq_len_interpolation_factor,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+            _recipe_lowering=lowering,
+        )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
