@@ -31,7 +31,7 @@ from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.models import Serializable, HybridModelConfig
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.training.utils import print_rank_0, warn_rank_0
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -346,6 +346,32 @@ class PretrainConfigContainer(ConfigContainerBase):
         self._validate_and_sync_distributed_optimizer_settings()
         self._validate_mixed_precision_consistency()
         self._validate_fine_grained_activation_offloading()
+
+        # CUDA graph scope validation: check_for_nan_in_loss must be disabled with full_iteration graph
+        if self.model.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in self.model.cuda_graph_scope:
+            assert not self.rerun_state_machine.check_for_nan_in_loss, (
+                "check_for_nan_in_loss must be disabled when using full_iteration CUDA graph. "
+                "Set rerun_state_machine.check_for_nan_in_loss=False."
+            )
+        if self.model.cuda_graph_impl == "none":
+            self.model.cuda_graph_scope = []
+
+        # ModelOpt/Quantization checks
+        if getattr(self.model, "restore_modelopt_state", False):
+            assert not self.model.gradient_accumulation_fusion, (
+                "Gradient accumulation fusion is not supported with ModelOpt/Quantized models. "
+                "Please set model.gradient_accumulation_fusion=False"
+            )
+
+        self.model.use_cpu_initialization = self.model.use_cpu_initialization or self.dist.lazy_mpu_init
+
+        # Make sure all functionality that requires Gloo process groups is disabled.
+        if not self.dist.use_gloo_process_groups:
+            if self.optimizer.use_distributed_optimizer:
+                # If using distributed optimizer, must use distributed checkpointing.
+                # Legacy checkpointing uses Gloo process groups to collect full distributed
+                # optimizer state in the CPU memory of DP rank 0.
+                assert self.checkpoint.ckpt_format == "torch_dist"
 
     def _validate_and_apply_megatron_fsdp_configs(self) -> None:
         """
