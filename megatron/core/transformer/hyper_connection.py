@@ -12,7 +12,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import CheckpointManager
+    from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 
 
 class SinkhornKnopp(torch.autograd.Function):
@@ -62,9 +62,13 @@ class SinkhornKnopp(torch.autograd.Function):
             H_res: [s, b, n, n] - doubly stochastic matrix
         """
         # Gradients are computed explicitly in backward via recomputation.
-        # Stabilized exp: subtract row-wise max to prevent overflow (log-sum-exp trick)
-        # M^{(0)} = exp(H_res_logits - max(H_res_logits)) - numerically equivalent
-        # after Sinkhorn normalization since row normalization absorbs the scaling.
+        # Numerical-stability shift: subtract the per-row max before exp to prevent
+        # overflow. This row-wise constant is invariant under Sinkhorn-Knopp
+        # normalization: the first iteration's row normalization (T_r) divides each
+        # row by its sum, which cancels any per-row scalar — i.e. exp(H_ij - c_i) and
+        # exp(H_ij) produce identical row-normalized matrices, hence the same Sinkhorn
+        # fixed point and the same gradient. The shift therefore changes only the
+        # numeric stability of the exp, not the algorithm's output.
         M_init = torch.exp(H_res_logits - H_res_logits.max(dim=-1, keepdim=True).values)
 
         M = SinkhornKnopp._sinkhorn_normalize(M_init, num_iterations)
@@ -279,7 +283,7 @@ class HyperConnectionModule(MegatronModule):
         self,
         x_with_bias: Tuple[Tensor, Optional[Tensor]],
         h_post: Tensor,
-        manager: Optional['CheckpointManager'] = None,
+        manager: Optional['CheckpointWithoutOutputManager'] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """
         Apply H_post to x and optionally bias, with optional checkpointing.
@@ -292,7 +296,7 @@ class HyperConnectionModule(MegatronModule):
                 - x: [s, b, C] - hidden states
                 - bias: [C] or None - optional bias tensor
             h_post: [s, b, n] - expansion weights
-            manager: Optional CheckpointManager for checkpoint management.
+            manager: Optional CheckpointWithoutOutputManager for checkpoint management.
                 When provided, wraps _apply_h_post with CheckpointWithoutOutput.
 
         Returns:
@@ -375,14 +379,16 @@ class HyperConnectionModule(MegatronModule):
         return mixed.view(s, b, n * C)
 
     def forward(
-        self, hidden_states: Tensor, mhc_recompute_manager: Optional['CheckpointManager'] = None
+        self,
+        hidden_states: Tensor,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Full mHC forward pass.
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
+            mhc_recompute_manager: Optional CheckpointWithoutOutputManager for checkpoint management.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
 
         Returns:
@@ -417,7 +423,7 @@ class HyperConnectionModule(MegatronModule):
         return aggregated, h_res, h_post
 
     def _forward_with_checkpoint(
-        self, hidden_states: Tensor, manager: 'CheckpointManager'
+        self, hidden_states: Tensor, manager: 'CheckpointWithoutOutputManager'
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass with checkpointing for memory efficiency.
@@ -429,7 +435,7 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            manager: CheckpointManager for unified recomputation
+            manager: CheckpointWithoutOutputManager for unified recomputation
 
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
@@ -501,7 +507,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: Optional['CheckpointManager'] = None,
+        manager: Optional['CheckpointWithoutOutputManager'] = None,
     ) -> Tensor:
         """
         Fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
@@ -524,7 +530,7 @@ class HyperConnectionModule(MegatronModule):
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
-            manager: Optional CheckpointManager for checkpoint management.
+            manager: Optional CheckpointWithoutOutputManager for checkpoint management.
                 When provided, each operation is wrapped with CheckpointWithoutOutput.
 
         Returns:
@@ -606,7 +612,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: 'CheckpointManager',
+        manager: 'CheckpointWithoutOutputManager',
     ) -> Tensor:
         """
         Checkpointed implementation of fused h_res, h_post and bda operations.
@@ -621,7 +627,7 @@ class HyperConnectionModule(MegatronModule):
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
-            manager: CheckpointManager for checkpoint management
+            manager: CheckpointWithoutOutputManager for checkpoint management
 
         Returns:
             output: [s, b, n*C] - final output

@@ -4,15 +4,15 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
-    CheckpointManager,
     CheckpointWithoutOutput,
+    CheckpointWithoutOutputManager,
     initialize_rng_tracker,
 )
 from tests.unit_tests.test_utilities import Utils
 
 
 class TestCheckpointWithoutOutputManagerAPI:
-    """Test CheckpointWithoutOutput integration with CheckpointManager."""
+    """Test CheckpointWithoutOutput integration with CheckpointWithoutOutputManager."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel()
@@ -23,7 +23,7 @@ class TestCheckpointWithoutOutputManagerAPI:
 
     def test_auto_register(self):
         """CheckpointWithoutOutput auto-registers to manager when ckpt_manager is provided."""
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         def func(x):
             return x * 2 + 1
@@ -50,7 +50,7 @@ class TestCheckpointWithoutOutputManagerAPI:
 
     def test_discard_is_noop_with_manager(self):
         """discard_output_and_register_recompute is a NO-OP when ckpt_manager is set."""
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         def func1(x):
             return x * 2
@@ -118,8 +118,8 @@ class TestCheckpointWithoutOutputManagerAPI:
         assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6)
 
     def test_error_handling(self):
-        """CheckpointManager rejects invalid add_checkpoint calls."""
-        manager = CheckpointManager()
+        """CheckpointWithoutOutputManager rejects invalid add_checkpoint calls."""
+        manager = CheckpointWithoutOutputManager()
 
         with pytest.raises(TypeError):
             manager.add_checkpoint("not a checkpoint")
@@ -130,7 +130,7 @@ class TestCheckpointWithoutOutputManagerAPI:
 
 
 class TestCheckpointManagerSequentialChain:
-    """Test CheckpointManager with sequential checkpoint chains."""
+    """Test CheckpointWithoutOutputManager with sequential checkpoint chains."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel()
@@ -161,7 +161,7 @@ class TestCheckpointManagerSequentialChain:
         loss_ref.backward()
         grad_ref = input_ref.grad.clone()
 
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         y1 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func1, input_ckpt)
         y2 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func2, y1)
@@ -205,7 +205,7 @@ class TestCheckpointManagerSequentialChain:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         y1 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_with_dropout, input_ckpt)
         y2 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func2, y1)
@@ -221,7 +221,7 @@ class TestCheckpointManagerSequentialChain:
         ), f"Gradients with dropout mismatch!\nWith manager: {grad_ckpt}\nReference: {grad_ref}"
 
     def test_multiple_outputs(self):
-        """CheckpointManager handles functions that return multiple outputs."""
+        """CheckpointWithoutOutputManager handles functions that return multiple outputs."""
 
         def func_multi_output(x):
             return x * 2, x + 1
@@ -238,7 +238,7 @@ class TestCheckpointManagerSequentialChain:
         loss_ref.backward()
         grad_ref = input_ref.grad.clone()
 
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         y1a, y1b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             func_multi_output, input_ckpt
@@ -258,7 +258,7 @@ class TestCheckpointManagerSequentialChain:
 
 
 class TestCheckpointManagerPartialCheckpoint:
-    """Test CheckpointManager with partial checkpointing (some ops not checkpointed)."""
+    """Test CheckpointWithoutOutputManager with partial checkpointing (some ops not checkpointed)."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel()
@@ -295,7 +295,7 @@ class TestCheckpointManagerPartialCheckpoint:
 
         input_ckpt = input_ref.detach().clone().requires_grad_(True)
 
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_f, input_ckpt)
         c = func_g(b)
@@ -358,7 +358,7 @@ class TestCheckpointManagerPartialCheckpoint:
         x_ckpt = x_ref.detach().clone().requires_grad_(True)
         residual_ckpt = residual_ref.detach().clone().requires_grad_(True)
 
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
 
         h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             compute_mappings, x_ckpt
@@ -403,7 +403,7 @@ class TestCheckpointManagerPartialCheckpoint:
 #
 # These tests instantiate a full ``TransformerBlock`` with mHC enabled to
 # exercise:
-#   * ``_build_mhc_recompute_layer_plan`` (per-layer ``CheckpointManager``
+#   * ``_build_mhc_recompute_layer_plan`` (per-layer ``CheckpointWithoutOutputManager``
 #     allocation, including the ``mhc_recompute_layer_num`` boundary case),
 #   * ``_finalize_mhc_recompute_layer`` (manager finalization at block end),
 #   * the ``HyperConnectionModule.input_expand`` / ``output_contract`` calls

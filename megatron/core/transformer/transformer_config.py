@@ -494,7 +494,7 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "mhc": recompute HyperConnection intermediate activations via
-            CheckpointWithoutOutput + CheckpointManager. Requires
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
     "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
@@ -912,7 +912,7 @@ class TransformerConfig(ModelParallelConfig):
     layer in the transformer block) will:
     - NOT checkpoint its final MLP BDA
     - Register the unified recompute hook on its MLP BDA output
-    - A new CheckpointManager is created for subsequent layers
+    - A new CheckpointWithoutOutputManager is created for subsequent layers
     
     If None, all layers in the transformer block share a single recompute block.
 
@@ -1535,11 +1535,11 @@ class TransformerConfig(ModelParallelConfig):
                     "'mhc' is in recompute_modules."
                 )
             if self.fine_grained_activation_offloading:
-                raise ValueError(
-                    "'mhc' in recompute_modules is incompatible with "
-                    "fine_grained_activation_offloading. The mHC recompute hook fires "
-                    "before the offloading backward chunk is initialized, causing "
-                    "tensor_pop on a None chunk. Disable one of them."
+                raise NotImplementedError(
+                    "'mhc' in recompute_modules + fine_grained_activation_offloading is "
+                    "not yet supported. The mHC recompute hook currently fires before "
+                    "the offloading backward chunk is initialized, causing tensor_pop "
+                    "on a None chunk. Disable one of them."
                 )
 
         if self.enable_hyper_connections and not (

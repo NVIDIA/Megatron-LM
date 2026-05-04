@@ -751,19 +751,19 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-class CheckpointManager:
+class CheckpointWithoutOutputManager:
     """
-    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock
-    cross layer recomputations, enabling unified recomputation during backward pass.
+    Coordinates activation recomputation across multiple CheckpointWithoutOutput instances
+    within a TransformerBlock, enabling unified recomputation during backward pass.
     This is particularly useful for scenarios where multiple checkpoint operations have
     sequential dependencies (i.e., the output of one checkpoint is the input of the next).
 
     Usage:
-        ckptManager = CheckpointManager()
-        ckpt_function = CheckpointWithoutOutput(ckpt_manager=ckptManager)
+        manager = CheckpointWithoutOutputManager()
+        ckpt_function = CheckpointWithoutOutput(ckpt_manager=manager)
         ckpt_function.checkpoint(run_function, *args)
         # other checkpointed operations
-        ckpt_manager.discard_all_outputs_and_register_unified_recompute(final_output)
+        manager.discard_all_outputs_and_register_unified_recompute(final_output)
     """
 
     def __init__(self):
@@ -817,7 +817,7 @@ class CheckpointWithoutOutput(object):
 
         Args:
             fp8: Whether to use FP8 mode. Defaults to False.
-            ckpt_manager: Optional CheckpointManager instance. When provided,
+            ckpt_manager: Optional CheckpointWithoutOutputManager instance. When provided,
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
