@@ -67,6 +67,16 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
     default=False,
     help="To enable lightweight mode",
 )
+@click.option(
+    "--cadence",
+    required=False,
+    type=str,
+    default=None,
+    help=(
+        "Trigger cadence to filter tests by (pr|nightly|mergegroup). "
+        "Empty/unset disables the cadence filter."
+    ),
+)
 def main(
     scope,
     model,
@@ -79,7 +89,10 @@ def main(
     hf_home: Optional[str] = None,
     tag: Optional[str] = None,
     enable_lightweight_mode: Optional[bool] = False,
+    cadence: Optional[str] = None,
 ):
+    cadence_arg = cadence or None
+
     workloads = recipe_parser.load_workloads(
         container_image="none",
         scope=scope,
@@ -89,6 +102,7 @@ def main(
         container_tag="none",
         platform=platform,
         tag=tag,
+        cadence=cadence_arg,
     )
 
     workloads = [workload for workload in workloads if workload.type != "build"]
