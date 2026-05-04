@@ -3,7 +3,6 @@
 import asyncio
 import gc
 import math
-import os
 import random
 import types
 from dataclasses import dataclass, field
@@ -1386,6 +1385,238 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         self._run_async_eviction_boundary_e2e("hybrid", num_speculative_tokens=2)
 
     @pytest.mark.internal
+    def test_async_lifecycle_interaction_matrix(self) -> None:
+        """Pending forwards tolerate lifecycle removals but reject slipped-in adds."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                context_max_requests=4,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+
+        with torch.inference_mode():
+            context.paused_request_count = 0
+            context.total_request_count = 2
+            context.request_ids[:2] = torch.tensor([30, 10], device='cpu')
+            controller._async_pending_forward_request_ids = torch.tensor(
+                [10, 20, 30, 40], device='cpu'
+            )
+
+        usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+
+        assert usable
+        assert row_mapped
+        assert row_indices is not None
+        assert row_indices.cpu().tolist() == [2, 0]
+        assert controller._async_row_mapped_forward_count == 1
+        assert controller._async_discarded_forward_count == 0
+
+        with torch.inference_mode():
+            context.total_request_count = 2
+            context.request_ids[:2] = torch.tensor([10, 50], device='cpu')
+            controller._async_pending_forward_request_ids = torch.tensor(
+                [10, 20, 30, 40], device='cpu'
+            )
+
+        usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+
+        assert not usable
+        assert not row_mapped
+        assert row_indices is None
+        assert controller._async_discarded_forward_count == 1
+
+        with torch.inference_mode():
+            context.total_request_count = 0
+            controller._async_pending_forward_request_ids = torch.tensor(
+                [10, 20, 30, 40], device='cpu'
+            )
+
+        usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+
+        assert not usable
+        assert not row_mapped
+        assert row_indices is None
+        assert controller._async_discarded_forward_count == 2
+
+    def _run_lifecycle_interaction_schedule(
+        self,
+        model_provider: str,
+        num_speculative_tokens: int,
+        *,
+        enable_async_scheduling: bool,
+        memory_pressure: bool,
+    ) -> DynamicEngineTestEnv:
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+        block_size_tokens = 256
+        tokens_per_request = num_speculative_tokens + 1
+        boundary_prompt_length = block_size_tokens - tokens_per_request
+        max_generation = 12
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=block_size_tokens,
+                num_tokens_to_generate=max_generation,
+                num_gap_steps=0,
+                model_provider=model_provider,
+                num_speculative_tokens=num_speculative_tokens,
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                context_block_size_tokens=block_size_tokens,
+                termination_id=-1,
+                top_k=1,
+                enable_async_scheduling=enable_async_scheduling,
+            )
+        )
+        env.requests = [None] * 4
+        request_specs = {
+            0: [(0, 4, 12), (1, boundary_prompt_length, 12)],
+            2: [(2, 4, 5)],
+            4: [(3, boundary_prompt_length, 7)],
+        }
+        added_count = 0
+        pressure_applied = False
+        eviction_forced = False
+
+        def add_request(request_id: int, prompt_length: int, output_length: int) -> None:
+            prompt = (
+                torch.arange(prompt_length, dtype=torch.int64, device='cuda')
+                % DynamicEngineTestConfig.vocab_size
+            )
+            request = DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=prompt,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=output_length, termination_id=-1, top_k=1
+                ),
+            )
+            env.requests[request_id] = request
+            env.engine._add_request(request)
+            request.state = "pending"
+
+        with torch.inference_mode():
+            for step_idx in range(80):
+                for request_id, prompt_length, output_length in request_specs.get(step_idx, []):
+                    add_request(request_id, prompt_length, output_length)
+                    added_count += 1
+
+                if added_count == len(env.requests) and not env.engine.has_unfinished_requests():
+                    break
+
+                self._run_step(env)
+
+                if memory_pressure and not pressure_applied and step_idx == 0:
+                    env.engine.context.kv_block_allocator.total_avail = 0
+                    pressure_applied = True
+
+                if (
+                    memory_pressure
+                    and pressure_applied
+                    and not eviction_forced
+                    and env.engine.context.paused_request_count > 0
+                ):
+                    env.engine.context.kv_block_allocator.paused_count = 0
+                    eviction_forced = True
+            else:
+                raise AssertionError("lifecycle interaction schedule did not finish")
+
+        assert added_count == len(env.requests)
+        assert [request.status for request in env.requests] == [Status.COMPLETED] * 4
+        if memory_pressure:
+            assert pressure_applied
+            assert eviction_forced
+            assert env.engine.evicted_request_count > 0
+        return env
+
+    def _assert_lifecycle_interaction_parity(
+        self, model_provider: str, num_speculative_tokens: int, *, memory_pressure: bool
+    ) -> None:
+        serial_env = self._run_lifecycle_interaction_schedule(
+            model_provider,
+            num_speculative_tokens,
+            enable_async_scheduling=False,
+            memory_pressure=memory_pressure,
+        )
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._run_lifecycle_interaction_schedule(
+            model_provider,
+            num_speculative_tokens,
+            enable_async_scheduling=True,
+            memory_pressure=memory_pressure,
+        )
+        async_tokens = [request.generated_tokens for request in async_env.requests]
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_add_deferral_count > 0
+        assert controller._async_finish_boundary_count + controller._async_mtp_finish_boundary_count > 0
+        if memory_pressure:
+            assert controller._async_pause_boundary_count > 0
+            assert controller._async_evict_boundary_count > 0
+        assert async_tokens == serial_tokens, (
+            f"serial={serial_tokens}, async={async_tokens}, "
+            f"add_deferrals={controller._async_add_deferral_count}, "
+            f"row_maps={controller._async_row_mapped_forward_count}, "
+            f"finishes={controller._async_finish_boundary_count}, "
+            f"mtp_finishes={controller._async_mtp_finish_boundary_count}, "
+            f"discarded={controller._async_discarded_forward_count}, "
+            f"disable={controller._async_disable_reason}"
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_lifecycle_interactions_gpt_cuda_graph_e2e(self) -> None:
+        """GPT async output matches serial across staggered adds and finishes."""
+        self._assert_lifecycle_interaction_parity(
+            "gpt", num_speculative_tokens=0, memory_pressure=False
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_lifecycle_interactions_hybrid_mtp_cuda_graph_e2e(self) -> None:
+        """Hybrid MTP async output matches serial across staggered adds and finishes."""
+        self._assert_lifecycle_interaction_parity(
+            "hybrid", num_speculative_tokens=2, memory_pressure=False
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_lifecycle_memory_pressure_gpt_cuda_graph_e2e(self) -> None:
+        """GPT async output matches serial through pause and eviction pressure."""
+        self._assert_lifecycle_interaction_parity(
+            "gpt", num_speculative_tokens=0, memory_pressure=True
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_lifecycle_memory_pressure_hybrid_mtp_cuda_graph_e2e(self) -> None:
+        """Hybrid MTP async output matches serial through pause and eviction pressure."""
+        self._assert_lifecycle_interaction_parity(
+            "hybrid", num_speculative_tokens=2, memory_pressure=True
+        )
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -1627,6 +1858,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert list(engine.waiting_request_ids) == [1]
         assert engine.context.total_request_count == 1
         assert controller._async_add_deferral_count == 1
+        assert controller._async_admission_barrier_requested
 
         monkeypatch.setattr(controller, "has_pending_async_forward", lambda: False)
         assert not engine._defer_waiting_request_admission_for_async()

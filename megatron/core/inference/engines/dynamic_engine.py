@@ -1505,7 +1505,7 @@ class DynamicInferenceEngine(AbstractEngine):
             return False
         if not self.controller.has_pending_async_forward():
             return False
-        self.controller._async_add_deferral_count += 1
+        self.controller.request_async_admission_barrier()
         return True
 
     def schedule_non_chunked_prefill(self):

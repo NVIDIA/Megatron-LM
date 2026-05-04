@@ -199,6 +199,7 @@ class TextGenerationController:
         self._async_pending_h2d_done_event = None
         self._async_pending_sample_cuda_graph_request_count = None
         self._async_pending_forward_request_ids = None
+        self._async_admission_barrier_requested = False
         self._async_row_mapped_forward_count = 0
         self._async_discarded_forward_count = 0
         self._async_add_deferral_count = 0
@@ -1207,6 +1208,7 @@ class TextGenerationController:
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
         required_logit_indices = context.speculative_required_logit_indices()
+        pending_forward_logit_indices = required_logit_indices
 
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.
@@ -1218,6 +1220,14 @@ class TextGenerationController:
                     .index_select(0, row_indices)
                     .reshape(-1, self.vocab_size)
                 )
+                pending_forward_logit_indices = (
+                    row_indices.to(required_logit_indices.dtype).unsqueeze(1) * stride
+                    + torch.arange(
+                        stride,
+                        device=row_indices.device,
+                        dtype=required_logit_indices.dtype,
+                    ).unsqueeze(0)
+                ).reshape(-1)
         else:
             assert row_indices is None, "row-mapped MTP async reuse requires last-token logits"
             required_logits = logits.squeeze(0)[
@@ -1237,7 +1247,8 @@ class TextGenerationController:
 
         # Verify speculative tokens against input tokens.
         nvtx_range_push("mtp-spec-decoding/verify/verify-tokens")
-        input_tokens_required = input_ids[0, required_logit_indices]
+        sampled_token_count = output_tokens.shape[0]
+        input_tokens_required = input_ids[0, required_logit_indices[:sampled_token_count]]
         last_one_indices, accepted_tokens_mask, input_tokens_required = (
             self._verify_speculative_tokens(
                 output_tokens,
@@ -1253,7 +1264,7 @@ class TextGenerationController:
         self._prepare_speculative_tokens_for_next_forward_pass(
             num_decode_requests,
             output_tokens,
-            required_logit_indices,
+            pending_forward_logit_indices[:sampled_token_count],
             last_one_indices,
             accepted_tokens_mask,
             input_tokens_required,
@@ -1337,6 +1348,11 @@ class TextGenerationController:
     def has_pending_async_forward(self) -> bool:
         """Whether a speculative async forward has already been launched for the next step."""
         return self._async_pending_forward
+
+    def request_async_admission_barrier(self) -> None:
+        """Stop chaining async forwards once so waiting requests can be admitted."""
+        self._async_add_deferral_count += 1
+        self._async_admission_barrier_requested = True
 
     def _active_request_ids_cpu(self) -> Tensor:
         """Return the current active request IDs in row order."""
@@ -1783,6 +1799,9 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         if active_request_count <= 0:
             return "no active requests"
+        if self._async_admission_barrier_requested:
+            self._async_admission_barrier_requested = False
+            return "waiting request admission deferred"
 
         if self._has_active_stop_words_callback is not None:
             active_request_ids = context.request_ids[
@@ -2622,6 +2641,8 @@ class TextGenerationController:
                 )
                 async_next_prepared = self._try_prepare_async_decode_after_sampling()
             elif self.num_speculative_tokens > 0:
+                if pending_forward_reused:
+                    self._dynamic_step_sample_bookkeeping()
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
                 self._dynamic_step_sample_logits_and_verify_tokens(
