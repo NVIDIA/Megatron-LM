@@ -368,7 +368,7 @@ def _moe_align_block_size_cuda_graphable(
     )
 
     tokens_per_expert = compute_local_tokens_per_expert(
-        routing_map, local_expert_start, num_local_experts, valid_tokens
+        routing_map, local_expert_start, num_local_experts, valid_tokens, persistent=True
     )
     exclusive_offsets, inclusive_offsets = compute_expert_offsets(
         tokens_per_expert, alignment=block_size

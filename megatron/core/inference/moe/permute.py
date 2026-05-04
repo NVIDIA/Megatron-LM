@@ -51,6 +51,36 @@ def _count_local_tokens_kernel(
     topk,  # number of expert choices per token
     local_expert_start,  # first global expert index owned by this rank
     num_local_experts: tl.constexpr,  # number of experts on this rank
+    BLOCK_SIZE: tl.constexpr,  # number of pairs processed per program
+):
+    """Count tokens routed to experts on this rank, ignoring tokens routed elsewhere.
+
+    Each program processes BLOCK_SIZE (token, topk) pairs. Tokens assigned to
+    experts outside [local_expert_start, local_expert_start + num_local_experts)
+    or beyond valid_tokens are silently skipped.
+
+    Grid is launched at max size (max_tokens * topk); valid_tokens gates which
+    pairs are actually processed — required for CUDA graph compatibility.
+    """
+    pid = tl.program_id(0)
+    valid_tokens = tl.load(valid_tokens_ptr)
+    valid_pairs = valid_tokens * topk
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < valid_pairs
+    expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
+    local_ids = expert_ids - local_expert_start
+    is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
+    tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
+
+
+@triton.jit
+def _count_local_tokens_kernel_persistent(
+    routing_map_ptr,  # [max_tokens, topk] flattened expert assignments
+    tokens_per_expert_ptr,  # [num_local_experts] output counters (zeroed by caller)
+    valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
+    topk,  # number of expert choices per token
+    local_expert_start,  # first global expert index owned by this rank
+    num_local_experts: tl.constexpr,  # number of experts on this rank
     num_sms,  # number of SMs (grid size for persistent kernel)
     BLOCK_SIZE: tl.constexpr,  # number of pairs processed per iteration
 ):
@@ -76,7 +106,6 @@ def _count_local_tokens_kernel(
             expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
             local_ids = expert_ids - local_expert_start
             is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
-            # TODO(ksanthanam): Explore using tl.histogram to reduce the number of atomic adds
             tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
 
 
@@ -85,6 +114,7 @@ def compute_local_tokens_per_expert(
     local_expert_start: int,
     num_local_experts: int,
     valid_tokens: torch.Tensor,
+    persistent: bool = False,
 ) -> torch.Tensor:
     """Count tokens routed to each local expert.
 
@@ -95,21 +125,34 @@ def compute_local_tokens_per_expert(
         num_local_experts: number of experts on this rank.
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens
             this iteration. Fixed address; value updated each step before graph replay.
+        persistent: use persistent-grid kernel variant (fewer CTAs, looped).
     """
+    max_pairs = routing_map.numel()
     topk = routing_map.shape[1]
     tokens_per_expert = torch.zeros(num_local_experts, dtype=torch.int32, device=routing_map.device)
     BLOCK = 1024
-    num_sms = _get_num_sms(routing_map.device)
-    _count_local_tokens_kernel[(num_sms,)](
-        routing_map,
-        tokens_per_expert,
-        valid_tokens,
-        topk,
-        local_expert_start,
-        num_local_experts,
-        num_sms,
-        BLOCK_SIZE=BLOCK,
-    )
+    if persistent:
+        num_sms = _get_num_sms(routing_map.device)
+        _count_local_tokens_kernel_persistent[(num_sms,)](
+            routing_map,
+            tokens_per_expert,
+            valid_tokens,
+            topk,
+            local_expert_start,
+            num_local_experts,
+            num_sms,
+            BLOCK_SIZE=BLOCK,
+        )
+    else:
+        _count_local_tokens_kernel[(_ceil_div(max_pairs, BLOCK),)](
+            routing_map,
+            tokens_per_expert,
+            valid_tokens,
+            topk,
+            local_expert_start,
+            num_local_experts,
+            BLOCK_SIZE=BLOCK,
+        )
     return tokens_per_expert
 
 
