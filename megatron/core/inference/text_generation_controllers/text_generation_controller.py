@@ -5,6 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
@@ -39,7 +40,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
-from megatron.core.transformer.utils import set_model_to_sequence_parallel
+from megatron.core.transformer.utils import set_model_to_sequence_parallel, toggle_cuda_graphs
 from megatron.core.utils import (
     accepts_parameter,
     get_asyncio_loop,
@@ -66,6 +67,16 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
+
+
+@dataclass
+class _AsyncDecodeGraph:
+    """Captured sample/bookkeeping/forward graph for one decode CUDA graph shape."""
+
+    batch_dimensions: InferenceBatchDimensions
+    graph: torch.cuda.CUDAGraph
+    sample_ready_event: torch.cuda.Event
+    h2d_done_event: torch.cuda.Event
 
 
 # pylint: disable=line-too-long
@@ -166,6 +177,9 @@ class TextGenerationController:
         self._async_pending_cuda_graph_request_count = None
         self._async_disable_reason = None
         self._async_forward_launch_count = 0
+        self._async_decode_graph_launch_count = 0
+        self._async_decode_graph_capture_failed_reason = None
+        self._async_decode_graphs: Dict[InferenceBatchDimensions, _AsyncDecodeGraph] = {}
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -1237,13 +1251,19 @@ class TextGenerationController:
             self._all_logits_cuda[:, : context.padded_active_token_count, :]
         )
 
-    def _dynamic_step_sample_logits_greedy_to_next_input_ids(self) -> None:
+    def _dynamic_step_sample_logits_greedy_to_next_input_ids(
+        self, sample_count: Optional[int] = None
+    ) -> None:
         """Greedy-sample logits and write sampled ids directly into next-step GPU inputs."""
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if sample_count is None
+            else sample_count
+        )
         required_token_logits = self._dynamic_step_required_token_logits()
         torch.max(
-            required_token_logits,
+            required_token_logits[:active_request_count],
             dim=-1,
             out=(
                 self._async_sample_values_cuda[:active_request_count],
@@ -1255,18 +1275,118 @@ class TextGenerationController:
         )
 
     def _async_transfer_samples_to_cpu(
-        self, active_request_count: int
+        self,
+        active_request_count: int,
+        sample_source_ready_event: Optional[torch.cuda.Event] = None,
     ) -> Tuple[Tensor, torch.cuda.Event]:
         """Copy sampled tokens to pinned CPU memory without blocking the default stream."""
-        current_stream = torch.cuda.current_stream()
-        self._async_sample_source_ready_event.record(current_stream)
+        if sample_source_ready_event is None:
+            current_stream = torch.cuda.current_stream()
+            sample_source_ready_event = self._async_sample_source_ready_event
+            sample_source_ready_event.record(current_stream)
         with torch.cuda.stream(self._async_copy_stream):
-            self._async_copy_stream.wait_event(self._async_sample_source_ready_event)
+            self._async_copy_stream.wait_event(sample_source_ready_event)
             self._async_sampled_tokens_cpu[:active_request_count].copy_(
                 self._sampled_tokens_cuda[:active_request_count], non_blocking=True
             )
             self._async_sample_ready_event.record(self._async_copy_stream)
         return self._async_sampled_tokens_cpu[:active_request_count], self._async_sample_ready_event
+
+    def capture_async_decode_graphs(self) -> None:
+        """Capture async decode graphs that fuse greedy sampling, H2D metadata, and forward."""
+        context = self.inference_wrapped_model.inference_context
+        if (
+            not self._async_scheduling_enabled
+            or not self._enable_cuda_graph
+            or CudaGraphScope.full_iteration_inference not in self.model_config.cuda_graph_scope
+        ):
+            return
+
+        self._async_decode_graphs.clear()
+        self._async_decode_graph_capture_failed_reason = None
+        model = self.inference_wrapped_model.model
+        toggle_cuda_graphs(model, set_to="none")
+        try:
+            for batch_dimensions in context.cuda_graph_batch_dimensions_list:
+                if (
+                    batch_dimensions.prefill_req_count != 0
+                    or batch_dimensions.token_count != batch_dimensions.decode_req_count
+                ):
+                    continue
+                self._capture_async_decode_graph(batch_dimensions)
+        except RuntimeError as exc:
+            self._async_decode_graphs.clear()
+            self._async_decode_graph_capture_failed_reason = str(exc)
+        finally:
+            toggle_cuda_graphs(model, set_to="local")
+            context.reset()
+            torch.cuda.synchronize()
+
+    def _capture_async_decode_graph(
+        self, batch_dimensions: InferenceBatchDimensions
+    ) -> None:
+        """Capture one async decode graph for a decode-only CUDA graph batch dimension."""
+        context = self.inference_wrapped_model.inference_context
+        context.reset()
+
+        input_ids, position_ids = self._dynamic_step_context_init(
+            construct_graph_dimensions=batch_dimensions
+        )
+
+        with torch.inference_mode():
+            # Warm eager forward once so capture does not include one-time allocations.
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+
+            if not context.prepare_async_decode_next_step():
+                raise RuntimeError(f"failed to prepare async decode graph {batch_dimensions}")
+
+            next_input_ids, next_position_ids = context.current_input_and_position_ids()
+            sample_count = batch_dimensions.decode_req_count
+
+            for _ in range(3):
+                self._dynamic_step_sample_logits_greedy_to_next_input_ids(sample_count)
+                context.transfer_bookkeeping_to_gpu(
+                    include_token_to_input_ids=False,
+                    refresh_request_staging=False,
+                )
+                self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            sample_ready_event = torch.cuda.Event(external=True)
+            h2d_done_event = torch.cuda.Event(external=True)
+            with torch.cuda.graph(graph):
+                self._dynamic_step_sample_logits_greedy_to_next_input_ids(sample_count)
+                sample_ready_event.record(torch.cuda.current_stream())
+                context.transfer_bookkeeping_to_gpu(
+                    include_token_to_input_ids=False,
+                    refresh_request_staging=False,
+                )
+                h2d_done_event.record(torch.cuda.current_stream())
+                self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+
+        self._async_decode_graphs[batch_dimensions] = _AsyncDecodeGraph(
+            batch_dimensions=batch_dimensions,
+            graph=graph,
+            sample_ready_event=sample_ready_event,
+            h2d_done_event=h2d_done_event,
+        )
+
+    def _get_async_decode_graph(self) -> Optional[_AsyncDecodeGraph]:
+        """Return the captured async decode graph for the current padded decode shape."""
+        context = self.inference_wrapped_model.inference_context
+        return self._async_decode_graphs.get(context.padded_batch_dimensions)
+
+    def _launch_async_decode_graph(self, async_decode_graph: _AsyncDecodeGraph) -> None:
+        """Enqueue a captured async decode graph on the current stream."""
+        async_decode_graph.graph.replay()
+        self._async_forward_launch_count += 1
+        self._async_decode_graph_launch_count += 1
+        self._async_pending_forward = True
+        self._async_pending_cuda_graph_request_count = (
+            self.inference_wrapped_model.inference_context.padded_active_request_count
+        )
 
     def _async_scheduling_disabled_reason(self) -> Optional[str]:
         """Return why async scheduling cannot be used for the current step, or None."""
@@ -2012,6 +2132,7 @@ class TextGenerationController:
         async_sample_ready_event = None
         async_h2d_done_event = None
         async_sampled_tokens_cpu = None
+        async_decode_graph = None
         input_ids = None
 
         with torch.inference_mode():
@@ -2060,6 +2181,19 @@ class TextGenerationController:
                 range_pop()
                 if not async_next_prepared:
                     self._async_disable_reason = "failed to prepare next-step metadata"
+                else:
+                    async_decode_graph = self._get_async_decode_graph()
+                    if async_decode_graph is not None:
+                        range_push("async_decode_graph_launch")
+                        self._launch_async_decode_graph(async_decode_graph)
+                        range_pop()
+                        async_sampled_tokens_cpu, async_sample_ready_event = (
+                            self._async_transfer_samples_to_cpu(
+                                active_request_count,
+                                async_decode_graph.sample_ready_event,
+                            )
+                        )
+                        async_h2d_done_event = async_decode_graph.h2d_done_event
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -2082,7 +2216,8 @@ class TextGenerationController:
                 self._dynamic_step_sample_bookkeeping()
 
             if async_next_prepared:
-                self._dynamic_step_sample_logits_greedy_to_next_input_ids()
+                if async_decode_graph is None:
+                    self._dynamic_step_sample_logits_greedy_to_next_input_ids()
             elif self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
@@ -2110,7 +2245,7 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
-            if async_next_prepared:
+            if async_next_prepared and async_decode_graph is None:
                 async_sampled_tokens_cpu, async_sample_ready_event = (
                     self._async_transfer_samples_to_cpu(active_request_count)
                 )
@@ -2156,9 +2291,13 @@ class TextGenerationController:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
                 # downstream consumers.
-                request_bookkeeping = {
-                    "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
-                }
+                if async_sampled_tokens_cpu is not None and async_sample_ready_event is not None:
+                    async_sample_ready_event.synchronize()
+                    request_bookkeeping = {"sample": async_sampled_tokens_cpu}
+                else:
+                    request_bookkeeping = {
+                        "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
+                    }
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.

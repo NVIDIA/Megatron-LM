@@ -426,6 +426,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
+        controller.capture_async_decode_graphs()
+
         # Memory usage.
         time_end = time.time()
         mem_stats_end = torch.cuda.memory_stats()
