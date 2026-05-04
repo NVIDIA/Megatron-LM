@@ -297,7 +297,7 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
-    sampling_backend: Literal['torch', 'flashinfer'] = 'flashinfer'
+    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None

@@ -2005,7 +2005,7 @@ def _add_inference_args(parser):
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
-                       type=str, default='flashinfer',
+                       type=str, default='torch',
                        choices=['torch', 'flashinfer'],
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
