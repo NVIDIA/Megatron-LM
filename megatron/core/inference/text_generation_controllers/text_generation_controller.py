@@ -74,9 +74,9 @@ class _AsyncDecodeGraph:
     """Captured sample/bookkeeping/forward graph for one decode CUDA graph shape."""
 
     batch_dimensions: InferenceBatchDimensions
-    graph: torch.cuda.CUDAGraph
-    sample_ready_event: torch.cuda.Event
-    h2d_done_event: torch.cuda.Event
+    graphs: Tuple[torch.cuda.CUDAGraph, ...]
+    sample_ready_events: Tuple[torch.cuda.Event, ...]
+    h2d_done_events: Tuple[torch.cuda.Event, ...]
 
 
 # pylint: disable=line-too-long
@@ -186,7 +186,13 @@ class TextGenerationController:
         self._async_pending_sample_ready_event = None
         self._async_pending_h2d_done_event = None
         self._async_pending_sample_cuda_graph_request_count = None
-        self._async_last_sample_copy_done_event = None
+        self._async_sample_slot_count = 2
+        self._async_current_sample_slot = 0
+        self._async_next_sample_slot = 0
+        self._async_sample_slot_copy_pending = [False] * self._async_sample_slot_count
+        self._async_sample_slot_launch_counts = [0] * self._async_sample_slot_count
+        self._async_sample_slot_copy_counts = [0] * self._async_sample_slot_count
+        self._async_sample_slot_wait_count = 0
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -195,24 +201,31 @@ class TextGenerationController:
             )
         else:
             self._all_logits_cuda = None
-        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
-        self._async_sample_values_cuda = torch.empty(
-            max_requests, dtype=logits_dtype, device=device
+        self._sampled_tokens_cuda_slots = torch.empty(
+            (self._async_sample_slot_count, max_requests), dtype=torch.int64, device=device
         )
-        self._async_sampled_tokens_cpu = torch.empty(
-            max_requests, dtype=torch.int64, device='cpu', pin_memory=True
+        self._async_sample_values_cuda_slots = torch.empty(
+            (self._async_sample_slot_count, max_requests), dtype=logits_dtype, device=device
         )
-        if self.num_speculative_tokens > 0:
-            self._async_sampled_mtp_tokens_cpu = torch.empty(
-                [self.num_speculative_tokens, max_requests],
-                dtype=torch.int64,
-                device='cpu',
-                pin_memory=True,
-            )
-        else:
-            self._async_sampled_mtp_tokens_cpu = None
-        self._async_sample_source_ready_event = torch.cuda.Event()
-        self._async_sample_ready_event = torch.cuda.Event()
+        self._async_sampled_tokens_cpu_slots = torch.empty(
+            (self._async_sample_slot_count, max_requests),
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        )
+        self._sampled_mtp_tokens_cuda_slots = None
+        self._async_sampled_mtp_tokens_cpu_slots = None
+        self._sampled_tokens_cuda = self._sampled_tokens_cuda_slots[0]
+        self._async_sample_values_cuda = self._async_sample_values_cuda_slots[0]
+        self._async_sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[0]
+        self._async_sample_source_ready_events = tuple(
+            torch.cuda.Event() for _ in range(self._async_sample_slot_count)
+        )
+        self._async_sample_ready_events = tuple(
+            torch.cuda.Event() for _ in range(self._async_sample_slot_count)
+        )
+        self._async_sample_source_ready_event = self._async_sample_source_ready_events[0]
+        self._async_sample_ready_event = self._async_sample_ready_events[0]
         self._async_copy_stream = torch.cuda.Stream(device=device)
 
         # Used for inefficient torch sampling.
@@ -226,6 +239,7 @@ class TextGenerationController:
         self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
 
         self._init_mtp_sampling_tensors()
+        self._select_async_sample_slot(0)
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -234,6 +248,7 @@ class TextGenerationController:
         """
         if not self.num_speculative_tokens:
             self._sampled_mtp_tokens_cuda = None
+            self._async_sampled_mtp_tokens_cpu = None
             self._accepted_tokens_per_request = None
             self._last_accepted_seq_indices = None
             return
@@ -241,9 +256,19 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
         device = torch.cuda.current_device()
-        self._sampled_mtp_tokens_cuda = torch.empty(
-            [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
+        self._sampled_mtp_tokens_cuda_slots = torch.empty(
+            [self._async_sample_slot_count, self.num_speculative_tokens, max_requests],
+            dtype=torch.int64,
+            device=device,
         )
+        self._async_sampled_mtp_tokens_cpu_slots = torch.empty(
+            [self._async_sample_slot_count, self.num_speculative_tokens, max_requests],
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        )
+        self._sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda_slots[0]
+        self._async_sampled_mtp_tokens_cpu = self._async_sampled_mtp_tokens_cpu_slots[0]
         self._accepted_tokens_per_request = (
             torch.ones(
                 [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
@@ -262,6 +287,27 @@ class TextGenerationController:
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
         )
+
+    def _select_async_sample_slot(self, sample_slot: int) -> None:
+        """Select the sampled-token buffers used by subsequent GPU sampling operations."""
+        self._async_current_sample_slot = sample_slot
+        self._sampled_tokens_cuda = self._sampled_tokens_cuda_slots[sample_slot]
+        self._async_sample_values_cuda = self._async_sample_values_cuda_slots[sample_slot]
+        self._async_sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[sample_slot]
+        self._async_sample_source_ready_event = self._async_sample_source_ready_events[sample_slot]
+        self._async_sample_ready_event = self._async_sample_ready_events[sample_slot]
+        if self.num_speculative_tokens > 0:
+            self._sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda_slots[sample_slot]
+            self._async_sampled_mtp_tokens_cpu = self._async_sampled_mtp_tokens_cpu_slots[
+                sample_slot
+            ]
+
+    def _mark_async_sample_copy_consumed(self, sample_ready_event: torch.cuda.Event) -> None:
+        """Mark the GPU sample slot guarded by this D2H event as reusable."""
+        for sample_slot, ready_event in enumerate(self._async_sample_ready_events):
+            if sample_ready_event is ready_event:
+                self._async_sample_slot_copy_pending[sample_slot] = False
+                return
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -1320,33 +1366,41 @@ class TextGenerationController:
         self,
         active_request_count: int,
         sample_source_ready_event: Optional[torch.cuda.Event] = None,
+        sample_slot: Optional[int] = None,
     ) -> Tuple[Tensor, Optional[Tensor], torch.cuda.Event]:
         """Copy sampled tokens to pinned CPU memory without blocking the default stream."""
+        sample_slot = self._async_current_sample_slot if sample_slot is None else sample_slot
+        sampled_tokens_cuda = self._sampled_tokens_cuda_slots[sample_slot]
+        sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[sample_slot]
         if sample_source_ready_event is None:
             current_stream = torch.cuda.current_stream()
-            sample_source_ready_event = self._async_sample_source_ready_event
+            sample_source_ready_event = self._async_sample_source_ready_events[sample_slot]
             sample_source_ready_event.record(current_stream)
+        sample_ready_event = self._async_sample_ready_events[sample_slot]
         with torch.cuda.stream(self._async_copy_stream):
             self._async_copy_stream.wait_event(sample_source_ready_event)
-            self._async_sampled_tokens_cpu[:active_request_count].copy_(
-                self._sampled_tokens_cuda[:active_request_count], non_blocking=True
+            sampled_tokens_cpu[:active_request_count].copy_(
+                sampled_tokens_cuda[:active_request_count], non_blocking=True
             )
             if self.num_speculative_tokens > 0:
-                self._async_sampled_mtp_tokens_cpu[:, :active_request_count].copy_(
-                    self._sampled_mtp_tokens_cuda[:, :active_request_count],
+                self._async_sampled_mtp_tokens_cpu_slots[
+                    sample_slot, :, :active_request_count
+                ].copy_(
+                    self._sampled_mtp_tokens_cuda_slots[sample_slot, :, :active_request_count],
                     non_blocking=True,
                 )
-            self._async_sample_ready_event.record(self._async_copy_stream)
-        self._async_last_sample_copy_done_event = self._async_sample_ready_event
+            sample_ready_event.record(self._async_copy_stream)
+        self._async_sample_slot_copy_pending[sample_slot] = True
+        self._async_sample_slot_copy_counts[sample_slot] += 1
         sampled_mtp_tokens_cpu = (
-            self._async_sampled_mtp_tokens_cpu[:, :active_request_count]
+            self._async_sampled_mtp_tokens_cpu_slots[sample_slot, :, :active_request_count]
             if self.num_speculative_tokens > 0
             else None
         )
         return (
-            self._async_sampled_tokens_cpu[:active_request_count],
+            sampled_tokens_cpu[:active_request_count],
             sampled_mtp_tokens_cpu,
-            self._async_sample_ready_event,
+            sample_ready_event,
         )
 
     def capture_async_decode_graphs(self) -> None:
@@ -1376,6 +1430,9 @@ class TextGenerationController:
             self._async_decode_graph_capture_failed_reason = str(exc)
         finally:
             toggle_cuda_graphs(model, set_to="local")
+            self._select_async_sample_slot(0)
+            self._async_next_sample_slot = 0
+            self._async_sample_slot_copy_pending = [False] * self._async_sample_slot_count
             context.reset()
             torch.cuda.synchronize()
 
@@ -1400,52 +1457,68 @@ class TextGenerationController:
             next_input_ids, next_position_ids = context.current_input_and_position_ids()
             sample_count = batch_dimensions.decode_req_count
 
-            for _ in range(3):
-                self._dynamic_step_sample_logits_greedy_to_next_input_ids(sample_count)
-                context.transfer_bookkeeping_to_gpu(
-                    include_token_to_input_ids=False,
-                    refresh_request_staging=False,
-                )
-                self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+            graphs = []
+            sample_ready_events = []
+            h2d_done_events = []
+            for sample_slot in range(self._async_sample_slot_count):
+                self._select_async_sample_slot(sample_slot)
+                for _ in range(3):
+                    self._dynamic_step_sample_logits_greedy_to_next_input_ids(sample_count)
+                    context.transfer_bookkeeping_to_gpu(
+                        include_token_to_input_ids=False,
+                        refresh_request_staging=False,
+                    )
+                    self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
 
-            torch.cuda.synchronize()
+                torch.cuda.synchronize()
 
-            graph = torch.cuda.CUDAGraph()
-            sample_ready_event = torch.cuda.Event(external=True)
-            h2d_done_event = torch.cuda.Event(external=True)
-            with torch.cuda.graph(graph):
-                self._dynamic_step_sample_logits_greedy_to_next_input_ids(sample_count)
-                sample_ready_event.record(torch.cuda.current_stream())
-                context.transfer_bookkeeping_to_gpu(
-                    include_token_to_input_ids=False,
-                    refresh_request_staging=False,
-                )
-                h2d_done_event.record(torch.cuda.current_stream())
-                self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+                graph = torch.cuda.CUDAGraph()
+                sample_ready_event = torch.cuda.Event(external=True)
+                h2d_done_event = torch.cuda.Event(external=True)
+                with torch.cuda.graph(graph):
+                    self._dynamic_step_sample_logits_greedy_to_next_input_ids(sample_count)
+                    sample_ready_event.record(torch.cuda.current_stream())
+                    context.transfer_bookkeeping_to_gpu(
+                        include_token_to_input_ids=False,
+                        refresh_request_staging=False,
+                    )
+                    h2d_done_event.record(torch.cuda.current_stream())
+                    self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+                graphs.append(graph)
+                sample_ready_events.append(sample_ready_event)
+                h2d_done_events.append(h2d_done_event)
 
         self._async_decode_graphs[batch_dimensions] = _AsyncDecodeGraph(
             batch_dimensions=batch_dimensions,
-            graph=graph,
-            sample_ready_event=sample_ready_event,
-            h2d_done_event=h2d_done_event,
+            graphs=tuple(graphs),
+            sample_ready_events=tuple(sample_ready_events),
+            h2d_done_events=tuple(h2d_done_events),
         )
+        self._select_async_sample_slot(0)
 
     def _get_async_decode_graph(self) -> Optional[_AsyncDecodeGraph]:
         """Return the captured async decode graph for the current padded decode shape."""
         context = self.inference_wrapped_model.inference_context
         return self._async_decode_graphs.get(context.padded_batch_dimensions)
 
-    def _launch_async_decode_graph(self, async_decode_graph: _AsyncDecodeGraph) -> None:
+    def _launch_async_decode_graph(self, async_decode_graph: _AsyncDecodeGraph) -> int:
         """Enqueue a captured async decode graph on the current stream."""
-        if self._async_last_sample_copy_done_event is not None:
-            torch.cuda.current_stream().wait_event(self._async_last_sample_copy_done_event)
-        async_decode_graph.graph.replay()
+        sample_slot = self._async_next_sample_slot
+        if self._async_sample_slot_copy_pending[sample_slot]:
+            torch.cuda.current_stream().wait_event(self._async_sample_ready_events[sample_slot])
+            self._async_sample_slot_copy_pending[sample_slot] = False
+            self._async_sample_slot_wait_count += 1
+        self._select_async_sample_slot(sample_slot)
+        async_decode_graph.graphs[sample_slot].replay()
+        self._async_next_sample_slot = (sample_slot + 1) % self._async_sample_slot_count
+        self._async_sample_slot_launch_counts[sample_slot] += 1
         self._async_forward_launch_count += 1
         self._async_decode_graph_launch_count += 1
         self._async_pending_forward = True
         self._async_pending_cuda_graph_request_count = (
             self.inference_wrapped_model.inference_context.padded_active_request_count
         )
+        return sample_slot
 
     def _try_launch_async_decode_graph(
         self, active_request_count: int
@@ -1476,21 +1549,23 @@ class TextGenerationController:
             return True, None, None, None, None, False
 
         range_push("async_decode_graph_launch")
-        self._launch_async_decode_graph(async_decode_graph)
+        sample_slot = self._launch_async_decode_graph(async_decode_graph)
         range_pop()
         (
             async_sampled_tokens_cpu,
             async_sampled_mtp_tokens_cpu,
             async_sample_ready_event,
         ) = self._async_transfer_samples_to_cpu(
-            active_request_count, async_decode_graph.sample_ready_event
+            active_request_count,
+            async_decode_graph.sample_ready_events[sample_slot],
+            sample_slot=sample_slot,
         )
         return (
             True,
             async_sampled_tokens_cpu,
             async_sampled_mtp_tokens_cpu,
             async_sample_ready_event,
-            async_decode_graph.h2d_done_event,
+            async_decode_graph.h2d_done_events[sample_slot],
             True,
         )
 
@@ -2165,6 +2240,7 @@ class TextGenerationController:
         elif sample_ready_event is not None:
             range_push("transfer_samples_to_cpu")
             sample_ready_event.synchronize()
+            self._mark_async_sample_copy_consumed(sample_ready_event)
             range_pop()
 
         range_push("active_request_mask")
@@ -2445,6 +2521,7 @@ class TextGenerationController:
                 # downstream consumers.
                 if async_sampled_tokens_cpu is not None and async_sample_ready_event is not None:
                     async_sample_ready_event.synchronize()
+                    self._mark_async_sample_copy_consumed(async_sample_ready_event)
                     request_bookkeeping = {"sample": async_sampled_tokens_cpu}
                 else:
                     request_bookkeeping = {

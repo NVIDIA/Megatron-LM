@@ -727,6 +727,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert (
             async_env.engine.controller._async_chained_decode_graph_launch_count > 0
         ), async_env.engine.controller._async_disable_reason
+        assert (
+            sum(count > 0 for count in async_env.engine.controller._async_sample_slot_launch_counts)
+            > 1
+        )
         assert [request.generated_tokens for request in async_env.requests] == [
             request.generated_tokens for request in serial_env.requests
         ]
