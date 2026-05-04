@@ -1,11 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+
+from .prefix_cache_registry import PrefixCacheRegistry
 
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
@@ -42,10 +44,14 @@ class MambaSlotAllocator:
         ssm_states_shape: tuple,
         conv_states_dtype: torch.dtype,
         ssm_states_dtype: torch.dtype,
+        prefix_cache_registry: Optional[PrefixCacheRegistry] = None,
     ):
         self.context = context
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
+        self.registry = prefix_cache_registry
+        if self.registry is not None:
+            self.registry.set_mamba_evict_callback(self._on_mamba_evicted)
 
         gpu_device = torch.cuda.current_device()
         num_blocks = context.kv_block_allocator.total_count
@@ -70,8 +76,9 @@ class MambaSlotAllocator:
             device=gpu_device,
         )
 
-        # Hash-to-block mapping: only blocks with cached Mamba state
-        self.hash_to_block_id: Dict[int, int] = {}
+        # The host hash -> block_id dict for Mamba-cached blocks lives on
+        # ``self.registry.mamba_hash_to_block_id``. This allocator only
+        # owns the slot pool / mappings / state tensors.
 
         # Per-request intermediate state storage.
         # offsets_cpu and counts_cpu: CPU source of truth.  GPU copies are
@@ -213,15 +220,17 @@ class MambaSlotAllocator:
         slots = self.block_to_slot[evict_ids].tolist()
         hashes = kv_alloc.block_hashes[evict_ids].tolist()
 
-        # Batch cleanup GPU mappings
+        # Clear block <-> slot mappings up front. The registry's evict
+        # callback then runs ``_on_mamba_evicted -> _invalidate_blocks_batch``,
+        # which short-circuits because ``block_to_slot[bid] < 0`` for all
+        # evicted blocks — so the slots are NOT returned to the free pool
+        # (the caller takes ownership of them).
         self.block_to_slot[evict_ids] = -1
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=self.block_to_slot.device)
         self.slot_to_block[slot_tensor] = -1
 
-        # Clean up hash dict (CPU loop)
-        for h in hashes:
-            if h > 0 and h in self.hash_to_block_id:
-                del self.hash_to_block_id[h]
+        if self.registry is not None:
+            self.registry.evict_mamba(hashes)
 
         return slots
 
@@ -263,7 +272,7 @@ class MambaSlotAllocator:
         """Free cache slots and clear mappings for multiple blocks at once.
 
         Vectorized version of invalidate_block that avoids per-block .item()
-        GPU syncs. Used by on_kv_blocks_deregistered for bulk eviction.
+        GPU syncs. Used by ``_on_mamba_evicted`` for bulk slot release.
 
         Args:
             block_ids_list: List of block IDs to invalidate.
@@ -283,22 +292,20 @@ class MambaSlotAllocator:
         self.free_slots[self.free_count : self.free_count + n] = valid_slots.to(torch.int32)
         self.free_count += n
 
-    def on_kv_blocks_deregistered(self, block_ids_list: list, hashes_to_delete: set) -> None:
-        """Handle KV block deregistration by cleaning up Mamba state.
+    def _on_mamba_evicted(self, block_ids: list) -> None:
+        """Registry callback: free GPU slots for the given block IDs.
 
-        Called by KVBlockAllocator._deregister_blocks via callback.
+        Fired by :class:`PrefixCacheRegistry` after the host Mamba dict drops
+        entries — either as a cascade from KV eviction (KV blocks gone
+        means their cached Mamba state is also gone) or from an explicit
+        ``registry.evict_mamba`` call.
 
-        Args:
-            block_ids_list: List of deregistered block IDs.
-            hashes_to_delete: Set of hashes being deregistered (excludes -1).
+        :meth:`_invalidate_blocks_batch` no-ops on blocks whose
+        ``block_to_slot`` is already ``-1``, which lets
+        :meth:`_evict_lru_slots_batch` suppress the free-pool return by
+        clearing mappings before firing the registry call.
         """
-        if self.hash_to_block_id:
-            mamba_keys = hashes_to_delete & self.hash_to_block_id.keys()
-            if mamba_keys:
-                from collections import deque
-
-                deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
-                self._invalidate_blocks_batch(block_ids_list)
+        self._invalidate_blocks_batch(block_ids)
 
     # =========================================================================
     # State store/restore
@@ -372,9 +379,8 @@ class MambaSlotAllocator:
             block_ids: List of block IDs.
             hashes: List of hash values (same length as block_ids).
         """
-        updates = {h: bid for bid, h in zip(block_ids, hashes) if h > 0}
-        if updates:
-            self.hash_to_block_id.update(updates)
+        if self.registry is not None:
+            self.registry.register_mamba(block_ids, hashes)
 
     # =========================================================================
     # Intermediate state tracking
@@ -627,7 +633,8 @@ class MambaSlotAllocator:
         self.slot_to_block.fill_(-1)
         self.free_slots = torch.arange(self.max_slots, dtype=torch.int32, device='cpu')
         self.free_count = self.max_slots
-        self.hash_to_block_id.clear()
+        if self.registry is not None:
+            self.registry.clear_mamba()
         self.intermediate_ssm_out.zero_()
         self.intermediate_conv_out.zero_()
         self._intermediate_offsets_cpu.fill_(0)

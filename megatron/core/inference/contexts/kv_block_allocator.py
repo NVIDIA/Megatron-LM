@@ -1,13 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from collections import deque
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+
+from .prefix_cache_registry import PrefixCacheRegistry
 
 
 class KVBlockAllocator:
@@ -34,12 +35,13 @@ class KVBlockAllocator:
         prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
             PrefixCachingEvictionPolicy.REF_ZERO
         ),
+        prefix_cache_registry: Optional[PrefixCacheRegistry] = None,
     ):
 
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
-        self.on_blocks_deregistered: Optional[Callable] = None
+        self.registry = prefix_cache_registry
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -55,8 +57,9 @@ class KVBlockAllocator:
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
             self.block_hashes = torch.full((self.total_count,), -1, dtype=torch.int64, device='cpu')
 
-            # Hash-to-block mapping for O(1) prefix lookup
-            self.kv_hash_to_block_id: Dict[int, int] = {}
+            # The host hash -> block_id dict lives on ``self.registry``;
+            # this allocator only owns the on-device shadow ``block_hashes``
+            # and the ref counts / eviction state.
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
@@ -252,7 +255,8 @@ class KVBlockAllocator:
             self.block_hashes.fill_(-1)
 
             # Reset prefix caching state
-            self.kv_hash_to_block_id.clear()
+            if self.registry is not None:
+                self.registry.clear_kv()
             self.block_ref_counts.fill_(0)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
@@ -276,7 +280,8 @@ class KVBlockAllocator:
         id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
-        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+        if self.registry is not None:
+            self.registry.register_kv(block_ids, block_hashes)
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -294,16 +299,10 @@ class KVBlockAllocator:
         block_ids_i64 = block_ids.to(torch.int64)
         hashes = self.block_hashes[block_ids_i64].tolist()
 
-        # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
-        keys_to_delete = set(hashes) - {-1}
-        deque(
-            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
-            maxlen=0,
-        )
-
-        # Notify Mamba slot allocator (if wired) to clean up its state
-        if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
+        # Drop hashes from the registry. The cascade fires the Mamba
+        # evict callback, which clears the corresponding Mamba GPU slots.
+        if self.registry is not None:
+            self.registry.evict_kv(hashes)
 
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1

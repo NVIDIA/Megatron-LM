@@ -265,9 +265,9 @@ class TestMambaPrefixCachingE2E:
                 finished[merged.request_id] = list(merged.generated_tokens)
         return finished, engine.context.lifetime_prefill_token_count
 
-    def _get_ref_count(self, alloc, block_hash):
-        bid = alloc.kv_hash_to_block_id.get(block_hash)
-        return 0 if bid is None else alloc.block_ref_counts[bid].item()
+    def _get_ref_count(self, ctx, block_hash):
+        bid = ctx.prefix_cache_registry.kv_hash_to_block_id.get(block_hash)
+        return 0 if bid is None else ctx.kv_block_allocator.block_ref_counts[bid].item()
 
     def _assert_step(self, step, reqs_by_group, alloc, step_prefill, num_groups, ctx=None):
         """Shared per-step verification for single-group and multi-group runs."""
@@ -276,24 +276,24 @@ class TestMambaPrefixCachingE2E:
             for g in range(G):
                 r = reqs_by_group[g]
                 assert r[0]._mamba_num_matched_blocks == 0, f"step 1 group {g}"
-                assert r[0].precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
-            assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G
+                assert r[0].precomputed_block_hashes[0] in ctx.prefix_cache_registry.mamba_hash_to_block_id
+            assert len(ctx.prefix_cache_registry.mamba_hash_to_block_id) == G
             assert step_prefill == G * 300, f"step 1: expected {G * 300}, got {step_prefill}"
             if G == 1:
                 assert (
-                    self._get_ref_count(alloc, reqs_by_group[0][0].precomputed_block_hashes[0]) == 1
+                    self._get_ref_count(ctx, reqs_by_group[0][0].precomputed_block_hashes[0]) == 1
                 )
 
         elif step == 2:
             for g in range(G):
                 r = reqs_by_group[g]
                 assert r[1]._mamba_num_matched_blocks == 1, f"step 2 group {g}"
-                assert r[1].precomputed_block_hashes[2] in ctx.mamba_slot_allocator.hash_to_block_id
-            assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G * 2
+                assert r[1].precomputed_block_hashes[2] in ctx.prefix_cache_registry.mamba_hash_to_block_id
+            assert len(ctx.prefix_cache_registry.mamba_hash_to_block_id) == G * 2
             assert step_prefill == G * 544, f"step 2: expected {G * 544}, got {step_prefill}"
             if G == 1:
                 assert (
-                    self._get_ref_count(alloc, reqs_by_group[0][0].precomputed_block_hashes[0]) == 2
+                    self._get_ref_count(ctx, reqs_by_group[0][0].precomputed_block_hashes[0]) == 2
                 )
 
         elif step == 3:
@@ -301,14 +301,14 @@ class TestMambaPrefixCachingE2E:
                 r = reqs_by_group[g]
                 assert r[2]._mamba_num_matched_blocks == 1, f"step 3 group {g} req 2"
                 assert r[4]._mamba_num_matched_blocks == 3, f"step 3 group {g} req 4"
-                assert r[2].precomputed_block_hashes[1] in ctx.mamba_slot_allocator.hash_to_block_id
-                assert r[2].precomputed_block_hashes[2] in ctx.mamba_slot_allocator.hash_to_block_id
-                assert r[4].precomputed_block_hashes[3] in ctx.mamba_slot_allocator.hash_to_block_id
+                assert r[2].precomputed_block_hashes[1] in ctx.prefix_cache_registry.mamba_hash_to_block_id
+                assert r[2].precomputed_block_hashes[2] in ctx.prefix_cache_registry.mamba_hash_to_block_id
+                assert r[4].precomputed_block_hashes[3] in ctx.prefix_cache_registry.mamba_hash_to_block_id
                 h0 = r[0].precomputed_block_hashes[0]
                 h1 = r[1].precomputed_block_hashes[1]
-                assert self._get_ref_count(alloc, h0) == 4, f"step 3 group {g}"
-                assert self._get_ref_count(alloc, h1) == 3, f"step 3 group {g}"
-            assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G * 5
+                assert self._get_ref_count(ctx, h0) == 4, f"step 3 group {g}"
+                assert self._get_ref_count(ctx, h1) == 3, f"step 3 group {g}"
+            assert len(ctx.prefix_cache_registry.mamba_hash_to_block_id) == G * 5
             assert step_prefill == G * (
                 544 + 332
             ), f"step 3: expected {G * 876}, got {step_prefill}"
@@ -317,12 +317,12 @@ class TestMambaPrefixCachingE2E:
             for g in range(G):
                 r = reqs_by_group[g]
                 assert r[3]._mamba_num_matched_blocks == 2, f"step 4 group {g}"
-                assert r[3].precomputed_block_hashes[2] in ctx.mamba_slot_allocator.hash_to_block_id
+                assert r[3].precomputed_block_hashes[2] in ctx.prefix_cache_registry.mamba_hash_to_block_id
                 h0 = r[0].precomputed_block_hashes[0]
                 h1 = r[1].precomputed_block_hashes[1]
-                assert self._get_ref_count(alloc, h0) == 5, f"step 4 group {g}"
-                assert self._get_ref_count(alloc, h1) == 4, f"step 4 group {g}"
-            assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G * 6
+                assert self._get_ref_count(ctx, h0) == 5, f"step 4 group {g}"
+                assert self._get_ref_count(ctx, h1) == 4, f"step 4 group {g}"
+            assert len(ctx.prefix_cache_registry.mamba_hash_to_block_id) == G * 6
             assert step_prefill == G * 288, f"step 4: expected {G * 288}, got {step_prefill}"
 
     def _run_pc_on(self, model, mamba_config, prompts):
@@ -513,9 +513,9 @@ class TestMambaPrefixCachingE2E:
 
             if step == 1:
                 assert reqs[0]._mamba_num_matched_blocks == 0, f"step 1"
-                assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1
+                assert len(ctx.prefix_cache_registry.mamba_hash_to_block_id) == 1
                 assert (
-                    reqs[0].precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
+                    reqs[0].precomputed_block_hashes[0] in ctx.prefix_cache_registry.mamba_hash_to_block_id
                 )
                 assert step_prefill == 256
             elif step == 2:
@@ -523,15 +523,15 @@ class TestMambaPrefixCachingE2E:
                 # C: 1 mamba match, skip 256, effective 256
                 assert reqs[1]._mamba_num_matched_blocks == 1, f"step 2 B"
                 assert reqs[2]._mamba_num_matched_blocks == 1, f"step 2 C"
-                assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 2
+                assert len(ctx.prefix_cache_registry.mamba_hash_to_block_id) == 2
                 assert (
-                    reqs[2].precomputed_block_hashes[1] in ctx.mamba_slot_allocator.hash_to_block_id
+                    reqs[2].precomputed_block_hashes[1] in ctx.prefix_cache_registry.mamba_hash_to_block_id
                 )
                 assert step_prefill == 512  # B=256 (back-off recompute) + C=256
             elif step == 3:
                 # D: 2 mamba matches, raw_skip >= chunk_length, back off to block 0, skip 256, effective 256
                 assert reqs[3]._mamba_num_matched_blocks == 2, f"step 3 D"
-                assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 2
+                assert len(ctx.prefix_cache_registry.mamba_hash_to_block_id) == 2
                 assert step_prefill == 256
 
         return finished, ctx.lifetime_prefill_token_count
@@ -601,21 +601,21 @@ class TestMambaPrefixCachingE2E:
         req_E = _run_one(0, prompts[0])
         h_E0 = req_E.precomputed_block_hashes[0]
         assert (
-            h_E0 in ctx.mamba_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
+            h_E0 in ctx.prefix_cache_registry.mamba_hash_to_block_id and h_E0 in ctx.prefix_cache_registry.kv_hash_to_block_id
         )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.total_avail == 1
+        assert len(ctx.prefix_cache_registry.mamba_hash_to_block_id) == 1 and alloc.total_avail == 1
 
         # F: disjoint prefix, forces eviction of E's cached block
         req_F = _run_one(1, prompts[1])
-        assert req_F.precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
+        assert req_F.precomputed_block_hashes[0] in ctx.prefix_cache_registry.mamba_hash_to_block_id
         assert (
-            h_E0 not in alloc.kv_hash_to_block_id
-            and h_E0 not in ctx.mamba_slot_allocator.hash_to_block_id
+            h_E0 not in ctx.prefix_cache_registry.kv_hash_to_block_id
+            and h_E0 not in ctx.prefix_cache_registry.mamba_hash_to_block_id
         )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1
+        assert len(ctx.prefix_cache_registry.mamba_hash_to_block_id) == 1
 
         # G: identical to E, but E's state was evicted
         req_G = _run_one(2, prompts[2])
         assert req_G._mamba_num_matched_blocks == 0
-        assert h_E0 in ctx.mamba_slot_allocator.hash_to_block_id
+        assert h_E0 in ctx.prefix_cache_registry.mamba_hash_to_block_id
         assert finished[0] == finished[2]

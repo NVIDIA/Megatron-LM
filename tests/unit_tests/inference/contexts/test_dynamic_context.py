@@ -2444,7 +2444,7 @@ class TestDynamicContext:
         # Blocks should still be discoverable via hash map.
         for bid in shared_blocks:
             h = ctx.kv_block_allocator.block_hashes[bid].item()
-            assert h in ctx.kv_block_allocator.kv_hash_to_block_id
+            assert h in ctx.prefix_cache_registry.kv_hash_to_block_id
 
     @pytest.mark.internal
     @rounder_override(64)
