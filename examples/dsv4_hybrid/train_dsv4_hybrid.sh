@@ -38,8 +38,8 @@ LR_WARMUP_SAMPLES=1024000
 LR_DECAY_SAMPLES=36621094
 LR_WSD_DECAY_SAMPLES=5493165
 
-# 24-layer pattern: mamba bulk + interleaved CSA / HCA / DSA + dense MLP.
-HYBRID_PATTERN="M-M-MCM-MHM-MDM-MCM-MHM-MDM-"
+# 16-layer pattern: mamba bulk + interleaved CSA / HCA / DSA + dense MLP.
+HYBRID_PATTERN="M-MCM-MHMDM-MHM-"
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -79,7 +79,6 @@ DSV4_HYBRID_ATTN_ARGS=(
     --csa-window-size 128
     --csa-compress-ratio-for-c 4
     --csa-compress-ratio-for-h 128
-    --csa-compress-rotary-base 40000
     --o-groups 4
     --o-lora-rank 128
     --dsa-indexer-n-heads 64
@@ -136,11 +135,9 @@ CHECKPOINT_ARGS=(
     --ckpt-fully-parallel-save
     --ckpt-fully-parallel-load
     --ckpt-assume-constant-structure
-    --async-save
-    --use-persistent-ckpt-worker
     --no-load-rng
-    --save-interval 125
-    --save-retain-interval 1000
+    --save-interval 12500
+    --save-retain-interval 100000
 )
 
 EVAL_AND_LOGGING_ARGS=(

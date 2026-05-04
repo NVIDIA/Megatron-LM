@@ -350,7 +350,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 Symbols.HCA_ATTENTION,
                 Symbols.GDN,
                 Symbols.MAMBA,
-            )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
+            )(
+                get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list)
+            )
 
             if len(gdn_layer_map) > 0:
                 raise NotImplementedError("GDN layers are not supported for inference.")
