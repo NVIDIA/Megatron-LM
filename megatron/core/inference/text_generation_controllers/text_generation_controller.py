@@ -1783,9 +1783,6 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         if active_request_count <= 0:
             return "no active requests"
-        if context.paused_request_count != 0:
-            self._async_pause_boundary_count += 1
-            return "paused requests are present"
 
         if self._has_active_stop_words_callback is not None:
             active_request_ids = context.request_ids[

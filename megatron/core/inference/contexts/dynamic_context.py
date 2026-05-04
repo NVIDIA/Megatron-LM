@@ -2367,7 +2367,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         n_active = self.total_request_count - self.paused_request_count
         if (
             n_active <= 0
-            or self.paused_request_count != 0
             or self.num_prefill_requests != 0
         ):
             return False

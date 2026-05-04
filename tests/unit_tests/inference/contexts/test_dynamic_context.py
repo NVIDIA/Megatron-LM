@@ -336,6 +336,104 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_async_lifecycle_pause_matrix(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=512,
+            buffer_size_gb=1.0,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_cuda_graphs=1,
+        )
+        for request_id in range(2):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(0, 4, dtype=torch.long, device='cpu'),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=16, termination_id=-1, top_k=1
+                    ),
+                )
+            )
+        dynamic_context.initialize_attention_state()
+        dynamic_context.update_requests(
+            active_requests_mask=torch.ones(2, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([7, 8], dtype=torch.long, device='cpu'),
+        )
+        dynamic_context.initialize_attention_state()
+
+        dynamic_context.paused_request_count = 1
+        dynamic_context.paused_tokens = torch.tensor([7], dtype=torch.long, device='cpu')
+        dynamic_context.active_token_count = 1
+        dynamic_context.num_prefill_requests = 0
+
+        assert dynamic_context.prepare_async_decode_next_step()
+        assert dynamic_context.active_token_count == 1
+        assert dynamic_context.token_to_request_idx[0].item() == 1
+        assert dynamic_context._staging_request_in_prefill_status[0].item() == 0
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("num_speculative_tokens", [0, 2], ids=["gpt", "mtp"])
+    def test_async_lifecycle_pause_preserves_tokens(self, num_speculative_tokens):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            max_tokens=512,
+            max_requests=512,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+
+        dynamic_context.total_request_count = 2
+        dynamic_context.paused_request_count = 0
+        dynamic_context.active_token_count = 2
+        dynamic_context.request_ids[:2] = torch.tensor([10, 11])
+        dynamic_context.request_query_lengths[:2] = 1
+        dynamic_context.request_kv_block_counts[:2] = 1
+        dynamic_context.request_kv_length_offsets[:2] = torch.tensor([15, 5])
+        dynamic_context.request_last_kv_block_offset[:2] = torch.tensor([15, 5])
+
+        blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(2)
+        dynamic_context.request_to_kv_block_ids[0, 0] = blocks[0]
+        dynamic_context.request_to_kv_block_ids[1, 0] = blocks[1]
+        dynamic_context.request_last_kv_block_id[:2] = blocks
+
+        dynamic_context.kv_block_allocator.total_avail = 0
+        dynamic_context.kv_block_allocator.paused_count = 100
+
+        active_requests_mask = torch.tensor([1, 1], device='cpu', dtype=torch.int32)
+        new_tokens = torch.tensor([99, 100], device='cpu')
+        new_speculative_tokens = None
+        if num_speculative_tokens > 0:
+            new_speculative_tokens = torch.tensor([[991, 1001], [992, 1002]], device='cpu')
+
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        assert dynamic_context.paused_request_count == 1
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.paused_tokens is not None
+        assert dynamic_context.paused_tokens[0].item() == 99
+        if num_speculative_tokens > 0:
+            assert dynamic_context.paused_speculative_tokens is not None
+            assert torch.equal(
+                dynamic_context.paused_speculative_tokens[:, 0],
+                torch.tensor([991, 992], device='cpu'),
+            )
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_update_requests_defers_unused_async_boundary_block_release(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,

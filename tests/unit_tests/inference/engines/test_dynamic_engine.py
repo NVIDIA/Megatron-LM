@@ -17,6 +17,7 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -1209,6 +1210,92 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert controller._async_mtp_finish_boundary_count > 0
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
+    def _run_async_pause_boundary_e2e(self, model_provider: str, num_speculative_tokens: int):
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+        block_size_tokens = 256
+        tokens_per_request = num_speculative_tokens + 1
+        boundary_prompt_length = block_size_tokens - tokens_per_request
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=block_size_tokens,
+                num_tokens_to_generate=8,
+                num_gap_steps=0,
+                model_provider=model_provider,
+                num_speculative_tokens=num_speculative_tokens,
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                context_block_size_tokens=block_size_tokens,
+                termination_id=-1,
+                top_k=1,
+                enable_async_scheduling=True,
+            )
+        )
+        engine = env.engine
+        with torch.inference_mode():
+            engine.add_request(
+                request_id=0,
+                prompt=(
+                    torch.arange(boundary_prompt_length, dtype=torch.int64, device='cuda')
+                    % DynamicEngineTestConfig.vocab_size
+                ),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=8, termination_id=-1, top_k=1
+                ),
+            )
+            engine.add_request(
+                request_id=1,
+                prompt=(
+                    torch.arange(4, dtype=torch.int64, device='cuda')
+                    % DynamicEngineTestConfig.vocab_size
+                ),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=8, termination_id=-1, top_k=1
+                ),
+            )
+
+            engine.step_modern()
+            engine.context.kv_block_allocator.total_avail = 0
+
+            launch_count_at_pause = None
+            async_launched_after_pause = False
+            for _ in range(6):
+                engine.step_modern()
+                controller = engine.controller
+                if engine.context.paused_request_count > 0 and launch_count_at_pause is None:
+                    launch_count_at_pause = controller._async_forward_launch_count
+                elif (
+                    launch_count_at_pause is not None
+                    and controller._async_forward_launch_count > launch_count_at_pause
+                ):
+                    async_launched_after_pause = True
+                    break
+
+        controller = engine.controller
+        assert launch_count_at_pause is not None
+        assert async_launched_after_pause, controller._async_disable_reason
+        assert controller._async_pause_boundary_count > 0
+        assert controller._async_disable_reason != "paused requests are present"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_pause_boundary_cuda_graph_e2e(self) -> None:
+        """Async GPT scheduling continues while a request is paused."""
+        self._run_async_pause_boundary_e2e("gpt", num_speculative_tokens=0)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_hybrid_mtp_pause_boundary_cuda_graph_e2e(self) -> None:
+        """Async hybrid MTP scheduling continues while a request is paused."""
+        self._run_async_pause_boundary_e2e("hybrid", num_speculative_tokens=2)
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -1237,8 +1324,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         context.total_request_count = 2
         context.paused_request_count = 1
-        assert controller._async_scheduling_disabled_reason() == "paused requests are present"
-        assert controller._async_pause_boundary_count > 0
+        context.active_token_count = 1
+        context.num_prefill_requests = 0
+        context.padded_batch_dimensions = InferenceBatchDimensions(
+            token_count=1, prefill_req_count=0, decode_req_count=1
+        )
+        with torch.inference_mode():
+            context.active_request_metadata["top_k"][0] = 1
+            context.active_request_metadata["top_p"][0] = 0.0
+            context.active_request_metadata["return_log_probs"][0] = False
+            context.active_request_metadata["top_n_logprobs"][0] = 0
+            context.active_request_metadata["termination_id"][0] = -1
+        assert controller._async_scheduling_disabled_reason() is None
 
         delete_cuda_graphs()
         Utils.destroy_model_parallel()
@@ -1274,6 +1371,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             mtp_context.paused_request_count = 0
             mtp_context.active_token_count = 3
             mtp_context.num_prefill_requests = 0
+            mtp_context.padded_batch_dimensions = InferenceBatchDimensions(
+                token_count=3, prefill_req_count=0, decode_req_count=1
+            )
             mtp_context.active_request_metadata["top_k"][0] = 1
             mtp_context.active_request_metadata["top_p"][0] = 0.0
             mtp_context.active_request_metadata["return_log_probs"][0] = False
@@ -1281,8 +1381,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             mtp_context.active_request_metadata["termination_id"][0] = 7
 
         assert (
-            mtp_controller._async_scheduling_disabled_reason(allow_mtp=True)
-            == "data-dependent termination id"
+            mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
         )
 
         with torch.inference_mode():
@@ -1293,11 +1392,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         monkeypatch.setattr(
             mtp_context, "get_max_sequence_lengths", lambda: torch.tensor([8], device='cpu')
         )
-        assert (
-            mtp_controller._async_scheduling_disabled_reason(allow_mtp=True)
-            == "request can finish by length"
-        )
-        assert mtp_controller._async_mtp_finish_boundary_count >= 2
+        assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
 
     @pytest.mark.internal
     @pytest.mark.skipif(
