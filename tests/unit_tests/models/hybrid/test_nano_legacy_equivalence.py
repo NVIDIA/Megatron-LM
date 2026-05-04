@@ -8,8 +8,9 @@ expresses the model through legacy `pretrain_hybrid.py` CLI flags;
 ``nano.py`` expresses it through the Python DSL that ``--model-recipe``
 consumes. This test parses ``nano.sh``, runs Megatron's argparse +
 ``core_transformer_config_from_args`` to reconstruct the legacy-path
-:class:`TransformerConfig`, then compiles the DSL recipe and asserts
-the two paths agree on every architectural field they can both express.
+:class:`TransformerConfig`, then lowers the DSL recipe (via the package's
+internal ``_lower`` helper) and asserts the two paths agree on every
+architectural field they can both express.
 
 Three known classes of difference are explicitly tolerated, with reasons:
 
@@ -61,7 +62,7 @@ LEGACY_CLI_CANT_EXPRESS: dict[str, str] = {
     "is_hybrid_model": (
         "Set implicitly by --hybrid-layer-pattern in production validate_args(); "
         "this test bypasses validate_args, so the legacy side reads as the TC "
-        "default (False) while the recipe forces True in compile()."
+        "default (False) while the recipe forces True during lowering."
     ),
 }
 
@@ -237,10 +238,10 @@ def _legacy_path_from_sh(sh_path: Path):
     return ns, legacy_tc, layer_type_list
 
 
-def _recipe_compiled():
+def _recipe_lowered():
     from examples.nemotron3.nano import make_recipe
 
-    return make_recipe().compile()
+    return make_recipe()._lower()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -321,7 +322,10 @@ def legacy(_no_tc_post_init):
 
 @pytest.fixture(scope="module")
 def recipe(_no_tc_post_init):
-    return _recipe_compiled()
+    # Returns a ``_RecipeLowering`` (the package-private lowering output) —
+    # the equivalence test reads its TC fields directly. Named ``recipe``
+    # for fixture-scope brevity; do not confuse with ``HybridModelConfig``.
+    return _recipe_lowered()
 
 
 @pytest.mark.internal

@@ -7,7 +7,7 @@ Faithful 1:1 with the canonical
 ``Megatron-Bridge/recipes/nemotronh/nemotron_3_nano.py::nemotron_3_nano_pretrain_config``.
 
 Recipe entry point: :func:`make_recipe`. ``num_layers`` is intentionally
-**not** set anywhere — it is derived at compile time from the flattened
+**not** set anywhere — it is derived at lowering time from the flattened
 decoder length of ``layer_pattern``.
 
 Use this recipe via the ``--model-recipe`` flag in any of these forms::
@@ -30,7 +30,6 @@ from megatron.core.models.hybrid import (
     HybridModelConfig,
     MambaLayerConfig,
     MoELayerConfig,
-    flatten_decoder_pattern,
 )
 
 VOCAB_SIZE: int = 131072
@@ -46,10 +45,10 @@ MAX_SEQUENCE_LENGTH: int = 8192
 # ``cuda_graph_impl``, ``cuda_graph_scope``, ``cuda_graph_warmup_steps``,
 # ``moe_layer_freq``, ``moe_router_bias_update_rate``,
 # ``mtp_loss_scaling_factor``, ``overlap_p2p_comm``) are intentionally
-# omitted — they fall through to TC's own defaults at compile time.
+# omitted — they fall through to TC's own defaults at lowering time.
 #
 # ``is_hybrid_model=True`` is also intentionally absent — every HybridModel
-# recipe is a hybrid model by construction; ``HybridModelConfig.compile()``
+# recipe is a hybrid model by construction; the DSL's internal lowering
 # forces it on every per-layer TC.
 #
 # ``make_vocab_size_divisible_by=128`` from the canonical config is NOT a
@@ -136,8 +135,8 @@ Loss = CrossEntropyLayerConfig(loss_fusion=True, fusion_impl="native")
 # --- Layer pattern composition ---------------------------------------------
 #
 # Decoder layout (52 layers total = 6 + 28 + 9 + 9). ``num_layers`` is never
-# set explicitly; HybridModelConfig.compile() derives it from the flattened
-# pattern length.
+# set explicitly; ``HybridModelConfig.num_layers`` derives it from the
+# flattened pattern length.
 
 stage0 = [Mamba] + [MoE, Mamba] * 2 + [Att]
 stage1 = [MoE, Mamba] * 3 + [Att]
@@ -176,30 +175,29 @@ def nemotron_3_nano_pretrain_config():
 
 
 if __name__ == "__main__":
-    # Compile the recipe and print the resulting layer_type_list. This is
+    # Lower the recipe and print the resulting layer_type_list. This is
     # the same code path ``--model-recipe`` exercises in production via
-    # ``load_recipe``.
+    # ``HybridModel.from_recipe``.
     #
-    # The full :meth:`HybridModelConfig.compile` requires Transformer Engine
+    # The full lowering requires Transformer Engine
     # (``moe_permute_fusion=True``, ``transformer_impl="transformer_engine"``,
     # etc. trigger TE checks at config-construction time). In dev environments
-    # without TE, fall back to the pure-Python ``flatten_decoder_pattern`` +
+    # without TE, fall back to the pure-Python ``flatten_decoder`` +
     # ``SYMBOL`` derivation so the smoke test can still verify the pattern
     # composition.
     recipe = make_recipe()
     try:
-        layer_type_list = recipe.compile().layer_type_list
+        layer_type_list = recipe._lower().layer_type_list
     except (ValueError, ImportError, ModuleNotFoundError) as e:
         msg = str(e)
         if "fused permutation" not in msg and "TE" not in msg and "transformer_engine" not in msg:
             raise
         print(
-            f"NOTE: full compile() needs Transformer Engine "
+            f"NOTE: full lowering needs Transformer Engine "
             f"({type(e).__name__}: {e}). Falling back to pattern-only "
-            f"verification — production runs go through compile()."
+            f"verification — production runs go through HybridModel.from_recipe."
         )
-        decoder_flat = flatten_decoder_pattern(recipe.layer_pattern[1:-1])
-        layer_type_list = [type(lc).SYMBOL for lc in decoder_flat]
+        layer_type_list = [type(lc).SYMBOL for lc in recipe.flatten_decoder()]
     composed_string = "".join(layer_type_list)
 
     print(f"Composed layer pattern: {composed_string}")
