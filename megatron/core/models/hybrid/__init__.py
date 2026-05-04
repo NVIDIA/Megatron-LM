@@ -32,6 +32,5 @@ __all__ = [
     "MLPLayerConfig",
     "MoELayerConfig",
     "RECIPE_ENTRY_POINT",
-    "flatten_decoder_pattern",
     "load_recipe",
 ]

@@ -73,7 +73,7 @@ def _build_model_from_recipe(recipe: HybridModelConfig) -> HybridModel:
         max_sequence_length=compiled.max_sequence_length,
         fp16_lm_cross_entropy=compiled.fp16_lm_cross_entropy,
         parallel_output=compiled.parallel_output,
-        share_embeddings_and_output_weights=compiled.share_embeddings_and_output_weights,
+        share_embeddings_and_output_weights=not compiled.untie_embeddings_and_output_weights,
         position_embedding_type=compiled.position_embedding_type,
         rotary_percent=compiled.rotary_percent,
         rotary_base=compiled.rotary_base,

@@ -161,9 +161,11 @@ class TestCommonLayerConfig:
             num_attention_heads=4,
             attention_dropout=0.25,
             attention_softmax_in_fp32=False,
-            apply_query_key_layer_scaling=False,
             add_qkv_bias=True,
             masked_softmax_fusion=True,
+            # Niche legacy fp16-stability knob; reachable via ``extra`` rather
+            # than as a curated AttentionLayerConfig field.
+            extra={"apply_query_key_layer_scaling": False},
         )
 
         tc = layer.to_transformer_config(num_layers=2)
@@ -352,8 +354,8 @@ class TestHybridModelConfigCompile:
         assert compiled.vocab_size == 32000
         assert compiled.max_sequence_length == 2048
         assert compiled.position_embedding_type == "rope"
-        # Default untie=False → share=True.
-        assert compiled.share_embeddings_and_output_weights is True
+        # Default untie=False → share=True at the call site.
+        assert compiled.untie_embeddings_and_output_weights is False
 
     def test_common_config_auto_inherited_into_layers_without_explicit_common(self):
         """A recipe author who omits ``common_config=common`` on a layer
@@ -428,7 +430,7 @@ class TestHybridModelConfigCompile:
             untie_embeddings_and_output_weights=True,
         )
         compiled = recipe.compile()
-        assert compiled.share_embeddings_and_output_weights is False
+        assert compiled.untie_embeddings_and_output_weights is True
 
     def test_missing_embedding_raises(self):
         common = _make_common()
@@ -801,13 +803,15 @@ class TestYarnEmbedding:
             vocab_size=1024,
             max_sequence_length=512,
             position_embedding_type="yarn",
-            yarn_rotary_scaling_factor=32.0,
-            yarn_original_max_position_embeddings=131072,
-            yarn_beta_fast=32.0,
-            yarn_beta_slow=1.0,
-            yarn_mscale=1.0,
-            yarn_mscale_all_dim=0.0,
-            yarn_correction_range_round_to_int=True,
+            yarn={
+                "yarn_rotary_scaling_factor": 32.0,
+                "yarn_original_max_position_embeddings": 131072,
+                "yarn_beta_fast": 32.0,
+                "yarn_beta_slow": 1.0,
+                "yarn_mscale": 1.0,
+                "yarn_mscale_all_dim": 0.0,
+                "yarn_correction_range_round_to_int": True,
+            },
         )
         a, loss = self._attention_loss(common)
         compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
@@ -820,38 +824,52 @@ class TestYarnEmbedding:
         assert compiled.config.yarn_correction_range_round_to_int is True
 
     def test_yarn_fields_not_attached_when_position_embedding_is_rope(self):
-        """When ``position_embedding_type != "yarn"``, yarn fields are silently
-        unused — they're a no-op rather than an error so a recipe author can
-        toggle the embedding type without removing the yarn block."""
+        """When ``position_embedding_type != "yarn"``, the yarn block is
+        silently unused — a no-op rather than an error so a recipe author
+        can toggle the embedding type without removing the yarn block."""
         common = _make_common()
         emb = EmbeddingLayerConfig(
             common_config=common,
             vocab_size=1024,
             max_sequence_length=512,
             position_embedding_type="rope",
-            yarn_rotary_scaling_factor=32.0,
+            yarn={"yarn_rotary_scaling_factor": 32.0},
         )
         a, loss = self._attention_loss(common)
         compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
         assert not hasattr(compiled.config, "yarn_rotary_scaling_factor")
 
-    def test_yarn_none_values_not_attached(self):
-        """Default-None yarn fields are not stamped on the config — useful to
-        avoid masking missing-required-attribute errors with stray None values
-        when ``HybridModel.__init__`` calls ``getattr`` without a default."""
+    def test_yarn_partial_dict_only_stamps_provided_keys(self):
+        """A partial yarn dict stamps only the keys the recipe author
+        provided; absent keys are not stamped, so missing-required-attribute
+        bugs in HybridModel.__init__ surface clearly via AttributeError."""
         common = _make_common()
         emb = EmbeddingLayerConfig(
             common_config=common,
             vocab_size=1024,
             max_sequence_length=512,
             position_embedding_type="yarn",
-            yarn_rotary_scaling_factor=32.0,
-            # other yarn fields left as default None
+            yarn={"yarn_rotary_scaling_factor": 32.0},
         )
         a, loss = self._attention_loss(common)
         compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
         assert compiled.config.yarn_rotary_scaling_factor == 32.0
         assert not hasattr(compiled.config, "yarn_beta_fast")
+
+    def test_yarn_unknown_key_rejected(self):
+        """Typos in the yarn dict raise at compile time."""
+        common = _make_common()
+        emb = EmbeddingLayerConfig(
+            common_config=common,
+            vocab_size=1024,
+            max_sequence_length=512,
+            position_embedding_type="yarn",
+            yarn={"yarn_typo_field": 1.0},
+        )
+        a, loss = self._attention_loss(common)
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss])
+        with pytest.raises(ValueError, match="unknown keys"):
+            recipe.compile()
 
 
 @pytest.mark.internal

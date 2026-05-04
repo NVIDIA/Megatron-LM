@@ -82,7 +82,7 @@ class CompiledRecipe:
     rotary_base: int
     seq_len_interpolation_factor: Optional[float]
     scatter_embedding_sequence_parallel: bool
-    share_embeddings_and_output_weights: bool
+    untie_embeddings_and_output_weights: bool
     fp16_lm_cross_entropy: bool
     parallel_output: bool
 
@@ -342,10 +342,15 @@ class HybridModelConfig:
         # getattr when position_embedding_type == "yarn"; mirror that
         # convention here so recipe-built models support YARN without forcing
         # the recipe author to monkey-patch the config.
-        if embedding.position_embedding_type == "yarn":
-            for name in _YARN_FIELDS:
-                value = getattr(embedding, name)
-                if value is not None:
+        if embedding.yarn:
+            unknown = set(embedding.yarn) - set(_YARN_FIELDS)
+            if unknown:
+                raise ValueError(
+                    f"EmbeddingLayerConfig.yarn has unknown keys {sorted(unknown)}; "
+                    f"valid keys are {sorted(_YARN_FIELDS)}."
+                )
+            if embedding.position_embedding_type == "yarn":
+                for name, value in embedding.yarn.items():
                     setattr(stack_config, name, value)
 
         return CompiledRecipe(
@@ -359,7 +364,7 @@ class HybridModelConfig:
             rotary_base=embedding.rotary_base,
             seq_len_interpolation_factor=embedding.seq_len_interpolation_factor,
             scatter_embedding_sequence_parallel=embedding.scatter_embedding_sequence_parallel,
-            share_embeddings_and_output_weights=not self.untie_embeddings_and_output_weights,
+            untie_embeddings_and_output_weights=self.untie_embeddings_and_output_weights,
             fp16_lm_cross_entropy=loss.fp16_lm_cross_entropy,
             parallel_output=loss.parallel_output,
         )
@@ -368,16 +373,16 @@ class HybridModelConfig:
 # --- pattern-structure helpers --------------------------------------------
 
 
-_DEFAULT_COMMON = CommonLayerConfig()
-
-
 def _inherit_common_if_default(node: Any, recipe_common: CommonLayerConfig) -> Any:
-    """If ``node`` carries a default-constructed common_config, replace it
-    with ``recipe_common`` via :func:`dataclasses.replace`. Otherwise return
-    unchanged. Applies to LayerConfig instances and pattern markers."""
+    """If ``node`` carries no explicit common_config (left as ``None``),
+    substitute ``recipe_common`` via :func:`dataclasses.replace`. An
+    explicit :class:`CommonLayerConfig` (even a default-constructed one)
+    is preserved — recipe authors who write ``CommonLayerConfig()``
+    intentionally get the default values they asked for. Applies to
+    LayerConfig instances and pattern markers."""
     if not hasattr(node, "common_config"):
         return node
-    if node.common_config == _DEFAULT_COMMON:
+    if node.common_config is None:
         return dataclasses.replace(node, common_config=recipe_common)
     return node
 
