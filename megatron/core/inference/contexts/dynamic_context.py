@@ -35,6 +35,10 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.moe.fused_a2a import (
+    HAVE_DEEP_EP_V2,
+    prepare_deepep_v2_buffer,
+)
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
@@ -594,14 +598,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
         # CUDA graph config list.
-        self._nccl_ep_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
-            and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
+        ep_size = get_pg_size(self.expert_model_parallel_group)
+        inference_dispatcher_type = getattr(
+            model_config, 'inference_moe_token_dispatcher_type', 'nccl'
         )
+        self._nccl_ep_dispatcher = ep_size > 1 and inference_dispatcher_type == 'nccl'
+        self._deepep_v2_ep_dispatcher = ep_size > 1 and inference_dispatcher_type == 'deepep_v2'
         # We disable non-decode cuda graphs for the nccl dispatcher.
         # The NCCL dispatcher uses allgathers. Thus there is a need to
         # run the same sized cuda-graph on every EP rank. This is difficult to
         # generalize for non-decode steps.
+        # The DeepEP V2 (epv2-release) path is graphable for both chunked prefill
+        # and decode, so it does not need this restriction.
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps and not self._nccl_ep_dispatcher
         )
@@ -621,15 +629,43 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
-        if get_pg_size(self.expert_model_parallel_group) > 1:
+        if ep_size > 1:
+            # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            # AllGather-style dispatchers must hold the full per-step worst case
+            # (any non-graphed prefill step can be up to max_tokens).
+            allgather_worst_case = self.round_up_tokens(self.max_tokens) // tp_size
             if self._nccl_ep_dispatcher:
                 NCCLAllGatherDispatcher.allocate_buffers()
+            elif self._deepep_v2_ep_dispatcher:
+                assert HAVE_DEEP_EP_V2, (
+                    "inference_moe_token_dispatcher_type='deepep_v2' requires deep_ep with "
+                    "ElasticBuffer (install from the epv2-release branch)."
+                )
+                # Pin the ElasticBuffer to the largest captured-graph shape, not
+                # the engine's global max_tokens. cuda_graph_max_tokens is asserted
+                # equal to max_requests * (num_speculative_tokens + 1) above, and
+                # mixed-prefill graphs reuse the same token-count granularity, so
+                # this covers every CUDA-graphed step. An eager (non-graphed)
+                # prefill step that exceeds this triggers a lazy reallocation
+                # inside _get_deepep_v2_buffer that grows the global buffer to the
+                # new high-water mark; the realloc itself is safe (runs outside
+                # graph capture), but the memory is held until process exit. Users
+                # running long prompts without chunked prefill therefore pay the
+                # NVLS-equivalent footprint at most once, the first time they hit
+                # a long step.
+                deepep_graph_cap = (
+                    self.max_requests * (self.num_speculative_tokens + 1)
+                )
+                prepare_deepep_v2_buffer(
+                    group=self.expert_model_parallel_group,
+                    num_max_tokens_per_rank=self.round_up_tokens(deepep_graph_cap) // tp_size,
+                    hidden=moe_hidden_size,
+                    num_topk=model_config.moe_router_topk,
+                )
             else:
-                # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
-                moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
                 NVLSAllGatherVDispatcher.allocate_buffers(
-                    per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
-                    // tp_size,
+                    per_rank_worst_case_token_count=allgather_worst_case,
                     topk=model_config.moe_router_topk,
                     hidden_size=moe_hidden_size,
                     ep_group=self.expert_model_parallel_group,

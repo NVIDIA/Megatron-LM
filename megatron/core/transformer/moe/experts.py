@@ -486,12 +486,21 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
 
-        if HAVE_FLASHINFER:
-            self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
-
-        self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
+        # When the inference dispatcher is DeepEP V2, the post-dispatch tensors are
+        # already in the per-expert grouped layout the parent TEGroupedMLP expects;
+        # the FlashInfer / mcore_fused_moe paths (which assume a gathered global
+        # tensor + valid_tokens mask) do not apply, so skip their activation
+        # resolution (which has narrower op support than the parent forward).
+        self._deepep_v2_dispatcher = (
+            config.inference_moe_token_dispatcher_type == 'deepep_v2'
+        )
+
+        if not self._deepep_v2_dispatcher:
+            if HAVE_FLASHINFER:
+                self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+            self._mcore_activation_type = self._resolve_mcore_activation_type()
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -675,6 +684,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
             assert (
                 not self.config.fp8_recipe == "mxfp8"
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
+            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+
+        if self._deepep_v2_dispatcher:
+            # DeepEP V2 dispatch already produced the grouped per-expert layout the
+            # parent TEGroupedMLP forward consumes (rows ordered by local expert,
+            # boundaries given by tokens_per_expert).
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         # Lazily build concatenated weights on first forward (after checkpoint load)

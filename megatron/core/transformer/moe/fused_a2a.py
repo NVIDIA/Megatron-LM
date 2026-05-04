@@ -298,7 +298,13 @@ def _get_deepep_v2_buffer(
     hidden: int,
     num_topk: int,
 ):
-    """Get or create a DeepEP V2 ElasticBuffer for MoE dispatch/combine."""
+    """Get or create a DeepEP V2 ElasticBuffer for MoE dispatch/combine.
+
+    Re-allocates if the existing buffer is too small for the requested layout.
+    Re-allocation is incompatible with CUDA graph capture, so the inference path
+    must call ``prepare_deepep_v2_buffer`` once at model init with worst-case
+    sizing to pin the buffer before any captured forward.
+    """
     global _deepep_v2_buffer
 
     required_bytes = ElasticBuffer.get_buffer_size_hint(
@@ -321,6 +327,37 @@ def _get_deepep_v2_buffer(
             use_fp8_dispatch=False,
         )
     return _deepep_v2_buffer
+
+
+def prepare_deepep_v2_buffer(
+    group: torch.distributed.ProcessGroup,
+    num_max_tokens_per_rank: int,
+    hidden: int,
+    num_topk: int,
+) -> None:
+    """Eagerly allocate the DeepEP V2 ElasticBuffer for the worst-case shape.
+
+    Call once at model init from outside any CUDA graph capture region, with
+    ``num_max_tokens_per_rank`` set to the largest per-rank token count any
+    captured graph will see. Subsequent dispatches must not exceed that bound.
+    """
+    if not HAVE_DEEP_EP_V2:
+        raise RuntimeError(
+            "prepare_deepep_v2_buffer requires deep_ep with ElasticBuffer (V2). "
+            "Install deep_ep from the epv2-release branch."
+        )
+    _get_deepep_v2_buffer(group, num_max_tokens_per_rank, hidden, num_topk)
+
+
+def _tokens_per_expert_from_psum(psum: torch.Tensor) -> torch.Tensor:
+    """Recover per-expert token counts from the device-resident inclusive prefix sum.
+
+    Avoids ``torch.tensor(handle.num_recv_tokens_per_expert_list)``, which is a
+    host->device copy that breaks CUDA graph capture. Valid when
+    ``expert_alignment == 1`` (alignment-padded == raw counts), which is the
+    setting used for both the training and inference paths here.
+    """
+    return torch.diff(psum, prepend=psum.new_zeros(1))
 
 
 def _get_deepep_v2_num_sms(
@@ -367,17 +404,21 @@ class DeepEPV2Dispatch(torch.autograd.Function):
         num_topk = token_indices.shape[1]
         buffer = _get_deepep_v2_buffer(group, num_max_tokens_per_rank, hidden, num_topk)
         num_sms = _get_deepep_v2_num_sms(buffer, group, num_experts, num_topk)
+        # Inference (use_expanded_layout=True) is the graph-capturable path: we
+        # must avoid the dispatch-side host sync, and we recover tokens_per_expert
+        # from the device-resident prefix-sum on the handle below.
+        do_cpu_sync = False if use_expanded_layout else None
         recv_x, recv_token_indices, recv_token_probs, handle, event = buffer.dispatch(
             x.contiguous(),
             topk_idx=token_indices,
             topk_weights=token_probs,
             num_experts=num_experts,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
-            expert_alignment=1 if use_expanded_layout else None,
+            expert_alignment=1,
             num_sms=num_sms,
             async_with_compute_stream=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
-            do_cpu_sync=True if use_expanded_layout else None,
+            do_cpu_sync=do_cpu_sync,
             do_expand=use_expanded_layout,
         )
         if use_expanded_layout:
@@ -395,7 +436,7 @@ class DeepEPV2Dispatch(torch.autograd.Function):
         ctx.hidden = hidden
         ctx.num_topk = num_topk
         ctx.num_sms = num_sms
-        tokens_per_expert = torch.tensor(handle.num_recv_tokens_per_expert_list)
+        tokens_per_expert = _tokens_per_expert_from_psum(handle.psum_num_recv_tokens_per_expert)
 
         return recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle
 

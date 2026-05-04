@@ -354,16 +354,33 @@ class MoELayer(BaseMoELayer):
 
         Called from __init__ when config.transformer_impl == "inference_optimized".
         Stores the training dispatcher and creates the inference dispatcher selected
-        by config.inference_moe_token_dispatcher_type ('nccl' or 'nvls').
+        by config.inference_moe_token_dispatcher_type:
+          - 'nccl' / 'nvls': swap to a dedicated AllGather-style inference dispatcher
+            in eval mode.
+          - 'deepep_v2': keep the training MoEFlexTokenDispatcher in eval mode; its
+            _DeepepManager already routes through DeepEP V2 ElasticBuffer and
+            switches to the gather-free expanded layout when grad is disabled.
         The active dispatcher is swapped automatically via the train() override:
         eval mode → inference dispatcher, train mode → standard dispatcher.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
+
+        self._training_token_dispatcher = self.token_dispatcher
+
+        if dispatcher_type == 'deepep_v2':
+            assert self.config.moe_token_dispatcher_type == 'flex', (
+                "inference_moe_token_dispatcher_type='deepep_v2' requires "
+                "moe_token_dispatcher_type='flex' (the DeepEP-backed dispatcher)."
+            )
+            # Reuse the training dispatcher directly. train() will be a no-op for
+            # the dispatcher; expanded-layout activation is gated on grad state
+            # inside _DeepepManager.dispatch.
+            self._inference_token_dispatcher = self.token_dispatcher
+            return
+
         dispatcher_cls = (
             NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
         )
-
-        self._training_token_dispatcher = self.token_dispatcher
         self._inference_token_dispatcher = dispatcher_cls(
             self.num_local_experts,
             self.local_expert_indices,
