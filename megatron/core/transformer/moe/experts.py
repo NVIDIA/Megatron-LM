@@ -59,7 +59,7 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
-from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 
 logger = logging.getLogger(__name__)
 
@@ -647,6 +647,24 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _vllm_forward(self, hidden_states, probs, routing_map):
+        """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
+        local_expert_start = self.ep_group.rank() * self.num_local_experts
+        output = vllm_fused_moe(
+            hidden_states,
+            probs,
+            self._fc1_weight,
+            self._fc2_weight,
+            activation_type=self._mcore_activation_type,
+            num_local_experts=self.num_local_experts,
+            local_expert_start=local_expert_start,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+            routing_map=routing_map,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+            num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
+        )
+        return output, None
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -696,6 +714,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
             return self._mcore_fused_moe_forward(
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
+            )
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
+            return self._vllm_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
 
