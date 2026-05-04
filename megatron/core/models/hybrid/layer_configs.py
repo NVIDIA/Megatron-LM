@@ -25,7 +25,7 @@ from megatron.core.models.hybrid.common_layer_config import (
 )
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 
 # ------------------------------------------------------------------- LAYERS
 
@@ -57,6 +57,12 @@ class LayerConfig:
     override common ``extra``, which overrides common curated fields."""
 
     SYMBOL: ClassVar[str]
+
+    TC_CLASS: ClassVar[type] = TransformerConfig
+    """The :class:`TransformerConfig` subclass used to materialise this
+    layer's per-layer config. Subclasses override (e.g.
+    :class:`DSALayerConfig` uses :class:`MLATransformerConfig`) when they
+    need fields that only live on a specialised subclass."""
 
     def _layer_specific_kwargs(self) -> Dict[str, Any]:
         """Return the layer-class-specific TransformerConfig kwargs."""
@@ -121,7 +127,7 @@ class LayerConfig:
         kwargs["num_layers"] = num_layers
         # Drop None values so TransformerConfig defaults apply.
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        return TransformerConfig(**kwargs)
+        return self.TC_CLASS(**kwargs)
 
 
 @dataclass
@@ -212,6 +218,12 @@ class DSALayerConfig(LayerConfig):
     """DeepSeek Sparse Attention / MLA layer (symbol ``D``).
 
     Cannot be combined with :class:`AttentionLayerConfig` in the same pattern.
+    The MLA-defining knobs (``q_lora_rank``, ``kv_lora_rank``,
+    ``qk_head_dim``, ``qk_pos_emb_head_dim``, ``v_head_dim``,
+    ``rotary_scaling_factor``) all default to ``None``, which means
+    "fall through to the underlying :class:`TransformerConfig` default";
+    DeepSeek-style models override them to the values the model card
+    specifies.
     """
 
     num_attention_heads: int = 1
@@ -227,7 +239,28 @@ class DSALayerConfig(LayerConfig):
     """Bias in the QKV projection only, overriding ``add_bias_linear`` for
     QKV. Mirrors the same field on :class:`AttentionLayerConfig`."""
 
+    q_lora_rank: Optional[int] = None
+    """Rank of the query tensor's low-rank representation."""
+
+    kv_lora_rank: Optional[int] = None
+    """Rank of the key/value tensors' low-rank representation."""
+
+    qk_head_dim: Optional[int] = None
+    """Dimension of the QK projection head. Together with
+    ``qk_pos_emb_head_dim`` this gives the full Q head dim
+    (``q_head_dim = qk_head_dim + qk_pos_emb_head_dim``)."""
+
+    qk_pos_emb_head_dim: Optional[int] = None
+    """Position-embedding portion of the QK projection head dim."""
+
+    v_head_dim: Optional[int] = None
+    """Dimension of the V projection head."""
+
+    rotary_scaling_factor: Optional[float] = None
+    """Rotary scaling factor for YaRN-style rope inside MLA."""
+
     SYMBOL: ClassVar[str] = Symbols.DS_ATTENTION
+    TC_CLASS: ClassVar[type] = MLATransformerConfig
 
     def _layer_specific_kwargs(self) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {
@@ -235,6 +268,12 @@ class DSALayerConfig(LayerConfig):
             "num_query_groups": self.num_query_groups,
             "kv_channels": self.kv_channels,
             "multi_latent_attention": True,
+            "q_lora_rank": self.q_lora_rank,
+            "kv_lora_rank": self.kv_lora_rank,
+            "qk_head_dim": self.qk_head_dim,
+            "qk_pos_emb_head_dim": self.qk_pos_emb_head_dim,
+            "v_head_dim": self.v_head_dim,
+            "rotary_scaling_factor": self.rotary_scaling_factor,
         }
         if self.add_qkv_bias is not None:
             kwargs["add_qkv_bias"] = self.add_qkv_bias
