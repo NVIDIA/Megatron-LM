@@ -601,6 +601,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config.inference_fuse_tp_communication
         )
         if using_fused_tp_inference_kernel:
+            # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
+            # operation in attention's out_proj (linear_proj)
             self._set_proj_residual(residual)
 
         nvtx_range_push(suffix="self_attention")
