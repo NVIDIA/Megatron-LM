@@ -62,6 +62,12 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     # so that experts.py can always call _valid_tokens() on this base class.
     _valid_tokens_tensor: Optional[torch.Tensor] = None
 
+    # Host-side estimate of the total valid token count across all EP ranks.
+    # Computed as local_tokens * ep_size to avoid a device-to-host sync (which
+    # would break CUDA graph capture).  This may differ from _valid_tokens_tensor
+    # when ranks have unequal token counts.
+    _host_valid_tokens_estimate: Optional[int] = None
+
     def __init__(self, *args, runs_metadata_sync: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._runs_metadata_sync = runs_metadata_sync
@@ -69,6 +75,10 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     @classmethod
     def _valid_tokens(cls) -> torch.Tensor:
         return cls._valid_tokens_tensor
+
+    @classmethod
+    def _get_host_valid_tokens_estimate(cls) -> Optional[int]:
+        return cls._host_valid_tokens_estimate
 
     def update_metadata(self, local_tokens: int) -> None:
         """Per-step metadata refresh fired from the first instance's token_dispatch.
@@ -145,9 +155,13 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
             cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(local_tokens_per_rank.sum())
+            total = local_tokens_per_rank.sum()
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(total)
+            InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = int(total.item())
         else:
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(ep_size * local_tokens)
+            total = ep_size * local_tokens
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(total)
+            InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = total
 
     def token_dispatch(self, hidden_states, probs):
         """Gather hidden_states, probs, and routing_map from all EP ranks.
@@ -288,7 +302,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _per_rank_worst_case_token_count: int = 2048  # round_up_tokens(max_tokens) // tp_size
 
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
-    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=bf16.
+    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=fp32.
     _symm_agv_hidden: Optional[dict] = None  # {"tensor": ..., "handle": ...}
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
@@ -372,8 +386,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.bfloat16)
-        ).maybe_get_tensor(rsv_shape, dtype=torch.bfloat16)
+            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
+        ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(
@@ -420,6 +434,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             cls._symm_agv_routing["tensor"].fill_(-1)
 
@@ -532,7 +547,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
         Args:
-            hidden_states: [global_max, hidden_size] bf16 expert outputs.
+            hidden_states: [global_max, hidden_size] expert outputs (fp32 when
+                written directly to the RSV buffer, bf16 otherwise).
 
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
@@ -547,7 +563,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         output = torch.empty(
             self._local_tokens,
             hidden_states.shape[1],
-            dtype=hidden_states.dtype,
+            dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
         multimem_reduce_scatter_v(
