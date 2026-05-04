@@ -28,6 +28,7 @@ from megatron.training.config.training_config import (
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.models import Serializable, HybridModelConfig
+from megatron.core._rank_utils import safe_get_world_size
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -247,3 +248,29 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+
+    def get_data_parallel_size(self, world_size: int) -> int:
+        """Calculate the data parallel size based on the model configuration."""
+        model_cfg = self.model
+        if hasattr(model_cfg, "dist_train") and getattr(model_cfg.dist_train, "use_dist_train", False) is True:
+            # use language world size to calculate data parallel size for dist train
+            world_size = model_cfg.dist_train.language_world_size
+        total_model_size = (
+            model_cfg.tensor_model_parallel_size
+            * model_cfg.pipeline_model_parallel_size
+            * model_cfg.context_parallel_size
+        )
+        assert world_size % total_model_size == 0, f"""
+        world size ({world_size}) is not divisible by total_model_size ({model_cfg.tensor_model_parallel_size=} * {model_cfg.pipeline_model_parallel_size=} * {model_cfg.context_parallel_size=})
+        """
+        return world_size // total_model_size
+
+    def set_data_parallel_size(self) -> None:
+        """Calculate and set data_parallel_size for this config.
+
+        This method calculates the data parallel size needed by setup methods, without
+        triggering full validation or finalization of Megatron Core configs.
+        """
+        # Calculate data parallel size (needed for comm overlap setup)
+        world_size = safe_get_world_size()
+        self.data_parallel_size = self.get_data_parallel_size(world_size)
