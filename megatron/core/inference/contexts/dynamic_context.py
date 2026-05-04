@@ -2283,12 +2283,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             n_active <= 0
             or self.paused_request_count != 0
             or self.num_prefill_requests != 0
-            or self.num_speculative_tokens != 0
         ):
             return False
 
+        tokens_per_request = self.num_speculative_tokens + 1
         batch_dimensions = InferenceBatchDimensions(
-            token_count=n_active,
+            token_count=n_active * tokens_per_request,
             prefill_req_count=0,
             decode_req_count=n_active,
         )
@@ -2305,20 +2305,49 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
         predicted_kv_offsets = request_kv_length_offsets_view + query_lengths_view
         request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
+        predicted_first_token_offsets = predicted_kv_offsets % self.block_size_tokens
+        if (
+            self.request_last_kv_block_offset[active_slice] + query_lengths_view
+            >= self.block_size_tokens
+        ).any():
+            return False
+        if (predicted_first_token_offsets > self.block_size_tokens - tokens_per_request).any():
+            return False
 
-        self.active_token_count = n_active
-        self.token_to_pos_ids[:n_active] = predicted_kv_offsets
-        self.token_to_request_idx[:n_active] = torch.arange(
-            self.paused_request_count, self.total_request_count, dtype=torch.int32, device='cpu'
-        )
-        self.token_to_position_in_request[:n_active] = predicted_kv_offsets
-        self.token_to_local_position_within_kv_block[:n_active] = (
-            predicted_kv_offsets % self.block_size_tokens
-        )
-        self.token_to_block_idx[:n_active] = self.request_last_kv_block_id[active_slice]
+        self.active_token_count = n_active * tokens_per_request
+        if tokens_per_request == 1:
+            token_positions = predicted_kv_offsets
+            token_request_idxs = torch.arange(
+                self.paused_request_count,
+                self.total_request_count,
+                dtype=torch.int32,
+                device='cpu',
+            )
+            token_block_idxs = self.request_last_kv_block_id[active_slice]
+        else:
+            token_positions = predicted_kv_offsets.repeat_interleave(
+                tokens_per_request
+            ) + torch.arange(tokens_per_request, device='cpu').repeat(n_active)
+            token_request_idxs = torch.arange(
+                self.paused_request_count,
+                self.total_request_count,
+                dtype=torch.int32,
+                device='cpu',
+            ).repeat_interleave(tokens_per_request)
+            token_block_idxs = self.request_last_kv_block_id[active_slice].repeat_interleave(
+                tokens_per_request
+            )
 
-        if n_active < self.padded_active_token_count:
-            pad_slice = slice(n_active, self.padded_active_token_count)
+        self.token_to_pos_ids[: self.active_token_count] = token_positions
+        self.token_to_request_idx[: self.active_token_count] = token_request_idxs
+        self.token_to_position_in_request[: self.active_token_count] = token_positions
+        self.token_to_local_position_within_kv_block[: self.active_token_count] = (
+            token_positions % self.block_size_tokens
+        )
+        self.token_to_block_idx[: self.active_token_count] = token_block_idxs
+
+        if self.active_token_count < self.padded_active_token_count:
+            pad_slice = slice(self.active_token_count, self.padded_active_token_count)
             self.token_to_block_idx[pad_slice] = self.kv_block_allocator.dummy_block_idx
             self.token_to_local_position_within_kv_block[pad_slice] = 0
             self.token_to_request_idx[pad_slice] = -1
@@ -2328,6 +2357,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.build_active_slices(
             min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
         )
+        self.pad_active_slices()
 
         padded_active = max(n_active, self.padded_active_request_count)
         self._staging_request_in_prefill_status[:n_active] = 0

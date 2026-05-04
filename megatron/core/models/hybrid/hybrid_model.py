@@ -366,7 +366,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
-            return super().__call__(*args, **kwargs)[0]
+            output = super().__call__(*args, **kwargs)
+            if (
+                isinstance(output, tuple)
+                and len(output) == 2
+                and self.config.mtp_num_layers is not None
+                and self.mtp_process
+            ):
+                logits, decoder_hidden_states = output
+                self._decoder_hidden_states_cache = decoder_hidden_states
+                return logits
+            return output[0]
         return super().__call__(*args, **kwargs)
 
     def create_mcore_cudagraph_manager(self, config):
@@ -560,7 +570,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if labels is None:
             # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
+            logits = logits.transpose(0, 1).contiguous()
+            if (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.num_speculative_tokens > 0
+                and self.mtp_process
+                and inference_context.using_cuda_graph_this_step()
+            ):
+                return logits, self._decoder_hidden_states_cache
+            return logits
 
         loss = self.compute_language_model_loss(labels, logits)
 

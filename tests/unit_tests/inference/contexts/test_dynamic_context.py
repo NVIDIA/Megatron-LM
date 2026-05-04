@@ -207,8 +207,9 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    @pytest.mark.parametrize("num_speculative_tokens", [0, 2])
     def test_prepare_async_decode_next_step_preserves_request_source_of_truth(
-        self, is_hybrid_model: bool
+        self, is_hybrid_model: bool, num_speculative_tokens: int
     ):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -221,6 +222,7 @@ class TestDynamicContext:
             max_tokens=None,
             num_cuda_graphs=1,
             is_hybrid_model=is_hybrid_model,
+            num_speculative_tokens=num_speculative_tokens,
         )
         dynamic_context.add_request(
             DynamicInferenceRequest(
@@ -230,18 +232,31 @@ class TestDynamicContext:
             )
         )
         dynamic_context.initialize_attention_state()
+        update_kwargs = {}
+        if num_speculative_tokens > 0:
+            update_kwargs["new_speculative_tokens"] = torch.tensor(
+                [[8], [9]], dtype=torch.long, device='cpu'
+            )
         dynamic_context.update_requests(
             active_requests_mask=torch.ones(1, dtype=torch.int32, device='cpu'),
             new_tokens=torch.tensor([7], dtype=torch.long, device='cpu'),
+            **update_kwargs,
         )
         dynamic_context.initialize_attention_state()
 
         original_kv_offsets = dynamic_context.request_kv_length_offsets.clone()
-        predicted_pos = (
+        tokens_per_request = num_speculative_tokens + 1
+        predicted_start_pos = (
             dynamic_context.request_kv_length_offsets[0]
             + dynamic_context.request_query_lengths[0]
         ).item()
-        dynamic_context.gpu_view.token_to_input_ids[0].fill_(77)
+        expected_positions = torch.arange(
+            predicted_start_pos,
+            predicted_start_pos + tokens_per_request,
+            dtype=dynamic_context.token_to_pos_ids.dtype,
+            device='cpu',
+        )
+        dynamic_context.gpu_view.token_to_input_ids[:tokens_per_request].fill_(77)
 
         assert dynamic_context.prepare_async_decode_next_step()
         h2d_done = dynamic_context.transfer_bookkeeping_to_gpu(
@@ -252,10 +267,21 @@ class TestDynamicContext:
         h2d_done.synchronize()
 
         assert torch.equal(dynamic_context.request_kv_length_offsets, original_kv_offsets)
-        assert dynamic_context.token_to_pos_ids[0].item() == predicted_pos
-        assert dynamic_context._staging_request_kv_length_offsets[0].item() == predicted_pos
-        assert dynamic_context.gpu_view.token_to_input_ids[0].item() == 77
-        assert dynamic_context.gpu_view.token_to_pos_ids[0].item() == predicted_pos
+        assert dynamic_context.active_token_count == tokens_per_request
+        assert torch.equal(
+            dynamic_context.token_to_pos_ids[:tokens_per_request], expected_positions
+        )
+        assert (
+            dynamic_context._staging_request_kv_length_offsets[0].item() == predicted_start_pos
+        )
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_input_ids[:tokens_per_request].cpu(),
+            torch.full((tokens_per_request,), 77, dtype=torch.long),
+        )
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_pos_ids[:tokens_per_request].cpu(),
+            expected_positions,
+        )
         if is_hybrid_model:
             assert dynamic_context._pending_mamba_transfer is None
 

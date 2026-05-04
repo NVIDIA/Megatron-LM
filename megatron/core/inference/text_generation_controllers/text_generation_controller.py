@@ -182,6 +182,7 @@ class TextGenerationController:
         self._async_decode_graph_capture_failed_reason = None
         self._async_decode_graphs: Dict[InferenceBatchDimensions, _AsyncDecodeGraph] = {}
         self._async_pending_sampled_tokens_cpu = None
+        self._async_pending_sampled_mtp_tokens_cpu = None
         self._async_pending_sample_ready_event = None
         self._async_pending_h2d_done_event = None
         self._async_pending_sample_cuda_graph_request_count = None
@@ -201,6 +202,15 @@ class TextGenerationController:
         self._async_sampled_tokens_cpu = torch.empty(
             max_requests, dtype=torch.int64, device='cpu', pin_memory=True
         )
+        if self.num_speculative_tokens > 0:
+            self._async_sampled_mtp_tokens_cpu = torch.empty(
+                [self.num_speculative_tokens, max_requests],
+                dtype=torch.int64,
+                device='cpu',
+                pin_memory=True,
+            )
+        else:
+            self._async_sampled_mtp_tokens_cpu = None
         self._async_sample_source_ready_event = torch.cuda.Event()
         self._async_sample_ready_event = torch.cuda.Event()
         self._async_copy_stream = torch.cuda.Stream(device=device)
@@ -1029,8 +1039,11 @@ class TextGenerationController:
             next_token_ids = spec_tokens
             nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}")
 
-        # Clean up cached hidden states.
-        if has_mtp:
+        # Clean up cached hidden states in eager mode. Hybrid full-model CUDA
+        # graphs refresh this graph-backed tensor on replay without re-running
+        # the Python assignment that creates the attribute, so keep the handle
+        # alive while graph replay is active.
+        if has_mtp and not context.using_cuda_graph_this_step():
             del unwrapped_model._decoder_hidden_states_cache
 
     def _sample_speculative_logits(
@@ -1276,15 +1289,38 @@ class TextGenerationController:
                 self._sampled_tokens_cuda[:active_request_count],
             ),
         )
-        context.gpu_view.token_to_input_ids[:active_request_count].copy_(
-            self._sampled_tokens_cuda[:active_request_count]
+        self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
+
+    def _copy_sampled_decode_tokens_to_next_input_ids(
+        self, active_request_count: Optional[int] = None
+    ) -> None:
+        """Write sampled decode tokens into the next-step GPU input-id buffer."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if active_request_count is None
+            else active_request_count
+        )
+        tokens_per_request = self.num_speculative_tokens + 1
+        if tokens_per_request == 1:
+            context.gpu_view.token_to_input_ids[:active_request_count].copy_(
+                self._sampled_tokens_cuda[:active_request_count]
+            )
+            return
+
+        token_ids = context.gpu_view.token_to_input_ids[
+            : active_request_count * tokens_per_request
+        ].view(active_request_count, tokens_per_request)
+        token_ids[:, 0].copy_(self._sampled_tokens_cuda[:active_request_count])
+        token_ids[:, 1:].copy_(
+            self._sampled_mtp_tokens_cuda[:, :active_request_count].transpose(0, 1)
         )
 
     def _async_transfer_samples_to_cpu(
         self,
         active_request_count: int,
         sample_source_ready_event: Optional[torch.cuda.Event] = None,
-    ) -> Tuple[Tensor, torch.cuda.Event]:
+    ) -> Tuple[Tensor, Optional[Tensor], torch.cuda.Event]:
         """Copy sampled tokens to pinned CPU memory without blocking the default stream."""
         if sample_source_ready_event is None:
             current_stream = torch.cuda.current_stream()
@@ -1295,9 +1331,23 @@ class TextGenerationController:
             self._async_sampled_tokens_cpu[:active_request_count].copy_(
                 self._sampled_tokens_cuda[:active_request_count], non_blocking=True
             )
+            if self.num_speculative_tokens > 0:
+                self._async_sampled_mtp_tokens_cpu[:, :active_request_count].copy_(
+                    self._sampled_mtp_tokens_cuda[:, :active_request_count],
+                    non_blocking=True,
+                )
             self._async_sample_ready_event.record(self._async_copy_stream)
         self._async_last_sample_copy_done_event = self._async_sample_ready_event
-        return self._async_sampled_tokens_cpu[:active_request_count], self._async_sample_ready_event
+        sampled_mtp_tokens_cpu = (
+            self._async_sampled_mtp_tokens_cpu[:, :active_request_count]
+            if self.num_speculative_tokens > 0
+            else None
+        )
+        return (
+            self._async_sampled_tokens_cpu[:active_request_count],
+            sampled_mtp_tokens_cpu,
+            self._async_sample_ready_event,
+        )
 
     def capture_async_decode_graphs(self) -> None:
         """Capture async decode graphs that fuse greedy sampling, H2D metadata, and forward."""
@@ -1399,41 +1449,68 @@ class TextGenerationController:
 
     def _try_launch_async_decode_graph(
         self, active_request_count: int
-    ) -> Tuple[bool, Optional[Tensor], Optional[torch.cuda.Event], Optional[torch.cuda.Event], bool]:
+    ) -> Tuple[
+        bool,
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[torch.cuda.Event],
+        Optional[torch.cuda.Event],
+        bool,
+    ]:
         """Prepare next-step metadata and launch a captured async decode graph if possible."""
         context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason()
         if self._async_disable_reason is not None:
-            return False, None, None, None, False
+            return False, None, None, None, None, False
 
         range_push("async_prepare_next_step")
         async_next_prepared = context.prepare_async_decode_next_step()
         range_pop()
         if not async_next_prepared:
             self._async_disable_reason = "failed to prepare next-step metadata"
-            return False, None, None, None, False
+            return False, None, None, None, None, False
 
         async_decode_graph = self._get_async_decode_graph()
         if async_decode_graph is None:
             self._async_disable_reason = "async decode graph not captured"
-            return True, None, None, None, False
+            return True, None, None, None, None, False
 
         range_push("async_decode_graph_launch")
         self._launch_async_decode_graph(async_decode_graph)
         range_pop()
-        async_sampled_tokens_cpu, async_sample_ready_event = self._async_transfer_samples_to_cpu(
-            active_request_count,
-            async_decode_graph.sample_ready_event,
+        (
+            async_sampled_tokens_cpu,
+            async_sampled_mtp_tokens_cpu,
+            async_sample_ready_event,
+        ) = self._async_transfer_samples_to_cpu(
+            active_request_count, async_decode_graph.sample_ready_event
         )
         return (
             True,
             async_sampled_tokens_cpu,
+            async_sampled_mtp_tokens_cpu,
             async_sample_ready_event,
             async_decode_graph.h2d_done_event,
             True,
         )
 
-    def _async_scheduling_disabled_reason(self) -> Optional[str]:
+    def _try_prepare_async_decode_after_sampling(self) -> bool:
+        """Prepare next-step metadata for an async forward launched after sampling."""
+        context = self.inference_wrapped_model.inference_context
+        self._async_disable_reason = self._async_scheduling_disabled_reason(allow_mtp=True)
+        if self._async_disable_reason is not None:
+            return False
+
+        range_push("async_prepare_next_step")
+        async_next_prepared = context.prepare_async_decode_next_step()
+        range_pop()
+        if not async_next_prepared:
+            self._async_disable_reason = "failed to prepare next-step metadata"
+            return False
+
+        return True
+
+    def _async_scheduling_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return why async scheduling cannot be used for the current step, or None."""
         context = self.inference_wrapped_model.inference_context
         if not self._async_scheduling_enabled:
@@ -1452,8 +1529,13 @@ class TextGenerationController:
             return "logging sync is enabled"
         if not context.config.materialize_only_last_token_logits:
             return "logprob logits are unsupported"
-        if self.num_speculative_tokens != 0:
-            return "mtp speculative decoding is unsupported"
+        if self.num_speculative_tokens != 0 and not allow_mtp:
+            return "mtp pre-sampling graph is unsupported"
+        if (
+            self.num_speculative_tokens != 0
+            and self._num_mtp_depths != self.num_speculative_tokens
+        ):
+            return "not enough mtp heads"
         if self._sampling_backend != "torch":
             return "sampling backend is unsupported"
         if not context.is_decode_only():
@@ -1489,14 +1571,28 @@ class TextGenerationController:
 
         active_sequence_lengths = context.get_active_sequence_lengths()
         max_sequence_lengths = context.get_max_sequence_lengths()
-        if torch.ge(active_sequence_lengths + 1, max_sequence_lengths).any():
+        tokens_per_request = self.num_speculative_tokens + 1
+        if torch.ge(active_sequence_lengths + tokens_per_request, max_sequence_lengths).any():
             return "request can finish by length"
 
         request_slice = slice(context.paused_request_count, context.total_request_count)
+        request_query_lengths = context.request_query_lengths[request_slice]
+        request_last_offsets = context.request_last_kv_block_offset[request_slice]
         if (
-            context.request_last_kv_block_offset[request_slice] >= context.block_size_tokens - 1
+            request_last_offsets + request_query_lengths >= context.block_size_tokens
         ).any():
+            return "current query can cross a kv block boundary"
+        next_token_offsets = (
+            context.request_kv_length_offsets[request_slice] + request_query_lengths
+        ) % context.block_size_tokens
+        if (next_token_offsets > context.block_size_tokens - tokens_per_request).any():
             return "request is at a kv block boundary"
+
+        if (
+            context.padded_batch_dimensions.token_count
+            != context.padded_batch_dimensions.decode_req_count * tokens_per_request
+        ):
+            return "cuda graph shape does not match decode stride"
 
         return None
 
@@ -2175,6 +2271,7 @@ class TextGenerationController:
         async_sample_ready_event = None
         async_h2d_done_event = None
         async_sampled_tokens_cpu = None
+        async_sampled_mtp_tokens_cpu = None
         async_sample_already_launched = False
         input_ids = None
         pending_async_sample = self._async_pending_sampled_tokens_cpu is not None
@@ -2184,9 +2281,11 @@ class TextGenerationController:
             async_sample_already_launched = True
             cuda_graph_request_count = self._async_pending_sample_cuda_graph_request_count
             async_sampled_tokens_cpu = self._async_pending_sampled_tokens_cpu
+            async_sampled_mtp_tokens_cpu = self._async_pending_sampled_mtp_tokens_cpu
             async_sample_ready_event = self._async_pending_sample_ready_event
             async_h2d_done_event = self._async_pending_h2d_done_event
             self._async_pending_sampled_tokens_cpu = None
+            self._async_pending_sampled_mtp_tokens_cpu = None
             self._async_pending_sample_ready_event = None
             self._async_pending_h2d_done_event = None
             self._async_pending_sample_cuda_graph_request_count = None
@@ -2197,6 +2296,8 @@ class TextGenerationController:
                     cuda_graph_request_count = self._async_pending_cuda_graph_request_count
                     self._async_pending_forward = False
                     self._async_pending_cuda_graph_request_count = None
+                    if self.num_speculative_tokens > 0:
+                        input_ids, _ = context.current_input_and_position_ids()
                 else:
                     input_ids, position_ids = self._dynamic_step_context_init()
 
@@ -2234,6 +2335,7 @@ class TextGenerationController:
                 (
                     async_next_prepared,
                     async_sampled_tokens_cpu,
+                    async_sampled_mtp_tokens_cpu,
                     async_sample_ready_event,
                     async_h2d_done_event,
                     async_sample_already_launched,
@@ -2286,13 +2388,19 @@ class TextGenerationController:
                 # Phase 4: Release freed blocks. Deferred from Phase 2 so the
                 # data-dependent boolean-mask sync overlaps with MTP GPU work.
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+
+                async_next_prepared = self._try_prepare_async_decode_after_sampling()
+                if async_next_prepared:
+                    self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
             else:
                 self._dynamic_step_sample_logits()
 
             if async_next_prepared and not async_sample_already_launched:
-                async_sampled_tokens_cpu, async_sample_ready_event = (
-                    self._async_transfer_samples_to_cpu(active_request_count)
-                )
+                (
+                    async_sampled_tokens_cpu,
+                    async_sampled_mtp_tokens_cpu,
+                    async_sample_ready_event,
+                ) = self._async_transfer_samples_to_cpu(active_request_count)
                 range_push("async_transfer_bookkeeping_to_gpu")
                 async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
                     include_token_to_input_ids=False,
@@ -2347,6 +2455,7 @@ class TextGenerationController:
                 # tensor produced by _transfer_samples_to_cpu.
                 request_bookkeeping = self._dynamic_step_context_bookkeeping(
                     sampled_tokens_cpu=async_sampled_tokens_cpu,
+                    sampled_mtp_tokens_cpu=async_sampled_mtp_tokens_cpu,
                     sample_ready_event=async_sample_ready_event,
                     h2d_done_event=async_h2d_done_event,
                 )
@@ -2362,6 +2471,7 @@ class TextGenerationController:
                     (
                         _,
                         pending_sampled_tokens_cpu,
+                        pending_sampled_mtp_tokens_cpu,
                         pending_sample_ready_event,
                         pending_h2d_done_event,
                         pending_sample_launched,
@@ -2372,6 +2482,9 @@ class TextGenerationController:
                         assert pending_h2d_done_event is not None
                         self._async_chained_decode_graph_launch_count += 1
                         self._async_pending_sampled_tokens_cpu = pending_sampled_tokens_cpu
+                        self._async_pending_sampled_mtp_tokens_cpu = (
+                            pending_sampled_mtp_tokens_cpu
+                        )
                         self._async_pending_sample_ready_event = pending_sample_ready_event
                         self._async_pending_h2d_done_event = pending_h2d_done_event
                         self._async_pending_sample_cuda_graph_request_count = (
