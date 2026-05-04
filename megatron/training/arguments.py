@@ -349,16 +349,22 @@ def _apply_model_recipe_to_args(args):
     args._compiled_model_recipe = compiled
 
     cfg = compiled.config
+    # Topology fields read from ``compiled`` (recipe-side, ``Optional[int]``)
+    # rather than ``cfg`` (substituted concrete values): the unset/None
+    # contract on the recipe means "defer to the launcher's CLI flag", and
+    # the ``if value is not None`` skip below relies on that distinction.
+    # ``cfg.<topology>`` is always concrete (TC requires it) and would
+    # silently overwrite the CLI value.
     recipe_values = {
         "num_layers": cfg.num_layers,
         "hidden_size": cfg.hidden_size,
         "num_attention_heads": cfg.num_attention_heads,
         "max_position_embeddings": compiled.max_sequence_length,
         "padded_vocab_size": compiled.vocab_size,
-        "tensor_model_parallel_size": cfg.tensor_model_parallel_size,
-        "context_parallel_size": cfg.context_parallel_size,
-        "expert_model_parallel_size": cfg.expert_model_parallel_size,
-        "expert_tensor_parallel_size": cfg.expert_tensor_parallel_size,
+        "tensor_model_parallel_size": compiled.tensor_model_parallel_size,
+        "context_parallel_size": compiled.context_parallel_size,
+        "expert_model_parallel_size": compiled.expert_model_parallel_size,
+        "expert_tensor_parallel_size": compiled.expert_tensor_parallel_size,
         "position_embedding_type": compiled.position_embedding_type,
         "rotary_percent": compiled.rotary_percent,
         "rotary_base": compiled.rotary_base,
