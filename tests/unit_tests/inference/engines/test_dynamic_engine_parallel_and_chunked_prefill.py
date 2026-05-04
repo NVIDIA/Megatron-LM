@@ -1119,7 +1119,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         def step_and_sample():
             nonlocal max_ref_seen
             env.engine.step_modern()
-            max_ref_seen = max(max_ref_seen, int(context.kv_block_allocator.block_ref_counts.max()))
+            max_ref_seen = max(max_ref_seen, int(context.kv_block_allocator.pc_state.block_ref_counts.max()))
 
         with self._record_mtp_kv_writes(context) as (_written, shared_writes):
             add_request(0)
