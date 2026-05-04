@@ -2284,7 +2284,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             or self.paused_request_count != 0
             or self.num_prefill_requests != 0
             or self.num_speculative_tokens != 0
-            or self.is_hybrid_model
         ):
             return False
 
@@ -2293,7 +2292,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefill_req_count=0,
             decode_req_count=n_active,
         )
-        best_graph = self._match_cuda_graph_batch_dimensions(batch_dimensions, strict=False)
+        best_graph = self._match_cuda_graph_batch_dimensions(
+            batch_dimensions, strict=self.is_hybrid_model
+        )
         if not self._configure_step_batch_dimensions(
             batch_dimensions, best_graph, allow_eager_fallback=False
         ):
@@ -2337,13 +2338,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._staging_request_query_lengths[n_active:padded_active] = 0
             self._staging_request_kv_length_offsets[n_active:padded_active] = 0
 
+        attn_dimensions = self._attention_batch_dimensions(batch_dimensions)
         self._prepare_mha_metadata(
-            attn_dimensions=batch_dimensions,
+            attn_dimensions=attn_dimensions,
             query_lengths_view=query_lengths_view,
             kv_length_offsets_view=predicted_kv_offsets,
             request_to_kv_block_ids_view=request_to_kv_block_ids_view,
         )
-        self._prepare_mamba_metadata(active_slice=active_slice, attn_dimensions=batch_dimensions)
+        self._prepare_mamba_metadata(active_slice=active_slice, attn_dimensions=attn_dimensions)
         self._prepare_moe_metadata_recording()
         return True
 

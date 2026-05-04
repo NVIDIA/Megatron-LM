@@ -134,6 +134,7 @@ class DynamicEngineTestConfig:
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
+    moe_pad_experts_for_cuda_graph_inference: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -347,6 +348,9 @@ class DynamicInferenceEngineTestBase:
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -420,6 +424,9 @@ class DynamicInferenceEngineTestBase:
                 transformer_impl=test_config.transformer_impl,
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
+                ),
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
                 ),
                 normalization=(
                     "RMSNorm"
@@ -689,15 +696,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_async_scheduling_decode_only_cuda_graph_e2e(self) -> None:
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    def test_async_scheduling_decode_only_cuda_graph_e2e(self, model_provider: str) -> None:
         """Async scheduling matches serial decode output and launches speculative forwards."""
+        skip_if_mamba_sequence_packing_not_available(model_provider)
         common_kwargs = dict(
             num_requests=4,
             min_prompt_length=4,
             max_prompt_length=4,
             num_tokens_to_generate=4,
             num_gap_steps=0,
-            model_provider="gpt",
+            model_provider=model_provider,
             num_cuda_graphs=1,
             cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
             force_build_cuda_graphs=True,
@@ -4548,6 +4557,55 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             ), f"Request {request.request_id}: status={request.status}"
             num_expected = request.sampling_params.num_tokens_to_generate
             assert len(request.generated_tokens) <= num_expected
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_scheduling_decode_only_moe_ep_cuda_graph_e2e(self) -> None:
+        """Async scheduling matches serial decode output for MoE expert parallel decode."""
+        ep_size = 2
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else Utils.world_size
+        )
+        if world_size < ep_size:
+            pytest.skip(f"Test requires at least {ep_size} GPUs")
+
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            model_provider="gpt",
+            expert_model_parallel_size=ep_size,
+            moe_pad_experts_for_cuda_graph_inference=True,
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+
+        assert (
+            async_env.engine.controller._async_forward_launch_count > 0
+        ), async_env.engine.controller._async_disable_reason
+        assert (
+            async_env.engine.controller._async_decode_graph_launch_count > 0
+        ), async_env.engine.controller._async_decode_graph_capture_failed_reason
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
 
 CHUNKED_CG_BLOCK_SIZE = 256

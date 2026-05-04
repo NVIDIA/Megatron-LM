@@ -206,7 +206,10 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_prepare_async_decode_next_step_preserves_request_source_of_truth(self):
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    def test_prepare_async_decode_next_step_preserves_request_source_of_truth(
+        self, is_hybrid_model: bool
+    ):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -217,6 +220,7 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
             num_cuda_graphs=1,
+            is_hybrid_model=is_hybrid_model,
         )
         dynamic_context.add_request(
             DynamicInferenceRequest(
@@ -252,6 +256,8 @@ class TestDynamicContext:
         assert dynamic_context._staging_request_kv_length_offsets[0].item() == predicted_pos
         assert dynamic_context.gpu_view.token_to_input_ids[0].item() == 77
         assert dynamic_context.gpu_view.token_to_pos_ids[0].item() == predicted_pos
+        if is_hybrid_model:
+            assert dynamic_context._pending_mamba_transfer is None
 
     @pytest.mark.internal
     @rounder_override(64)

@@ -1444,12 +1444,6 @@ class TextGenerationController:
             return "requires full-iteration inference cuda graphs"
         if self.model_is_pipeline_parallel:
             return "pipeline parallel is unsupported"
-        if self.model_config.expert_model_parallel_size > 1:
-            return "expert parallel is unsupported"
-        if getattr(self.model_config, "num_moe_experts", None) is not None:
-            return "moe is unsupported"
-        if context.is_hybrid_model:
-            return "hybrid models are unsupported"
         if context.config.enable_prefix_caching:
             return "prefix caching is unsupported"
         if context.config.enable_chunked_prefill:
