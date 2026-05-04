@@ -1440,7 +1440,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # CUDA-graph machinery (which can't handle a CheckpointWithoutOutputManager).
         # forward() reads the value back from self.
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
-        kwargs.pop("is_last_layer_in_recompute_block", None)
         return super().__call__(*args, **kwargs)
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
