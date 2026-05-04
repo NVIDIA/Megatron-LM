@@ -3,6 +3,7 @@ import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
+from megatron.training.utils import print_rank_0
 
 
 @dataclass(kw_only=True)
@@ -107,6 +108,22 @@ class TrainingConfig:
 
     iterations_to_skip: list[int] = field(default_factory=list)
     """List of 1-indexed iterations to skip during training, empty by default."""
+
+    def finalize(self) -> None:
+        """Validate training mode specification and calculate train_iters from train_samples if needed."""
+        has_train_iters = self.train_iters is not None
+        has_train_samples = self.train_samples is not None
+
+        assert has_train_iters or has_train_samples, "Either train_iters or train_samples must be provided"
+        assert not (has_train_iters and has_train_samples), "Cannot specify both train_iters and train_samples"
+        if has_train_samples:
+            assert self.train_samples > 0, "train_samples must be positive"
+            assert self.rampup_batch_size is None, "Batch size rampup not supported with sample-based training yet"
+
+            # Calculate train_iters from train_samples (rampup_batch_size already validated as None)
+            assert self.global_batch_size is not None, "global_batch_size must be set when using train_samples"
+            self.train_iters = self.train_samples // self.global_batch_size
+            print_rank_0(f"Setting training iterations to {self.train_iters} based on {self.train_samples} samples")
 
 
 @dataclass(kw_only=True)
