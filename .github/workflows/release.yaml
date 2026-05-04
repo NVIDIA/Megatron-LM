@@ -78,7 +78,9 @@ jobs:
   bump:
     needs: [pre-flight]
     if: |
-      github.repository == 'NVIDIA/Megatron-LM'
+      !cancelled()
+      && (needs.pre-flight.result == 'success' || needs.pre-flight.result == 'skipped')
+      && github.repository == 'NVIDIA/Megatron-LM'
       && (
         github.event_name == 'workflow_dispatch'
         || !(needs.pre-flight.outputs.docs_only == 'true'
@@ -107,14 +109,15 @@ jobs:
   build-test-publish-wheels:
     needs: [pre-flight, bump]
     if: |
-      github.repository == 'NVIDIA/Megatron-LM'
+      !cancelled()
+      && (needs.pre-flight.result == 'success' || needs.pre-flight.result == 'skipped')
+      && needs.bump.result == 'success'
+      && github.repository == 'NVIDIA/Megatron-LM'
       && (
         github.event_name == 'workflow_dispatch'
         || !(needs.pre-flight.outputs.docs_only == 'true'
              || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       )
-      && (success() || !failure())
-      && !cancelled()
     uses: ./.github/workflows/_build_test_publish_wheel.yml
     with:
       ref: ${{ inputs.release-ref || github.sha }}
