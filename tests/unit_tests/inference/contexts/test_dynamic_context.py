@@ -382,6 +382,66 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    @pytest.mark.parametrize("active_mask", [[1, 1], [1, 0], [0, 1], [0, 0]])
+    def test_async_boundary_block_reconciliation_matrix(self, active_mask):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=512,
+            buffer_size_gb=1.0,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_cuda_graphs=1,
+        )
+        for request_id in range(2):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(0, 127, dtype=torch.long, device='cpu'),
+                    sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+                )
+            )
+        dynamic_context.initialize_attention_state()
+        dynamic_context.update_requests(
+            active_requests_mask=torch.ones(2, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([7, 8], dtype=torch.long, device='cpu'),
+        )
+        dynamic_context.initialize_attention_state()
+
+        assert dynamic_context.prepare_async_decode_next_step()
+        reserved_by_request = {
+            int(dynamic_context._async_reserved_kv_block_request_ids[idx]): int(
+                dynamic_context._async_reserved_kv_block_ids[idx]
+            )
+            for idx in range(dynamic_context._async_reserved_kv_block_count)
+        }
+
+        active_mask_tensor = torch.tensor(active_mask, dtype=torch.int32, device='cpu')
+        dynamic_context.update_requests(
+            active_requests_mask=active_mask_tensor,
+            new_tokens=torch.tensor([9, 10], dtype=torch.long, device='cpu'),
+        )
+
+        expected_active_ids = [idx for idx, is_active in enumerate(active_mask) if is_active]
+        expected_finished_ids = [idx for idx, is_active in enumerate(active_mask) if not is_active]
+        assert dynamic_context.request_ids[: len(expected_active_ids)].tolist() == expected_active_ids
+        assert dynamic_context._async_reserved_kv_block_adoption_count == len(expected_active_ids)
+        assert dynamic_context._async_deferred_kv_blocks_to_release.tolist() == [
+            reserved_by_request[request_id] for request_id in expected_finished_ids
+        ]
+        for row, request_id in enumerate(expected_active_ids):
+            assert dynamic_context.request_kv_block_counts[row].item() == 2
+            assert dynamic_context.request_to_kv_block_ids[row, 1].item() == reserved_by_request[
+                request_id
+            ]
+
+        dynamic_context.release_deferred_async_kv_blocks()
+        assert dynamic_context._async_deferred_kv_blocks_to_release.numel() == 0
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_is_memory_available(self, is_hybrid_model):
 
