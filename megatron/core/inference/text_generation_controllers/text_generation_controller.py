@@ -2423,7 +2423,10 @@ class TextGenerationController:
         termination_ids = context.active_request_metadata["termination_id"][:active_request_count]
         termination_enabled = termination_ids >= 0
         termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
-        if self.num_speculative_tokens > 0:
+        if self.num_speculative_tokens > 0 and termination_enabled.any().item():
+            # Avoid a per-step CUDA sync in the common fixed-length MTP path.
+            # Accepted speculative tokens only need to be inspected when at
+            # least one active request can terminate by token id.
             accepted_tokens_cpu = self._accepted_tokens_per_request[:active_request_count].cpu()
             termination_hit |= termination_enabled & (
                 accepted_tokens_cpu == termination_ids[:, None]

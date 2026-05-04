@@ -1103,6 +1103,109 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert finished_request.status == Status.COMPLETED
         assert finished_request.generated_tokens == [4, 7]
 
+    @pytest.mark.internal
+    def test_async_mtp_active_mask_skips_accepted_token_sync_without_termination(
+        self, monkeypatch
+    ) -> None:
+        """Fixed-length MTP bookkeeping does not copy accepted tokens back to CPU."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                num_speculative_tokens=2,
+                model_provider="gpt",
+                context_max_requests=4,
+            )
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        captured = {}
+
+        class CpuForbiddenAcceptedTokens:
+            def __getitem__(self, _):
+                return self
+
+            def cpu(self):
+                raise AssertionError("accepted MTP tokens should not be synchronized")
+
+        def fake_update_requests(active_request_mask, new_sample, sampled_mtp_tokens):
+            captured["active_request_mask"] = active_request_mask.clone()
+            return {
+                "newly_paused_request_ids": torch.empty(0, dtype=torch.long),
+                "evict_request_ids": torch.empty(0, dtype=torch.long),
+            }
+
+        with torch.inference_mode():
+            context.total_request_count = 1
+            context.paused_request_count = 0
+            context.request_ids[0] = 11
+            context.active_request_metadata["termination_id"][0] = -1
+
+        monkeypatch.setattr(
+            context, "get_active_sequence_lengths", lambda: torch.tensor([4], device='cpu')
+        )
+        monkeypatch.setattr(
+            context, "get_max_sequence_lengths", lambda: torch.tensor([10], device='cpu')
+        )
+        monkeypatch.setattr(context, "update_requests", fake_update_requests)
+        controller._accepted_tokens_per_request = CpuForbiddenAcceptedTokens()
+
+        result = controller._dynamic_step_context_bookkeeping(
+            sampled_tokens_cpu=torch.tensor([5], dtype=torch.long),
+            sampled_mtp_tokens_cpu=torch.tensor([[6], [7]], dtype=torch.long),
+        )
+
+        assert captured["active_request_mask"].tolist() == [1]
+        assert result["finished_request_ids"].numel() == 0
+
+    @pytest.mark.internal
+    def test_async_mtp_active_mask_detects_accepted_token_termination(self, monkeypatch) -> None:
+        """MTP bookkeeping still finishes requests on accepted speculative EOS tokens."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                num_speculative_tokens=2,
+                model_provider="gpt",
+                context_max_requests=4,
+            )
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        captured = {}
+
+        def fake_update_requests(active_request_mask, new_sample, sampled_mtp_tokens):
+            captured["active_request_mask"] = active_request_mask.clone()
+            return {
+                "newly_paused_request_ids": torch.empty(0, dtype=torch.long),
+                "evict_request_ids": torch.empty(0, dtype=torch.long),
+            }
+
+        with torch.inference_mode():
+            context.total_request_count = 1
+            context.paused_request_count = 0
+            context.request_ids[0] = 17
+            context.active_request_metadata["termination_id"][0] = 7
+            controller._accepted_tokens_per_request = torch.tensor(
+                [[7, -1], [-1, -1], [-1, -1], [-1, -1]],
+                dtype=torch.long,
+                device='cuda',
+            )
+
+        monkeypatch.setattr(
+            context, "get_active_sequence_lengths", lambda: torch.tensor([4], device='cpu')
+        )
+        monkeypatch.setattr(
+            context, "get_max_sequence_lengths", lambda: torch.tensor([10], device='cpu')
+        )
+        monkeypatch.setattr(context, "update_requests", fake_update_requests)
+
+        result = controller._dynamic_step_context_bookkeeping(
+            sampled_tokens_cpu=torch.tensor([5], dtype=torch.long),
+            sampled_mtp_tokens_cpu=torch.tensor([[7], [8]], dtype=torch.long),
+        )
+
+        assert captured["active_request_mask"].tolist() == [0]
+        assert result["finished_request_ids"].tolist() == [17]
+
     def _run_async_mtp_finish_boundary_e2e(self, model_provider: str) -> None:
         skip_if_mamba_sequence_packing_not_available(model_provider)
         common_kwargs = dict(
