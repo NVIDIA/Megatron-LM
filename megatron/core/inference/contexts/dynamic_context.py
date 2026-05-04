@@ -2855,14 +2855,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_idx = self.mamba_metadata.allocate_slot()
             if mamba_idx is None:
                 raise ContextOverflowError(req.request_id, "No Mamba slots available")
-            self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
+
+            # NOTE: This branch is guaranteed to run with `current_id == total_request_count`.
+            self.mamba_metadata.request_to_mamba_state_idx[current_id] = mamba_idx
 
             # Restore Mamba state from the block corresponding to prefix_skip_tokens
             restore_block_count = prefix_skip_tokens // self.block_size_tokens
             if restore_block_count > 0 and self.mamba_slot_allocator is not None:
                 restore_block_id = matched_block_ids[restore_block_count - 1]
                 self._pending_mamba_restores.append(
-                    (self.total_request_count, restore_block_id, mamba_idx)
+                    (current_id, restore_block_id, mamba_idx)
                 )
             else:
                 self._pending_mamba_zeros.append(mamba_idx)
