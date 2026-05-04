@@ -287,6 +287,101 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_prepare_async_decode_next_step_reserves_boundary_block(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=512,
+            buffer_size_gb=1.0,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_cuda_graphs=1,
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, 127, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+            )
+        )
+        dynamic_context.initialize_attention_state()
+        dynamic_context.update_requests(
+            active_requests_mask=torch.ones(1, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([7], dtype=torch.long, device='cpu'),
+        )
+        dynamic_context.initialize_attention_state()
+
+        avail_before_prepare = dynamic_context.kv_block_allocator.total_avail
+        assert dynamic_context.request_kv_block_counts[0].item() == 1
+        assert dynamic_context.prepare_async_decode_next_step()
+
+        assert dynamic_context._async_reserved_kv_block_count == 1
+        reserved_block = dynamic_context._async_reserved_kv_block_ids[0].item()
+        assert dynamic_context.kv_block_allocator.total_avail == avail_before_prepare - 1
+        assert dynamic_context.request_kv_block_counts[0].item() == 1
+        assert dynamic_context.token_to_pos_ids[0].item() == 128
+        assert dynamic_context.token_to_block_idx[0].item() == reserved_block
+
+        dynamic_context.update_requests(
+            active_requests_mask=torch.ones(1, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([8], dtype=torch.long, device='cpu'),
+        )
+
+        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context.request_kv_block_counts[0].item() == 2
+        assert dynamic_context.request_to_kv_block_ids[0, 1].item() == reserved_block
+        assert dynamic_context.kv_block_allocator.total_avail == avail_before_prepare - 1
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_update_requests_defers_unused_async_boundary_block_release(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=512,
+            buffer_size_gb=1.0,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_cuda_graphs=1,
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, 127, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+            )
+        )
+        dynamic_context.initialize_attention_state()
+        dynamic_context.update_requests(
+            active_requests_mask=torch.ones(1, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([7], dtype=torch.long, device='cpu'),
+        )
+        dynamic_context.initialize_attention_state()
+
+        avail_before_prepare = dynamic_context.kv_block_allocator.total_avail
+        assert dynamic_context.prepare_async_decode_next_step()
+        reserved_block = dynamic_context._async_reserved_kv_block_ids[0].item()
+
+        dynamic_context.update_requests(
+            active_requests_mask=torch.zeros(1, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([8], dtype=torch.long, device='cpu'),
+        )
+
+        assert dynamic_context.total_request_count == 0
+        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context._async_deferred_kv_blocks_to_release.tolist() == [reserved_block]
+        assert dynamic_context.kv_block_allocator.total_avail == avail_before_prepare
+
+        dynamic_context.release_deferred_async_kv_blocks()
+        assert dynamic_context._async_deferred_kv_blocks_to_release.numel() == 0
+        assert dynamic_context.kv_block_allocator.total_avail == avail_before_prepare + 1
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_is_memory_available(self, is_hybrid_model):
 

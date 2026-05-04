@@ -1804,19 +1804,6 @@ class TextGenerationController:
         ):
             return "request can finish by length"
 
-        request_slice = slice(context.paused_request_count, context.total_request_count)
-        request_query_lengths = context.request_query_lengths[request_slice]
-        request_last_offsets = context.request_last_kv_block_offset[request_slice]
-        if (
-            request_last_offsets + request_query_lengths >= context.block_size_tokens
-        ).any():
-            return "current query can cross a kv block boundary"
-        next_token_offsets = (
-            context.request_kv_length_offsets[request_slice] + request_query_lengths
-        ) % context.block_size_tokens
-        if (next_token_offsets > context.block_size_tokens - tokens_per_request).any():
-            return "request is at a kv block boundary"
-
         if (
             context.padded_batch_dimensions.token_count
             != context.padded_batch_dimensions.decode_req_count * tokens_per_request
@@ -2537,6 +2524,7 @@ class TextGenerationController:
                         pending_forward_row_indices,
                         pending_forward_row_mapped,
                     ) = self._resolve_pending_async_forward_rows()
+                    context.release_deferred_async_kv_blocks()
                     if pending_forward_reused and self.num_speculative_tokens > 0:
                         input_ids, _ = context.current_input_and_position_ids()
                 if not pending_forward_reused:
@@ -2759,6 +2747,12 @@ class TextGenerationController:
                         self._async_pending_sample_cuda_graph_request_count = (
                             context.padded_active_request_count
                         )
+                elif self._async_pending_forward and next_active_request_count == 0:
+                    torch.cuda.current_stream().synchronize()
+                    context.release_deferred_async_kv_blocks()
+                    self._async_pending_forward = False
+                    self._async_pending_cuda_graph_request_count = None
+                    self._async_pending_forward_request_ids = None
 
             ret = {
                 "accepted_tokens": (
