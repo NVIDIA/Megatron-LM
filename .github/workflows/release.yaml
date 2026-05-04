@@ -73,7 +73,7 @@ concurrency:
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.94.1
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name != 'workflow_dispatch'
 
   bump:
     needs: [pre-flight]
