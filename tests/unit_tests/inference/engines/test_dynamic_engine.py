@@ -1296,6 +1296,95 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         """Async hybrid MTP scheduling continues while a request is paused."""
         self._run_async_pause_boundary_e2e("hybrid", num_speculative_tokens=2)
 
+    def _run_async_eviction_boundary_e2e(self, model_provider: str, num_speculative_tokens: int):
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+        block_size_tokens = 256
+        tokens_per_request = num_speculative_tokens + 1
+        boundary_prompt_length = block_size_tokens - tokens_per_request
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=block_size_tokens,
+                num_tokens_to_generate=16,
+                num_gap_steps=0,
+                model_provider=model_provider,
+                num_speculative_tokens=num_speculative_tokens,
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                context_block_size_tokens=block_size_tokens,
+                termination_id=-1,
+                top_k=1,
+                enable_async_scheduling=True,
+            )
+        )
+        engine = env.engine
+        with torch.inference_mode():
+            engine.add_request(
+                request_id=0,
+                prompt=(
+                    torch.arange(boundary_prompt_length, dtype=torch.int64, device='cuda')
+                    % DynamicEngineTestConfig.vocab_size
+                ),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=16, termination_id=-1, top_k=1
+                ),
+            )
+            engine.add_request(
+                request_id=1,
+                prompt=(
+                    torch.arange(4, dtype=torch.int64, device='cuda')
+                    % DynamicEngineTestConfig.vocab_size
+                ),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=16, termination_id=-1, top_k=1
+                ),
+            )
+
+            engine.step_modern()
+            engine.context.kv_block_allocator.total_avail = 0
+
+            for _ in range(8):
+                engine.step_modern()
+                if engine.context.paused_request_count > 0:
+                    break
+            assert engine.context.paused_request_count > 0
+
+            controller = engine.controller
+            launch_count_before_eviction = controller._async_forward_launch_count
+            engine.context.kv_block_allocator.paused_count = 0
+
+            eviction_count_before = engine.evicted_request_count
+            async_launched_after_eviction = False
+            for _ in range(8):
+                engine.step_modern()
+                if engine.evicted_request_count > eviction_count_before:
+                    if controller._async_forward_launch_count > launch_count_before_eviction:
+                        async_launched_after_eviction = True
+                    break
+
+        assert engine.evicted_request_count > eviction_count_before
+        assert controller._async_evict_boundary_count > 0
+        assert async_launched_after_eviction, controller._async_disable_reason
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_eviction_boundary_cuda_graph_e2e(self) -> None:
+        """Async GPT scheduling continues while a paused request is evicted."""
+        self._run_async_eviction_boundary_e2e("gpt", num_speculative_tokens=0)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_hybrid_mtp_eviction_boundary_cuda_graph_e2e(self) -> None:
+        """Async hybrid MTP scheduling continues while a paused request is evicted."""
+        self._run_async_eviction_boundary_e2e("hybrid", num_speculative_tokens=2)
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -1423,6 +1512,39 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert controller._async_mtp_finish_boundary_count >= 0
         assert controller._async_pause_boundary_count >= 0
         assert controller._async_evict_boundary_count >= 0
+
+    @pytest.mark.internal
+    def test_async_lifecycle_eviction_pending_forward_row_map(self) -> None:
+        """Pending async forwards remain reusable after an evicted row disappears."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                context_max_requests=4,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        with torch.inference_mode():
+            context.paused_request_count = 0
+            context.total_request_count = 2
+            context.request_ids[:2] = torch.tensor([30, 20], device='cpu')
+            controller._async_pending_forward_request_ids = torch.tensor(
+                [10, 20, 30], device='cpu'
+            )
+
+        usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+
+        assert usable
+        assert row_mapped
+        assert row_indices is not None
+        assert row_indices.cpu().tolist() == [2, 1]
+        assert controller._async_row_mapped_forward_count == 1
 
     @pytest.mark.internal
     @pytest.mark.skipif(

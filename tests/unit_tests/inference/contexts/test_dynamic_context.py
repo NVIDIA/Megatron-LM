@@ -434,6 +434,141 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_async_lifecycle_eviction_matrix(self):
+        """Evict overflowing paused rows while preserving active rows."""
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            paused_buffer_size_gb=0.0,
+            block_size_tokens=16,
+            max_tokens=512,
+            max_requests=512,
+            num_speculative_tokens=2,
+        )
+        dynamic_context.paused_request_count = 1
+        dynamic_context.total_request_count = 3
+        dynamic_context.request_ids[:3] = torch.tensor([10, 20, 30], device='cpu')
+        dynamic_context.request_kv_block_counts[:3] = 1
+
+        blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(3)
+        dynamic_context.request_to_kv_block_ids[:3, 0] = blocks
+        dynamic_context.request_last_kv_block_id[:3] = blocks
+        dynamic_context.kv_block_allocator.paused_count = 0
+
+        evicted_ids = dynamic_context.evict_overflow_paused_requests(
+            active_request_count=2,
+            next_tokens=torch.tensor([1, 2, 3], device='cpu'),
+            new_speculative_tokens=torch.tensor([[11, 22, 33], [111, 222, 333]], device='cpu'),
+        )
+
+        assert evicted_ids is not None
+        assert evicted_ids.tolist() == [10]
+        assert dynamic_context.paused_request_count == 0
+        assert dynamic_context.total_request_count == 2
+        assert set(dynamic_context.request_ids[:2].tolist()) == {20, 30}
+        assert torch.all(dynamic_context.request_to_kv_block_ids[2] == -1)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_async_lifecycle_eviction_releases_kv_blocks(self):
+        """Evicting the last paused row releases KV blocks and clears paused token cache."""
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            paused_buffer_size_gb=0.0,
+            block_size_tokens=16,
+            max_tokens=512,
+            max_requests=512,
+            num_speculative_tokens=2,
+        )
+        dynamic_context.paused_request_count = 1
+        dynamic_context.total_request_count = 2
+        dynamic_context.active_token_count = 2
+        dynamic_context.request_ids[:2] = torch.tensor([10, 20], device='cpu')
+        dynamic_context.request_query_lengths[:2] = 1
+        dynamic_context.request_kv_length_offsets[:2] = 5
+        dynamic_context.request_last_kv_block_offset[:2] = 5
+        dynamic_context.request_kv_block_counts[:2] = 1
+        dynamic_context.paused_tokens = torch.tensor([99], device='cpu')
+        dynamic_context.paused_speculative_tokens = torch.tensor([[100], [101]], device='cpu')
+
+        blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(2)
+        dynamic_context.request_to_kv_block_ids[:2, 0] = blocks
+        dynamic_context.request_last_kv_block_id[:2] = blocks
+        dynamic_context.kv_block_allocator.paused_count = 0
+        dynamic_context.kv_block_allocator.total_avail = 0
+
+        update_result = dynamic_context.update_requests(
+            active_requests_mask=torch.tensor([1], device='cpu', dtype=torch.int32),
+            new_tokens=torch.tensor([88], device='cpu'),
+            new_speculative_tokens=torch.tensor([[200], [201]], device='cpu'),
+        )
+
+        assert update_result["evict_request_ids"].tolist() == [10]
+        assert dynamic_context.paused_request_count == 0
+        assert dynamic_context.total_request_count == 1
+        assert dynamic_context.paused_tokens is None
+        assert dynamic_context.paused_speculative_tokens is None
+        assert dynamic_context.kv_block_allocator.total_avail == 1
+        assert dynamic_context.request_ids[0].item() == 20
+        assert dynamic_context.token_to_input_ids[:3].tolist() == [88, 200, 201]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_async_lifecycle_eviction_releases_hybrid_mamba_state(self):
+        """Evicting a hybrid paused row releases its Mamba slot."""
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            paused_buffer_size_gb=0.0,
+            block_size_tokens=16,
+            max_tokens=512,
+            max_requests=512,
+            is_hybrid_model=True,
+        )
+        dynamic_context.paused_request_count = 1
+        dynamic_context.total_request_count = 3
+        dynamic_context.request_ids[:3] = torch.tensor([10, 20, 30], device='cpu')
+        dynamic_context.request_kv_block_counts[:3] = 1
+        dynamic_context.mamba_metadata.request_to_mamba_state_idx[:3] = torch.tensor(
+            [0, 1, 2], device='cpu'
+        )
+        dynamic_context.mamba_metadata.mamba_state_free_slot_count -= 3
+        free_count_before = dynamic_context.mamba_metadata.mamba_state_free_slot_count
+
+        blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(3)
+        dynamic_context.request_to_kv_block_ids[:3, 0] = blocks
+        dynamic_context.request_last_kv_block_id[:3] = blocks
+        dynamic_context.kv_block_allocator.paused_count = 0
+
+        evicted_ids = dynamic_context.evict_overflow_paused_requests(
+            active_request_count=2,
+            next_tokens=torch.tensor([1, 2, 3], device='cpu'),
+        )
+
+        assert evicted_ids is not None
+        assert evicted_ids.tolist() == [10]
+        assert dynamic_context.mamba_metadata.mamba_state_free_slot_count == (
+            free_count_before + 1
+        )
+        active_mamba_idxs = dynamic_context.mamba_metadata.request_to_mamba_state_idx[:2]
+        assert set(active_mamba_idxs.tolist()) == {1, 2}
+        assert dynamic_context.mamba_metadata.request_to_mamba_state_idx[2].item() == -1
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_update_requests_defers_unused_async_boundary_block_release(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,

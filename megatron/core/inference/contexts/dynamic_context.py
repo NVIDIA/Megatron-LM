@@ -3733,6 +3733,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.paused_speculative_tokens = new_speculative_tokens[
                     :, : self.paused_request_count
                 ].clone()
+        else:
+            self.paused_tokens = None
+            self.paused_speculative_tokens = None
 
         # add_ and fill_ calls seems to work as intended with sliced indexing
         # (i.e. x[3:5].add(...) or x[3:5].fill_) but when another tensor is used
