@@ -108,6 +108,8 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             mtp_block_spec=mtp_block_spec,
             vp_stage=vp_stage,
             pg_collection=pg_collection,
+            use_fused_lce=args.use_fused_lce,
+            logits_split_chunks=args.logits_split_chunks
         )
 
     return model
