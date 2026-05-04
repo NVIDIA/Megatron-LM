@@ -15,3 +15,13 @@ class TestInferenceConfig:
         dynamic_inference_config_fields = set(dataclasses.fields(InferenceConfig))
         transformer_config_fields = set(dataclasses.fields(TransformerConfig))
         assert len(dynamic_inference_config_fields.intersection(transformer_config_fields)) == 0
+
+    def test_async_scheduling_config_default(self):
+        """Async scheduling is opt-in."""
+        config = InferenceConfig()
+        assert config.enable_async_scheduling is False
+
+    def test_async_scheduling_config_can_enable(self):
+        """Async scheduling can be enabled explicitly."""
+        config = InferenceConfig(enable_async_scheduling=True)
+        assert config.enable_async_scheduling is True

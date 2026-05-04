@@ -1145,6 +1145,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+        self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
         # Bind the shared MHA GPU views to both graph and non-graph metadata;
         # only one is active per step, so sharing storage is safe.
@@ -1938,6 +1939,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_expert_parallel_dummy_cuda_graph_step: bool = False,
+        transfer_bookkeeping_to_gpu: bool = True,
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
@@ -1946,6 +1948,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 The graph config to use for constructing the cuda graphs.
             is_expert_parallel_dummy_cuda_graph_step (bool):
                 Whether this is a dummy expert model parallel step.
+            transfer_bookkeeping_to_gpu (bool):
+                Whether to transfer the prepared CPU bookkeeping snapshot to GPU before returning.
         Return:
             None.
         """
@@ -2193,7 +2197,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # `initialize_attention_state()`) see populated GPU bookkeeping. The
         # text-generation controller still calls `transfer_bookkeeping_to_gpu`
         # explicitly; that second call is a cheap idempotent re-copy.
-        self.transfer_bookkeeping_to_gpu()
+        if transfer_bookkeeping_to_gpu:
+            self.transfer_bookkeeping_to_gpu()
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -2219,7 +2224,143 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def prepare_async_decode_next_step(self) -> bool:
+        """Prepare a decode-only GPU bookkeeping snapshot for a speculative next step.
+
+        This is intentionally narrower than ``initialize_attention_state``. It
+        prepares the metadata for the common decode case where the active request
+        set is unchanged and no KV block transition is needed. Persistent CPU
+        request tensors are not updated here; ``update_requests`` remains the
+        source of truth and reconciles them after the speculative forward is
+        launched.
+        """
+        n_active = self.total_request_count - self.paused_request_count
+        if (
+            n_active <= 0
+            or self.paused_request_count != 0
+            or self.num_prefill_requests != 0
+            or self.num_speculative_tokens != 0
+            or self.is_hybrid_model
+        ):
+            return False
+
+        batch_dimensions = InferenceBatchDimensions(
+            token_count=n_active,
+            prefill_req_count=0,
+            decode_req_count=n_active,
+        )
+        best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+            batch_dimensions,
+            self.cuda_graph_batch_dimensions_list,
+            smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
+            strict=False,
+            decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
+            ep_group=self.expert_model_parallel_group,
+            num_speculative_tokens=self.num_speculative_tokens,
+            ep_zmq_communicator=self._ep_zmq_communicator,
+            match_ep_token_counts=self._nccl_ep_dispatcher,
+        )
+        if best_graph is None:
+            return False
+
+        self.batch_dimensions = batch_dimensions
+        self._using_cuda_graph_this_step = True
+        self.padded_batch_dimensions = best_graph
+        self.padded_active_token_count = best_graph.token_count
+        self.padded_active_request_count = best_graph.req_count
+        self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
+        self.active_attn_metadata = self.graph_attn_metadata
+
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        query_lengths_view = self.request_query_lengths[active_slice]
+        request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
+        predicted_kv_offsets = request_kv_length_offsets_view + query_lengths_view
+        request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
+
+        self.active_token_count = n_active
+        self.token_to_pos_ids[:n_active] = predicted_kv_offsets
+        self.token_to_request_idx[:n_active] = torch.arange(
+            self.paused_request_count, self.total_request_count, dtype=torch.int32, device='cpu'
+        )
+        self.token_to_position_in_request[:n_active] = predicted_kv_offsets
+        self.token_to_local_position_within_kv_block[:n_active] = (
+            predicted_kv_offsets % self.block_size_tokens
+        )
+        self.token_to_block_idx[:n_active] = self.request_last_kv_block_id[active_slice]
+
+        if n_active < self.padded_active_token_count:
+            pad_slice = slice(n_active, self.padded_active_token_count)
+            self.token_to_block_idx[pad_slice] = self.kv_block_allocator.dummy_block_idx
+            self.token_to_local_position_within_kv_block[pad_slice] = 0
+            self.token_to_request_idx[pad_slice] = -1
+            self.token_to_position_in_request[pad_slice] = 0
+            self.token_to_pos_ids[pad_slice] = 0
+
+        self.build_active_slices(
+            min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
+        )
+
+        padded_active = max(n_active, self.padded_active_request_count)
+        self._staging_request_in_prefill_status[:n_active] = 0
+        self._staging_request_query_lengths[:n_active] = query_lengths_view
+        self._staging_request_kv_length_offsets[:n_active] = predicted_kv_offsets
+        if n_active < padded_active:
+            self._staging_request_in_prefill_status[n_active:padded_active] = 0
+            self._staging_request_query_lengths[n_active:padded_active] = 0
+            self._staging_request_kv_length_offsets[n_active:padded_active] = 0
+
+        real_bs = n_active
+        padded_bs = self.padded_batch_dimensions.req_count
+        mha = self.active_attn_metadata["mha_metadata"]
+
+        self._cpu_mha_query_lengths[:real_bs] = query_lengths_view[:real_bs]
+        if real_bs < padded_bs:
+            self._cpu_mha_query_lengths[real_bs:padded_bs] = 0
+
+        self._cpu_mha_cu_query_seq_lengths[0] = 0
+        if real_bs > 0:
+            self._cpu_mha_cu_query_seq_lengths[1 : real_bs + 1] = torch.cumsum(
+                query_lengths_view[:real_bs], dim=0
+            )
+        if real_bs < padded_bs:
+            self._cpu_mha_cu_query_seq_lengths[real_bs + 1 : padded_bs + 1] = (
+                self._cpu_mha_cu_query_seq_lengths[real_bs]
+            )
+
+        self._cpu_mha_kv_seq_lengths[:real_bs] = (
+            predicted_kv_offsets[:real_bs] + query_lengths_view[:real_bs]
+        )
+        if real_bs < padded_bs:
+            self._cpu_mha_kv_seq_lengths[real_bs:padded_bs] = 0
+
+        self._cpu_mha_cu_kv_seq_lengths[0] = 0
+        if real_bs > 0:
+            self._cpu_mha_cu_kv_seq_lengths[1 : real_bs + 1] = torch.cumsum(
+                self._cpu_mha_kv_seq_lengths[:real_bs], dim=0
+            )
+        if real_bs < padded_bs:
+            self._cpu_mha_cu_kv_seq_lengths[real_bs + 1 : padded_bs + 1] = (
+                self._cpu_mha_cu_kv_seq_lengths[real_bs]
+            )
+
+        self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
+        if real_bs < padded_bs:
+            self._cpu_mha_block_table[real_bs:padded_bs] = -1
+
+        mha.set_state_data(
+            padded_active_request_count=padded_bs,
+            max_seqlen_q=self.num_speculative_tokens + 1,
+            max_seqlen_k=mha.max_seqlen,
+        )
+        return True
+
+    def transfer_bookkeeping_to_gpu(
+        self,
+        *,
+        include_token_to_input_ids: bool = True,
+        refresh_request_staging: bool = True,
+        record_done_event: bool = False,
+    ) -> Optional[torch.cuda.Event]:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
@@ -2240,26 +2381,39 @@ class DynamicInferenceContext(BaseInferenceContext):
         # CPU-to-CPU slice assignment on pinned memory (~7.5 KB total for 3
         # int32 fields at max_requests=624). Negligible vs. the launch overhead
         # we save by merging 9 H2D memcpys into 1.
-        self._staging_request_in_prefill_status[:n_active] = self.request_in_prefill_status_tensor[
-            active_slice
-        ]
-        self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
-        self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
-            active_slice
-        ]
-        # Full-iteration CUDA graphs may have captured GPU consumers with the
-        # padded graph request count. Keep those padded staging rows bounded so
-        # graph replay never builds indices from stale request lengths.
-        if n_active < padded_active:
-            self._staging_request_in_prefill_status[n_active:padded_active] = 0
-            self._staging_request_query_lengths[n_active:padded_active] = 0
-            self._staging_request_kv_length_offsets[n_active:padded_active] = 0
+        if refresh_request_staging:
+            self._staging_request_in_prefill_status[:n_active] = (
+                self.request_in_prefill_status_tensor[active_slice]
+            )
+            self._staging_request_query_lengths[:n_active] = self.request_query_lengths[
+                active_slice
+            ]
+            self._staging_request_kv_length_offsets[:n_active] = (
+                self.request_kv_length_offsets[active_slice]
+            )
+            # Full-iteration CUDA graphs may have captured GPU consumers with the
+            # padded graph request count. Keep those padded staging rows bounded so
+            # graph replay never builds indices from stale request lengths.
+            if n_active < padded_active:
+                self._staging_request_in_prefill_status[n_active:padded_active] = 0
+                self._staging_request_query_lengths[n_active:padded_active] = 0
+                self._staging_request_kv_length_offsets[n_active:padded_active] = 0
 
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        if include_token_to_input_ids:
+            self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        else:
+            input_ids_nbytes = self.max_tokens * self.token_to_input_ids.element_size()
+            self.gpu_view._buf[input_ids_nbytes:].copy_(
+                self._cpu_bookkeeping_buf[input_ids_nbytes:], non_blocking=True
+            )
+        done_event = None
+        if record_done_event:
+            done_event = self._bookkeeping_h2d_done_event
+            done_event.record(torch.cuda.current_stream())
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
@@ -2269,6 +2423,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+        return done_event
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""

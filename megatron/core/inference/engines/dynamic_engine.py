@@ -1677,8 +1677,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
-        # schedule requests
-        self.schedule_waiting_requests()
+        # Do not admit new requests while a speculative decode forward is pending:
+        # the GPU context for that forward was built from the previous active set.
+        if not self.controller.has_pending_async_forward():
+            self.schedule_waiting_requests()
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we

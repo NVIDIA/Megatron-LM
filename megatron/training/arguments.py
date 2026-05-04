@@ -1951,6 +1951,11 @@ def _add_inference_args(parser):
                        help="Enable chunked prefill (disabled by default)")
     group.add_argument('--num-speculative-tokens', type=int, default=0,
                        help='Number of speculative tokens generated during decode')
+    group.add_argument('--inference-dynamic-batching-async-scheduling',
+                       '--enable-async-scheduling',
+                       dest='inference_dynamic_batching_enable_async_scheduling',
+                       action='store_true', default=False,
+                       help='Enable async scheduling for eligible dynamic batching decode steps.')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,

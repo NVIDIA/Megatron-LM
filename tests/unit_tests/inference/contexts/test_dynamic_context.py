@@ -177,6 +177,84 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_transfer_bookkeeping_to_gpu_can_skip_token_input_ids(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=512,
+            buffer_size_gb=1.0,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.gpu_view.token_to_input_ids[:4].fill_(99)
+        dynamic_context.token_to_input_ids[:4] = torch.arange(4, dtype=torch.long, device='cpu')
+        dynamic_context.token_to_pos_ids[:4] = torch.arange(10, 14, dtype=torch.long, device='cpu')
+
+        dynamic_context.transfer_bookkeeping_to_gpu(include_token_to_input_ids=False)
+        torch.cuda.synchronize()
+
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_input_ids[:4].cpu(),
+            torch.full((4,), 99, dtype=torch.long),
+        )
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_pos_ids[:4].cpu(),
+            torch.arange(10, 14, dtype=torch.long),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_prepare_async_decode_next_step_preserves_request_source_of_truth(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=512,
+            buffer_size_gb=1.0,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_cuda_graphs=1,
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, 4, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=16, termination_id=-1),
+            )
+        )
+        dynamic_context.initialize_attention_state()
+        dynamic_context.update_requests(
+            active_requests_mask=torch.ones(1, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([7], dtype=torch.long, device='cpu'),
+        )
+        dynamic_context.initialize_attention_state()
+
+        original_kv_offsets = dynamic_context.request_kv_length_offsets.clone()
+        predicted_pos = (
+            dynamic_context.request_kv_length_offsets[0]
+            + dynamic_context.request_query_lengths[0]
+        ).item()
+        dynamic_context.gpu_view.token_to_input_ids[0].fill_(77)
+
+        assert dynamic_context.prepare_async_decode_next_step()
+        h2d_done = dynamic_context.transfer_bookkeeping_to_gpu(
+            include_token_to_input_ids=False,
+            refresh_request_staging=False,
+            record_done_event=True,
+        )
+        h2d_done.synchronize()
+
+        assert torch.equal(dynamic_context.request_kv_length_offsets, original_kv_offsets)
+        assert dynamic_context.token_to_pos_ids[0].item() == predicted_pos
+        assert dynamic_context._staging_request_kv_length_offsets[0].item() == predicted_pos
+        assert dynamic_context.gpu_view.token_to_input_ids[0].item() == 77
+        assert dynamic_context.gpu_view.token_to_pos_ids[0].item() == predicted_pos
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_is_memory_available(self, is_hybrid_model):
 

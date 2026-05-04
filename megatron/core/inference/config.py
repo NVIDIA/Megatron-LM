@@ -240,6 +240,9 @@ class InferenceConfig:
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
 
+    enable_async_scheduling: bool = False
+    """Whether to speculatively launch eligible decode-only forward passes."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
