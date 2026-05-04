@@ -155,11 +155,7 @@ def load(
         if getattr(ckpt_args, "async_save", False)
         else "mcore"
     )
-    # ``replicate_local_replicas`` is plumbed at .load()-time rather than at
-    # strategy construction so the same strategy object can be reused across
-    # different load runs with different knob values (e.g. for A/B
-    # benchmarking the legacy cross-read path against the local-read path on
-    # the same on-disk checkpoint).
+
     loaded_state_dict = sharded_strategy.load(
         sharded_state_dict,
         checkpoint_dir,

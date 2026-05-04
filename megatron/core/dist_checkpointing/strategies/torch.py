@@ -522,6 +522,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
         # PyT versions disagree on the return type: older builds return a
         # bool (``True`` == valid), newer source returns a list of error
         # strings (empty == valid). Handle both.
+        # TODO(asolergi-nv): Remove the bool type return in the future.
         if isinstance(result, bool):
             if not result:
                 raise ValueError("Failed to validate global plan")
@@ -937,15 +938,6 @@ class TorchDistLoadShardedStrategy:
                 False (default) the redirect is skipped, so the load uses
                 the metadata's deduped storage entry exactly as today,
                 even if the checkpoint *does* contain shadow keys.
-                Decision: this is a per-call kwarg rather than a
-                constructor argument because the value depends on
-                runtime/training configuration (``args.ckpt_fully_parallel
-                _load_replicate_local``) while the strategy itself is
-                often built by callers (see ``serialization.py``
-                defaults) that do not have access to the args namespace.
-                Putting it on ``.load`` mirrors how ``async_strategy`` is
-                already plumbed and avoids threading the knob through
-                every constructor site.
 
         Returns: loaded state dict
         """
@@ -975,11 +967,7 @@ class TorchDistLoadShardedStrategy:
         # written under a `__shadow_<rank>__<fqn>` FQN pointing at the
         # rank's own __<rank>_*.distcp file. Reroute every load request
         # whose shadow key is in the metadata so that PyT DCP opens our
-        # local file rather than the dedup-winning peer's file. The
-        # ``replicate_local_replicas`` knob lets the user opt out of this
-        # redirect at runtime — useful for A/B benchmarking the legacy
-        # cross-read path against the new local-read path on the same
-        # on-disk checkpoint.
+        # local file rather than the dedup-winning peer's file.
         from .local_replica import (
             redirect_pyt_state_dict_to_shadows,
             restore_pyt_state_dict_from_shadows,

@@ -332,9 +332,7 @@ class FullyParallelLoadStrategyWrapper:
             )
 
         with debug_time("base_load_ShardedTensors", logger):
-            # Load sharded tensors separately. The picker chose this rank
-            # to read these shards, so this is where the shadow redirect
-            # has to fire if it is going to fire at all.
+            # Load sharded tensors separately
             loaded_tensors = self.base_strategy.load(
                 to_load_shards,
                 checkpoint_dir,

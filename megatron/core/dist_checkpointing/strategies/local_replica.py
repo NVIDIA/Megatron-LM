@@ -17,8 +17,8 @@ producing read-side contention on the file system when the world is large.
 The *local replica* mode opts into trading extra disk for read locality.
 For each shard, the load-side picker (``ignore_groups=True`` in
 ``determine_main_replica_uniform_distribution``) selects one rank per
-parallelization group to actually issue the read; everyone else in the
-group receives the data by broadcast. The save-side picker
+parallelization group to actually issue the read; then communicate the data 
+to the other ranks across the parallelization group. The save-side picker
 (``ignore_groups=False``) selects one rank per group as the save winner.
 When the two pickers select the **same** rank — which is the common case
 for tensors whose ``replica_id == (0, 0, 0)`` exists somewhere in every
@@ -40,7 +40,7 @@ the same group. There are two ways for that to occur:
 
 In both cases the rank picked by load is exactly the rank that benefits
 from a local copy. So the filter — encoded in
-:func:`compute_shadow_shard_ids` — emits a shadow on a rank iff that rank
+:func:`compute_shadow_shard_ids` — emits a shadow on a rank if that rank
 is the load picker for the shard *and* the save picker did not pick the
 same rank in the group.
 

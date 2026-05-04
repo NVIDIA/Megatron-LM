@@ -1252,9 +1252,6 @@ def _load_global_dist_base_checkpoint(
         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
         strict=args.dist_ckpt_strictness,
         verify_integrity=args.verify_integrity,
-        # Per-call rather than constructor-time, so the strategy itself
-        # stays free of training-config coupling and is reusable across
-        # subsequent load invocations with different knob values.
         replicate_local_replicas=getattr(
             args, 'ckpt_fully_parallel_load_replicate_local', False
         ),
