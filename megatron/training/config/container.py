@@ -274,3 +274,57 @@ class PretrainConfigContainer(ConfigContainerBase):
         # Calculate data parallel size (needed for comm overlap setup)
         world_size = safe_get_world_size()
         self.data_parallel_size = self.get_data_parallel_size(world_size)
+
+    def validate(self) -> None:
+        """Performs validation checks on the combined configuration.
+
+        Calculates dependent values like data_parallel_size and scheduler steps.
+        Ensures compatibility across sub-configs.
+        """
+
+        if hasattr(self.ddp, "finalize"):
+            self.ddp.finalize()
+        if hasattr(self.optimizer, "finalize"):
+            self.optimizer.finalize()
+        if hasattr(self.model, "finalize"):
+            self.model.finalize()
+
+        self.train.finalize()
+        self.scheduler.finalize()
+        self.checkpoint.finalize()
+        if self.profiling is not None:
+            self.profiling.finalize()
+
+        # Sync config. If TE RNG tracker is set in either ways, set them in both places.
+        if self.rng.te_rng_tracker or self.model.use_te_rng_tracker:
+            self.model.use_te_rng_tracker = self.rng.te_rng_tracker = True
+
+        # Re-run post-inits of sub-configs
+        for f in dataclass_fields(self):
+            sub_cfg = getattr(self, f.name)
+            if hasattr(sub_cfg, "__post_init__") and not hasattr(sub_cfg, "finalize"):
+                sub_cfg.__post_init__()
+
+        # Distributed - ensure data_parallel_size is calculated (might already be set by set_data_parallel_size)
+        if not hasattr(self, "data_parallel_size") or self.data_parallel_size is None:
+            self.set_data_parallel_size()
+
+        # Resolve eval batch size defaults from training config
+        if self.validation.eval_global_batch_size is None:
+            assert self.train.global_batch_size is not None, (
+                "train.global_batch_size must be set when eval_global_batch_size is not explicitly configured"
+            )
+            self.validation.eval_global_batch_size = self.train.global_batch_size
+        if self.validation.eval_micro_batch_size is None:
+            assert self.train.micro_batch_size is not None, (
+                "train.micro_batch_size must be set when eval_micro_batch_size is not explicitly configured"
+            )
+            self.validation.eval_micro_batch_size = self.train.micro_batch_size
+
+        # Eval batch size divisibility check
+        eval_dp_product = self.validation.eval_micro_batch_size * self.data_parallel_size
+        assert self.validation.eval_global_batch_size % eval_dp_product == 0, (
+            f"eval_global_batch_size ({self.validation.eval_global_batch_size}) must be divisible by "
+            f"eval_micro_batch_size * data_parallel_size ({self.validation.eval_micro_batch_size} * "
+            f"{self.data_parallel_size} = {eval_dp_product})"
+        )
