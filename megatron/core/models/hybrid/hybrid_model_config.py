@@ -86,6 +86,16 @@ class CompiledRecipe:
     fp16_lm_cross_entropy: bool
     parallel_output: bool
 
+    # Recipe topology pins, surfaced None-able so the launcher's args
+    # projection can distinguish "recipe pinned this value" from "recipe
+    # left it unset, defer to the CLI flag". ``compiled.config`` always
+    # carries concrete substituted values (TC needs them); these mirror
+    # the recipe's authorial intent, not the substituted runtime values.
+    tensor_model_parallel_size: Optional[int]
+    context_parallel_size: Optional[int]
+    expert_model_parallel_size: Optional[int]
+    expert_tensor_parallel_size: Optional[int]
+
 
 @dataclass
 class HybridModelConfig:
@@ -137,6 +147,23 @@ class HybridModelConfig:
     expert_tensor_parallel_size: Optional[int] = None
     """Expert tensor-parallel size; ``None`` = use ``--expert-tensor-parallel-size``
     (which itself defaults to ``tensor_model_parallel_size``)."""
+
+    # === Stack-TC MoE metadata override (heterogeneous-MoE recipes only) ===
+    # The stack-level TransformerConfig carries one ``num_moe_experts`` /
+    # ``moe_ffn_hidden_size`` pair. With homogeneous MoE the value is
+    # unambiguous; with heterogeneous MoE there is no single right answer.
+    # Two consumers read these fields from the stack TC: MTP's MoE body and
+    # the inference text-generation capacity-factor calculation. Recipes
+    # that mix MoE shapes must pin the values they want those consumers to
+    # see — ``compile()`` raises if MoE is heterogeneous and these are unset.
+    stack_moe_num_experts: Optional[int] = None
+    """Stack-TC ``num_moe_experts`` for heterogeneous-MoE recipes.
+    Required when MoE layers disagree on ``num_experts``; ignored otherwise."""
+
+    stack_moe_ffn_hidden_size: Optional[int] = None
+    """Stack-TC ``moe_ffn_hidden_size`` for heterogeneous-MoE recipes.
+    Required when MoE layers disagree on ``ffn_hidden_size``; ignored
+    otherwise. ``None`` falls through to ``ffn_hidden_size``."""
 
     def compile(self) -> CompiledRecipe:
         """Process the layer pattern into a :class:`CompiledRecipe`.
@@ -287,7 +314,11 @@ class HybridModelConfig:
         # symbol contains ``E``, the MoE layer inside MTP is built from the
         # stack TC) and the inference capacity-factor calculation
         # (``capacity_factor = num_moe_experts / moe_router_topk``).
-        stack_moe_experts, stack_moe_ffn_hidden_size = _derive_stack_moe_metadata(decoder_flat)
+        stack_moe_experts, stack_moe_ffn_hidden_size = _derive_stack_moe_metadata(
+            decoder_flat,
+            override_num_experts=self.stack_moe_num_experts,
+            override_ffn_hidden_size=self.stack_moe_ffn_hidden_size,
+        )
         if stack_moe_experts is not None:
             stack_kwargs["num_moe_experts"] = stack_moe_experts
             if stack_moe_ffn_hidden_size is not None:
@@ -381,6 +412,10 @@ class HybridModelConfig:
             untie_embeddings_and_output_weights=self.untie_embeddings_and_output_weights,
             fp16_lm_cross_entropy=loss.fp16_lm_cross_entropy,
             parallel_output=loss.parallel_output,
+            tensor_model_parallel_size=self.tensor_model_parallel_size,
+            context_parallel_size=self.context_parallel_size,
+            expert_model_parallel_size=self.expert_model_parallel_size,
+            expert_tensor_parallel_size=self.expert_tensor_parallel_size,
         )
 
 
@@ -489,6 +524,8 @@ def _infer_uniform_attention_metadata(decoder_flat: List[LayerConfig]) -> dict[s
 
 def _derive_stack_moe_metadata(
     decoder_flat: List[LayerConfig],
+    override_num_experts: Optional[int],
+    override_ffn_hidden_size: Optional[int],
 ) -> tuple[Optional[int], Optional[int]]:
     """Derive ``(num_moe_experts, moe_ffn_hidden_size)`` for the stack-level TC.
 
@@ -502,27 +539,55 @@ def _derive_stack_moe_metadata(
        dense; the caller is responsible for raising on ``EP > 1``.
     2. Homogeneous MoE → that value. The stack TC matches what every MoE
        layer in the recipe actually uses.
-    3. Heterogeneous MoE → ``max`` across MoE layers ("widest config"). An
-       MTP body containing ``E`` inherits the largest sensible MoE sizing,
-       and capacity buffers are sized for the worst case rather than
-       under-provisioned. Recipe authors who want a specific MTP MoE shape
-       should keep main-decoder MoE homogeneous (per-MTP-layer overrides
-       are not yet supported).
+    3. Heterogeneous MoE → recipe must pin
+       :attr:`HybridModelConfig.stack_moe_num_experts` (and optionally
+       :attr:`stack_moe_ffn_hidden_size`). Without the pin we raise rather
+       than silently picking a "max"-shaped value: MTP and the inference
+       capacity-factor calc would otherwise consume a config that matches
+       no actual layer, and per-consumer wrongness is hard to debug after
+       the fact.
     """
     moe_layers = [lc for lc in decoder_flat if isinstance(lc, MoELayerConfig)]
     if not moe_layers:
         return None, None
-    num_experts = max(lc.num_experts for lc in moe_layers)
-    # Pick the moe_ffn_hidden_size from a layer matching the chosen
-    # num_experts; ``None`` lets TC default it from ``ffn_hidden_size``.
-    ffn_hidden_size = next(
-        (
-            lc.ffn_hidden_size
-            for lc in moe_layers
-            if lc.num_experts == num_experts and lc.ffn_hidden_size is not None
-        ),
-        None,
-    )
+
+    distinct_experts = {lc.num_experts for lc in moe_layers}
+    distinct_ffn = {lc.ffn_hidden_size for lc in moe_layers if lc.ffn_hidden_size is not None}
+
+    if len(distinct_experts) == 1:
+        num_experts = next(iter(distinct_experts))
+    elif override_num_experts is not None:
+        num_experts = override_num_experts
+    else:
+        raise ValueError(
+            f"Heterogeneous MoE recipe (num_experts values: {sorted(distinct_experts)}) "
+            f"requires HybridModelConfig.stack_moe_num_experts to pin the value the "
+            f"stack-level TransformerConfig should expose. The stack TC is read by "
+            f"MTP and by the inference capacity-factor calculation; without an "
+            f"explicit pin those consumers would see a config that matches no "
+            f"actual MoE layer."
+        )
+
+    if len(distinct_ffn) <= 1:
+        # Homogeneous (or all None) — pick the matching layer's value, or fall
+        # through to ``ffn_hidden_size`` when every MoE layer leaves it unset.
+        ffn_hidden_size = next(
+            (
+                lc.ffn_hidden_size
+                for lc in moe_layers
+                if lc.num_experts == num_experts and lc.ffn_hidden_size is not None
+            ),
+            None,
+        )
+    elif override_ffn_hidden_size is not None:
+        ffn_hidden_size = override_ffn_hidden_size
+    else:
+        raise ValueError(
+            f"Heterogeneous MoE recipe (ffn_hidden_size values: {sorted(distinct_ffn)}) "
+            f"requires HybridModelConfig.stack_moe_ffn_hidden_size to pin the value the "
+            f"stack-level TransformerConfig should expose."
+        )
+
     return num_experts, ffn_hidden_size
 
 
