@@ -338,8 +338,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
-        self.text_generation_controller._all_logits_cuda = logits
-        self.text_generation_controller._dynamic_step_sample_logits()
+        self.text_generation_controller._dynamic_step_sample_logits(logits)
         sampled_logits = self.text_generation_controller._sampled_tokens_cuda[:batch_size]
         vocab_indices = torch.arange(self.vocab_size).cuda()
 
@@ -1021,9 +1020,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Mock logits matching input shape
         logits = torch.randn(1, 6, self.vocab_size, device='cuda')
-        self.text_generation_controller._all_logits_cuda = logits
 
-        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+            input_ids, logits
+        )
 
         # Verify acceptance counts
         accepted_counts = self.text_generation_controller._accepted_token_counts_per_request[:2]
@@ -1256,9 +1256,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.active_request_metadata["top_k"][:2] = 0
         ctx.active_request_metadata["top_p"][:2] = 0.9
 
-        self.text_generation_controller._all_logits_cuda = logits
         try:
-            self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+            self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+                input_ids, logits
+            )
         except RuntimeError as e:
             if "prob_dist must be 1 or 2 dim" in str(e):
                 pytest.fail("MTP logits were not flattened before calling multinomial sampling.")

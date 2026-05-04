@@ -118,14 +118,12 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
-        logits_out = inference_input.get("logits_out")
         return self.model(
             tokens,
             position_ids,
             attention_mask,
             inference_context=self.inference_context,
             runtime_gather_output=True,  # Inference should always gather the logits
-            logits_out=logits_out,
         )
 
     def _get_batch_size_and_seq_len(

@@ -528,7 +528,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        logits_out: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -601,7 +600,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
-            logits_out=logits_out,
         )
 
     def _postprocess(
@@ -623,7 +621,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
-        logits_out=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -739,8 +736,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         if labels is None:
             if in_inference_mode and inference_context.is_dynamic_batching():
-                logits_out[:, : logits.shape[0], :].copy_(logits.transpose(0, 1))
-                return logits_out[:, : logits.shape[0], :]
+                # Optimization: a contiguous [1, s, h] can be re-viewed as a contiguous
+                # [s, 1, h] via squeeze/unsqueeze. Dynamic batching always has B=1.
+                return logits.squeeze(1).unsqueeze(0).float()
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
