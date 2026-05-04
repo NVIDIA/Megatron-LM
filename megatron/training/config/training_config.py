@@ -240,6 +240,37 @@ class SchedulerConfig:
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
 
+    def finalize(self) -> None:
+        """Post-initialization checks for scheduler config."""
+        if self.start_weight_decay is not None:
+            assert self.start_weight_decay >= 0.0, "start_weight_decay should be positive."
+            assert self.end_weight_decay >= self.start_weight_decay
+
+        if self.override_opt_param_scheduler:
+            assert not self.use_checkpoint_opt_param_scheduler, "both override and use-checkpoint are set."
+
+        # Validate mutual exclusivity between iteration-based and sample-based scheduler fields
+        has_iter_fields = (
+            self.lr_decay_iters is not None or self.lr_warmup_iters != 0 or self.lr_wsd_decay_iters is not None
+        )
+        has_sample_fields = (
+            self.lr_decay_samples is not None or self.lr_warmup_samples != 0 or self.lr_wsd_decay_samples is not None
+        )
+
+        assert not (has_iter_fields and has_sample_fields), (
+            f"Cannot mix iteration-based and sample-based scheduler fields. "
+            f"Found iteration fields: lr_decay_iters={self.lr_decay_iters}, lr_warmup_iters={self.lr_warmup_iters}, lr_wsd_decay_iters={self.lr_wsd_decay_iters}. "
+            f"Found sample fields: lr_decay_samples={self.lr_decay_samples}, lr_warmup_samples={self.lr_warmup_samples}, lr_wsd_decay_samples={self.lr_wsd_decay_samples}. "
+            f"Use either iteration fields OR sample fields, not both."
+        )
+
+        # Validate mutual exclusivity between lr_warmup_fraction and specific warmup fields
+        if self.lr_warmup_fraction is not None:
+            assert self.lr_warmup_iters == 0 and self.lr_warmup_samples == 0, (
+                f"Cannot specify lr_warmup_fraction={self.lr_warmup_fraction} with lr_warmup_iters={self.lr_warmup_iters} or lr_warmup_samples={self.lr_warmup_samples}. "
+                f"Use either lr_warmup_fraction OR lr_warmup_iters OR lr_warmup_samples."
+            )
+
 
 @dataclass(kw_only=True)
 class LoggerConfig:
