@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,29 +51,83 @@ on:
         default: ""
 
 permissions:
-  contents: write # To read repository content
-  pull-requests: write # To create PRs
+  contents: write
+  pull-requests: write
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
 
 jobs:
-  release:
-    uses: ./.github/workflows/_release_library.yml
+  bump:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@cd92468874e9df2a8156d8927a661c5931a3a11f
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       dry-run: ${{ inputs.dry-run || false }}
       version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
-      create-gh-release: ${{ inputs.create-gh-release || true }}
-      gh-release-use-changelog-builder: ${{ inputs.generate-changelog }}
-      publish-docs: ${{ inputs.publish-docs }}
-      gh-release-from-tag: ${{ inputs.gh-release-from-tag }}
+      restrict-to-admins: true
+      app-id: ${{ vars.BOT_ID }}
+      library-name: Megatron Core
+      bump-targets: |
+        [
+          {"python-package": "megatron.core", "src-dir": ""},
+          {"python-package": "megatron_fsdp", "src-dir": "megatron/core/distributed/fsdp/src/"}
+        ]
+    secrets:
+      BOT_KEY: ${{ secrets.BOT_KEY }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_PWD: ${{ secrets.SSH_PWD }}
+
+  build-test-publish-wheels:
+    needs: [bump]
+    if: |
+      (
+        success() || !failure()
+      )
+      && !cancelled()
+    uses: ./.github/workflows/_build_test_publish_wheel.yml
+    with:
+      ref: ${{ inputs.release-ref || github.sha }}
+      dry-run: ${{ inputs.dry-run || false }}
+      no-publish: ${{ inputs.dry-run || false }}
     secrets:
       TWINE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_TOKEN || secrets.SVC_PYPI_TEST_TOKEN }}
-      SLACK_WEBHOOK: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SLACK_MAIN_CHANNEL_WEBHOOK || secrets.SLACK_CI_CHANNEL_WEBHOOK }}
+
+  finalize:
+    needs: [bump, build-test-publish-wheels]
+    if: |
+      (
+        success() || !failure()
+      )
+      && !cancelled()
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@cd92468874e9df2a8156d8927a661c5931a3a11f
+    with:
+      release-ref: ${{ inputs.release-ref || github.sha }}
+      release-version: ${{ needs.bump.outputs.release-version }}
+      library-name: Megatron Core
+      pypi-name: megatron-core
+      dry-run: ${{ inputs.dry-run || false }}
+      create-gh-release: ${{ inputs.create-gh-release || true }}
+      gh-release-tag-prefix: core_
+      gh-release-use-changelog-builder: ${{ inputs.generate-changelog }}
+      gh-release-from-tag: ${{ inputs.gh-release-from-tag }}
+      publish-docs: false
+    secrets:
       PAT: ${{ secrets.PAT }}
-      AWS_ASSUME_ROLE_ARN: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AKAMAI_HOST: ${{ secrets.AKAMAI_HOST }}
-      AKAMAI_CLIENT_TOKEN: ${{ secrets.AKAMAI_CLIENT_TOKEN }}
-      AKAMAI_CLIENT_SECRET: ${{ secrets.AKAMAI_CLIENT_SECRET }}
-      AKAMAI_ACCESS_TOKEN: ${{ secrets.AKAMAI_ACCESS_TOKEN }}
-      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+      SLACK_WEBHOOK: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SLACK_MAIN_CHANNEL_WEBHOOK || secrets.SLACK_CI_CHANNEL_WEBHOOK }}
+
+  publish-docs:
+    needs: [bump, finalize]
+    if: |
+      (
+        success() || !failure()
+      )
+      && inputs.publish-docs == true
+      && !cancelled()
+    uses: ./.github/workflows/release-docs.yml
+    with:
+      dry-run: ${{ inputs.dry-run }}
+      publish-as-latest: true
+      docs-version-override: ${{ needs.bump.outputs.release-version }}
+      build-docs-ref: ${{ inputs.release-ref || github.sha }}
+    secrets: inherit
