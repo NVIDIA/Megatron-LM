@@ -776,6 +776,172 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_lifecycle_gpt_finish_row_map_matrix(self) -> None:
+        """Pending GPT forward rows are reusable when only finished requests disappear."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=4,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                model_provider="gpt",
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        engine = env.engine
+        controller = engine.controller
+        context = engine.context
+        for request in env.requests:
+            engine._add_request(request)
+        with torch.inference_mode():
+            engine.schedule_waiting_requests()
+
+            controller._async_pending_forward_request_ids = torch.tensor(
+                [0, 1, 2, 3], dtype=context.request_ids.dtype, device=context.request_ids.device
+            )
+            context.request_ids[:3] = torch.tensor(
+                [0, 2, 3], dtype=context.request_ids.dtype, device=context.request_ids.device
+            )
+            context.total_request_count = 3
+            usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+            assert usable
+            assert row_mapped
+            assert row_indices.tolist() == [0, 2, 3]
+            assert controller._async_row_mapped_forward_count == 1
+            assert controller._async_discarded_forward_count == 0
+
+            controller._async_pending_forward_request_ids = torch.tensor(
+                [0, 2, 3], dtype=context.request_ids.dtype, device=context.request_ids.device
+            )
+            context.total_request_count = 0
+            usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+            assert not usable
+            assert row_indices is None
+            assert not row_mapped
+            assert controller._async_discarded_forward_count == 1
+
+            controller._async_pending_forward_request_ids = torch.tensor(
+                [0, 2, 3], dtype=context.request_ids.dtype, device=context.request_ids.device
+            )
+            context.request_ids[:2] = torch.tensor(
+                [0, 99], dtype=context.request_ids.dtype, device=context.request_ids.device
+            )
+            context.total_request_count = 2
+            usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+            assert not usable
+            assert row_indices is None
+            assert not row_mapped
+            assert controller._async_discarded_forward_count == 2
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_finish_termination_boundary_cuda_graph_e2e(self) -> None:
+        """Async GPT scheduling accepts pending rows when requests finish by EOS token."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        probe_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        probe_tokens = [request.generated_tokens for request in probe_env.requests]
+        termination_id = None
+        for token_idx in range(common_kwargs["num_tokens_to_generate"] - 1):
+            step_tokens = [tokens[token_idx] for tokens in probe_tokens]
+            for candidate in step_tokens:
+                finished_this_step = sum(token == candidate for token in step_tokens)
+                if 0 < finished_this_step < len(step_tokens):
+                    termination_id = candidate
+                    break
+            if termination_id is not None:
+                break
+        assert termination_id is not None
+
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+        serial_env = self._run_test(
+            enable_async_scheduling=False, **{**common_kwargs, "termination_id": termination_id}
+        )
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+        async_env = self._run_test(
+            enable_async_scheduling=True, **{**common_kwargs, "termination_id": termination_id}
+        )
+
+        controller = async_env.engine.controller
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_finish_boundary_count > 0
+        assert controller._async_discarded_forward_count == 0
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_all_finished_pending_forward_cleanup_e2e(self) -> None:
+        """All-finished GPT steps clear pending async state and deferred releases."""
+        env = self._run_test(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=2,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+            enable_async_scheduling=True,
+        )
+
+        controller = env.engine.controller
+        context = env.engine.context
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_finish_boundary_count > 0
+        assert not controller.has_pending_async_forward()
+        assert controller._async_pending_forward_request_ids is None
+        assert context._async_deferred_kv_blocks_to_release.numel() == 0
+        assert [request.status for request in env.requests] == [Status.COMPLETED] * 4
+        assert [len(request.generated_tokens) for request in env.requests] == [2] * 4
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_scheduling_decode_kv_boundary_cuda_graph_e2e(self) -> None:
         """Async scheduling matches serial output when decode crosses KV block boundaries."""
         common_kwargs = dict(
