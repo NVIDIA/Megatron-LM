@@ -309,6 +309,15 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
+    disable_ep_consensus: bool = False
+    """If True, the engine skips the EP-group consensus all-reduce in
+    `run_engine_with_coordinator` and steps purely on local state. Pause
+    transitions take effect as soon as PAUSE is delivered to the rank, with no
+    cross-EP coordination or dummy_forward participation. Only safe when EP
+    coordination is not required (e.g. ep_world_size == 1, or workloads where
+    EP peers do not need to advance in lockstep).
+    """
+
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""

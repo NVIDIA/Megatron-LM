@@ -118,6 +118,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.use_coordinator = False
 
         self.ep_world_size = 1
+        self.disable_ep_consensus = False
 
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()

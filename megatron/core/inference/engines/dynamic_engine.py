@@ -221,6 +221,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
+        self.disable_ep_consensus = inference_config.disable_ep_consensus
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -2329,6 +2330,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
+                    if self.disable_ep_consensus:
+                        # No cross-EP coordination: act on local state only.
+                        if self.state == EngineState.PAUSING:
+                            await self._world_barrier()
+                            self.state = EngineState.PAUSED
+                            self._state_events[EngineState.PAUSED].set()
+                        elif local_pending > 0:
+                            await self.async_step()
+                        else:
+                            await asyncio.sleep(0.02)
+                        continue
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
                         global_work_from_last_consensus == 0
@@ -2378,6 +2390,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.state = EngineState.RUNNING
                     self._state_events[EngineState.PAUSED].clear()
                     self._state_events[EngineState.RUNNING].set()
+                    # The cache from the PAUSING phase still has all_pausing=True;
+                    # without this reset the next RUNNING iteration would skip
+                    # consensus, read the stale flag, and immediately re-pause.
+                    self._last_ep_consensus = (0, False)
 
                 elif self.state == EngineState.SUSPENDING:
                     await self._world_barrier()
