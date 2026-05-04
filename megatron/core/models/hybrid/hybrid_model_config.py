@@ -85,9 +85,6 @@ class CompiledRecipe:
     share_embeddings_and_output_weights: bool
     fp16_lm_cross_entropy: bool
     parallel_output: bool
-    # Dotted path to a custom HybridStack ``ModuleSpec``; the builder
-    # imports it. ``None`` lets the builder auto-pick by ``transformer_impl``.
-    stack_spec: Optional[str]
 
 
 @dataclass
@@ -131,14 +128,6 @@ class HybridModelConfig:
 
     expert_tensor_parallel_size: Optional[int] = None
     """Expert tensor-parallel size (defaults to ``tensor_model_parallel_size``)."""
-
-    stack_spec: Optional[str] = None
-    """Dotted Python path to a custom :class:`ModuleSpec` for
-    :class:`HybridStack` (e.g. ``"my_pkg.my_module.my_stack_spec"``). When
-    set, the builder imports and uses this spec; otherwise the spec is
-    auto-picked from ``transformer_impl`` (the legacy ``--spec`` /
-    ``hybrid_inference_stack_spec`` selection). The string form keeps
-    recipes serialisable; resolution happens in ``hybrid_builder``."""
 
     def compile(self) -> CompiledRecipe:
         """Process the layer pattern into a :class:`CompiledRecipe`.
@@ -355,7 +344,6 @@ class HybridModelConfig:
             share_embeddings_and_output_weights=not self.untie_embeddings_and_output_weights,
             fp16_lm_cross_entropy=loss.fp16_lm_cross_entropy,
             parallel_output=loss.parallel_output,
-            stack_spec=self.stack_spec,
         )
 
 
