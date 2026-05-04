@@ -297,7 +297,10 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
         else:
             ctx.initialize_attention_state()
 
-        # Phase 3: Verify per-rank graph match status.
+        # Phase 3: Verify.
+        # With NVLS dispatcher each rank matches independently, so every rank
+        # must find a graph for its own state — except PREFILL_EXCEED, whose
+        # token count exceeds the max cuda-graph size and falls back to eager.
         if my_state in _NO_CUDA_GRAPH_STATES:
             assert not ctx.using_cuda_graph_this_step(), (
                 f"EP rank {ep_rank} (state={my_state}): expected no CUDA graph match "
