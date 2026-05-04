@@ -1186,7 +1186,9 @@ class TextGenerationController:
             num_speculative_tokens=self.num_speculative_tokens,
         )
 
-    def _dynamic_step_sample_logits_and_verify_tokens(self, input_ids: Tensor):
+    def _dynamic_step_sample_logits_and_verify_tokens(
+        self, input_ids: Tensor, row_indices: Optional[Tensor] = None
+    ):
         """
         Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
         """
@@ -1209,7 +1211,15 @@ class TextGenerationController:
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.
             required_logits = logits.squeeze(0)
+            if row_indices is not None:
+                stride = self.num_speculative_tokens + 1
+                required_logits = (
+                    required_logits.view(-1, stride, self.vocab_size)
+                    .index_select(0, row_indices)
+                    .reshape(-1, self.vocab_size)
+                )
         else:
+            assert row_indices is None, "row-mapped MTP async reuse requires last-token logits"
             required_logits = logits.squeeze(0)[
                 required_logit_indices, :
             ]  # Shape [num_required, vocab_size]
@@ -1786,7 +1796,6 @@ class TextGenerationController:
 
         active_metadata = context.active_request_metadata
         active_slice = slice(0, active_request_count)
-        supports_finish_boundaries = self.num_speculative_tokens == 0
         if (active_metadata["top_k"][active_slice] != 1).any():
             return "non-greedy top_k"
         if (active_metadata["top_p"][active_slice] != 0.0).any():
@@ -1795,23 +1804,10 @@ class TextGenerationController:
             return "logprobs requested"
         if (active_metadata["top_n_logprobs"][active_slice] > 0).any():
             return "top-n logprobs requested"
-        if (
-            not supports_finish_boundaries
-            and (active_metadata["termination_id"][active_slice] >= 0).any()
-        ):
-            self._async_mtp_finish_boundary_count += 1
-            return "data-dependent termination id"
 
         active_sequence_lengths = context.get_active_sequence_lengths()
         max_sequence_lengths = context.get_max_sequence_lengths()
         tokens_per_request = self.num_speculative_tokens + 1
-        if (
-            not supports_finish_boundaries
-            and torch.ge(active_sequence_lengths + tokens_per_request, max_sequence_lengths).any()
-        ):
-            self._async_mtp_finish_boundary_count += 1
-            return "request can finish by length"
-
         if (
             context.padded_batch_dimensions.token_count
             != context.padded_batch_dimensions.decode_req_count * tokens_per_request
@@ -2405,12 +2401,20 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
-        # Both operands are CPU: sampled_tokens_cpu was D2H'd above, and
-        # active_request_metadata is CPU-pinned.
-        active_request_mask = (
-            sampled_tokens_cpu
-            != context.active_request_metadata["termination_id"][:active_request_count]
-        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+        # These operands are CPU: sampled_tokens_cpu was D2H'd above, and
+        # active_request_metadata is CPU-pinned. Under MTP, termination can be
+        # hit by an accepted speculative token before the new base sample.
+        termination_ids = context.active_request_metadata["termination_id"][:active_request_count]
+        termination_enabled = termination_ids >= 0
+        termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
+        if self.num_speculative_tokens > 0:
+            accepted_tokens_cpu = self._accepted_tokens_per_request[:active_request_count].cpu()
+            termination_hit |= termination_enabled & (
+                accepted_tokens_cpu == termination_ids[:, None]
+            ).any(dim=1)
+        active_request_mask = (~termination_hit).byte() & torch.less(
+            active_sequence_lengths, max_sequence_lengths
+        ).byte()
 
         # Mark requests as finished if they hit stop words
         # (detected in previous step's post_process_requests)
@@ -2623,7 +2627,9 @@ class TextGenerationController:
             elif self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
-                self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                self._dynamic_step_sample_logits_and_verify_tokens(
+                    input_ids, row_indices=pending_forward_row_indices
+                )
                 nvtx_range_pop("mtp-spec-decoding/verify")
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")

@@ -1160,6 +1160,14 @@ class DynamicInferenceEngine(AbstractEngine):
                         request_log_probs = request_log_probs[:keep]
                     if top_n_logprobs is not None and req_idx in top_n_logprobs:
                         top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
+                termination_id = request.sampling_params.termination_id
+                if termination_id is not None and termination_id >= 0 and termination_id in tokens:
+                    keep = tokens.index(termination_id) + 1
+                    tokens = tokens[:keep]
+                    if request_log_probs is not None:
+                        request_log_probs = request_log_probs[:keep]
+                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens

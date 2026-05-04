@@ -1049,6 +1049,166 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             request.generated_tokens for request in serial_env.requests
         ]
 
+    @staticmethod
+    def _reinitialize_model_parallel_for_async_test() -> None:
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_lifecycle_mtp_finish_trim_matrix(self) -> None:
+        """MTP termination trims accepted speculative tokens before completion."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=8,
+                num_speculative_tokens=2,
+                model_provider="gpt",
+                context_max_requests=4,
+            )
+        )
+        request = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64, device='cuda'),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=8,
+                termination_id=7,
+                top_k=1,
+            ),
+        )
+        env.engine._add_request(request)
+
+        _, finished_records = env.engine.post_process_requests(
+            request_ids=torch.tensor([0], dtype=torch.long),
+            finished_request_ids=torch.tensor([0], dtype=torch.long),
+            evict_request_ids=None,
+            step_time=0.0,
+            sample=torch.tensor([9], dtype=torch.long),
+            accepted_tokens=torch.tensor([[4, 7]], dtype=torch.long),
+            log_probs=None,
+        )
+
+        assert len(finished_records) == 1
+        finished_request = finished_records[0].merge()
+        assert finished_request.status == Status.COMPLETED
+        assert finished_request.generated_tokens == [4, 7]
+
+    def _run_async_mtp_finish_boundary_e2e(self, model_provider: str) -> None:
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=5,
+            num_gap_steps=0,
+            model_provider=model_provider,
+            num_speculative_tokens=2,
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        controller = async_env.engine.controller
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert (
+            controller._async_forward_graph_launch_count > 0
+        ), controller._async_decode_graph_capture_failed_reason
+        assert controller._async_mtp_finish_boundary_count > 0
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_gpt_mtp_finish_boundary_cuda_graph_e2e(self) -> None:
+        """Async MTP accepts GPT length-finish boundaries."""
+        self._run_async_mtp_finish_boundary_e2e("gpt")
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_hybrid_mtp_finish_boundary_cuda_graph_e2e(self) -> None:
+        """Async MTP accepts hybrid length-finish boundaries."""
+        self._run_async_mtp_finish_boundary_e2e("hybrid")
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_decode_mtp_termination_boundary_cuda_graph_e2e(self) -> None:
+        """Async MTP accepts termination-id finish boundaries."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_speculative_tokens=2,
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        probe_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        probe_tokens = [request.generated_tokens for request in probe_env.requests]
+        termination_id = None
+        for token_idx in range(common_kwargs["num_tokens_to_generate"] - 1):
+            step_tokens = [
+                tokens[token_idx] for tokens in probe_tokens if token_idx < len(tokens)
+            ]
+            for candidate in step_tokens:
+                finished_by_candidate = sum(candidate in tokens for tokens in probe_tokens)
+                if 0 < finished_by_candidate < len(probe_tokens):
+                    termination_id = candidate
+                    break
+            if termination_id is not None:
+                break
+        assert termination_id is not None
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        serial_env = self._run_test(
+            enable_async_scheduling=False, **{**common_kwargs, "termination_id": termination_id}
+        )
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._run_test(
+            enable_async_scheduling=True, **{**common_kwargs, "termination_id": termination_id}
+        )
+        controller = async_env.engine.controller
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert (
+            controller._async_forward_graph_launch_count > 0
+        ), controller._async_decode_graph_capture_failed_reason
+        assert controller._async_mtp_finish_boundary_count > 0
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
