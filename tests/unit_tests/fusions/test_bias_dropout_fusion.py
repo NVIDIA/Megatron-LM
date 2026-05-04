@@ -327,7 +327,7 @@ class TestFp32ResidualStreamAcrossLayers:
 #
 # When ``mhc_recompute_manager`` is provided, ``get_bias_dropout_add`` returns
 # a closure that wraps the underlying BDA in ``CheckpointWithoutOutput`` and
-# auto-registers with the supplied ``CheckpointManager``. These tests cover
+# auto-registers with the supplied ``CheckpointWithoutOutputManager``. These tests cover
 # that branch (which is otherwise only invoked indirectly from the mHC layer
 # forward path).
 
@@ -351,10 +351,10 @@ class TestBiasDropoutAddMhcRecompute:
     @pytest.mark.parametrize("with_bias", [True, False])
     def test_checkpointed_bda_forward_backward(self, fused, with_bias):
         """Closure runs forward+backward and registers with the manager."""
-        from megatron.core.tensor_parallel.random import CheckpointManager
+        from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 
         torch.manual_seed(0)
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
         bda = get_bias_dropout_add(training=True, fused=fused, mhc_recompute_manager=manager)
 
         x = torch.randn(8, 4, 16, device="cuda", requires_grad=True)
@@ -376,10 +376,10 @@ class TestBiasDropoutAddMhcRecompute:
 
     def test_checkpointed_bda_chained_managers(self):
         """Two checkpointed BDAs chained on one manager both register."""
-        from megatron.core.tensor_parallel.random import CheckpointManager
+        from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 
         torch.manual_seed(0)
-        manager = CheckpointManager()
+        manager = CheckpointWithoutOutputManager()
         bda = get_bias_dropout_add(training=True, fused=False, mhc_recompute_manager=manager)
 
         x = torch.randn(4, 2, 8, device="cuda", requires_grad=True)
