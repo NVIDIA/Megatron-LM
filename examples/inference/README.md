@@ -4,13 +4,13 @@ This guide provides an example for Megatron Core for running model inference.
 ### Contents
 - [Megatron Core Inference Documentation](#megatron-core-inference-documentation)
 - [Contents](#contents)
-  - [1. Quick Start](#1-quick-start)
-    - [1.1 Understanding The Code](#11-understanding-the-code)
+  - [1. Quick Start](#1-quickstart)
+    - [1.1 Code Walkthrough](#11-code-walkthrough)
     - [1.2 Running The Code](#12-running-the-code)
   - [2. Flow of Control In MCore Backend](#2-flow-of-control-in-mcore-backend)
   - [3. Customizing The Inference Pipeline](#3-customizing-the-inference-pipeline)
     - [3.1. Create Your Own Inference Backend](#31-create-your-own-inference-backend)
-    - [3.2. Create Your Own Text Generation Controller](#32-create-your-own-text-generation-controller)
+    - [3.2. Implement a new Sampling Loop](#32-implement-a-new-sampling-loop)
     - [3.3. Support Other Models](#33-support-other-models)
     - [3.3. Modify Inference Parameters](#33-modify-inference-parameters)
   - [4. Future work](#4-future-work)
@@ -44,7 +44,7 @@ The model provider function supports both MCore and Legacy models.
 ```
 
 ***STEP 3 - Choose an engine***
-Text generation requires an inference engine, which includes a scheduler. The default engine is the [Megatron Core engine](../../megatron/core/inference/engine/mcore_engine.py) with a [text generation controller](../../megatron/core/inference/text_generation_controllers/text_generation_controller.py). TRTLLMEngine will be supported in the future.
+Text generation requires an inference engine, which includes a scheduler. The default engine is the [Megatron Core engine](../../megatron/core/inference/engines/mcore_engine.py) with a [text generation controller](../../megatron/core/inference/text_generation_controllers/text_generation_controller.py). TRTLLMEngine will be supported in the future.
 ```python
     # Create an inference wrapper to setup the model.
     inference_wrapped_model = GPTInferenceWrapper(model, args)
@@ -180,7 +180,7 @@ The inference pipeline supports three levels of customization:
 <br>
 
 ##### 3.1. Create Your Own Inference Backend 
-The  [abstract_engine.py](./../../megatron/core/inference/engine/abstract_engine.py) file contains a `generate` method that can be extended to support a new backend. 
+The  [abstract_engine.py](./../../megatron/core/inference/engines/abstract_engine.py) file contains a `generate` method that can be extended to support a new backend. 
 
 ```python
 class AbstractEngine(ABC):

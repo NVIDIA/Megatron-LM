@@ -42,11 +42,9 @@ See [examples/mimo](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mim
 
 ## Diffusion Models
 
-For multimodal diffusion models (image generation, text-to-image, etc.), see [NeMo Diffusion Models](https://github.com/NVIDIA-NeMo/NeMo/tree/main/nemo/collections/diffusion). NeMo provides production-ready implementations of:
-- Stable Diffusion variants
-- Text-to-image generation
-- Image-to-image translation
-- ControlNet and other conditioning mechanisms
+For multimodal diffusion models, see [NeMo DFM](https://github.com/NVIDIA-NeMo/DFM). NeMo DFM provides implementations of:
+- DiT (Diffusion Transformers) for image and video generation
+- WAN 2.1 for video generation
 
 ## Multimodal Features
 
