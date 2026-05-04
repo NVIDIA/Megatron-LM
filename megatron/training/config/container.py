@@ -33,6 +33,7 @@ from megatron.training.models import Serializable, HybridModelConfig
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.training.utils import print_rank_0, warn_rank_0
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer import TransformerConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -387,6 +388,10 @@ class PretrainConfigContainer(ConfigContainerBase):
 
         self._validate_cp_comm_type()
 
+        # Validate DeepEP or HybridEP is supported for the current GPU architecture
+        if isinstance(self.model,  HybridModelConfig):
+            validate_flex_dispatcher_backend(self.model.transformer)
+
     def _validate_and_apply_megatron_fsdp_configs(self) -> None:
         """
         Validate Megatron-FSDP configuration when Megatron-FSDP is used.
@@ -674,3 +679,23 @@ class PretrainConfigContainer(ConfigContainerBase):
                 f"Product of hierarchical_context_parallel_sizes {hcp_sizes} "
                 f"(={prod(hcp_sizes)}) must equal context_parallel_size (={cp_size})."
             )
+
+
+def validate_flex_dispatcher_backend(model_config: TransformerConfig) -> None:
+    """Validate DeepEP or HybridEP is supported for the current GPU architecture."""
+    if model_config.moe_token_dispatcher_type == "flex":
+        device_properties = torch.cuda.get_device_properties(0)
+        if model_config.moe_flex_dispatcher_backend == "deepep":
+            if not (
+                device_properties.major in (8, 9) or device_properties.name.startswith(("NVIDIA B200", "NVIDIA B300"))
+            ):
+                raise ValueError(
+                    f"DeepEP is supported for Ampere, Hopper, and Blackwell (B200/B300) GPUs. "
+                    f"Current GPU: {device_properties.name}"
+                )
+
+        if model_config.moe_flex_dispatcher_backend == "hybridep":
+            if not device_properties.major in [8, 9, 10]:
+                raise ValueError(
+                    "HybridEP is supported for GB200, GB300 with NVL72 and for Ampere, Hopper, B200 and B300 GPUs"
+                )
