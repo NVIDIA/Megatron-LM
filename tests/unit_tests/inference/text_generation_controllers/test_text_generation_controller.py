@@ -67,6 +67,7 @@ class TextGenerationControllerTestBase:
         expert_model_parallel_size: int = 1,
         num_moe_experts: int = None,
         hybrid_layer_pattern: str = None,
+        sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
     ):
         if use_training_random_init:
@@ -164,6 +165,7 @@ class TextGenerationControllerTestBase:
                     enable_prefix_caching=enable_prefix_caching,
                     max_requests=max_requests,
                     mamba_inference_state_config=mamba_inference_state_config,
+                    sampling_backend=sampling_backend,
                 ),
             )
 
@@ -280,28 +282,34 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
-    @pytest.mark.parametrize("backend", ["torch"])
+    @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_sample_from_dynamic_logits(
         self, backend: str, materialize_only_last_token_logits: bool
     ):
-        batch_size = 12
+        if backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        batch_size = 15
         self.setup_model(
             torch.float32,
             batch_size=batch_size,
             static=False,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
+            sampling_backend=backend,
         )
         self.mock_tokenizer.eod = self.vocab_size
 
         context = self.text_generation_controller.inference_wrapped_model.inference_context
 
         # Prepare sampling params in human-readable format, to aid with test maintenance.
+        # The temperature=0 / top_k=1 bucket exercises the greedy path: torch short-circuits
+        # to argmax, flashinfer relies on its temperature clamp to avoid divide-by-zero.
         sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
             (SamplingParams(temperature=0.1, top_p=0.01), [9, 6, 10]),
             (SamplingParams(temperature=5.0, top_k=15), [0, 3, 2]),
             (SamplingParams(top_p=0.8), [4, 1, 7]),
             (SamplingParams(temperature=10.0, top_k=5), [11, 5, 8]),
+            (SamplingParams(temperature=0.0, top_k=1), [12, 13, 14]),
         ]
         # For non-torch backends, test simultaneous top_k and top_p sampling.
         if backend != "torch":
@@ -317,18 +325,16 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict])
         top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])
-        context.request_metadata["temperature"][:batch_size].copy_(temp_values)
-        context.request_metadata["top_k"][:batch_size].copy_(top_k_values)
-        context.request_metadata["top_p"][:batch_size].copy_(top_p_values)
-        self.text_generation_controller._sampling_backend = backend
+        context.active_request_metadata["temperature"][:batch_size].copy_(temp_values)
+        context.active_request_metadata["top_k"][:batch_size].copy_(top_k_values)
+        context.active_request_metadata["top_p"][:batch_size].copy_(top_p_values)
 
         context.padded_active_token_count = batch_size
-        context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32)
+        context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32, device='cuda')
         context.paused_request_count = 0
         context.total_request_count = batch_size
-
-        # Bookkeeping.
-        self.text_generation_controller._dynamic_step_sample_bookkeeping()
+        context.num_prefill_requests = 0
+        context.pad_active_slices()
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
@@ -353,13 +359,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         sampled_l.masked_fill_(top_k_mask, 0.0)
         top_p_mask = sampled_l.cumsum(dim=-1) > top_p_values.unsqueeze(1)
 
+        # When `top_p` is enabled, but the cumulative probs don't actually filter anything,
+        # our constraint reduces to top_k alone.
+        start_idx = torch.clamp(self.vocab_size - top_k_values, min=0).long()
         first_excluded = torch.where(
-            top_p_mask.any(dim=-1),
-            top_p_mask.float().argmax(dim=-1),
-            torch.full((batch_size,), self.vocab_size, device=top_p_mask.device),
+            top_p_mask.any(dim=-1), top_p_mask.float().argmax(dim=-1), start_idx + 1
         )
         last_included = torch.clamp(first_excluded - 1, min=0)
-        start_idx = torch.clamp(self.vocab_size - top_k_values, min=0).long()
         last_included = torch.max(last_included, start_idx)
         expected_min_values = l.gather(1, last_included.unsqueeze(1)).squeeze(1)
         assert torch.all(
@@ -954,10 +960,22 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                     ), f"Request {req_idx}, token {token_idx}: expected {top_n} indices"
 
     @pytest.mark.internal
-    def test_speculative_verify_tokens(self):
+    @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_verify_tokens(
+        self, backend: str, materialize_only_last_token_logits: bool
+    ):
         """Test consecutive token acceptance logic for speculative decoding."""
+        if backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         self.setup_model(
-            torch.float32, static=False, num_speculative_tokens=2, max_requests=2, mtp_num_layers=2
+            torch.float32,
+            static=False,
+            num_speculative_tokens=2,
+            max_requests=2,
+            mtp_num_layers=2,
+            sampling_backend=backend,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
         )
 
         # Enable speculative decoding
@@ -971,6 +989,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.request_query_lengths = torch.tensor(
             [3, 3], dtype=torch.int32, device='cuda'
         )  # 1 sampled + 2 spec
+        ctx.num_prefill_requests = 0
+        ctx.pad_active_slices()
 
         # Init accepted tokens tensors
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -992,12 +1012,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 # The verification logic only uses base tokens, so we can return zeros here.
                 return torch.zeros((12,), dtype=torch.long, device='cuda')
 
-        # Override sampling to return our predictable mock outputs
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
-        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
-            torch.tensor([0, 1], device='cuda', dtype=torch.long)
-        ]
-        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+        # Override sampling to return our predictable mock outputs.
+        self.text_generation_controller._sampling.sample_kernel = mock.MagicMock(
             side_effect=mock_sampling_func
         )
 
@@ -1032,26 +1048,29 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
         self.text_generation_controller.num_speculative_tokens = 3
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        context_device = ctx.request_kv_length_offsets.device
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
-        ctx.request_in_prefill_status_tensor = torch.tensor([0, 0], device='cuda')
+        ctx.request_in_prefill_status_tensor[:2] = torch.tensor(
+            [0, 0], dtype=torch.int32, device=context_device
+        )
 
         # Initialize allocator and states
         ctx.kv_block_allocator.total_avail = 100
-        ctx.request_kv_length_offsets[:2] = torch.tensor([10, 15], device='cuda')
-        ctx.request_kv_block_counts[:2] = torch.tensor([3, 4], device='cuda')
+        ctx.request_kv_length_offsets[:2] = torch.tensor([10, 15], device=context_device)
+        ctx.request_kv_block_counts[:2] = torch.tensor([3, 4], device=context_device)
 
         # Req 0: offset 2. Rewinding 2 tokens -> offset 0. No block released.
         # Req 1: offset 1. Rewinding 3 tokens -> offset 2 (prev block). 1 block released.
-        ctx.request_last_kv_block_offset[:2] = torch.tensor([2, 1], device='cuda')
-        ctx.request_last_kv_block_id[:2] = torch.tensor([50, 60], device='cuda')
+        ctx.request_last_kv_block_offset[:2] = torch.tensor([2, 1], device=context_device)
+        ctx.request_last_kv_block_id[:2] = torch.tensor([50, 60], device=context_device)
         ctx.request_to_kv_block_ids[:2, :4] = torch.tensor(
-            [[48, 49, 50, -1], [57, 58, 59, 60]], dtype=torch.int, device='cuda'
+            [[48, 49, 50, -1], [57, 58, 59, 60]], dtype=torch.int, device=context_device
         )
 
         if is_hybrid_model:
             ctx.mamba_metadata.request_to_mamba_state_idx[:2] = torch.tensor(
-                [0, 1], dtype=torch.int32, device='cuda'
+                [0, 1], dtype=torch.int32, device=context_device
             )
             ctx.mamba_ssm_states.zero_()
             ctx.mamba_intermediate_ssm_states.fill_(99)
@@ -1070,18 +1089,21 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # Assert offsets updated
         assert torch.equal(
             ctx.request_last_kv_block_offset[:2],
-            torch.tensor([0, 2], dtype=torch.int, device='cuda'),
+            torch.tensor([0, 2], dtype=torch.int, device=context_device),
         )
         assert torch.equal(
-            ctx.request_kv_length_offsets[:2], torch.tensor([8, 12], dtype=torch.int, device='cuda')
+            ctx.request_kv_length_offsets[:2],
+            torch.tensor([8, 12], dtype=torch.int, device=context_device),
         )
 
         # Assert block counts and IDs updated for boundary crossing
         assert torch.equal(
-            ctx.request_kv_block_counts[:2], torch.tensor([3, 3], dtype=torch.int, device='cuda')
+            ctx.request_kv_block_counts[:2],
+            torch.tensor([3, 3], dtype=torch.int, device=context_device),
         )
         assert torch.equal(
-            ctx.request_last_kv_block_id[:2], torch.tensor([50, 59], dtype=torch.int, device='cuda')
+            ctx.request_last_kv_block_id[:2],
+            torch.tensor([50, 59], dtype=torch.int, device=context_device),
         )
 
         # Assert released block is cleared
@@ -1216,6 +1238,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )  # Decode requests
         # query lengths for decode with spec tokens is (1 + num_spec) = 4
         ctx.request_query_lengths = torch.tensor([4, 4], dtype=torch.int32, device='cuda')
+        ctx.num_prefill_requests = 0
+        ctx.pad_active_slices()
 
         # Setup inputs
         input_ids = torch.randint(0, self.vocab_size, (1, 8), device='cuda')
@@ -1224,15 +1248,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # Base logits shape: [1, 8, vocab_size]
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
 
-        # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
-        # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
-        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
-            torch.tensor([0, 1], device='cuda', dtype=torch.long)
-        ]
-
-        # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
-        # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
+        # Drive sampling onto the multinomial path (top_p > 0, top_k == 0) via metadata.
+        # We do NOT mock the sampling kernel: we want it to run natively to prove it doesn't crash.
+        ctx.active_request_metadata["temperature"][:2] = 1.0
+        ctx.active_request_metadata["top_k"][:2] = 0
+        ctx.active_request_metadata["top_p"][:2] = 0.9
 
         self.text_generation_controller._all_logits_cuda = logits
         try:
@@ -1267,18 +1287,21 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        context_device = ctx.request_kv_length_offsets.device
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
-        ctx.request_in_prefill_status_tensor = torch.tensor([0, 0], device='cuda')
+        ctx.request_in_prefill_status_tensor[:2] = torch.tensor(
+            [0, 0], dtype=torch.int32, device=context_device
+        )
 
         # Req 0: 3 blocks, offset 1 in last block. Rewinding 1 token -> no block release.
         # Req 1: 3 blocks, offset 0 in last block. Rewinding 2 tokens -> crosses back, release block.
-        ctx.request_kv_length_offsets[:2] = torch.tensor([9, 9], device='cuda')
-        ctx.request_kv_block_counts[:2] = torch.tensor([3, 3], device='cuda')
-        ctx.request_last_kv_block_offset[:2] = torch.tensor([1, 0], device='cuda')
-        ctx.request_last_kv_block_id[:2] = torch.tensor([10, 20], device='cuda')
+        ctx.request_kv_length_offsets[:2] = torch.tensor([9, 9], device=context_device)
+        ctx.request_kv_block_counts[:2] = torch.tensor([3, 3], device=context_device)
+        ctx.request_last_kv_block_offset[:2] = torch.tensor([1, 0], device=context_device)
+        ctx.request_last_kv_block_id[:2] = torch.tensor([10, 20], device=context_device)
         ctx.request_to_kv_block_ids[:2, :3] = torch.tensor(
-            [[8, 9, 10], [18, 19, 20]], dtype=torch.int, device='cuda'
+            [[8, 9, 10], [18, 19, 20]], dtype=torch.int, device=context_device
         )
 
         # Set ref counts: block 20 is shared (ref=2), block 10 is exclusive (ref=1).
@@ -1313,17 +1336,20 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
+        context_device = ctx.request_kv_length_offsets.device
         ctx.total_request_count = 1
         ctx.paused_request_count = 0
-        ctx.request_in_prefill_status_tensor = torch.tensor([0], device='cuda')
+        ctx.request_in_prefill_status_tensor[:1] = torch.tensor(
+            [0], dtype=torch.int32, device=context_device
+        )
 
         # 4 blocks. Offset 2 in last block. Rewinding 3 crosses into previous block.
-        ctx.request_kv_length_offsets[:1] = torch.tensor([14], device='cuda')
-        ctx.request_kv_block_counts[:1] = torch.tensor([4], device='cuda')
-        ctx.request_last_kv_block_offset[:1] = torch.tensor([2], device='cuda')
-        ctx.request_last_kv_block_id[:1] = torch.tensor([40], device='cuda')
+        ctx.request_kv_length_offsets[:1] = torch.tensor([14], device=context_device)
+        ctx.request_kv_block_counts[:1] = torch.tensor([4], device=context_device)
+        ctx.request_last_kv_block_offset[:1] = torch.tensor([2], device=context_device)
+        ctx.request_last_kv_block_id[:1] = torch.tensor([40], device=context_device)
         ctx.request_to_kv_block_ids[0, :4] = torch.tensor(
-            [10, 20, 30, 40], dtype=torch.int, device='cuda'
+            [10, 20, 30, 40], dtype=torch.int, device=context_device
         )
 
         # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
@@ -1471,10 +1497,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
-        ctrl._torch_sampling_bucket_index_tensors = [
-            torch.arange(active_request_count, device='cuda', dtype=torch.long)
-        ]
+        ctx.active_request_metadata["temperature"][:active_request_count] = 1.0
+        ctx.active_request_metadata["top_k"][:active_request_count] = 1
+        ctx.active_request_metadata["top_p"][:active_request_count] = 0.0
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()

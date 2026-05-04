@@ -104,6 +104,13 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
 
     args_dict = vars(get_args()).copy()
     del args_dict["kv_channels"]  # not recalculated if present
+    # Setting teacher Flextron fields to false if training with Flextron, can be overridden
+    if "flextron" in args_dict:
+        config["flextron"] = False
+    if "enable_router" in args_dict:
+        config["enable_router"] = False
+    if "freeze_model" in args_dict:
+        config["freeze_model"] = False
     args_dict.update(config)
 
     # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
