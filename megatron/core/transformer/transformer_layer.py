@@ -594,14 +594,58 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        input_layernorm_output, residual = self._run_input_layernorm(hidden_states)
+
+        using_fused_tp_inference_kernel = (not self.training) and (
+            self.config.inference_fuse_tp_communication
+        )
+        if using_fused_tp_inference_kernel:
+            self._set_proj_residual(residual)
+
+        nvtx_range_push(suffix="self_attention")
+        attention_output_with_bias = self.self_attention(
+            input_layernorm_output,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
+        nvtx_range_pop(suffix="self_attention")
+
+        if self._input_layernorm_checkpoint_active:
+            # discard the output of the input layernorm and register the recompute
+            # as a gradient hook of attention_output_with_bias[0]
+            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
+
+        hidden_states = self._apply_self_attn_bda_step(attention_output_with_bias, residual)
+        return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
+
+    def _run_input_layernorm(self, hidden_states):
+        """Run input layernorm with optional output-discarding checkpoint and
+        fine-grained activation offloading.
+
+        Sets ``self._input_layernorm_checkpoint_active`` so the caller can gate
+        the post-attention discard-and-register hook on the same condition. The
+        flag is consumed by the next ``self._apply_self_attn_bda_step`` step.
+
+        Returns:
+            Tuple ``(input_layernorm_output, residual)`` ready for the
+            self-attention call.
+        """
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as offload_interface,
         )
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        # Optional Input Layer norm
-        if self.recompute_input_layernorm:
+        self._input_layernorm_checkpoint_active = self.recompute_input_layernorm
+        if self._input_layernorm_checkpoint_active:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with offload_interface(
                 self.offload_attn_norm, hidden_states, "attn_norm"
@@ -628,37 +672,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.config.fp32_residual_connection:
             residual = residual.float()
+        return input_layernorm_output, residual
+
+    def _apply_self_attn_bda_step(self, attention_output_with_bias, residual):
+        """bias-dropout-add for self-attention output + post-step offload commit.
+
+        Subclasses override this to swap in a fused kernel that consumes extra
+        intermediate tensors stashed on ``self`` during ``_run_input_layernorm``.
+        """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as offload_interface,
+        )
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
-
-        if using_fused_tp_inference_kernel:
-            self._set_proj_residual(residual)
-
-        # Self attention.
-        nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-        )
-        nvtx_range_pop(suffix="self_attention")
-
-        if self.recompute_input_layernorm:
-            # discard the output of the input layernorm and register the recompute
-            # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
-
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
@@ -680,8 +708,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = offload_interface.group_commit(
                 hidden_states, name="attn_norm", forced_released_tensors=[residual]
             )
+        return hidden_states
 
-        # Optional Layer norm after self-attention
+    def _run_cross_attention(self, hidden_states, context, context_mask, inference_context):
+        """Optional pre-cross-attn layernorm + cross-attention + bda block."""
         pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
 
         if isinstance(pre_cross_attn_layernorm_output, tuple):
@@ -698,7 +728,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.config.fp32_residual_connection:
             residual = residual.float()
-        # Cross attention.
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,
             attention_mask=context_mask,
@@ -1435,6 +1464,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # is not a CUDA-graph-supported type and gets stripped during capture).
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
+        # Stashed during _run_input_layernorm and consumed by _apply_self_attn_bda_step
+        # so the mHC fused kernel can mix the residual + h_post + bda in one op without
+        # threading extra kwargs through the inherited base _forward_attention skeleton.
+        self._h_res: Optional[Tensor] = None
+        self._h_post: Optional[Tensor] = None
+
     def __call__(self, *args, **kwargs):
         # Pull the manager off kwargs before super().__call__ hands them to the
         # CUDA-graph machinery (which can't handle a CheckpointWithoutOutputManager).
@@ -1481,63 +1516,57 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         return submodules
 
     def forward(self, *args, **kwargs):
-        """Forward pass with MHC recompute manager support."""
-        # Set by __call__ from kwargs (see HyperConnectionTransformerLayer.__call__).
-        mhc_recompute_manager = self._mhc_recompute_manager
+        """Forward pass with MHC recompute manager support.
 
-        hidden_states, context = self._forward_attention(
-            *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs
-        )
-
+        Inherits ``_forward_attention`` from base; the mHC-specific behavior
+        is contained in the ``_run_input_layernorm`` and
+        ``_apply_self_attn_bda_step`` overrides below, which read the manager
+        and the stashed h_res/h_post off ``self``.
+        """
+        hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
-            mhc_recompute_manager=mhc_recompute_manager,
+            mhc_recompute_manager=self._mhc_recompute_manager,
         )
         return output, context
 
-    def _forward_attention(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        rotary_pos_cos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        inference_context: Optional[Any] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
-        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
-        *,
-        inference_params: Optional[Any] = None,
-    ):
-        """Forward attention with hyper connection pre/post processing on self-attention."""
+    def _run_input_layernorm(self, hidden_states):
+        """HC input layernorm: hyper-connection pre-wrap + mHC-aware checkpoint.
+
+        Stashes ``self._h_res`` and ``self._h_post`` so the inherited base
+        ``_forward_attention`` skeleton can later call
+        ``_apply_self_attn_bda_step`` (which reads them) for the fused kernel.
+        Also sets ``self._input_layernorm_checkpoint_active`` for the
+        post-self-attn discard hook.
+
+        Returns ``(input_layernorm_output, residual)`` where ``residual`` is
+        the n-stream hidden state captured before layernorm — it flows to
+        ``_apply_self_attn_bda_step`` via the base skeleton's ``residual``
+        argument.
+        """
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as offload_interface,
         )
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
+        # Capture the n-stream residual BEFORE self_attention_hyper_connection
+        # aggregates n-stream -> single-stream. The fused bda kernel needs the
+        # original n-stream tensor.
         residual = hidden_states
 
         nvtx_range_push(suffix="self_attention_hyper_connection")
-        hidden_states, self_attn_h_res, self_attn_hc_h_post = self.self_attention_hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        hidden_states, self._h_res, self._h_post = self.self_attention_hyper_connection(
+            hidden_states, mhc_recompute_manager=self._mhc_recompute_manager
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
 
-        # Optional Input Layer norm
-        checkpoint_input_layernorm = self.recompute_input_layernorm or (
-            mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
+        self._input_layernorm_checkpoint_active = self.recompute_input_layernorm or (
+            self._mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
         )
-        if checkpoint_input_layernorm:
+        if self._input_layernorm_checkpoint_active:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                ckpt_manager=mhc_recompute_manager
+                ckpt_manager=self._mhc_recompute_manager
             )
             with offload_interface(
                 self.offload_attn_norm, hidden_states, "attn_norm"
@@ -1551,64 +1580,39 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             ) as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
-        # Self attention.
-        nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-        )
-        nvtx_range_pop(suffix="self_attention")
+        return input_layernorm_output, residual
 
-        if checkpoint_input_layernorm:
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
+    def _apply_self_attn_bda_step(self, attention_output_with_bias, residual):
+        """HC fused bias-dropout-add: combines apply_h_res + apply_h_post + bda.
+
+        Consumes ``self._h_res`` and ``self._h_post`` stashed by
+        ``_run_input_layernorm``; clears them on exit so post-call state is
+        clean.
+        """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as offload_interface,
+        )
 
         nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
-                self_attn_h_res,
+                self._h_res,
                 residual,
-                self_attn_hc_h_post,
+                self._h_post,
                 attention_output_with_bias,
                 self.hidden_dropout,
                 self.training,
                 self.config.bias_dropout_fusion,
-                mhc_recompute_manager,
+                self._mhc_recompute_manager,
             )
         nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
-
+        # HC omits forced_released_tensors — the n-stream residual is consumed
+        # by the fused kernel above, so the base class's "release residual after
+        # commit" trick doesn't apply.
         if self.offload_attn_norm:
             hidden_states = offload_interface.group_commit(hidden_states, name="attn_norm")
-
-        # Cross-attention (no hyper connection support).
-        residual = hidden_states
-        pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
-
-        attention_output_with_bias = self.cross_attention(
-            pre_cross_attn_layernorm_output,
-            attention_mask=context_mask,
-            key_value_states=context,
-            inference_context=inference_context,
-        )
-
-        if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
-            context = attention_output_with_bias["context"]
-
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
-
-        return hidden_states, context
+        self._h_res = self._h_post = None
+        return hidden_states
 
     def _forward_mlp(
         self,
