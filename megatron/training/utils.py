@@ -797,3 +797,21 @@ def has_nvrx_installed():
 def has_nvrx_checkpointing_async_support():
     """Checks whether the installed NVRx package exposes the async checkpointing API Megatron uses."""
     return has_nvrx_async_support()
+
+
+def file_exists(path: str) -> bool:
+    """Check if a file exists.
+
+    Args:
+        path: The path to the file. Can be a local path or an MSC URL.
+
+    Returns:
+        True if the file exists, False otherwise.
+    """
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.os.path.exists(path)
+    else:
+        return os.path.exists(path)
+
+

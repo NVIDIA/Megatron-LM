@@ -644,15 +644,28 @@ class CheckpointConfig:
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
 
-    def __post_init__(self):
+    def finalize(self) -> None:
+        """Post-initialization checks for checkpoint config."""
         from megatron.training.utils import has_nvrx_checkpointing_async_support
+
+        if self.pretrained_checkpoint is not None:
+            from megatron.training.utils import file_exists
+
+            assert file_exists(self.pretrained_checkpoint), (
+                f"Pretrained checkpoint {self.pretrained_checkpoint} does not exist"
+            )
+
+        if self.load_main_params_from_ckpt:
+            assert not self.load_optim, "load_main_params_from_ckpt must be used with load_optim=False"
 
         assert self.async_strategy in ["nvrx", "mcore"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
 
         if not self.async_save:
             self.async_strategy = "mcore"
-
+        else:
+            assert self.save is not None, "async_save is enabled, but save is not set. Set save to a valid path."
+            assert self.use_persistent_ckpt_worker, "async_save requires use_persistent_ckpt_worker=True."
         if (
             self.async_save
             and self.async_strategy == "nvrx"
@@ -666,6 +679,19 @@ class CheckpointConfig:
         if self.verify_integrity:
             assert self.ckpt_format == "torch_dist", \
                 f"`verify_integrity` is only supported with torch_dist checkpoint format."
+
+        # Validate ckpt_step if specified
+        if self.ckpt_step is not None:
+            if self.load is None:
+                raise ValueError(
+                    f"ckpt_step={self.ckpt_step} specified but checkpoint.load is None. "
+                    f"Please set checkpoint.load to the base checkpoint directory."
+                )
+
+        if self.dist_ckpt_optim_fully_reshardable:
+            assert not self.distrib_optim_fully_reshardable_mem_efficient, (
+                "distrib_optim_fully_reshardable_mem_efficient requires use_gloo_process_groups"
+            )
 
 
 @dataclass(kw_only=True)
