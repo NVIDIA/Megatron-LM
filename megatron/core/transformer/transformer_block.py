@@ -260,7 +260,7 @@ def _get_block_submodules(
         raise Exception(f"specialize for {type(spec).__name__}.")
 
 
-def checkpointed_foward(
+def checkpointed_forward(
     self: "TransformerBlock | HybridStack",
     hidden_states: Tensor,
     attention_mask: Tensor,
@@ -775,7 +775,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         with rng_context, outer_quantization_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
-                checkpointed_result = checkpointed_foward(
+                checkpointed_result = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
