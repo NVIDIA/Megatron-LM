@@ -666,6 +666,9 @@ class CheckpointConfig:
         else:
             assert self.save is not None, "async_save is enabled, but save is not set. Set save to a valid path."
             assert self.use_persistent_ckpt_worker, "async_save requires use_persistent_ckpt_worker=True."
+            assert self.ckpt_format in ["torch_dist", "fsdp_dtensor"], (
+                "async_save is only supported with ckpt_format='torch_dist','fsdp_dtensor'"
+            )
         if (
             self.async_save
             and self.async_strategy == "nvrx"
