@@ -154,7 +154,6 @@ class InferenceBatchDimensions:
 
         Args:
             local_batch_dims: The local batch dimensions to adjust.
-            strict: Whether to use strict matching for batch dimensions.
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
