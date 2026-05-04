@@ -117,17 +117,26 @@ class HybridModelConfig:
     # injects them into every per-layer TransformerConfig and the
     # stack-level config. PP is intentionally absent — the recipe DSL is
     # PP-free; recipes that need PP must use the legacy string DSL.
-    tensor_model_parallel_size: int = 1
-    """Tensor-model-parallel world size."""
+    #
+    # All four default to ``None``, meaning "do not pin from the recipe".
+    # When unset, ``_apply_model_recipe_to_args`` skips projecting them onto
+    # ``args``, so launcher CLI flags (``--tensor-model-parallel-size`` etc.)
+    # win. Recipes for topology-bound models (e.g. Nemotron-3 Nano needs
+    # TP=4/EP=8 to fit) should pin these explicitly; ad-hoc / debugging
+    # recipes can leave them unset and let the launcher decide.
+    tensor_model_parallel_size: Optional[int] = None
+    """Tensor-model-parallel world size; ``None`` = use ``--tensor-model-parallel-size``."""
 
-    context_parallel_size: int = 1
-    """Context-parallel world size."""
+    context_parallel_size: Optional[int] = None
+    """Context-parallel world size; ``None`` = use ``--context-parallel-size``."""
 
-    expert_model_parallel_size: int = 1
-    """Expert-model-parallel world size (used by MoE layers)."""
+    expert_model_parallel_size: Optional[int] = None
+    """Expert-model-parallel world size (used by MoE layers); ``None`` = use
+    ``--expert-model-parallel-size``."""
 
     expert_tensor_parallel_size: Optional[int] = None
-    """Expert tensor-parallel size (defaults to ``tensor_model_parallel_size``)."""
+    """Expert tensor-parallel size; ``None`` = use ``--expert-tensor-parallel-size``
+    (which itself defaults to ``tensor_model_parallel_size``)."""
 
     def compile(self) -> CompiledRecipe:
         """Process the layer pattern into a :class:`CompiledRecipe`.
@@ -178,13 +187,26 @@ class HybridModelConfig:
         # this glue block changes.
         # ─────────────────────────────────────────────────────────────────
 
+        # Topology fields default to ``None`` on the recipe (= "let the
+        # launcher decide"). For per-layer TC construction we still need
+        # concrete values, so substitute TC defaults (1 / TP) here. The
+        # ``None``-ness is preserved on the recipe itself for the args
+        # projection, which only writes to ``args.<field>`` when the recipe
+        # pinned a value.
+        tp = self.tensor_model_parallel_size if self.tensor_model_parallel_size is not None else 1
+        cp = self.context_parallel_size if self.context_parallel_size is not None else 1
+        ep = self.expert_model_parallel_size if self.expert_model_parallel_size is not None else 1
+        etp = (
+            self.expert_tensor_parallel_size if self.expert_tensor_parallel_size is not None else tp
+        )
+
         # Universal parallelism — flows into every per-layer TC. PP is
         # intentionally absent: the recipe DSL is PP-free. ``is_hybrid_model``
         # is implicit for any HybridModelConfig recipe; force it on every TC
         # so users don't carry a redundant ``=True``.
         parallelism: dict = {
-            "tensor_model_parallel_size": self.tensor_model_parallel_size,
-            "context_parallel_size": self.context_parallel_size,
+            "tensor_model_parallel_size": tp,
+            "context_parallel_size": cp,
             "is_hybrid_model": True,
         }
 
@@ -195,12 +217,8 @@ class HybridModelConfig:
         # auto-derived from TP) take over, which is correct because those
         # layers don't participate in expert parallelism.
         expert_parallelism: dict = {
-            "expert_model_parallel_size": self.expert_model_parallel_size,
-            "expert_tensor_parallel_size": (
-                self.expert_tensor_parallel_size
-                if self.expert_tensor_parallel_size is not None
-                else self.tensor_model_parallel_size
-            ),
+            "expert_model_parallel_size": ep,
+            "expert_tensor_parallel_size": etp,
         }
 
         # ``placeholders`` only fill if absent, so a recipe author's
@@ -221,7 +239,7 @@ class HybridModelConfig:
         if embedding.position_embedding_type in ("rope", "yarn"):
             _reject_heterogeneous_attention_geometry(decoder_flat, attention_metadata)
 
-        placeholders: dict = {"num_attention_heads": max(1, self.tensor_model_parallel_size)}
+        placeholders: dict = {"num_attention_heads": max(1, tp)}
         # If the recipe contains a uniform attention geometry, use it as the
         # semantic placeholder for non-attention layer TransformerConfigs.
         # This keeps recipe authors out of TransformerConfig compatibility
@@ -274,7 +292,7 @@ class HybridModelConfig:
             stack_kwargs["num_moe_experts"] = stack_moe_experts
             if stack_moe_ffn_hidden_size is not None:
                 stack_kwargs["moe_ffn_hidden_size"] = stack_moe_ffn_hidden_size
-        elif self.expert_model_parallel_size > 1:
+        elif ep > 1:
             raise ValueError(
                 "expert_model_parallel_size > 1 requires at least one "
                 "MoELayerConfig in the layer_pattern; the recipe has none. "
