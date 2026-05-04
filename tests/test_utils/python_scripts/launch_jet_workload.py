@@ -340,7 +340,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 )
 @click.option("--n-repeat", required=False, default=1, type=int)
 @click.option("--time-limit", required=False, default=1800, type=int)
-@click.option("--scope", required=False, default="mr", type=str)
+@click.option("--scope", required=False, default="L1", type=str)
 @click.option(
     "--account",
     required=False,
