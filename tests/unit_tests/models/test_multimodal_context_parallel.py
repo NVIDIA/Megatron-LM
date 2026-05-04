@@ -313,9 +313,12 @@ class TestDynamicResCPDistributed:
     def test_split_dynamic_res_temporal_aware_tubelets(self):
         """``temporal_patch_size > 1`` triggers the tubelet-aware split.
 
-        Two videos of 4 and 4 frames each, T=2 ⇒ 4 tubelets total over 2 CP
-        ranks ⇒ each rank owns 2 tubelets. Verify ``local_num_frames`` reflects
-        the per-rank frame counts (not tubelet counts).
+        ``split_to_context_parallel_ranks_dynamic_res`` is called **before**
+        :meth:`RADIOViTModel._apply_temporal_grouping`, so its inputs are
+        per-frame (one ``imgs_sizes`` entry and one ``cu_seqlens`` segment per
+        frame). With two videos of 4 frames each (T=2 ⇒ 2 tubelets/video, 4
+        tubelets total) split across cp_size=2, each rank owns 1 video = 4
+        frames = 2 tubelets.
         """
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
 
@@ -328,21 +331,18 @@ class TestDynamicResCPDistributed:
         num_videos = 2
         frames_per_video = 4
         temporal_patch_size = 2
-        # After temporal grouping each video has frames_per_video//T tubelets.
-        # split_to_context_parallel_ranks_dynamic_res receives post-grouping
-        # tubelet data: one entry per tubelet in imgs_sizes / cu_seqlens.
-        total_tubelets = num_videos * (frames_per_video // temporal_patch_size)  # = 4
+        total_frames = num_videos * frames_per_video  # = 8 (per-frame entries)
 
         chunks = [
             torch.full((per_img_seq, hidden), float(i), dtype=torch.float32, device="cuda")
-            for i in range(total_tubelets)
+            for i in range(total_frames)
         ]
         global_t = torch.cat(chunks, dim=0).unsqueeze(0)
         global_imgs_sizes = torch.tensor(
-            [[patch_dim, patch_dim]] * total_tubelets, dtype=torch.int32, device="cuda"
+            [[patch_dim, patch_dim]] * total_frames, dtype=torch.int32, device="cuda"
         )
         cu_seqlens = torch.tensor(
-            [i * per_img_seq for i in range(total_tubelets + 1)], dtype=torch.int32, device="cuda"
+            [i * per_img_seq for i in range(total_frames + 1)], dtype=torch.int32, device="cuda"
         )
         global_packed_seq_params = PackedSeqParams(
             qkv_format="thd",
@@ -368,12 +368,13 @@ class TestDynamicResCPDistributed:
 
         assert has_padding is False
         assert num_padded_ranks == 0
-        # Per-rank frame counts: 4 tubelets ÷ 2 ranks = 2 tubelets/rank ⇒ 4 frames/rank.
+        # With a clean media-boundary split (target_split == media boundary),
+        # each rank owns exactly one full video: frames_per_video frames.
         assert local_num_frames is not None
-        assert int(local_num_frames.sum().item()) == 4
-        # Each rank owns 2 tubelets worth of patches (one tubelet = per_img_seq patches).
-        assert local_t.shape == (1, 2 * per_img_seq, hidden)
-        assert local_imgs_sizes.shape == (2, 2)
+        assert int(local_num_frames.sum().item()) == frames_per_video
+        # Each rank owns frames_per_video frames worth of patches.
+        assert local_t.shape == (1, frames_per_video * per_img_seq, hidden)
+        assert local_imgs_sizes.shape == (frames_per_video, 2)
 
     @pytest.mark.internal
     def test_split_dynamic_res_pads_when_too_few_images(self):

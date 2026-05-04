@@ -1082,9 +1082,7 @@ class LLaVAModel(MegatronModule):
                 )
                 if is_packed_dynamic_res:
                     image_embeddings = self.vision_model(
-                        images,
-                        imgs_sizes=imgs_sizes,
-                        packed_seq_params=vision_packed_seq_params,
+                        images, imgs_sizes=imgs_sizes, packed_seq_params=vision_packed_seq_params
                     )  # [1, sum(patches_i + ct_len), h_vision]
                     P = int(self.vision_model.patch_dim)
                     sizes = (
@@ -1130,7 +1128,9 @@ class LLaVAModel(MegatronModule):
                             images
                         )  # [num_tiles, img_seq_len, h_vision]
                     if self._drop_vision_class_token:
-                        image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
+                        image_embeddings = image_embeddings[
+                            :, self.vision_model.class_token_len :, :
+                        ]
 
             # Packed dynamic-res path already pixel-shuffled per-image above; skip outer call.
             # For the single-image (non-packed) case pass h/w from imgs_sizes if available.

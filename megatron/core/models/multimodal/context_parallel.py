@@ -231,42 +231,54 @@ def gather_from_context_parallel_ranks_dynamic_res(local_t, num_padded_imgs=0):
 
 
 def _compute_tubelet_aware_split_points(num_frames, temporal_patch_size, cp_size, total_frames):
-    """Compute split points that respect tubelet boundaries within videos."""
+    """Compute frame-space split points that respect tubelet boundaries within videos.
+
+    Returns ``cp_size + 1`` split points in **frame** indices (not tubelet indices),
+    since callers slice per-frame ``cu_seqlens`` and ``imgs_sizes`` with these bounds.
+    Splits land on either media boundaries or tubelet boundaries inside a media so
+    that no rank receives a partial tubelet.
+    """
     T = temporal_patch_size
     target_per_rank = total_frames / cp_size
 
     media_boundaries = [0]
     for nf in num_frames:
         media_boundaries.append(media_boundaries[-1] + nf)
+    boundary_set = set(media_boundaries)
 
     split_points = [0]
     for rank in range(1, cp_size):
         target_split = int(rank * target_per_rank)
 
-        media_idx = 0
-        for i, boundary in enumerate(media_boundaries[1:], 1):
-            if boundary > target_split:
-                media_idx = i - 1
-                break
+        # If the target lands exactly on a media boundary, split there cleanly
+        # without forcing a cut into the next media.
+        if target_split in boundary_set:
+            split_point = target_split
         else:
-            media_idx = len(num_frames) - 1
-
-        media_start = media_boundaries[media_idx]
-        media_end = media_boundaries[media_idx + 1]
-        nf = num_frames[media_idx]
-        num_tubelets = math.ceil(nf / T)
-
-        if num_tubelets <= 1:
-            if target_split - media_start < media_end - target_split:
-                split_point = media_start
+            media_idx = 0
+            for i, boundary in enumerate(media_boundaries[1:], 1):
+                if boundary > target_split:
+                    media_idx = i - 1
+                    break
             else:
-                split_point = media_end
-        else:
-            offset_in_media = target_split - media_start
-            tubelet_idx = round(offset_in_media / T)
-            tubelet_idx = max(1, min(tubelet_idx, num_tubelets - 1))
-            split_point = media_start + tubelet_idx * T
-            split_point = min(split_point, media_end)
+                media_idx = len(num_frames) - 1
+
+            media_start = media_boundaries[media_idx]
+            media_end = media_boundaries[media_idx + 1]
+            nf = num_frames[media_idx]
+            num_tubelets = math.ceil(nf / T)
+
+            if num_tubelets <= 1:
+                if target_split - media_start < media_end - target_split:
+                    split_point = media_start
+                else:
+                    split_point = media_end
+            else:
+                offset_in_media = target_split - media_start
+                tubelet_idx = round(offset_in_media / T)
+                tubelet_idx = max(1, min(tubelet_idx, num_tubelets - 1))
+                split_point = media_start + tubelet_idx * T
+                split_point = min(split_point, media_end)
 
         split_point = max(split_point, split_points[-1])
         split_points.append(split_point)
@@ -275,28 +287,26 @@ def _compute_tubelet_aware_split_points(num_frames, temporal_patch_size, cp_size
     return split_points
 
 
-def _split_num_frames(num_frames, lb, ub, temporal_patch_size=1):
-    """Return per-media frame counts for entries in the range ``[lb, ub)``.
+def _split_num_frames(num_frames, lb, ub):
+    """Return per-media frame counts clipped to the frame range ``[lb, ub)``.
 
-    When ``temporal_patch_size > 1``, ``lb`` and ``ub`` are tubelet indices and
-    the returned counts are the corresponding original frame counts.
+    ``lb`` and ``ub`` are frame indices (the same coordinate system used by
+    :func:`_compute_tubelet_aware_split_points` and the per-frame ``seqlens``
+    array in :func:`split_to_context_parallel_ranks_dynamic_res`). The returned
+    list has one entry per media that contributes at least one frame to the
+    range, with the value being the number of frames of that media in the
+    range.
     """
-    T = temporal_patch_size
     new_num_frames = []
-    tub_idx = 0
+    frame_idx = 0
     for nf in num_frames:
-        num_tub = math.ceil(nf / T)
-        media_tub_start = tub_idx
-        media_tub_end = tub_idx + num_tub
-        overlap_start = max(media_tub_start, lb)
-        overlap_end = min(media_tub_end, ub)
+        media_start = frame_idx
+        media_end = frame_idx + nf
+        overlap_start = max(media_start, lb)
+        overlap_end = min(media_end, ub)
         if overlap_start < overlap_end:
-            if overlap_end == media_tub_end:
-                owned_frames = nf - (overlap_start - media_tub_start) * T
-            else:
-                owned_frames = (overlap_end - overlap_start) * T
-            new_num_frames.append(owned_frames)
-        tub_idx = media_tub_end
+            new_num_frames.append(overlap_end - overlap_start)
+        frame_idx = media_end
     return new_num_frames
 
 
@@ -439,9 +449,7 @@ def split_to_context_parallel_ranks_dynamic_res(
 
         lb = split_points[cp_rank]
         ub = split_points[cp_rank + 1]
-        local_num_frames = _split_num_frames(
-            num_frames_list, lb, ub, temporal_patch_size=temporal_patch_size
-        )
+        local_num_frames = _split_num_frames(num_frames_list, lb, ub)
     else:
         seq_per_rank = total_frames // cp_size
         lb = cp_rank * seq_per_rank
