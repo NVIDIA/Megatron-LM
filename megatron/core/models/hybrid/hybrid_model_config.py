@@ -20,18 +20,25 @@ export — returns an instance of this class:
             untie_embeddings_and_output_weights=True,
         )
 
-:meth:`compile` walks the layer pattern, extracts the embedding / loss /
-pipeline-split markers, derives ``num_layers`` from the flattened layer count,
-and returns private compiler output containing exactly the kwargs
-:class:`HybridModel` needs. Recipe authors should treat
-:class:`HybridModelConfig` as the stable API; the generated
-:class:`TransformerConfig` objects are a compatibility layer for the current
-implementation.
+The recipe is the **public contract**: a :class:`HybridModelConfig` is passed
+directly to :class:`HybridModel` (``HybridModel(recipe=...)``), and the
+launcher's ``--model-recipe`` adapter projects recipe fields onto ``args``
+through the public queries on this class (:attr:`num_layers`,
+:attr:`has_multi_latent_attention`, :meth:`derived_moe_metadata`,
+:attr:`embedding_marker`, etc.).
+
+:meth:`_lower` and :class:`_RecipeLowering` below are intentionally private.
+They are the lowering pass that turns the DSL into the per-layer
+:class:`TransformerConfig` representation today's :class:`HybridModel`
+consumes; that target type is an implementation detail that will be replaced
+when ``TransformerConfig`` / ``TransformerLayer`` are retired. Recipe authors
+must not depend on the lowering output's shape — pass the recipe to
+:class:`HybridModel` and let it own the lowering.
 """
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from megatron.core.models.hybrid.common_layer_config import CommonLayerConfig
 from megatron.core.models.hybrid.layer_configs import (
@@ -47,7 +54,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 # YARN scaling parameters that HybridModel reads via getattr when
 # position_embedding_type == "yarn" (see hybrid_model.py around the
 # YarnRotaryEmbedding construction). They are not currently
-# TransformerConfig dataclass fields; compile() applies them via setattr to
+# TransformerConfig dataclass fields; _lower() applies them via setattr to
 # match the existing legacy-path pattern.
 _YARN_FIELDS = (
     "yarn_rotary_scaling_factor",
@@ -61,15 +68,18 @@ _YARN_FIELDS = (
 
 
 @dataclass
-class CompiledRecipe:
-    """Internal result of compiling a :class:`HybridModelConfig`.
+class _RecipeLowering:
+    """Internal lowering result of :meth:`HybridModelConfig._lower`.
 
-    Contains exactly the data :class:`HybridModel` needs to construct the
-    model: a global :class:`TransformerConfig` for the stack-level concerns
-    (final norm, embedding init), per-layer configs and symbols for the
-    decoder, and the model-wrapping kwargs derived from the embedding / loss
-    markers. This is intentionally compiler output, not the user-facing recipe
-    authoring API.
+    Carries exactly the data :class:`HybridModel` consumes when constructed
+    with ``recipe=``: a stack-level :class:`TransformerConfig`, per-layer
+    configs and symbols, and the model-wrapping kwargs derived from the
+    embedding / loss markers.
+
+    This type is **private**. :class:`HybridModel` reads it inline during
+    construction; nothing outside the hybrid package should hold references
+    to it. Its shape will change (or disappear) when the underlying layer
+    infrastructure is rewritten with dedicated per-layer config classes.
     """
 
     config: TransformerConfig
@@ -101,9 +111,11 @@ class CompiledRecipe:
 class HybridModelConfig:
     """A complete HybridModel recipe.
 
-    Returned by a recipe module's ``make_recipe()`` entry point and consumed
-    by :func:`load_recipe` and the ``--model-recipe`` path in
-    ``hybrid_builder``.
+    Returned by a recipe module's ``make_recipe()`` entry point. Pass an
+    instance directly to :class:`HybridModel` via ``HybridModel(recipe=...)``;
+    the ``--model-recipe`` adapter loads the recipe and projects its fields
+    onto the legacy launcher namespace using the public query methods on
+    this class (no lowering object is exposed to callers).
     """
 
     common_config: CommonLayerConfig
@@ -113,9 +125,9 @@ class HybridModelConfig:
     """The layer pattern. Must begin with an :class:`EmbeddingLayerConfig`,
     contain at least one decoder :class:`LayerConfig`, and end with a
     :class:`CrossEntropyLayerConfig`. Decoder layers may be nested in any
-    list/tuple structure; :func:`compile` flattens them. Pipeline parallelism
-    is not part of the recipe DSL — recipes that need PP must use the legacy
-    ``hybrid_layer_pattern`` string DSL."""
+    list/tuple structure; :meth:`flatten_decoder` flattens them. Pipeline
+    parallelism is not part of the recipe DSL — recipes that need PP must
+    use the legacy ``hybrid_layer_pattern`` string DSL."""
 
     untie_embeddings_and_output_weights: bool = False
     """Untie input embedding and output projection weights."""
@@ -123,13 +135,13 @@ class HybridModelConfig:
     # === Model-level parallelism ===
     # These live here (not on :class:`CommonLayerConfig`) because they are
     # job-/model-level concerns: process groups are constructed once, not
-    # per-layer, and they cannot meaningfully vary per layer. ``compile()``
+    # per-layer, and they cannot meaningfully vary per layer. ``_lower()``
     # injects them into every per-layer TransformerConfig and the
-    # stack-level config. PP is intentionally absent — the recipe DSL is
+    # stack-level TC. PP is intentionally absent — the recipe DSL is
     # PP-free; recipes that need PP must use the legacy string DSL.
     #
     # All four default to ``None``, meaning "do not pin from the recipe".
-    # When unset, ``_apply_model_recipe_to_args`` skips projecting them onto
+    # When unset, the launcher's args projection skips writing them onto
     # ``args``, so launcher CLI flags (``--tensor-model-parallel-size`` etc.)
     # win. Recipes for topology-bound models (e.g. Nemotron-3 Nano needs
     # TP=4/EP=8 to fit) should pin these explicitly; ad-hoc / debugging
@@ -148,32 +160,108 @@ class HybridModelConfig:
     """Expert tensor-parallel size; ``None`` = use ``--expert-tensor-parallel-size``
     (which itself defaults to ``tensor_model_parallel_size``)."""
 
-    # === Stack-TC MoE metadata override (heterogeneous-MoE recipes only) ===
+    # === Stack-level MoE metadata override (heterogeneous-MoE recipes only) ===
     # The stack-level TransformerConfig carries one ``num_moe_experts`` /
     # ``moe_ffn_hidden_size`` pair. With homogeneous MoE the value is
     # unambiguous; with heterogeneous MoE there is no single right answer.
     # Two consumers read these fields from the stack TC: MTP's MoE body and
     # the inference text-generation capacity-factor calculation. Recipes
     # that mix MoE shapes must pin the values they want those consumers to
-    # see — ``compile()`` raises if MoE is heterogeneous and these are unset.
+    # see — :meth:`derived_moe_metadata` raises if MoE is heterogeneous and
+    # these are unset.
     stack_moe_num_experts: Optional[int] = None
-    """Stack-TC ``num_moe_experts`` for heterogeneous-MoE recipes.
+    """Stack-level ``num_moe_experts`` for heterogeneous-MoE recipes.
     Required when MoE layers disagree on ``num_experts``; ignored otherwise."""
 
     stack_moe_ffn_hidden_size: Optional[int] = None
-    """Stack-TC ``moe_ffn_hidden_size`` for heterogeneous-MoE recipes.
+    """Stack-level ``moe_ffn_hidden_size`` for heterogeneous-MoE recipes.
     Required when MoE layers disagree on ``ffn_hidden_size``; ignored
     otherwise. ``None`` falls through to ``ffn_hidden_size``."""
 
-    def compile(self) -> CompiledRecipe:
-        """Process the layer pattern into a :class:`CompiledRecipe`.
+    # ──────────────────────────────────────────────────────────────────────
+    # Public queries
+    #
+    # These are TC-free observations on the recipe itself. The launcher's
+    # args projection reads them to populate ``args.num_layers``,
+    # ``args.num_experts``, etc., without going through ``_lower()``. They
+    # also let tests assert recipe semantics without depending on the
+    # lowering's output shape.
+    # ──────────────────────────────────────────────────────────────────────
 
-        Extracts the embedding/loss markers, validates pattern structure,
-        flattens decoder layers, derives ``num_layers`` from the flattened
-        count, and produces per-layer :class:`TransformerConfig` instances.
+    @property
+    def embedding_marker(self) -> EmbeddingLayerConfig:
+        """The :class:`EmbeddingLayerConfig` at the start of ``layer_pattern``.
+
+        Validates pattern structure on access.
+        """
+        embedding, _, _ = _split_pattern(self.layer_pattern)
+        return embedding
+
+    @property
+    def loss_marker(self) -> CrossEntropyLayerConfig:
+        """The :class:`CrossEntropyLayerConfig` at the end of ``layer_pattern``.
+
+        Validates pattern structure on access.
+        """
+        _, _, loss = _split_pattern(self.layer_pattern)
+        return loss
+
+    def flatten_decoder(self) -> List[LayerConfig]:
+        """Return the decoder body as a flat list of :class:`LayerConfig`.
+
+        Walks the (possibly nested) ``layer_pattern[1:-1]`` and flattens it
+        into a single ordered list. Useful for the launcher and for tests
+        that need to inspect "what layers does this recipe contain".
         """
         from megatron.core.models.hybrid.layer_pattern import flatten_decoder_pattern
 
+        _, decoder_body, _ = _split_pattern(self.layer_pattern)
+        return flatten_decoder_pattern(decoder_body)
+
+    @property
+    def num_layers(self) -> int:
+        """Number of decoder layers, derived from ``layer_pattern``."""
+        return len(self.flatten_decoder())
+
+    @property
+    def has_multi_latent_attention(self) -> bool:
+        """Whether the recipe uses MLA (any :class:`DSALayerConfig` in the decoder).
+
+        Surfaced as a query because the launcher needs it to set
+        ``args.multi_latent_attention`` *before* any process-group / config
+        wiring happens, i.e. before lowering can run.
+        """
+        return any(isinstance(lc, DSALayerConfig) for lc in self.flatten_decoder())
+
+    def derived_moe_metadata(self) -> Tuple[Optional[int], Optional[int]]:
+        """Return ``(num_moe_experts, moe_ffn_hidden_size)`` for stack-level
+        MoE consumers (MTP body construction, inference capacity-factor calc).
+
+        Three cases:
+
+        1. No :class:`MoELayerConfig` in the decoder → ``(None, None)``.
+        2. Homogeneous MoE → that value.
+        3. Heterogeneous MoE → the recipe must pin :attr:`stack_moe_num_experts`
+           (and optionally :attr:`stack_moe_ffn_hidden_size`); raises otherwise.
+        """
+        return _derive_stack_moe_metadata(
+            self.flatten_decoder(),
+            override_num_experts=self.stack_moe_num_experts,
+            override_ffn_hidden_size=self.stack_moe_ffn_hidden_size,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Internal lowering
+    #
+    # Do not call from outside the hybrid package. ``HybridModel.__init__``
+    # invokes this when constructed with ``recipe=``; it returns a private
+    # dataclass shaped to match the current TransformerConfig-based
+    # backend. Both this method and its return type are implementation
+    # details that will change when TC / TransformerLayer are retired.
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _lower(self) -> _RecipeLowering:
+        """Lower this recipe into the form :class:`HybridModel` consumes today."""
         embedding, decoder_leaves, loss = _split_pattern(self.layer_pattern)
 
         # Auto-inherit the recipe's common_config into any layer/marker that
@@ -184,6 +272,8 @@ class HybridModelConfig:
         embedding = _inherit_common_if_default(embedding, self.common_config)
         loss = _inherit_common_if_default(loss, self.common_config)
         decoder_leaves = _inherit_common_in_pattern(decoder_leaves, self.common_config)
+
+        from megatron.core.models.hybrid.layer_pattern import flatten_decoder_pattern
 
         decoder_flat: List[LayerConfig] = flatten_decoder_pattern(decoder_leaves)
         if not decoder_flat:
@@ -217,8 +307,8 @@ class HybridModelConfig:
         # Topology fields default to ``None`` on the recipe (= "let the
         # launcher decide"). For per-layer TC construction we still need
         # concrete values, so substitute TC defaults (1 / TP) here. The
-        # ``None``-ness is preserved on the recipe itself for the args
-        # projection, which only writes to ``args.<field>`` when the recipe
+        # ``None``-ness is preserved on the recipe itself so the launcher's
+        # args projection only writes to ``args.<field>`` when the recipe
         # pinned a value.
         tp = self.tensor_model_parallel_size if self.tensor_model_parallel_size is not None else 1
         cp = self.context_parallel_size if self.context_parallel_size is not None else 1
@@ -262,7 +352,7 @@ class HybridModelConfig:
         # ``num_attention_heads`` / ``num_query_groups`` / ``kv_channels``,
         # the rotary tensor is sized for the placeholder value and at
         # runtime layers with different geometry hit shape mismatches.
-        # Reject at compile time until per-layer rotary lands.
+        # Reject at lowering time until per-layer rotary lands.
         if embedding.position_embedding_type in ("rope", "yarn"):
             _reject_heterogeneous_attention_geometry(decoder_flat, attention_metadata)
 
@@ -298,9 +388,8 @@ class HybridModelConfig:
 
         # Stack-level config: a model-wide topology snapshot used for the
         # final norm, embedding init, inference capacity sizing, and the
-        # args projection in ``_apply_model_recipe_to_args``. Carries EP/ETP
-        # because it represents the global topology, even though non-MoE
-        # per-layer TCs do not.
+        # launcher's args projection. Carries EP/ETP because it represents
+        # the global topology, even though non-MoE per-layer TCs do not.
         stack_kwargs = embedding.common_config.to_transformer_config_kwargs()
         stack_kwargs.update(parallelism)
         stack_kwargs.update(expert_parallelism)
@@ -365,7 +454,7 @@ class HybridModelConfig:
             # CrossEntropy's curated fields are renamed when projected onto
             # TransformerConfig (``loss_fusion`` → ``cross_entropy_loss_fusion``
             # etc.); reject both the recipe-side dataclass names and the
-            # TC-side names ``compile`` writes into ``stack_kwargs`` above.
+            # TC-side names ``_lower`` writes into ``stack_kwargs`` above.
             curated = {f.name for f in dataclasses.fields(loss) if f.name != "extra"} | {
                 "cross_entropy_loss_fusion",
                 "cross_entropy_fusion_impl",
@@ -398,7 +487,7 @@ class HybridModelConfig:
                 for name, value in embedding.yarn.items():
                     setattr(stack_config, name, value)
 
-        return CompiledRecipe(
+        return _RecipeLowering(
             config=stack_config,
             layer_type_list=layer_type_list,
             layer_config_list=layer_config_list,
@@ -499,7 +588,7 @@ def _infer_uniform_attention_metadata(decoder_flat: List[LayerConfig]) -> dict[s
     should have to spell in ``CommonLayerConfig.extra``.
 
     When all attention/DSA layers in the pattern agree on a field, expose that
-    value to the compiler as a private placeholder. If attention layers are
+    value to the lowering as a private placeholder. If attention layers are
     heterogeneous, return only the fields that are actually uniform; the
     remaining TransformerConfig invariants fall back to minimal placeholders.
     """

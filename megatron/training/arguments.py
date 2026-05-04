@@ -329,9 +329,21 @@ def _apply_model_recipe_to_args(args):
     ``--model-recipe`` keeps the user-facing model definition in Python DSL
     objects, but the rest of Megatron's launcher still reads topology and a
     handful of shape fields from ``args``. This adapter is intentionally
-    one-way: recipe values win, and the compiled recipe is cached for the
-    builder so users do not have to pass duplicate legacy shape flags.
+    one-way: recipe values win, and the recipe itself is cached on
+    ``args._model_recipe`` so ``hybrid_builder`` can reach it via
+    :meth:`HybridModel.from_recipe` without re-loading or re-lowering.
+
+    Reads happen entirely through the public recipe surface
+    (:class:`HybridModelConfig` queries + curated marker fields). The
+    internal lowering is not used here — keeping launcher code decoupled
+    from the lowering output's shape (and from the
+    :class:`TransformerConfig` backend it currently targets).
     """
+    from megatron.core.models.hybrid.layer_configs import (
+        AttentionLayerConfig,
+        DSALayerConfig,
+        MoELayerConfig,
+    )
     from megatron.core.models.hybrid.layer_pattern import load_recipe
 
     # Reject user-supplied conflicts up front; the projection below sets
@@ -345,32 +357,48 @@ def _apply_model_recipe_to_args(args):
         '--model-recipe and --hybrid-override-pattern are mutually exclusive.'
     )
 
-    compiled = load_recipe(args.model_recipe)
-    args._compiled_model_recipe = compiled
+    recipe = load_recipe(args.model_recipe)
+    args._model_recipe = recipe
 
-    cfg = compiled.config
-    # Topology fields read from ``compiled`` (recipe-side, ``Optional[int]``)
-    # rather than ``cfg`` (substituted concrete values): the unset/None
-    # contract on the recipe means "defer to the launcher's CLI flag", and
-    # the ``if value is not None`` skip below relies on that distinction.
-    # ``cfg.<topology>`` is always concrete (TC requires it) and would
-    # silently overwrite the CLI value.
+    decoder_layers = recipe.flatten_decoder()
+    embedding = recipe.embedding_marker
+    loss = recipe.loss_marker
+    common = recipe.common_config
+
+    # Uniform attention-head count across attention/DSA layers, when one
+    # exists. Heterogeneous attention is rejected by lowering under
+    # RoPE/YARN; under fixed/none position embeddings the launcher has no
+    # single right value and we leave ``args.num_attention_heads`` alone.
+    attention_layers = [
+        lc for lc in decoder_layers if isinstance(lc, (AttentionLayerConfig, DSALayerConfig))
+    ]
+    head_counts = {
+        lc.num_attention_heads
+        for lc in attention_layers
+        if lc.num_attention_heads is not None
+    }
+    num_attention_heads = head_counts.pop() if len(head_counts) == 1 else None
+
+    # Topology values read from the recipe directly; ``None`` on the recipe
+    # = "defer to the launcher's CLI flag", and the ``if value is not None``
+    # skip below relies on that distinction. The lowered stack TC carries
+    # substituted concrete values that would silently overwrite the CLI.
     recipe_values = {
-        "num_layers": cfg.num_layers,
-        "hidden_size": cfg.hidden_size,
-        "num_attention_heads": cfg.num_attention_heads,
-        "max_position_embeddings": compiled.max_sequence_length,
-        "padded_vocab_size": compiled.vocab_size,
-        "tensor_model_parallel_size": compiled.tensor_model_parallel_size,
-        "context_parallel_size": compiled.context_parallel_size,
-        "expert_model_parallel_size": compiled.expert_model_parallel_size,
-        "expert_tensor_parallel_size": compiled.expert_tensor_parallel_size,
-        "position_embedding_type": compiled.position_embedding_type,
-        "rotary_percent": compiled.rotary_percent,
-        "rotary_base": compiled.rotary_base,
-        "rotary_seq_len_interpolation_factor": compiled.seq_len_interpolation_factor,
-        "untie_embeddings_and_output_weights": compiled.untie_embeddings_and_output_weights,
-        "fp16_lm_cross_entropy": compiled.fp16_lm_cross_entropy,
+        "num_layers": recipe.num_layers,
+        "hidden_size": common.hidden_size,
+        "num_attention_heads": num_attention_heads,
+        "max_position_embeddings": embedding.max_sequence_length,
+        "padded_vocab_size": embedding.vocab_size,
+        "tensor_model_parallel_size": recipe.tensor_model_parallel_size,
+        "context_parallel_size": recipe.context_parallel_size,
+        "expert_model_parallel_size": recipe.expert_model_parallel_size,
+        "expert_tensor_parallel_size": recipe.expert_tensor_parallel_size,
+        "position_embedding_type": embedding.position_embedding_type,
+        "rotary_percent": embedding.rotary_percent,
+        "rotary_base": embedding.rotary_base,
+        "rotary_seq_len_interpolation_factor": embedding.seq_len_interpolation_factor,
+        "untie_embeddings_and_output_weights": recipe.untie_embeddings_and_output_weights,
+        "fp16_lm_cross_entropy": loss.fp16_lm_cross_entropy,
     }
     for attr, value in recipe_values.items():
         if value is not None and hasattr(args, attr):
@@ -381,27 +409,20 @@ def _apply_model_recipe_to_args(args):
     if hasattr(args, "encoder_num_layers"):
         args.encoder_num_layers = None
 
-    moe_experts = [
-        tc.num_moe_experts
-        for tc in compiled.layer_config_list
-        if tc.num_moe_experts is not None
-    ]
+    moe_experts = [lc.num_experts for lc in decoder_layers if isinstance(lc, MoELayerConfig)]
     args._model_recipe_num_experts = tuple(moe_experts)
     unique_moe_experts = set(moe_experts)
     if len(unique_moe_experts) == 1 and hasattr(args, "num_experts"):
         args.num_experts = unique_moe_experts.pop()
 
-    if (
-        any(tc.multi_latent_attention for tc in compiled.layer_config_list)
-        and hasattr(args, "multi_latent_attention")
-    ):
+    if recipe.has_multi_latent_attention and hasattr(args, "multi_latent_attention"):
         args.multi_latent_attention = True
 
     # Mark the run as hybrid for downstream metrics. ``is_hybrid_model(args)``
     # in ``megatron/training/utils.py`` keys off ``args.hybrid_layer_pattern``;
     # without this, recipe-built hybrid models would silently fall back to GPT
     # FLOP-accounting and MoE-metric paths.
-    args.hybrid_layer_pattern = "".join(compiled.layer_type_list)
+    args.hybrid_layer_pattern = "".join(type(lc).SYMBOL for lc in decoder_layers)
 
 
 def validate_args(args, defaults={}):

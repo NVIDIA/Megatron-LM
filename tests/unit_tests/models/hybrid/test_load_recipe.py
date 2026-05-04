@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from megatron.core.models.hybrid.common_layer_config import CommonLayerConfig
-from megatron.core.models.hybrid.hybrid_model_config import CompiledRecipe, HybridModelConfig
+from megatron.core.models.hybrid.hybrid_model_config import HybridModelConfig
 from megatron.core.models.hybrid.layer_configs import (
     AttentionLayerConfig,
     CrossEntropyLayerConfig,
@@ -91,8 +91,9 @@ class TestExplicitFuncSelection:
             my_pretrain_recipe=my_pretrain_recipe,
             helper=helper,
         )
-        compiled = load_recipe("tests._explicit_func_recipe:my_pretrain_recipe")
-        assert isinstance(compiled, CompiledRecipe)
+        loaded = load_recipe("tests._explicit_func_recipe:my_pretrain_recipe")
+        assert isinstance(loaded, HybridModelConfig)
+        assert loaded is recipe
 
     def test_module_colon_func_missing_function(self, monkeypatch):
         _register_synthetic_module(monkeypatch, "tests._explicit_func_missing")
@@ -126,8 +127,9 @@ class TestMakeRecipeDefault:
         _register_synthetic_module(
             monkeypatch, "tests._make_recipe_convention", make_recipe=make_recipe
         )
-        compiled = load_recipe("tests._make_recipe_convention")
-        assert isinstance(compiled, CompiledRecipe)
+        loaded = load_recipe("tests._make_recipe_convention")
+        assert isinstance(loaded, HybridModelConfig)
+        assert loaded is recipe
 
     def test_make_recipe_used_even_when_other_functions_exist(self, monkeypatch):
         common = _make_common()
@@ -154,10 +156,10 @@ class TestMakeRecipeDefault:
             make_recipe=make_recipe,
             debug_recipe=debug_recipe,
         )
-        compiled = load_recipe("tests._make_recipe_default")
-        assert compiled.config.tensor_model_parallel_size == 2
+        loaded = load_recipe("tests._make_recipe_default")
+        assert loaded.tensor_model_parallel_size == 2
         explicit = load_recipe("tests._make_recipe_default:debug_recipe")
-        assert explicit.config.tensor_model_parallel_size == 4
+        assert explicit.tensor_model_parallel_size == 4
 
     def test_make_recipe_must_be_callable(self, monkeypatch):
         common = _make_common()
@@ -210,8 +212,8 @@ class TestFilesystemPath:
                 )
             """,
         )
-        compiled = load_recipe(str(path))
-        assert isinstance(compiled, CompiledRecipe)
+        loaded = load_recipe(str(path))
+        assert isinstance(loaded, HybridModelConfig)
 
     def test_file_path_with_explicit_func(self, tmp_path):
         path = self._write_recipe_file(
@@ -234,8 +236,8 @@ class TestFilesystemPath:
                 )
             """,
         )
-        compiled = load_recipe(f"{path}:my_pretrain_config")
-        assert isinstance(compiled, CompiledRecipe)
+        loaded = load_recipe(f"{path}:my_pretrain_config")
+        assert isinstance(loaded, HybridModelConfig)
 
     def test_file_path_does_not_exist(self, tmp_path):
         path = tmp_path / "nope.py"
@@ -244,14 +246,21 @@ class TestFilesystemPath:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Compile-time errors propagate
+# Pattern-validation errors surface on first use
+#
+# ``load_recipe`` is now a pure loader — it returns the unmodified
+# :class:`HybridModelConfig`. Pattern-shape validation runs lazily, the
+# first time a consumer queries the recipe (``embedding_marker``,
+# ``flatten_decoder``, lowering inside ``HybridModel.from_recipe``, etc.).
+# That keeps loading cheap and pushes validation to the call site that
+# actually depends on the malformed field.
 # ──────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.internal
-class TestCompileErrorPropagation:
+class TestPatternValidation:
 
-    def test_bad_pattern_propagates_typeerror(self, monkeypatch):
+    def test_bad_pattern_validates_on_first_use(self, monkeypatch):
         common = _make_common()
         bad = HybridModelConfig(
             common_config=common,
@@ -264,8 +273,10 @@ class TestCompileErrorPropagation:
         _register_synthetic_module(
             monkeypatch, "tests._bad_pattern_recipe", make_recipe=make_recipe
         )
+        loaded = load_recipe("tests._bad_pattern_recipe")
+        assert isinstance(loaded, HybridModelConfig)
         with pytest.raises(TypeError, match="EmbeddingLayerConfig"):
-            load_recipe("tests._bad_pattern_recipe")
+            loaded.flatten_decoder()
 
 
 def _has_apply_model_recipe_to_args() -> bool:
@@ -326,7 +337,12 @@ class TestRecipeArgProjection:
 
         _apply_model_recipe_to_args(args)
 
-        assert args._compiled_model_recipe.config.num_layers == 2
+        # ``args._model_recipe`` carries the loaded HybridModelConfig itself —
+        # not a lowered intermediate. The launcher and ``hybrid_builder``
+        # both consume it via the public recipe surface (queries on
+        # HybridModelConfig + ``HybridModel.from_recipe``).
+        assert isinstance(args._model_recipe, HybridModelConfig)
+        assert args._model_recipe.num_layers == 2
         assert args.num_layers == 2
         assert args.encoder_num_layers is None
         assert args.hidden_size == common.hidden_size
@@ -341,10 +357,10 @@ class TestRecipeArgProjection:
         launcher") must NOT overwrite a value the user passed via
         ``--tensor-model-parallel-size`` on the CLI. Same for CP/EP/ETP.
 
-        Regression guard: until ``CompiledRecipe`` surfaced the recipe-side
-        ``Optional[int]`` topology, the projection read concrete values off
-        ``compiled.config.tensor_model_parallel_size`` (TC always carries
-        them) and silently clobbered ``args.tensor_model_parallel_size``."""
+        Regression guard: the launcher reads topology from the recipe's
+        ``Optional[int]`` fields directly; reading from the lowered stack
+        TC instead would see substituted concrete values (TC always carries
+        them) and silently clobber ``args.tensor_model_parallel_size``."""
         from megatron.training.arguments import _apply_model_recipe_to_args
 
         common = _make_common()

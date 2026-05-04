@@ -66,22 +66,7 @@ def _loss() -> CrossEntropyLayerConfig:
 
 
 def _build_model_from_recipe(recipe: HybridModelConfig) -> HybridModel:
-    compiled = recipe.compile()
-    return HybridModel(
-        config=compiled.config,
-        vocab_size=compiled.vocab_size,
-        max_sequence_length=compiled.max_sequence_length,
-        fp16_lm_cross_entropy=compiled.fp16_lm_cross_entropy,
-        parallel_output=compiled.parallel_output,
-        share_embeddings_and_output_weights=not compiled.untie_embeddings_and_output_weights,
-        position_embedding_type=compiled.position_embedding_type,
-        rotary_percent=compiled.rotary_percent,
-        rotary_base=compiled.rotary_base,
-        scatter_embedding_sequence_parallel=compiled.scatter_embedding_sequence_parallel,
-        seq_len_interpolation_factor=compiled.seq_len_interpolation_factor,
-        layer_type_list=compiled.layer_type_list,
-        layer_config_list=compiled.layer_config_list,
-    )
+    return HybridModel.from_recipe(recipe)
 
 
 @pytest.mark.internal

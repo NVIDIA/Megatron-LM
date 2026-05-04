@@ -21,44 +21,30 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         if config is not None:
             print_rank_0(
                 "Note: --model-recipe was provided; ignoring caller-supplied config "
-                "and using the recipe's compiled TransformerConfig."
+                "and using the recipe."
             )
-        recipe = getattr(args, '_compiled_model_recipe', None)
+        recipe = getattr(args, '_model_recipe', None)
         if recipe is None:
             recipe = load_recipe(args.model_recipe)
 
         # Spec selection: ``--spec`` (CLI) overrides everything; otherwise
-        # auto-pick by ``transformer_impl``. ``None`` falls through to
-        # HybridModel's default hybrid_stack_spec. Same precedence as the
-        # legacy path below — recipe-built models get spec selection from
-        # the launcher, not from the recipe itself.
+        # auto-pick by ``transformer_impl`` set on the recipe's common
+        # config. ``None`` falls through to HybridModel's default
+        # hybrid_stack_spec. Same precedence as the legacy path below —
+        # recipe-built models get spec selection from the launcher, not
+        # from the recipe itself.
         if getattr(args, 'spec', None) is not None:
             recipe_stack_spec = import_module(args.spec)
-        elif recipe.config.transformer_impl == "inference_optimized":
-            assert (
-                not recipe.config.inference_fuse_tp_communication
-            ), "inference_fuse_tp_communication is not supported for HybridModel"
+        elif recipe.common_config.transformer_impl == "inference_optimized":
             recipe_stack_spec = hybrid_inference_stack_spec
         else:
             recipe_stack_spec = None
 
-        model = HybridModel(
-            config=recipe.config,
+        model = HybridModel.from_recipe(
+            recipe,
             hybrid_stack_spec=recipe_stack_spec,
-            vocab_size=recipe.vocab_size,
-            max_sequence_length=recipe.max_sequence_length,
             pre_process=pre_process,
             post_process=post_process,
-            fp16_lm_cross_entropy=recipe.fp16_lm_cross_entropy,
-            parallel_output=recipe.parallel_output,
-            share_embeddings_and_output_weights=not recipe.untie_embeddings_and_output_weights,
-            position_embedding_type=recipe.position_embedding_type,
-            rotary_percent=recipe.rotary_percent,
-            rotary_base=recipe.rotary_base,
-            seq_len_interpolation_factor=recipe.seq_len_interpolation_factor,
-            scatter_embedding_sequence_parallel=recipe.scatter_embedding_sequence_parallel,
-            layer_type_list=recipe.layer_type_list,
-            layer_config_list=recipe.layer_config_list,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )

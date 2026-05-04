@@ -21,9 +21,7 @@ from megatron.core.models.hybrid import (
     HybridModelConfig,
     MambaLayerConfig,
     MoELayerConfig,
-    flatten_decoder_pattern,
 )
-
 
 LEGACY_HYBRID_LAYER_PATTERN = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
 VOCAB_SIZE = 131072
@@ -150,14 +148,13 @@ def nemotron_3_nano_pretrain_config() -> HybridModelConfig:
 if __name__ == "__main__":
     recipe = make_recipe()
     try:
-        layer_type_list = recipe.compile().layer_type_list
+        layer_type_list = recipe._lower().layer_type_list
     except (ValueError, ImportError, ModuleNotFoundError) as exc:
         print(
-            "NOTE: full compile() failed "
+            "NOTE: full lowering failed "
             f"({type(exc).__name__}: {exc}). Falling back to pattern-only verification."
         )
-        decoder_flat = flatten_decoder_pattern(recipe.layer_pattern[1:-1])
-        layer_type_list = [type(layer_config).SYMBOL for layer_config in decoder_flat]
+        layer_type_list = [type(lc).SYMBOL for lc in recipe.flatten_decoder()]
 
     composed = "".join(layer_type_list)
     print(f"Composed layer pattern: {composed}")
