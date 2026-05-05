@@ -1,7 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
+import argparse
 import time
+
+from megatron.training.config.container import PretrainConfigContainer
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 
@@ -66,6 +69,7 @@ try:
 except ImportError:
     has_rl_utils = False
 
+
 # Canonical list of RL timer names to include in timers_to_log.
 # When the profiling branch is merged, this will be imported from rl_profiling
 # as RL_LOGGABLE_TIMER_NAMES instead of being defined here.
@@ -123,12 +127,6 @@ try:
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
-
-try:
-    from nvidia_resiliency_ext.inprocess import CallWrapper
-except ImportError:
-    CallWrapper = type(None)
-
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -191,6 +189,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
+from megatron.training.config import FaultInjectorConfig
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
@@ -677,7 +676,7 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         from operator import itemgetter
 
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
@@ -830,6 +829,7 @@ def preprocess_common_state_dict(common_state_dict):
 
 
 def pretrain(
+    cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
     model_provider,
     model_type,
@@ -839,7 +839,7 @@ def pretrain(
     get_position_embedding_ranks=None,
     non_loss_data_func=None,
     store=None,
-    inprocess_call_wrapper: Optional[CallWrapper] = None,
+    inprocess_call_wrapper: Optional[Any] = None,
 ):
     """Main training program.
 
@@ -911,13 +911,11 @@ def pretrain(
     timers = get_timers()
 
     if args.fine_grained_activation_offloading:
-        from megatron.core.pipeline_parallel.utils import (
-            set_ideal_affinity_for_current_gpu
-        )
+        from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
 
-    if args.log_progress:
+    if cfg_container.logger.log_progress:
         append_to_progress_log("Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
@@ -997,14 +995,14 @@ def pretrain(
     one_logger_utils.on_pretrain_start()
 
     # Context used for persisting some state between checkpoint saves.
-    if args.non_persistent_ckpt_type == 'local':
+    if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
         try:
             from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
                 LocalCheckpointManager,
             )
             from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                parse_group_sequence,
                 GroupWrapper,
+                parse_group_sequence,
             )
             from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
                 CliqueReplicationStrategy,
@@ -1015,16 +1013,16 @@ def pretrain(
                 "checkpointing but was not found. Please ensure it is installed."
             )
 
-        if args.replication:
+        if cfg_container.checkpoint.replication:
             repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                args.replication_jump, args.replication_factor
+                cfg_container.checkpoint.replication_jump, cfg_container.checkpoint.replication_factor
             )
         else:
             repl_strategy = None
 
         checkpointing_context = {
             'local_checkpoint_manager': LocalCheckpointManager(
-                args.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
+                cfg_container.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
             )
         }
     else:
@@ -1038,7 +1036,7 @@ def pretrain(
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
-    config = get_model_config(model[0])
+    model_cfg = get_model_config(model[0])
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -1068,7 +1066,7 @@ def pretrain(
             )
 
             # Build an isolated inference config so training config remains unchanged
-            inference_config = copy.deepcopy(config)
+            inference_config = copy.deepcopy(model_cfg)
             if args.rl_inference_tensor_model_parallel_size is not None:
                 inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
             if args.rl_inference_pipeline_model_parallel_size is not None:
@@ -1158,7 +1156,7 @@ def pretrain(
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
         args.train_iters,
-        args.skip_train,
+        cfg_container.validation.skip_train,
         args.do_train,
         args.do_valid,
         args.do_test,
@@ -1177,8 +1175,8 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
-    if not args.skip_train or args.perform_rl_step:
-        if args.skip_train:
+    if not cfg_container.validation.skip_train or args.perform_rl_step:
+        if cfg_container.validation.skip_train:
             print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
         else:
             print_rank_0('training ...')
@@ -1194,7 +1192,7 @@ def pretrain(
                 train_data_iterator,
                 valid_data_iterator,
                 process_non_loss_data_func,
-                config,
+                model_cfg,
                 checkpointing_context,
                 non_loss_data_func,
                 inference_model,
@@ -1202,16 +1200,15 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
-            save_checkpoint(
+        if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
+            save_checkpoint_and_time(
                 iteration,
                 model,
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator,
-                preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                train_data_iterator=train_data_iterator
             )
 
         one_logger and one_logger.log_metrics(
@@ -1241,15 +1238,15 @@ def pretrain(
                 rl_eval_model,
                 optimizer,
                 iteration,
-                write_to_tensorboard=not args.skip_train,
+                write_to_tensorboard=not cfg_container.validation.skip_train,
                 training_model=rl_training_model,
             )
         else:
             evaluate_and_print_results(
                 prefix, forward_step_func,
                 valid_data_iterator, model,
-                iteration, process_non_loss_data_func, config,
-                verbose=True, write_to_tensorboard=not args.skip_train,
+                iteration, process_non_loss_data_func, model_cfg,
+                verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
                 non_loss_data_func=non_loss_data_func
             )
 
@@ -1262,9 +1259,9 @@ def pretrain(
             model,
             iteration,
             process_non_loss_data_func,
-            config,
+            model_cfg,
             verbose=True,
-            write_to_tensorboard=not args.skip_train,
+            write_to_tensorboard=not cfg_container.validation.skip_train,
             non_loss_data_func=non_loss_data_func,
         )
 
@@ -1293,29 +1290,20 @@ def update_train_iters(args):
     if args.train_iters:
         return
 
-    # Constant batch size with sample-based training.
-    if args.rampup_batch_size is None:
-        args.train_iters = args.train_samples // args.global_batch_size
-
-    else:
-        # Sample based training with rampup batch size.
+    if args.step_batch_size_schedule is not None:
+        # Sample based training with step batch size schedule.
         iterations = 0
         consumed_samples = 0
-        # Rampup phase.
-        while (
-            consumed_samples <= int(args.rampup_batch_size[2])
-            and consumed_samples <= args.train_samples
-        ):
+        while consumed_samples < args.train_samples:
             update_num_microbatches(consumed_samples, consistency_check=False)
             consumed_samples += get_current_global_batch_size()
             iterations += 1
         # Reset
         update_num_microbatches(0, consistency_check=False)
-        # Constant phase
-        # Note that we throw away any partial last batch.
-        if args.train_samples > consumed_samples:
-            iterations += (args.train_samples - consumed_samples) // args.global_batch_size
         args.train_iters = iterations
+    else:
+        # Constant batch size with sample-based training.
+        args.train_iters = args.train_samples // args.global_batch_size
 
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
@@ -1342,6 +1330,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import has_modelopt_state
+
         # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
         # set a flag to use our model provider if so.
         if args.load is not None and has_modelopt_state(args.load):
@@ -1463,34 +1452,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
             ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
         else:
-            kwargs = {}
-            for f in dataclasses.fields(DistributedDataParallelConfig):
-                if hasattr(args, f.name):
-                    kwargs[f.name] = getattr(args, f.name)
-            kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
-            kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
-            kwargs['check_for_large_grads'] = args.check_for_large_grads
             if args.ddp_num_buckets is not None:
                 assert args.ddp_bucket_size is None, \
                     "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
                 assert args.ddp_num_buckets > 0, \
                     "--ddp-num-buckets must be greater than 0"
-                kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
+                bucket_size = num_parameters // args.ddp_num_buckets
             else:
-                kwargs['bucket_size'] = args.ddp_bucket_size
-            kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
-            kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
-            kwargs['param_name_patterns_for_fp32_local_accumulation'] = \
-                tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
-            kwargs['average_in_collective'] = args.ddp_average_in_collective
-            # Megatron-FSDP arguments.
-            kwargs['megatron_fsdp_main_params_dtype'] = args.megatron_fsdp_main_params_dtype
-            kwargs['megatron_fsdp_main_grads_dtype'] = args.megatron_fsdp_main_grads_dtype
-            kwargs['megatron_fsdp_grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
-            kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer
+                bucket_size = args.ddp_bucket_size
 
             # Initialize DDPConfig.
-            ddp_config = DistributedDataParallelConfig(**kwargs)
+            ddp_config = get_megatron_ddp_config(args)
+            ddp_config.bucket_size = bucket_size
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             # If bucket_size is not provided as an input, use sane default.
@@ -1516,18 +1489,49 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             dp_init_kwargs = {}
             if args.use_megatron_fsdp:
                 dp_init_kwargs["pg_collection"] = pg_collection
-            model = [
-                DP(
-                    config=config,
-                    ddp_config=ddp_config,
-                    module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication
-                    # for these model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-                    **dp_init_kwargs,
+
+            wrapped_model = []
+            for model_chunk_idx, model_chunk in enumerate(model):
+                chunk_kwargs = dict(dp_init_kwargs)
+                disable_bucketing = (
+                    (model_chunk_idx > 0)
+                    or args.overlap_param_gather_with_optimizer_step
                 )
-                for (model_chunk_idx, model_chunk) in enumerate(model)
-            ]
+
+                # Pre-compute parameter layouts for the distributed optimizer.
+                # Only pass to DDP; FSDP variants don't accept full_param_layout.
+                if args.use_distributed_optimizer and DP is DDP:
+                    all_params = [
+                        p for p in model_chunk.parameters() if p.requires_grad
+                    ]
+                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                    effective_bucket_size = (
+                        None
+                        if disable_bucketing or pp_rank > 0
+                        else ddp_config.bucket_size
+                    )
+                    chunk_kwargs["full_param_layout"] = (
+                        DistributedOptimizer.compute_full_param_layout(
+                            all_params,
+                            effective_bucket_size,
+                            mpu.get_data_parallel_world_size(with_context_parallel=True),
+                            ddp_config,
+                            expert_data_parallel_world_size=(
+                                mpu.get_expert_data_parallel_world_size()
+                            ),
+                        )
+                    )
+
+                wrapped_model.append(
+                    DP(
+                        config=config,
+                        ddp_config=ddp_config,
+                        module=model_chunk,
+                        disable_bucketing=disable_bucketing,
+                        **chunk_kwargs,
+                    )
+                )
+            model = wrapped_model
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
@@ -1610,6 +1614,29 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     config_overrides = get_standard_config_overrides(config=config)
 
     return config, config_overrides
+
+def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
+    """Return an MCore DDPConfig from the argparse arguments."""
+
+    kwargs = {}
+    for f in dataclasses.fields(DistributedDataParallelConfig):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
+    kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
+    kwargs["check_for_large_grads"] = args.check_for_large_grads
+    kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
+    kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
+    kwargs["param_name_patterns_for_fp32_local_accumulation"] = \
+        tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
+    kwargs["average_in_collective"] = args.ddp_average_in_collective
+    # Megatron-FSDP arguments.
+    kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+    kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+    kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+    kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+
+    return DistributedDataParallelConfig(**kwargs)
 
 
 def setup_model_and_optimizer(
@@ -1739,6 +1766,21 @@ def setup_model_and_optimizer(
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+
+    # Validate that the world size can accommodate the current batch size.
+    # This catches the case where GPUs were scaled up mid-training but the
+    # current position in the batch size schedule yields a batch size that
+    # is too small for the number of data-parallel replicas.
+    num_microbatches = get_num_microbatches()
+    current_global_batch_size = get_current_global_batch_size()
+    data_parallel_size = mpu.get_data_parallel_world_size()
+    assert num_microbatches is not None and num_microbatches >= 1, (
+        f'current global batch size ({current_global_batch_size}) is too small for '
+        f'micro_batch_size ({args.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
+        f'{args.micro_batch_size * data_parallel_size}. The world size cannot accommodate the '
+        f'batch size. This can happen when resuming with more GPUs than the current batch size '
+        f'schedule entry supports.'
+    )
 
     # get model without FP16 and/or DDP wrappers
     if (
@@ -2171,7 +2213,8 @@ def training_log(
             from operator import itemgetter
 
             from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-                Symbols, get_hybrid_layer_counts,
+                Symbols,
+                get_hybrid_layer_counts,
             )
             layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
         else:
@@ -2288,6 +2331,13 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
+
+        # RL token throughput metrics.
+        if args.perform_rl_step:
+            log_string += rl_utils.log_rl_throughput_metrics(
+                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
+            )
+
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -2426,6 +2476,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    
+    # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
+    timers(timer_key).stop(barrier=True)
+    save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
+    
     if should_report_memory:
         # Track memory after checkpoint save.
         report_memory(f"(after save_checkpoint for iteration {iteration})")
@@ -2436,12 +2491,12 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
-    timers(timer_key).stop(barrier=True)
+
     timers.log([timer_key])
 
     # Log E2E metrics after save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    save_checkpoint_duration = timers(timer_key).elapsed()
+
     one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
     if args.log_progress and not non_persistent_ckpt:
@@ -2652,6 +2707,28 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+    fault_injector_kwargs = {}
+    for f in dataclasses.fields(FaultInjectorConfig):
+        if hasattr(args, f.name):
+            fault_injector_kwargs[f.name] = getattr(args, f.name)
+    fault_injector_config = FaultInjectorConfig(**fault_injector_kwargs)
+
+    _maybe_raise_workload_exception = None
+    if (
+        fault_injector_config.fault_injector_ranks is not None
+        or fault_injector_config.fault_injector_num_ranks is not None
+    ):
+        from megatron.core.fault_injector import (
+            maybe_raise_workload_exception as _maybe_raise_workload_exception,
+        )
+        from megatron.core.fault_injector import (
+            setup_fault_injection,
+            should_setup_fault_injection_at_iteration,
+            should_setup_fault_injection_at_start,
+        )
+
+        if should_setup_fault_injection_at_start(fault_injector_config):
+            setup_fault_injection(fault_injector_config)
 
     if args.perform_rl_step:
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
@@ -2704,18 +2781,20 @@ def train(
         print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
         from megatron.core.num_microbatches_calculator import (
             destroy_num_microbatches_calculator,
-            init_num_microbatches_calculator
+            init_num_microbatches_calculator,
         )
+
         # First destroy the existing calculator
         destroy_num_microbatches_calculator()
         # Then initialize with the correct perform_rl_step=True context
         init_num_microbatches_calculator(
-            args.rank,
-            args.rampup_batch_size,
-            args.global_batch_size,
-            args.micro_batch_size,
-            mpu.get_data_parallel_world_size(),
-            args.decrease_batch_size_if_needed
+            rank=args.rank,
+            global_batch_size=args.global_batch_size,
+            micro_batch_size=args.micro_batch_size,
+            data_parallel_size=mpu.get_data_parallel_world_size(),
+            decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+            step_batch_size_schedule=args.step_batch_size_schedule,
+            seq_length=args.seq_length,
         )
         print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
 
@@ -2727,8 +2806,9 @@ def train(
 
     if args.run_workload_inspector_server:
         try:
-            from workload_inspector.utils.webserver import run_server
             import threading
+
+            from workload_inspector.utils.webserver import run_server
 
             threading.Thread(
                 target=run_server, daemon=True, args=(torch.distributed.get_rank(),)
@@ -2967,8 +3047,8 @@ def train(
                 )
             else:
                 assert get_num_microbatches() > num_microbatches, (
-                    f"Number of microbatches should be increasing due to batch size rampup; "
-                    f"instead going from {num_microbatches} to {get_num_microbatches()}"
+                    f"Number of microbatches should not decrease; "
+                    f"going from {num_microbatches} to {get_num_microbatches()}"
                 )
                 if args.save is not None:
                     save_checkpoint_and_time(
@@ -3028,6 +3108,7 @@ def train(
                     sequence_packing=args.rl_use_sequence_packing,
                     buffered_rollouts=buffered_rollouts,
                     is_correction=args.rl_inference_logprobs_is_correction,
+                    optimizer_is_on_cpu=args.rl_offload_optimizer_during_inference,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
@@ -3058,6 +3139,15 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+            if _maybe_raise_workload_exception is not None and iteration != start_iteration:
+                _maybe_raise_workload_exception()
+            # Fault delay timing can start at the end of iteration N. Self-firing faults
+            # (signals, GIL, GPU) may then manifest in iteration N or N+1 depending on the
+            # configured delay; workload-exception faults manifest on a later poll.
+            if _maybe_raise_workload_exception is not None and should_setup_fault_injection_at_iteration(
+                fault_injector_config, iteration
+            ):
+                setup_fault_injection(fault_injector_config)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3103,6 +3193,7 @@ def train(
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
             getattr(args, "fsdp_manual_registration", False)
+            and getattr(args, "nccl_ub", False)
             and getattr(args, "use_megatron_fsdp", False)
             and iteration ==  start_iteration + 1
         ):
@@ -3110,9 +3201,9 @@ def train(
                 if isinstance(model_chunk, megatron_FSDP) and getattr(
                     model_chunk.ddp_config, "fsdp_manual_registration", False
                 ):
-                    pad_buf = getattr(model_chunk, "param_and_grad_buffer", None)
-                    if pad_buf is not None:
-                        pad_buf.manual_buffer_registration()
+                    param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
+                    if param_and_grad_buffer is not None:
+                        param_and_grad_buffer.manual_buffer_registration()
 
         if args.perform_rl_step and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
@@ -3558,10 +3649,20 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
 
 
-def cyclic_iter(iter):
+def cyclic_iter(iterable):
     while True:
-        for x in iter:
+        iterator = iter(iterable)
+        count = 0
+        for x in iterator:
+            count += 1
             yield x
+        if count == 0:
+            # No data was yielded, the iterable is empty
+            raise RuntimeError(
+                "cyclic_iter: iterable produced no data. "
+                "This may indicate the validation dataloader is empty or eval_iters is incorrectly set. "
+                "Check that your validation dataset has data and that the dataloader is properly configured."
+            )
 
 
 def get_train_valid_test_num_samples():
@@ -3736,32 +3837,42 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
         train_data_iterator = None
 
     if valid_dataloaders is not None:
-        # when using full validation, we need to override eval iters with the correct
-        # number of iterations on tp rank 0 so that it can be distributed to the other
-        # ranks later
+        # when using full validation, we need to override eval iters with the
+        # MAX length across DP ranks so all ranks run the same number of steps
         if args.full_validation:
             if args.multiple_validation_sets:
                 if valid_dataloaders[0] is None:
-                    args.eval_iters = [None]*len(valid_dataloaders)
+                    args.eval_iters = [None] * len(valid_dataloaders)
                 else:
-                    args.eval_iters = [len(dl) for dl in valid_dataloaders]
+                    local_eval_iters = [len(dl) for dl in valid_dataloaders]
+                    eval_iters_tensor = torch.tensor(local_eval_iters, dtype=torch.long, device='cuda')
+                    torch.distributed.all_reduce(
+                        eval_iters_tensor,
+                        op=torch.distributed.ReduceOp.MAX,
+                        group=mpu.get_data_parallel_group(with_context_parallel=True),
+                    )
+                    args.eval_iters = eval_iters_tensor.tolist()
             else:
-                args.eval_iters = len(valid_dataloaders[0])
+                local_eval_iters = len(valid_dataloaders[0])
+                eval_iters_tensor = torch.tensor([local_eval_iters], dtype=torch.long, device='cuda')
+                torch.distributed.all_reduce(
+                    eval_iters_tensor,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=mpu.get_data_parallel_group(with_context_parallel=True),
+                )
+                args.eval_iters = eval_iters_tensor.item()
 
         if args.multiple_validation_sets:
             if valid_dataloaders[0] is None:
                 valid_data_iterators = [None] * len(valid_dataloaders)
             else:
                 valid_dl_type = "cyclic" if args.full_validation else dl_type
-                print(
-                    f"[VALID DATA LOADER LENGTHS] "
-                    ", ".join(f"{idx}: {len(dl)}" for idx, dl in enumerate(valid_dataloaders))
-                )
                 valid_data_iterators = [
                     _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
                 ]
         elif valid_dataloaders[0] is not None:
-            valid_data_iterators = _get_iterator(dl_type, valid_dataloaders[0])
+            valid_dl_type = "cyclic" if args.full_validation else dl_type
+            valid_data_iterators = _get_iterator(valid_dl_type, valid_dataloaders[0])
         else:
             valid_data_iterators = None
     else:

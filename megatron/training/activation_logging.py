@@ -65,6 +65,25 @@ _TE_TYPES, _GROUPED_LINEAR_TYPES = _discover_te_types()
 LINEAR_TYPES = (nn.Linear, nn.Embedding, ColumnParallelLinear, RowParallelLinear,
                 Router, *_TE_TYPES)
 
+def _parse_tpe_module_name(module_name: str) -> Tuple[str, int | None, int] | None:
+    """Parse a TPE-eligible module name into ``(block, mtp_idx, layer)``.
+
+    Returns ``None`` if *module_name* matches neither the decoder nor the MTP pattern.
+
+    Examples::
+
+        decoder.layers.3.mlp.experts.linear_fc1                       -> ("decoder", None, 3)
+        mtp.layers.0.mtp_model_layer.layers.1.mlp.experts.linear_fc1  -> ("mtp", 0, 1)
+    """
+    if m := re.fullmatch(r'decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc1', module_name):
+        return "decoder", None, int(m.group(1))
+    if m := re.fullmatch(
+        r'mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.mlp\.experts\.linear_fc1',
+        module_name,
+    ):
+        return "mtp", int(m.group(1)), int(m.group(2))
+    return None
+
 
 def _register_hooks(model, module_types, hook_factory, *, name_filter=None):
     """Walk *model* and register a forward hook on every module matching *module_types*.
@@ -109,8 +128,10 @@ class ActivationLogger:
         self._activations_state_dict: defaultdict = defaultdict(dict)
         self._activation_hooks: List[torch.utils.hooks.RemovableHook] = []
 
-        # Tokens-per-expert state: layer -> list of per-microbatch token counts.
-        self._tpe_records: dict[str, list] = defaultdict(list)
+        # Tokens-per-expert state: per-microbatch token counts.  Decoder entries
+        # are keyed by ``layer``; MTP entries by ``(mtp_idx, inner_layer)``.
+        self._decoder_tpe_records: dict[int, list[list[int]]] = defaultdict(list)
+        self._mtp_tpe_records: dict[Tuple[int, int], list[list[int]]] = defaultdict(list)
         self._tpe_hooks: List[torch.utils.hooks.RemovableHook] = []
 
     # ------------------------------------------------------------------
@@ -158,27 +179,33 @@ class ActivationLogger:
     # Tokens-per-expert hooks
     # ------------------------------------------------------------------
 
-    def _make_tpe_hook(self, _model_chunk_name: str, module_name: str) -> Callable:
+    def _make_tpe_hook(self, _model_chunk_name: str, module_name: str) -> Callable | None:
         """Forward hook that captures only the non-Tensor ``input1`` (tokens_per_expert).
 
-        The layer number is extracted from *module_name*
-        (e.g. ``decoder.layers.3.mlp.experts.linear_fc1`` → ``3``).
+        Attaches to main decoder MoE layers
+        (``decoder.layers.<N>.mlp.experts.linear_fc1``) and MTP MoE layers
+        (``mtp.layers.<N>.mtp_model_layer.layers.<M>.mlp.experts.linear_fc1``).
+        Returns ``None`` (and logs a warning) for any other module name.
         """
-        m = re.search(r'\.layers\.(\d+)\.', module_name)
-        if not m:
+        parsed = _parse_tpe_module_name(module_name)
+        if parsed is None:
             logger.warning(
                 "Cannot extract layer number from module name: %r — "
                 "skipping tokens-per-expert hook for this module", module_name
             )
             return None
-        layer = m.group(1)
+        block, mtp_idx, layer = parsed
+        if block == "decoder":
+            records, key = self._decoder_tpe_records, layer
+        else:
+            records, key = self._mtp_tpe_records, (mtp_idx, layer)
 
         def hook(_, args, kwargs, output):
             input_tuple = args if isinstance(args, tuple) else (args,)
             if len(input_tuple) > 1 and input_tuple[1] is not None:
                 inp = input_tuple[1]
                 if not isinstance(inp, torch.Tensor):
-                    self._tpe_records[layer].append(list(inp))
+                    records[key].append(list(inp))
 
         return hook
 
@@ -198,24 +225,35 @@ class ActivationLogger:
         """Append captured tokens-per-expert records as JSON Lines.
 
         Each rank writes to its own file under ``{save_dir}/tokens_per_expert/``,
-        e.g. ``rank0.jsonl``, ``rank1.jsonl``.  Each line is a JSON object::
+        e.g. ``rank0.jsonl``, ``rank1.jsonl``.  Each line is a JSON object; the
+        ``mtp_idx`` field is present only for MTP entries::
 
-            {"iter": 100, "layer": 3, "tpe": [[128, 64], [96, 80]]}
+            {"iter": 100, "block": "decoder", "layer": 3, "tpe": [[128, 64], [96, 80]]}
+            {"iter": 100, "block": "mtp", "mtp_idx": 0, "layer": 1, "tpe": [[50, 50]]}
         """
-        if not self._tpe_records:
+        if not self._decoder_tpe_records and not self._mtp_tpe_records:
             return
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         tpe_dir = os.path.join(self._save_dir, "tokens_per_expert")
         os.makedirs(tpe_dir, exist_ok=True)
         filepath = os.path.join(tpe_dir, f"rank{rank}.jsonl")
-        lines = "".join(
-            json.dumps({"iter": iteration, "layer": int(layer),
-                        "tpe": microbatches}) + "\n"
-            for layer, microbatches in sorted(self._tpe_records.items())
-        )
+
+        lines = []
+        for layer, microbatches in sorted(self._decoder_tpe_records.items()):
+            lines.append(json.dumps({
+                "iter": iteration, "block": "decoder",
+                "layer": layer, "tpe": microbatches,
+            }) + "\n")
+        for (mtp_idx, layer), microbatches in sorted(self._mtp_tpe_records.items()):
+            lines.append(json.dumps({
+                "iter": iteration, "block": "mtp",
+                "mtp_idx": mtp_idx, "layer": layer, "tpe": microbatches,
+            }) + "\n")
+
         with open(filepath, "a") as f:
-            f.write(lines)
-        self._tpe_records.clear()
+            f.writelines(lines)
+        self._decoder_tpe_records.clear()
+        self._mtp_tpe_records.clear()
 
 _LOGGER: ActivationLogger | None = None
 
