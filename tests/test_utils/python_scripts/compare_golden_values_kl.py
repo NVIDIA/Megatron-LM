@@ -15,11 +15,19 @@ The golden-value JSON files produced by `download_golden_values.py` look like:
 
 For each metric we treat the per-step value series as a discrete distribution
 (after restricting to steps present in both files and applying a strictly
-positive shift). We then report:
+positive shift) and compute KL divergence plus a couple of summary stats.
 
-  * KL(old || new), KL(new || old)
-  * Symmetric KL                     = KL(old||new) + KL(new||old)
-  * max abs diff, mean abs diff, mean relative diff (over shared steps)
+The printed table and the CSV both emit the same 6 columns, each answering
+a distinct question:
+
+  * file / metric          -- which test, which metric
+  * sym_KL                 -- did the distribution shape change, and by how
+                              much?
+  * median(old)/median(new) -- typical value before/after (matches what the
+                               framework's median-based check uses, e.g. for
+                               iteration-time)
+  * max rel|d|             -- worst-step relative shift; catches single bad
+                               steps that approximate-equality checks reject
 
 By default the script compares the working-tree version of each modified
 golden-value file against its `git show HEAD:<path>` version, so the typical
@@ -172,13 +180,17 @@ def kl_divergence(p: list[float], q: list[float]) -> float:
 class MetricStats:
     file: str
     metric: str
-    n_shared_steps: int
-    kl_old_new: float
-    kl_new_old: float
     sym_kl: float
-    max_abs_diff: float
-    mean_abs_diff: float
-    mean_rel_diff: float
+    median_old: float
+    median_new: float
+    max_rel_diff: float
+
+
+def _median(xs: list[float]) -> float:
+    n = len(xs)
+    s = sorted(xs)
+    mid = n // 2
+    return s[mid] if n % 2 == 1 else 0.5 * (s[mid - 1] + s[mid])
 
 
 def _extract_series(metric_block: dict) -> dict[int, float]:
@@ -210,22 +222,17 @@ def compare_metric(
     p = _normalize(old_vals)
     q = _normalize(new_vals)
 
-    abs_diffs = [abs(a - b) for a, b in zip(old_vals, new_vals)]
     rel_diffs = [abs(a - b) / max(abs(a), 1e-12) for a, b in zip(old_vals, new_vals)]
 
-    kl_pq = kl_divergence(p, q)
-    kl_qp = kl_divergence(q, p)
+    sym_kl = kl_divergence(p, q) + kl_divergence(q, p)
 
     return MetricStats(
         file=file_label,
         metric=metric_name,
-        n_shared_steps=len(shared),
-        kl_old_new=kl_pq,
-        kl_new_old=kl_qp,
-        sym_kl=kl_pq + kl_qp,
-        max_abs_diff=max(abs_diffs),
-        mean_abs_diff=sum(abs_diffs) / len(abs_diffs),
-        mean_rel_diff=sum(rel_diffs) / len(rel_diffs),
+        sym_kl=sym_kl,
+        median_old=_median(old_vals),
+        median_new=_median(new_vals),
+        max_rel_diff=max(rel_diffs),
     )
 
 
@@ -243,17 +250,15 @@ def compare_files(file_label: str, old_doc: dict, new_doc: dict) -> list[MetricS
 # Output
 # ---------------------------------------------------------------------------
 
-_HEADERS = [
-    "file",
-    "metric",
-    "n_steps",
-    "KL(old||new)",
-    "KL(new||old)",
-    "sym_KL",
-    "max|d|",
-    "mean|d|",
-    "mean rel|d|",
-]
+# Six columns, each answers a distinct question:
+#   file / metric        -- which test, which metric
+#   sym_KL               -- did the distribution shape change, and by how much?
+#   median(old)/median(new) -- typical value before/after (matches the
+#                              framework's median-based check, e.g.
+#                              iteration-time)
+#   max rel|d|           -- worst-step relative shift; catches single bad
+#                            steps that approximate-equality checks reject
+_HEADERS = ["file", "metric", "sym_KL", "median(old)", "median(new)", "max rel|d|"]
 
 
 def _fmt(x: float) -> str:
@@ -264,28 +269,17 @@ def _fmt(x: float) -> str:
     return f"{x:.6f}"
 
 
+def _row(r: MetricStats) -> list:
+    return [r.file, r.metric, r.sym_kl, r.median_old, r.median_new, r.max_rel_diff]
+
+
 def print_table(rows: Iterable[MetricStats]) -> None:
     rows = list(rows)
     if not rows:
         print("(no comparable metrics)")
         return
 
-    table = [_HEADERS]
-    for r in rows:
-        table.append(
-            [
-                r.file,
-                r.metric,
-                str(r.n_shared_steps),
-                _fmt(r.kl_old_new),
-                _fmt(r.kl_new_old),
-                _fmt(r.sym_kl),
-                _fmt(r.max_abs_diff),
-                _fmt(r.mean_abs_diff),
-                _fmt(r.mean_rel_diff),
-            ]
-        )
-
+    table = [_HEADERS] + [[c if isinstance(c, str) else _fmt(c) for c in _row(r)] for r in rows]
     widths = [max(len(row[i]) for row in table) for i in range(len(_HEADERS))]
     for i, row in enumerate(table):
         line = "  ".join(cell.ljust(widths[j]) for j, cell in enumerate(row))
@@ -299,19 +293,7 @@ def write_csv(rows: Iterable[MetricStats], path: pathlib.Path) -> None:
         w = csv.writer(f)
         w.writerow(_HEADERS)
         for r in rows:
-            w.writerow(
-                [
-                    r.file,
-                    r.metric,
-                    r.n_shared_steps,
-                    r.kl_old_new,
-                    r.kl_new_old,
-                    r.sym_kl,
-                    r.max_abs_diff,
-                    r.mean_abs_diff,
-                    r.mean_rel_diff,
-                ]
-            )
+            w.writerow(_row(r))
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +377,7 @@ def main(
 
         logger.info("Comparing %d file(s) against %s", len(target_files), rev)
         for p in target_files:
+            p = p.resolve()
             old_doc = load_from_git(rev, p)
             if old_doc is None:
                 logger.warning("Skipping %s: not present at %s (new file).", p, rev)
