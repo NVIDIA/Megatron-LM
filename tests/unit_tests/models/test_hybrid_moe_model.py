@@ -176,6 +176,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_flex_dispatcher_backend": "deepep",
     "moe_grouped_gemm": True,
     "moe_hybridep_num_sms": None,
+    "moe_hybridep_num_sms_preprocessing": 108,
     "moe_hybridep_num_blocks_permute": None,
     "moe_hybridep_num_blocks_unpermute": None,
     "moe_input_jitter_eps": None,
@@ -316,10 +317,16 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "max_seqlen_per_dp_cp_rank": None,
     "fallback_to_eager_attn": False,
     "inference_disable_triton_nvls_kernels": False,
-    "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "torch",
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",
+    "linear_attention_type": None,
+    "moe_mlp_glu_interleave_size": None,
+    "moe_router_force_biased": None,
+    "sequence_packing_scheduler": None,
+    "use_transformer_engine_op_fuser": False,
+    "moe_single_grouped_weight": False,
+    "moe_single_grouped_bias": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

@@ -154,7 +154,8 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        dynamic_context_parallel=getattr(args, 'hybrid_context_parallel', False)
+        or getattr(args, 'dynamic_context_parallel', False),
     )
 
 
