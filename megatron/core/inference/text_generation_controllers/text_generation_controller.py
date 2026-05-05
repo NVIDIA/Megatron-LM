@@ -1855,12 +1855,10 @@ class TextGenerationController:
         ):
             return "mtp logprobs requested"
         if (
-            return_log_probs_requested
+            (return_log_probs_requested | top_n_logprobs_requested)
             & ~active_metadata["skip_prompt_log_probs"][active_slice]
         ).any():
             return "prompt logprobs requested"
-        if top_n_logprobs_requested.any():
-            return "top-n logprobs requested"
 
         active_sequence_lengths = context.get_active_sequence_lengths()
         max_sequence_lengths = context.get_max_sequence_lengths()
