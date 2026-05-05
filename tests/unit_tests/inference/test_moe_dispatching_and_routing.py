@@ -17,6 +17,7 @@ import torch
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
@@ -36,7 +37,7 @@ requires_torch_grouped_mm = pytest.mark.skipif(
 # ──────────────────────────────────────────────────────────────────────
 
 NANOV3_BASE = dict(
-    num_layers=1,
+    num_layers=4,
     hidden_size=128,
     ffn_hidden_size=128,
     num_attention_heads=4,
@@ -59,6 +60,16 @@ NANOV3_BASE = dict(
     bf16=True,
     params_dtype=torch.bfloat16,
     transformer_impl="inference_optimized",
+    expert_tensor_parallel_size=1,
+    use_cpu_initialization=True,
+    attention_backend=AttnBackend.local,
+    cuda_graph_impl="local",
+    cuda_graph_scope="full_iteration_inference",
+    moe_pad_experts_for_cuda_graph_inference=False,
+    mamba_state_dim=128,
+    mamba_head_dim=64,
+    mamba_num_groups=8,
+    mamba_num_heads=64,
 )
 
 
@@ -126,17 +137,6 @@ class TestInferenceTopKRouter:
         )
         assert router is not None
 
-    def test_set_unset_inference_mode(self):
-        """Toggle is_inference_cuda_graphed_iteration flag."""
-        router = self._make_router()
-        assert not router.is_inference_cuda_graphed_iteration
-
-        router.set_inference_cuda_graphed_iteration()
-        assert router.is_inference_cuda_graphed_iteration
-
-        router.unset_inference_cuda_graphed_iteration()
-        assert not router.is_inference_cuda_graphed_iteration
-
     def test_training_mode_forward_returns_sparse(self):
         """In training mode, forward delegates to parent and returns sparse tensors."""
         router = self._make_router()
@@ -174,7 +174,6 @@ class TestInferenceTopKRouter:
 
         # Inference mode: get top_indices (dense)
         router.eval()
-        router.set_inference_cuda_graphed_iteration()
         _, top_indices = router(input_tensor.clone())
 
         inference_experts = set()
@@ -187,12 +186,126 @@ class TestInferenceTopKRouter:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# InferenceCUDAGraphTokenDispatcher
+# NCCLAllGatherDispatcher
 # ──────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.internal
-class TestInferenceCUDAGraphTokenDispatcher:
+class TestNCCLAllGatherDispatcher:
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _make_dispatcher(self, **config_overrides):
+        from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        NCCLAllGatherDispatcher.allocate_buffers()
+        config_overrides.setdefault("expert_model_parallel_size", Utils.world_size)
+        config = _make_base_config(**config_overrides)
+        num_local_experts = config.num_moe_experts // Utils.world_size
+        ep_rank = torch.distributed.get_rank() if Utils.world_size > 1 else 0
+        local_expert_indices = [ep_rank * num_local_experts + i for i in range(num_local_experts)]
+        return NCCLAllGatherDispatcher(
+            num_local_experts=num_local_experts,
+            local_expert_indices=local_expert_indices,
+            config=config,
+            pg_collection=get_default_pg_collection(),
+            runs_metadata_sync=True,
+        )
+
+    def test_init(self):
+        """Dispatcher can be constructed with nanov3-like config and EP=world_size."""
+        dispatcher = self._make_dispatcher()
+        assert dispatcher.topk == NANOV3_BASE["moe_router_topk"]
+        assert dispatcher.ep_size == Utils.world_size
+
+    @pytest.mark.parametrize("use_allgather_v", [False, True])
+    def test_dispatch_combine(self, use_allgather_v):
+        """Dispatch+combine correctness for both CG (equal-count) and prefill (variable-count) paths.
+
+        All ranks share the same global reference tensors (broadcast from rank 0).
+        Each rank contributes its own slice, then we verify:
+        - dispatch gathers all slices back to the full global tensor
+        - combine reduce-scatters the gathered data, giving each rank ep_size * its_slice
+        """
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if use_allgather_v and Utils.world_size == 1:
+            pytest.skip("Variable-token prefill path requires EP > 1")
+
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        rank = torch.distributed.get_rank() if ep_size > 1 else 0
+        hidden_size = NANOV3_BASE["hidden_size"]
+        topk = NANOV3_BASE["moe_router_topk"]
+        num_experts = NANOV3_BASE["num_moe_experts"]
+
+        if use_allgather_v:
+            # Variable token counts: rank r contributes (r+1)*8 tokens
+            tokens_per_rank = [(r + 1) * 8 for r in range(ep_size)]
+        else:
+            tokens_per_rank = [16] * ep_size
+
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+
+        NCCLAllGatherDispatcher._use_allgather_v = use_allgather_v
+
+        global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
+        global_routing_map = torch.randint(0, num_experts, (total_tokens, topk), device="cuda")
+        if ep_size > 1:
+            torch.distributed.broadcast(global_hidden, src=0)
+            torch.distributed.broadcast(global_probs, src=0)
+            torch.distributed.broadcast(global_routing_map, src=0)
+
+        offset = sum(tokens_per_rank[:rank])
+        hidden = global_hidden[offset : offset + local_tokens].contiguous()
+        probs = global_probs[offset : offset + local_tokens].contiguous()
+        dispatcher.routing_map = global_routing_map[offset : offset + local_tokens].contiguous()
+
+        if ep_size == 1:
+            d_hidden, d_probs = dispatcher.token_dispatch(hidden, probs)
+            assert d_hidden is hidden
+            assert d_probs is probs
+            return
+
+        d_hidden, d_probs = dispatcher.token_dispatch(hidden, probs)
+
+        assert d_hidden.shape == (total_tokens, hidden_size)
+        assert d_probs.shape == (total_tokens, topk)
+        torch.testing.assert_close(d_hidden, global_hidden, atol=0, rtol=0)
+        torch.testing.assert_close(d_probs, global_probs, atol=0, rtol=0)
+        torch.testing.assert_close(dispatcher.routing_map, global_routing_map, atol=0, rtol=0)
+
+        # All ranks have identical gathered data, so rank r's reduce-scatter output
+        # is ep_size * its slice of global_hidden.
+        combined = dispatcher.token_combine(d_hidden)
+        assert combined.shape == (local_tokens, hidden_size)
+        expected = (global_hidden[offset : offset + local_tokens].float() * ep_size).bfloat16()
+        torch.testing.assert_close(combined, expected)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# NVLSAllGatherVDispatcher
+# ──────────────────────────────────────────────────────────────────────
+
+_NVLS_ENGINE_MAX_TOKENS = 512
+
+
+@pytest.mark.internal
+class TestNVLSAllGatherVDispatcher:
 
     @classmethod
     def setup_class(cls):
@@ -206,27 +319,32 @@ class TestInferenceCUDAGraphTokenDispatcher:
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
-    def teardown_method(self, method):
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    def _make_dispatcher(self, **config_overrides):
+    def _make_dispatcher(self):
+        from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
         from megatron.core.transformer.moe.token_dispatcher_inference import (
-            InferenceCUDAGraphTokenDispatcher,
+            NVLSAllGatherVDispatcher,
         )
 
-        config_overrides.setdefault("expert_model_parallel_size", Utils.world_size)
-        config = _make_base_config(**config_overrides)
+        config = _make_base_config(expert_model_parallel_size=Utils.world_size)
         num_local_experts = config.num_moe_experts // Utils.world_size
         ep_rank = torch.distributed.get_rank() if Utils.world_size > 1 else 0
         local_expert_indices = [ep_rank * num_local_experts + i for i in range(num_local_experts)]
+        ep_group = get_expert_model_parallel_group()
 
-        return InferenceCUDAGraphTokenDispatcher(
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=NANOV3_BASE["moe_router_topk"],
+            hidden_size=NANOV3_BASE["hidden_size"],
+            ep_group=ep_group,
+        )
+
+        return NVLSAllGatherVDispatcher(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=get_default_pg_collection(),
+            runs_metadata_sync=True,
         )
 
     def test_init(self):
@@ -235,85 +353,22 @@ class TestInferenceCUDAGraphTokenDispatcher:
         assert dispatcher.topk == NANOV3_BASE["moe_router_topk"]
         assert dispatcher.ep_size == Utils.world_size
 
-    def test_symmetric_memory_buffer_initialized(self):
-        """EP symmetric memory buffer is lazily created via SymmetricMemoryManager."""
-        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-
-        # Buffer should not exist yet (lazy init)
-        assert not SymmetricMemoryManager.is_initialized("ep")
-
-        # Create it explicitly and verify
-        from megatron.core.parallel_state import get_expert_model_parallel_group
-
-        buf = SymmetricMemoryManager.get_buffer(
-            "ep", process_group=get_expert_model_parallel_group()
-        )
-        assert buf is not None
-        assert SymmetricMemoryManager.is_initialized("ep")
-
     @pytest.mark.parametrize("seed", [42, 123, 7])
     @pytest.mark.parametrize(
-        "num_local_tokens",
-        [
-            1,
-            2,
-            4,
-            8,
-            16,
-            24,
-            32,
-            40,
-            48,
-            56,
-            64,
-            72,
-            80,
-            88,
-            96,
-            104,
-            112,
-            120,
-            128,
-            136,
-            144,
-            152,
-            160,
-            168,
-            176,
-            184,
-            192,
-            200,
-            208,
-            216,
-            224,
-            232,
-            240,
-            248,
-            256,
-            272,
-            288,
-            304,
-            320,
-            336,
-            352,
-            368,
-            384,
-            400,
-            416,
-            432,
-            448,
-            464,
-            480,
-            496,
-            512,
-        ],
+        "max_rank_tokens",
+        # Covers: small, unaligned, power-of-2, and large up to engine_max
+        [1, 7, 16, 24, 64, 128, 256, 512],
     )
-    def test_cuda_graph_dispatch_combine(self, num_local_tokens, seed):
+    def test_cuda_graph_dispatch_combine(self, max_rank_tokens, seed):
         """Dispatch+combine can be captured in a CUDA graph and replayed.
-        Creates global buffers, shards per rank, and verifies:
-        - NVLS AllGather output matches the full globalwol buffer
-        - NVLS ReduceScatter output matches fp32-accumulated reference
-        All tensor byte sizes are 128-bit aligned for NVLS eligibility.
+
+        Uses uneven token counts across EP ranks (rank r gets
+        max(1, max_rank_tokens + r - (ep_size - 1)) tokens) to exercise the
+        AllGatherV variable-length path. Verifies:
+        - AllGatherV output matches the global reference (valid prefix only)
+        - ReduceScatterV output matches fp32-accumulated reference
+        Exact match (atol=0) is possible because the NVLS triton kernels
+        accumulate in fp32 before writing bf16 output.
         """
 
         torch.manual_seed(seed)
@@ -325,41 +380,38 @@ class TestInferenceCUDAGraphTokenDispatcher:
         topk = NANOV3_BASE["moe_router_topk"]
         num_experts = NANOV3_BASE["num_moe_experts"]
         rank = torch.distributed.get_rank() if ep_size > 1 else 0
-        num_global_tokens = num_local_tokens * ep_size
 
-        # Create global buffers on rank 0 and broadcast to all ranks
-        global_hidden = torch.randn(
-            num_global_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
-        )
-        global_probs = torch.randn(num_global_tokens, topk, device="cuda", dtype=torch.float32)
-        global_routing_map = torch.randint(0, num_experts, (num_global_tokens, topk), device="cuda")
-        torch.distributed.broadcast(global_hidden, src=0)
-        torch.distributed.broadcast(global_probs, src=0)
-        torch.distributed.broadcast(global_routing_map, src=0)
+        # Uneven token counts: rank r gets max(1, max_rank_tokens + r - (ep_size-1))
+        # so the last rank always has max_rank_tokens (≤ engine_max) and earlier
+        # ranks have fewer, exercising the variable-length AllGatherV path.
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+        global_max = _NVLS_ENGINE_MAX_TOKENS * ep_size
 
-        # Each rank grabs their own shard
-        start = rank * num_local_tokens
-        end = start + num_local_tokens
+        global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
+        global_routing_map = torch.randint(0, num_experts, (total_tokens, topk), device="cuda")
+        if ep_size > 1:
+            torch.distributed.broadcast(global_hidden, src=0)
+            torch.distributed.broadcast(global_probs, src=0)
+            torch.distributed.broadcast(global_routing_map, src=0)
+
+        start = sum(tokens_per_rank[:rank])
+        end = start + local_tokens
         static_hidden = global_hidden[start:end].contiguous()
         static_probs = global_probs[start:end].contiguous()
         static_routing_map = global_routing_map[start:end].contiguous()
 
-        if not are_tensors_nvls_eligible(static_hidden, static_probs, static_routing_map):
-            pytest.skip(
-                "Tensors are not NVLS-eligible (need SM>=9 and each tensor's memory to be a multiple of 16 bytes)"
-            )
-
-        # 3 warmup iterations on a side stream
+        # Warmup on a side stream
         with torch.no_grad():
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
                 for _ in range(3):
                     dispatcher.routing_map = static_routing_map
+                    dispatcher._local_tokens = local_tokens
                     d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
-                    d_hidden = d_hidden.clone()
-                    d_probs = d_probs.clone()
-                    dispatcher.routing_map = dispatcher.routing_map.clone()
                     dispatcher.token_combine(d_hidden.clone())
             torch.cuda.current_stream().wait_stream(s)
 
@@ -367,28 +419,23 @@ class TestInferenceCUDAGraphTokenDispatcher:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             dispatcher.routing_map = static_routing_map
+            dispatcher._local_tokens = local_tokens
             d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
-            graph_hidden = d_hidden.clone()
-            graph_probs = d_probs.clone()
-            graph_routing_map = dispatcher.routing_map.clone()
+            graph_hidden = d_hidden[:total_tokens].clone()
+            graph_probs = d_probs[:total_tokens].clone()
+            graph_routing_map = dispatcher.routing_map[:total_tokens].clone()
             graph_combined = dispatcher.token_combine(d_hidden.clone())
 
-        # Verify shapes: dispatch expands by ep_size, combine shrinks back
-        assert graph_hidden.shape == (num_global_tokens, hidden_size)
-        assert graph_probs.shape == (num_global_tokens, topk)
-        assert graph_combined.shape == (num_local_tokens, hidden_size)
+        # dispatch output is (global_max, *); only first total_tokens are valid
+        assert d_hidden.shape == (global_max, hidden_size)
+        assert d_probs.shape == (global_max, topk)
+        assert graph_combined.shape == (local_tokens, hidden_size)
 
-        # Replay
         graph.replay()
 
-        # Verify AllGather: all gathered tensors should match global buffers
         torch.testing.assert_close(graph_hidden, global_hidden, atol=0, rtol=0)
         torch.testing.assert_close(graph_probs, global_probs, atol=0, rtol=0)
         torch.testing.assert_close(graph_routing_map, global_routing_map, atol=0, rtol=0)
 
-        # Verify ReduceScatter: all ranks have the same all-gathered data, so
-        # rank r gets ep_size * chunk_r. Compute reference in fp32 then downcast.
-        # Exact match (atol=0, rtol=0) is possible because the NVLS triton kernels
-        # accumulate in fp32 before writing bf16 output.
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
