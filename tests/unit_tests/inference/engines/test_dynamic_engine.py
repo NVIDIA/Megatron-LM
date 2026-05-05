@@ -920,6 +920,66 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_scheduling_generate_api_generated_logprobs_top_n_e2e(self) -> None:
+        """Generate returns async generated logprobs and top-n logprobs matching serial output."""
+        prompts = ["1 2 3 4", "2 3 4 5", "3 4 5 6", "4 5 6 7"]
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=4,
+            termination_id=-1,
+            top_k=1,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            top_n_logprobs=4,
+        )
+
+        def build_env(enable_async_scheduling: bool) -> DynamicEngineTestEnv:
+            env = self._build_generate_until_env(enable_async_scheduling=enable_async_scheduling)
+            env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
+            return env
+
+        serial_env = build_env(enable_async_scheduling=False)
+        with torch.inference_mode():
+            serial_requests = [
+                record.merge() for record in serial_env.engine.generate(prompts, sampling_params)
+            ]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = build_env(enable_async_scheduling=True)
+        with torch.inference_mode():
+            async_requests = [
+                record.merge() for record in async_env.engine.generate(prompts, sampling_params)
+            ]
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert [request.generated_tokens for request in async_requests] == [
+            request.generated_tokens for request in serial_requests
+        ]
+        for async_request, serial_request in zip(async_requests, serial_requests):
+            assert async_request.prompt_log_probs is None or len(async_request.prompt_log_probs) == 0
+            assert (
+                async_request.prompt_top_n_logprobs is None
+                or len(async_request.prompt_top_n_logprobs) == 0
+            )
+            assert async_request.generated_log_probs == pytest.approx(
+                serial_request.generated_log_probs
+            )
+            assert len(async_request.generated_top_n_logprobs) == len(
+                serial_request.generated_top_n_logprobs
+            )
+            for async_top_n, serial_top_n in zip(
+                async_request.generated_top_n_logprobs,
+                serial_request.generated_top_n_logprobs,
+            ):
+                assert async_top_n.keys() == serial_top_n.keys()
+                for token in async_top_n:
+                    assert async_top_n[token] == pytest.approx(serial_top_n[token])
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_scheduling_allows_chunked_prefill_decode_only_cuda_graph_e2e(self) -> None:
         """Chunked prefill config does not block async scheduling on decode-only steps."""
         skip_if_mamba_sequence_packing_not_available("hybrid")
