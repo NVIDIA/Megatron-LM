@@ -1932,8 +1932,6 @@ class TextGenerationController:
             return "pipeline parallel is unsupported"
         if context.config.logging_step_interval != 0:
             return "logging sync is enabled"
-        if not context.config.materialize_only_last_token_logits:
-            return "logprob logits are unsupported"
         if self.num_speculative_tokens != 0 and not allow_mtp:
             return "mtp pre-sampling graph is unsupported"
         if (
@@ -1955,18 +1953,6 @@ class TextGenerationController:
             self._async_admission_barrier_requested = False
             return "waiting request admission deferred"
 
-        active_metadata = context.active_request_metadata
-        active_slice = slice(0, active_request_count)
-        return_log_probs_requested = active_metadata["return_log_probs"][active_slice]
-        top_n_logprobs_requested = active_metadata["top_n_logprobs"][active_slice] > 0
-        if (
-            (return_log_probs_requested | top_n_logprobs_requested)
-            & ~active_metadata["skip_prompt_log_probs"][active_slice]
-        ).any():
-            return "prompt logprobs requested"
-
-        active_sequence_lengths = context.get_active_sequence_lengths()
-        max_sequence_lengths = context.get_max_sequence_lengths()
         tokens_per_request = self.num_speculative_tokens + 1
         if (
             context.padded_batch_dimensions.token_count

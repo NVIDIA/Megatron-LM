@@ -2559,7 +2559,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert controller._async_scheduling_disabled_reason() is None
         with torch.inference_mode():
             context.active_request_metadata["skip_prompt_log_probs"][0] = False
-        assert controller._async_scheduling_disabled_reason() == "prompt logprobs requested"
+        assert controller._async_scheduling_disabled_reason() is None
         with torch.inference_mode():
             context.active_request_metadata["return_log_probs"][0] = False
             context.active_request_metadata["top_n_logprobs"][0] = 3
@@ -2567,7 +2567,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert controller._async_scheduling_disabled_reason() is None
         with torch.inference_mode():
             context.active_request_metadata["skip_prompt_log_probs"][0] = False
-        assert controller._async_scheduling_disabled_reason() == "prompt logprobs requested"
+        assert controller._async_scheduling_disabled_reason() is None
         with torch.inference_mode():
             context.active_request_metadata["top_n_logprobs"][0] = 0
 
@@ -2634,10 +2634,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
         with torch.inference_mode():
             mtp_context.active_request_metadata["skip_prompt_log_probs"][0] = False
-        assert (
-            mtp_controller._async_scheduling_disabled_reason(allow_mtp=True)
-            == "prompt logprobs requested"
-        )
+        assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
         with torch.inference_mode():
             mtp_context.active_request_metadata["skip_prompt_log_probs"][0] = True
             mtp_context.active_request_metadata["return_log_probs"][0] = False
@@ -2645,10 +2642,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
         with torch.inference_mode():
             mtp_context.active_request_metadata["skip_prompt_log_probs"][0] = False
-        assert (
-            mtp_controller._async_scheduling_disabled_reason(allow_mtp=True)
-            == "prompt logprobs requested"
-        )
+        assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
         with torch.inference_mode():
             mtp_context.active_request_metadata["skip_prompt_log_probs"][0] = True
             mtp_context.active_request_metadata["top_n_logprobs"][0] = 0
