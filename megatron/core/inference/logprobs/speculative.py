@@ -492,9 +492,9 @@ class LogProbsSpeculative:
                 decode_len = num_decode * spec_plus_one
                 raw_decode = logits.squeeze(0)[:decode_len].float()
                 top_n_v_raw, top_n_i_raw = _topk(raw_decode, k=top_n_max)
-                top_n_v_flat = top_n_v_raw - decode_lse[:num_decode].reshape(
-                    decode_len
-                ).unsqueeze(-1)
+                top_n_v_flat = top_n_v_raw - decode_lse[:num_decode].reshape(decode_len).unsqueeze(
+                    -1
+                )
                 decode_top_n_v = top_n_v_flat.reshape(num_decode, spec_plus_one, -1)
                 decode_top_n_i = top_n_i_raw.reshape(num_decode, spec_plus_one, -1)
 

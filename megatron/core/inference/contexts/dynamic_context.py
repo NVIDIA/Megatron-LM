@@ -2351,8 +2351,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # aligned coalesced buffer). Refresh the dedicated GPU bool mirror used
         # by the log-prob indexing kernels.
         self.gpu_return_log_probs_mask[:padded_active].copy_(
-            self.active_request_metadata["return_log_probs"][:padded_active],
-            non_blocking=True,
+            self.active_request_metadata["return_log_probs"][:padded_active], non_blocking=True
         )
         if padded_active < self.max_requests:
             self.gpu_return_log_probs_mask[padded_active:].fill_(False)
