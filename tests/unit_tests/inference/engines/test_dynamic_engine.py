@@ -39,6 +39,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import asyncio_QueueShutDown
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
@@ -904,6 +905,390 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 )
 
             engine_task.cancel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_run_engine_with_deferred_bookkeeping(self):
+        """Correctness of the deferred bookkeep path.
+
+        Exercises length-based termination, stop words, eviction,
+        failed-request cleanup, and deferred log-prob accumulation all in a
+        single engine run. A deterministic mock forward produces an ascending
+        token sequence so stop-word hits and generated tokens are predictable.
+        A tight KV budget forces eviction so all code paths fire in one run.
+
+        Log-prob correctness is verified by checking count alignment (prompt
+        log probs == prompt_length - 1, generated log probs == generated
+        tokens) and value sanity (finite, <= 0, >= -50).
+        """
+        with torch.inference_mode():
+            # Tight KV budget forces eviction while allowing all requests to
+            # eventually complete. materialize_only_last_token_logits=False is
+            # required for prompt log probs.
+            num_tokens_to_generate = 16
+            prompt_length = 4
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,  # All requests added manually below.
+                min_prompt_length=prompt_length,
+                max_prompt_length=prompt_length,
+                num_tokens_to_generate=num_tokens_to_generate,
+                context_block_size_tokens=16,
+                context_buffer_size_gb=0.00064,
+                context_paused_buffer_size_gb=0.0,
+                model_provider="gpt",
+                materialize_only_last_token_logits=False,
+            )
+            env = self._build_test_env(test_config)
+
+            # Deterministic forward: token N produces token N+1.
+            unwrapped_model = env.engine.controller.inference_wrapped_model.model
+            vocab_size = test_config.vocab_size
+
+            def mock_deterministic_forward(*args, **kwargs):
+                tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+                b, s = tokens.shape
+                base_logits = torch.zeros(
+                    b, s, vocab_size, device=tokens.device, dtype=torch.bfloat16
+                )
+                next_toks = (tokens + 1).clamp(max=vocab_size - 1)
+                base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
+                return base_logits
+
+            unwrapped_model.forward = mock_deterministic_forward
+
+            engine_task = asyncio.create_task(env.engine.run_engine())
+
+            try:
+                futs: Dict[int, asyncio.Future] = {}
+                expected: Dict[int, Dict] = {}
+
+                # --- Length-based requests (with log probs) ---
+                # Prompts start high enough to avoid hitting stop word [8, 9].
+                for rid in range(3):
+                    start = 20 + rid * 5
+                    prompt = torch.tensor(
+                        [start + i for i in range(prompt_length)], device='cuda', dtype=torch.int64
+                    )
+                    futs[rid] = env.engine.add_request(
+                        request_id=rid,
+                        prompt=prompt,
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=num_tokens_to_generate,
+                            termination_id=-1,
+                            return_log_probs=True,
+                        ),
+                    )
+                    last_prompt_tok = start + prompt_length - 1
+                    expected[rid] = {
+                        "status": Status.COMPLETED,
+                        "generated": [
+                            min(last_prompt_tok + 1 + i, vocab_size - 1)
+                            for i in range(num_tokens_to_generate)
+                        ],
+                        "check_log_probs": True,
+                    }
+
+                # --- Stop-word requests (with log probs) ---
+                # Three requests hit stop word [8, 9] at different offsets.
+                stop_word_configs = [(100, 1), (101, 2), (102, 3)]
+                stop_word_expected_generated = {
+                    100: [5, 6, 7, 8, 9],  # prompt [1,2,3,4]
+                    101: [6, 7, 8, 9],  # prompt [2,3,4,5]
+                    102: [7, 8, 9],  # prompt [3,4,5,6]
+                }
+                for rid, start in stop_word_configs:
+                    prompt = torch.tensor(
+                        [start + i for i in range(prompt_length)], device='cuda', dtype=torch.int64
+                    )
+                    futs[rid] = env.engine.add_request(
+                        request_id=rid,
+                        prompt=prompt,
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=num_tokens_to_generate,
+                            termination_id=-1,
+                            return_log_probs=True,
+                            detokenize_stop_sequence=True,
+                        ),
+                    )
+                    env.engine.get_request(rid).stop_word_ids = [[8, 9]]
+                    expected[rid] = {
+                        "status": Status.COMPLETED,
+                        "generated": stop_word_expected_generated[rid],
+                        "check_log_probs": True,
+                    }
+
+                # --- Failed request ---
+                max_seq_len = env.engine.context.max_sequence_length
+                failed_rid = 9999
+                failed_fut = env.engine.add_request(
+                    request_id=failed_rid,
+                    prompt=torch.tensor([1, 2, 3, 4], device='cuda', dtype=torch.int64),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=max_seq_len + 100, termination_id=-1
+                    ),
+                )
+
+                # Failed future resolves immediately.
+                failed_record = (await failed_fut).merge()
+                assert (
+                    failed_record.status == Status.FAILED
+                ), f"Expected FAILED for oversized request, got {failed_record.status}"
+
+                # --- Wait for all normal requests ---
+                records = await asyncio.wait_for(asyncio.gather(*futs.values()), timeout=120.0)
+
+                # --- Verify all normal requests ---
+                for rid, record in zip(futs.keys(), records):
+                    req = record.merge()
+                    exp = expected[rid]
+
+                    assert req.status == exp["status"], (
+                        f"Request {rid}: expected {exp['status']}, got {req.status}"
+                    )
+                    assert req.generated_tokens == exp["generated"], (
+                        f"Request {rid}: expected tokens {exp['generated']}, "
+                        f"got {req.generated_tokens}"
+                    )
+
+                    if exp.get("check_log_probs"):
+                        # Prompt log probs: one per prompt token except the first.
+                        assert (
+                            req.prompt_log_probs is not None
+                        ), f"Request {rid}: prompt_log_probs is None"
+                        assert len(req.prompt_log_probs) == len(req.prompt_tokens) - 1, (
+                            f"Request {rid}: expected {len(req.prompt_tokens) - 1} "
+                            f"prompt log probs, got {len(req.prompt_log_probs)}"
+                        )
+                        for i, lp in enumerate(req.prompt_log_probs):
+                            assert not math.isnan(lp) and not math.isinf(
+                                lp
+                            ), f"Request {rid}, prompt log_prob[{i}] = {lp}"
+                            assert (
+                                -50.0 <= lp <= 0.0
+                            ), f"Request {rid}, prompt log_prob[{i}] = {lp} out of range"
+
+                        # Generated log probs: one per generated token.
+                        assert (
+                            req.generated_log_probs is not None
+                        ), f"Request {rid}: generated_log_probs is None"
+                        assert len(req.generated_log_probs) == len(req.generated_tokens), (
+                            f"Request {rid}: expected {len(req.generated_tokens)} "
+                            f"generated log probs, got {len(req.generated_log_probs)}"
+                        )
+                        for i, lp in enumerate(req.generated_log_probs):
+                            assert not math.isnan(lp) and not math.isinf(
+                                lp
+                            ), f"Request {rid}, generated log_prob[{i}] = {lp}"
+                            assert (
+                                -50.0 <= lp <= 0.0
+                            ), f"Request {rid}, generated log_prob[{i}] = {lp} out of range"
+
+                # --- Verify eviction fired ---
+                assert (
+                    env.engine.evicted_request_count > 0
+                ), "No evictions triggered"
+
+                # --- Verify failed request was cleaned up ---
+                await env.engine._bookkeep_queue.join()
+                assert (
+                    failed_rid not in env.engine.requests
+                ), f"Failed request {failed_rid} not popped from self.requests"
+            finally:
+                engine_task.cancel()
+                try:
+                    await engine_task
+                except asyncio.CancelledError:
+                    pass
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_shutdown_with_pending_bookkeep_work(self):
+        """Cancelling run_engine while bookkeep work is pending must drain cleanly.
+
+        With deferred bookkeeping, forward(N) puts a snapshot on the queue and
+        the consumer (`_bookkeep_loop`) processes it during forward(N+1). If
+        the engine is cancelled while a snapshot is in-flight, run_engine's
+        `finally` block must call `_drain_bookkeep_queue` and let that work
+        finish — otherwise the request future never resolves.
+
+        This test slows `_bookkeep` so that the queue is guaranteed to have an
+        unprocessed item at cancel time. It then verifies:
+          * run_engine's drain completes the in-flight work
+          * the bookkeep task exits and the queue is shut down
+          * a follow-up `engine.shutdown()` is idempotent (does not hang or
+            re-shutdown a closed queue)
+          * no request was orphaned (all started requests have a status)
+        """
+        with torch.inference_mode():
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=8,
+                model_provider="gpt",
+            )
+            env = self._build_test_env(test_config)
+
+            unwrapped_model = env.engine.controller.inference_wrapped_model.model
+            vocab_size = test_config.vocab_size
+
+            def mock_fwd(*args, **kwargs):
+                tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+                _, _ = tokens.shape
+                base = torch.zeros(
+                    *tokens.shape, vocab_size, device=tokens.device, dtype=torch.bfloat16
+                )
+                next_toks = (tokens + 1).clamp(max=vocab_size - 1)
+                base.scatter_(2, next_toks.unsqueeze(-1), 100.0)
+                return base
+
+            unwrapped_model.forward = mock_fwd
+
+            # Slow the consumer so the maxsize=1 queue stays occupied: any
+            # pending put on the producer side blocks until drain runs.
+            original_bookkeep = env.engine._bookkeep
+            bookkeep_completed = 0
+
+            async def slow_bookkeep(work):
+                nonlocal bookkeep_completed
+                await asyncio.sleep(0.05)
+                ret = await original_bookkeep(work)
+                bookkeep_completed += 1
+                return ret
+
+            env.engine._bookkeep = slow_bookkeep
+
+            engine_task = asyncio.create_task(env.engine.run_engine())
+
+            futs: Dict[int, asyncio.Future] = {}
+            for rid in range(3):
+                start = 30 + rid * 5
+                futs[rid] = env.engine.add_request(
+                    request_id=rid,
+                    prompt=torch.tensor(
+                        [start + i for i in range(4)], device='cuda', dtype=torch.int64
+                    ),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=8, termination_id=-1
+                    ),
+                )
+
+            # Let a couple of steps run before cancelling. With slow_bookkeep,
+            # the queue is in steady state: one item in `_bookkeep`, producer
+            # blocked at the next put.
+            await asyncio.sleep(0.2)
+            assert bookkeep_completed > 0, "no steps completed before cancel"
+            completed_before_cancel = bookkeep_completed
+
+            engine_task.cancel()
+            try:
+                await asyncio.wait_for(engine_task, timeout=10.0)
+            except asyncio.CancelledError:
+                pass
+
+            # Drain finished the in-flight work (and possibly more) cleanly.
+            assert bookkeep_completed >= completed_before_cancel
+            assert env.engine._bookkeep_task.done()
+            # Subsequent puts must fail because the queue is shut down.
+            with pytest.raises(asyncio_QueueShutDown):
+                env.engine._bookkeep_queue.put_nowait({})
+
+            # shutdown() called after run_engine exits must be safe and reach
+            # STOPPED without hanging. The queue is already shut, so drain is
+            # a no-op; the test is that it doesn't raise on the closed queue
+            # or block on the already-finished bookkeep task.
+            await asyncio.wait_for(env.engine.shutdown(), timeout=5.0)
+            assert env.engine.state == EngineState.STOPPED
+
+            # All in-flight request futures should be either resolved by
+            # bookkeep or cancelled by shutdown — never left pending.
+            for rid, fut in futs.items():
+                assert fut.done(), f"request {rid} future left pending after shutdown"
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_drain_bookkeep_queue_pause_resume(self):
+        """`_drain_bookkeep_queue(signal_exit=False)` is the synchronization
+        primitive used by the PAUSING transition in run_engine_with_coordinator.
+
+        After draining with signal_exit=False:
+          * pending work on the queue must be processed before drain returns
+          * `_bookkeep_loop` must remain alive (this is the resumption point)
+          * subsequent puts must be processed normally
+
+        After a follow-up drain with signal_exit=True (mirroring shutdown):
+          * the queue must be shut down
+          * `_bookkeep_loop` must exit cleanly
+
+        We exercise the loop directly with synthetic work items rather than
+        spinning up `run_engine`, because `run_engine_with_coordinator` is the
+        only call site that uses signal_exit=False and it requires multi-rank
+        ZMQ coordination unavailable in unit tests.
+        """
+        with torch.inference_mode():
+            test_config = DynamicEngineTestConfig(num_requests=0, model_provider="gpt")
+            env = self._build_test_env(test_config)
+            engine = env.engine
+
+            # Mimic what run_engine does on entry.
+            engine._loop = asyncio.get_running_loop()
+            engine._bookkeep_task = engine._loop.create_task(engine._bookkeep_loop())
+
+            def make_minimal_work():
+                # `_bookkeep` is mostly gated on step_result is not None. With
+                # step_result=None the per-request loop is skipped and only the
+                # failed_request_ids / prefix-cache / metrics paths run, which
+                # we keep no-op via empty lists and kv_stats=None.
+                return {
+                    "step_result": None,
+                    "context_state": {"post_forward_step_count": 0, "kv_stats": None},
+                    "sync_time": 0.0,
+                    "step_time": 0.0,
+                    "failed_request_ids": [],
+                    "prefix_cache_hits_delta": 0,
+                    "prefix_cache_blocks_matched_delta": 0,
+                    "mem_stats": None,
+                }
+
+            # Phase 1: pause-style drain with pending work.
+            for _ in range(3):
+                await engine._bookkeep_queue.put(make_minimal_work())
+
+            await asyncio.wait_for(
+                engine._drain_bookkeep_queue(engine._bookkeep_task, signal_exit=False),
+                timeout=5.0,
+            )
+
+            assert engine._bookkeep_queue.empty()
+            assert (
+                not engine._bookkeep_task.done()
+            ), "pause-style drain must not terminate the bookkeep loop"
+
+            # Phase 2: resume — more work goes through the still-alive loop.
+            for _ in range(2):
+                await engine._bookkeep_queue.put(make_minimal_work())
+            # Use join() to confirm the loop drained these without another drain call.
+            await asyncio.wait_for(engine._bookkeep_queue.join(), timeout=5.0)
+            assert not engine._bookkeep_task.done()
+
+            # Phase 3: shutdown-style drain terminates the loop.
+            await asyncio.wait_for(
+                engine._drain_bookkeep_queue(engine._bookkeep_task, signal_exit=True),
+                timeout=5.0,
+            )
+            await asyncio.wait_for(engine._bookkeep_task, timeout=5.0)
+            assert engine._bookkeep_task.done()
+            with pytest.raises(asyncio_QueueShutDown):
+                engine._bookkeep_queue.put_nowait(make_minimal_work())
 
     @pytest.mark.internal
     @pytest.mark.skipif(

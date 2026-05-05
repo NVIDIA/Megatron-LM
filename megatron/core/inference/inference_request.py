@@ -498,10 +498,19 @@ class DynamicInferenceRequest(InferenceRequest):
         ]
 
     def add_event(
-        self, type: DynamicInferenceEventType, payload: Optional[Any] = None
+        self,
+        type: DynamicInferenceEventType,
+        payload: Optional[Any] = None,
+        timestamp: Optional[float] = None,
     ) -> DynamicInferenceEvent:
-        """Add event."""
-        event = DynamicInferenceEvent(type=type, payload=payload)
+        """Add event.
+
+        Args:
+            timestamp: Override the event's wall-clock timestamp.
+                Used when the event is observed in one step, but constructed later
+                (i.e. deferred bookkeeping), in order to reflect the true timestamp.
+        """
+        event = DynamicInferenceEvent(type=type, payload=payload, timestamp=timestamp)
         self.events.append(event)
         return event
 
@@ -523,6 +532,7 @@ class DynamicInferenceRequest(InferenceRequest):
         blocks_ref_count: Optional[int] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
+        timestamp: Optional[float] = None,
     ):
         """Add 'generated_token' event - records each generated token.
 
@@ -534,6 +544,7 @@ class DynamicInferenceRequest(InferenceRequest):
             blocks_ref_count (int): Sum of block ref counts from allocator.
             pre_fwd_active_token_count (int): Active token count before forward pass.
             pre_fwd_step_count (int): Step count before forward pass.
+            timestamp (float): Override wall-clock timestamp; see add_event().
         """
         payload = {"token_id": token}
         if blocks_total is not None:
@@ -548,19 +559,21 @@ class DynamicInferenceRequest(InferenceRequest):
             payload["pre_fwd_active_token_count"] = pre_fwd_active_token_count
         if pre_fwd_step_count is not None:
             payload["pre_fwd_step_count"] = pre_fwd_step_count
-        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, payload)
+        return self.add_event(
+            DynamicInferenceEventType.GENERATED_TOKEN, payload, timestamp=timestamp
+        )
 
-    def add_event_pause(self):
+    def add_event_pause(self, timestamp: Optional[float] = None):
         """Add 'pause' event."""
-        return self.add_event(DynamicInferenceEventType.PAUSE)
+        return self.add_event(DynamicInferenceEventType.PAUSE, timestamp=timestamp)
 
-    def add_event_evict(self):
+    def add_event_evict(self, timestamp: Optional[float] = None):
         """Add 'evict' event."""
-        return self.add_event(DynamicInferenceEventType.EVICT)
+        return self.add_event(DynamicInferenceEventType.EVICT, timestamp=timestamp)
 
-    def add_event_finish(self):
+    def add_event_finish(self, timestamp: Optional[float] = None):
         """Add 'finish' event."""
-        return self.add_event(DynamicInferenceEventType.FINISH)
+        return self.add_event(DynamicInferenceEventType.FINISH, timestamp=timestamp)
 
     def add_event_fail(self):
         """Add 'fail' event."""
