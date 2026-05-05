@@ -1248,6 +1248,74 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_scheduling_generate_api_prompt_logprobs_top_n_e2e(self) -> None:
+        """Generate returns prompt logprobs before async decode resumes."""
+        prompts = ["1 2 3 4", "2 3 4 5", "3 4 5 6", "4 5 6 7"]
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=4,
+            termination_id=-1,
+            top_k=1,
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            top_n_logprobs=4,
+        )
+
+        def assert_top_n_match(actual_top_n, expected_top_n):
+            assert len(actual_top_n) == len(expected_top_n)
+            for actual, expected in zip(actual_top_n, expected_top_n):
+                assert actual.keys() == expected.keys()
+                for token in actual:
+                    assert actual[token] == pytest.approx(expected[token])
+
+        def build_env(enable_async_scheduling: bool) -> DynamicEngineTestEnv:
+            env = self._build_generate_until_env(
+                enable_async_scheduling=enable_async_scheduling,
+                materialize_only_last_token_logits=False,
+            )
+            env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
+            return env
+
+        serial_env = build_env(enable_async_scheduling=False)
+        with torch.inference_mode():
+            serial_requests = [
+                record.merge() for record in serial_env.engine.generate(prompts, sampling_params)
+            ]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = build_env(enable_async_scheduling=True)
+        with torch.inference_mode():
+            async_requests = [
+                record.merge() for record in async_env.engine.generate(prompts, sampling_params)
+            ]
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_decode_graph_launch_count == 0
+        assert [request.generated_tokens for request in async_requests] == [
+            request.generated_tokens for request in serial_requests
+        ]
+        for async_request, serial_request in zip(async_requests, serial_requests):
+            assert len(async_request.prompt_log_probs) == len(async_request.prompt_tokens) - 1
+            assert async_request.prompt_log_probs == pytest.approx(
+                serial_request.prompt_log_probs
+            )
+            assert async_request.generated_log_probs == pytest.approx(
+                serial_request.generated_log_probs
+            )
+            assert_top_n_match(
+                async_request.prompt_top_n_logprobs,
+                serial_request.prompt_top_n_logprobs,
+            )
+            assert_top_n_match(
+                async_request.generated_top_n_logprobs,
+                serial_request.generated_top_n_logprobs,
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @torch.inference_mode()
     def test_async_scheduling_logprob_result_scan_is_request_gated(self) -> None:
         """No-logprob requests skip the extra generated-logprob metadata scan."""
@@ -1718,7 +1786,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert request_tokens[-len(stop_word_ids) :] == stop_word_ids
         assert async_tokens == serial_tokens
 
-    def _build_generate_until_env(self, *, enable_async_scheduling: bool) -> DynamicEngineTestEnv:
+    def _build_generate_until_env(
+        self,
+        *,
+        enable_async_scheduling: bool,
+        materialize_only_last_token_logits: bool = True,
+    ) -> DynamicEngineTestEnv:
         """Build an async-capable engine whose tokenizer accepts whitespace token IDs."""
         env = self._build_test_env(
             DynamicEngineTestConfig(
@@ -1735,6 +1808,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 termination_id=-1,
                 top_k=1,
                 enable_async_scheduling=enable_async_scheduling,
+                materialize_only_last_token_logits=materialize_only_last_token_logits,
             )
         )
         env.engine.controller.tokenizer.bos = None
