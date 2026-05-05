@@ -191,24 +191,23 @@ class LogProbsDecode:
             top_n_dict = built or None
         return result, top_n_dict
 
-    def indexing(self, context, *, eager: bool = False) -> None:
+    def indexing(self, context, *, eager: bool = False) -> Tensor:
         """Run indexing kernel with optional CUDA graph capture/replay."""
         key = ("decode_idx", context.padded_batch_dimensions)
-        self._ri = self.indexing_kernel(context, eager=eager, cache_key=key)
+        return self.indexing_kernel(context, eager=eager, cache_key=key)
 
-    def lse(self, context, logits: Tensor, *, eager: bool = False) -> None:
-        """Run LSE precompute on the side stream so it overlaps with sampling.
-
-        Stashes `self._lse`; consumed by the next `calculate` call.
-        """
+    def lse(self, context, logits: Tensor, ri: Tensor, *, eager: bool = False) -> Tensor:
+        """Run LSE precompute on the side stream so it overlaps with sampling."""
         key = ("decode_lse", context.padded_batch_dimensions)
-        self._lse = self.lse_kernel(logits, self._ri, eager=eager, cache_key=key)
+        return self.lse_kernel(logits, ri, eager=eager, cache_key=key)
 
     def calculate(
         self,
         context,
         logits: Tensor,
         new_tokens: Tensor,
+        ri: Tensor,
+        lse: Tensor,
         log_prob_request_count: int,
         *,
         eager: bool = False,
@@ -220,6 +219,8 @@ class LogProbsDecode:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, padded_active_requests, vocab_size].
             new_tokens (Tensor): Newly sampled tokens.
+            ri (Tensor): Output of `indexing`.
+            lse (Tensor): Output of `lse`.
             log_prob_request_count (int): Number of requests wanting log probs.
             eager (bool): If True, skip CUDA graph capture/replay for the kernels.
             top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
@@ -227,9 +228,7 @@ class LogProbsDecode:
         Returns:
             A callable that returns (per_request_log_probs, top_n_dict).
         """
-        # `_ri` was stashed by `indexing`; `_lse` by `lse` on the side stream.
         # Gather is cheap (per-row scalar lookup + subtract), runs on the main stream.
-        ri, lse = self._ri, self._lse
         key = ("decode_gather", context.padded_batch_dimensions)
         slp = self.gather_kernel(logits, new_tokens, ri, lse, eager=eager, cache_key=key)
 

@@ -388,42 +388,34 @@ class LogProbsSpeculative:
 
         return top_n_dict if top_n_dict else None
 
-    def prefill_indexing(self, context, *, eager: bool = False) -> None:
-        """Run prefill indexing kernel with optional CUDA graph capture/replay.
-
-        Args:
-            context: The active DynamicInferenceContext.
-            eager (bool): If True, skip CUDA graph capture/replay for the kernels.
-        """
+    def prefill_indexing(
+        self, context, *, eager: bool = False
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Run prefill indexing kernel with optional CUDA graph capture/replay."""
         spec_plus_one = context.num_speculative_tokens + 1
         # CPU-side stamp into the pinned scalar;
         # the H2D itself runs inside the graphed kernel below so it gets captured.
         self._prefill_offset_pinned[0] = context.num_decode_requests * spec_plus_one
         key = ("spec_fp_idx", context.padded_batch_dimensions)
-        result = self.prefill_indexing_kernel(
+        return self.prefill_indexing_kernel(
             context, self._prefill_offset_pinned, eager=eager, cache_key=key
         )
-        (
-            self._prefill_offset_gpu,
-            self._fp_ri,
-            self._fp_cu_ml,
-            self._fp_li,
-            self._fp_mt,
-            self._fp_count_gpu,
-        ) = result
 
-    def softmax(self, context, logits: Tensor, *, eager: bool = False) -> None:
+    def softmax(
+        self, context, logits: Tensor, prefill_offset_gpu: Tensor, *, eager: bool = False
+    ) -> Tuple[Tensor, Tensor]:
         """Run post-forward softmax with optional CUDA graph capture/replay.
 
         Args:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
+            prefill_offset_gpu (Tensor): from `prefill_indexing` (first element of its return).
             eager (bool): If True, skip CUDA graph capture/replay for the kernels.
         """
         # Computes per-row LSE only; gather happens later in `calculate` post-verification.
         key = ("spec_sm", context.padded_batch_dimensions)
-        self._decode_lse, self._prefill_lse = self.softmax_kernel(
-            context, logits, self._prefill_offset_gpu, eager=eager, cache_key=key
+        return self.softmax_kernel(
+            context, logits, prefill_offset_gpu, eager=eager, cache_key=key
         )
 
     def calculate(
@@ -431,6 +423,8 @@ class LogProbsSpeculative:
         context,
         logits: Tensor,
         new_tokens: Tensor,
+        prefill_indexing_outputs: Tuple[Tensor, ...],
+        softmax_outputs: Tuple[Tensor, Tensor],
         log_prob_request_count: int,
         accepted_tokens: Tensor,
         accepted_token_counts: Tensor,
@@ -444,6 +438,9 @@ class LogProbsSpeculative:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
             new_tokens (Tensor): Newly sampled tokens.
+            prefill_indexing_outputs: tuple from `prefill_indexing`:
+                (prefill_offset_gpu, fp_ri, fp_cu_ml, fp_li, fp_mt, fp_count_gpu).
+            softmax_outputs: tuple from `softmax`: (decode_lse, prefill_lse).
             log_prob_request_count (int): Number of requests wanting log probs.
             accepted_tokens (Tensor): Speculative-verified token IDs.
             accepted_token_counts (Tensor): Per-decode-request accepted counts.
@@ -459,9 +456,8 @@ class LogProbsSpeculative:
         only_last = context.config.materialize_only_last_token_logits
         spec_plus_one = context.num_speculative_tokens + 1
 
-        # LSE values were precomputed in the post-forward `softmax` stage.
-        decode_lse = self._decode_lse
-        prefill_lse = self._prefill_lse
+        prefill_offset_gpu, fp_ri, fp_cu_ml, fp_li, fp_mt, fp_count_gpu = prefill_indexing_outputs
+        decode_lse, prefill_lse = softmax_outputs
 
         # Gather depends on accepted_tokens / new_tokens which only exist after verification.
         key = ("spec_ga", context.padded_batch_dimensions)
@@ -473,7 +469,7 @@ class LogProbsSpeculative:
             new_tokens,
             accepted_tokens,
             accepted_token_counts,
-            self._prefill_offset_gpu,
+            prefill_offset_gpu,
             eager=eager,
             cache_key=key,
         )
@@ -481,14 +477,7 @@ class LogProbsSpeculative:
         # Full-prefill softmax: only when the model materialized per-token logits for prefills.
         # Reuses LogProbsPrefill via the _prefill_softmax wrapper.
         fp_slp = fp_lse = None
-        fp_ri = fp_cu_ml = fp_li = fp_count_gpu = None
         if not only_last and num_prefill > 0:
-            fp_ri = self._fp_ri
-            fp_cu_ml = self._fp_cu_ml
-            fp_li = self._fp_li
-            mt = self._fp_mt
-            fp_count_gpu = self._fp_count_gpu
-
             fp_key = ("spec_fp_sm", context.padded_batch_dimensions)
             fp_slp, fp_lse = self._prefill_softmax(
                 logits,
@@ -496,7 +485,7 @@ class LogProbsSpeculative:
                 fp_ri,
                 fp_cu_ml,
                 fp_li,
-                mt,
+                fp_mt,
                 eager=eager,
                 cache_key=fp_key,
             )
