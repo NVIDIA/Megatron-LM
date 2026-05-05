@@ -250,7 +250,7 @@ class TestTritonHAggregate:
     @_require_triton
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256), (64, 8, 4, 4096)])
     def test_fwd_vs_reference(self, s, b, n, C):
-        from megatron.core.fusions.triton_mhc_kernels import _triton_h_aggregate_fwd
+        from megatron.core.fusions.fused_mhc_kernels import _triton_h_aggregate_fwd
 
         _info()
         x_data = _rand(s, b, n, C)
@@ -370,7 +370,7 @@ class TestTritonHPostBDA:
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256), (64, 8, 4, 4096)])
     def test_fwd_vs_reference(self, s, b, n, C, with_bias):
         """Triton hpb forward output must match the PyTorch reference."""
-        from megatron.core.fusions.triton_mhc_kernels import _triton_h_post_bda_fwd
+        from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_fwd
 
         _info()
         hr_data = _rand(s, b, n, n)
@@ -389,7 +389,7 @@ class TestTritonHPostBDA:
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256), (64, 8, 4, 4096), (128, 1, 8, 7168)])
     def test_bwd_vs_reference(self, s, b, n, C, with_bias):
         """Triton hpb backward grads must match the PyTorch reference."""
-        from megatron.core.fusions.triton_mhc_kernels import _triton_h_post_bda_bwd
+        from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_bwd
 
         _info()
         hr_data = _rand(s, b, n, n)
@@ -435,7 +435,7 @@ class TestTritonHPostBDA:
     def test_triton_vs_cutile(self, s, b, n, C, with_bias):
         """Triton and cuTile backward must produce identical results."""
         from megatron.core.fusions.fused_mhc_kernels import _cutile_h_post_bda_bwd
-        from megatron.core.fusions.triton_mhc_kernels import _triton_h_post_bda_bwd
+        from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_bwd
 
         _info()
         hr_data = _rand(s, b, n, n)
@@ -476,7 +476,7 @@ class TestTritonHPostBDABwdE2EDebug:
             fused_proj_rms,
             fused_sinkhorn,
         )
-        from megatron.core.fusions.triton_mhc_kernels import _triton_h_post_bda_bwd
+        from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_bwd
 
         s, b, n, C = 8, 4, 4, 1024
         eps = 1e-6
@@ -537,7 +537,7 @@ class TestTritonSinkhorn:
     @_require_triton
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10), (8, 4, 4, 20)])
     def test_fwd_bwd_vs_reference(self, s, b, n, iters):
-        from megatron.core.fusions.triton_mhc_kernels import triton_fused_sinkhorn
+        from megatron.core.fusions.fused_mhc_kernels import triton_fused_sinkhorn
 
         eps = 1e-6
         data = _rand(s, b, n, n)
@@ -562,7 +562,7 @@ class TestTritonSinkhorn:
             _cutile_sinkhorn_bwd,
             _cutile_sinkhorn_fwd,
         )
-        from megatron.core.fusions.triton_mhc_kernels import triton_fused_sinkhorn
+        from megatron.core.fusions.fused_mhc_kernels import triton_fused_sinkhorn
 
         eps = 1e-6
         data = _rand(s, b, n, n)
