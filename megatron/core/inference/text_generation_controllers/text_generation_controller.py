@@ -1416,6 +1416,12 @@ class TextGenerationController:
             and (active_metadata["top_p"][active_slice] == 0.0).all()
         )
 
+    def _active_requests_need_sampling_bookkeeping(self) -> bool:
+        """Whether active requests need per-step sampling parameter buckets."""
+        if self._sampling_backend != "torch":
+            return False
+        return not self._active_requests_use_greedy_sampling()
+
     def _active_request_ids_cpu(self) -> Tensor:
         """Return the current active request IDs in row order."""
         context = self.inference_wrapped_model.inference_context
@@ -1808,6 +1814,8 @@ class TextGenerationController:
 
         if self._active_requests_need_logprob_results():
             return True, None, None, None, None, False
+        if not self._active_requests_use_greedy_sampling(active_request_count):
+            return True, None, None, None, None, False
 
         async_decode_graph = self._get_async_decode_graph()
         if async_decode_graph is None:
@@ -1894,8 +1902,6 @@ class TextGenerationController:
         active_slice = slice(0, active_request_count)
         return_log_probs_requested = active_metadata["return_log_probs"][active_slice]
         top_n_logprobs_requested = active_metadata["top_n_logprobs"][active_slice] > 0
-        if (active_metadata["top_k"][active_slice] != 1).any():
-            return "non-greedy top_k"
         if (active_metadata["top_p"][active_slice] != 0.0).any():
             return "top_p sampling"
         if (
@@ -1958,6 +1964,22 @@ class TextGenerationController:
         if async_sample_already_launched:
             return False
         return self._active_requests_need_logprob_results()
+
+    def _should_collect_dynamic_sampling_bookkeeping(
+        self,
+        *,
+        async_next_prepared: bool,
+        pending_forward_reused: bool,
+        async_sample_already_launched: bool,
+    ) -> bool:
+        """Whether this step needs sampling buckets or logprob bookkeeping."""
+        if self._active_requests_need_sampling_bookkeeping():
+            return True
+        return self._should_collect_dynamic_logprob_bookkeeping(
+            async_next_prepared=async_next_prepared,
+            pending_forward_reused=pending_forward_reused,
+            async_sample_already_launched=async_sample_already_launched,
+        )
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
         """Collect flat routing indices for MoE router recording.
@@ -2756,7 +2778,7 @@ class TextGenerationController:
 
         with torch.inference_mode():
             range_push("sampling")
-            if self._should_collect_dynamic_logprob_bookkeeping(
+            if self._should_collect_dynamic_sampling_bookkeeping(
                 async_next_prepared=async_next_prepared,
                 pending_forward_reused=pending_forward_reused,
                 async_sample_already_launched=async_sample_already_launched,
