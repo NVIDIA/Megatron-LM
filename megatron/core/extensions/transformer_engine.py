@@ -767,21 +767,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             kwargs["cache_quantized_input"] = cache_quantized_input
         return op_type(**kwargs)
 
-    def _make_te_ops_tensor_parallel_output_collective(
-        module: torch.nn.Module,
-        *,
-        module_name: str,
-        tp_world_size: int,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> Optional[te.pytorch.ops.FusibleOperation]:
-        """Construct the TE output collective for row-parallel-style output."""
-        _validate_te_ops_adapter_module(module, module_name, ("sequence_parallel",))
-        if tp_world_size <= 1:
-            return None
-        if module.sequence_parallel:
-            return te.pytorch.ops.ReduceScatter(tp_group)
-        return te.pytorch.ops.AllReduce(tp_group)
-
     class TEFusedResidualRMSNorm(TEFusedOpsMixin, te.pytorch.RMSNorm):
         """
         RMSNorm with fused residual output for Megatron Core.
@@ -2455,14 +2440,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     rng_state_tracker_function=rng_state_tracker_function,
                 )
             )
-            op = _make_te_ops_tensor_parallel_output_collective(
-                self.linear_fc2,
-                module_name="linear_fc2",
-                tp_world_size=tp_world_size,
-                tp_group=tp_group,
-            )
-            if op is not None:
-                fused_impl.append(op)
+            if tp_world_size > 1:
+                if self.linear_fc2.sequence_parallel:
+                    fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
+                else:
+                    fused_impl.append(te.pytorch.ops.AllReduce(tp_group))
 
             # FC2 bias op
             if not self.linear_fc2.te_return_bias:
