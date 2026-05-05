@@ -1182,10 +1182,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_mamba_chunks=self._max_mamba_chunks,
         )
 
-        # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. The slice
-        # + unsqueeze chain in current_input_and_position_ids constructs new
-        # TensorImpls each call (~30-60 us on the host); the underlying storage
-        # is fixed so views are reusable across steps. Bounded by the small set
+        # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
+        # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
+        # we fix the underlying storage so views are reusable across steps. Bounded by the small set
         # of token counts that recur (graph sizes + the eager batch size).
         self._input_position_views: Dict[int, Tuple[Tensor, Tensor]] = {}
 
