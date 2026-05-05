@@ -1755,14 +1755,12 @@ class TextGenerationController:
             context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
             range_pop()
 
-        # Record after forward pass kernels are enqueued.  Awaiting this
-        # lets other asyncio tasks run while the GPU is busy, and resumes
-        # as soon as the forward pass completes.
+        # Trigger a faux-interrupt on the event loop after the forward pass GPU work completes.
+        # The actual await happens after the CPU has also enqueued sampling work.
+        # This allows the GPU to continue working (on sampling) while the faux-interrupt is handled.
         gpu_done.record()
-        await gpu_done
 
         with torch.inference_mode():
-            range_push("sampling")
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             if self.num_speculative_tokens > 0:
@@ -1770,6 +1768,14 @@ class TextGenerationController:
                 nvtx_range_push("mtp-spec-decoding/verify")
                 self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
                 nvtx_range_pop("mtp-spec-decoding/verify")
+            else:
+                nvtx_range_push("sampling")
+                self._dynamic_step_sample_logits()
+                nvtx_range_pop("sampling")
+
+            await gpu_done
+
+            if self.num_speculative_tokens > 0:
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
@@ -1789,8 +1795,6 @@ class TextGenerationController:
                 # Phase 4: Release freed blocks. Deferred from Phase 2 so the
                 # data-dependent boolean-mask sync overlaps with MTP GPU work.
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
-            else:
-                self._dynamic_step_sample_logits()
 
             log_probs = None
             top_n_logprobs = None
@@ -1809,7 +1813,6 @@ class TextGenerationController:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                             log_probs_tensor
                         )
-            range_pop()
 
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
