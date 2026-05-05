@@ -1011,6 +1011,86 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert controller._async_discarded_forward_count == 0
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
+    def _run_stop_word_finish_schedule(
+        self, stop_word_ids_by_request: Dict[int, int], *, enable_async_scheduling: bool
+    ) -> DynamicEngineTestEnv:
+        """Run a decode schedule whose requests stop on per-request stop tokens."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=4,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=8,
+                num_gap_steps=0,
+                model_provider="gpt",
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                termination_id=-1,
+                top_k=1,
+                enable_async_scheduling=enable_async_scheduling,
+            )
+        )
+        with torch.inference_mode():
+            for request in env.requests:
+                request.sampling_params.detokenize_stop_sequence = True
+                env.engine._add_request(request)
+                tracked_request = env.engine.get_request(request.request_id)
+                tracked_request.stop_word_ids = [[stop_word_ids_by_request[request.request_id]]]
+                request.state = "pending"
+
+            while env.engine.has_unfinished_requests():
+                self._run_step(env)
+
+        return env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_stop_word_finish_cuda_graph_e2e(self) -> None:
+        """Async GPT scheduling finishes stop-word requests without falling back."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        probe_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        stop_word_ids_by_request = {
+            request.request_id: request.generated_tokens[1] for request in probe_env.requests
+        }
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        serial_env = self._run_stop_word_finish_schedule(
+            stop_word_ids_by_request, enable_async_scheduling=False
+        )
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._run_stop_word_finish_schedule(
+            stop_word_ids_by_request, enable_async_scheduling=True
+        )
+        async_tokens = [request.generated_tokens for request in async_env.requests]
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_finish_boundary_count > 0
+        assert all(len(tokens) < common_kwargs["num_tokens_to_generate"] for tokens in async_tokens)
+        assert async_tokens == serial_tokens
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
