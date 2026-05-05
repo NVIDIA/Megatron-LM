@@ -24,7 +24,6 @@ class MambaMetadata:
         max_tokens: int,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
-        request_to_mamba_state_idx_buf: Optional[torch.Tensor] = None,
     ):
         """
         Initialize the Mamba metadata buffers.
@@ -35,13 +34,6 @@ class MambaMetadata:
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
-            request_to_mamba_state_idx_buf (Optional[Tensor]): Pre-allocated CPU
-                ``(max_requests,)`` int32 buffer for the request-to-slot mapping,
-                aliased into the context's coalesced pinned bookkeeping buffer
-                so writes here ride the per-step H2D into
-                ``gpu_view.request_to_mamba_state_idx``. When ``None`` (e.g. unit
-                tests constructing :class:`MambaMetadata` standalone) a fresh
-                CPU tensor is allocated.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
@@ -53,16 +45,9 @@ class MambaMetadata:
         self.max_chunks = max_tokens // mamba_chunk_size + max_requests
 
         # Map from requests to slots in the static Mamba state buffer.
-        # Aliased into the context's coalesced pinned CPU bookkeeping buffer
-        # when constructed with one (production); otherwise standalone.
-        if request_to_mamba_state_idx_buf is not None:
-            assert request_to_mamba_state_idx_buf.shape == (max_requests,)
-            assert request_to_mamba_state_idx_buf.dtype == torch.int32
-            self.request_to_mamba_state_idx = request_to_mamba_state_idx_buf
-        else:
-            self.request_to_mamba_state_idx = torch.full(
-                (max_requests,), -1, dtype=torch.int32, device='cpu'
-            )
+        self.request_to_mamba_state_idx = torch.full(
+            (max_requests,), -1, dtype=torch.int32, device=self.device
+        )
 
         # Map from requests to slots in the static Mamba state buffer for active decode requests.
         # int64 so selective_state_update can index directly without a per-layer upcast kernel.
@@ -447,15 +432,8 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         max_tokens: int,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
-        request_to_mamba_state_idx_buf: Optional[torch.Tensor] = None,
     ):
-        super().__init__(
-            max_requests,
-            max_tokens,
-            mamba_chunk_size,
-            d_conv,
-            request_to_mamba_state_idx_buf=request_to_mamba_state_idx_buf,
-        )
+        super().__init__(max_requests, max_tokens, mamba_chunk_size, d_conv)
 
         # Each prefill request can produce up to MAX_INTERMEDIATE_OFFSETS_PER_REQUEST offsets.
         self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * max_requests

@@ -333,12 +333,10 @@ class MambaSlotAllocator:
             return
         device = self.conv_states.device
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=device)
-        # Lookup mamba indices from CPU bookkeeping, then move to GPU for state copy.
-        req_tensor_cpu = torch.tensor(request_indices, dtype=torch.int64)
-        mamba_indices = self.context.mamba_metadata.request_to_mamba_state_idx[
-            req_tensor_cpu
-        ].tolist()
-        mamba_idx_tensor = torch.tensor(mamba_indices, dtype=torch.int64, device=device)
+        req_tensor = torch.tensor(request_indices, dtype=torch.int64, device=device)
+        mamba_idx_tensor = self.context.mamba_metadata.request_to_mamba_state_idx[
+            req_tensor
+        ].to(torch.int64)
         # Fancy-indexed copy (2 kernel launches instead of 2E)
         self.conv_states[:, slot_tensor] = self.context.mamba_conv_states[:, mamba_idx_tensor]
         self.ssm_states[:, slot_tensor] = self.context.mamba_ssm_states[:, mamba_idx_tensor]

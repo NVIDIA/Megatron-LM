@@ -187,9 +187,17 @@ class TextGenerationController:
         self._post_sampling_bookkeeping_stream = torch.cuda.Stream(device=device)
         self._post_sampling_bookkeeping_event = torch.cuda.Event()
 
-        # Used for inefficient torch sampling.
-        if self._sampling_backend == "torch":
-            self._torch_sampling_buckets: List[Tuple] = []
+        # Sampling backend: provides the sampling kernel consumed by
+        # ``_dynamic_step_sample_logits`` and friends.
+        if self._sampling_backend == "flashinfer":
+            self._sampling: Sampling = FlashInferSampling(
+                self.vocab_size,
+                self.sampling_rng,
+                config=self.model_config,
+                enable_cuda_graph=self._enable_cuda_graph,
+            )
+        else:
+            self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
 
         # Cache values that are constant across inference steps.
         self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
@@ -745,15 +753,9 @@ class TextGenerationController:
         # Mamba speculative rewind stays on GPU because it mutates GPU-resident
         # SSM/conv state that the next forward pass reads directly.
         if context.is_hybrid_model:
-            cuda_device = torch.cuda.current_device()
-            # gpu_view.request_in_prefill_status was uploaded by this step's
-            # coalesced H2D and mirrors the active-slice CPU values, so we
-            # don't need to re-upload prefill_status for the Mamba kernels.
-            prefill_status_gpu = context.gpu_view.request_in_prefill_status[:active_request_count]
+            prefill_status_gpu = context.request_in_prefill_status_tensor[:active_request_count]
             accepted_counts_gpu = self._accepted_token_counts_per_request[:active_request_count]
-            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
-                active_request_slice
-            ].to(cuda_device, non_blocking=True)
+            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[active_request_slice]
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
@@ -830,16 +832,10 @@ class TextGenerationController:
             last_accepted_hidden = None
 
         # Compute position IDs for the next tokens.
-        # After rewind, request_kv_length_offsets has been adjusted. Read from
-        # CPU context (post-rewind values), NOT gpu_view (stale pre-rewind snapshot).
-        # The next position to predict is: adjusted_offset + processed_tokens.
-        cuda_device = torch.cuda.current_device()
-        adjusted_offsets = context.request_kv_length_offsets[active_slice].to(
-            cuda_device, non_blocking=True
-        )
-        processed_tokens = context.request_query_lengths[active_slice].to(
-            cuda_device, non_blocking=True
-        )
+        # After rewind, request_kv_length_offsets has been adjusted. The next
+        # position to predict is: adjusted_offset + processed_tokens.
+        adjusted_offsets = context.request_kv_length_offsets[active_slice]
+        processed_tokens = context.request_query_lengths[active_slice]
         # Cast to int64 to match CUDA graph capture dtype expectations.
         base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
 
@@ -980,7 +976,7 @@ class TextGenerationController:
         logits = self._all_logits_cuda
         # `speculative_required_logit_indices()` already returns padded indices when
         # running a captured graph (`num_last_token_logits` uses the padded counts and
-        # `_pad_gpu_active_slices` zero-pads the trailing slots), so the call site does not
+        # `pad_active_slices` zero-pads the trailing slots), so the call site does not
         # need to re-pad here.
         required_logit_indices = context.speculative_required_logit_indices()
 
@@ -1095,7 +1091,7 @@ class TextGenerationController:
         gather_indices = (
             None
             if context.config.materialize_only_last_token_logits
-            else context.gpu_view.active_request_last_token_idxs
+            else context.active_request_last_token_idxs
         )
         self._sampled_tokens_cuda = self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
@@ -1217,11 +1213,10 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Use gpu_view for data consumed by GPU log-probs operations.
-        request_in_prefill_status_tensor = context.gpu_view.request_in_prefill_status[
+        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
             :active_request_count
         ]
-        request_query_lengths = context.gpu_view.request_query_lengths[:active_request_count]
+        request_query_lengths = context.request_query_lengths[:active_request_count]
 
         num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
@@ -1284,7 +1279,7 @@ class TextGenerationController:
                 ]
                 log_probs_list_prefill = [[lp.item()] for lp in selected_log_probs]
             else:
-                prefill_token_ids = context.gpu_view.token_to_input_ids[
+                prefill_token_ids = context.token_to_input_ids[
                     decode_len : context.active_token_count
                 ].roll(-1, 0)
                 prefill_query_lengths = request_query_lengths[request_in_prefill_status_tensor == 1]
@@ -1327,11 +1322,10 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Use gpu_view for data consumed by GPU top-n operations.
-        request_in_prefill_status_tensor = context.gpu_view.request_in_prefill_status[
+        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
             :active_request_count
         ]
-        request_query_lengths = context.gpu_view.request_query_lengths[:active_request_count]
+        request_query_lengths = context.request_query_lengths[:active_request_count]
 
         num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
@@ -1641,19 +1635,13 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
+        # Batch GPU-to-CPU transfer of the sampled tokens; returned as
+        # ``"sample"`` so the engine's eventual ``.tolist()`` is sync-free.
         range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count
-        )
+        sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
         range_pop()
 
         range_push("active_request_mask")
-        # Everything below is 100% CPU.
-        # Use the snapshot taken during _build_cpu_active_slices: active_request_ids holds the
-        # request IDs that were active when the step started (before update_requests
-        # rearranges slots).
-        active_request_ids = context.active_request_ids[:active_request_count]
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
@@ -1665,7 +1653,7 @@ class TextGenerationController:
 
         # Request finished if termination_id or length >= max_sequence_length.
         active_request_mask = (
-            sampled_tokens_cpu
+            self._sampled_tokens_cuda[:active_request_count]
             != context.active_request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
@@ -1713,10 +1701,8 @@ class TextGenerationController:
         return {
             "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
-            # Already a CPU tensor (independent of _sampled_tokens_cuda via the
-            # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
-            # the separate new_sample_copy). Returning the CPU copy avoids a
-            # D2H sync when the engine later calls sample.tolist().
+            # CPU tensor (D2H done above); returning it avoids a sync
+            # when the engine later calls ``sample.tolist()``.
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
             "has_chunked": has_chunked,
@@ -1873,9 +1859,9 @@ class TextGenerationController:
             range_pop()
 
             if skip_bookkeeping:
-                # _transfer_samples_to_cpu wasn't invoked on this path, so do
-                # a one-shot D2H here to keep "sample" as a CPU tensor for
-                # downstream consumers.
+                # _dynamic_step_post_sample_bookkeeping wasn't invoked on this
+                # path, so do a one-shot D2H here to keep "sample" as a CPU
+                # tensor for downstream consumers.
                 request_bookkeeping = {
                     "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
                 }

@@ -241,7 +241,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 # Make all inference/* metrics use inference_step as their x-axis
                 # This allows inference and training to have independent step counters
-                context.metrics_writer.define_metric(
+                self.metrics_writer.define_metric(
                     "inference/*", step_metric="inference/inference_step"
                 )
                 # Initialize inference step offset by querying existing run history
@@ -352,7 +352,6 @@ class DynamicInferenceEngine(AbstractEngine):
         for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
 
-        # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
@@ -431,10 +430,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # Only need to capture the context bookkeeping graph once.
         prep_result = controller._dynamic_step_post_sample_bookkeeping()
         controller._run_update_requests(prep_result)
-
-        # Disable inference dispatcher after graph capture
-        if is_inference_optimized_ep:
-            unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
