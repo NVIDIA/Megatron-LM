@@ -262,8 +262,9 @@ git commit --amend --no-edit  # rewrites the merge commit's tree;
 git push -u origin "$BRANCH"  # only non-force push of the run.
 ```
 
-Every Phase 3 fix amends this commit and force-pushes. See the
-single-commit policy in Rules.
+Once pushed, this commit is immutable for the rest of the run.
+Phase 3 fixes go into a separate rolling fix commit on top (see
+Phase 3 step 4 and the two-commit policy in Rules).
 
 ---
 
@@ -432,12 +433,21 @@ does NOT show.
 4. Read the tool output:
    - If `RESULT=FAILURE`: diagnose via
      `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs` (or the
-     external-context equivalent), fix the code, amend the existing
-     commit, and force-push:
+     external-context equivalent) and fix the code. The Phase 1
+     commit is immutable; fixes accumulate in a single rolling fix
+     commit on top of it:
      ```bash
      git add -A
-     git commit --amend --no-edit
-     git push --force-with-lease origin "$BRANCH"
+     if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+       # HEAD has two parents → still the Phase 1 merge commit.
+       # First failure of this run: create the fix commit.
+       git commit -m "fix: post-CI corrections"
+       git push origin "$BRANCH"
+     else
+       # HEAD is the existing fix commit → amend it.
+       git commit --amend --no-edit
+       git push --force-with-lease origin "$BRANCH"
+     fi
      ```
      `--force-with-lease` (not `--force`): if a human pushed onto the
      branch since the bot last fetched, the lease aborts the push
@@ -582,11 +592,13 @@ comment should include:
 
 - Prioritize main over dev on genuine conflicts. Preserve dev-only additions
   that do not conflict.
-- **Single-commit policy:** the PR must contain exactly one bot-authored
-  commit at HEAD. Phase 1's push is the only non-force push; every
-  Phase 3 fix amends that commit (`git commit --amend --no-edit`) and
-  force-pushes (`git push --force-with-lease`). Never accumulate a
-  chain of bot fixup commits.
+- **Two-commit policy:** the PR contains at most two bot-authored
+  commits — the Phase 1 merge commit (immutable once pushed) and a
+  single rolling fix commit on top. The fix commit is created on
+  the first Phase 3 failure (normal push) and amended on every
+  subsequent failure (`git commit --amend --no-edit` +
+  `git push --force-with-lease`). Never modify the Phase 1 commit
+  after pushing it; never let the fix-commit count exceed one.
 - CI triggers via comment: `/ok to test <sha>`
 - CI runs appear on branch `pull-request/<PR_NUMBER>`
 - Git committer identity: `svcnvidia-nemo-ci`
