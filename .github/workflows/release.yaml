@@ -101,7 +101,6 @@ jobs:
           {"python-package": "megatron_fsdp", "src-dir": "megatron/core/distributed/fsdp/src/"}
         ]
     secrets:
-      PAT: ${{ secrets.PAT }}
 
   build-test-publish-wheels:
     needs: [pre-flight, bump]
@@ -143,7 +142,6 @@ jobs:
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
       publish-docs: false
     secrets:
-      PAT: ${{ secrets.PAT }}
       SLACK_WEBHOOK: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SLACK_MAIN_CHANNEL_WEBHOOK || secrets.SLACK_CI_CHANNEL_WEBHOOK }}
 
   publish-docs:
