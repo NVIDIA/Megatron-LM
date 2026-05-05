@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 from .copy_services.base import CopyService
 from .transforms import ReshardTransform, _ensure_sendable
-from .utils import ReshardPlan
+from .utils import ReshardPlan, named_refit_tensors
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +48,15 @@ def execute_reshard_plan(
     of the default slice-and-copy logic.
     """
 
-    # Extract parameters from models if present
+    # Extract parameters and persistent buffers from models if present.
+    # Persistent buffers carry training state (e.g. MoE router expert_bias)
+    # and must be refit alongside parameters.
     src_params = {}
     dst_params = {}
     if src_module is not None:
-        src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
+        src_params = {name: p for name, p in named_refit_tensors(src_module)}
     if dst_module is not None:
-        dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
+        dst_params = {name: p for name, p in named_refit_tensors(dst_module)}
 
     # Cache dequantized BF16 views of MXFP8 source params so that multiple
     # send ops for the same param reuse one dequant instead of repeating it.

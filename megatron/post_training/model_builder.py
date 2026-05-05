@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 """ModelOpt GPT model provider."""
 
@@ -16,16 +16,15 @@ from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
-from megatron.core.models.mamba import MambaModel as MCoreMambaModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel as MCoreHybridModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
-from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
+from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-
-from megatron.post_training.utils import print_distributed_quant_summary
 
 
 def count_parameters_in_layer(model, layer_name):
@@ -104,6 +103,13 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
 
     args_dict = vars(get_args()).copy()
     del args_dict["kv_channels"]  # not recalculated if present
+    # Setting teacher Flextron fields to false if training with Flextron, can be overridden
+    if "flextron" in args_dict:
+        config["flextron"] = False
+    if "enable_router" in args_dict:
+        config["enable_router"] = False
+    if "freeze_model" in args_dict:
+        config["freeze_model"] = False
     args_dict.update(config)
 
     # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
@@ -114,7 +120,7 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     return Namespace(**args_dict)
 
 
-def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
+def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
     """Teacher model creator."""
     args = get_args()
 
@@ -124,7 +130,7 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
         # _load_teacher_model_config, so config_raw.hybrid_layer_pattern is always set here.
         model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_layer_pattern
 
-        teacher = MCoreMambaModel(config=config, **model_kwargs)
+        teacher = MCoreHybridModel(config=config, **model_kwargs)
     else:
         # GPT layer spec needs re-creation since it depends on number of model layers.
         if config.heterogeneous_block_specs:
@@ -141,31 +147,22 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
                 use_arbitrary_attention_mask=False,
             )
         teacher = MCoreGPTModel(config=config, **model_kwargs)
+
     _add_load_convert_hooks(teacher)
 
-    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
-    # [WAR]: load checkpoint will check checkpoint's saved args and rng state if not finetune.
-    # To avoid error out on loading teacher's checkpoint, we temporarily set args.finetune to
-    # True while loading the teacher checkpoint.
-    original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
-    args.finetune = True
-    if args.export_kd_teacher_ckpt_format is not None:
-        args.ckpt_format = args.export_kd_teacher_ckpt_format
-    load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
-    args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
-    print_rank_0("...teacher loaded successfully.")
+    # NOTE: Checkpoint loading now handled in `megatron/training/checkpointing.py`.
 
     return teacher
 
 
-def modelopt_gpt_mamba_builder(
+def modelopt_gpt_hybrid_builder(
     args,
     pre_process,
     post_process,
     vp_stage=None,
     config=None,
     pg_collection=None,
-) -> MCoreGPTModel | MCoreMambaModel:
+) -> MCoreGPTModel | MCoreHybridModel:
     """Builds the model.
 
     Args:
@@ -179,7 +176,7 @@ def modelopt_gpt_mamba_builder(
             attached to the returned model for downstream routing/resharding utilities.
 
     Returns:
-        MCoreGPTModel | MCoreMambaModel: The returned model
+        MCoreGPTModel | MCoreHybridModel: The returned model
     """
     print_rank_0("building GPT model ...")
 
@@ -207,8 +204,8 @@ def modelopt_gpt_mamba_builder(
         raise ValueError(
             "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
         )
-    if args.spec is not None:
-        raise ValueError("ModelOpt integration does not support custom args.spec.")
+    if args.spec is not None and not args.export_default_te_spec:
+        raise ValueError("ModelOpt integration does not support custom args.spec when TE spec is not enabled via --export-default-te-spec.")
 
     # Llama-4 Scout/Maverick support
     config.qk_l2_norm = args.export_qk_l2_norm
@@ -259,8 +256,17 @@ def modelopt_gpt_mamba_builder(
             "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
-    elif args.export_model_type == "MambaModel" or getattr(args, 'hybrid_layer_pattern', None) is not None:
-        from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
+    elif args.export_model_type in ("HybridModel", "MambaModel") or getattr(args, 'hybrid_layer_pattern', None) is not None:
+        if args.export_model_type == "MambaModel":
+            import warnings
+
+            warnings.warn(
+                '--export-model-type "MambaModel" is deprecated. '
+                'Use --export-model-type "HybridModel" instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 
         if args.export_default_te_spec and args.export_te_mcore_model:
             logging.getLogger(__name__).warning(
@@ -269,12 +275,12 @@ def modelopt_gpt_mamba_builder(
             )
             args.export_te_mcore_model = False
 
-        mamba_stack_spec = get_mamba_stack_modelopt_spec(
+        hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model,
             use_default_te_spec=args.export_default_te_spec,
         )
         model_kwargs = {
-            "mamba_stack_spec": mamba_stack_spec,
+            "hybrid_stack_spec": hybrid_stack_spec,
             "vocab_size": args.padded_vocab_size,
             "max_sequence_length": args.max_position_embeddings,
             "hybrid_layer_pattern": args.hybrid_layer_pattern,
@@ -289,7 +295,7 @@ def modelopt_gpt_mamba_builder(
             "pg_collection": pg_collection,
         }
 
-        model = MCoreMambaModel(config=config, **model_kwargs)
+        model = MCoreHybridModel(config=config, **model_kwargs)
 
         for l in range(model.decoder.num_layers_per_pipeline_rank):
             layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
@@ -338,7 +344,7 @@ def modelopt_gpt_mamba_builder(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
         )
         kd_config = {
-            "teacher_model": _load_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
+            "teacher_model": _build_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
             "criterion": distill_cfg.criterion,
             "loss_balancer": distill_cfg.loss_balancer,
         }
@@ -349,6 +355,10 @@ def modelopt_gpt_mamba_builder(
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
         # Also remove KD mode state to prevent issues with re-conversion after restore.
         mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
-    
+
     print_distributed_quant_summary(model)
     return model
+
+
+# Backward-compatible alias
+modelopt_gpt_mamba_builder = modelopt_gpt_hybrid_builder

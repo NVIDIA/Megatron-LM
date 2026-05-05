@@ -1109,7 +1109,6 @@ class _HybridEPManager(_DispatchManager):
                 num_permuted_tokens=self.num_permuted_tokens,
                 pad_multiple=self.pad_multiple,
                 fused=self.config.moe_permute_fusion_into_hybridep,
-                num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
