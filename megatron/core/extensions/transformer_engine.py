@@ -435,7 +435,354 @@ else:
 
 if HAVE_TE and is_te_min_version("1.13.0"):
 
-    class TEFusedResidualRMSNorm(te.pytorch.RMSNorm):
+    class TEFusedOpsMixin:
+        """Shared lifecycle helpers for modules backed by TE fused ops.
+
+        Requirements and assumptions:
+        - The mixin must appear before the concrete module class in the MRO.
+        - Subclasses must call ``super().__init__`` so the mixin can initialize
+          the unregistered fused-ops cache.
+        - Subclasses must implement ``_make_fused_impl`` and return a
+          ``te.pytorch.ops.Sequential`` whose parameters alias parameters owned
+          by the registered MCore/TE modules.
+        - The fused implementation is built lazily on first forward, after the
+          concrete module has created its submodules and parameters.
+        - The fused implementation must not be registered as a PyTorch
+          submodule, because checkpointing and optimizer state should continue
+          to use the original module hierarchy as the source of truth.
+        - The fused implementation is an unregistered execution view over
+          registered source modules and parameters.
+        - Forward hooks on source modules are best-effort emulated on the fused
+          implementation. Hooks that modify tensors are unsupported because TE
+          fused ops do not expose intermediate tensors.
+        - Hooks, config, and source module replacement after first forward are
+          not reflected in the cached fused implementation. Call
+          ``_reset_fused_impl`` before the next forward after such changes.
+        """
+
+        _fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]]
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._fused_impl = None
+
+        def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """Construct the fused implementation."""
+            raise NotImplementedError
+
+        def _get_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """Return the lazily-built fused implementation.
+
+            This owns cache initialization and hook registration for all fused
+            wrappers. The fused implementation is stored in a tuple so PyTorch
+            does not register the TE ops graph as a submodule with duplicate
+            parameters.
+            """
+            if self._fused_impl is None:
+                fused_impl = self._make_fused_impl()
+                self._register_hooks_on_fused_impl(fused_impl)
+                self._fused_impl = (fused_impl,)
+            return self._fused_impl[0]
+
+        def _reset_fused_impl(self) -> None:
+            """Discard the cached unregistered fused implementation.
+
+            This is intended for tests and for internal use after replacing
+            source modules, changing config that affects TE ops, or changing
+            hooks after the first forward.
+            """
+            self._fused_impl = None
+
+        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
+            """Attempt to emulate submodule callback hooks.
+
+            This is not always possible because Transformer Engine's
+            op fuser does not expose intermediate tensors. Depending
+            on what kernel fusions the op fuser chooses, the
+            intermediate tensors may not even exist. Hooks that modify
+            tensors will result in incorrect behavior.
+            """
+
+            # Get submodule hooks
+            forward_pre_hooks = []
+            forward_post_hooks = []
+            backward_pre_hooks = []
+            backward_post_hooks = []
+            for submodule in self.modules():
+                for hook_id, hook in submodule._forward_pre_hooks.items():
+                    with_kwargs = hook_id in submodule._forward_pre_hooks_with_kwargs
+                    forward_pre_hooks.append((submodule, hook, with_kwargs))
+                for hook_id, hook in submodule._forward_hooks.items():
+                    with_kwargs = hook_id in submodule._forward_hooks_with_kwargs
+                    forward_post_hooks.append((submodule, hook, with_kwargs))
+                for hook in submodule._backward_pre_hooks.values():
+                    backward_pre_hooks.append((submodule, hook))
+                for hook in submodule._backward_hooks.values():
+                    backward_post_hooks.append((submodule, hook))
+
+            module_name = self.__class__.__name__
+
+            # Pre-forward hooks
+            # Note: DDP pre-forward hooks are safe since they do not
+            # interact with input tensor.
+            if forward_pre_hooks:
+                from megatron.core.distributed import distributed_data_parallel
+
+                if any(
+                    inspect.getmodule(hook) != distributed_data_parallel
+                    for _, hook, _ in forward_pre_hooks
+                ):
+                    warnings.warn(
+                        f"{module_name} module has a submodule with a pre-forward hook. "
+                        f"{module_name} module does not expose intermediate tensors, "
+                        "so the hook may have incorrect behavior if it attempts to "
+                        "access the input tensor."
+                    )
+
+                def forward_pre_hook(module, *_) -> None:
+                    for submodule, hook, with_kwargs in forward_pre_hooks:
+                        if with_kwargs:
+                            ret = hook(submodule, (), {})
+                        else:
+                            ret = hook(submodule, ())
+                        if ret is not None:
+                            raise RuntimeError(
+                                f"{module_name} module does not expose intermediate tensors, "
+                                "but submodule has pre-forward hook that modifies input tensor."
+                            )
+
+                fused_impl.register_forward_pre_hook(forward_pre_hook)
+
+            # Post-forward hooks
+            if forward_post_hooks:
+                warnings.warn(
+                    f"{module_name} module has a submodule with a post-forward hook. "
+                    f"{module_name} module does not expose intermediate tensors, "
+                    "so the hook may have incorrect behavior if it attempts to "
+                    "access the input or output tensors."
+                )
+
+                def forward_post_hook(module, *_) -> None:
+                    for submodule, hook, with_kwargs in forward_post_hooks:
+                        if with_kwargs:
+                            ret = hook(submodule, (), {}, None)
+                        else:
+                            ret = hook(submodule, (), None)
+                        if ret is not None:
+                            raise RuntimeError(
+                                f"{module_name} module does not expose intermediate tensors, "
+                                "but submodule has post-forward hook that modifies output tensor."
+                            )
+
+                fused_impl.register_forward_hook(forward_post_hook)
+
+            # Backward hooks
+            if backward_pre_hooks:
+                raise RuntimeError(
+                    f"{module_name} module does not support submodules with pre-backward hooks"
+                )
+            if backward_post_hooks:
+                raise RuntimeError(
+                    f"{module_name} module does not support submodules with post-backward hooks"
+                )
+
+    def _te_ops_has_nested_attr(module: torch.nn.Module, attr_name: str) -> bool:
+        """Return whether an adapter input exposes a possibly-nested attribute."""
+        current: Any = module
+        for part in attr_name.split("."):
+            if not hasattr(current, part):
+                return False
+            current = getattr(current, part)
+        return True
+
+    def _validate_te_ops_adapter_module(
+        module: torch.nn.Module, module_name: str, required_attrs: Tuple[str, ...]
+    ) -> None:
+        """Validate that a module has the MCore/TE wrapper attributes needed by an adapter."""
+        missing_attrs = [
+            attr for attr in required_attrs if not _te_ops_has_nested_attr(module, attr)
+        ]
+        if missing_attrs:
+            raise ValueError(
+                f"{module_name} must be a Megatron Core Transformer Engine wrapper, "
+                f"but got {module.__class__.__name__} with missing required attributes: "
+                f"{', '.join(missing_attrs)}."
+            )
+
+    def _get_te_ops_tensor_parallel_context() -> Tuple[int, Optional[torch.distributed.ProcessGroup]]:
+        """Return tensor-parallel world size and group for TE ops."""
+        tp_world_size = get_tensor_model_parallel_world_size()
+        tp_group = None
+        if tp_world_size > 1:
+            tp_group = get_tensor_model_parallel_group()
+        return tp_world_size, tp_group
+
+    def _get_te_ops_rng_state_tracker_function() -> Optional[Callable]:
+        """Return the CUDA RNG tracker function if it is initialized."""
+        if get_cuda_rng_tracker().is_initialized():
+            return get_cuda_rng_tracker
+        return None
+
+    def _make_te_ops_rmsnorm_from_te_rmsnorm(
+        module: torch.nn.Module, module_name: str
+    ) -> te.pytorch.ops.RMSNorm:
+        """Construct a TE RMSNorm op that aliases an existing TE RMSNorm module."""
+        _validate_te_ops_adapter_module(
+            module, module_name, ("eps", "weight", "zero_centered_gamma")
+        )
+
+        kwargs = {
+            "eps": module.eps,
+            "device": "meta",
+            "dtype": module.weight.dtype,
+            "zero_centered_gamma": module.zero_centered_gamma,
+        }
+        if hasattr(module, '_sm_margins'):
+            kwargs["sm_margin"] = module._sm_margins
+
+        op = te.pytorch.ops.RMSNorm(module.weight.shape, **kwargs)
+        op.weight = module.weight
+        return op
+
+    def _make_te_ops_norm_from_mcore_te_layernorm_linear(
+        module: torch.nn.Module, module_name: str
+    ) -> te.pytorch.ops.FusibleOperation:
+        """Construct a TE norm op that aliases a Megatron TE LayerNormLinear wrapper."""
+        _validate_te_ops_adapter_module(
+            module,
+            module_name,
+            (
+                "eps",
+                "layer_norm_bias",
+                "layer_norm_weight",
+                "normalization",
+                "weight",
+                "zero_centered_gamma",
+            ),
+        )
+
+        norm_type = module.normalization
+        norm_shape = module.weight.size(1)
+        kwargs = {
+            "eps": module.eps,
+            "device": "meta",
+            "dtype": module.layer_norm_weight.dtype,
+            "zero_centered_gamma": module.zero_centered_gamma,
+        }
+
+        if norm_type == "LayerNorm":
+            op = te.pytorch.ops.LayerNorm(norm_shape, **kwargs)
+            op.weight = module.layer_norm_weight
+            op.bias = module.layer_norm_bias
+        elif norm_type == "RMSNorm":
+            op = te.pytorch.ops.RMSNorm(norm_shape, **kwargs)
+            op.weight = module.layer_norm_weight
+        else:
+            raise ValueError(f"Unsupported normalization ({norm_type})")
+        return op
+
+    def _make_te_ops_basic_linear_from_mcore_te_linear(
+        module: torch.nn.Module,
+        *,
+        module_name: str,
+        output_features: Optional[int] = None,
+        tensor_parallel_mode: Optional[str] = None,
+        tensor_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        sequence_parallel: Optional[bool] = None,
+        rng_state_tracker_function: Optional[Callable] = None,
+    ) -> te.pytorch.ops.BasicLinear:
+        """Construct a TE BasicLinear op that aliases a Megatron TE linear wrapper."""
+        _validate_te_ops_adapter_module(
+            module,
+            module_name,
+            ("config.tp_comm_overlap", "fuse_wgrad_accumulation", "ub_name", "weight"),
+        )
+
+        weight = module.weight
+        userbuffers_options = None
+        if module.config.tp_comm_overlap and module.ub_name is not None:
+            userbuffers_options = {"comm_name": module.ub_name}
+        if output_features is None:
+            output_features = weight.size(0)
+        if sequence_parallel is None:
+            sequence_parallel = False
+
+        op = te.pytorch.ops.BasicLinear(
+            weight.size(1),
+            output_features,
+            device="meta",
+            dtype=weight.dtype,
+            tensor_parallel_mode=tensor_parallel_mode,
+            tensor_parallel_group=tensor_parallel_group,
+            sequence_parallel=sequence_parallel,
+            rng_state_tracker_function=rng_state_tracker_function,
+            accumulate_into_main_grad=module.fuse_wgrad_accumulation,
+            userbuffers_options=userbuffers_options,
+        )
+        op.weight = weight
+        return op
+
+    def _make_te_ops_bias_from_tensor(
+        bias: Optional[torch.Tensor],
+    ) -> Optional[te.pytorch.ops.Bias]:
+        """Construct a TE Bias op that aliases an existing bias tensor."""
+        if isinstance(bias, torch.Tensor) and bias.numel() == 0:
+            bias = None
+        if bias is None:
+            return None
+
+        op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
+        op.bias = bias
+        return op
+
+    def _make_te_ops_activation(
+        activation_func: Callable, gated_linear_unit: bool, cache_quantized_input: bool
+    ) -> te.pytorch.ops.FusibleOperation:
+        """Construct a TE activation op."""
+        op_type = None
+        if (activation_func, gated_linear_unit) == (F.gelu, False):
+            op_type = te.pytorch.ops.GELU
+        elif (activation_func, gated_linear_unit) == (F.gelu, True):
+            op_type = te.pytorch.ops.GEGLU
+        elif (activation_func, gated_linear_unit) == (F.silu, False):
+            if not is_te_min_version("2.8.0"):
+                raise NotImplementedError("SiLU activation requires Transformer Engine 2.8+")
+            op_type = te.pytorch.ops.SiLU
+        elif (activation_func, gated_linear_unit) == (F.silu, True):
+            op_type = te.pytorch.ops.SwiGLU
+        elif (activation_func, gated_linear_unit) == (F.relu, False):
+            op_type = te.pytorch.ops.ReLU
+        elif (activation_func, gated_linear_unit) == (F.relu, True):
+            op_type = te.pytorch.ops.ReGLU
+
+        if op_type is None:
+            raise NotImplementedError(
+                "Transformer Engine operation-based API does not support "
+                f"activation_func={activation_func}, "
+                f"gated_linear_unit={gated_linear_unit}"
+            )
+
+        kwargs = {}
+        if is_te_min_version("2.3"):
+            kwargs["cache_quantized_input"] = cache_quantized_input
+        return op_type(**kwargs)
+
+    def _make_te_ops_tensor_parallel_output_collective(
+        module: torch.nn.Module,
+        *,
+        module_name: str,
+        tp_world_size: int,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> Optional[te.pytorch.ops.FusibleOperation]:
+        """Construct the TE output collective for row-parallel-style output."""
+        _validate_te_ops_adapter_module(module, module_name, ("sequence_parallel",))
+        if tp_world_size <= 1:
+            return None
+        if module.sequence_parallel:
+            return te.pytorch.ops.ReduceScatter(tp_group)
+        return te.pytorch.ops.AllReduce(tp_group)
+
+    class TEFusedResidualRMSNorm(TEFusedOpsMixin, te.pytorch.RMSNorm):
         """
         RMSNorm with fused residual output for Megatron Core.
 
@@ -449,11 +796,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
         Forward pass returns: (normalized_output, residual)
         """
-
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            # Fused implementation (stored in tuple to avoid submodule registration)
-            self._fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]] = None
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """
@@ -469,113 +811,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             fused_impl.append(te.pytorch.ops.MakeExtraOutput())
 
             # Op 2: RMSNorm - shares weight parameter with self
-            kwargs = {
-                "eps": self.eps,
-                "device": "meta",  # Already initialized
-                "dtype": self.weight.dtype,
-                "zero_centered_gamma": self.zero_centered_gamma,
-            }
-
-            # Add sm_margin if available (TE 2.5+)
-            if hasattr(self, '_sm_margins'):
-                kwargs["sm_margin"] = self._sm_margins
-
-            rmsnorm_op = te.pytorch.ops.RMSNorm(self.weight.shape, **kwargs)
-
-            rmsnorm_op.weight = self.weight
-
-            fused_impl.append(rmsnorm_op)
-
-            self._register_hooks_on_fused_impl(fused_impl)
+            fused_impl.append(
+                _make_te_ops_rmsnorm_from_te_rmsnorm(
+                    self, module_name=self.__class__.__name__
+                )
+            )
 
             return fused_impl
-
-        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
-
-            forward_pre_hooks = []
-            forward_post_hooks = []
-            backward_pre_hooks = []
-            backward_post_hooks = []
-
-            for submodule in self.modules():
-                for hook_id, hook in submodule._forward_pre_hooks.items():
-                    with_kwargs = hook_id in submodule._forward_pre_hooks_with_kwargs
-                    forward_pre_hooks.append((submodule, hook, with_kwargs))
-                for hook_id, hook in submodule._forward_hooks.items():
-                    with_kwargs = hook_id in submodule._forward_hooks_with_kwargs
-                    forward_post_hooks.append((submodule, hook, with_kwargs))
-                for hook in submodule._backward_pre_hooks.values():
-                    backward_pre_hooks.append((submodule, hook))
-                for hook in submodule._backward_hooks.values():
-                    backward_post_hooks.append((submodule, hook))
-
-            # Pre-forward hooks
-            # Note: DDP pre-forward hooks are safe since they do not
-            # interact with input tensor.
-            if forward_pre_hooks:
-                from megatron.core.distributed import distributed_data_parallel
-
-                if any(
-                    inspect.getmodule(hook) != distributed_data_parallel
-                    for _, hook, _ in forward_pre_hooks
-                ):
-                    warnings.warn(
-                        "TEFusedResidualRMSNorm module has a submodule with a pre-forward hook. "
-                        "TEFusedResidualRMSNorm module does not expose intermediate tensors, "
-                        "so the hook may have incorrect behavior if it attempts to "
-                        "access the input tensor."
-                    )
-
-                def forward_pre_hook(module, *_) -> None:
-                    for submodule, hook, with_kwargs in forward_pre_hooks:
-                        if with_kwargs:
-                            ret = hook(submodule, (), {})
-                        else:
-                            ret = hook(submodule, ())
-                        if ret is not None:
-                            raise RuntimeError(
-                                "TEFusedResidualRMSNorm module does not expose "
-                                "intermediate tensors, but submodule has "
-                                "pre-forward hook that modifies input tensor."
-                            )
-
-                fused_impl.register_forward_pre_hook(forward_pre_hook)
-
-            # Post-forward hooks
-            if forward_post_hooks:
-                warnings.warn(
-                    "TEFusedResidualRMSNorm module has a submodule with a post-forward hook. "
-                    "TEFusedResidualRMSNorm module does not expose intermediate tensors, "
-                    "so the hook may have incorrect behavior if it attempts to "
-                    "access the input or output tensors."
-                )
-
-                def forward_post_hook(module, *_) -> None:
-                    for submodule, hook, with_kwargs in forward_post_hooks:
-                        if with_kwargs:
-                            ret = hook(submodule, (), {}, None)
-                        else:
-                            ret = hook(submodule, (), None)
-                        if ret is not None:
-                            raise RuntimeError(
-                                "TEFusedResidualRMSNorm module does not expose "
-                                "intermediate tensors, but submodule has "
-                                "post-forward hook that modifies output tensor."
-                            )
-
-                fused_impl.register_forward_hook(forward_post_hook)
-
-            # Backward hooks
-            if backward_pre_hooks:
-                raise RuntimeError(
-                    "TEFusedResidualRMSNorm module does not support "
-                    "submodules with pre-backward hooks"
-                )
-            if backward_post_hooks:
-                raise RuntimeError(
-                    "TEFusedResidualRMSNorm module does not support "
-                    "submodules with post-backward hooks"
-                )
 
         def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             """
@@ -592,14 +834,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 when MakeExtraOutput is present, so we don't need manual unpacking.
             """
 
-            # Construct fused impl lazily on first forward
-            # (in case parameters are modified after __init__)
-            if self._fused_impl is None:
-                self._fused_impl = (self._make_fused_impl(),)
-
             # Apply fused implementation
             # Sequential returns (normalized_output, residual) automatically
-            return self._fused_impl[0](hidden_states)
+            return self._get_fused_impl()(hidden_states)
 
 else:
     TEFusedResidualRMSNorm = None  # type: ignore[assignment, misc]
@@ -2147,15 +2384,12 @@ else:
 
 if HAVE_TE and is_te_min_version("1.13.0"):
 
-    class TEFusedMLP(MLP):
+    class TEFusedMLP(TEFusedOpsMixin, MLP):
         """MLP wrapper using Transformer Engine's operation-based API."""
 
         @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-
-            # Fused implementation
-            self._fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]] = None
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module matching MLP."""
@@ -2163,83 +2397,50 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Container for fusible ops
             fused_impl = te.pytorch.ops.Sequential()
 
-            # Tensor parallelism configuration
-            tp_world_size = get_tensor_model_parallel_world_size()
-            tp_group = None
-            if tp_world_size > 1:
-                tp_group = get_tensor_model_parallel_group()
-
-            # RNG state
-            rng_state_tracker_function = None
-            if get_cuda_rng_tracker().is_initialized():
-                rng_state_tracker_function = get_cuda_rng_tracker
+            tp_world_size, tp_group = _get_te_ops_tensor_parallel_context()
+            rng_state_tracker_function = _get_te_ops_rng_state_tracker_function()
 
             # Check submodule types
-            if not isinstance(self.linear_fc1, te.pytorch.LayerNormLinear):
+            if not isinstance(self.linear_fc1, TELayerNormColumnParallelLinear):
                 raise ValueError(
                     f"{self.__class__.__name__} expects FC1 to be "
-                    "Transformer Engine LayerNormLinear, but found "
+                    "Megatron Core TELayerNormColumnParallelLinear, but found "
                     f"{self.linear_fc1.__class__.__name__}."
                 )
-            if not isinstance(self.linear_fc2, te.pytorch.Linear):
+            if not isinstance(self.linear_fc2, TERowParallelLinear):
                 raise ValueError(
-                    f"{self.__class__.__name__} expects FC1 to be "
-                    "Transformer Engine Linear, but found "
+                    f"{self.__class__.__name__} expects FC2 to be "
+                    "Megatron Core TERowParallelLinear, but found "
                     f"{self.linear_fc2.__class__.__name__}."
                 )
 
-            # Norm op
-            norm_type = self.linear_fc1.normalization
-            norm_shape = self.linear_fc1.weight.size(1)
-            kwargs = {
-                "eps": self.linear_fc1.eps,
-                "device": "meta",
-                "dtype": self.linear_fc1.layer_norm_weight.dtype,
-                "zero_centered_gamma": self.linear_fc1.zero_centered_gamma,
-            }
-            op = None
-            if norm_type == "LayerNorm":
-                op = te.pytorch.ops.LayerNorm(norm_shape, **kwargs)
-                op.weight = self.linear_fc1.layer_norm_weight
-                op.bias = self.linear_fc1.layer_norm_bias
-            elif norm_type == "RMSNorm":
-                op = te.pytorch.ops.RMSNorm(norm_shape, **kwargs)
-                op.weight = self.linear_fc1.layer_norm_weight
-            else:
-                raise ValueError(f"Unsupported normalization ({norm_type})")
-            fused_impl.append(op)
+            fused_impl.append(
+                _make_te_ops_norm_from_mcore_te_layernorm_linear(
+                    self.linear_fc1, module_name="linear_fc1"
+                )
+            )
 
             # FC1 linear op
             weight = self.linear_fc1.weight
-            userbuffers_options = None
-            if self.linear_fc1.config.tp_comm_overlap and self.linear_fc1.ub_name is not None:
-                userbuffers_options = {"comm_name": self.linear_fc1.ub_name}
-            op = te.pytorch.ops.BasicLinear(
-                weight.size(1),
-                weight.size(0) * tp_world_size,
-                device="meta",
-                dtype=weight.dtype,
-                tensor_parallel_mode="column" if tp_world_size > 1 else None,
-                tensor_parallel_group=tp_group,
-                sequence_parallel=self.linear_fc1.sequence_parallel,
-                rng_state_tracker_function=rng_state_tracker_function,
-                accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
-                userbuffers_options=userbuffers_options,
+            fused_impl.append(
+                _make_te_ops_basic_linear_from_mcore_te_linear(
+                    self.linear_fc1,
+                    module_name="linear_fc1",
+                    output_features=weight.size(0) * tp_world_size,
+                    tensor_parallel_mode="column" if tp_world_size > 1 else None,
+                    tensor_parallel_group=tp_group,
+                    sequence_parallel=self.linear_fc1.sequence_parallel,
+                    rng_state_tracker_function=rng_state_tracker_function,
+                )
             )
-            op.weight = weight
-            fused_impl.append(op)
 
             # FC1 bias op
-            bias = self.linear_fc1.bias
-            if isinstance(bias, torch.Tensor) and bias.numel() == 0:
-                bias = None
-            if bias is not None:
-                op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
-                op.bias = bias
+            op = _make_te_ops_bias_from_tensor(self.linear_fc1.bias)
+            if op is not None:
                 fused_impl.append(op)
 
             # Activation op
-            op = self._make_activation_op(
+            op = _make_te_ops_activation(
                 self.activation_func,
                 self.config.gated_linear_unit,
                 self.config.activation_func_fp8_input_store,
@@ -2247,183 +2448,35 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             fused_impl.append(op)
 
             # FC2 linear op
-            weight = self.linear_fc2.weight
-            userbuffers_options = None
-            if self.linear_fc2.config.tp_comm_overlap and self.linear_fc2.ub_name is not None:
-                userbuffers_options = {"comm_name": self.linear_fc2.ub_name}
-            op = te.pytorch.ops.BasicLinear(
-                weight.size(1),
-                weight.size(0),
-                device="meta",
-                dtype=weight.dtype,
-                rng_state_tracker_function=rng_state_tracker_function,
-                accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
-                userbuffers_options=userbuffers_options,
+            fused_impl.append(
+                _make_te_ops_basic_linear_from_mcore_te_linear(
+                    self.linear_fc2,
+                    module_name="linear_fc2",
+                    rng_state_tracker_function=rng_state_tracker_function,
+                )
             )
-            op.weight = weight
-            fused_impl.append(op)
-            if tp_world_size > 1:
-                if self.linear_fc2.sequence_parallel:
-                    fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
-                else:
-                    fused_impl.append(te.pytorch.ops.AllReduce(tp_group))
+            op = _make_te_ops_tensor_parallel_output_collective(
+                self.linear_fc2,
+                module_name="linear_fc2",
+                tp_world_size=tp_world_size,
+                tp_group=tp_group,
+            )
+            if op is not None:
+                fused_impl.append(op)
 
             # FC2 bias op
             if not self.linear_fc2.te_return_bias:
-                bias = self.linear_fc2.bias
-                if isinstance(bias, torch.Tensor) and bias.numel() == 0:
-                    bias = None
-                if bias is not None:
-                    op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
-                    op.bias = bias
+                op = _make_te_ops_bias_from_tensor(self.linear_fc2.bias)
+                if op is not None:
                     fused_impl.append(op)
 
-            # Emulate submodule forward hooks if needed
-            self._register_hooks_on_fused_impl(fused_impl)
-
             return fused_impl
-
-        def _make_activation_op(
-            self, activation_func: Callable, gated_linear_unit: bool, cache_quantized_input: bool
-        ) -> te.pytorch.ops.FusibleOperation:
-            """Construct activation op."""
-
-            # Get op type
-            op_type = None
-            if (activation_func, gated_linear_unit) == (F.gelu, False):
-                op_type = te.pytorch.ops.GELU
-            elif (activation_func, gated_linear_unit) == (F.gelu, True):
-                op_type = te.pytorch.ops.GEGLU
-            elif (activation_func, gated_linear_unit) == (F.silu, False):
-                if not is_te_min_version("2.8.0"):
-                    raise NotImplementedError("SiLU activation requires Transformer Engine 2.8+")
-                op_type = te.pytorch.ops.SiLU
-            elif (activation_func, gated_linear_unit) == (F.silu, True):
-                op_type = te.pytorch.ops.SwiGLU
-            elif (activation_func, gated_linear_unit) == (F.relu, False):
-                op_type = te.pytorch.ops.ReLU
-            elif (activation_func, gated_linear_unit) == (F.relu, True):
-                op_type = te.pytorch.ops.ReGLU
-
-            # Could not find corresponding activation op
-            if op_type is None:
-                raise NotImplementedError(
-                    "Transformer Engine operation-based API does not support "
-                    f"activation_func={activation_func}, "
-                    f"gated_linear_unit={gated_linear_unit}"
-                )
-
-            # Construct op
-            kwargs = {}
-            if is_te_min_version("2.3"):
-                kwargs["cache_quantized_input"] = cache_quantized_input
-            return op_type(**kwargs)
-
-        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
-            """Attempt to emulate submodule callback hooks.
-
-            This is not always possible because Transformer Engine's
-            op fuser does not expose intermediate tensors. Depending
-            on what kernel fusions the op fuser chooses, the
-            intermediate tensors may not even exist. Hooks that modify
-            tensors will result in incorrect behavior.
-
-            """
-
-            # Get submodule hooks
-            forward_pre_hooks = []
-            forward_post_hooks = []
-            backward_pre_hooks = []
-            backward_post_hooks = []
-            for submodule in self.modules():
-                for hook_id, hook in submodule._forward_pre_hooks.items():
-                    with_kwargs = hook_id in submodule._forward_pre_hooks_with_kwargs
-                    forward_pre_hooks.append((submodule, hook, with_kwargs))
-                for hook_id, hook in submodule._forward_hooks.items():
-                    with_kwargs = hook_id in submodule._forward_hooks_with_kwargs
-                    forward_post_hooks.append((submodule, hook, with_kwargs))
-                for hook in submodule._backward_pre_hooks.values():
-                    backward_pre_hooks.append((submodule, hook))
-                for hook in submodule._backward_hooks.values():
-                    backward_post_hooks.append((submodule, hook))
-
-            # Pre-forward hooks
-            # Note: DDP pre-forward hooks are safe since they do not
-            # interact with input tensor.
-            if forward_pre_hooks:
-                from megatron.core.distributed import distributed_data_parallel
-
-                if any(
-                    inspect.getmodule(hook) != distributed_data_parallel
-                    for _, hook, _ in forward_pre_hooks
-                ):
-                    warnings.warn(
-                        "TEFusedMLP module has a submodule with a pre-forward hook. "
-                        "TEFusedMLP module does not expose intermediate tensors, "
-                        "so the hook may have incorrect behavior if it attempts to "
-                        "access the input tensor."
-                    )
-
-                def forward_pre_hook(module, *_) -> None:
-                    for submodule, hook, with_kwargs in forward_pre_hooks:
-                        if with_kwargs:
-                            ret = hook(submodule, (), {})
-                        else:
-                            ret = hook(submodule, ())
-                        if ret is not None:
-                            raise RuntimeError(
-                                "TEFusedMLP module does not expose intermediate tensors, but "
-                                "submodule has pre-forward hook that modifies input tensor."
-                            )
-
-                fused_impl.register_forward_pre_hook(forward_pre_hook)
-
-            # Post-forward hooks
-            if forward_post_hooks:
-                warnings.warn(
-                    "TEFusedMLP module has a submodule with a post-forward hook. "
-                    "TEFusedMLP module does not expose intermediate tensors, "
-                    "so the hook may have incorrect behavior if it attempts to "
-                    "access the input or output tensors."
-                )
-
-                def forward_post_hook(module, *_) -> None:
-                    for submodule, hook, with_kwargs in forward_post_hooks:
-                        if with_kwargs:
-                            ret = hook(submodule, (), {}, None)
-                        else:
-                            ret = hook(submodule, (), None)
-                        if ret is not None:
-                            raise RuntimeError(
-                                "TEFusedMLP module does not expose intermediate tensors, but "
-                                "submodule has post-forward hook that modifies output tensor."
-                            )
-
-                fused_impl.register_forward_hook(forward_post_hook)
-
-            # Backward hooks
-            if backward_pre_hooks:
-                raise RuntimeError(
-                    "TEFusedMLP module does not support submodules with pre-backward hooks"
-                )
-            if backward_post_hooks:
-                raise RuntimeError(
-                    "TEFusedMLP module does not support submodules with post-backward hooks"
-                )
 
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
 
-            # Construct fused impl if needed
-            # Note: We initialize during the first forward pass in
-            # case the params are modified after the constructor.
-            # Note: The fused impl is stored in a tuple to avoid
-            # registering as a submodule.
-            if self._fused_impl is None:
-                self._fused_impl = (self._make_fused_impl(),)
-
             # Apply fused impl
-            out = self._fused_impl[0](hidden_states)
+            out = self._get_fused_impl()(hidden_states)
 
             # Return bias tensor if requested
             bias = None
