@@ -944,6 +944,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
                 "or skip_prompt_log_probs to True in SamplingParams."
             )
+        self.controller.note_request_sampling_params(request.sampling_params)
 
         if request.sampling_params.num_tokens_total is not None:
             request.sampling_params.num_tokens_to_generate = (

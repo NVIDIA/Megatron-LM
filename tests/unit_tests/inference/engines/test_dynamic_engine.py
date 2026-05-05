@@ -980,6 +980,52 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_async_scheduling_logprob_result_scan_is_request_gated(self) -> None:
+        """No-logprob requests skip the extra generated-logprob metadata scan."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=4,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        for request in env.requests:
+            env.engine._add_request(request)
+        env.engine.schedule_waiting_requests()
+
+        controller = env.engine.controller
+        context = env.engine.context
+        assert not controller._async_logprob_requests_seen
+
+        context.active_request_metadata["return_log_probs"][0] = True
+        assert not controller._active_requests_need_logprob_results()
+
+        controller.note_request_sampling_params(
+            SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                top_k=1,
+                return_log_probs=True,
+                skip_prompt_log_probs=True,
+            )
+        )
+        assert controller._active_requests_need_logprob_results()
+
+        context.active_request_metadata["return_log_probs"][0] = False
+        context.active_request_metadata["top_n_logprobs"][0] = 4
+        assert controller._active_requests_need_logprob_results()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_scheduling_allows_chunked_prefill_decode_only_cuda_graph_e2e(self) -> None:
         """Chunked prefill config does not block async scheduling on decode-only steps."""
         skip_if_mamba_sequence_packing_not_available("hybrid")

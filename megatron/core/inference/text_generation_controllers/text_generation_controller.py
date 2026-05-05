@@ -162,6 +162,11 @@ class TextGenerationController:
         """Set a callback to test whether active requests use stop words."""
         self._has_active_stop_words_callback = callback
 
+    def note_request_sampling_params(self, sampling_params: SamplingParams) -> None:
+        """Record request features that affect async scheduling hot-path checks."""
+        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+            self._async_logprob_requests_seen = True
+
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
@@ -203,6 +208,7 @@ class TextGenerationController:
         self._async_pending_sample_cuda_graph_request_count = None
         self._async_pending_forward_request_ids = None
         self._async_admission_barrier_requested = False
+        self._async_logprob_requests_seen = False
         self._async_row_mapped_forward_count = 0
         self._async_discarded_forward_count = 0
         self._async_add_deferral_count = 0
@@ -1883,6 +1889,9 @@ class TextGenerationController:
 
     def _active_requests_need_logprob_results(self) -> bool:
         """Whether active requests need logits preserved for generated logprob bookkeeping."""
+        if not self._async_logprob_requests_seen:
+            return False
+
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         if active_request_count <= 0:
