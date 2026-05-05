@@ -1959,7 +1959,9 @@ class TextGenerationController:
         _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
         return stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
-    def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
+    def _dynamic_step_calculate_log_probs(
+        self, row_indices: Optional[Tensor] = None
+    ) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1970,9 +1972,13 @@ class TextGenerationController:
             if context.config.materialize_only_last_token_logits
             else context.padded_active_token_count
         )
+        logits = self._all_logits_cuda[:, :logits_seq_len, :]
+        if row_indices is not None:
+            assert context.config.materialize_only_last_token_logits
+            logits = logits.index_select(1, row_indices)
 
         return context.calculate_log_probs(
-            self._all_logits_cuda[:, :logits_seq_len, :],
+            logits,
             self._sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=context.config.materialize_only_last_token_logits,
         )
@@ -2741,6 +2747,11 @@ class TextGenerationController:
             log_probs = None
             top_n_logprobs = None
             if return_log_probs or return_top_n_logprobs:
+                logprob_row_indices = (
+                    pending_forward_row_indices
+                    if pending_forward_row_mapped and self.num_speculative_tokens == 0
+                    else None
+                )
                 if self.num_speculative_tokens > 0:
                     log_probs, log_probs_tensor = (
                         self._dynamic_step_calculate_log_probs_speculative()
@@ -2750,7 +2761,9 @@ class TextGenerationController:
                             log_probs_tensor
                         )
                 else:
-                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs()
+                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(
+                        row_indices=logprob_row_indices
+                    )
                     if return_top_n_logprobs:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                             log_probs_tensor

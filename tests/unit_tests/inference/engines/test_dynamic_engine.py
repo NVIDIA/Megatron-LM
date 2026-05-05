@@ -780,6 +780,46 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_scheduling_generated_logprobs_gpt_finish_row_map_e2e(self) -> None:
+        """Generated logprobs stay aligned when finished requests row-map a pending forward."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            use_fixed_output_lengths=True,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            top_k=1,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            materialize_only_last_token_logits=True,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+        serial_log_probs = [request.generated_log_probs for request in serial_env.requests]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_row_mapped_forward_count > 0
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+        for request, expected_log_probs in zip(async_env.requests, serial_log_probs):
+            assert len(request.generated_log_probs) == len(request.generated_tokens)
+            assert request.generated_log_probs == pytest.approx(expected_log_probs)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_scheduling_allows_chunked_prefill_decode_only_cuda_graph_e2e(self) -> None:
         """Chunked prefill config does not block async scheduling on decode-only steps."""
         skip_if_mamba_sequence_packing_not_available("hybrid")
