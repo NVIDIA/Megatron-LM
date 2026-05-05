@@ -85,6 +85,8 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
 
+    parser = _add_fault_injector_args(parser)
+
     return parser
 
 def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
@@ -132,6 +134,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
 
     # Experimental yaml
     if args.yaml_cfg is not None:
@@ -620,11 +624,16 @@ def validate_args(args, defaults={}):
         args.phase_transition_iterations = sorted(
             int(x.strip()) for x in args.phase_transition_iterations.split(",")
         )
-        assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
-
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    is_global_batch_size_explicitly_specified = getattr(
+        args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
+        raise ValueError(
+            'Cannot specify both --step-batch-size-schedule and --global-batch-size'
+        )
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
@@ -644,7 +653,6 @@ def validate_args(args, defaults={}):
             args.grpo_samples_per_iteration * args.grpo_iterations)
 
         # Ensure that the number of prompts we collect is a multiple of the global batch size.
-        # TODO: Make this account for batch size rampup?
         assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
             f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
 
@@ -684,7 +692,7 @@ def validate_args(args, defaults={}):
             args.rank,
         )
 
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    from megatron.core.models.hybrid.hybrid_layer_allocation import (
         Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
     )
@@ -826,6 +834,11 @@ def validate_args(args, defaults={}):
                 "This argument will be ignored.",
                 args.rank
             )
+
+    # Infer use of MLA from unified pattern
+    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+        args.multi_latent_attention = True
+
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
     # Uneven virtual pipeline parallelism
@@ -1021,6 +1034,16 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
+        try:
+            import flashinfer  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "--inference-dynamic-batching-sampling-backend=flashinfer requires "
+                "the flashinfer package; install it or pass "
+                "--inference-dynamic-batching-sampling-backend=torch."
+            ) from e
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -1058,7 +1081,13 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-        
+    
+    if args.nccl_ub and args.use_megatron_fsdp:
+        # In Megatron-LM, required implementation for manual registration is already provided.
+        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+        args.fsdp_manual_registration = True
+        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
+
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."      
@@ -1138,8 +1167,6 @@ def validate_args(args, defaults={}):
             'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
-        assert args.rampup_batch_size is None, \
-            'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
@@ -1216,6 +1243,8 @@ def validate_args(args, defaults={}):
         if args.save_retain_interval is not None:
             assert args.save_retain_interval > 0
             assert args.save_retain_interval % args.save_interval == 0
+        if args.save_params_interval is not None:
+            assert not args.overlap_param_gather
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
@@ -1545,6 +1574,9 @@ def validate_args(args, defaults={}):
             )
             args.async_save = False
 
+    if not args.async_save:
+        args.async_strategy = "mcore"
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
@@ -1790,6 +1822,9 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+            kw_args['experimental_attention_variant'] = 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -1996,6 +2031,12 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
+    group.add_argument('--inference-dynamic-batching-sampling-backend',
+                       type=str, default='torch',
+                       choices=['torch', 'flashinfer'],
+                       help='Which sampling kernels to use during inference. '
+                            'Falls back to "torch" with a warning if "flashinfer" '
+                            'is requested but the package is not installed.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
@@ -2128,7 +2169,7 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
+                        choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
                         help='Position embedding type.')
     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
                         help='Number of buckets for relative position embeddings.')
@@ -2924,6 +2965,11 @@ def _add_tokenizer_args(parser):
                        help='Converting text to ids will not include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
+    group.add_argument('--null-tokenizer-eod-id', type=int, default=None,
+                       help='EOD token id for NullTokenizer. Defaults to `vocab_size - 1`.')
+    group.add_argument('--null-tokenizer-pad-id', type=int, default=-1,
+                       help='Pad token id for NullTokenizer. Defaults to -1 (no pad token). '
+                            'Set to a value outside the dataset to avoid masking real tokens.')
     return parser
 
 
@@ -2940,8 +2986,7 @@ def _add_data_args(parser):
                        'This argument is exclusive to the other independent --*-data-path arguments.')
     group.add_argument('--phase-transition-iterations', type=str, default=None,
                        help='Comma-separated list of iterations where phase '
-                       'transitions occur. Requires fixed global batch size across phases. '
-                       'Does not support batch size ramp-up.')
+                       'transitions occur. Requires fixed global batch size across phases.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -3326,9 +3371,10 @@ def _add_experimental_args(parser):
                        '`transformer_block.py`, or `transformer_layer.py`')
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-                       '* (attention), - (mlp), E (moe). Use | to define pipeline stage '
-                       'boundaries for flexible virtual pipeline parallel (fVPP). Use / to '
-                       'separate MTP patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+                       '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+                       'stage boundaries for flexible virtual pipeline parallel (fVPP). '
+                       'Use / to separate MTP patterns. '
+                       'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
@@ -3416,4 +3462,10 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    return parser
+
+
+def _add_fault_injector_args(parser):
+    from megatron.training.config import FaultInjectorConfig
+    ArgumentGroupFactory(FaultInjectorConfig).build_group(parser, "fault injector")
     return parser

@@ -2,7 +2,7 @@
 
 from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
@@ -24,7 +24,7 @@ class MambaInferenceStateConfig:
     layer_type_list: List[str]
     """
     A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
-    See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list of symbols.
+    See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
@@ -50,7 +50,7 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -297,10 +297,13 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
-    request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
+    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
+    """Which sampling kernels to use during inference."""
+
+    request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
-    consisting of the string label, the target dtype, and whether to store the data on GPU.
+    consisting of the string label and the target dtype.
     """
 
     use_synchronous_zmq_collectives: bool = False
@@ -320,3 +323,12 @@ class InferenceConfig:
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
             )
+
+        if self.sampling_backend == 'flashinfer':
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    "sampling_backend='flashinfer' requires the flashinfer package; "
+                    "install it or set sampling_backend='torch'."
+                ) from e

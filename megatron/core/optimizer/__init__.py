@@ -975,6 +975,8 @@ def get_megatron_optimizer(
                 # applied to the Megatron-FSDP main weight and extended to FusedAdam
                 # main weights. Override this here.
                 setattr(optimizer_part.optimizer, "master_weights", False)
+                # Megatron-FSDP always uses a decoupled gradient when using FusedAdam.
+                setattr(optimizer_part.optimizer, "use_decoupled_grad", True)
 
             optimizers.append(optimizer_part)
             model_chunk_offset += 1

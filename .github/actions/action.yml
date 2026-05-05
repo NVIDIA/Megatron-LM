@@ -61,6 +61,10 @@ inputs:
     description: "Platform to run tests on (e.g. dgx_h100, dgx_gb200)"
     required: false
     default: "dgx_h100"
+  cadence:
+    description: "Trigger cadence for cadence filter (pr|nightly|mergegroup). Empty disables filter."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -83,7 +87,11 @@ runs:
           echo "apt attempt $i failed, retrying..."
           sleep 10
         done
-        curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+        for i in 1 2 3; do
+          curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh && break
+          echo "uv install attempt $i failed, retrying..."
+          sleep 10
+        done
 
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
@@ -131,6 +139,9 @@ runs:
         )
         if [ "${{ inputs.lightweight }}" == "true" ]; then
           ARGS+=(--enable-lightweight-mode)
+        fi
+        if [ -n "${{ inputs.cadence }}" ]; then
+          ARGS+=(--cadence ${{ inputs.cadence }})
         fi
 
         export PYTHONPATH=$(pwd)
@@ -210,7 +221,7 @@ runs:
         LOG_BASE=$([[ "$IS_UNIT_TEST" == "true" ]] && echo "assets_dir/logs" || echo "assets_dir")
         LATEST_LOG=""
         if [[ -d "$LOG_BASE" ]]; then
-          LATEST_LOG=$(find "$LOG_BASE" -maxdepth 3 -name "*.log" ! -name "nccl_debug.log" -type f 2>/dev/null \
+          LATEST_LOG=$(find "$LOG_BASE" -name "*.log" ! -name "nccl_debug.log" -type f 2>/dev/null \
                          | xargs -r ls -t 2>/dev/null | head -1 || true)
         fi
         if [[ -n "$LATEST_LOG" ]]; then
