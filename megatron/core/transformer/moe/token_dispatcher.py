@@ -1195,13 +1195,18 @@ class _DeepepManager(_DispatchManager):
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        self.enable_expanded_layout_for_inference = (
-            self.use_deepep_v2
-            and config.bf16
-            and not config.fp8
-            and not config.fp4
-            and not config.moe_router_padding_for_quantization
-        )
+        # Expand mode (`do_expand=True`) skips the post-dispatch permute by writing
+        # one slot per (token, expert) pair into a worst-case-sized recv buffer.
+        # The valid prefix is `psum_num_recv_tokens_per_expert[-1]`; everything
+        # past it is padding. This requires a downstream consumer that runs a
+        # grouped GEMM over the entire padded buffer (e.g. torch grouped_mm with
+        # device-resident cumulative offsets), since combine() discards the
+        # padding slots. The current consumers — TEGroupedMLP (split-based) and
+        # FlashInfer/mcore_fused_moe (gathered-global layout) — can't handle the
+        # padded recv. Until an expand-mode-aware expert kernel is wired,
+        # disable the optimization and fall back to non-expand recv (tight-sized
+        # tensor at `[psum[-1], hidden]`) so TEGroupedMLP can consume it.
+        self.enable_expanded_layout_for_inference = False
         self.use_expanded_layout = False
         if not self.use_deepep_v2:
             set_deepep_num_sms(config.moe_deepep_num_sms)

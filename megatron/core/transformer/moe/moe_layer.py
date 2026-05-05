@@ -494,7 +494,18 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and not self.training:
+        # The AllGather-style inference dispatchers (NCCL/NVLS) need to forward
+        # routing_map so the FlashInfer / mcore_fused_moe kernels can pick the
+        # right expert per token from the gathered global tensor. The deepep_v2
+        # inference path reuses the training MoEFlexTokenDispatcher: dispatch is
+        # by-expert (already grouped per local expert via tokens_per_expert), so
+        # no routing_map is needed and the dispatcher does not expose one.
+        is_inference_eval = hasattr(self, "_inference_token_dispatcher") and not self.training
+        is_deepep_v2_inference = (
+            is_inference_eval
+            and self.config.inference_moe_token_dispatcher_type == 'deepep_v2'
+        )
+        if is_inference_eval and not is_deepep_v2_inference:
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
