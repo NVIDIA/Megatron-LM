@@ -6116,6 +6116,60 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         assert async_env.engine.controller._async_deferred_mtp_release_count > 0
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_scheduling_hybrid_ep_chunked_prefill_cuda_graph_e2e(self) -> None:
+        """Async scheduling stays eligible for the nano-v3-style hybrid EP decode path."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        ep_size = 4
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else Utils.world_size
+        )
+        if world_size < ep_size:
+            pytest.skip(f"Test requires at least {ep_size} GPUs")
+
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            model_provider="hybrid",
+            expert_model_parallel_size=ep_size,
+            inference_moe_token_dispatcher_type="alltoall",
+            moe_pad_experts_for_cuda_graph_inference=True,
+            enable_chunked_prefill=True,
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        controller = async_env.engine.controller
+        diagnostics = controller.get_async_scheduling_diagnostics()
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert (
+            controller._async_decode_graph_launch_count > 0
+        ), controller._async_decode_graph_capture_failed_reason
+        assert diagnostics["eligibility_passes"] > 0
+        assert "chunked prefill is unsupported" not in diagnostics["disable_reason_counts"]
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+
 
 CHUNKED_CG_BLOCK_SIZE = 256
 CHUNKED_CG_VOCAB_SIZE = 10000
