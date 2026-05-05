@@ -716,13 +716,15 @@ if _CUTILE_AVAILABLE:
         Alpha_pre,
         Alpha_post,
         Alpha_res,
-        Y,
+        H_PRE,
+        H_POST,
+        H_RES,
         R,
         PROJ_OUT,
         M: int,
         N: int,
         K: int,
-        n: int,
+        n: ConstInt,
         eps: float,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
@@ -741,17 +743,23 @@ if _CUTILE_AVAILABLE:
         alpha_post = ct.load(Alpha_post, index=(0,), shape=(1,)).item()
         alpha_res = ct.load(Alpha_res, index=(0,), shape=(1,)).item()
 
-        # 1. Reduce split-K partials
-        y_accum = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)
+        # 1. Reduce split-K partials for each logical output segment.
+        pre_accum = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
+        post_accum = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
         r_accum = ct.full((TILE_SIZE_M, 1), 0.0, dtype=ct.float32)
 
         for split_idx in ct.static_iter(range(SPLIT_K)):
             bid_m_k = bid_m + split_idx * num_bid_m
-            y_tile = ct.load(
-                Y_acc, index=(bid_m_k, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
+            pre_tile = ct.load(
+                Y_acc, index=(bid_m_k, 0), shape=(TILE_SIZE_M, n),
                 padding_mode=PAD_ZERO,
             )
-            y_accum = y_accum + ct.astype(y_tile, ct.float32)
+            post_tile = ct.load(
+                Y_acc, index=(bid_m_k, 1), shape=(TILE_SIZE_M, n),
+                padding_mode=PAD_ZERO,
+            )
+            pre_accum = pre_accum + ct.astype(pre_tile, ct.float32)
+            post_accum = post_accum + ct.astype(post_tile, ct.float32)
 
             r_tile = ct.load(
                 R_acc, index=(bid_m_k, 0), shape=(TILE_SIZE_M, 1),
@@ -759,8 +767,9 @@ if _CUTILE_AVAILABLE:
             )
             r_accum = r_accum + ct.astype(r_tile, ct.float32)
 
-        # Store reduced proj for backward
-        ct.store(PROJ_OUT, index=(bid_m, 0), tile=y_accum.astype(PROJ_OUT.dtype))
+        # Store reduced projection segments for backward.
+        ct.store(PROJ_OUT, index=(bid_m, 0), tile=pre_accum.astype(PROJ_OUT.dtype))
+        ct.store(PROJ_OUT, index=(bid_m, 1), tile=post_accum.astype(PROJ_OUT.dtype))
 
         # 2. Compute r = norm / sqrt(K)
         denom = ct.full((TILE_SIZE_M, 1), K * 1.0, dtype=ct.float32)
@@ -771,36 +780,42 @@ if _CUTILE_AVAILABLE:
 
         ct.store(R, index=(bid_m, 0), tile=r_val.astype(R.dtype))
 
-        # 3. Build per-column scale from 3 scalar alphas via masks
-        offsets = ct.arange(TILE_SIZE_N, dtype=ct.int32)
-
-        one = ct.full((TILE_SIZE_N,), 1.0, dtype=ct.float32)
-        zero = ct.full((TILE_SIZE_N,), 0.0, dtype=ct.float32)
-
-        mask_pre = ct.where(ct.less(offsets, n), one, zero)
-        mask_post = ct.where(ct.less(offsets, 2 * n), one, zero) - mask_pre
-        mask_res = one - mask_pre - mask_post
-
-        scale = alpha_pre * mask_pre + alpha_post * mask_post + alpha_res * mask_res
-        scale = ct.reshape(scale, (1, TILE_SIZE_N))
-
-        mask_pre = ct.reshape(mask_pre, (1, TILE_SIZE_N))
-        mask_post = ct.reshape(mask_post, (1, TILE_SIZE_N))
-        mask_res = ct.reshape(mask_res, (1, TILE_SIZE_N))
-
-        # 4. Apply compute_h: linear = proj * scale / (r + eps) + bias
-        bias_tile = ct.load(
-            Bias, index=(0, 0), shape=(1, TILE_SIZE_N), padding_mode=PAD_ZERO,
+        # 3. Apply compute_h directly into split outputs.
+        inv_r_eps = 1.0 / (r_val + eps)
+        bias_pre = ct.load(
+            Bias, index=(0, 0), shape=(1, n), padding_mode=PAD_ZERO,
         )
-        bias_tile = ct.astype(bias_tile, ct.float32)
+        bias_post = ct.load(
+            Bias, index=(0, 1), shape=(1, n), padding_mode=PAD_ZERO,
+        )
+        bias_pre = ct.astype(bias_pre, ct.float32)
+        bias_post = ct.astype(bias_post, ct.float32)
 
-        linear = y_accum * scale / (r_val + eps) + bias_tile
+        h_pre_linear = pre_accum * alpha_pre * inv_r_eps + bias_pre
+        h_post_linear = post_accum * alpha_post * inv_r_eps + bias_post
+        h_pre = _ct_sigmoid(h_pre_linear)
+        h_post = _ct_sigmoid(h_post_linear) * 2.0
 
-        # 5. Mask-based activations
-        sig = _ct_sigmoid(linear)
-        out = sig * mask_pre + 2.0 * sig * mask_post + linear * mask_res
+        ct.store(H_PRE, index=(bid_m, 0), tile=h_pre.astype(H_PRE.dtype))
+        ct.store(H_POST, index=(bid_m, 0), tile=h_post.astype(H_POST.dtype))
 
-        ct.store(Y, index=(bid_m, 0), tile=out.astype(Y.dtype))
+        for res_chunk in ct.static_iter(range(n)):
+            res_accum = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
+            for split_idx in ct.static_iter(range(SPLIT_K)):
+                bid_m_k = bid_m + split_idx * num_bid_m
+                res_tile = ct.load(
+                    Y_acc, index=(bid_m_k, 2 + res_chunk), shape=(TILE_SIZE_M, n),
+                    padding_mode=PAD_ZERO,
+                )
+                res_accum = res_accum + ct.astype(res_tile, ct.float32)
+
+            bias_res = ct.load(
+                Bias, index=(0, 2 + res_chunk), shape=(1, n), padding_mode=PAD_ZERO,
+            )
+            bias_res = ct.astype(bias_res, ct.float32)
+            h_res = res_accum * alpha_res * inv_r_eps + bias_res
+            ct.store(PROJ_OUT, index=(bid_m, 2 + res_chunk), tile=res_accum.astype(PROJ_OUT.dtype))
+            ct.store(H_RES, index=(bid_m, res_chunk), tile=h_res.astype(H_RES.dtype))
 
     @ct.kernel
     def _ct_proj_rms_bwd_kernel(
@@ -1087,11 +1102,13 @@ if _CUTILE_AVAILABLE:
         tile_m: int,
         tile_n: int,
         split_k: int,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Launch reduce split-K + compute_h kernel.
 
         Returns:
-            y_activated: [M, N] with h_pre | h_post | h_res activated
+            h_pre: [M, n] sigmoid-activated pre weights
+            h_post: [M, n] 2*sigmoid-activated post weights
+            h_res: [M, n*n] residual logits
             r: [M, 1]  r = norm / sqrt(K)
             proj_reduced: [M, N] reduced projection (for backward)
         """
@@ -1100,7 +1117,9 @@ if _CUTILE_AVAILABLE:
 
         bias_2d = bias.unsqueeze(0).contiguous()  # [1, N]
 
-        y_out = torch.empty(M, N, dtype=proj_acc.dtype, device=dev)
+        h_pre_out = torch.empty(M, n, dtype=proj_acc.dtype, device=dev)
+        h_post_out = torch.empty(M, n, dtype=proj_acc.dtype, device=dev)
+        h_res_out = torch.empty(M, N - 2 * n, dtype=proj_acc.dtype, device=dev)
         r_out = torch.empty(M, 1, dtype=proj_acc.dtype, device=dev)
         proj_out = torch.empty(M, N, dtype=proj_acc.dtype, device=dev)
 
@@ -1111,7 +1130,7 @@ if _CUTILE_AVAILABLE:
             return (
                 proj_acc, norm_acc, bias_2d,
                 alpha_pre, alpha_post, alpha_res,
-                y_out, r_out, proj_out,
+                h_pre_out, h_post_out, h_res_out, r_out, proj_out,
                 M, N, K, n, eps,
                 tm, tile_n, split_k,
             )
@@ -1141,7 +1160,7 @@ if _CUTILE_AVAILABLE:
                 _ct_reduce_compute_h_kernel, _make_args(best_tm),
             )
 
-        return y_out, r_out, proj_out
+        return h_pre_out, h_post_out, h_res_out, r_out, proj_out
 
     # -- Combined proj_rms + compute_h forward --------------------------------
 
@@ -1154,14 +1173,16 @@ if _CUTILE_AVAILABLE:
         alpha_res: Tensor,
         n: int,
         eps: float,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused proj_rms + compute_h forward.
 
         Launches the existing _ct_proj_rms_fwd_kernel (split-K matmul + partial norm),
         then _ct_reduce_compute_h_kernel (reduce + r + activations).
 
         Returns:
-            y_activated: [M, N] activated h values
+            h_pre: [M, n] activated pre weights
+            h_post: [M, n] activated post weights
+            h_res: [M, n*n] residual logits
             r: [M, 1] r = norm / sqrt(K)
             proj_reduced: [M, N] reduced projection (for backward)
         """
@@ -1244,13 +1265,13 @@ if _CUTILE_AVAILABLE:
                 )
 
         # Launch reduce + compute_h kernel
-        y_activated, r, proj_reduced = _cutile_reduce_compute_h(
+        h_pre, h_post, h_res, r, proj_reduced = _cutile_reduce_compute_h(
             proj_acc, norm_acc, bias,
             alpha_pre, alpha_post, alpha_res,
             n, M, N, K, eps,
             tm, TILE_N, split_k,
         )
-        return y_activated, r, proj_reduced
+        return h_pre, h_post, h_res, r, proj_reduced
 
     def _proj_rms_bwd_autotune_configs(N):
         """Generate autotune search space for proj_rms backward kernel (K >= 8192 path)."""
@@ -1334,8 +1355,11 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_fused_grad_h_proj_kernel(
-        GRAD_Y,         # [M, N]
-        Y_ACT,          # [M, N]
+        GRAD_H_PRE,     # [M, n]
+        GRAD_H_POST,    # [M, n]
+        GRAD_H_RES,     # [M, n*n]
+        H_PRE,          # [M, n]
+        H_POST,         # [M, n]
         PROJ,           # [M, N]
         R,              # [M, 1]
         GRAD_R_EXT,     # [M, 1]
@@ -1347,10 +1371,13 @@ if _CUTILE_AVAILABLE:
         GRAD_R_TOTAL,   # [M, 1] output
         M: int,
         N: int,
-        n: int,
+        n: ConstInt,
         eps: float,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
+        HAS_GRAD_H_PRE: ConstInt,
+        HAS_GRAD_H_POST: ConstInt,
+        HAS_GRAD_H_RES: ConstInt,
         HAS_GRAD_R_EXT: ConstInt,
     ):
         """Precompute grad_h, grad_proj, and grad_r_total for downstream backward kernels.
@@ -1363,56 +1390,105 @@ if _CUTILE_AVAILABLE:
         alpha_post = ct.load(Alpha_post, index=(0,), shape=(1,)).item()
         alpha_res = ct.load(Alpha_res, index=(0,), shape=(1,)).item()
 
-        offsets = ct.arange(TILE_SIZE_N, dtype=ct.int32)
-        one = ct.full((TILE_SIZE_N,), 1.0, dtype=ct.float32)
-        zero = ct.full((TILE_SIZE_N,), 0.0, dtype=ct.float32)
-        mask_pre = ct.where(ct.less(offsets, n), one, zero)
-        mask_post = ct.where(ct.less(offsets, 2 * n), one, zero) - mask_pre
-        mask_res = one - mask_pre - mask_post
-
-        scale = alpha_pre * mask_pre + alpha_post * mask_post + alpha_res * mask_res
-        scale_2d = ct.reshape(scale, (1, TILE_SIZE_N))
-        mask_pre_2d = ct.reshape(mask_pre, (1, TILE_SIZE_N))
-        mask_post_2d = ct.reshape(mask_post, (1, TILE_SIZE_N))
-        mask_res_2d = ct.reshape(mask_res, (1, TILE_SIZE_N))
-
-        gy_tile = ct.load(
-            GRAD_Y, index=(tile_m_id, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
-            padding_mode=PAD_ZERO,
-        )
-        gy_tile = ct.astype(gy_tile, ct.float32)
-        y_tile = ct.load(
-            Y_ACT, index=(tile_m_id, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
-            padding_mode=PAD_ZERO,
-        )
-        y_tile = ct.astype(y_tile, ct.float32)
-        proj_tile = ct.load(
-            PROJ, index=(tile_m_id, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
-            padding_mode=PAD_ZERO,
-        )
-        proj_tile = ct.astype(proj_tile, ct.float32)
         r_tile = ct.load(
             R, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1),
             padding_mode=PAD_ZERO,
         )
         r_tile = ct.astype(r_tile, ct.float32)
 
-        # Activation backward → grad_h
-        gh_pre = gy_tile * y_tile * (1.0 - y_tile) * mask_pre_2d
-        half_y = y_tile * 0.5
-        gh_post = gy_tile * half_y * (1.0 - half_y) * 2.0 * mask_post_2d
-        gh_res = gy_tile * mask_res_2d
-        grad_h = gh_pre + gh_post + gh_res
-
         r_eps = r_tile + eps
         inv_r_eps = 1.0 / r_eps
-        grad_proj_tile = grad_h * scale_2d * inv_r_eps
+        grad_r_from_h = ct.full((TILE_SIZE_M, 1), 0.0, dtype=ct.float32)
 
-        # grad_r_total: reduction over N → [TILE_M, 1]
-        grad_r_from_h = ct.sum(
-            grad_h * proj_tile * scale_2d * (-inv_r_eps * inv_r_eps),
+        # Clear the padded columns once inside this kernel.  Valid columns are
+        # overwritten by the segment stores below.
+        zero_full = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)
+        ct.store(GRAD_H, index=(tile_m_id, 0), tile=zero_full.astype(GRAD_H.dtype))
+        ct.store(GRAD_PROJ, index=(tile_m_id, 0), tile=zero_full.astype(GRAD_PROJ.dtype))
+
+        if HAS_GRAD_H_PRE:
+            gy_pre = ct.load(
+                GRAD_H_PRE, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
+                padding_mode=PAD_ZERO,
+            )
+            gy_pre = ct.astype(gy_pre, ct.float32)
+        else:
+            gy_pre = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
+        h_pre = ct.load(
+            H_PRE, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
+            padding_mode=PAD_ZERO,
+        )
+        h_pre = ct.astype(h_pre, ct.float32)
+        proj_pre = ct.load(
+            PROJ, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
+            padding_mode=PAD_ZERO,
+        )
+        proj_pre = ct.astype(proj_pre, ct.float32)
+        grad_h_pre = gy_pre * h_pre * (1.0 - h_pre)
+        grad_proj_pre = grad_h_pre * alpha_pre * inv_r_eps
+        grad_r_from_h += ct.sum(
+            grad_h_pre * proj_pre * alpha_pre * (-inv_r_eps * inv_r_eps),
             axis=1, keepdims=True,
         )
+        ct.store(GRAD_H, index=(tile_m_id, 0), tile=grad_h_pre.astype(GRAD_H.dtype))
+        ct.store(GRAD_PROJ, index=(tile_m_id, 0), tile=grad_proj_pre.astype(GRAD_PROJ.dtype))
+
+        if HAS_GRAD_H_POST:
+            gy_post = ct.load(
+                GRAD_H_POST, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
+                padding_mode=PAD_ZERO,
+            )
+            gy_post = ct.astype(gy_post, ct.float32)
+        else:
+            gy_post = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
+        h_post = ct.load(
+            H_POST, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
+            padding_mode=PAD_ZERO,
+        )
+        h_post = ct.astype(h_post, ct.float32)
+        proj_post = ct.load(
+            PROJ, index=(tile_m_id, 1), shape=(TILE_SIZE_M, n),
+            padding_mode=PAD_ZERO,
+        )
+        proj_post = ct.astype(proj_post, ct.float32)
+        half_h_post = h_post * 0.5
+        grad_h_post = gy_post * half_h_post * (1.0 - half_h_post) * 2.0
+        grad_proj_post = grad_h_post * alpha_post * inv_r_eps
+        grad_r_from_h += ct.sum(
+            grad_h_post * proj_post * alpha_post * (-inv_r_eps * inv_r_eps),
+            axis=1, keepdims=True,
+        )
+        ct.store(GRAD_H, index=(tile_m_id, 1), tile=grad_h_post.astype(GRAD_H.dtype))
+        ct.store(GRAD_PROJ, index=(tile_m_id, 1), tile=grad_proj_post.astype(GRAD_PROJ.dtype))
+
+        for res_chunk in ct.static_iter(range(n)):
+            if HAS_GRAD_H_RES:
+                grad_h_res = ct.load(
+                    GRAD_H_RES, index=(tile_m_id, res_chunk), shape=(TILE_SIZE_M, n),
+                    padding_mode=PAD_ZERO,
+                )
+                grad_h_res = ct.astype(grad_h_res, ct.float32)
+            else:
+                grad_h_res = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
+            proj_res = ct.load(
+                PROJ, index=(tile_m_id, 2 + res_chunk), shape=(TILE_SIZE_M, n),
+                padding_mode=PAD_ZERO,
+            )
+            proj_res = ct.astype(proj_res, ct.float32)
+            grad_proj_res = grad_h_res * alpha_res * inv_r_eps
+            grad_r_from_h += ct.sum(
+                grad_h_res * proj_res * alpha_res * (-inv_r_eps * inv_r_eps),
+                axis=1, keepdims=True,
+            )
+            ct.store(
+                GRAD_H, index=(tile_m_id, 2 + res_chunk),
+                tile=grad_h_res.astype(GRAD_H.dtype),
+            )
+            ct.store(
+                GRAD_PROJ, index=(tile_m_id, 2 + res_chunk),
+                tile=grad_proj_res.astype(GRAD_PROJ.dtype),
+            )
+
         if HAS_GRAD_R_EXT:
             grad_r_ext_tile = ct.load(
                 GRAD_R_EXT, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1),
@@ -1423,8 +1499,6 @@ if _CUTILE_AVAILABLE:
             grad_r_ext_tile = ct.full((TILE_SIZE_M, 1), 0.0, dtype=ct.float32)
         grad_r_total = grad_r_from_h + grad_r_ext_tile
 
-        ct.store(GRAD_H, index=(tile_m_id, 0), tile=grad_h.astype(GRAD_H.dtype))
-        ct.store(GRAD_PROJ, index=(tile_m_id, 0), tile=grad_proj_tile.astype(GRAD_PROJ.dtype))
         ct.store(GRAD_R_TOTAL, index=(tile_m_id, 0), tile=grad_r_total.astype(GRAD_R_TOTAL.dtype))
 
     @ct.kernel
@@ -1617,23 +1691,15 @@ if _CUTILE_AVAILABLE:
     def _ct_fused_compute_h_proj_rms_bwd_small_k_kernel(
         X,              # [M, K]
         WEIGHT,         # [N, K]
-        GRAD_Y,         # [M, N]
-        Y_ACT,          # [M, N]
-        PROJ,           # [M, N]
+        GRAD_PROJ,      # [M, TILE_N] precomputed
+        GRAD_R_TOTAL,   # [M, 1] precomputed
         R,              # [M, 1]
-        GRAD_R_EXT,     # [M, 1]
-        Alpha_pre,      # [1]
-        Alpha_post,     # [1]
-        Alpha_res,      # [1]
         GRAD_X,         # [M, K] output
         GRAD_WEIGHT,    # [N, K] output
         M: int,
         N: int,
         K: int,
-        n: int,
-        eps: float,
         TILE_N_SIZE: ConstInt,
-        HAS_GRAD_R_EXT: ConstInt,
     ):
         """Fused backward (small K path) with work-stealing.
 
@@ -1643,24 +1709,6 @@ if _CUTILE_AVAILABLE:
         Scalar gradients are computed by the separate partial/reduce kernels.
         """
         zero_pad = ct.PaddingMode.ZERO
-
-        alpha_pre = ct.load(Alpha_pre, index=(0,), shape=(1,)).item()
-        alpha_post = ct.load(Alpha_post, index=(0,), shape=(1,)).item()
-        alpha_res = ct.load(Alpha_res, index=(0,), shape=(1,)).item()
-
-        # Build masks and scale
-        offsets = ct.arange(TILE_N_SIZE, dtype=ct.int32)
-        one = ct.full((TILE_N_SIZE,), 1.0, dtype=ct.float32)
-        zero_v = ct.full((TILE_N_SIZE,), 0.0, dtype=ct.float32)
-        mask_pre = ct.where(ct.less(offsets, n), one, zero_v)
-        mask_post = ct.where(ct.less(offsets, 2 * n), one, zero_v) - mask_pre
-        mask_res = one - mask_pre - mask_post
-
-        scale = alpha_pre * mask_pre + alpha_post * mask_post + alpha_res * mask_res
-        scale_2d = ct.reshape(scale, (1, TILE_N_SIZE))
-        mask_pre_2d = ct.reshape(mask_pre, (1, TILE_N_SIZE))
-        mask_post_2d = ct.reshape(mask_post, (1, TILE_N_SIZE))
-        mask_res_2d = ct.reshape(mask_res, (1, TILE_N_SIZE))
 
         TILE_DB_SIZE_M = 128
         TILE_DB_SIZE_K = 64
@@ -1676,31 +1724,10 @@ if _CUTILE_AVAILABLE:
                         X, index=(m_tile, tile_id),
                         shape=(TILE_DB_SIZE_M, TILE_DB_SIZE_K), padding_mode=zero_pad,
                     )
-                    # Compute grad_proj on-the-fly
-                    gy_tile = ct.load(
-                        GRAD_Y, index=(m_tile, 0),
+                    grad_proj_tile = ct.load(
+                        GRAD_PROJ, index=(m_tile, 0),
                         shape=(TILE_DB_SIZE_M, TILE_N_SIZE), padding_mode=zero_pad,
                     )
-                    gy_tile = ct.astype(gy_tile, ct.float32)
-                    y_tile = ct.load(
-                        Y_ACT, index=(m_tile, 0),
-                        shape=(TILE_DB_SIZE_M, TILE_N_SIZE), padding_mode=zero_pad,
-                    )
-                    y_tile = ct.astype(y_tile, ct.float32)
-                    r_tile = ct.load(
-                        R, index=(m_tile, 0),
-                        shape=(TILE_DB_SIZE_M, 1), padding_mode=zero_pad,
-                    )
-                    r_tile = ct.astype(r_tile, ct.float32)
-
-                    gh_pre = gy_tile * y_tile * (1.0 - y_tile) * mask_pre_2d
-                    half_y = y_tile * 0.5
-                    gh_post = gy_tile * half_y * (1.0 - half_y) * 2.0 * mask_post_2d
-                    gh_res = gy_tile * mask_res_2d
-                    grad_h = gh_pre + gh_post + gh_res
-                    r_eps = r_tile + eps
-                    inv_r_eps = 1.0 / r_eps
-                    grad_proj_tile = grad_h * scale_2d * inv_r_eps
 
                     accumulator_db = ct.mma(
                         x_tile.transpose().astype(ct.tfloat32),
@@ -1725,51 +1752,19 @@ if _CUTILE_AVAILABLE:
                 b_tile_idx = tile_id % NUM_DA_K_TILES
                 dd_tile_idx = tile_id // NUM_DA_K_TILES
 
-                # Compute grad_proj on-the-fly
-                gy_tile = ct.load(
-                    GRAD_Y, index=(dd_tile_idx, 0),
+                grad_proj_tile = ct.load(
+                    GRAD_PROJ, index=(dd_tile_idx, 0),
                     shape=(TILE_DA_SIZE_M, TILE_N_SIZE), padding_mode=zero_pad,
                 )
-                gy_tile = ct.astype(gy_tile, ct.float32)
-                y_tile = ct.load(
-                    Y_ACT, index=(dd_tile_idx, 0),
-                    shape=(TILE_DA_SIZE_M, TILE_N_SIZE), padding_mode=zero_pad,
+                grad_r_total = ct.load(
+                    GRAD_R_TOTAL, index=(dd_tile_idx, 0),
+                    shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad,
                 )
-                y_tile = ct.astype(y_tile, ct.float32)
-                proj_tile = ct.load(
-                    PROJ, index=(dd_tile_idx, 0),
-                    shape=(TILE_DA_SIZE_M, TILE_N_SIZE), padding_mode=zero_pad,
-                )
-                proj_tile = ct.astype(proj_tile, ct.float32)
                 r_tile = ct.load(
                     R, index=(dd_tile_idx, 0),
                     shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad,
                 )
                 r_tile = ct.astype(r_tile, ct.float32)
-
-                gh_pre = gy_tile * y_tile * (1.0 - y_tile) * mask_pre_2d
-                half_y = y_tile * 0.5
-                gh_post = gy_tile * half_y * (1.0 - half_y) * 2.0 * mask_post_2d
-                gh_res = gy_tile * mask_res_2d
-                grad_h = gh_pre + gh_post + gh_res
-                r_eps = r_tile + eps
-                inv_r_eps = 1.0 / r_eps
-                grad_proj_tile = grad_h * scale_2d * inv_r_eps
-
-                # Simplified rms_dnorm: grad_r_total * x / (r * K)
-                grad_r_from_h = ct.sum(
-                    grad_h * proj_tile * scale_2d * (-inv_r_eps * inv_r_eps),
-                    axis=1, keepdims=True,
-                )
-                if HAS_GRAD_R_EXT:
-                    grad_r_ext_tile = ct.load(
-                        GRAD_R_EXT, index=(dd_tile_idx, 0),
-                        shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad,
-                    )
-                    grad_r_ext_tile = ct.astype(grad_r_ext_tile, ct.float32)
-                else:
-                    grad_r_ext_tile = ct.full((TILE_DA_SIZE_M, 1), 0.0, dtype=ct.float32)
-                grad_r_total = grad_r_from_h + grad_r_ext_tile
 
                 x_tile = ct.load(
                     X, index=(dd_tile_idx, b_tile_idx),
@@ -1803,8 +1798,12 @@ if _CUTILE_AVAILABLE:
     def _cutile_fused_compute_h_proj_rms_bwd(
         x: Tensor,
         weight: Tensor,
-        grad_y: Tensor,
-        y_activated: Tensor,
+        grad_h_pre: Tensor,
+        grad_h_post: Tensor,
+        grad_h_res: Tensor,
+        h_pre: Tensor,
+        h_post: Tensor,
+        h_res: Tensor,
         proj: Tensor,
         r: Tensor,
         grad_r_ext: Tensor,
@@ -1837,23 +1836,32 @@ if _CUTILE_AVAILABLE:
         has_grad_r_ext = grad_r_ext is not None
         has_grad_r_ext_flag = int(has_grad_r_ext)
         grad_r_ext_arg = grad_r_ext if has_grad_r_ext else r
+        has_grad_h_pre = grad_h_pre is not None
+        has_grad_h_post = grad_h_post is not None
+        has_grad_h_res = grad_h_res is not None
+        grad_h_pre_arg = grad_h_pre if has_grad_h_pre else h_pre
+        grad_h_post_arg = grad_h_post if has_grad_h_post else h_post
+        grad_h_res_arg = grad_h_res if has_grad_h_res else h_res
 
         # 0. Precompute grad_h, grad_proj, grad_r_total
         grad_h_buf = torch.empty(M, TILE_N, dtype=torch.float32, device=dev)
         grad_proj_buf = torch.empty(M, TILE_N, dtype=torch.float32, device=dev)
         grad_r_total_buf = torch.empty(M, 1, dtype=torch.float32, device=dev)
 
-        tile_m_precomp = min(128, M)
+        tile_m_precomp = _default_tile_m(M)
         ct.launch(
             stream,
             (math.ceil(M / tile_m_precomp),),
             _ct_fused_grad_h_proj_kernel,
             (
-                grad_y, y_activated, proj, r, grad_r_ext_arg,
+                grad_h_pre_arg, grad_h_post_arg, grad_h_res_arg,
+                h_pre, h_post, proj, r, grad_r_ext_arg,
                 alpha_pre, alpha_post, alpha_res,
                 grad_h_buf, grad_proj_buf, grad_r_total_buf,
                 M, N, n, eps,
-                tile_m_precomp, TILE_N, has_grad_r_ext_flag,
+                tile_m_precomp, TILE_N,
+                int(has_grad_h_pre), int(has_grad_h_post), int(has_grad_h_res),
+                has_grad_r_ext_flag,
             ),
         )
 
@@ -1916,11 +1924,10 @@ if _CUTILE_AVAILABLE:
                 (num_sms, 2, 1),
                 _ct_fused_compute_h_proj_rms_bwd_small_k_kernel,
                 (
-                    x, weight, grad_y, y_activated, proj, r, grad_r_ext_arg,
-                    alpha_pre, alpha_post, alpha_res,
+                    x, weight, grad_proj_buf, grad_r_total_buf, r,
                     grad_x, grad_weight,
-                    M, N, K, n, eps,
-                    TILE_N, has_grad_r_ext_flag,
+                    M, N, K,
+                    TILE_N,
                 ),
             )
 
@@ -2086,7 +2093,7 @@ def _torch_proj_rms_compute_h(
     bias: Tensor,
     n: int,
     eps: float,
-) -> Tuple[Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     proj = torch.matmul(x, weight.t())
     r = x.float().norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
     alpha = torch.cat(
@@ -2100,8 +2107,8 @@ def _torch_proj_rms_compute_h(
     h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
     h_pre = h[..., :n].sigmoid()
     h_post = h[..., n : 2 * n].sigmoid() * 2
-    y_activated = torch.cat([h_pre, h_post, h[..., 2 * n :]], dim=-1)
-    return y_activated, r.to(dtype=x.dtype)
+    h_res = h[..., 2 * n :]
+    return h_pre, h_post, h_res, r.to(dtype=x.dtype)
 
 
 if _CUTILE_AVAILABLE:
@@ -2168,27 +2175,28 @@ if _CUTILE_AVAILABLE:
             n: int,
             eps: float = 1e-6,
         ):
-            y_activated, r, proj_reduced = _cutile_proj_rms_compute_h_fwd(
+            h_pre, h_post, h_res, r, proj_reduced = _cutile_proj_rms_compute_h_fwd(
                 x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps,
             )
             ctx.save_for_backward(
-                x, weight, y_activated, proj_reduced, r,
+                x, weight, h_pre, h_post, h_res, proj_reduced, r,
                 alpha_pre, alpha_post, alpha_res, bias,
             )
             ctx.n = n
             ctx.eps = eps
-            return y_activated, r
+            return h_pre, h_post, h_res, r
 
         @staticmethod
-        def backward(ctx, grad_y, grad_r_ext):
+        def backward(ctx, grad_h_pre, grad_h_post, grad_h_res, grad_r_ext):
             (
-                x, weight, y_activated, proj, r,
+                x, weight, h_pre, h_post, h_res, proj, r,
                 alpha_pre, alpha_post, alpha_res, bias_param,
             ) = ctx.saved_tensors
 
             grad_x, grad_weight, grad_ap, grad_apo, grad_ar, grad_bias = (
                 _cutile_fused_compute_h_proj_rms_bwd(
-                    x, weight, grad_y, y_activated, proj, r, grad_r_ext,
+                    x, weight, grad_h_pre, grad_h_post, grad_h_res,
+                    h_pre, h_post, h_res, proj, r, grad_r_ext,
                     alpha_pre, alpha_post, alpha_res,
                     bias_param, ctx.n, ctx.eps,
                 )
@@ -2305,8 +2313,8 @@ def fused_proj_rms_compute_h(
     bias: Tensor,
     n: int,
     eps: float = 1e-6,
-) -> Tuple[Tensor, Tensor]:
-    """Projection + RMS norm + compute_h activations using cuTile, then torch."""
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Projection + RMS norm + compute_h split outputs using cuTile, then torch."""
     if _CUTILE_AVAILABLE:
         return CutileProjRmsComputeH.apply(
             x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps
