@@ -1097,34 +1097,36 @@ class TextGenerationController:
     def _dynamic_step_log_probs_indexing(self):
         """Conditionally launch log-prob indexing kernels."""
         if self._log_prob_count == 0:
-            return
+            return None
 
         context = self.inference_wrapped_model.inference_context
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
 
         if context.num_speculative_tokens > 0:
-            self._log_probs_speculative.prefill_indexing(context, eager=eager)
-            return
+            return self._log_probs_speculative.prefill_indexing(context, eager=eager)
 
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
-            self._log_probs_decode.indexing(context, eager=eager)
-        else:
-            self._log_probs_prefill.indexing(context, eager=eager)
+            return self._log_probs_decode.indexing(context, eager=eager)
+        return self._log_probs_prefill.indexing(context, eager=eager)
 
-    def _dynamic_step_log_probs_lse(self):
+    def _dynamic_step_log_probs_lse(self, indexing_outputs):
         """Pre-sample LSE precompute on the side stream (overlaps sampling)."""
         if self._log_prob_count == 0:
-            return
+            return None
 
         context = self.inference_wrapped_model.inference_context
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
 
         if context.num_speculative_tokens > 0:
-            self._log_probs_speculative.softmax(context, self._all_logits_cuda, eager=eager)
-        elif context.config.materialize_only_last_token_logits or context.is_decode_only():
-            self._log_probs_decode.lse(context, self._all_logits_cuda, eager=eager)
-        else:
-            self._log_probs_prefill.lse(context, self._all_logits_cuda, eager=eager)
+            prefill_offset_gpu = indexing_outputs[0]
+            return self._log_probs_speculative.softmax(
+                context, self._all_logits_cuda, prefill_offset_gpu, eager=eager
+            )
+        if context.config.materialize_only_last_token_logits or context.is_decode_only():
+            ri = indexing_outputs
+            return self._log_probs_decode.lse(context, self._all_logits_cuda, ri, eager=eager)
+        _, _, li, _ = indexing_outputs
+        return self._log_probs_prefill.lse(context, self._all_logits_cuda, li, eager=eager)
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
         """Collect flat routing indices for MoE router recording.
@@ -1185,7 +1187,7 @@ class TextGenerationController:
         _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
         return stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
-    def _dynamic_step_calculate_log_probs(self):
+    def _dynamic_step_calculate_log_probs(self, indexing_outputs, lse_outputs):
         """Calculate log probs from logits."""
         log_prob_request_count = self._log_prob_count
         top_n_max = self._top_n_max
@@ -1200,6 +1202,8 @@ class TextGenerationController:
                 context,
                 self._all_logits_cuda,
                 self._sampled_tokens_cuda,
+                indexing_outputs,
+                lse_outputs,
                 log_prob_request_count,
                 self._accepted_tokens_per_request,
                 self._accepted_token_counts_per_request,
@@ -1207,18 +1211,29 @@ class TextGenerationController:
                 top_n_max=top_n_max,
             )
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
+            ri = indexing_outputs
+            lse = lse_outputs
             return self._log_probs_decode.calculate(
                 context,
                 self._all_logits_cuda,
                 self._sampled_tokens_cuda,
+                ri,
+                lse,
                 log_prob_request_count,
                 eager=eager,
                 top_n_max=top_n_max,
             )
+        ri, cu_ml, li, mt = indexing_outputs
+        lse = lse_outputs
         return self._log_probs_prefill.calculate(
             context,
             self._all_logits_cuda,
             self._sampled_tokens_cuda,
+            ri,
+            cu_ml,
+            li,
+            mt,
+            lse,
             log_prob_request_count,
             eager=eager,
             top_n_max=top_n_max,
@@ -1502,7 +1517,7 @@ class TextGenerationController:
 
             self._side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._side_stream):
-                self._dynamic_step_log_probs_indexing()
+                indexing_outputs = self._dynamic_step_log_probs_indexing()
 
             torch.cuda.current_stream().wait_event(self._side_step_done_event)
 
@@ -1513,7 +1528,7 @@ class TextGenerationController:
 
             self._side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._side_stream):
-                self._dynamic_step_log_probs_lse()
+                lse_outputs = self._dynamic_step_log_probs_lse(indexing_outputs)
 
             self._side_pre_calc_event.record(self._side_stream)
 
@@ -1568,7 +1583,9 @@ class TextGenerationController:
                 self._dynamic_step_sample_logits()
 
             torch.cuda.current_stream().wait_event(self._side_pre_calc_event)
-            log_probs_extract = self._dynamic_step_calculate_log_probs()
+            log_probs_extract = self._dynamic_step_calculate_log_probs(
+                indexing_outputs, lse_outputs
+            )
             self._side_stream.wait_stream(torch.cuda.current_stream())
             self._side_step_done_event.record(self._side_stream)
 

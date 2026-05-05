@@ -394,7 +394,7 @@ class DynamicInferenceEngine(AbstractEngine):
             controller._dynamic_step_log_probs_bookkeeping()
             controller._side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(controller._side_stream):
-                controller._dynamic_step_log_probs_indexing()
+                indexing_outputs = controller._dynamic_step_log_probs_indexing()
 
             torch.cuda.current_stream().wait_event(controller._side_step_done_event)
 
@@ -415,7 +415,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 controller._side_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(controller._side_stream):
-                    controller._dynamic_step_log_probs_lse()
+                    lse_outputs = controller._dynamic_step_log_probs_lse(indexing_outputs)
 
                 controller._side_pre_calc_event.record(controller._side_stream)
 
@@ -446,7 +446,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # Capture remaining log-prob graphs (gather, extract).
                 torch.cuda.current_stream().wait_event(controller._side_pre_calc_event)
-                controller._dynamic_step_calculate_log_probs()
+                controller._dynamic_step_calculate_log_probs(indexing_outputs, lse_outputs)
                 controller._side_step_done_event.record(controller._side_stream)
 
                 context.reset()

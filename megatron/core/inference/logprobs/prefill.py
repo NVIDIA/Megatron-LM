@@ -286,25 +286,28 @@ class LogProbsPrefill:
             top_n_dict = built or None
         return result, top_n_dict
 
-    def indexing(self, context, *, eager: bool = False) -> None:
+    def indexing(
+        self, context, *, eager: bool = False
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Run indexing kernel with optional CUDA graph capture/replay."""
         key = ("prefill_idx", context.padded_batch_dimensions)
-        result = self.indexing_kernel(context, eager=eager, cache_key=key)
-        self._ri, self._cu_ml, self._li, self._mt = result
+        return self.indexing_kernel(context, eager=eager, cache_key=key)
 
-    def lse(self, context, logits: Tensor, *, eager: bool = False) -> None:
-        """Run LSE precompute on the side stream so it overlaps with sampling.
-
-        Stashes `self._lse`; consumed by the next `calculate` call.
-        """
+    def lse(self, context, logits: Tensor, li: Tensor, *, eager: bool = False) -> Tensor:
+        """Run LSE precompute on the side stream so it overlaps with sampling."""
         key = ("prefill_lse", context.padded_batch_dimensions)
-        self._lse = self.lse_kernel(logits, self._li, eager=eager, cache_key=key)
+        return self.lse_kernel(logits, li, eager=eager, cache_key=key)
 
     def calculate(
         self,
         context,
         logits: Tensor,
         new_tokens: Tensor,
+        ri: Tensor,
+        cu_masked_lengths: Tensor,
+        logit_indices: Tensor,
+        masked_tokens: Tensor,
+        lse: Tensor,
         log_prob_request_count: int,
         *,
         eager: bool = False,
@@ -316,6 +319,8 @@ class LogProbsPrefill:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, padded_active_tokens, vocab_size].
             new_tokens (Tensor): Newly sampled tokens.
+            ri, cu_masked_lengths, logit_indices, masked_tokens: outputs of `indexing`.
+            lse (Tensor): output of `lse`.
             log_prob_request_count (int): Number of requests wanting log probs.
             eager (bool): If True, skip CUDA graph capture/replay for the kernels.
             top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
@@ -323,9 +328,7 @@ class LogProbsPrefill:
         Returns:
             A callable that returns (per_request_log_probs, top_n_dict).
         """
-        # `_ri`/`_cu_ml`/`_li`/`_mt` were stashed by `indexing`; `_lse` by `lse`
-        # on the side stream. Gather is cheap (per-token scalar + subtract) on main.
-        ri, cu_ml, li, mt, lse = (self._ri, self._cu_ml, self._li, self._mt, self._lse)
+        cu_ml, li, mt = cu_masked_lengths, logit_indices, masked_tokens
         key = ("prefill_gather", context.padded_batch_dimensions)
         slp = self.gather_kernel(
             logits, new_tokens, ri, cu_ml, li, mt, lse, eager=eager, cache_key=key
