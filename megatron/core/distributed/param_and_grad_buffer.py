@@ -254,8 +254,9 @@ class _ParamAndGradBucketGroup:
         # or bucket.grad_data.
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
-        # Track grad mode used to create cached param views. Rebuild if mode changes to avoid
-        # mixing no_grad-created views with in-place updates in grad-enabled mode.
+        # Cached views remember the grad-mode context in which they were created. Rebuild them
+        # after a mode change so param all-gathers never mutate no_grad-created views while
+        # autograd is enabled.
         self._cached_param_buffer_shards_grad_enabled = None
 
     def reset(self):
@@ -424,6 +425,9 @@ class _ParamAndGradBucketGroup:
             if self._cached_param_buffer_shards_grad_enabled != current_grad_enabled:
                 self.cached_param_buffer_shard_list = [None] * len(self.buckets)
                 self._cached_param_buffer_shards_grad_enabled = current_grad_enabled
+            # Param all-gather writes directly into bucket param buffers. These in-place updates are
+            # optimizer state movement, not differentiable work, so keep the cached destination views
+            # and the collective inside no_grad.
             with torch.no_grad():
                 with _coalescing_manager(
                     self.intra_distributed_optimizer_instance_group, async_ops=async_op

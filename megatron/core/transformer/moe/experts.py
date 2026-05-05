@@ -47,8 +47,11 @@ from megatron.core.transformer.utils import (
 from megatron.core.typed_torch import apply_module, not_none
 
 if HAVE_TE:
+    import transformer_engine as te
+
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 else:
+    te = None
     Fp8Padding, Fp8Unpadding = None, None
 
 try:
@@ -343,13 +346,14 @@ class TEGroupedMLP(MegatronModule):
             else self.linear_fc2.weight0.dtype
         )
 
-        # TODO:ksivamani: Why meta device?
+        # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
+        # Using meta avoids allocating duplicate weights for the fused wrapper.
         op = te.pytorch.ops.GroupedLinear(
             self.linear_fc1.num_gemms,
             self.linear_fc1.in_features,
             self.linear_fc1.out_features,
             bias=self.linear_fc1.use_bias,
-            device=torch.cuda.current_device(),
+            device="meta",
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
             single_grouped_parameter=fc1_single_grouped_parameter,
@@ -379,7 +383,7 @@ class TEGroupedMLP(MegatronModule):
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,
             bias=self.linear_fc2.use_bias,
-            device=torch.cuda.current_device(),
+            device="meta",
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
             single_grouped_parameter=fc2_single_grouped_parameter,
@@ -476,6 +480,15 @@ class TEGroupedMLP(MegatronModule):
 
         return output
 
+    @staticmethod
+    def _remove_glu_interleaving(x: torch.Tensor, interleave_size: int) -> torch.Tensor:
+        """Reorder interleaved GLU blocks so gate and linear halves are contiguous."""
+        shape = x.size()
+        x = x.reshape(-1, shape[-1] // (2 * interleave_size), 2, interleave_size)
+        x = x.transpose(1, 2).contiguous()
+        x = x.view(shape)
+        return x
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -549,25 +562,13 @@ class TEGroupedMLP(MegatronModule):
                 and self.config.moe_mlp_glu_interleave_size is not None
             )
 
-            def remove_glu_interleaving(x: torch.Tensor) -> torch.Tensor:
-                """Reorder tensor so gate and linear units are contiguous.
-
-                Should only be applied if the activation function is
-                an interleaved GLU.
-
-                """
-                shape = x.size()
-                interleave_size = self.config.moe_mlp_glu_interleave_size
-                x = x.reshape(-1, shape[-1] // (2 * interleave_size), 2, interleave_size)
-                x = x.transpose(1, 2).contiguous()
-                x = x.view(shape)
-                return x
-
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
                 if with_glu_interleaving:
-                    intermediate_parallel = remove_glu_interleaving(intermediate_parallel)
+                    intermediate_parallel = self._remove_glu_interleaving(
+                        intermediate_parallel, self.config.moe_mlp_glu_interleave_size
+                    )
                 intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
                     original_dtype = intermediate_parallel.dtype
@@ -609,7 +610,9 @@ class TEGroupedMLP(MegatronModule):
 
                     def glu(x):
                         if with_glu_interleaving:
-                            x = remove_glu_interleaving(x)
+                            x = self._remove_glu_interleaving(
+                                x, self.config.moe_mlp_glu_interleave_size
+                            )
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)

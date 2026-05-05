@@ -1,9 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import argparse
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 
+import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -14,9 +18,155 @@ from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
-from megatron.training.arguments import parse_args
+from megatron.training.arguments import _add_network_size_args, parse_args
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_op_fuser_transformer_config_args_are_exposed():
+    parser = argparse.ArgumentParser()
+    _add_network_size_args(parser)
+
+    args = parser.parse_args(
+        ["--use-transformer-engine-op-fuser", "--moe-mlp-glu-interleave-size", "16"]
+    )
+
+    assert args.use_transformer_engine_op_fuser is True
+    assert args.moe_mlp_glu_interleave_size == 16
+
+
+def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
+    interleaved = torch.tensor(
+        [
+            [1, 2, 5, 6, 3, 4, 7, 8],
+            [11, 12, 15, 16, 13, 14, 17, 18],
+        ]
+    )
+    expected = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [11, 12, 13, 14, 15, 16, 17, 18],
+        ]
+    )
+
+    output = TEGroupedMLP._remove_glu_interleaving(interleaved, interleave_size=2)
+
+    torch.testing.assert_close(output, expected)
+
+
+def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch):
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(
+            self,
+            num_gemms,
+            in_features,
+            out_features,
+            *,
+            bias,
+            device,
+            dtype,
+            accumulate_into_main_grad,
+            single_grouped_parameter,
+        ):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.in_features = in_features
+            self.out_features = out_features
+            self.use_bias = bias
+            self.device = device
+            self.dtype = dtype
+            self.fuse_wgrad_accumulation = accumulate_into_main_grad
+            self.single_grouped_parameter = single_grouped_parameter
+
+        def need_backward_dw(self):
+            return False
+
+    class FakeScaledSwiGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+
+    class FakeSequential(list):
+        def register_forward_pre_hook(self, hook):
+            self.forward_pre_hook = hook
+
+    fake_te = SimpleNamespace(
+        pytorch=SimpleNamespace(
+            GroupedLinear=FakeGroupedLinear,
+            ops=SimpleNamespace(
+                GroupedLinear=FakeGroupedLinear,
+                ScaledSwiGLU=FakeScaledSwiGLU,
+                Sequential=FakeSequential,
+            ),
+        )
+    )
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_mlp_glu_interleave_size=16)
+    module.linear_fc1 = FakeGroupedLinear(
+        2,
+        4,
+        8,
+        bias=True,
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=True,
+        single_grouped_parameter=False,
+    )
+    module.linear_fc2 = FakeGroupedLinear(
+        2,
+        8,
+        4,
+        bias=False,
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_parameter=True,
+    )
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4) * 2)
+    module.linear_fc1.bias0 = torch.nn.Parameter(torch.zeros(8))
+    module.linear_fc1.bias1 = torch.nn.Parameter(torch.ones(8))
+    module.linear_fc2.weight = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    assert len(ops) == 3
+    assert ops[0].device == "meta"
+    assert ops[0].weight0 is module.linear_fc1.weight0
+    assert ops[0].weight1 is module.linear_fc1.weight1
+    assert ops[0].bias0 is module.linear_fc1.bias0
+    assert ops[0].bias1 is module.linear_fc1.bias1
+    assert ops[1].glu_interleave_size == 16
+    assert ops[2].device == "meta"
+    assert ops[2].weight is module.linear_fc2.weight
+    assert hasattr(ops, "forward_pre_hook")
+
+
+def test_fused_forward_caches_ops_and_forwards_expected_arguments():
+    class FakeFusedOps:
+        def __call__(self, hidden_states, fc1_tokens, probs, fc2_tokens):
+            self.args = (hidden_states, fc1_tokens, probs, fc2_tokens)
+            return hidden_states + 1
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(fp8=False, fp4=False)
+    module._fused_ops = None
+    fused_ops = FakeFusedOps()
+    module._make_fused_ops = lambda: fused_ops
+    hidden_states = torch.zeros(2, 4)
+    tokens_per_expert = torch.tensor([1, 1])
+    probs = torch.ones(2)
+
+    output = module._fused_forward(hidden_states, tokens_per_expert, probs)
+
+    torch.testing.assert_close(output, torch.ones_like(hidden_states))
+    assert module._fused_ops is fused_ops
+    assert fused_ops.args[0] is hidden_states
+    assert fused_ops.args[1] is tokens_per_expert
+    assert fused_ops.args[2] is probs
+    assert fused_ops.args[3] is tokens_per_expert
 
 
 @pytest.mark.skipif(
