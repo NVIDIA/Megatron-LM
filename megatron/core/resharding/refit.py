@@ -27,6 +27,7 @@ from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .transforms import MXFP8ReshardTransform, ReshardTransform
+from .utils import named_persistent_buffers
 
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
@@ -376,6 +377,59 @@ def swap_model_weights(
     )
 
 
+def _harmonize_buffer_dtypes(src_core, tgt_core, group=None):
+    """Bring destination persistent-buffer dtypes into agreement with source.
+
+    Some buffers (notably the MoE router ``expert_bias``) are upcast to fp32
+    inside the trainer on first forward by ``_maintain_float32_expert_bias``,
+    while the freshly-built inference model still holds them in bf16 from the
+    ``Float16Module`` wrap.  The reshard send/recv path is dtype-strict —
+    sending fp32 bytes into a bf16 receive buffer corrupts the data — so dst's
+    buffer must match src's dtype before the transfer.
+
+    Works for both collocated and non-collocated transfers: every rank reports
+    its source-side persistent-buffer dtypes via a single
+    ``all_gather_object`` on ``group``.  Destination-side ranks then look up
+    each of their own buffers in the gathered map and replace the tensor with
+    one in src's dtype.  Source-only and idle ranks contribute empty dicts and
+    skip the apply step, but still participate in the collective so it is
+    well-formed across every rank.
+
+    Buffer matching is by raw module path (e.g. ``decoder.layers.0.…``); the
+    planner's PP-aware ``resolved_name`` is intentionally not used here because
+    we only need the dtype, which is uniform for a given buffer kind across
+    layers in practice.
+    """
+    # Build local map of source-side persistent buffer dtypes.
+    local_src_dtypes: dict[str, torch.dtype] = {}
+    if src_core is not None:
+        for full_name, _sub, _buf_name, buf in named_persistent_buffers(src_core):
+            local_src_dtypes[full_name] = buf.dtype
+
+    world_size = group.size() if group is not None else torch.distributed.get_world_size()
+    gathered: list = [None] * world_size
+    torch.distributed.all_gather_object(gathered, local_src_dtypes, group=group)
+
+    canonical: dict[str, torch.dtype] = {}
+    for d in gathered:
+        if not d:
+            continue
+        for name, dtype in d.items():
+            # Replicated buffers agree across ranks; first writer wins.
+            canonical.setdefault(name, dtype)
+
+    if tgt_core is None:
+        return
+
+    for full_name, sub, buf_name, dst_buf in named_persistent_buffers(tgt_core):
+        expected = canonical.get(full_name)
+        if expected is not None and dst_buf.dtype != expected:
+            # Replace the tensor in-place on the parent module so subsequent
+            # recvs write the right number of bytes and the in-model lookup
+            # (``self.expert_bias``) sees the new storage.
+            sub._buffers[buf_name] = dst_buf.to(expected)
+
+
 def reshard_model_weights(
     src_model: LanguageModule,
     target_model: LanguageModule,
@@ -400,6 +454,7 @@ def reshard_model_weights(
         transform: Optional ReshardTransform for custom format conversion.
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
+    _harmonize_buffer_dtypes(src_core, tgt_core, group=group)
     plan = _build_or_get_plan(
         src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
     )
