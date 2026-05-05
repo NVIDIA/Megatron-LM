@@ -1776,8 +1776,6 @@ class TextGenerationController:
             return "pipeline parallel is unsupported"
         if context.config.enable_prefix_caching:
             return "prefix caching is unsupported"
-        if context.config.enable_chunked_prefill:
-            return "chunked prefill is unsupported"
         if context.config.logging_step_interval != 0:
             return "logging sync is enabled"
         if not context.config.materialize_only_last_token_logits:
