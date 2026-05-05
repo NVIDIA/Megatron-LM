@@ -68,7 +68,7 @@ audit.
 from __future__ import annotations
 
 import re
-from typing import Dict, Optional, Set, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
@@ -197,9 +197,7 @@ def compute_shadow_shard_ids(
 
 
 def rewrite_replicas_to_shadow(
-    sharded_state_dict: ShardedStateDict,
-    global_rank: int,
-    shadow_shard_ids: Set[_ShardId],
+    sharded_state_dict: ShardedStateDict, global_rank: int, shadow_shard_ids: Set[_ShardId]
 ) -> int:
     """Promote selected local replicas to shadow savers in place.
 
@@ -232,7 +230,6 @@ def rewrite_replicas_to_shadow(
             continue
         if _sharded_tensor_shard_id(sh) not in shadow_shard_ids:
             continue
-        print(f"[DEBUG shadow keys | {global_rank}] {sh.key} -> {shadow_key(global_rank, sh.key)}")
         sh.key = shadow_key(global_rank, sh.key)
         sh.replica_id = 0
         n_renamed += 1
@@ -292,9 +289,7 @@ def restore_pyt_state_dict_from_shadows(
         pyt_state_dict[original_fqn] = pyt_state_dict.pop(shadow_fqn)
 
 
-def filter_non_shadow_keys(
-    state_dict_metadata: Dict[str, object],
-) -> Dict[str, object]:
+def filter_non_shadow_keys(state_dict_metadata: Dict[str, object]) -> Dict[str, object]:
     """Return a copy of ``state_dict_metadata`` with shadow entries removed.
 
     Used by :class:`MCoreSavePlanner` to bypass the default

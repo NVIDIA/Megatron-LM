@@ -498,8 +498,8 @@ class MCoreSavePlanner(DefaultSavePlanner):
         import dataclasses
 
         from torch.distributed.checkpoint.default_planner import (
-            create_default_global_save_plan,
             _validate_global_plan,
+            create_default_global_save_plan,
         )
 
         from .local_replica import filter_non_shadow_keys
@@ -509,14 +509,14 @@ class MCoreSavePlanner(DefaultSavePlanner):
 
         if self.flatten_state_dict:
             from collections import ChainMap
+
             planner_data_dict = [p.planner_data for p in global_plan]
             merged_mappings = dict(ChainMap(*planner_data_dict))
             metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
 
         # Strip shadow entries before the volume check (see docstring).
         metadata_for_validation = dataclasses.replace(
-            metadata,
-            state_dict_metadata=filter_non_shadow_keys(metadata.state_dict_metadata),
+            metadata, state_dict_metadata=filter_non_shadow_keys(metadata.state_dict_metadata)
         )
         result = _validate_global_plan(global_plan, metadata_for_validation)
         # PyT versions disagree on the return type: older builds return a
@@ -531,9 +531,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
                 error_summary = "; ".join(result)
                 if len(error_summary) > 500:
                     error_summary = error_summary[:500] + "... (truncated)"
-                raise ValueError(
-                    f"Failed to validate global plan: {error_summary}"
-                )
+                raise ValueError(f"Failed to validate global plan: {error_summary}")
 
         return global_plan, metadata
 

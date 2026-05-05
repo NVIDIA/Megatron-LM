@@ -774,10 +774,7 @@ class TestLocalReplicaSaveLoad:
         full = torch.arange(8 * tp_size, dtype=torch.float32).reshape(2 * tp_size, 4)
         local = full[2 * tp_rank : 2 * (tp_rank + 1)].clone()
         linear = ShardedTensor.from_rank_offsets(
-            'linear.weight',
-            local,
-            (0, tp_rank, tp_size),
-            replica_id=(0, 0, dp_cp_rank),
+            'linear.weight', local, (0, tp_rank, tp_size), replica_id=(0, 0, dp_cp_rank)
         )
         sd = {'rmsnorm.weight': rmsnorm, 'linear.weight': linear}
         expected = {'rmsnorm.weight': replicated, 'linear.weight': full}
@@ -811,7 +808,9 @@ class TestLocalReplicaSaveLoad:
             )
             parallelization_group = parallel_state.get_expert_data_parallel_group()
         else:
-            Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+            )
             parallelization_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=True
             )
@@ -872,7 +871,9 @@ class TestLocalReplicaSaveLoad:
         """
         import pickle
 
-        Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+        )
         parallelization_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
         state_dict, _ = self._make_state_dict()
@@ -903,15 +904,15 @@ class TestLocalReplicaSaveLoad:
         """
         import pickle
 
-        Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+        )
         parallelization_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
         state_dict, _ = self._make_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'local_replica_on_metadata') as ckpt_dir:
             save_strategy = FullyParallelSaveStrategyWrapper(
-                TorchDistSaveShardedStrategy(),
-                parallelization_group,
-                replicate_local_replicas=True,
+                TorchDistSaveShardedStrategy(), parallelization_group, replicate_local_replicas=True
             )
             save_strategy.save(state_dict, ckpt_dir)
 
