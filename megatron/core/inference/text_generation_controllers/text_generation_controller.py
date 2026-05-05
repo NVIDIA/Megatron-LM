@@ -540,14 +540,11 @@ class TextGenerationController:
             input_ids (Tensor): The active input IDs.
             position_ids (Tensor): The active position IDs.
         """
-        with torch.cuda.nvtx.range("ctx_init.get_context"):
-            context = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
 
         # Remove Float16Module wrapper if it exists
-        with torch.cuda.nvtx.range("ctx_init.unwrap_model"):
-            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-        with torch.cuda.nvtx.range("ctx_init.get_model_config"):
-            model_config = get_model_config(unwrapped_model)
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state (100% CPU computation).
         range_push("initialize_attention_state")

@@ -2288,64 +2288,52 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
-        with torch.cuda.nvtx.range("xfer_bk.compute_slices"):
-            n_active = self.total_request_count - self.paused_request_count
-            active_slice = slice(self.paused_request_count, self.total_request_count)
-            padded_active = max(n_active, self.padded_active_request_count)
+        n_active = self.total_request_count - self.paused_request_count
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        padded_active = max(n_active, self.padded_active_request_count)
 
         # Refresh request-level staging slots from the persistent CPU source.
         # CPU-to-CPU slice assignment on pinned memory (~15 KB total for 6
         # 4-byte fields at max_requests=624). Negligible vs. the launch overhead
         # we save by merging the H2D memcpys into 1.
-        with torch.cuda.nvtx.range("xfer_bk.staging_request_fields"):
-            self._staging_request_in_prefill_status[:n_active] = (
-                self.request_in_prefill_status_tensor[active_slice]
-            )
-            self._staging_request_query_lengths[:n_active] = self.request_query_lengths[
-                active_slice
-            ]
-            self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
-                active_slice
-            ]
+        self._staging_request_in_prefill_status[:n_active] = self.request_in_prefill_status_tensor[
+            active_slice
+        ]
+        self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
+        self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
+            active_slice
+        ]
         # Sampling-parameter staging slots: read from `active_request_metadata`,
         # which `build_active_slices` + `pad_active_slices` already populated for
         # `[:padded_active]` (active values + neutral padding defaults).
-        with torch.cuda.nvtx.range("xfer_bk.staging_sampling_params"):
-            self._staging_temperature[:padded_active] = self.active_request_metadata[
-                "temperature"
-            ][:padded_active]
-            self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][
-                :padded_active
-            ]
-            self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][
-                :padded_active
-            ]
+        self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
+            :padded_active
+        ]
+        self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][:padded_active]
+        self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][:padded_active]
 
         # Full-iteration CUDA graphs may have captured GPU consumers with the
         # padded graph request count. Keep those padded staging rows bounded so
         # graph replay never builds indices from stale request lengths.
         if n_active < padded_active:
-            with torch.cuda.nvtx.range("xfer_bk.zero_pad_rows"):
-                self._staging_request_in_prefill_status[n_active:padded_active] = 0
-                self._staging_request_query_lengths[n_active:padded_active] = 0
-                self._staging_request_kv_length_offsets[n_active:padded_active] = 0
+            self._staging_request_in_prefill_status[n_active:padded_active] = 0
+            self._staging_request_query_lengths[n_active:padded_active] = 0
+            self._staging_request_kv_length_offsets[n_active:padded_active] = 0
 
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        with torch.cuda.nvtx.range("xfer_bk.h2d_copy"):
-            self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
         # bytes. Nothing else to do here for MHA.
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
-        with torch.cuda.nvtx.range("xfer_bk.mamba_transfer"):
-            if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
-                self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
-                self._pending_mamba_transfer = None
+        if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
+            self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
+            self._pending_mamba_transfer = None
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
@@ -2447,20 +2435,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tuple[Tensor, Tensor]) Flattened active input and position IDs.
         """
-        with torch.cuda.nvtx.range("cur_input.resolve_count"):
-            num_tokens = num_warmup_tokens or self.padded_active_token_count
-        with torch.cuda.nvtx.range("cur_input.assert_count"):
-            assert num_tokens >= self.padded_batch_dimensions.decode_req_count * (
-                self.num_speculative_tokens + 1
-            )
+        num_tokens = num_warmup_tokens or self.padded_active_token_count
+        assert num_tokens >= self.padded_batch_dimensions.decode_req_count * (
+            self.num_speculative_tokens + 1
+        )
         cached = self._input_position_views.get(num_tokens)
         if cached is not None:
             return cached
-        with torch.cuda.nvtx.range("cur_input.build_views"):
-            input_ids = self.gpu_view.token_to_input_ids[:num_tokens].unsqueeze(0)
-            pos_ids = self.gpu_view.token_to_pos_ids[:num_tokens].unsqueeze(0)
-            cached = (input_ids, pos_ids)
-            self._input_position_views[num_tokens] = cached
+        input_ids = self.gpu_view.token_to_input_ids[:num_tokens].unsqueeze(0)
+        pos_ids = self.gpu_view.token_to_pos_ids[:num_tokens].unsqueeze(0)
+        cached = (input_ids, pos_ids)
+        self._input_position_views[num_tokens] = cached
         return cached
 
     def speculative_required_logit_indices(self) -> Tensor:
