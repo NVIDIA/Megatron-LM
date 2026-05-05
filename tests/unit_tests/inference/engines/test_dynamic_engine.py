@@ -984,6 +984,72 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_scheduling_prompt_top_n_logprobs_resume_decode_gpt_e2e(self) -> None:
+        """Prompt top-N logprobs are collected before async decode resumes."""
+
+        def assert_top_n_match(actual_top_n, expected_top_n):
+            assert len(actual_top_n) == len(expected_top_n)
+            for actual, expected in zip(actual_top_n, expected_top_n):
+                assert actual.keys() == expected.keys()
+                for token in actual:
+                    assert actual[token] == pytest.approx(expected[token])
+
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            materialize_only_last_token_logits=False,
+            top_n_logprobs=4,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+        serial_prompt_log_probs = [request.prompt_log_probs for request in serial_env.requests]
+        serial_generated_log_probs = [
+            request.generated_log_probs for request in serial_env.requests
+        ]
+        serial_prompt_top_n = [request.prompt_top_n_logprobs for request in serial_env.requests]
+        serial_generated_top_n = [
+            request.generated_top_n_logprobs for request in serial_env.requests
+        ]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_decode_graph_launch_count == 0
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+        for request, prompt_lp, generated_lp, prompt_top_n, generated_top_n in zip(
+            async_env.requests,
+            serial_prompt_log_probs,
+            serial_generated_log_probs,
+            serial_prompt_top_n,
+            serial_generated_top_n,
+        ):
+            assert len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
+            assert request.prompt_log_probs == pytest.approx(prompt_lp)
+            assert len(request.generated_log_probs) == len(request.generated_tokens)
+            assert request.generated_log_probs == pytest.approx(generated_lp)
+            assert_top_n_match(request.prompt_top_n_logprobs, prompt_top_n)
+            assert_top_n_match(request.generated_top_n_logprobs, generated_top_n)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_scheduling_generated_logprobs_gpt_finish_row_map_e2e(self) -> None:
         """Generated logprobs stay aligned when finished requests row-map a pending forward."""
         common_kwargs = dict(
@@ -4193,11 +4259,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             # Update sampling params to include top_n_logprobs
             request.sampling_params = SamplingParams(
                 num_tokens_to_generate=test_config.num_tokens_to_generate,
-                termination_id=test_config.vocab_size - 1,
+                termination_id=-1,
                 return_log_probs=True,
                 top_n_logprobs=top_n,
                 skip_prompt_log_probs=skip_prompt_log_probs,
-                top_k=10,  # Add some sampling randomness
+                top_k=1,
             )
             requests_to_add.append(request)
 
