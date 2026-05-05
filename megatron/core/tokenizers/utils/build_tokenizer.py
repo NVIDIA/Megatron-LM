@@ -74,6 +74,13 @@ def build_tokenizer(args, **kwargs):
         metadata = {'library': tokenizer_library}
         if args.vocab_size:
             kwargs['vocab_size'] = args.vocab_size
+        if args.tokenizer_type == 'NullTokenizer':
+            null_eod_id = getattr(args, 'null_tokenizer_eod_id', None)
+            if null_eod_id is not None:
+                kwargs['eod_id'] = null_eod_id
+            null_pad_id = getattr(args, 'null_tokenizer_pad_id', None)
+            if null_pad_id is not None:
+                kwargs['pad_id'] = null_pad_id
         tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, **kwargs)
 
         # Add vocab size (if not already set from a checkpoint).

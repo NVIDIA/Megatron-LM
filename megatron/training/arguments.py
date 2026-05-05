@@ -83,6 +83,8 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
 
+    parser = _add_fault_injector_args(parser)
+
     return parser
 
 
@@ -747,7 +749,7 @@ def validate_args(args, defaults={}):
             args.rank,
         )
 
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    from megatron.core.models.hybrid.hybrid_layer_allocation import (
         Symbols,
         get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
@@ -1773,6 +1775,9 @@ def validate_args(args, defaults={}):
             )
             args.async_save = False
 
+    if not args.async_save:
+        args.async_strategy = "mcore"
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert (
@@ -2059,7 +2064,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
@@ -2551,7 +2556,7 @@ def _add_network_size_args(parser):
         '--position-embedding-type',
         type=str,
         default='learned_absolute',
-        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
+        choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
         help='Position embedding type.',
     )
     group.add_argument(
@@ -4044,6 +4049,19 @@ def _add_tokenizer_args(parser):
         default=False,
         help='Whether or not to allow PreTrainedTokenizer to execute remote code',
     )
+    group.add_argument(
+        '--null-tokenizer-eod-id',
+        type=int,
+        default=None,
+        help='EOD token id for NullTokenizer. Defaults to `vocab_size - 1`.',
+    )
+    group.add_argument(
+        '--null-tokenizer-pad-id',
+        type=int,
+        default=-1,
+        help='Pad token id for NullTokenizer. Defaults to -1 (no pad token). '
+        'Set to a value outside the dataset to avoid masking real tokens.',
+    )
     return parser
 
 
@@ -4599,13 +4617,13 @@ def _add_mla_args(parser):
         '--o-groups',
         type=int,
         default=8,
-        help="Number of groups for grouped output (wo_a). 0 = single linear."
+        help="Number of groups for grouped output (wo_a). 0 = single linear.",
     )
     group.add_argument(
         '--o-lora-rank',
         type=int,
         default=1024,
-        help="Low-rank dimension per group for grouped output (wo_a). Used when o-groups > 0."
+        help="Low-rank dimension per group for grouped output (wo_a). Used when o-groups > 0.",
     )
     group.add_argument(
         '--cache-mla-latents',
@@ -4645,11 +4663,11 @@ def _add_experimental_attention_variant_args(parser):
         type=compress_ratios_type,
         default=None,
         help='Per-layer compress ratios for compressed sparse attention. '
-            'Accepts a string containing a Python list expression, e.g.: '
-            '"[0,0,4,128,4,128]" or "([0]+[4,128]*2)*3". '
-            'Each value is the compression ratio for the corresponding '
-            'transformer layer (valid values: 0, 4, 128). '
-            'The list length must equal num_layers.'
+        'Accepts a string containing a Python list expression, e.g.: '
+        '"[0,0,4,128,4,128]" or "([0]+[4,128]*2)*3". '
+        'Each value is the compression ratio for the corresponding '
+        'transformer layer (valid values: 0, 4, 128). '
+        'The list length must equal num_layers.',
     )
     return parser
 
@@ -4883,4 +4901,11 @@ def _add_sft_args(parser):
         'If not specified and --mock-data is set, defaults to a lognormal distribution with '
         'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
     )
+    return parser
+
+
+def _add_fault_injector_args(parser):
+    from megatron.training.config import FaultInjectorConfig
+
+    ArgumentGroupFactory(FaultInjectorConfig).build_group(parser, "fault injector")
     return parser

@@ -19,7 +19,7 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=FutureWarning)
 
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -47,6 +47,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
@@ -97,7 +98,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
           - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
             regardless of pipeline stage.
 
-        Difference from ``pretrain_mamba.py``:
+        Difference from ``pretrain_hybrid.py``:
           - Return format: GPT returns a 6-tuple
             ``(tokens, labels, loss_mask, attention_mask, position_ids,
             packed_seq_params)`` where ``packed_seq_params`` is a
@@ -313,7 +314,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     )
 
 
-def core_gpt_dataset_config_from_args(args):
+def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -351,8 +352,7 @@ def core_gpt_dataset_config_from_args(args):
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
-        "dynamic_context_parallel": args.dynamic_context_parallel,
-        "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
+        "hybrid_context_parallel": args.hybrid_context_parallel,
     }
 
     # add FIM args to the config
@@ -441,7 +441,7 @@ if __name__ == "__main__":
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
-    train_valid_test_datasets_provider.is_distributed = True
+    setattr(train_valid_test_datasets_provider, "is_distributed", True)
 
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
@@ -450,7 +450,9 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
+    full_config = pretrain_cfg_container_from_args(args)
     pretrain(
+        full_config,
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
