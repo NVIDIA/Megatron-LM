@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -27,32 +28,48 @@ class LogProbsSpeculative:
     When prefill logits are available it delegates to `LogProbsPrefill` for the prefill portion.
     """
 
-    def __init__(self, config=None):
+    def __init__(
+        self,
+        config=None,
+        *,
+        side_stream: Optional[torch.cuda.Stream] = None,
+        side_pool_anchor: Optional[CudaGraphManager] = None,
+    ):
         """
         Args:
             config: Optional MegatronConfig for CUDA graph capture configuration.
+            side_stream: Optional CUDA stream the controller hosts softmax, indexing, and top-n on.
+            side_pool_anchor: Optional anchor whose mempool the side-stream graph shares.
         """
+        self._side_stream = side_stream
         # Pinned CPU scalar holding `num_decode * spec_plus_one`.
         self._prefill_offset_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
+        self.side_pool_anchor: Optional[CudaGraphManager] = None
         if config is not None and config.cuda_graph_impl == "local":
-            CudaGraphManager(
+            self.side_pool_anchor = CudaGraphManager(
                 config,
                 self,
                 function_name="softmax_kernel",
                 need_backward=False,
                 inline_capture=True,
-            )
-            CudaGraphManager(
-                config,
-                self,
-                function_name="gather_kernel",
-                need_backward=False,
-                inline_capture=True,
+                **(
+                    {"share_mempool_with": side_pool_anchor}
+                    if side_pool_anchor is not None
+                    else {"new_mempool": True}
+                ),
             )
             CudaGraphManager(
                 config,
                 self,
                 function_name="prefill_indexing_kernel",
+                need_backward=False,
+                inline_capture=True,
+                share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+            )
+            CudaGraphManager(
+                config,
+                self,
+                function_name="gather_kernel",
                 need_backward=False,
                 inline_capture=True,
             )
@@ -481,37 +498,44 @@ class LogProbsSpeculative:
         prefill_top_n_v = prefill_top_n_i = None
         fp_top_n_v = fp_top_n_i = None
 
-        # TODO: Overlap eager top-n compute on a side stream with sampling/extract work.
         if top_n_max > 0:
-            # Decode region: topk on [num_decode * spec_plus_one] real rows,
-            # LSE-adjust using the pre-computed decode_lse,
-            # reshape to [num_decode, spec+1, top_n_max] for per-position addressing in extract.
-            if num_decode > 0:
-                decode_len = num_decode * spec_plus_one
-                raw_decode = logits.squeeze(0)[:decode_len].float()
-                top_n_v_raw, top_n_i_raw = _topk(raw_decode, k=top_n_max)
-                top_n_v_flat = top_n_v_raw - decode_lse[:num_decode].reshape(decode_len).unsqueeze(
-                    -1
-                )
-                decode_top_n_v = top_n_v_flat.reshape(num_decode, spec_plus_one, -1)
-                decode_top_n_i = top_n_i_raw.reshape(num_decode, spec_plus_one, -1)
+            if self._side_stream is not None:
+                if fp_lse is not None:
+                    fp_lse.record_stream(self._side_stream)
+                self._side_stream.wait_stream(torch.cuda.current_stream())
+                stream_ctx = torch.cuda.stream(self._side_stream)
+            else:
+                stream_ctx = nullcontext()
+            with stream_ctx:
+                # Decode region: topk on [num_decode * spec_plus_one] real rows,
+                # LSE-adjust using the pre-computed decode_lse,
+                # reshape to [num_decode, spec+1, top_n_max] for per-position addressing in extract.
+                if num_decode > 0:
+                    decode_len = num_decode * spec_plus_one
+                    raw_decode = logits.squeeze(0)[:decode_len].float()
+                    top_n_v_raw, top_n_i_raw = _topk(raw_decode, k=top_n_max)
+                    top_n_v_flat = top_n_v_raw - decode_lse[:num_decode].reshape(
+                        decode_len
+                    ).unsqueeze(-1)
+                    decode_top_n_v = top_n_v_flat.reshape(num_decode, spec_plus_one, -1)
+                    decode_top_n_i = top_n_i_raw.reshape(num_decode, spec_plus_one, -1)
 
-            # Last-token prefill region.
-            # In full-prefill mode this is overridden per-request by the full-prefill top-n;
-            # it's still emitted here so only-last mode has it without an extra branch.
-            if num_prefill > 0:
-                decode_len = num_decode * spec_plus_one
-                raw_prefill = logits.squeeze(0)[decode_len : decode_len + num_prefill].float()
-                top_n_v_raw, top_n_i_raw = _topk(raw_prefill, k=top_n_max)
-                prefill_top_n_v = top_n_v_raw - prefill_lse[:num_prefill].unsqueeze(-1)
-                prefill_top_n_i = top_n_i_raw
+                # Last-token prefill region.
+                # In full-prefill mode this is overridden per-request by the full-prefill top-n;
+                # it's still emitted here so only-last mode has it without an extra branch.
+                if num_prefill > 0:
+                    decode_len = num_decode * spec_plus_one
+                    raw_prefill = logits.squeeze(0)[decode_len : decode_len + num_prefill].float()
+                    top_n_v_raw, top_n_i_raw = _topk(raw_prefill, k=top_n_max)
+                    prefill_top_n_v = top_n_v_raw - prefill_lse[:num_prefill].unsqueeze(-1)
+                    prefill_top_n_i = top_n_i_raw
 
-            # Full-prefill region: per-token top-n addressed by fp_li.
-            if fp_slp is not None:
-                raw_full_prefill = logits.squeeze(0)[fp_li].float()
-                top_n_v_raw, top_n_i_raw = _topk(raw_full_prefill, k=top_n_max)
-                fp_top_n_v = top_n_v_raw - fp_lse.unsqueeze(-1)
-                fp_top_n_i = top_n_i_raw
+                # Full-prefill region: per-token top-n addressed by fp_li.
+                if fp_slp is not None:
+                    raw_full_prefill = logits.squeeze(0)[fp_li].float()
+                    top_n_v_raw, top_n_i_raw = _topk(raw_full_prefill, k=top_n_max)
+                    fp_top_n_v = top_n_v_raw - fp_lse.unsqueeze(-1)
+                    fp_top_n_i = top_n_i_raw
 
         # Defer the CPU-side extract: caller invokes the partial after step bookkeeping
         # so D2H copies pay their synchronization cost as late as possible.
