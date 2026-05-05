@@ -542,6 +542,47 @@ class TestApplyTemporalGrouping:
             )
 
     @pytest.mark.internal
+    def test_mixed_video_lengths_first_clean_second_with_last_frame_dup(self):
+        """Two videos: first has 4 frames (evenly divisible by T=2, no duplication),
+        second has 3 frames (last frame duplicated to fill the 2nd tubelet).
+
+        Verifies that both videos independently produce new_num_frames[i]=2 and that
+        the duplication only affects the final tubelet of the second video.
+        """
+        global_t, imgs_sizes = self._make_global([4, 3])
+        x_grouped, _new_sizes, new_nf, _packed, is_image = RADIOViTModel._apply_temporal_grouping(
+            self._stub(),
+            x=global_t,
+            imgs_sizes=imgs_sizes,
+            num_frames=[4, 3],
+            packed_seq_params=None,
+            skip_image_duplication=False,
+        )
+
+        assert new_nf == [2, 2]
+        assert is_image == [False, False, False, False]
+        per_img = self.PATCH_DIM * self.PATCH_DIM
+        assert x_grouped.shape == (1, 4 * per_img, 8 * self.TEMPORAL_PATCH_DIM)
+
+        h = 8  # default hidden from _make_global
+        # Video 0, tubelet 0: [frame 0.0, frame 1.0] — clean, no duplication.
+        t0 = x_grouped[0, :per_img]
+        assert torch.all(t0[:, :h] == 0.0)
+        assert torch.all(t0[:, h:] == 1.0)
+        # Video 0, tubelet 1: [frame 2.0, frame 3.0] — clean, no duplication.
+        t1 = x_grouped[0, per_img : 2 * per_img]
+        assert torch.all(t1[:, :h] == 2.0)
+        assert torch.all(t1[:, h:] == 3.0)
+        # Video 1, tubelet 0: [frame 100.0, frame 101.0] — clean.
+        t2 = x_grouped[0, 2 * per_img : 3 * per_img]
+        assert torch.all(t2[:, :h] == 100.0)
+        assert torch.all(t2[:, h:] == 101.0)
+        # Video 1, tubelet 1: [frame 102.0, frame 102.0] — last frame duplicated.
+        t3 = x_grouped[0, 3 * per_img : 4 * per_img]
+        assert torch.all(t3[:, :h] == 102.0)
+        assert torch.all(t3[:, h:] == 102.0)
+
+    @pytest.mark.internal
     def test_skip_image_duplication_returns_list_of_chunks(self):
         """``skip_image_duplication=True`` returns a list (not a concat tensor)
         so ``separate_video_embedder`` can route image chunks to a different embedder."""
