@@ -774,6 +774,38 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_scheduling_top_p_sampling_gpt_cuda_graph_fallback_e2e(self) -> None:
+        """Top-p sampling uses async forward overlap without replaying the greedy decode graph."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=0,
+            top_p=0.9,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_decode_graph_launch_count == 0
+        assert [request.generated_tokens for request in async_env.requests] == [
+            request.generated_tokens for request in serial_env.requests
+        ]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_scheduling_generated_logprobs_gpt_cuda_graph_fallback_e2e(self) -> None:
         """Generated logprobs keep async forward overlap without using the decode graph."""
         common_kwargs = dict(
@@ -2425,10 +2457,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.active_request_metadata["top_k"][0] = 10
         assert controller._async_scheduling_disabled_reason() is None
         with torch.inference_mode():
-            context.active_request_metadata["top_k"][0] = 1
+            context.active_request_metadata["top_k"][0] = 0
             context.active_request_metadata["top_p"][0] = 0.9
-        assert controller._async_scheduling_disabled_reason() == "top_p sampling"
+        assert controller._async_scheduling_disabled_reason() is None
         with torch.inference_mode():
+            context.active_request_metadata["top_k"][0] = 1
             context.active_request_metadata["top_p"][0] = 0.0
         with torch.inference_mode():
             context.active_request_metadata["return_log_probs"][0] = True

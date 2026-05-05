@@ -1902,8 +1902,6 @@ class TextGenerationController:
         active_slice = slice(0, active_request_count)
         return_log_probs_requested = active_metadata["return_log_probs"][active_slice]
         top_n_logprobs_requested = active_metadata["top_n_logprobs"][active_slice] > 0
-        if (active_metadata["top_p"][active_slice] != 0.0).any():
-            return "top_p sampling"
         if (
             (return_log_probs_requested | top_n_logprobs_requested)
             & ~active_metadata["skip_prompt_log_probs"][active_slice]
