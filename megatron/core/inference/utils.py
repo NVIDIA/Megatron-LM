@@ -352,7 +352,10 @@ class GPUFuture:
     """Awaitable that resolves when all preceding work on a CUDA stream completes.
 
     Instead of blocking on the CPU thread, this future fires a callback from CUDA's internal thread.
-    When the callback triggers, this class attempts to prepend the task to the event loop queue.
+
+    When `interrupt_event_loop` is True, the callback is prepended to the event loop queue.
+    When False (default), the callback is treated like a normal asyncio callback.
+    Note that `interrupt_event_loop=True` requires a `PriorityEventLoop`.
 
     Usage:
 
@@ -363,14 +366,15 @@ class GPUFuture:
         gpu_done.record()
         # Recommendation: enqueue a short GPU workload to cover the latency of the callback.
         launch_short_gpu_work(...)
-        await gpu_done    # resumes at front of queue as soon as GPU finishes.
+        await gpu_done    # resumes as soon as GPU finishes.
     """
 
     _prevent_gc: dict = {}
     _asyncio_future_blocking = False
 
-    def __init__(self, loop: asyncio.AbstractEventLoop):
+    def __init__(self, loop: asyncio.AbstractEventLoop, interrupt_event_loop: bool = False):
         self._loop = loop
+        self._interrupt_event_loop = interrupt_event_loop
         self._done = False
         self._callbacks: list = []
 
@@ -391,12 +395,23 @@ class GPUFuture:
             raise asyncio.InvalidStateError('not ready')
         return None
 
+    def _schedule(self, fn, *, context=None):
+        """Schedule `fn` on the loop, at the front of the queue if interrupting."""
+        if self._interrupt_event_loop:
+            self._loop.call_soon_front(fn, self, context=context)
+        else:
+            self._loop.call_soon(fn, self, context=context)
+
+    def _schedule_threadsafe(self, fn):
+        """Thread-safe variant of `_schedule`, without the future arg / context."""
+        if self._interrupt_event_loop:
+            self._loop.call_soon_threadsafe_front(fn)
+        else:
+            self._loop.call_soon_threadsafe(fn)
+
     def add_done_callback(self, fn, *, context=None):
         if self._done:
-            try:
-                self._loop.call_soon_front(fn, self, context=context)
-            except AttributeError:
-                self._loop.call_soon(fn, self, context=context)
+            self._schedule(fn, context=context)
         else:
             self._callbacks.append((fn, context))
 
@@ -422,10 +437,7 @@ class GPUFuture:
         def _host_fn(_user_data: ctypes.c_void_p) -> None:
             # Runs on CUDA's internal callback thread; MUST NOT call CUDA API.
             try:
-                try:
-                    self._loop.call_soon_threadsafe_front(self._resolve)
-                except AttributeError:
-                    self._loop.call_soon_threadsafe(self._resolve)
+                self._schedule_threadsafe(self._resolve)
             except RuntimeError:
                 pass  # event loop closed
             GPUFuture._prevent_gc.pop(id(prevent_gc_ref), None)
@@ -442,11 +454,8 @@ class GPUFuture:
             raise RuntimeError(f"cudaLaunchHostFunc failed with CUDA error {err}")
 
     def _resolve(self):
-        """Mark done and fire callbacks at the front of the ready queue."""
+        """Mark done and fire pending callbacks."""
         self._done = True
         cbs, self._callbacks = self._callbacks, []
         for fn, ctx in cbs:
-            try:
-                self._loop.call_soon_front(fn, self, context=ctx)
-            except AttributeError:
-                self._loop.call_soon(fn, self, context=ctx)
+            self._schedule(fn, context=ctx)

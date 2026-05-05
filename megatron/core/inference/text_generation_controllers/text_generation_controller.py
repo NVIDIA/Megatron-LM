@@ -1721,7 +1721,7 @@ class TextGenerationController:
             return None
 
         loop = get_asyncio_loop(loop)
-        gpu_done = GPUFuture(loop)
+        gpu_done = GPUFuture(loop, interrupt_event_loop=True)
 
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
