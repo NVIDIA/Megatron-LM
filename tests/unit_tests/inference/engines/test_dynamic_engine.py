@@ -1970,6 +1970,34 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert list(engine.waiting_request_ids) == []
         assert engine.context.total_request_count == 2
 
+        full_env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=1,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        full_engine = full_env.engine
+        full_controller = full_engine.controller
+        full_engine._add_request(full_env.requests[0])
+        with torch.inference_mode():
+            full_engine.schedule_waiting_requests()
+        full_engine._add_request(full_env.requests[1])
+        monkeypatch.setattr(full_controller, "has_pending_async_forward", lambda: True)
+        assert not full_engine._defer_waiting_request_admission_for_async()
+        assert list(full_engine.waiting_request_ids) == [1]
+        assert full_engine.context.total_request_count == 1
+        assert full_controller._async_add_deferral_count == 0
+        assert not full_controller._async_admission_barrier_requested
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

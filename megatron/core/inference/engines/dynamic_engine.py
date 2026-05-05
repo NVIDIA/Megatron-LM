@@ -1505,6 +1505,12 @@ class DynamicInferenceEngine(AbstractEngine):
             return False
         if not self.controller.has_pending_async_forward():
             return False
+        req = self.get_request(self.waiting_request_ids[0])
+        request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
+            self.context.check_availability(req)
+        )
+        if not (request_can_be_added and request_tokens_can_be_added and kv_cache_available):
+            return False
         self.controller.request_async_admission_barrier()
         return True
 
