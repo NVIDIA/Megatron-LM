@@ -61,6 +61,10 @@ inputs:
     description: "Platform to run tests on (e.g. dgx_h100, dgx_gb200)"
     required: false
     default: "dgx_h100"
+  cadence:
+    description: "Trigger cadence for cadence filter (pr|nightly|mergegroup). Empty disables filter."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -135,6 +139,9 @@ runs:
         )
         if [ "${{ inputs.lightweight }}" == "true" ]; then
           ARGS+=(--enable-lightweight-mode)
+        fi
+        if [ -n "${{ inputs.cadence }}" ]; then
+          ARGS+=(--cadence ${{ inputs.cadence }})
         fi
 
         export PYTHONPATH=$(pwd)
