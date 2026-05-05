@@ -16,7 +16,7 @@ RUN uv pip install --system --no-cache --break-system-packages \
     braceexpand \
     webdataset \
     packaging \
-    "transformers<5.0.0" \
+    transformers \
     datasets \
     accelerate \
     timm \
