@@ -1006,6 +1006,21 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         context.active_request_metadata["return_log_probs"][0] = True
         assert not controller._active_requests_need_logprob_results()
+        assert not controller._should_collect_dynamic_logprob_bookkeeping(
+            async_next_prepared=True,
+            pending_forward_reused=False,
+            async_sample_already_launched=False,
+        )
+        assert not controller._should_collect_dynamic_logprob_bookkeeping(
+            async_next_prepared=False,
+            pending_forward_reused=True,
+            async_sample_already_launched=False,
+        )
+        assert controller._should_collect_dynamic_logprob_bookkeeping(
+            async_next_prepared=False,
+            pending_forward_reused=False,
+            async_sample_already_launched=False,
+        )
 
         controller.note_request_sampling_params(
             SamplingParams(
@@ -1017,6 +1032,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
         )
         assert controller._active_requests_need_logprob_results()
+        assert controller._should_collect_dynamic_logprob_bookkeeping(
+            async_next_prepared=True,
+            pending_forward_reused=False,
+            async_sample_already_launched=False,
+        )
+        assert not controller._should_collect_dynamic_logprob_bookkeeping(
+            async_next_prepared=True,
+            pending_forward_reused=False,
+            async_sample_already_launched=True,
+        )
 
         context.active_request_metadata["return_log_probs"][0] = False
         context.active_request_metadata["top_n_logprobs"][0] = 4

@@ -1903,6 +1903,20 @@ class TextGenerationController:
             or (active_metadata["top_n_logprobs"][active_slice] > 0).any()
         )
 
+    def _should_collect_dynamic_logprob_bookkeeping(
+        self,
+        *,
+        async_next_prepared: bool,
+        pending_forward_reused: bool,
+        async_sample_already_launched: bool,
+    ) -> bool:
+        """Whether this step needs sampling metadata for logprob calculation."""
+        if not (async_next_prepared or pending_forward_reused):
+            return True
+        if async_sample_already_launched:
+            return False
+        return self._active_requests_need_logprob_results()
+
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
         """Collect flat routing indices for MoE router recording.
 
@@ -2700,14 +2714,16 @@ class TextGenerationController:
 
         with torch.inference_mode():
             range_push("sampling")
-            logprob_logits_available = not async_sample_already_launched
-            if (async_next_prepared or pending_forward_reused) and not logprob_logits_available:
+            if self._should_collect_dynamic_logprob_bookkeeping(
+                async_next_prepared=async_next_prepared,
+                pending_forward_reused=pending_forward_reused,
+                async_sample_already_launched=async_sample_already_launched,
+            ):
+                return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+                self._dynamic_step_sample_bookkeeping()
+            else:
                 return_log_probs = False
                 return_top_n_logprobs = False
-            else:
-                return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
-
-                self._dynamic_step_sample_bookkeeping()
 
             if async_next_prepared:
                 if not async_sample_already_launched:
