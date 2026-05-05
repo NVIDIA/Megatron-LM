@@ -379,18 +379,23 @@ class GPUFuture:
         self._callbacks: list = []
 
     def get_loop(self):
+        """Return the event loop this future is bound to."""
         return self._loop
 
     def done(self):
+        """Return True once the GPU stream has drained past the recorded callback."""
         return self._done
 
     def cancelled(self):
+        """A `GPUFuture` cannot be cancelled; always returns False."""
         return False
 
     def cancel(self, msg=None):
+        """A `GPUFuture` cannot be cancelled; always returns False."""
         return False
 
     def result(self):
+        """Return None once done; raises `InvalidStateError` if awaited too early."""
         if not self._done:
             raise asyncio.InvalidStateError('not ready')
         return None
@@ -410,6 +415,7 @@ class GPUFuture:
             self._loop.call_soon_threadsafe(fn)
 
     def add_done_callback(self, fn, *, context=None):
+        """Register `fn` to run when the future resolves; fires immediately if already done."""
         if self._done:
             self._schedule(fn, context=context)
         else:
