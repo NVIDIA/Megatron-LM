@@ -82,7 +82,7 @@ Conventional Commits + sign-off + signed commit per @AGENTS.md and
 ```bash
 git add pyproject.toml uv.lock         # or docker/.ngc_version.* for base image
 git commit -S -s -m "build: bump <package> to <ref>"
-git push -u origin ko3n1g/<tag>/<desc>
+git push -u origin <your-branch>
 ```
 
 ## Step 4 — Open a draft PR
@@ -90,7 +90,7 @@ git push -u origin ko3n1g/<tag>/<desc>
 Title and labels per @skills/cicd/SKILL.md. Two bump-specific requirements:
 
 - The PR **must be a draft** (`--draft`) and pushed cross-repo from your
-  fork (per @AGENTS.md): `--head ko3n1g:<branch>`.
+  fork (per @AGENTS.md): `--head <your-username>:<branch>`.
 - Apply **`Run functional tests`** — the matrix-expand label. Add
   **`container::lts`** for any high-blast-radius bump (TE, FlashMLA,
   base image, anything that touches CUDA / NCCL) so the LTS stack is
@@ -307,7 +307,7 @@ it up.
 |---|---|---|
 | Wrong TE branch ref (`release/v2.15`) silently resolves nothing | TE uses `release_vX.Y` with an underscore | Verify with `git ls-remote` and pin a SHA, not a branch |
 | Lockfile diff includes unrelated transitive bumps | Floor constraints in `pyproject.toml` floated when re-resolving | Re-run lock and accept; don't try to revert transitives |
-| `gh pr create` fails with `head must be in the format owner:branch` | PR opened from a fork without the fork prefix | Use `--head ko3n1g:<branch>` |
+| `gh pr create` fails with `head must be in the format owner:branch` | PR opened from a fork without the fork prefix | Use `--head <your-username>:<branch>` |
 | Watchdog reports `RUN id STARTED` but no jobs | First poll happened before jobs were enumerated | Wait one cycle (60s); watchdog will fill in |
 
 ## Anti-patterns
