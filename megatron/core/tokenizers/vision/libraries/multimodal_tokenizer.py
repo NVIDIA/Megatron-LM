@@ -251,15 +251,15 @@ class MegatronMultimodalTokenizer:
         # Apply possible image tag.
         conversation = self._apply_image_tag(conversation)
 
-        tokens = self.tokenizer.apply_chat_template(
-            conversation,
-            tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            return_assistant_token_mask=False,
-            return_tensors="np",
-            return_dict=False,
-            chat_template=self._prompt_config.custom_chat_template,
-        )[0]
+        tokens = np.array(
+            self.tokenizer.apply_chat_template(
+                conversation,
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                return_assistant_token_mask=False,
+                chat_template=self._prompt_config.custom_chat_template,
+            )
+        )
 
         if not return_target:
             return tokens
