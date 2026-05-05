@@ -1466,6 +1466,7 @@ class CudaGraphManager(torch.nn.Module):
         num_warmup_steps=None,
         new_mempool: bool = False,
         share_mempool_with: 'CudaGraphManager' = None,
+        pin_input_from: List['CudaGraphManager'] = None,
     ):
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
@@ -1487,6 +1488,19 @@ class CudaGraphManager(torch.nn.Module):
 
                 See the class docstring for the replay-order invariant the caller is
                 responsible for upholding when sharing a mempool.
+            pin_input_from: Optional list of upstream `CudaGraphManager`s whose captured
+                outputs may flow into this graph as inputs. At capture time, every input
+                tensor whose `data_ptr()` matches one of those managers' captured outputs
+                is substituted with the producer's actual output tensor. The captured graph
+                then reads from the producer's slot directly, and the per-replay input copy
+                in `_CudagraphReplayNode.forward` is skipped.
+
+                Replay invariant the caller must uphold: each step, the upstream runner
+                whose output was substituted at capture time must be the runner producing
+                this step's input (i.e. capture order matches replay order across the
+                producer-consumer pair). Same flavour of constraint as `share_mempool_with`.
+
+                Stored as weak refs so a consumer does not pin its producer's lifetime.
         """
         super().__init__()
         if new_mempool and share_mempool_with is not None:
@@ -1498,6 +1512,7 @@ class CudaGraphManager(torch.nn.Module):
         self._share_with_ref = (
             weakref.ref(share_mempool_with) if share_mempool_with is not None else None
         )
+        self._pin_input_from_refs = [weakref.ref(m) for m in (pin_input_from or [])]
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
         if pg_collection is None:
@@ -1756,6 +1771,48 @@ class CudaGraphManager(torch.nn.Module):
                         except StopIteration:
                             # No match found for previous layer, continue with no buffer reuse
                             pass
+
+                    # Handle `pin_input_from`.
+                    # Any input whose `data_ptr()` matches one of the declared upstream managers'
+                    # captured outputs is substituted with the captured output tensor.
+                    # `can_skip_replay_copy` is then set, preventing unnecessary copies.
+                    if self._pin_input_from_refs:
+
+                        def _maybe_pin(arg):
+                            if not torch.is_tensor(arg):
+                                return arg
+                            target_ptr = arg.data_ptr()
+                            for upstream_ref in self._pin_input_from_refs:
+                                upstream = upstream_ref()
+                                if upstream is None:
+                                    continue
+                                for upstream_runner in upstream.cudagraph_runners:
+                                    if upstream_runner.fwd_graph is None:
+                                        continue
+                                    for out in upstream_runner.fwd_graph_output_surface:
+                                        if out.data_ptr() == target_ptr:
+                                            if out.shape != arg.shape or out.dtype != arg.dtype:
+                                                raise RuntimeError(
+                                                    "`pin_input_from` matched an upstream output "
+                                                    "output by `data_ptr()` but shape/dtype differ "
+                                                    "Consumer input: "
+                                                    f"shape={tuple(arg.shape)}, "
+                                                    f"dtype={arg.dtype}. Producer output: "
+                                                    f"shape={tuple(out.shape)}, "
+                                                    f"dtype={out.dtype}."
+                                                )
+                                            out.can_skip_replay_copy = True
+                                            return out
+                            return arg
+
+                        if local_args is args:
+                            local_args = list(args)
+                        else:
+                            local_args = list(local_args)
+                        local_args = [_maybe_pin(a) for a in local_args]
+                        if local_kwargs is kwargs:
+                            local_kwargs = dict(kwargs)
+                        local_kwargs = {k: _maybe_pin(v) for k, v in local_kwargs.items()}
 
                     runner.create_fwd_graph(
                         local_args, local_kwargs, outputs=None, clone_inputs=runner.is_first_layer

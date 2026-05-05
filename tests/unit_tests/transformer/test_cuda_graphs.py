@@ -1461,6 +1461,61 @@ class TestMultiMempool:
         assert runner.mempool is new_pool, "runner.mempool must read through to the manager"
         assert torch.equal(eager_out, out2)
 
+    @pytest.mark.parametrize("case", ["pinned", "no_pin", "shape_mismatch"])
+    @torch.inference_mode()
+    def test_pin_input_from(self, case):
+        """`pin_input_from`: at capture, a consumer input whose `data_ptr()` matches an
+        upstream producer's captured output is substituted with the producer's output
+        tensor and tagged `can_skip_replay_copy` so the per-replay input copy is skipped.
+        Cases:
+          pinned         -- substitution + flag set, replay matches eager.
+          no_pin         -- without the kwarg, no flag is set on the producer's output.
+          shape_mismatch -- a `data_ptr()` match with a shape mismatch must raise rather
+                            than silently capturing a graph that crashes at replay.
+        """
+        producer_mgr, producer = self._make_manager_with_module()
+        consumer_kwargs = (
+            {"pin_input_from": [producer_mgr]} if case in ("pinned", "shape_mismatch") else {}
+        )
+        consumer_mgr, consumer = self._make_manager_with_module(**consumer_kwargs)
+
+        x = torch.randn(4, 32, device="cuda")
+
+        if case == "shape_mismatch":
+            # `y[:2]` slices dim 0 from index 0, so `.data_ptr()` is preserved but the
+            # shape changes. The pin path must reject this rather than substituting a
+            # mismatched-shape tensor that crashes the captured graph at replay.
+            y = producer.my_op(x)
+            y_view = y[:2]
+            assert y_view.data_ptr() == y.data_ptr()
+            assert y_view.shape != y.shape
+            with pytest.raises(RuntimeError, match=r"shape"):
+                consumer.my_op(y_view)
+            return
+
+        eager_out = consumer.my_op(producer.my_op(x, eager=True), eager=True).clone()
+
+        # Capture pass.
+        y = producer.my_op(x)
+        z = consumer.my_op(y).clone()
+
+        producer_out = producer_mgr.cudagraph_runners[0].fwd_graph_output_surface[0]
+        is_pinned = case == "pinned"
+        assert (
+            getattr(producer_out, "can_skip_replay_copy", False) is is_pinned
+        ), f"`can_skip_replay_copy` mismatch for case={case!r}"
+
+        if is_pinned:
+            # Weak-ref invariant: consumer does not pin producer's lifetime.
+            assert isinstance(consumer_mgr._pin_input_from_refs[0], weakref.ref)
+            assert consumer_mgr._pin_input_from_refs[0]() is producer_mgr
+
+        # Replay matches eager.
+        y2 = producer.my_op(x)
+        z2 = consumer.my_op(y2).clone()
+        assert torch.equal(eager_out, z)
+        assert torch.equal(eager_out, z2)
+
 
 if __name__ == "__main__":
 
