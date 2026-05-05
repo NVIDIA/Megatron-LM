@@ -66,7 +66,7 @@ class LogProbsDecode:
         # trailing entries past log_prob_request_count are sliced off later, during extract.
         padded_count = context.padded_active_request_count
         request_indices = torch.nonzero_static(
-            context.active_request_metadata["return_log_probs"][:padded_count], size=padded_count
+            context.gpu_return_log_probs_mask[:padded_count], size=padded_count
         ).squeeze(1)
         # Row range over the gather space; used by softmax_kernel to address per-row sampled tokens.
         padded_arange = torch.arange(padded_count, device=request_indices.device)

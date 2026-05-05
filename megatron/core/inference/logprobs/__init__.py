@@ -109,6 +109,17 @@ def calculate_log_probs(
     if log_prob_request_count == 0:
         return [], None
 
+    # Refresh `gpu_return_log_probs_mask` from CPU pinned `active_request_metadata`.
+    # Production runs `transfer_bookkeeping_to_gpu` before this entry point; tests
+    # often mutate the CPU mask between the H2D and the call here, so re-stage the
+    # GPU mirror to make this helper safe to call standalone.
+    padded = context.padded_active_request_count
+    context.gpu_return_log_probs_mask[:padded].copy_(
+        context.active_request_metadata["return_log_probs"][:padded]
+    )
+    if padded < context.max_requests:
+        context.gpu_return_log_probs_mask[padded:].fill_(False)
+
     # Local naming (kept short to keep kernel call sites compact):
     #   ri              request_indices (output of indexing_kernel)
     #   padded_arange   arange over padded_active_request_count

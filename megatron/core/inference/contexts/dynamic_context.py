@@ -34,6 +34,10 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    NCCLAllGatherDispatcher,
+    NVLSAllGatherVDispatcher,
+)
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
@@ -41,6 +45,7 @@ from megatron.core.utils import get_pg_size, internal_api
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
+from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
@@ -322,6 +327,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
+        # Optional CPU-side collective for EP batch-dimension sync. Populated by
+        # the engine via set_ep_zmq_communicator() when available. When set,
+        # match_graph_config() uses this to perform the MAX reduction on the
+        # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
+        self._ep_zmq_communicator = None
+
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -588,9 +599,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
-        # CUDA graph config list
+        # CUDA graph config list.
+        self._nccl_ep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
+        )
+        # We disable non-decode cuda graphs for the nccl dispatcher.
+        # The NCCL dispatcher uses allgathers. Thus there is a need to
+        # run the same sized cuda-graph on every EP rank. This is difficult to
+        # generalize for non-decode steps.
         self.use_cuda_graphs_for_non_decode_steps = (
-            inference_config.use_cuda_graphs_for_non_decode_steps
+            inference_config.use_cuda_graphs_for_non_decode_steps and not self._nccl_ep_dispatcher
         )
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
@@ -606,6 +625,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
+        # Allocate per-step dispatcher buffers upfront so update_metadata never
+        # triggers an allocation inside a captured CUDA graph.
+        if get_pg_size(self.expert_model_parallel_group) > 1:
+            if self._nccl_ep_dispatcher:
+                NCCLAllGatherDispatcher.allocate_buffers()
+            else:
+                # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
+                moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+                NVLSAllGatherVDispatcher.allocate_buffers(
+                    per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
+                    // tp_size,
+                    topk=model_config.moe_router_topk,
+                    hidden_size=moe_hidden_size,
+                    ep_group=self.expert_model_parallel_group,
+                )
+
         self.smallest_non_decode_cuda_graph_size = min(
             inference_config.cuda_graph_mixed_prefill_count, self.max_requests
         )
@@ -619,6 +654,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         elif inference_config.use_flashinfer_fused_rope is None:
             inference_config.use_flashinfer_fused_rope = HAVE_FLASHINFER
         self.use_flashinfer_fused_rope = inference_config.use_flashinfer_fused_rope
+        self.inference_grouped_gemm_backend = model_config.inference_grouped_gemm_backend
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
@@ -738,8 +774,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
+                mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
+            # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
+            # fields ride along with the single coalesced H2D in
+            # transfer_bookkeeping_to_gpu().
+            self.mamba_metadata.bind_cpu_buffers(
+                {
+                    "batch_indices_decode": self._cpu_mamba_batch_indices_decode,
+                    "batch_indices_prefill": self._cpu_mamba_batch_indices_prefill,
+                    "seq_idx": self._cpu_mamba_seq_idx,
+                    "cu_seqlens": self._cpu_mamba_cu_seqlens,
+                    "cu_chunk_seqlens": self._cpu_mamba_cu_chunk_seqlens,
+                    "last_chunk_indices": self._cpu_mamba_last_chunk_indices,
+                    "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
+                    "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
+                    "conv_seq_start": self._cpu_mamba_conv_seq_start,
+                }
+            )
+            self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
@@ -815,72 +869,343 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"Please move tensor '{key}'."
             )
 
-        # Per-request state.
+        # Per-request state (CPU, pinned memory for fast H2D transfer).
         self.request_ids = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests,), -1, dtype=torch.int32, device='cpu', pin_memory=True
         )
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_query_lengths = torch.empty_like(self.request_ids)
+        self.request_query_lengths = torch.empty(
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
+        )
         # True only for a new request , then after a forward pass it is set to False
-        self.request_in_prefill_status_tensor = torch.empty_like(self.request_ids)
+        self.request_in_prefill_status_tensor = torch.empty(
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
+        )
         # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
-        self.request_output_lengths = torch.empty_like(self.request_ids)
+        self.request_output_lengths = torch.empty(
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
+        )
         # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_kv_length_offsets = torch.empty_like(self.request_ids)
-        self.request_kv_block_counts = torch.empty_like(self.request_ids)
-        self.request_last_kv_block_id = torch.empty_like(self.request_ids)
+        self.request_kv_length_offsets = torch.empty(
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
+        )
+        self.request_kv_block_counts = torch.empty(
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
+        )
+        self.request_last_kv_block_id = torch.empty(
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
+        )
         # request_last_kv_block_offset represents number of tokens in the last kv block
-        self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
+        self.request_last_kv_block_offset = torch.empty(
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
+        )
         self.request_to_kv_block_ids = torch.full(
             (self.max_requests, self.max_kv_block_count),
             -1,
             dtype=torch.int,
-            device=torch.cuda.current_device(),
+            device='cpu',
+            pin_memory=True,
         )
 
-        # Track request metadata.
+        # Track request metadata. Backed by pinned CPU memory: bookkeeping is
+        # CPU-resident; GPU consumers read from the active-slice mirror in
+        # `active_request_metadata` (also CPU pinned, refreshed each step).
         self.request_metadata = {
-            label: torch.empty(
-                (self.max_requests,), dtype=dtype, device=torch.cuda.current_device()
-            )
+            label: torch.empty((self.max_requests,), dtype=dtype, device='cpu', pin_memory=True)
             for label, dtype in self.request_metadata_types
         }
 
-        # Per-token state.
-        self.token_to_input_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
+        # Static tensor addresses of active slices to enable fast inference
+        # kernels. Pinned CPU mirrors of `request_metadata`, refreshed each
+        # step by `build_active_slices()` from the active subrange.
+        self.active_request_metadata = {
+            label: torch.empty_like(tensor, pin_memory=True)
+            for label, tensor in self.request_metadata.items()
+        }
+
+        # Coalesced pinned CPU buffer for the bookkeeping fields that get
+        # transferred to GPU each step via transfer_bookkeeping_to_gpu().
+        # Layout matches ContextGPUView._buf so a single cudaMemcpyAsync
+        # suffices. Int64 token fields come first (8-byte aligned automatically),
+        # then int32 token fields, then int32/float32 request-staging fields.
+        #   token_to_input_ids                         (int64,   max_tokens)
+        #   token_to_pos_ids                           (int64,   max_tokens)
+        #   token_to_block_idx                         (int32,   max_tokens)
+        #   token_to_local_position_within_kv_block    (int32,   max_tokens)
+        #   token_to_request_idx                       (int32,   max_tokens)
+        #   token_to_position_in_request               (int32,   max_tokens)
+        #   request_in_prefill_status        (staging) (int32,   max_requests)
+        #   request_query_lengths            (staging) (int32,   max_requests + 1)
+        #   request_kv_length_offsets        (staging) (int32,   max_requests)
+        #   temperature                      (staging) (float32, max_requests)
+        #   top_k                            (staging) (int32,   max_requests)
+        #   top_p                            (staging) (float32, max_requests)
+        #   active_request_last_token_idxs   (alias)   (int32,   max_requests + 1)
+        #
+        # Token fields are aliased with the source-of-truth attributes
+        # (`self.token_to_input_ids`, etc.) because the forward pass reads
+        # `gpu_view.token_to_input_ids[:n_tok]` which matches the CPU slot
+        # layout `[0, n_tok)`. Request fields, however, are read on GPU at
+        # `[:n_active]` but on CPU at `[paused_count:total_count)` — so the
+        # staging slots here are refreshed each step by copying the active
+        # slice from the persistent `request_*` tensors above.
+        #
+        # `request_query_lengths` and `active_request_last_token_idxs` reserve
+        # one extra trailing slot at index `max_requests` used as a sentinel by
+        # `LogProbsPrefill.indexing_kernel` (`nonzero_static(...,
+        # fill_value=max_requests)`); the trailing slot of `request_query_lengths`
+        # stays at zero (never written), and the trailing slot of
+        # `active_request_last_token_idxs` is set each step in `pad_active_slices`.
+        _tok_int64_bytes = self.max_tokens * 8
+        _tok_int32_bytes = self.max_tokens * 4
+        # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
+        _req_4byte_bytes = self.max_requests * 4
+        _req_4byte_with_sentinel_bytes = (self.max_requests + 1) * 4
+        # MHA section: 5 fields (int32) shared between GraphedMHAMetadata and
+        # NonGraphedMHAMetadata. max_bs == max_requests.
+        _mha_query_lengths_bytes = self.max_requests * 4
+        _mha_cu_query_seq_lengths_bytes = (self.max_requests + 1) * 4
+        _mha_kv_seq_lengths_bytes = self.max_requests * 4
+        _mha_cu_kv_seq_lengths_bytes = (self.max_requests + 1) * 4
+        _mha_block_table_bytes = self.max_requests * self.max_kv_block_count * 4
+        # Mamba section: 9 int32 fields (hybrid models only). Must match the
+        # MambaMetadata shapes (mirrors the layout documented in ContextGPUView).
+        if self.is_hybrid_model:
+            self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
+            _mamba_batch_indices_decode_bytes = self.max_requests * 4
+            _mamba_batch_indices_prefill_bytes = self.max_requests * 4
+            _mamba_seq_idx_bytes = self.max_tokens * 4
+            _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
+            _mamba_cu_chunk_seqlens_bytes = (self._max_mamba_chunks + 1) * 4
+            _mamba_last_chunk_indices_bytes = self.max_requests * 4
+            _mamba_seq_idx_for_varlen_bytes = self._max_mamba_chunks * 4
+            _mamba_conv_seq_idx_bytes = self.max_tokens * 4
+            _mamba_conv_seq_start_bytes = self.max_tokens * 4
+        else:
+            self._max_mamba_chunks = 0
+            _mamba_batch_indices_decode_bytes = 0
+            _mamba_batch_indices_prefill_bytes = 0
+            _mamba_seq_idx_bytes = 0
+            _mamba_cu_seqlens_bytes = 0
+            _mamba_cu_chunk_seqlens_bytes = 0
+            _mamba_last_chunk_indices_bytes = 0
+            _mamba_seq_idx_for_varlen_bytes = 0
+            _mamba_conv_seq_idx_bytes = 0
+            _mamba_conv_seq_start_bytes = 0
+        _total_bytes = (
+            2 * _tok_int64_bytes
+            + 4 * _tok_int32_bytes
+            + 5 * _req_4byte_bytes
+            + 2 * _req_4byte_with_sentinel_bytes
+            + _mha_query_lengths_bytes
+            + _mha_cu_query_seq_lengths_bytes
+            + _mha_kv_seq_lengths_bytes
+            + _mha_cu_kv_seq_lengths_bytes
+            + _mha_block_table_bytes
+            + _mamba_batch_indices_decode_bytes
+            + _mamba_batch_indices_prefill_bytes
+            + _mamba_seq_idx_bytes
+            + _mamba_cu_seqlens_bytes
+            + _mamba_cu_chunk_seqlens_bytes
+            + _mamba_last_chunk_indices_bytes
+            + _mamba_seq_idx_for_varlen_bytes
+            + _mamba_conv_seq_idx_bytes
+            + _mamba_conv_seq_start_bytes
         )
-        self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
-        self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
-        self.token_to_block_idx = torch.empty_like(self.token_to_input_ids)
+        self._cpu_bookkeeping_buf = torch.empty(
+            _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True
+        )
+        # token_to_input_ids and token_to_pos_ids were previously torch.full(0);
+        # zero the whole buffer so their views start at 0 too, and so the
+        # request staging slots start with a deterministic value.
+        self._cpu_bookkeeping_buf.fill_(0)
+
+        _off = 0
+        # Per-token state (source-of-truth lives in the coalesced buffer since
+        # the CPU-side bookkeeping and the GPU forward pass use the same
+        # `[:n_tok]` slice).
+        self.token_to_input_ids = self._cpu_bookkeeping_buf[_off : _off + _tok_int64_bytes].view(
+            torch.long
+        )
+        _off += _tok_int64_bytes
+        self.token_to_pos_ids = self._cpu_bookkeeping_buf[_off : _off + _tok_int64_bytes].view(
+            torch.long
+        )
+        _off += _tok_int64_bytes
+        self.token_to_block_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int32_bytes].view(
+            torch.int32
+        )
+        _off += _tok_int32_bytes
         # i.e For a set of tokens A B C D E F ..  and block_size 4:
         # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
-        self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
-        self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
-
-        # Static tensor addresses of active slices to enable fast inference kernels.
-        self.active_request_metadata = {
-            label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
-        }
-
-        # active_request_query_lengths and active_request_last_token_idxs reserve a permanent
-        # sentinel at index `max_requests` for log-prob indexing kernels (see logprobs/prefill.py).
-        self.active_request_query_lengths = self.request_query_lengths.new_zeros(
-            self.max_requests + 1
+        self.token_to_local_position_within_kv_block = self._cpu_bookkeeping_buf[
+            _off : _off + _tok_int32_bytes
+        ].view(torch.int32)
+        _off += _tok_int32_bytes
+        self.token_to_request_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int32_bytes].view(
+            torch.int32
         )
-        self.active_request_last_token_idxs = self.request_query_lengths.new_zeros(
-            self.max_requests + 1
+        _off += _tok_int32_bytes
+        self.token_to_position_in_request = self._cpu_bookkeeping_buf[
+            _off : _off + _tok_int32_bytes
+        ].view(torch.int32)
+        _off += _tok_int32_bytes
+
+        # Request-level staging views into the coalesced buffer. Write-only on
+        # CPU (refreshed from persistent tensors in transfer_bookkeeping_to_gpu);
+        # read-only on GPU via matching slots in ContextGPUView._buf.
+        self._staging_request_in_prefill_status = self._cpu_bookkeeping_buf[
+            _off : _off + _req_4byte_bytes
+        ].view(torch.int32)
+        _off += _req_4byte_bytes
+        # `_staging_request_query_lengths` has one extra trailing slot at index
+        # `max_requests`; it stays at zero (initial buffer fill_(0), never written
+        # by transfer_bookkeeping_to_gpu) so `LogProbsPrefill.indexing_kernel` can
+        # index it via the `nonzero_static(..., fill_value=max_requests)` sentinel.
+        self._staging_request_query_lengths = self._cpu_bookkeeping_buf[
+            _off : _off + _req_4byte_with_sentinel_bytes
+        ].view(torch.int32)
+        _off += _req_4byte_with_sentinel_bytes
+        self._staging_request_kv_length_offsets = self._cpu_bookkeeping_buf[
+            _off : _off + _req_4byte_bytes
+        ].view(torch.int32)
+        _off += _req_4byte_bytes
+
+        # Sampling-parameter staging slots, refreshed from `active_request_metadata`
+        # in transfer_bookkeeping_to_gpu(). FlashInfer reads these via
+        # `gpu_view.{temperature, top_k, top_p}`.
+        self._staging_temperature = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
+            torch.float32
+        )
+        _off += _req_4byte_bytes
+        self._staging_top_k = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
+            torch.int32
+        )
+        _off += _req_4byte_bytes
+        self._staging_top_p = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
+            torch.float32
+        )
+        _off += _req_4byte_bytes
+
+        # Per-request last-token row indices. Aliased with the matching gpu_view slot:
+        # build_active_slices/pad_active_slices populate this CPU view.
+        # Has one extra trailing slot at index `max_requests` used as the
+        # sentinel-row target for `LogProbsPrefill.indexing_kernel`. The slot is
+        # set each step in `pad_active_slices`.
+        self.active_request_last_token_idxs = self._cpu_bookkeeping_buf[
+            _off : _off + _req_4byte_with_sentinel_bytes
+        ].view(torch.int32)
+        _off += _req_4byte_with_sentinel_bytes
+
+        # Static tensor addresses to make `last_token_logits` graphable with speculative decoding.
+        max_logit_idxs = self.max_requests * (self.num_speculative_tokens + 1)
+        self.active_logit_idxs = torch.zeros(
+            max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._decode_logit_idxs = torch.arange(
+            max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
-        # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
+        # GPU mirror of `active_request_metadata["return_log_probs"]`, refreshed
+        # in `transfer_bookkeeping_to_gpu`. Used by `LogProbsPrefill`/`LogProbsDecode`
+        # /`LogProbsSpeculative` indexing kernels (`nonzero_static` requires a
+        # GPU mask for graph capture). Stable address; never reallocated.
+        self.gpu_return_log_probs_mask = torch.zeros(
+            self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
+        )
+
+        # MHA flash-attention metadata views (write-only on CPU, read-only on
+        # GPU via the matching region of ContextGPUView._buf). Populated per
+        # step by initialize_attention_state(); transferred as part of the
+        # single coalesced H2D in transfer_bookkeeping_to_gpu().
+        self._cpu_mha_query_lengths = self._cpu_bookkeeping_buf[
+            _off : _off + _mha_query_lengths_bytes
+        ].view(torch.int32)
+        _off += _mha_query_lengths_bytes
+        self._cpu_mha_cu_query_seq_lengths = self._cpu_bookkeeping_buf[
+            _off : _off + _mha_cu_query_seq_lengths_bytes
+        ].view(torch.int32)
+        _off += _mha_cu_query_seq_lengths_bytes
+        self._cpu_mha_kv_seq_lengths = self._cpu_bookkeeping_buf[
+            _off : _off + _mha_kv_seq_lengths_bytes
+        ].view(torch.int32)
+        _off += _mha_kv_seq_lengths_bytes
+        self._cpu_mha_cu_kv_seq_lengths = self._cpu_bookkeeping_buf[
+            _off : _off + _mha_cu_kv_seq_lengths_bytes
+        ].view(torch.int32)
+        _off += _mha_cu_kv_seq_lengths_bytes
+        self._cpu_mha_block_table = (
+            self._cpu_bookkeeping_buf[_off : _off + _mha_block_table_bytes]
+            .view(torch.int32)
+            .view(self.max_requests, self.max_kv_block_count)
+        )
+        _off += _mha_block_table_bytes
+
+        # Mamba varlen metadata views (hybrid models only). Populated per step
+        # by MambaMetadata.compute_cpu_metadata(); transferred as part of the
+        # single coalesced H2D in transfer_bookkeeping_to_gpu().
         if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(
-                max_requests=self.max_requests,
-                max_tokens=self.max_tokens,
-                mamba_chunk_size=self.mamba_chunk_size,
-                d_conv=self.mamba_conv_states_shape[-1],
+            self._cpu_mamba_batch_indices_decode = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_batch_indices_decode_bytes
+            ].view(torch.int32)
+            _off += _mamba_batch_indices_decode_bytes
+            self._cpu_mamba_batch_indices_prefill = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_batch_indices_prefill_bytes
+            ].view(torch.int32)
+            _off += _mamba_batch_indices_prefill_bytes
+            self._cpu_mamba_seq_idx = (
+                self._cpu_bookkeeping_buf[_off : _off + _mamba_seq_idx_bytes]
+                .view(torch.int32)
+                .view(1, self.max_tokens)
             )
+            _off += _mamba_seq_idx_bytes
+            self._cpu_mamba_cu_seqlens = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_cu_seqlens_bytes
+            ].view(torch.int32)
+            _off += _mamba_cu_seqlens_bytes
+            self._cpu_mamba_cu_chunk_seqlens = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_cu_chunk_seqlens_bytes
+            ].view(torch.int32)
+            _off += _mamba_cu_chunk_seqlens_bytes
+            self._cpu_mamba_last_chunk_indices = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_last_chunk_indices_bytes
+            ].view(torch.int32)
+            _off += _mamba_last_chunk_indices_bytes
+            self._cpu_mamba_seq_idx_for_varlen = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_seq_idx_for_varlen_bytes
+            ].view(torch.int32)
+            _off += _mamba_seq_idx_for_varlen_bytes
+            self._cpu_mamba_conv_seq_idx = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_conv_seq_idx_bytes
+            ].view(torch.int32)
+            _off += _mamba_conv_seq_idx_bytes
+            self._cpu_mamba_conv_seq_start = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_conv_seq_start_bytes
+            ].view(torch.int32)
+            _off += _mamba_conv_seq_start_bytes
+
+        assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
+
+        # GPU view: the single interface for GPU code to read context state.
+        # Populated per-step by transfer_bookkeeping_to_gpu().
+        self.gpu_view = ContextGPUView(
+            max_requests=self.max_requests,
+            max_tokens=self.max_tokens,
+            max_kv_blocks=self.max_kv_block_count,
+            device=torch.cuda.current_device(),
+            max_mamba_chunks=self._max_mamba_chunks,
+        )
+
+        # Bind the shared MHA GPU views to both graph and non-graph metadata;
+        # only one is active per step, so sharing storage is safe.
+        self.graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+        self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+
+        # Deferred Mamba GPU operations.  Populated by add_request() /
+        # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
+        self._pending_mamba_zeros: list = []
+        self._pending_mamba_restores: list = []
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -1088,12 +1413,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_metadata[label][padded_slice], non_blocking=True
             )
 
-        self.active_request_query_lengths[:batch_size].copy_(
-            self.request_query_lengths[padded_slice]
-        )
-
         torch.cumsum(
-            self.active_request_query_lengths[:batch_size],
+            self.request_query_lengths[padded_slice],
             dim=0,
             out=self.active_request_last_token_idxs[:batch_size],
         )
@@ -1101,16 +1422,47 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def pad_active_slices(self):
         """Pad the active slices of specific tensors."""
-        # Request-level padding.
         active_request_count = self.total_request_count - self.paused_request_count
-        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
-        self.active_request_query_lengths[padding_request_slice].fill_(
-            self.num_speculative_tokens + 1
+        active_decode_count = self.num_decode_requests
+        active_prefill_count = active_request_count - active_decode_count
+        active_decode_token_count = active_decode_count * (self.num_speculative_tokens + 1)
+
+        # Decode prefix: positions [0, 1, ..., active_decode_token_count - 1].
+        self.active_logit_idxs[:active_decode_token_count].copy_(
+            self._decode_logit_idxs[:active_decode_token_count]
         )
+
+        # Prefill last-token positions: cumsum the prefill query lengths in place,
+        # then shift by (active_decode_token_count - 1) to get absolute positions.
+        prefill_dst = self.active_logit_idxs[
+            active_decode_token_count : active_decode_token_count + active_prefill_count
+        ]
+        prefill_idxs = self.paused_request_count + active_decode_count
+        prefill_lengths = self.request_query_lengths[prefill_idxs : self.total_request_count]
+        if active_prefill_count > 0:
+            prefill_cumsum = torch.cumsum(prefill_lengths, dim=0, dtype=torch.int32)
+            prefill_cumsum.add_(active_decode_token_count - 1)
+            prefill_dst.copy_(prefill_cumsum, non_blocking=True)
+
+        self.active_logit_idxs[active_decode_token_count + active_prefill_count :].zero_()
+
+        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
+
+        # Sampling metadata: pad with neutral defaults, so that the kernel early-exits.
+        self.active_request_metadata["temperature"][padding_request_slice].fill_(1.0)
+        self.active_request_metadata["top_k"][padding_request_slice].fill_(0)
+        self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
+        # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
         self.active_request_last_token_idxs[padding_request_slice].fill_(0)
+        # Padded slots must opt out of log-prob computation; LogProbsPrefill.indexing_kernel
+        # gathers `request_indices` from this mask.
         self.active_request_metadata["return_log_probs"][padding_request_slice] = False
 
-        # We upsize this tensor by 1 do reserve a permanent sentinel slot. We must pad that slot.
+        # `active_request_last_token_idxs` reserves a permanent sentinel slot at
+        # index `max_requests` (size is `max_requests + 1`). LogProbsPrefill.indexing_kernel
+        # uses `nonzero_static(..., fill_value=max_requests)` and reads at that slot;
+        # the value `padded_active_token_count - 1` lets the slack-absorbing math
+        # produce in-range logit indices for filler rows.
         self.active_request_last_token_idxs[self.max_requests] = self.padded_active_token_count - 1
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
@@ -1131,12 +1483,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 value=value,
                 memory_buffer=self.memory_buffer,
                 padded_active_token_count=self.padded_active_token_count,
-                token_to_block_idx=self.token_to_block_idx,
-                token_to_local_position_within_kv_block=self.token_to_local_position_within_kv_block,
+                token_to_block_idx=self.gpu_view.token_to_block_idx,
+                token_to_local_position_within_kv_block=self.gpu_view.token_to_local_position_within_kv_block,
             )
 
-        block_idx = self.token_to_block_idx[: self.padded_active_token_count]
-        local_kv_seq_idx = self.token_to_local_position_within_kv_block[
+        block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
+        local_kv_seq_idx = self.gpu_view.token_to_local_position_within_kv_block[
             : self.padded_active_token_count
         ]
 
@@ -1272,7 +1624,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # use .view instead of .reshape to avoid extra transpose operations
         query_rope, key_rope = flashinfer.rope.apply_rope_with_cos_sin_cache(
-            positions=self.token_to_pos_ids[:n],
+            positions=self.gpu_view.token_to_pos_ids[:n],
             query=query[:n].reshape(n, num_q_heads * head_size),
             key=key[:n].reshape(n, num_k_heads * head_size),
             head_size=head_size,
@@ -1305,7 +1657,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tensor) Query tensor after applying rotary embeddings.
         """
         n = self.padded_active_token_count
-        query_seq_idx = self.token_to_pos_ids[:n]
+        query_seq_idx = self.gpu_view.token_to_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
         query[:n] = apply_rotary_pos_emb(
             t=query[:n],
@@ -1337,7 +1689,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tensor) Key tensor after applying rotary embeddings.
         """
         n = self.padded_active_token_count
-        key_seq_idx = self.token_to_position_in_request[:n]
+        key_seq_idx = self.gpu_view.token_to_position_in_request[:n]
         key_emb = key_emb[key_seq_idx]
         if self.is_decode_only():
             if key.shape[0] != n:
@@ -1355,6 +1707,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                 t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group, mscale=mscale
             )
         return key
+
+    def set_ep_zmq_communicator(self, communicator) -> None:
+        """Attach an EP-group ZMQ communicator for CPU-side sync collectives.
+
+        When set, match_graph_config() uses this communicator's
+        sync_all_reduce_max() to perform the EP batch-dimension MAX reduction on
+        the CPU instead of launching a NCCL AllReduce kernel on the compute
+        stream. Expected to be called once by the inference engine after both
+        the context and the communicator have been created.
+
+        Args:
+            communicator: AsyncZMQCommunicator over the EP process group.
+        """
+        self._ep_zmq_communicator = communicator
 
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
@@ -1444,7 +1810,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_block_counts[request_slice] = block_counts
         for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
-                metadata_cols[i], dtype=dtype, device=torch.cuda.current_device()
+                metadata_cols[i], dtype=dtype, device='cpu'
             )
 
         dummy_block_idx = self.kv_block_allocator.dummy_block_idx
@@ -1503,8 +1869,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     raise ContextOverflowError(
                         requests[logical_idx].request_id, "No Mamba slots available"
                     )
-                self.mamba_conv_states[:, mamba_idx] = 0.0
-                self.mamba_ssm_states[:, mamba_idx] = 0.0
+                self._pending_mamba_zeros.append(mamba_idx)
                 self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
 
         self.active_token_count = token_end
@@ -1526,7 +1891,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Pre-construct shared objects (safe due to deep copy in DynamicInferenceRequest.__post_init__)
         shared_sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
         shared_decode_tokens = torch.zeros(
-            self.num_speculative_tokens + 1, dtype=torch.long, device=torch.cuda.current_device()
+            self.num_speculative_tokens + 1, dtype=torch.long, device='cpu'
         )
 
         decode_requests = [
@@ -1556,9 +1921,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert per_prefill_tokens > 0
         # Create a single large tensor and slice from it for each prefill request
         max_prefill_tokens = per_prefill_tokens + (1 if rem_prefill_tokens > 0 else 0)
-        shared_prefill_tokens = torch.zeros(
-            max_prefill_tokens, dtype=torch.long, device=torch.cuda.current_device()
-        )
+        shared_prefill_tokens = torch.zeros(max_prefill_tokens, dtype=torch.long, device='cpu')
 
         prefill_requests = [
             DynamicInferenceRequest(
@@ -1604,7 +1967,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_token_count = T
         self.num_prefill_requests = N_prefill
 
-        # 2. Per-request state consumed by mha_metadata.update().
+        # 2. Per-request state consumed by initialize_attention_state().
         #    Decode requests come first, followed by prefill requests.
         self.request_query_lengths[0:N_decode].fill_(tokens_per_decode_request)
         if N_prefill > 0:
@@ -1663,6 +2026,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
+        # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
+        # overlap with the CPU work below.  These are non-blocking GPU kernels.
+        self._execute_pending_mamba_ops()
+
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
             self.is_creating_cuda_graphs and is_expert_parallel_dummy_cuda_graph_step
@@ -1672,19 +2039,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         # EP dummy requests are added AFTER the EP sync below.
         if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
+        elif is_expert_parallel_dummy_cuda_graph_step:
+            self.add_dummy_requests_for_expert_parallel_step(
+                InferenceBatchDimensions(
+                    token_count=self.num_speculative_tokens + 1,
+                    prefill_req_count=0,
+                    decode_req_count=1,
+                )
+            )
 
-        if is_expert_parallel_dummy_cuda_graph_step:
-            # No real requests on this EP rank. Pass empty dimensions so the EP
-            # all-reduce in match_graph_config picks up the real ranks' values.
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=0, prefill_req_count=0, decode_req_count=0
-            )
-        else:
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=self.active_token_count,
-                prefill_req_count=self.num_prefill_requests,
-                decode_req_count=self.num_decode_requests,
-            )
+        batch_dimensions = InferenceBatchDimensions(
+            token_count=self.active_token_count,
+            prefill_req_count=self.num_prefill_requests,
+            decode_req_count=self.num_decode_requests,
+        )
 
         self.batch_dimensions = batch_dimensions
 
@@ -1696,28 +2064,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
             num_speculative_tokens=self.num_speculative_tokens,
+            ep_zmq_communicator=self._ep_zmq_communicator,
+            match_ep_token_counts=self._nccl_ep_dispatcher,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
         if construct_graph_dimensions is not None:
             assert self._using_cuda_graph_this_step
-
-        if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
-            # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
-            # could not find a compatible cuda graph for the dummy forward step.
-            # Now, we need not do the remaining setup. The controller
-            # will directly call the model forward pass with a single token.
-            return
-
-        # Add dummy requests AFTER the EP sync so they match the resolved graph.
-        if is_expert_parallel_dummy_cuda_graph_step:
-            self.add_dummy_requests_for_expert_parallel_step(best_graph)
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=self.active_token_count,
-                prefill_req_count=self.num_prefill_requests,
-                decode_req_count=self.num_decode_requests,
-            )
-            self.batch_dimensions = batch_dimensions
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
@@ -1753,7 +2106,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        self.build_active_slices(self.padded_active_request_count)
+        self.build_active_slices(
+            min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
+        )
         self.pad_active_slices()
 
         # Update token position indexes.
@@ -1793,31 +2148,98 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
 
         assert self.active_attn_metadata is not None
-        self.active_attn_metadata["mha_metadata"].update(
-            request_query_lengths=query_lengths_view,
-            request_kv_length_offsets=request_kv_length_offsets_view,
-            request_to_kv_block_ids=request_to_kv_block_ids_view,
-            batch_dimensions=attn_dimensions,
-            padded_batch_dimensions=self.padded_batch_dimensions,
-            num_speculative_tokens=self.num_speculative_tokens,
+
+        # Compute MHA metadata directly into the pinned CPU section of
+        # _cpu_bookkeeping_buf. The single coalesced H2D in
+        # transfer_bookkeeping_to_gpu() covers these fields along with the rest
+        # of the bookkeeping state, so no ephemeral tensors and no per-field
+        # cudaMemcpyAsyncs.
+        real_bs = attn_dimensions.req_count
+        padded_bs = self.padded_batch_dimensions.req_count
+        mha = self.active_attn_metadata["mha_metadata"]
+
+        # Query lengths: [0:real_bs] real data, [real_bs:padded_bs] zero pad.
+        self._cpu_mha_query_lengths[:real_bs] = query_lengths_view[:real_bs]
+        if real_bs < padded_bs:
+            self._cpu_mha_query_lengths[real_bs:padded_bs] = 0
+
+        # Cumulative query lengths (padded slots repeat cu[real_bs]).
+        self._cpu_mha_cu_query_seq_lengths[0] = 0
+        if real_bs > 0:
+            self._cpu_mha_cu_query_seq_lengths[1 : real_bs + 1] = torch.cumsum(
+                query_lengths_view[:real_bs], dim=0
+            )
+        if real_bs < padded_bs:
+            self._cpu_mha_cu_query_seq_lengths[real_bs + 1 : padded_bs + 1] = (
+                self._cpu_mha_cu_query_seq_lengths[real_bs]
+            )
+
+        # KV sequence lengths: [0:real_bs] = kv_offsets + query_lengths.
+        self._cpu_mha_kv_seq_lengths[:real_bs] = (
+            request_kv_length_offsets_view[:real_bs] + query_lengths_view[:real_bs]
+        )
+        if real_bs < padded_bs:
+            self._cpu_mha_kv_seq_lengths[real_bs:padded_bs] = 0
+
+        # Cumulative KV lengths.
+        self._cpu_mha_cu_kv_seq_lengths[0] = 0
+        if real_bs > 0:
+            self._cpu_mha_cu_kv_seq_lengths[1 : real_bs + 1] = torch.cumsum(
+                self._cpu_mha_kv_seq_lengths[:real_bs], dim=0
+            )
+        if real_bs < padded_bs:
+            self._cpu_mha_cu_kv_seq_lengths[real_bs + 1 : padded_bs + 1] = (
+                self._cpu_mha_cu_kv_seq_lengths[real_bs]
+            )
+
+        # Block table: [0:real_bs] real, [real_bs:padded_bs] = -1 sentinel.
+        self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
+        if real_bs < padded_bs:
+            self._cpu_mha_block_table[real_bs:padded_bs] = -1
+
+        # Max sequence lengths (Python scalars; consumed as kernel launch args).
+        if not self.using_cuda_graph_this_step() and real_bs > 0:
+            # NonGraphedMHAMetadata: use actual max values.
+            max_seqlen_q = self._cpu_mha_query_lengths[:real_bs].max().item()
+            max_seqlen_k = self._cpu_mha_kv_seq_lengths[:real_bs].max().item()
+        else:
+            # GraphedMHAMetadata: use conservative bounds.
+            if self.padded_batch_dimensions.prefill_req_count == 0:
+                max_seqlen_q = self.num_speculative_tokens + 1
+            else:
+                max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
+            max_seqlen_k = mha.max_seqlen
+        if not self.using_cuda_graph_this_step() and real_bs == 0:
+            max_seqlen_q = self.num_speculative_tokens + 1
+            max_seqlen_k = 1
+
+        # Bind state_data to GPU views now. set_state_data() only creates Python
+        # slice references into the GPU buffer (no GPU reads), so it's safe to
+        # call before the H2D in transfer_bookkeeping_to_gpu(). This guarantees
+        # that callers reading state_data["block_table"] etc. between
+        # initialize_attention_state() and transfer_bookkeeping_to_gpu() see
+        # populated entries (the actual data fill happens at the H2D).
+        mha.set_state_data(
+            padded_active_request_count=padded_bs,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
         )
 
         if self.is_hybrid_model:
-            active_mamba_indices_view = self.mamba_metadata.request_to_mamba_state_idx[active_slice]
-            token_to_request_idx_view = self.token_to_request_idx[: self.active_token_count]
-            cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
-                "cu_query_seq_lengths"
-            ]
+            # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
+            # because it writes to GPU buffers. Store the parameters here.
+            # intermediate_offsets_gpu / intermediate_counts_gpu get the CPU-side
+            # slices here; H2D transfer happens in transfer_bookkeeping_to_gpu().
             intermediate_offsets_gpu = None
             intermediate_counts_gpu = None
             if self.mamba_slot_allocator is not None:
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
-                    self.mamba_slot_allocator.get_intermediate_gpu_data()
+                    self.mamba_slot_allocator.get_intermediate_cpu_data()
                 )
-            self.mamba_metadata.update(
-                active_mamba_indices_view,
-                token_to_request_idx_view,
-                cu_seqlens,
+            self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
+                active_mamba_indices=self.mamba_metadata.request_to_mamba_state_idx[active_slice],
+                token_to_request_idx=self.token_to_request_idx[: self.active_token_count],
+                cpu_cu_query=self._cpu_mha_cu_query_seq_lengths,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
@@ -1831,8 +2253,121 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
+        # Flip NCCLAllGather dispatcher's path selector to not use allgathers.
+        # _nccl_ep_dispatcher already implies ep_size > 1, so no extra EP guard.
+        if self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher._use_allgather_v = not self.using_cuda_graph_this_step()
+
+        # Flush any Mamba ops queued by add_dummy_requests_for_cudagraph_capture
+        # (warmup) or add_dummy_requests_for_expert_parallel_step (EP dummy step).
+        # The earlier call at the top drained ops queued by add_request() before
+        # this function ran; this call covers ops queued during the function.
+        # No-op when the queue is already empty (regular non-warmup steps).
+        self._execute_pending_mamba_ops()
+
+        # Run the H2D transfer here so callers that bypass the controller
+        # (e.g. unit tests that call `model.forward()` directly after
+        # `initialize_attention_state()`) see populated GPU bookkeeping. The
+        # text-generation controller still calls `transfer_bookkeeping_to_gpu`
+        # explicitly; that second call is a cheap idempotent re-copy.
+        self.transfer_bookkeeping_to_gpu()
+
+    def _execute_pending_mamba_ops(self) -> None:
+        """Execute Mamba GPU operations deferred from add_request() / update_requests().
+
+        This runs at the start of initialize_attention_state() so that all GPU
+        Mamba state is correct before the forward pass.
+        """
+        if not (self._pending_mamba_restores or self._pending_mamba_zeros):
+            return
+
+        # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
+        for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
+            restored = self.mamba_slot_allocator.restore_to_live(request_idx, block_id)
+            if not restored:
+                self._pending_mamba_zeros.append(mamba_idx)
+        self._pending_mamba_restores.clear()
+
+        # Batch-zero newly allocated Mamba slots.
+        if self._pending_mamba_zeros:
+            device = self.mamba_conv_states.device
+            indices = torch.tensor(self._pending_mamba_zeros, dtype=torch.long, device=device)
+            self.mamba_conv_states[:, indices] = 0.0
+            self.mamba_ssm_states[:, indices] = 0.0
+            self._pending_mamba_zeros.clear()
+
+    def transfer_bookkeeping_to_gpu(self) -> None:
+        """Batch transfer CPU bookkeeping state to GPU staging buffers.
+
+        Called after initialize_attention_state() and before the forward pass.
+        All copies use non_blocking=True with pinned CPU memory. CUDA stream
+        ordering guarantees the forward pass sees completed transfers.
+
+        The bookkeeping fields are backed by one contiguous pinned CPU buffer
+        and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
+        Request-level staging slots are refreshed from the persistent CPU
+        tensors immediately before the H2D (GPU reads them at `[:n_active]`
+        while CPU bookkeeping keeps them at `[paused_count:total_count)`).
+        """
+        n_active = self.total_request_count - self.paused_request_count
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        padded_active = max(n_active, self.padded_active_request_count)
+
+        # Refresh request-level staging slots from the persistent CPU source.
+        # CPU-to-CPU slice assignment on pinned memory (~15 KB total for 6
+        # 4-byte fields at max_requests=624). Negligible vs. the launch overhead
+        # we save by merging the H2D memcpys into 1.
+        self._staging_request_in_prefill_status[:n_active] = self.request_in_prefill_status_tensor[
+            active_slice
+        ]
+        self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
+        self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
+            active_slice
+        ]
+        # Sampling-parameter staging slots: read from `active_request_metadata`,
+        # which `build_active_slices` + `pad_active_slices` already populated for
+        # `[:padded_active]` (active values + neutral padding defaults).
+        self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
+            :padded_active
+        ]
+        self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][:padded_active]
+        self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][:padded_active]
+
+        # Full-iteration CUDA graphs may have captured GPU consumers with the
+        # padded graph request count. Keep those padded staging rows bounded so
+        # graph replay never builds indices from stale request lengths.
+        if n_active < padded_active:
+            self._staging_request_in_prefill_status[n_active:padded_active] = 0
+            self._staging_request_query_lengths[n_active:padded_active] = 0
+            self._staging_request_kv_length_offsets[n_active:padded_active] = 0
+
+        # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
+        # Copying the whole (max_tokens + max_requests)-sized buffer including
+        # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
+        # 8 redundant launch overheads vs. the prior per-field copies.
+        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+
+        # `return_log_probs` is bool (1 byte per slot, doesn't share the int32-
+        # aligned coalesced buffer). Refresh the dedicated GPU bool mirror used
+        # by the log-prob indexing kernels.
+        self.gpu_return_log_probs_mask[:padded_active].copy_(
+            self.active_request_metadata["return_log_probs"][:padded_active],
+            non_blocking=True,
+        )
+        if padded_active < self.max_requests:
+            self.gpu_return_log_probs_mask[padded_active:].fill_(False)
+
+        # MHA metadata GPU views were already bound to state_data in
+        # initialize_attention_state(); the H2D above populates the underlying
+        # bytes. Nothing else to do here for MHA.
+
+        # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
+        if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
+            self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
+            self._pending_mamba_transfer = None
+
     def reset_tensors(self) -> None:
-        """Fill all GPU tensors with sentinel values."""
+        """Fill all bookkeeping tensors with sentinel values."""
 
         # Reset request indexes.
         self.request_ids.fill_(-1)
@@ -1936,35 +2471,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_speculative_tokens + 1
         )
         return (
-            self.token_to_input_ids[:num_tokens].unsqueeze(0),
-            self.token_to_pos_ids[:num_tokens].unsqueeze(0),
+            self.gpu_view.token_to_input_ids[:num_tokens].unsqueeze(0),
+            self.gpu_view.token_to_pos_ids[:num_tokens].unsqueeze(0),
         )
 
-    def speculative_required_logit_indices(self, device: torch.device) -> Tensor:
+    def speculative_required_logit_indices(self) -> Tensor:
         """Token-level indices needed for speculative decode verification.
 
         Returns all decode token positions (base + speculative) concatenated
         with the last token position of each prefill request.
 
-        Args:
-            device (torch.device): Device on which to create the index tensor.
-
         Return:
             (Tensor) 1-D indices into the packed token sequence, length
-            ``num_decode_requests * (num_speculative_tokens + 1) + num_prefill_requests``.
+            ``num_decode_requests * (num_speculative_tokens + 1) + num_prefill_requests``
+            in eager, or the equivalent padded count under non-eager.
         """
-        paused = self.paused_request_count
-        total = self.total_request_count
-        query_lengths = self.request_query_lengths[paused:total]
-        num_decode = self.num_decode_requests
-
-        decode_token_count = num_decode * (self.num_speculative_tokens + 1)
-        decode_indices = torch.arange(decode_token_count, device=device)
-
-        cumsum = torch.cumsum(query_lengths, dim=0)
-        prefill_last_indices = cumsum[num_decode:] - 1
-
-        return torch.cat([decode_indices, prefill_last_indices])
+        return self.active_logit_idxs[: self.num_last_token_logits]
 
     @property
     def num_last_token_logits(self) -> int:
@@ -1974,11 +2496,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         `(num_speculative_tokens + 1)` rows per decode request when MTP is active.
         """
         if self.num_speculative_tokens > 0:
-            return (
-                self.num_decode_requests * (self.num_speculative_tokens + 1)
-                + self.num_prefill_requests
-            )
-        return self.total_request_count - self.paused_request_count
+            if self._using_cuda_graph_this_step:
+                return (
+                    self.padded_batch_dimensions.decode_req_count
+                    * (self.num_speculative_tokens + 1)
+                    + self.padded_batch_dimensions.prefill_req_count
+                )
+            else:
+                return (
+                    self.num_decode_requests * (self.num_speculative_tokens + 1)
+                    + self.num_prefill_requests
+                )
+        else:
+            if self._using_cuda_graph_this_step:
+                return self.padded_active_request_count
+            else:
+                return self.total_request_count - self.paused_request_count
 
     @property
     def padded_num_last_token_logits(self) -> int:
@@ -2011,19 +2544,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"logits.size(1) ({tuple(logits.shape)}) != "
             f"padded_active_token_count ({self.padded_active_token_count})."
         )
-        logits_2d = logits.squeeze(0)
-
-        if self.num_speculative_tokens > 0:
-            selected = self.speculative_required_logit_indices(logits.device)
-            assert selected.numel() == self.num_last_token_logits
-            return logits_2d[selected, :]
-
-        paused = self.paused_request_count
-        total = self.total_request_count
-        query_lengths = self.request_query_lengths[paused:total]
-        last_token_idxs = torch.cumsum(query_lengths, dim=0) - 1
-        assert last_token_idxs.numel() == self.num_last_token_logits
-        return logits_2d[last_token_idxs, :]
+        return logits.squeeze(0)[self.active_logit_idxs[: self.num_last_token_logits], :]
 
     def _compute_prefix_match(
         self, req: DynamicInferenceRequest, prefill_chunk_length: int
@@ -2236,9 +2757,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Increment ref counts and update timestamps for matched (shared) blocks
         if num_matched_blocks > 0:
-            matched_tensor = torch.tensor(
-                matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
-            )
+            matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
             self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.kv_block_allocator.update_timestamps(matched_tensor)
@@ -2362,17 +2881,18 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Restore Mamba state from the block corresponding to prefix_skip_tokens
             restore_block_count = prefix_skip_tokens // self.block_size_tokens
-            restored = False
             if restore_block_count > 0 and self.mamba_slot_allocator is not None:
                 restore_block_id = matched_block_ids[restore_block_count - 1]
-                restored = self.mamba_slot_allocator.restore_to_live(
-                    self.total_request_count, restore_block_id
+                self._pending_mamba_restores.append(
+                    (self.total_request_count, restore_block_id, mamba_idx)
                 )
-            if not restored:
-                self.mamba_conv_states[:, mamba_idx] = 0.0
-                self.mamba_ssm_states[:, mamba_idx] = 0.0
+            else:
+                self._pending_mamba_zeros.append(mamba_idx)
 
-            # Compute intermediate offsets for state extraction during forward pass
+            # compute_and_store_offsets sets both CPU state (hash_to_block_id,
+            # _eos_cache_block_id_gpu) and GPU staging buffers.  Runs immediately
+            # because commit_intermediate_states() reads the CPU state after the
+            # forward pass.
             if self.mamba_slot_allocator is not None:
                 self.mamba_slot_allocator.compute_and_store_offsets(
                     req,
@@ -2496,13 +3016,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             self.mamba_metadata.free_slots(request_indexes)
 
-        # Clear intermediate offset entries for released requests
+        # Clear intermediate offset entries for released requests (CPU writes).
         if self.mamba_slot_allocator is not None:
             sa = self.mamba_slot_allocator
-            sa._intermediate_counts_gpu[request_indexes] = 0
-            sa._intermediate_offsets_gpu[request_indexes] = 0
-            sa._intermediate_block_ids_gpu[request_indexes] = -1
-            sa._eos_cache_block_id_gpu[request_indexes] = -1
+            sa._intermediate_counts_cpu[request_indexes] = 0
+            sa._intermediate_offsets_cpu[request_indexes] = 0
+            sa._intermediate_block_ids_cpu[request_indexes] = -1
+            sa._eos_cache_block_id_cpu[request_indexes] = -1
 
     def resume_paused_requests(
         self, active_request_count: int, newly_paused_request_ids: torch.Tensor
@@ -2636,7 +3156,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             -1,
             -1,
             dtype=paused_block_counts_cumsum.dtype,
-            device=torch.cuda.current_device(),
+            device='cpu',
         )
         net_block_counts = paused_block_counts_cumsum - remaining_paused_request_counts
         evict_request_count = torch.nonzero(net_block_counts >= 0)[0].item() + 1
@@ -2644,9 +3164,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Eviction index range.
         evict_start_idx = self.paused_request_count - evict_request_count
         evict_end_idx = self.paused_request_count
-        evict_request_idxs = torch.arange(
-            evict_start_idx, evict_end_idx, device=torch.cuda.current_device()
-        )
+        evict_request_idxs = torch.arange(evict_start_idx, evict_end_idx, device='cpu')
         # Clone needed: subsequent release_memory_blocks_from_request_indexes and
         # _swap_book_keeping_tensors calls mutate self.request_ids in place.
         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
@@ -2661,24 +3179,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             src_idxs = torch.arange(
                 self.paused_request_count - evict_request_count,
                 self.paused_request_count,
-                device=torch.cuda.current_device(),
+                device='cpu',
             )
             dst_idxs = torch.arange(
                 self.total_request_count - evict_request_count,
                 self.total_request_count,
-                device=torch.cuda.current_device(),
+                device='cpu',
             )
         else:
             # Swap all active requests with left-most evicted requests.
             src_idxs = torch.arange(
                 self.paused_request_count - evict_request_count,
                 self.paused_request_count - evict_request_count + active_request_count,
-                device=torch.cuda.current_device(),
+                device='cpu',
             )
             dst_idxs = torch.arange(
                 self.paused_request_count,
                 self.paused_request_count + active_request_count,
-                device=torch.cuda.current_device(),
+                device='cpu',
             )
 
         # Swap evicted and active requests.
@@ -2753,6 +3271,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
+
+        # Ensure all inputs are on CPU for bookkeeping operations.
+        if active_requests_mask.is_cuda:
+            active_requests_mask = active_requests_mask.cpu()
+        if new_tokens.is_cuda:
+            new_tokens = new_tokens.cpu()
+        if new_speculative_tokens is not None and new_speculative_tokens.is_cuda:
+            new_speculative_tokens = new_speculative_tokens.cpu()
 
         self.num_prefill_requests = 0  # all turns to decode
         # All request that were in prefill become decode requests.
@@ -3058,14 +3584,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_pos_ids[: self.active_token_count] = self.request_kv_length_offsets[
             self.paused_request_count : self.total_request_count
         ].repeat_interleave(num_generated_tokens) + torch.arange(
-            num_generated_tokens, device=torch.cuda.current_device()
+            num_generated_tokens, device='cpu'
         ).repeat(
             active_request_count
         )
         #
         # Token to request idx : [0, 0, 0, 1, 1, 1, 2, 2, 2 ...]
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
-            self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
+            self.paused_request_count, self.total_request_count, device='cpu'
         ).repeat_interleave(num_generated_tokens)
 
         self.token_to_position_in_request[: self.active_token_count] = self.token_to_pos_ids[
@@ -3087,7 +3613,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         raw_positions = (
             old_offsets[:, None]
             + 1  # Offset by 1 because old_offsets points to the LAST token
-            + torch.arange(num_generated_tokens, device=torch.cuda.current_device())[None, :]
+            + torch.arange(num_generated_tokens, device='cpu')[None, :]
         )
         #
         # A token crosses to the next block if its raw_position >= block_size
