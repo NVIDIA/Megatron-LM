@@ -65,7 +65,7 @@ MODE=$(cat $TRAINING_PARAMS_PATH |
 
 MODES=("pretraining" "inference")
 TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "checkpoint-consistency" "release")
-TEST_EVALUATION_TYPES=("pass", "xpass")
+TEST_EVALUATION_TYPES=("pass" "xpass")
 
 if [[ "$TEST_TYPE" == "release" ]]; then
     export ONE_LOGGER_JOB_CATEGORY=production
