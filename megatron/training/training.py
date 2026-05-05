@@ -1969,8 +1969,10 @@ def setup_model_and_optimizer(
         from megatron.training.logits_saver import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
-            k=args.logits_save_top_k,
             save_dir=args.logits_save_dir,
+            k=args.logits_save_top_k,
+            p=args.logits_save_top_p,
+            min_k=args.logits_save_top_p_min_k,
             compress_zstd=args.logits_save_compress,
             flush_interval=args.logits_save_flush_interval,
             save_dtype=args.logits_save_dtype,

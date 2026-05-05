@@ -607,15 +607,15 @@ def topk_kl_div(
 
     # ---- Add a "ghost" token containing sum of non-top-K probabilities to both student and teacher ----
     if add_ghost_token:
-        eps = 1e-6
+        eps = 1e-8
         student_topk_logprobs_exp = student_topk_logprobs.exp() * mask  # don't sum duplicate indices if any
         student_topk_exp_sum = student_topk_logprobs_exp.sum(dim=-1, keepdim=True)
         if tp_size > 1:
             student_topk_exp_sum = dist_nn.functional.all_reduce(
                 student_topk_exp_sum, op=dist.ReduceOp.SUM, group=tp_group
             )
-        student_residual = torch.log(1.0 - student_topk_exp_sum + eps)
-        teacher_residual = torch.log(1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True).clamp(max=1-eps))
+        student_residual = torch.log((1.0 - student_topk_exp_sum).clamp(min=eps))
+        teacher_residual = torch.log((1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True)).clamp(min=eps))
         student_topk_logprobs = torch.cat([student_topk_logprobs, student_residual], dim=-1)
         teacher_topk_logprobs = torch.cat([teacher_topk_logprobs, teacher_residual], dim=-1)
         mask = torch.cat([mask, mask.new_full((*mask.shape[:-1], 1), float(tp_rank==0))], dim=-1)

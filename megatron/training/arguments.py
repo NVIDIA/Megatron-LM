@@ -2357,6 +2357,16 @@ def _add_logging_args(parser):
                        help='Set default logging level')
     group.add_argument('--logits-save-top-k', type=int, default=None,
                        help='Number of top logits to save.')
+    group.add_argument('--logits-save-top-p', type=float, default=None,
+                       help='Top-P (nucleus) threshold applied after top-K '
+                            'selection when saving logits. Only the smallest '
+                            'set of entries whose cumulative probability mass '
+                            'reaches this threshold is kept; the rest are '
+                            'masked with sentinels. Must be in (0, 1].')
+    group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
+                       help='Minimum number of entries kept per token when '
+                            'top-P masking is active, regardless of '
+                            'cumulative mass. Default: 1.')
     group.add_argument('--logits-save-dir', type=str, default=None,
                        help='Directory to save logits.')
     group.add_argument('--logits-save-compress', action='store_true', default=False,

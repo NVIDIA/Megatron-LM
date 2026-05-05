@@ -195,6 +195,17 @@ class LogitsSaverHooks:
     - Computing global top-K from gathered results
     - Having each rank save only its K/N slice (evenly divisible)
 
+    When ``p`` is set, a top-P (nucleus) mask is applied after global top-K
+    selection.  The K dimension is truncated to the maximum per-token nucleus
+    size (reducing the amount of data written to disk), and tokens whose
+    nucleus is smaller than that maximum have their trailing entries masked
+    with ``-1e4`` value / ``-1`` index sentinels.  These sentinels are
+    compatible with :func:`topk_kl_div` in ``cached_logits_loss.py``: the
+    ``-1`` index falls outside every TP rank's vocab range so the entry is
+    excluded from the KL sum, and ``exp(-1e4) = 0`` so masked teacher
+    probability is effectively zero.  At least ``min_k`` entries are always
+    kept per token.
+
     Indices are stored efficiently: uint16 for lower 16 bits + separate high bit tensor.
     tp_rank and dp_rank are stored in the filename for flexibility with multi-digit values.
 
@@ -205,8 +216,15 @@ class LogitsSaverHooks:
     buffered data.
 
     Args:
-        k: Number of top log-probabilities to save globally
         save_dir: Directory to save log-prob files
+        k: Number of top log-probabilities to save globally
+        p: Optional top-P (nucleus) threshold applied after global top-K
+            selection.  When set, only the smallest set of leading entries
+            per token whose cumulative probability mass reaches ``p`` is
+            kept; remaining entries are masked with a ``-1e4`` value
+            sentinel and ``-1`` index sentinel.
+        min_k: Minimum number of entries kept per token when top-P masking
+            is active, regardless of cumulative mass.  Defaults to 1.
         compress_zstd: Whether to use zstd compression (requires zstandard package)
         flush_interval: Number of iterations to batch before writing a single tar
             archive.  1 (default) preserves the legacy one-file-per-iteration behaviour.
@@ -222,9 +240,11 @@ class LogitsSaverHooks:
 
     def __init__(
         self,
-        k: int,
         save_dir: str,
+        k: int,
         *,
+        p: Optional[float] = None,
+        min_k: int = 1,
         compress_zstd: bool = False,
         flush_interval: int = 1,
         save_dtype: str = 'fp16',
@@ -238,8 +258,19 @@ class LogitsSaverHooks:
             )
         self._save_dtype = self._DTYPE_MAP[save_dtype]
 
-        self.k = k
+        if p is not None and not (0.0 < p <= 1.0):
+            raise ValueError(
+                f"p must be in (0, 1] or None, got {p}"
+            )
+        if min_k < 1:
+            raise ValueError(
+                f"min_k must be >= 1, got {min_k}"
+            )
+
         self.save_dir = save_dir
+        self.k = k
+        self.p = p
+        self.min_k = min_k
         self.flush_interval = flush_interval
 
         # Parallel state info
@@ -425,6 +456,11 @@ class LogitsSaverHooks:
         else:
             global_values, global_indices = local_logprob_vals, local_indices
 
+        if self.p is not None:
+            global_values, global_indices = self._apply_topp_truncation(
+                global_values, global_indices,
+            )
+
         global_values = global_values.to(self._save_dtype)
         indices_low, high_bit = _pack_indices(global_indices)
 
@@ -495,6 +531,61 @@ class LogitsSaverHooks:
         topk_global_indices = torch.gather(gathered_indices, -1, topk_positions)
 
         return topk_logprobs, topk_global_indices
+
+    def _apply_topp_truncation(
+        self,
+        values: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply top-P (nucleus) mask to already-sorted top-K log-probs.
+
+        Keeps the smallest set of leading entries per token whose
+        cumulative probability mass is at least ``self.p``, with a floor
+        of ``self.min_k`` kept entries.
+
+        Because the number of surviving entries varies per token, the K
+        dimension is truncated to the *maximum* kept count across all
+        tokens in the microbatch.  Tokens whose individual nucleus is
+        smaller than that maximum have their trailing entries masked with
+        ``-1e4`` value / ``-1`` index sentinels.  These sentinels are
+        compatible with :func:`topk_kl_div`: the ``-1`` index falls
+        outside every TP rank's vocab range so the entry is excluded from
+        the KL sum, and ``exp(-1e4) = 0`` so masked teacher probability
+        is effectively zero.
+
+        Args:
+            values: Top-K log-prob values, sorted descending along the
+                last dimension.  Shape ``(seq, batch, K)``.
+            indices: Corresponding global vocab indices (int64).
+
+        Returns:
+            Tuple of ``(values, indices)`` with K dimension truncated to
+            the maximum per-token nucleus size, and trailing out-of-nucleus
+            entries masked with sentinels.
+        """
+        probs = values.float().exp()
+        cumprobs = probs.cumsum(dim=-1)
+        # Standard nucleus rule: keep entry i iff the cumulative mass
+        # *before* it is < p.  This guarantees we include the entry
+        # that crosses the threshold and always keeps top-1.
+        keep_mask = (cumprobs - probs) < self.p
+
+        k = values.size(-1)
+        min_keep = min(self.min_k, k)
+        arange = torch.arange(k, device=values.device)
+        keep_mask = keep_mask | (arange < min_keep)
+
+        # Truncate to reduce storage
+        max_kept = int(keep_mask.sum(dim=-1).max().item())
+        values = values[..., :max_kept]
+        indices = indices[..., :max_kept]
+        keep_mask = keep_mask[..., :max_kept]
+
+        # Mask out-of-nucleus entries
+        values = torch.where(keep_mask, values, -1e4)
+        indices = torch.where(keep_mask, indices, -1)
+
+        return values, indices
 
     def _write_to_disk(
         self,
