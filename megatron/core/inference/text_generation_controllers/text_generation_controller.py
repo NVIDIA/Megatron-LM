@@ -1725,6 +1725,7 @@ class TextGenerationController:
 
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
+            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             cuda_graph_request_count = (
                 context.padded_active_request_count
@@ -1761,8 +1762,6 @@ class TextGenerationController:
         gpu_done.record()
 
         with torch.inference_mode():
-            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
-
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
