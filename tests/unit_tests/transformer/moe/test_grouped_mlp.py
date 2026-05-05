@@ -151,7 +151,9 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
             return hidden_states + 1
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
-    module.config = SimpleNamespace(fp8=False, fp4=False)
+    module.config = SimpleNamespace(
+        fp8=False, fp4=False, moe_router_padding_for_quantization=False
+    )
     module._fused_ops = None
     fused_ops = FakeFusedOps()
     module._make_fused_ops = lambda: fused_ops
@@ -162,7 +164,7 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     output = module._fused_forward(hidden_states, tokens_per_expert, probs)
 
     torch.testing.assert_close(output, torch.ones_like(hidden_states))
-    assert module._fused_ops is fused_ops
+    assert module._fused_ops[0] is fused_ops
     assert fused_ops.args[0] is hidden_states
     assert fused_ops.args[1] is tokens_per_expert
     assert fused_ops.args[2] is probs
