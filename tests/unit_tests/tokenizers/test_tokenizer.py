@@ -124,7 +124,6 @@ def test_hf_tokenizer():
     assert tokenizer.vocab_size == 128258
 
 
-# HuggingFaceTokenizer.ids_to_text and include_special_tokens (--tokenizer-hf-include-special-tokens).
 # Uses same local path as test_hf_tokenizer; tests EOS stripping vs keeping in detokenized output (e.g. RL).
 LOCAL_HF_TOKENIZER_PATH = "/opt/data/tokenizers/huggingface"
 

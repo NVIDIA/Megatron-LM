@@ -6,7 +6,7 @@ from typing import Any, Type, TypeVar
 import yaml
 from omegaconf import OmegaConf
 from megatron.training.config.common_config import RNGConfig, DistributedInitConfig, ProfilingConfig
-from megatron.training.config.training_config import TrainingConfig, ValidationConfig, SchedulerConfig, LoggerConfig, CheckpointConfig
+from megatron.training.config.training_config import TokenizerConfig, TrainingConfig, ValidationConfig, SchedulerConfig, LoggerConfig, CheckpointConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
@@ -221,13 +221,13 @@ class PretrainConfigContainer(ConfigContainerBase):
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
-    # tokenizer: TokenizerConfig # TODO (@maanug): add support
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
     logger: LoggerConfig
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
