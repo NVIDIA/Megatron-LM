@@ -283,14 +283,14 @@ class HyperConnectionModule(MegatronModule):
             # Fused path: proj_rms + compute_h in one kernel launch sequence
             x_2d = x.reshape(s * b, self.n * self.hidden_size)
             with torch.cuda.nvtx.range("HyperConnection::fused_proj_rms_compute_h"):
-                y_activated, r = self._proj_rms_compute_h_op(
+                h_pre, h_post, h_res, _ = self._proj_rms_compute_h_op(
                     x_2d, self.mapping_proj.weight,
                     self.alpha_pre, self.alpha_post, self.alpha_res,
                     self.bias, self.n, self.norm_eps,
                 )
-            h_pre = y_activated[:, : self.n].view(s, b, self.n)
-            h_post = y_activated[:, self.n : 2 * self.n].view(s, b, self.n)
-            h_res = y_activated[:, 2 * self.n :].view(s, b, self.n, self.n)
+            h_pre = h_pre.view(s, b, self.n)
+            h_post = h_post.view(s, b, self.n)
+            h_res = h_res.view(s, b, self.n, self.n)
         else:
             # Native path: separate proj_rms + _compute_h
             with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):

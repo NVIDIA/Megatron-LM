@@ -124,8 +124,7 @@ def _ref_proj_rms_compute_h(
     h_pre = h[..., :n].sigmoid()
     h_post = h[..., n : 2 * n].sigmoid() * 2
     h_res = h[..., 2 * n :]
-    y = torch.cat([h_pre, h_post, h_res], dim=-1)
-    return y, r
+    return h_pre, h_post, h_res, r
 
 
 # ============================================================================
@@ -676,6 +675,9 @@ class TestFusedProjRmsComputeH:
         ar_data = _rand(1)
         bias_data = _rand(N)
         grad_y = _rand(M, N)
+        grad_h_pre = grad_y[:, :n]
+        grad_h_post = grad_y[:, n : 2 * n]
+        grad_h_res = grad_y[:, 2 * n :]
         grad_r = _rand(M, 1)
 
         def _make_inputs():
@@ -690,15 +692,33 @@ class TestFusedProjRmsComputeH:
 
         # -- fused path --
         xf, wf, apf, apof, arf, bf = _make_inputs()
-        y_f, r_f = fused_proj_rms_compute_h(xf, wf, apf, apof, arf, bf, n, eps)
-        (y_f * grad_y + r_f * grad_r).sum().backward()
+        h_pre_f, h_post_f, h_res_f, r_f = fused_proj_rms_compute_h(
+            xf, wf, apf, apof, arf, bf, n, eps
+        )
+        loss_f = (
+            (h_pre_f * grad_h_pre).sum()
+            + (h_post_f * grad_h_post).sum()
+            + (h_res_f * grad_h_res).sum()
+            + (r_f * grad_r).sum()
+        )
+        loss_f.backward()
 
         # -- reference path --
         xr, wr, apr, apor, arr, br = _make_inputs()
-        y_r, r_r = _ref_proj_rms_compute_h(xr, wr, apr, apor, arr, br, n, eps)
-        (y_r * grad_y + r_r * grad_r).sum().backward()
+        h_pre_r, h_post_r, h_res_r, r_r = _ref_proj_rms_compute_h(
+            xr, wr, apr, apor, arr, br, n, eps
+        )
+        loss_r = (
+            (h_pre_r * grad_h_pre).sum()
+            + (h_post_r * grad_h_post).sum()
+            + (h_res_r * grad_h_res).sum()
+            + (r_r * grad_r).sum()
+        )
+        loss_r.backward()
 
-        torch.testing.assert_close(y_f, y_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="y_activated mismatch")
+        torch.testing.assert_close(h_pre_f, h_pre_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_pre mismatch")
+        torch.testing.assert_close(h_post_f, h_post_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post mismatch")
+        torch.testing.assert_close(h_res_f, h_res_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_res mismatch")
         torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="r mismatch")
         torch.testing.assert_close(
             xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on x"
@@ -931,13 +951,13 @@ class TestEndToEndFused:
             bias_p = bias_data.clone().requires_grad_(True)
 
             x_2d = hs.reshape(s * b, n * C)
-            y_activated, r = fused_proj_rms_compute_h(
+            h_pre, h_post, h_res_logits, _ = fused_proj_rms_compute_h(
                 x_2d, w, ap, apo, ar, bias_p, n, eps,
             )
 
-            h_pre = y_activated[:, :n].view(s, b, n)
-            h_post = y_activated[:, n : 2 * n].view(s, b, n)
-            h_res_logits = y_activated[:, 2 * n :].view(s, b, n, n)
+            h_pre = h_pre.view(s, b, n)
+            h_post = h_post.view(s, b, n)
+            h_res_logits = h_res_logits.view(s, b, n, n)
             h_res = fused_sinkhorn(h_res_logits, sinkhorn_iters, eps)
 
             aggregated = fused_h_aggregate(hs.view(s, b, n, C), h_pre)
@@ -959,13 +979,13 @@ class TestEndToEndFused:
             bias_p = bias_data.clone().requires_grad_(True)
 
             x_2d = hs.reshape(s * b, n * C)
-            y_ref, r_ref = _ref_proj_rms_compute_h(
+            h_pre, h_post, h_res_logits, _ = _ref_proj_rms_compute_h(
                 x_2d, w, ap, apo, ar, bias_p, n, eps,
             )
 
-            h_pre = y_ref[:, :n].view(s, b, n)
-            h_post = y_ref[:, n : 2 * n].view(s, b, n)
-            h_res_logits = y_ref[:, 2 * n :].view(s, b, n, n)
+            h_pre = h_pre.view(s, b, n)
+            h_post = h_post.view(s, b, n)
+            h_res_logits = h_res_logits.view(s, b, n, n)
             h_res = _ref_sinkhorn(h_res_logits, sinkhorn_iters, eps)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
@@ -1273,13 +1293,13 @@ class TestEndToEndFusedBroadcast:
             hs_map, hs_agg, hs_res = BroadcastTensorFused.apply(hs, fused_add_3)
 
             x_2d = hs_map.reshape(s * b, n * C)
-            y_activated, r = fused_proj_rms_compute_h(
+            h_pre, h_post, h_res_logits, _ = fused_proj_rms_compute_h(
                 x_2d, w, ap, apo, ar, bias_p, n, eps,
             )
 
-            h_pre = y_activated[:, :n].view(s, b, n)
-            h_post = y_activated[:, n : 2 * n].view(s, b, n)
-            h_res_logits = y_activated[:, 2 * n :].view(s, b, n, n)
+            h_pre = h_pre.view(s, b, n)
+            h_post = h_post.view(s, b, n)
+            h_res_logits = h_res_logits.view(s, b, n, n)
             h_res = fused_sinkhorn(h_res_logits, sinkhorn_iters, eps)
 
             aggregated = fused_h_aggregate(hs_agg.view(s, b, n, C), h_pre)
@@ -1301,13 +1321,13 @@ class TestEndToEndFusedBroadcast:
             bias_p = bias_data.clone().requires_grad_(True)
 
             x_2d = hs.reshape(s * b, n * C)
-            y_ref, r_ref = _ref_proj_rms_compute_h(
+            h_pre, h_post, h_res_logits, _ = _ref_proj_rms_compute_h(
                 x_2d, w, ap, apo, ar, bias_p, n, eps,
             )
 
-            h_pre = y_ref[:, :n].view(s, b, n)
-            h_post = y_ref[:, n : 2 * n].view(s, b, n)
-            h_res_logits = y_ref[:, 2 * n :].view(s, b, n, n)
+            h_pre = h_pre.view(s, b, n)
+            h_post = h_post.view(s, b, n)
+            h_res_logits = h_res_logits.view(s, b, n, n)
             h_res = _ref_sinkhorn(h_res_logits, sinkhorn_iters, eps)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
