@@ -1012,7 +1012,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
     def _run_stop_word_finish_schedule(
-        self, stop_word_ids_by_request: Dict[int, int], *, enable_async_scheduling: bool
+        self, stop_word_ids_by_request: Dict[int, List[int]], *, enable_async_scheduling: bool
     ) -> DynamicEngineTestEnv:
         """Run a decode schedule whose requests stop on per-request stop tokens."""
         env = self._build_test_env(
@@ -1037,7 +1037,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 request.sampling_params.detokenize_stop_sequence = True
                 env.engine._add_request(request)
                 tracked_request = env.engine.get_request(request.request_id)
-                tracked_request.stop_word_ids = [[stop_word_ids_by_request[request.request_id]]]
+                tracked_request.stop_word_ids = [stop_word_ids_by_request[request.request_id]]
                 request.state = "pending"
 
             while env.engine.has_unfinished_requests():
@@ -1068,7 +1068,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         probe_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
         stop_word_ids_by_request = {
-            request.request_id: request.generated_tokens[1] for request in probe_env.requests
+            request.request_id: [request.generated_tokens[1]] for request in probe_env.requests
         }
 
         self._reinitialize_model_parallel_for_async_test()
@@ -1089,6 +1089,53 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert controller._async_forward_launch_count > 0, controller._async_disable_reason
         assert controller._async_finish_boundary_count > 0
         assert all(len(tokens) < common_kwargs["num_tokens_to_generate"] for tokens in async_tokens)
+        assert async_tokens == serial_tokens
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_multi_token_stop_word_cuda_graph_e2e(self) -> None:
+        """Async GPT scheduling handles multi-token stop words without output drift."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        probe_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        stop_word_ids_by_request = {
+            request.request_id: request.generated_tokens[1:3] for request in probe_env.requests
+        }
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        serial_env = self._run_stop_word_finish_schedule(
+            stop_word_ids_by_request, enable_async_scheduling=False
+        )
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._run_stop_word_finish_schedule(
+            stop_word_ids_by_request, enable_async_scheduling=True
+        )
+        async_tokens = [request.generated_tokens for request in async_env.requests]
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_finish_boundary_count > 0
+        for request_tokens, stop_word_ids in zip(async_tokens, stop_word_ids_by_request.values()):
+            assert request_tokens[-len(stop_word_ids) :] == stop_word_ids
         assert async_tokens == serial_tokens
 
     @pytest.mark.internal
@@ -4397,6 +4444,49 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             # Stop word stripped
             assert request.generated_tokens == [1, 2, 3]
             assert trimmed == 2
+
+    @pytest.mark.parametrize(
+        "generated_tokens,stop_word_ids,num_speculative_tokens,detokenize_stop_sequence,expected_hit,expected_trim,expected_tokens",
+        [
+            ([1, 2, 3, 4, 5], [4, 5], 0, True, True, 0, [1, 2, 3, 4, 5]),
+            ([1, 2, 3, 4, 5, 6], [4, 5], 1, True, True, 1, [1, 2, 3, 4, 5]),
+            ([1, 2, 3, 4, 5, 6], [4, 5], 1, False, True, 3, [1, 2, 3]),
+            ([1, 2, 3, 4], [4, 5], 1, True, False, 0, [1, 2, 3, 4]),
+            ([1, 2, 3, 4, 3, 4], [3, 4], 2, True, True, 0, [1, 2, 3, 4, 3, 4]),
+        ],
+        ids=[
+            "tail_keep_stop",
+            "trailing_token_keep_stop",
+            "trailing_token_strip_stop",
+            "partial_prefix_no_hit",
+            "overlap_tail_hit",
+        ],
+    )
+    def test_stop_word_post_append_trim_matrix(
+        self,
+        generated_tokens,
+        stop_word_ids,
+        num_speculative_tokens,
+        detokenize_stop_sequence,
+        expected_hit,
+        expected_trim,
+        expected_tokens,
+    ):
+        """Stop-word trimming keeps token/logprob alignment for multi-token boundaries."""
+        engine = types.SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        check = DynamicInferenceEngine._check_stop_words_for_request_post_append
+
+        request = types.SimpleNamespace(
+            generated_tokens=list(generated_tokens),
+            stop_word_ids=[stop_word_ids],
+            sampling_params=SamplingParams(detokenize_stop_sequence=detokenize_stop_sequence),
+        )
+
+        hit, trimmed = check(engine, request)
+
+        assert hit is expected_hit
+        assert trimmed == expected_trim
+        assert request.generated_tokens == expected_tokens
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
