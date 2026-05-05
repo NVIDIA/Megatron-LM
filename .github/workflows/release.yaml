@@ -94,6 +94,7 @@ jobs:
       dry-run: ${{ inputs.dry-run || false }}
       version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
       restrict-to-admins: true
+      app-id: ${{ vars.BOT_ID }}
       library-name: Megatron Core
       bump-targets: |
         [
@@ -101,6 +102,9 @@ jobs:
           {"python-package": "megatron_fsdp", "src-dir": "megatron/core/distributed/fsdp/src/"}
         ]
     secrets:
+      BOT_KEY: ${{ secrets.BOT_KEY }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_PWD: ${{ secrets.SSH_PWD }}
 
   build-test-publish-wheels:
     needs: [pre-flight, bump]
@@ -141,7 +145,9 @@ jobs:
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
       publish-docs: false
+      app-id: ${{ vars.BOT_ID }}
     secrets:
+      BOT_KEY: ${{ secrets.BOT_KEY }}
       SLACK_WEBHOOK: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SLACK_MAIN_CHANNEL_WEBHOOK || secrets.SLACK_CI_CHANNEL_WEBHOOK }}
 
   publish-docs:
