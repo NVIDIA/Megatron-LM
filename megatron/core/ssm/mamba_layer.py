@@ -198,11 +198,10 @@ class MambaLayer(GraphableMegatronModule):
             and not torch.is_inference_mode_enabled()  # for inference eager dummy_forward
         ):
             return True
-        elif (
-            kwargs.get('inference_context') is not None
-            and kwargs['inference_context'].is_active
-            and hasattr(self, 'cudagraph_manager')
+        elif BaseInferenceContext.is_active() and (
+            hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
+            and kwargs.get('inference_context') is not None
             and not self.config.cuda_graph_scope  # empty-list = per-layer CUDA graphs
         ):
             context = kwargs['inference_context']

@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -678,12 +679,7 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(
-        self,
-        input: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        inference_context: Optional['BaseInferenceContext'] = None,
-    ):
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """
         Forward pass of the router.
 
@@ -692,9 +688,6 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
-            inference_context (BaseInferenceContext, optional): Active inference context. Ignored
-                                                                in the training router; the
-                                                                inference subclass overrides this.
         """
         self._maintain_float32_expert_bias()
 
@@ -810,18 +803,12 @@ class InferenceTopKRouter(TopKRouter):
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
-    def forward(
-        self,
-        input: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        inference_context: Optional['BaseInferenceContext'] = None,
-    ):
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Simplified forward pass for inference - returns dense tensors only.
 
         Args:
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
-            inference_context (BaseInferenceContext, optional): Active inference context.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -829,7 +816,7 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
-        if inference_context is None or not inference_context.is_active:
+        if not BaseInferenceContext.is_active():
             return super().forward(input, padding_mask)
 
         return self._forward(input, padding_mask)
