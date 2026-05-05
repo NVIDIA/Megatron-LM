@@ -1758,6 +1758,9 @@ class TextGenerationController:
             self._record_async_disable_reason(self._async_disable_reason)
             return False, None, None, None, None, False
 
+        if self._active_requests_need_logprob_results():
+            return True, None, None, None, None, False
+
         async_decode_graph = self._get_async_decode_graph()
         if async_decode_graph is None:
             self._async_disable_reason = "async decode graph not captured"
@@ -1841,13 +1844,22 @@ class TextGenerationController:
 
         active_metadata = context.active_request_metadata
         active_slice = slice(0, active_request_count)
+        return_log_probs_requested = active_metadata["return_log_probs"][active_slice]
+        top_n_logprobs_requested = active_metadata["top_n_logprobs"][active_slice] > 0
         if (active_metadata["top_k"][active_slice] != 1).any():
             return "non-greedy top_k"
         if (active_metadata["top_p"][active_slice] != 0.0).any():
             return "top_p sampling"
-        if active_metadata["return_log_probs"][active_slice].any():
-            return "logprobs requested"
-        if (active_metadata["top_n_logprobs"][active_slice] > 0).any():
+        if self.num_speculative_tokens != 0 and (
+            return_log_probs_requested.any() or top_n_logprobs_requested.any()
+        ):
+            return "mtp logprobs requested"
+        if (
+            return_log_probs_requested
+            & ~active_metadata["skip_prompt_log_probs"][active_slice]
+        ).any():
+            return "prompt logprobs requested"
+        if top_n_logprobs_requested.any():
             return "top-n logprobs requested"
 
         active_sequence_lengths = context.get_active_sequence_lengths()
@@ -1873,6 +1885,19 @@ class TextGenerationController:
         return (
             (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
             (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
+        )
+
+    def _active_requests_need_logprob_results(self) -> bool:
+        """Whether active requests need logits preserved for generated logprob bookkeeping."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count <= 0:
+            return False
+        active_metadata = context.active_request_metadata
+        active_slice = slice(0, active_request_count)
+        return bool(
+            active_metadata["return_log_probs"][active_slice].any()
+            or (active_metadata["top_n_logprobs"][active_slice] > 0).any()
         )
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
@@ -2656,7 +2681,8 @@ class TextGenerationController:
 
         with torch.inference_mode():
             range_push("sampling")
-            if async_next_prepared or pending_forward_reused:
+            logprob_logits_available = not async_sample_already_launched
+            if (async_next_prepared or pending_forward_reused) and not logprob_logits_available:
                 return_log_probs = False
                 return_top_n_logprobs = False
             else:
@@ -2712,6 +2738,24 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
+            log_probs = None
+            top_n_logprobs = None
+            if return_log_probs or return_top_n_logprobs:
+                if self.num_speculative_tokens > 0:
+                    log_probs, log_probs_tensor = (
+                        self._dynamic_step_calculate_log_probs_speculative()
+                    )
+                    if return_top_n_logprobs:
+                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
+                            log_probs_tensor
+                        )
+                else:
+                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs()
+                    if return_top_n_logprobs:
+                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                            log_probs_tensor
+                        )
+
             if async_next_prepared and not async_sample_already_launched:
                 (
                     async_sampled_tokens_cpu,
@@ -2752,23 +2796,6 @@ class TextGenerationController:
                 self._async_deferred_mtp_release_count += 1
                 range_pop()
 
-            log_probs = None
-            top_n_logprobs = None
-            if return_log_probs or return_top_n_logprobs:
-                if self.num_speculative_tokens > 0:
-                    log_probs, log_probs_tensor = (
-                        self._dynamic_step_calculate_log_probs_speculative()
-                    )
-                    if return_top_n_logprobs:
-                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
-                            log_probs_tensor
-                        )
-                else:
-                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs()
-                    if return_top_n_logprobs:
-                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
-                            log_probs_tensor
-                        )
             range_pop()
 
             if skip_bookkeeping:
