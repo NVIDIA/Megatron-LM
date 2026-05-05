@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import functools
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -27,18 +28,33 @@ class LogProbsDecode:
     Instance methods wrap the kernels in CUDA-graph capture/replay.
     """
 
-    def __init__(self, config=None):
+    def __init__(
+        self,
+        config=None,
+        *,
+        side_stream: Optional[torch.cuda.Stream] = None,
+        side_pool_anchor: Optional[CudaGraphManager] = None,
+    ):
         """
         Args:
             config: Optional MegatronConfig for CUDA graph capture configuration.
+            side_stream: Optional CUDA stream the controller hosts indexing and top-n on.
+            side_pool_anchor: Optional anchor whose mempool the side-stream graph shares.
         """
+        self._side_stream = side_stream
+        self.side_pool_anchor: Optional[CudaGraphManager] = None
         if config is not None and config.cuda_graph_impl == "local":
-            CudaGraphManager(
+            self.side_pool_anchor = CudaGraphManager(
                 config,
                 self,
                 function_name="indexing_kernel",
                 need_backward=False,
                 inline_capture=True,
+                **(
+                    {"share_mempool_with": side_pool_anchor}
+                    if side_pool_anchor is not None
+                    else {"new_mempool": True}
+                ),
             )
             CudaGraphManager(
                 config,
@@ -196,12 +212,18 @@ class LogProbsDecode:
         )
 
         top_n_v = top_n_i = None
-        # TODO: Overlap eager top-n compute on a side stream with sampling/extract work.
         if top_n_max > 0:
-            # Reuse the LSE from softmax_kernel: top_n_log_probs = topk_raw - lse.
-            raw = logits.squeeze(0)[ri].float()
-            top_n_v_raw, top_n_i = _topk(raw, k=top_n_max)
-            top_n_v = top_n_v_raw - lse.unsqueeze(-1)
+            if self._side_stream is not None:
+                lse.record_stream(self._side_stream)
+                self._side_stream.wait_stream(torch.cuda.current_stream())
+                stream_ctx = torch.cuda.stream(self._side_stream)
+            else:
+                stream_ctx = nullcontext()
+            with stream_ctx:
+                # Reuse the LSE from softmax_kernel: top_n_log_probs = topk_raw - lse.
+                raw = logits.squeeze(0)[ri].float()
+                top_n_v_raw, top_n_i = _topk(raw, k=top_n_max)
+                top_n_v = top_n_v_raw - lse.unsqueeze(-1)
 
         active_request_count = context.total_request_count - context.paused_request_count
         # Defer the CPU-side extract: caller invokes the partial after step bookkeeping

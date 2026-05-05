@@ -5,7 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
 import torch
@@ -171,11 +171,27 @@ class TextGenerationController:
         self._log_prob_count = 0
         self._top_n_max = 0
 
-        # Log-prob computation backends (graph caching is per-backend).
-        # TODO: Overlap these methods with other compute by running them on side-streams.
-        self._log_probs_decode = LogProbsDecode(self.model_config)
-        self._log_probs_prefill = LogProbsPrefill(self.model_config)
-        self._log_probs_speculative = LogProbsSpeculative(self.model_config)
+        # Side stream for work that can be overlapped with critical path (forward & sampling).
+        self._side_stream = torch.cuda.Stream(device=device)
+        self._side_pre_calc_event = torch.cuda.Event()
+        self._side_step_done_event = torch.cuda.Event()
+        # Dedicated stream for the deferred log-prob extract D2H copies.
+        self._extract_stream = torch.cuda.Stream(device=device)
+
+        # Log-prob computation backends.
+        # All side-stream graphs across the three classes share one mempool.
+        self._log_probs_decode = LogProbsDecode(self.model_config, side_stream=self._side_stream)
+        side_pool_anchor = self._log_probs_decode.side_pool_anchor
+        self._log_probs_prefill = LogProbsPrefill(
+            self.model_config,
+            side_stream=self._side_stream,
+            side_pool_anchor=side_pool_anchor,
+        )
+        self._log_probs_speculative = LogProbsSpeculative(
+            self.model_config,
+            side_stream=self._side_stream,
+            side_pool_anchor=side_pool_anchor,
+        )
 
         # Sampling backend: provides the sampling kernel.
         if self._sampling_backend == "flashinfer":
@@ -1199,6 +1215,16 @@ class TextGenerationController:
             context, logits, new_tokens, log_prob_request_count, eager=eager, top_n_max=top_n_max
         )
 
+    async def run_log_probs_extract(
+        self, log_probs_extract: Optional[Callable]
+    ) -> Tuple[Optional[List], Optional[Dict]]:
+        """Run a deferred extract callable from `_dynamic_step_calculate_log_probs`."""
+        if log_probs_extract is None:
+            return None, None
+        self._extract_stream.wait_event(self._side_step_done_event)
+        with torch.cuda.stream(self._extract_stream):
+            return log_probs_extract()
+
     @torch.inference_mode()
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
@@ -1450,7 +1476,6 @@ class TextGenerationController:
             return None
 
         with torch.inference_mode():
-            # TODO: Overlap compute by launching kernels on multiple streams.
             self._dynamic_step_log_probs_bookkeeping()
 
             input_ids, position_ids = self._dynamic_step_context_init()
@@ -1466,7 +1491,11 @@ class TextGenerationController:
             if config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            self._dynamic_step_log_probs_indexing()
+            self._side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._side_stream):
+                self._dynamic_step_log_probs_indexing()
+
+            torch.cuda.current_stream().wait_event(self._side_step_done_event)
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
@@ -1474,7 +1503,11 @@ class TextGenerationController:
             self._dynamic_step_forward_logits(input_ids, position_ids)
 
             if self.num_speculative_tokens > 0:
-                self._dynamic_step_log_probs_softmax()
+                self._side_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._side_stream):
+                    self._dynamic_step_log_probs_softmax()
+
+            self._side_pre_calc_event.record(self._side_stream)
 
             # Commit Mamba intermediate states before update_requests, which
             # may swap request indices. The Python lists tracking EOS block IDs
@@ -1526,7 +1559,10 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
+            torch.cuda.current_stream().wait_event(self._side_pre_calc_event)
             log_probs_extract = self._dynamic_step_calculate_log_probs()
+            self._side_stream.wait_stream(torch.cuda.current_stream())
+            self._side_step_done_event.record(self._side_stream)
 
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
