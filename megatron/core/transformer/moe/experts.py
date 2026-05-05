@@ -329,6 +329,8 @@ class TEGroupedMLP(MegatronModule):
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
 
+        assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
+
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
 

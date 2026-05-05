@@ -501,3 +501,76 @@ class TestTEGroupedMLP:
         for i in range(self.num_experts):
             assert getattr(self.grouped_mlp.experts.linear_fc1, f"weight{i}").grad is not None
             assert getattr(self.grouped_mlp.experts.linear_fc2, f"weight{i}").grad is not None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_gpu_make_fused_ops_constructs_with_real_te(self):
+        """Verify `_make_fused_ops` builds a working TE op-fuser pipeline.
+
+        Regression guard for the `device="meta"` shell + weight-reattachment
+        sequence — a TE-side change that allocates state in the constructor
+        would break this without any of the mock-based unit tests catching it.
+        """
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        import inspect
+
+        if "single_grouped_parameter" not in inspect.signature(GroupedLinear.__init__).parameters:
+            pytest.skip(
+                "Installed TE op fuser GroupedLinear lacks `single_grouped_parameter` kwarg; "
+                "_make_fused_ops requires a TE build that exposes it."
+            )
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        layer = MoELayer(
+            tf_config,
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp.submodules,
+        )
+        layer = Float16Module(layer.config, layer).module
+        layer.cuda()
+        experts = layer.experts
+        assert isinstance(experts, TEGroupedMLP)
+        assert experts._with_fused_impl
+
+        ops = experts._make_fused_ops()
+
+        assert len(ops) == 3
+        assert isinstance(ops[0], GroupedLinear)
+        assert isinstance(ops[1], ScaledSwiGLU)
+        assert isinstance(ops[2], GroupedLinear)
+        # Weights of the wrapper ops must alias the underlying GroupedLinear
+        # parameters so optimizer updates are visible to the fused path.
+        for idx in range(experts.linear_fc1.num_gemms):
+            if not experts.linear_fc1.single_grouped_parameter:
+                assert getattr(ops[0], f"weight{idx}") is getattr(
+                    experts.linear_fc1, f"weight{idx}"
+                )
+        for idx in range(experts.linear_fc2.num_gemms):
+            if not experts.linear_fc2.single_grouped_parameter:
+                assert getattr(ops[2], f"weight{idx}") is getattr(
+                    experts.linear_fc2, f"weight{idx}"
+                )
