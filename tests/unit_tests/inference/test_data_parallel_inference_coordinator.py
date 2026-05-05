@@ -455,9 +455,7 @@ class TestCoordinator:
                 )
 
                 # Submit and complete requests to confirm the step path still works.
-                futures = [
-                    client.add_request(prompt=p, sampling_params=s) for p, s in requests
-                ]
+                futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
                 for result in results:
                     assert result["status"] == Status.COMPLETED.name
