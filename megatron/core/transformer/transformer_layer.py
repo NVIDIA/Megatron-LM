@@ -6,7 +6,7 @@ import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.distributed
@@ -15,7 +15,6 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
@@ -36,6 +35,9 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
 
@@ -600,7 +602,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             residual = residual.float()
 
         using_fused_tp_inference_kernel = (
-            BaseInferenceContext.is_active() and self.config.inference_fuse_tp_communication
+            inference_context is not None
+            and inference_context.is_active
+            and self.config.inference_fuse_tp_communication
         )
 
         if using_fused_tp_inference_kernel:
@@ -779,7 +783,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         using_fused_tp_inference_kernel = (
-            BaseInferenceContext.is_active() and self.config.inference_fuse_tp_communication
+            inference_context is not None
+            and inference_context.is_active
+            and self.config.inference_fuse_tp_communication
         )
 
         if self.recompute_mlp:
@@ -828,7 +834,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            if self.is_moe_layer:
+                mlp_output_with_bias = self.mlp(
+                    pre_mlp_layernorm_output,
+                    padding_mask=padding_mask,
+                    inference_context=inference_context,
+                )
+            else:
+                mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
 
         nvtx_range_pop(suffix="mlp")
 
@@ -848,10 +861,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
         else:
-            return self._forward_post_mlp(mlp_output_with_bias, residual)
+            return self._forward_post_mlp(
+                mlp_output_with_bias, residual, inference_context=inference_context
+            )
 
     def _forward_post_mlp(
-        self, mlp_output_with_bias: tuple[Tensor, Tensor | None], residual: Tensor
+        self,
+        mlp_output_with_bias: tuple[Tensor, Tensor | None],
+        residual: Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
         """
         Perform operations after the MLP computation.
@@ -859,6 +877,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
+            inference_context: Active inference context, or None outside inference.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -868,7 +887,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         using_fused_tp_inference_kernel = (
-            BaseInferenceContext.is_active() and self.config.inference_fuse_tp_communication
+            inference_context is not None
+            and inference_context.is_active
+            and self.config.inference_fuse_tp_communication
         )
 
         if self.recompute_pre_mlp_layernorm:
@@ -1273,8 +1294,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         ):
             return True
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
-        elif BaseInferenceContext.is_active() and (
-            hasattr(self, 'cudagraph_manager')
+        elif (
+            (kwargs.get('inference_context') is not None)
+            and kwargs['inference_context'].is_active
+            and hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
                 (kwargs.get('inference_context') is not None)

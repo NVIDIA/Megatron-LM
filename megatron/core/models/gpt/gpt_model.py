@@ -308,7 +308,7 @@ class GPTModel(LanguageModule):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
-        in_inference_mode = BaseInferenceContext.is_active()
+        in_inference_mode = inference_context is not None and inference_context.is_active
 
         # Decoder embedding.
         if decoder_input is not None:
@@ -377,7 +377,11 @@ class GPTModel(LanguageModule):
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
         elif self.position_embedding_type == 'yarn':
-            if not BaseInferenceContext.is_active() or not self.config.flash_decode:
+            if (
+                inference_context is None
+                or not inference_context.is_active
+                or not self.config.flash_decode
+            ):
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
@@ -393,7 +397,11 @@ class GPTModel(LanguageModule):
                     "YarnRotaryEmbedding yet."
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
-            if not BaseInferenceContext.is_active() or not self.config.flash_decode:
+            if (
+                inference_context is None
+                or not inference_context.is_active
+                or not self.config.flash_decode
+            ):
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
@@ -590,7 +598,7 @@ class GPTModel(LanguageModule):
         Applies Multi-Token Prediction if enabled, generates output logits through
         the output layer, and computes language model loss when labels are provided.
         """
-        in_inference_mode = BaseInferenceContext.is_active()
+        in_inference_mode = inference_context is not None and inference_context.is_active
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 

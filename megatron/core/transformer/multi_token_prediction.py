@@ -14,7 +14,6 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
@@ -909,7 +908,12 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         return input_ids, position_ids, decoder_input, hidden_states
 
-    def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
+    def _concat_embeddings(
+        self,
+        hidden_states: torch.Tensor,
+        decoder_input: torch.Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+    ):
         """
         Concatenate the tokens before sending to transformer layer.
         """
@@ -923,7 +927,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states, _ = self.eh_proj(hidden_states)
         # For tensor parallel we need to gather the tensor across the model-parallel
         # ranks after the linear projection.
-        if BaseInferenceContext.is_active():
+        if inference_context is not None and inference_context.is_active:
             hidden_states = inference_all_gather_from_tensor_model_parallel_region(
                 hidden_states, self.tp_group, self.config
             )
@@ -971,7 +975,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         # TODO: currently ignoring FP4 in MTP layers because we need more numerical validation
         with rng_context:
             with fp8_context:
-                hidden_states = self._concat_embeddings(hidden_states, decoder_input)
+                hidden_states = self._concat_embeddings(
+                    hidden_states, decoder_input, inference_context=inference_params
+                )
 
             # Use a separate fp8 context for the transformer layer. This is to ensure that when the
             # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is

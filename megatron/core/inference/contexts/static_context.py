@@ -19,7 +19,7 @@ class StaticInferenceContext(BaseInferenceContext):
     ):
         config = InferenceConfig(materialize_only_last_token_logits=True)
         super().__init__(inference_config=config)
-        BaseInferenceContext.set_active()
+        self.is_active = True
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size
         self.sequence_len_offset = 0

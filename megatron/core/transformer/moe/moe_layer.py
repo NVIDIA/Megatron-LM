@@ -10,7 +10,6 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -371,7 +370,7 @@ class MoELayer(BaseMoELayer):
         Stores the training dispatcher and creates the inference dispatcher selected
         by config.inference_moe_token_dispatcher_type ('nccl' or 'nvls').
         The active dispatcher is selected at the start of `forward` based on
-        `BaseInferenceContext.is_active()`.
+        `inference_context.is_active`.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
         dispatcher_cls = (
@@ -407,13 +406,20 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        inference_context: Optional['BaseInferenceContext'] = None,
+    ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        probs, routing_map = apply_module(self.router)(
+            hidden_states, padding_mask, inference_context=inference_context
+        )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -476,7 +482,12 @@ class MoELayer(BaseMoELayer):
         return shared_expert_output
 
     @internal_api
-    def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def routed_experts_compute(
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        inference_context: Optional['BaseInferenceContext'] = None,
+    ):
         """Computes the output of the routed experts on the dispatched tokens.
 
         This method first post-processes the dispatched input to get permuted tokens
@@ -490,10 +501,15 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and BaseInferenceContext.is_active():
+        is_inference = inference_context is not None and inference_context.is_active
+        if hasattr(self, "_inference_token_dispatcher") and is_inference:
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
+                dispatched_input,
+                tokens_per_expert,
+                permuted_probs,
+                routing_map=routing_map,
+                inference_context=inference_context,
             )
         else:
             expert_output, mlp_bias = apply_module(self.experts)(
@@ -537,6 +553,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
+        inference_context: Optional['BaseInferenceContext'] = None,
     ):
         """Forward pass for the MoE layer.
 
@@ -551,6 +568,9 @@ class MoELayer(BaseMoELayer):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            inference_context (BaseInferenceContext, optional): Active inference context, used to
+                                                                select inference-specific code paths
+                                                                in the router and experts.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -562,8 +582,9 @@ class MoELayer(BaseMoELayer):
         # Select the active token dispatcher based on whether the inference engine
         # is currently using the model. Only applies when the inference dispatcher
         # was set up (config.transformer_impl == "inference_optimized").
+        is_inference = inference_context is not None and inference_context.is_active
         if hasattr(self, "_inference_token_dispatcher"):
-            if BaseInferenceContext.is_active():
+            if is_inference:
                 self.token_dispatcher = self._inference_token_dispatcher
                 self.shared_expert_overlap = (
                     self._inference_token_dispatcher.shared_experts is not None
@@ -576,11 +597,15 @@ class MoELayer(BaseMoELayer):
             padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+        def custom_forward(
+            hidden_states, intermediate_tensors=None, padding_mask=None, inference_context=None
+        ):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    probs, routing_map = self.route(
+                        hidden_states, padding_mask, inference_context=inference_context
+                    )
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
@@ -599,7 +624,9 @@ class MoELayer(BaseMoELayer):
                     hidden_states, probs = intermediate_tensors
 
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                output, mlp_bias = self.routed_experts_compute(
+                    dispatched_input, probs, inference_context=inference_context
+                )
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
@@ -629,13 +656,21 @@ class MoELayer(BaseMoELayer):
                     hidden_states,
                     intermediate_tensors,
                     padding_mask,
+                    inference_context,
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                    custom_forward,
+                    False,
+                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                    inference_context,
                 )
         else:
-            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+            outputs = custom_forward(
+                hidden_states, intermediate_tensors, padding_mask, inference_context
+            )
 
         return outputs
 

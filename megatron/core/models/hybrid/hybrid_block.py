@@ -262,7 +262,7 @@ class HybridStack(MegatronModule):
             )
             and inference_context
             and inference_context.is_static_batching()
-            and BaseInferenceContext.is_active()
+            and inference_context.is_active
         ):
             current_batch_size = hidden_states.shape[1]
             sequence_len_offset = torch.tensor(
