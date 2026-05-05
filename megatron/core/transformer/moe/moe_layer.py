@@ -19,6 +19,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
@@ -394,6 +395,16 @@ class MoELayer(BaseMoELayer):
             and self.config.moe_shared_expert_overlap
         ):
             self._inference_token_dispatcher.set_shared_experts(self.shared_experts)
+            # With MoE latent projections, the shared expert must run on the full
+            # hidden_states (pre-latent) and its output added post-fc2_latent_proj.
+            # The dispatcher only sees latent-dim tensors, so we move the launch+add
+            # into preprocess/postprocess on the layer and tell the dispatcher to
+            # skip its own internal launch+add.
+            if self.config.moe_latent_size:
+                self._inference_token_dispatcher._external_shared_expert_launch = True
+        # Holds the side-stream shared-expert output for the latent-MoE inference
+        # path (preprocess launches, postprocess joins+adds).
+        self._latent_shared_expert_output: Optional[torch.Tensor] = None
 
     def train(self, mode: bool = True):
         """Swap token dispatcher when switching between train and eval modes."""
@@ -438,11 +449,27 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher.
         """
-        # Project the hidden_states from hidden dimension down to latent dimenion.
-        if self.config.moe_latent_size:
+        # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
+        # expert on its side stream BEFORE fc1_latent_proj so it sees the full
+        # hidden_states. The corresponding join+add runs in postprocess after
+        # fc2_latent_proj. Skipped on the training / NCCL paths.
+        if (
+            self.config.moe_latent_size
+            and self.shared_expert_overlap
+            and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
+        ):
+            stream = SharedExpertMLP.stream
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                self._latent_shared_expert_output = apply_module(self.shared_experts)(
+                    hidden_states
+                )
+        elif self.config.moe_latent_size:
             assert (
                 not self.shared_expert_overlap
-            ), "Shared expert overlap not supported when MoE latent projections are used."
+            ), "Shared expert overlap with MoE latent is only supported on the NVLS inference dispatcher."
+        # Project the hidden_states from hidden dimension down to latent dimenion.
+        if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
@@ -536,6 +563,13 @@ class MoELayer(BaseMoELayer):
 
         if shared_expert_output is not None:
             output = output + shared_expert_output
+        # Latent-MoE + NVLS-inference shared-expert overlap: join the side stream
+        # and add the output launched in preprocess.  Must happen post-fc2_latent_proj
+        # so dimensions match.
+        if self._latent_shared_expert_output is not None:
+            torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
+            output = output + self._latent_shared_expert_output
+            self._latent_shared_expert_output = None
         return output
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):

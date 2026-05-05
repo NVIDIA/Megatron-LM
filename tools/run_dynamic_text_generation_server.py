@@ -95,7 +95,7 @@ if __name__ == "__main__":
         # Enable return_log_probs to allow prompt logprobs computation for echo=True requests
         # This sets materialize_only_last_token_logits=False in the inference context,
         # which is required for lm-eval compatibility (loglikelihood evaluation tasks)
-        args.return_log_probs = True
+        args.return_log_probs = False # set to False for benchmarking.
 
         engine = get_dynamic_inference_engine()
 
