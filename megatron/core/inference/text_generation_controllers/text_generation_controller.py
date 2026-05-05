@@ -1552,6 +1552,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         if (
             not self._async_scheduling_enabled
+            or not context.config.enable_async_decode_graphs
             or not self._enable_cuda_graph
             or CudaGraphScope.full_iteration_inference not in self.model_config.cuda_graph_scope
         ):
