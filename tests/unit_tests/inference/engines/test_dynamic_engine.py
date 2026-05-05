@@ -854,6 +854,48 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize(
+        "sampling_kwargs",
+        [
+            pytest.param({"top_k": 10}, id="top_k"),
+            pytest.param({"top_k": 0, "top_p": 0.9}, id="top_p"),
+        ],
+    )
+    def test_async_scheduling_non_greedy_hybrid_mtp_cuda_graph_fallback_e2e(
+        self, sampling_kwargs: dict
+    ) -> None:
+        """Hybrid MTP non-greedy sampling matches serial output with async overlap enabled."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            model_provider="hybrid",
+            num_speculative_tokens=2,
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            **sampling_kwargs,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_forward_graph_launch_count > 0
+        assert [request.generated_tokens for request in async_env.requests] == [
+            request.generated_tokens for request in serial_env.requests
+        ]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_scheduling_generated_logprobs_gpt_cuda_graph_fallback_e2e(self) -> None:
         """Generated logprobs keep async forward overlap without using the decode graph."""
         common_kwargs = dict(
@@ -2576,6 +2618,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert (
             mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
         )
+        with torch.inference_mode():
+            mtp_context.active_request_metadata["top_k"][0] = 10
+        assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
+        with torch.inference_mode():
+            mtp_context.active_request_metadata["top_k"][0] = 0
+            mtp_context.active_request_metadata["top_p"][0] = 0.9
+        assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
+        with torch.inference_mode():
+            mtp_context.active_request_metadata["top_k"][0] = 1
+            mtp_context.active_request_metadata["top_p"][0] = 0.0
         with torch.inference_mode():
             mtp_context.active_request_metadata["return_log_probs"][0] = True
             mtp_context.active_request_metadata["skip_prompt_log_probs"][0] = True
