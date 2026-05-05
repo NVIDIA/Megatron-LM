@@ -36,18 +36,8 @@ def test_op_fuser_transformer_config_args_are_exposed():
 
 
 def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
-    interleaved = torch.tensor(
-        [
-            [1, 2, 5, 6, 3, 4, 7, 8],
-            [11, 12, 15, 16, 13, 14, 17, 18],
-        ]
-    )
-    expected = torch.tensor(
-        [
-            [1, 2, 3, 4, 5, 6, 7, 8],
-            [11, 12, 13, 14, 15, 16, 17, 18],
-        ]
-    )
+    interleaved = torch.tensor([[1, 2, 5, 6, 3, 4, 7, 8], [11, 12, 15, 16, 13, 14, 17, 18]])
+    expected = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [11, 12, 13, 14, 15, 16, 17, 18]])
 
     output = TEGroupedMLP._remove_glu_interleaving(interleaved, interleave_size=2)
 
@@ -152,9 +142,7 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
             return hidden_states + 1
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
-    module.config = SimpleNamespace(
-        fp8=False, fp4=False, moe_router_padding_for_quantization=False
-    )
+    module.config = SimpleNamespace(fp8=False, fp4=False, moe_router_padding_for_quantization=False)
     module._fused_ops = None
     fused_ops = FakeFusedOps()
     module._make_fused_ops = lambda: fused_ops
@@ -183,18 +171,11 @@ def test_apply_bias_returns_input_unchanged_when_bias_is_none():
 
 
 def test_apply_bias_combines_per_expert_bias_and_probs():
-    intermediate = torch.tensor(
-        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32
-    )
-    bias_parallel = [
-        torch.tensor([10.0, 20.0]),
-        torch.tensor([100.0, 200.0]),
-    ]
+    intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
+    bias_parallel = [torch.tensor([10.0, 20.0]), torch.tensor([100.0, 200.0])]
     tokens_per_expert = [2, 1]
     permuted_probs = torch.tensor([0.5, 0.5, 1.0])
-    expected = torch.tensor(
-        [[6.0, 12.0], [8.0, 14.0], [105.0, 206.0]], dtype=torch.float32
-    )
+    expected = torch.tensor([[6.0, 12.0], [8.0, 14.0], [105.0, 206.0]], dtype=torch.float32)
 
     output = TEGroupedMLP._apply_bias(
         intermediate, bias_parallel, tokens_per_expert, permuted_probs

@@ -425,9 +425,9 @@ class _ParamAndGradBucketGroup:
             if self._cached_param_buffer_shards_grad_enabled != current_grad_enabled:
                 self.cached_param_buffer_shard_list = [None] * len(self.buckets)
                 self._cached_param_buffer_shards_grad_enabled = current_grad_enabled
-            # Param all-gather writes directly into bucket param buffers. These in-place updates are
-            # optimizer state movement, not differentiable work, so keep the cached destination views
-            # and the collective inside no_grad.
+            # Param all-gather writes directly into bucket param buffers. These in-place updates
+            # are optimizer state movement, not differentiable work, so keep the cached
+            # destination views and the collective inside no_grad.
             with torch.no_grad():
                 with _coalescing_manager(
                     self.intra_distributed_optimizer_instance_group, async_ops=async_op
