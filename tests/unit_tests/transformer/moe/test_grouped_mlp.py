@@ -103,6 +103,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
     monkeypatch.setattr(experts_module, "te", fake_te)
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
     module.config = SimpleNamespace(moe_mlp_glu_interleave_size=16)
     module.linear_fc1 = FakeGroupedLinear(
         2,
@@ -169,6 +170,168 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     assert fused_ops.args[1] is tokens_per_expert
     assert fused_ops.args[2] is probs
     assert fused_ops.args[3] is tokens_per_expert
+
+
+def test_apply_bias_returns_input_unchanged_when_bias_is_none():
+    intermediate = torch.arange(6, dtype=torch.float32).view(3, 2)
+
+    output = TEGroupedMLP._apply_bias(
+        intermediate, bias_parallel=None, tokens_per_expert=[2, 1], permuted_probs=torch.ones(3)
+    )
+
+    assert output is intermediate
+
+
+def test_apply_bias_combines_per_expert_bias_and_probs():
+    intermediate = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32
+    )
+    bias_parallel = [
+        torch.tensor([10.0, 20.0]),
+        torch.tensor([100.0, 200.0]),
+    ]
+    tokens_per_expert = [2, 1]
+    permuted_probs = torch.tensor([0.5, 0.5, 1.0])
+    expected = torch.tensor(
+        [[6.0, 12.0], [8.0, 14.0], [105.0, 206.0]], dtype=torch.float32
+    )
+
+    output = TEGroupedMLP._apply_bias(
+        intermediate, bias_parallel, tokens_per_expert, permuted_probs
+    )
+
+    torch.testing.assert_close(output, expected)
+    assert output.dtype == intermediate.dtype
+
+
+def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    fc1_child = torch.nn.Linear(2, 2)
+    fc2_child = torch.nn.Linear(2, 2)
+    module.linear_fc1 = torch.nn.Sequential(fc1_child)
+    module.linear_fc2 = torch.nn.Sequential(fc2_child)
+
+    calls = []
+
+    def fc1_hook(submodule, _inp):
+        calls.append(("fc1", submodule))
+        return None
+
+    def fc2_hook(submodule, _inp):
+        calls.append(("fc2", submodule))
+        return None
+
+    fc1_child.register_forward_pre_hook(fc1_hook)
+    fc2_child.register_forward_pre_hook(fc2_hook)
+
+    hook = module._make_fused_impl_pre_forward_hook()
+    hook(object())
+
+    visited = {label for label, _ in calls}
+    assert visited == {"fc1", "fc2"}
+
+
+def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    fc1_child = torch.nn.Linear(2, 2)
+    module.linear_fc1 = torch.nn.Sequential(fc1_child)
+    module.linear_fc2 = torch.nn.Sequential(torch.nn.Linear(2, 2))
+
+    fc1_child.register_forward_pre_hook(lambda submodule, _inp: torch.zeros(1))
+
+    hook = module._make_fused_impl_pre_forward_hook()
+
+    with pytest.raises(RuntimeError, match="modifies the input tensor"):
+        hook(object())
+
+
+def test_make_fused_ops_handles_single_grouped_parameter_for_fc1(monkeypatch):
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(
+            self,
+            num_gemms,
+            in_features,
+            out_features,
+            *,
+            bias,
+            device,
+            dtype,
+            accumulate_into_main_grad,
+            single_grouped_parameter,
+        ):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.in_features = in_features
+            self.out_features = out_features
+            self.use_bias = bias
+            self.device = device
+            self.dtype = dtype
+            self.fuse_wgrad_accumulation = accumulate_into_main_grad
+            self.single_grouped_parameter = single_grouped_parameter
+
+        def need_backward_dw(self):
+            return False
+
+    class FakeScaledSwiGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+
+    class FakeSequential(list):
+        def register_forward_pre_hook(self, hook):
+            self.forward_pre_hook = hook
+
+    fake_te = SimpleNamespace(
+        pytorch=SimpleNamespace(
+            GroupedLinear=FakeGroupedLinear,
+            ops=SimpleNamespace(
+                GroupedLinear=FakeGroupedLinear,
+                ScaledSwiGLU=FakeScaledSwiGLU,
+                Sequential=FakeSequential,
+            ),
+        )
+    )
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(moe_mlp_glu_interleave_size=8)
+    module.linear_fc1 = FakeGroupedLinear(
+        2,
+        4,
+        8,
+        bias=False,
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_parameter=True,
+    )
+    module.linear_fc2 = FakeGroupedLinear(
+        2,
+        8,
+        4,
+        bias=True,
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=True,
+        single_grouped_parameter=False,
+    )
+    module.linear_fc1.weight = torch.nn.Parameter(torch.ones(2, 8, 4))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8) * 2)
+    module.linear_fc2.bias0 = torch.nn.Parameter(torch.zeros(4))
+    module.linear_fc2.bias1 = torch.nn.Parameter(torch.ones(4))
+
+    ops = module._make_fused_ops()
+
+    assert ops[0].weight is module.linear_fc1.weight
+    assert ops[1].glu_interleave_size == 8
+    assert ops[2].weight0 is module.linear_fc2.weight0
+    assert ops[2].weight1 is module.linear_fc2.weight1
+    assert ops[2].bias0 is module.linear_fc2.bias0
+    assert ops[2].bias1 is module.linear_fc2.bias1
 
 
 @pytest.mark.skipif(

@@ -65,3 +65,19 @@ def test_split_grouped_checkpoint_tensor_rejects_bad_group_count():
 
     with pytest.raises(RuntimeError, match="has 2 groups, expected 3"):
         module._split_grouped_checkpoint_tensor(tensor, "weight")
+
+
+def test_split_grouped_checkpoint_tensor_rejects_unsplittable_first_dim():
+    module = _grouped_linear_stub(num_gemms=3)
+    tensor = torch.arange(8).view(4, 2)
+
+    with pytest.raises(RuntimeError, match="Cannot split checkpoint tensor"):
+        module._split_grouped_checkpoint_tensor(tensor, "weight")
+
+
+def test_split_grouped_checkpoint_tensor_rejects_zero_dim():
+    module = _grouped_linear_stub(num_gemms=2)
+    tensor = torch.tensor(7)
+
+    with pytest.raises(RuntimeError, match="Cannot split checkpoint tensor"):
+        module._split_grouped_checkpoint_tensor(tensor, "weight")
