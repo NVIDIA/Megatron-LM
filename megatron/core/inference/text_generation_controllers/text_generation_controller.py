@@ -223,6 +223,7 @@ class TextGenerationController:
         self._async_sample_slot_launch_counts = [0] * self._async_sample_slot_count
         self._async_sample_slot_copy_counts = [0] * self._async_sample_slot_count
         self._async_sample_slot_wait_count = 0
+        self._request_sampling_rngs: Dict[int, torch.Generator] = {}
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -453,6 +454,7 @@ class TextGenerationController:
         top_k: int,
         top_p: float,
         vocab_size: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ):
         """Samples the logits to generate outputs
 
@@ -526,7 +528,9 @@ class TextGenerationController:
             probabilities = last_token_logits.softmax(dim=-1)
 
             sampled_logits = torch.multinomial(
-                probabilities, num_samples=1, generator=self.sampling_rng
+                probabilities,
+                num_samples=1,
+                generator=self.sampling_rng if generator is None else generator,
             ).view(-1)
 
             # If vocab size is provided, make sure the samples are in in the range [0, vocab-size).
@@ -889,6 +893,49 @@ class TextGenerationController:
                 for indices, *_ in self._torch_sampling_buckets
             ]
 
+    def _sampling_generator_for_request_id(self, request_id: int) -> torch.Generator:
+        """Return the per-request generator used for dynamic non-greedy sampling."""
+        generator = self._request_sampling_rngs.get(request_id)
+        if generator is None:
+            generator = torch.Generator(device=torch.cuda.current_device())
+            seed = (int(self.model_config.inference_sampling_seed) + int(request_id)) % (2**63)
+            generator.manual_seed(seed)
+            self._request_sampling_rngs[request_id] = generator
+        return generator
+
+    def _sample_logits_for_request_indices(
+        self,
+        logits: Tensor,
+        request_indices: Union[List[int], Tensor],
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> Tensor:
+        """Sample rows, using per-request RNG streams for non-greedy sampling."""
+        if top_k == 1:
+            return self._torch_sampling_func(logits, temperature, top_k, top_p)
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_ids = context.request_ids[
+            context.paused_request_count : context.total_request_count
+        ].tolist()
+        if isinstance(request_indices, Tensor):
+            request_indices = request_indices.tolist()
+
+        sampled_tokens = []
+        for row_idx, request_index in enumerate(request_indices):
+            request_id = int(active_request_ids[int(request_index)])
+            sampled_tokens.append(
+                self._torch_sampling_func(
+                    logits[row_idx : row_idx + 1],
+                    temperature,
+                    top_k,
+                    top_p,
+                    generator=self._sampling_generator_for_request_id(request_id),
+                )
+            )
+        return torch.cat(sampled_tokens, dim=0)
+
     def _rewind_kv_cache(self) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
 
@@ -969,7 +1016,9 @@ class TextGenerationController:
             self._torch_sampling_bucket_index_tensors, self._torch_sampling_buckets
         ):
             spec_token_list.append(
-                self._torch_sampling_func(logits_2d[idx_tensor, :], temp, top_k, top_p)
+                self._sample_logits_for_request_indices(
+                    logits_2d[idx_tensor, :], idx_tensor, temp, top_k, top_p
+                )
             )
 
         spec_tokens = torch.empty(logits_2d.shape[0], device=logits_2d.device, dtype=torch.int64)
@@ -1163,7 +1212,13 @@ class TextGenerationController:
         ):
             required_indices = torch.where(torch.isin(token_to_request_index, idx_tensor))[0]
             output_tokens_jumbled_list.append(
-                self._torch_sampling_func(required_logits[required_indices, :], temp, top_k, top_p)
+                self._sample_logits_for_request_indices(
+                    required_logits[required_indices, :],
+                    token_to_request_index[required_indices],
+                    temp,
+                    top_k,
+                    top_p,
+                )
             )
             token_order_list.append(required_indices)
 
@@ -1344,7 +1399,9 @@ class TextGenerationController:
             # [ [req at index 1, req at index 3, req at index 4] , t2, topk2, topp2]
             for indices, temp, top_k, top_p in self._torch_sampling_buckets:
                 token_list.append(
-                    self._torch_sampling_func(required_token_logits[indices, :], temp, top_k, top_p)
+                    self._sample_logits_for_request_indices(
+                        required_token_logits[indices, :], indices, temp, top_k, top_p
+                    )
                 )
                 indices_list.append(
                     torch.tensor(indices, device=required_token_logits.device, dtype=torch.long)
@@ -2598,6 +2655,8 @@ class TextGenerationController:
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
         finished_request_ids = context.request_ids[finished_idxs]
+        for request_id in finished_request_ids.tolist():
+            self._request_sampling_rngs.pop(int(request_id), None)
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.

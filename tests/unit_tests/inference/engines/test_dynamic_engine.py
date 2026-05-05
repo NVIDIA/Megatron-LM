@@ -802,6 +802,54 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             request.generated_tokens for request in serial_env.requests
         ]
 
+    def _run_top_k_staggered_add_schedule(
+        self, *, enable_async_scheduling: bool
+    ) -> DynamicEngineTestEnv:
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=6,
+                model_provider="gpt",
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                termination_id=-1,
+                top_k=10,
+                enable_async_scheduling=enable_async_scheduling,
+            )
+        )
+
+        env.engine._add_request(env.requests[0])
+        env.requests[0].state = "pending"
+        self._run_step(env)
+        self._run_step(env)
+
+        env.engine._add_request(env.requests[1])
+        env.requests[1].state = "pending"
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+        return env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_top_k_staggered_add_rng_parity_e2e(self) -> None:
+        """Top-k sampling stays deterministic when async defers a staggered admission."""
+        serial_env = self._run_top_k_staggered_add_schedule(enable_async_scheduling=False)
+        async_env = self._run_top_k_staggered_add_schedule(enable_async_scheduling=True)
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_add_deferral_count > 0
+        assert controller._request_sampling_rngs == {}
+        assert [request.generated_tokens for request in async_env.requests] == [
+            request.generated_tokens for request in serial_env.requests
+        ]
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
