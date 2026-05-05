@@ -1138,6 +1138,89 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert request_tokens[-len(stop_word_ids) :] == stop_word_ids
         assert async_tokens == serial_tokens
 
+    def _build_generate_until_env(self, *, enable_async_scheduling: bool) -> DynamicEngineTestEnv:
+        """Build an async-capable engine whose tokenizer accepts whitespace token IDs."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=8,
+                num_gap_steps=0,
+                model_provider="gpt",
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                termination_id=-1,
+                top_k=1,
+                enable_async_scheduling=enable_async_scheduling,
+            )
+        )
+        env.engine.controller.tokenizer.bos = None
+        env.engine.controller.tokenizer.tokenize = lambda text: [
+            int(token_id) for token_id in text.split()
+        ]
+        return env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_generate_until_stop_words_cuda_graph_e2e(self) -> None:
+        """Generate-style stop words are tokenized at admission and keep async active."""
+        prompts = ["1 2 3 4", "2 3 4 5", "3 4 5 6", "4 5 6 7"]
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=8,
+            termination_id=-1,
+            top_k=1,
+            detokenize_stop_sequence=True,
+        )
+
+        probe_env = self._build_generate_until_env(enable_async_scheduling=False)
+        with torch.inference_mode():
+            probe_records = probe_env.engine.generate(prompts, sampling_params)
+        probe_tokens = [record.merge().generated_tokens for record in probe_records]
+        stop_word = " ".join(str(token_id) for token_id in probe_tokens[0][1:3])
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        serial_env = self._build_generate_until_env(enable_async_scheduling=False)
+        with torch.inference_mode():
+            serial_records = serial_env.engine.generate(
+                prompts,
+                SamplingParams(
+                    num_tokens_to_generate=8,
+                    termination_id=-1,
+                    top_k=1,
+                    stop_words=[stop_word],
+                    detokenize_stop_sequence=True,
+                ),
+            )
+        serial_tokens = [record.merge().generated_tokens for record in serial_records]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._build_generate_until_env(enable_async_scheduling=True)
+        with torch.inference_mode():
+            async_records = async_env.engine.generate(
+                prompts,
+                SamplingParams(
+                    num_tokens_to_generate=8,
+                    termination_id=-1,
+                    top_k=1,
+                    stop_words=[stop_word],
+                    detokenize_stop_sequence=True,
+                ),
+            )
+        async_tokens = [record.merge().generated_tokens for record in async_records]
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert controller._async_finish_boundary_count > 0
+        assert async_tokens[0][-2:] == probe_tokens[0][1:3]
+        assert async_tokens == serial_tokens
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
