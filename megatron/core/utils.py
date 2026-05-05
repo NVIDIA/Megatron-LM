@@ -970,12 +970,11 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     if use_dtensor_format:
         if prepend_axis_num > 0:
-            for _, _, offset_dim_size in prepend_offsets:
-                if offset_dim_size == 1:
-                    raise ValueError(
-                        "Non-trivial prepended-style sharding not supported with DTensors: "
-                        f"{prepend_offsets}"
-                    )
+            raise ValueError(
+                "Prepend-style expert sharding is not supported in DTensor format. "
+                "Use singleton_local_shards=True for expert sharding. "
+                f"Got prepend_offsets={prepend_offsets}"
+            )
 
         placements, device_mesh = get_dtensor_metadata(tp=True, tp_axis=tp_axis)
 
