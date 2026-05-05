@@ -54,5 +54,5 @@ If you do not know the answer to an issue or discussion question, that's ok, **D
 
 On a daily basis, track the following:
 
-- [new issues](https://github.com/NVIDIA/Megatron-LM/issues): check to see if there are any new issues before they become out of SLA.
+- [https://github.com/NVIDIA/Megatron-LM/issues](https://github.com/NVIDIA/Megatron-LM/issues?q=is%3Aissue%20state%3Aopen%20label%3Awaiting-on-maintainers): check to see if there are any new issues before they become out of SLA.
 
