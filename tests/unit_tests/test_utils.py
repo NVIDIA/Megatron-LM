@@ -9,6 +9,7 @@ from unittest.mock import patch
 import mock
 import numpy as np
 import pytest
+from megatron.core._rank_utils import safe_get_world_size
 import torch
 
 import megatron.core.utils as util
@@ -470,3 +471,51 @@ def test_straggler_detector():
     util.StragglerDetector._configured = False
     # Teardown.
     _deinit_distributed()
+
+
+class TestGetWorldSizeSafe:
+    """Test get_world_size_safe function."""
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_world_size")
+    def test_initialized_torch_distributed(self, mock_get_world_size, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is initialized."""
+        mock_is_initialized.return_value = True
+        mock_get_world_size.return_value = 4
+
+        result = safe_get_world_size()
+
+        assert result == 4
+        mock_is_initialized.assert_called_once()
+        mock_get_world_size.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"WORLD_SIZE": "8"})
+    def test_uninitialized_torch_distributed_with_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is not initialized but WORLD_SIZE env var exists."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_world_size()
+
+        assert result == 8
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_uninitialized_torch_distributed_no_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is not initialized and no WORLD_SIZE env var."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_world_size()
+
+        assert result == 1
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"WORLD_SIZE": "invalid"})
+    def test_invalid_world_size_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe with invalid WORLD_SIZE environment variable."""
+        mock_is_initialized.return_value = False
+
+        with pytest.raises(ValueError):
+            safe_get_world_size()
