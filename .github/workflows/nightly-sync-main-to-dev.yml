@@ -32,9 +32,30 @@ permissions:
   id-token: write
 
 jobs:
-  sync-main-to-dev:
+  # Re-dispatch scheduled runs as workflow_dispatch via a PAT so the heavy
+  # job runs with a real User-type actor. On `schedule` events GitHub sets
+  # `github.actor` to `github-merge-queue` (no Users-API entry), which
+  # crashes anthropics/claude-code-action@v1 in `checkHumanActor` with a
+  # 404 before `allowed_bots` is ever consulted. Upstream fix PR
+  # https://github.com/anthropics/claude-code-action/pull/1212 is closed
+  # and unmerged; see issue
+  # https://github.com/anthropics/claude-code-action/issues/1284 for the
+  # same class of bug. The dispatch carries the PAT owner as the actor.
+  cron-redispatch:
+    if: github.event_name == 'schedule' && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+    steps:
+      - name: Dispatch sync workflow via PAT
+        run: |
+          gh workflow run nightly-sync-main-to-dev.yml \
+            --repo "${{ github.repository }}" \
+            --ref main
+
+  sync-main-to-dev:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'NVIDIA/Megatron-LM'
+    runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
       GH_TOKEN: ${{ secrets.PAT }}
