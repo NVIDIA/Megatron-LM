@@ -64,8 +64,17 @@ def common_test_parallel_reconfiguration_e2e(
     src_model_init_kwargs=None,
     dst_model_init_kwargs=None,
     metadata=None,
+    replicate_local_replicas=False,
 ):
-    """Test model saving and loading with different TP/PP"""
+    """Test model saving and loading with different TP/PP.
+
+    The ``replicate_local_replicas`` arg is forwarded to both the
+    ``FullyParallelSaveStrategyWrapper`` and to the public ``load`` entry
+    point, so the same callsite covers both halves of the feature when a
+    test wants to exercise it. It is only meaningful when ``use_fpsl``
+    is True (the wrappers run only in that branch); on the no-FP path
+    the flag is ignored.
+    """
     src_model_init_kwargs = src_model_init_kwargs or {}
     dst_model_init_kwargs = dst_model_init_kwargs or {}
     Utils.initialize_model_parallel(*src_tp_pp, **(src_tp_pp_kwargs or {}), order=load_order)
@@ -87,6 +96,7 @@ def common_test_parallel_reconfiguration_e2e(
                 save_strategy,
                 parallel_state.get_data_parallel_group(with_context_parallel=True),
                 True,
+                replicate_local_replicas=replicate_local_replicas,
             )
         save(gpt_model_A.sharded_state_dict(metadata=metadata), ckpt_dir_A, save_strategy)
         regular_state_dict_A = gpt_model_A.state_dict()
@@ -113,6 +123,7 @@ def common_test_parallel_reconfiguration_e2e(
             ckpt_dir_A,
             load_strategy,
             strict=StrictHandling.RETURN_ALL,
+            replicate_local_replicas=replicate_local_replicas,
         )
         # Potential mismatch is because of extra states which is ok
         assert all('_extra_state' in k for k in missing_keys)
