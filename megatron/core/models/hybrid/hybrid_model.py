@@ -450,15 +450,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             post_process=post_process,
             fp16_lm_cross_entropy=lowering.fp16_lm_cross_entropy,
             parallel_output=lowering.parallel_output,
-            share_embeddings_and_output_weights=(
-                not lowering.untie_embeddings_and_output_weights
-            ),
+            share_embeddings_and_output_weights=(not lowering.untie_embeddings_and_output_weights),
             position_embedding_type=lowering.position_embedding_type,
             rotary_percent=lowering.rotary_percent,
             rotary_base=lowering.rotary_base,
-            scatter_embedding_sequence_parallel=(
-                lowering.scatter_embedding_sequence_parallel
-            ),
+            scatter_embedding_sequence_parallel=(lowering.scatter_embedding_sequence_parallel),
             seq_len_interpolation_factor=lowering.seq_len_interpolation_factor,
             pg_collection=pg_collection,
             vp_stage=vp_stage,

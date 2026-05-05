@@ -493,9 +493,7 @@ class TestHybridModelConfigLowering:
         m = MambaLayerConfig()  # No common_config — should auto-inherit.
         a = AttentionLayerConfig(num_attention_heads=4)  # Same.
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, m, a, loss]
-        )._lower()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, loss])._lower()
         # All per-layer TCs see the recipe's hidden_size, not 0.
         for tc in compiled.layer_config_list:
             assert tc.hidden_size == common.hidden_size
@@ -510,9 +508,7 @@ class TestHybridModelConfigLowering:
         m = MambaLayerConfig(common_config=other_common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, m, a, loss]
-        )._lower()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, loss])._lower()
         # Mamba layer (idx 0) keeps its explicit hidden_size=512.
         assert compiled.layer_config_list[0].hidden_size == 512
         # Attention layer (idx 1) uses the recipe common's 256.
