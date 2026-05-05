@@ -294,6 +294,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
         # Deferred: bookkeeping runs one step behind. Synchronous: join after each put.
         self._bookkeep_queue: asyncio_Queue = asyncio_Queue(maxsize=1)
+        self._can_bookkeep = asyncio.Event()
         self.state = EngineState.RUNNING
         self._state_events[EngineState.RUNNING].set()
         self._pending_signals = deque()
@@ -1490,6 +1491,7 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_push("Prefill" if not is_decode_only else "Decode")
 
         self.step_start_event.record()
+        self._can_bookkeep.set()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
         self.context.step_count += 1
@@ -1977,6 +1979,8 @@ class DynamicInferenceEngine(AbstractEngine):
             while True:
                 work = await self._bookkeep_queue.get()
                 try:
+                    self._can_bookkeep.clear()
+                    await self._can_bookkeep.wait()
                     await self._bookkeep(work)
                 except Exception:
                     logging.error("bookkeep failed; work keys=%s", list(work.keys()))
@@ -2205,6 +2209,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 Ignored when the bookkeep loop task has already died; in that case the
                 queue has already been shutdown.
         """
+        self._can_bookkeep.set()
         join_task = asyncio.ensure_future(self._bookkeep_queue.join())
         await asyncio.wait({join_task, bookkeep_task}, return_when=asyncio.FIRST_COMPLETED)
         if not join_task.done():
