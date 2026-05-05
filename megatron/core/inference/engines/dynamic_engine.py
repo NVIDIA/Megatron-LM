@@ -1452,15 +1452,20 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
-    async def async_forward(self) -> Tuple[Dict, Dict, float]:
-        """Uses `asyncio` for continuous generation.
+    async def async_forward(self) -> Tuple[Optional[Dict], Dict]:
+        """Run one forward step asynchronously.
         Sleeps when no requests are available, until new requests have been added.
+
+        Step timing is captured by `step_start_event` / `step_end_event` and
+        converted into seconds inside `_prepare_bookkeep_work_item`, after the
+        controller's implicit `.tolist()` sync makes the events queryable.
 
         Returns:
             A tuple comprised of:
                 step_result (Optional[Dict]): The result of the step.
-                context_state (Dict): A tuple consisting of the state of the context.
-                is_decode_only, total/paused request count, active token count.
+                context_state (Dict): Snapshot of context state needed by the
+                    deferred bookkeeping coroutine (is_decode_only, request and
+                    token counts, KV-cache stats, batch dimensions, etc.).
         """
 
         # If suspended, no stepping.
@@ -1483,8 +1488,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Generate tokens.
         nvtx_range_push("Prefill" if not is_decode_only else "Decode")
-        # TODO @TDE: Account for this line when overlapping forward and bookkeep.
-        self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
