@@ -413,10 +413,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         controller._dynamic_step_sample_logits()
 
-                if controller.num_speculative_tokens > 0:
-                    controller._side_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(controller._side_stream):
-                        controller._dynamic_step_log_probs_softmax()
+                controller._side_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(controller._side_stream):
+                    controller._dynamic_step_log_probs_lse()
 
                 controller._side_pre_calc_event.record(controller._side_stream)
 

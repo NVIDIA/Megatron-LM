@@ -72,6 +72,7 @@ class LogProbsSpeculative:
                 function_name="gather_kernel",
                 need_backward=False,
                 inline_capture=True,
+                share_mempool_with=side_pool_anchor or self.side_pool_anchor,
             )
             # Thin wrapper: delegates to LogProbsPrefill's static method.
             CudaGraphManager(
@@ -80,6 +81,7 @@ class LogProbsSpeculative:
                 function_name="_prefill_softmax",
                 need_backward=False,
                 inline_capture=True,
+                share_mempool_with=side_pool_anchor or self.side_pool_anchor,
             )
 
     @staticmethod
@@ -141,7 +143,7 @@ class LogProbsSpeculative:
             logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
             decode_lse (Tensor): Decode lse [padded_decode, spec+1].
             prefill_lse (Tensor): Prefill lse [padded_prefill].
-            new_tokens (Tensor): Newly sampled tokens [padded_active_requests].
+            new_tokens (Tensor): shape [max_requests].
             accepted_tokens (Tensor): Speculative-verified token IDs.
             accepted_token_counts (Tensor): Per-decode-request accepted counts.
             prefill_offset_gpu (Tensor): scalar holding `num_decode * spec_plus_one`.
@@ -210,7 +212,7 @@ class LogProbsSpeculative:
 
         Returns:
             (prefill_offset_gpu, request_indices, cu_masked_lengths, logit_indices,
-             logit_indices_range, masked_tokens, prefill_log_prob_count_gpu).
+             masked_tokens, prefill_log_prob_count_gpu).
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
@@ -223,7 +225,7 @@ class LogProbsSpeculative:
             # Per-token prefill log probs aren't computed when model only emits last-token logits.
             # Return zero-shape placeholders so the call site can unpack without branching.
             empty = torch.zeros(0, dtype=torch.int64, device=device)
-            return prefill_offset_gpu, empty, empty, empty, empty, empty, empty
+            return prefill_offset_gpu, empty, empty, empty, empty, empty
 
         padded_decode_count = context.padded_batch_dimensions.decode_req_count
 
@@ -241,11 +243,11 @@ class LogProbsSpeculative:
             : context.padded_active_request_count
         ].sum()
 
-        ri, cu_ml, li, li_range, mt = LogProbsPrefill.indexing_kernel(context)
+        ri, cu_ml, li, mt = LogProbsPrefill.indexing_kernel(context)
 
         context.gpu_return_log_probs_mask[:padded_decode_count] = saved_mask
 
-        return prefill_offset_gpu, ri, cu_ml, li, li_range, mt, prefill_log_prob_count_gpu
+        return prefill_offset_gpu, ri, cu_ml, li, mt, prefill_log_prob_count_gpu
 
     def _prefill_softmax(
         self,
@@ -254,23 +256,31 @@ class LogProbsSpeculative:
         ri,
         cu_ml,
         li,
-        li_range,
         mt,
         *,
         eager: bool = False,
         cache_key=None,
     ):
-        """Delegate to LogProbsPrefill's softmax kernel (cross-class call).
+        """Compute full-prefill log probs by chaining LogProbsPrefill's split kernels.
+
+        Runs sequentially on the current (main) stream — no overlap with sampling
+        for the spec full-prefill path; that would require a separate spec-side
+        LSE precompute, which we don't do today.
 
         Args:
-            logits, new_tokens, ri, cu_ml, li, li_range, mt:
-                Forwarded as-is to LogProbsPrefill.softmax_kernel; see there for shapes.
+            logits, new_tokens, ri, cu_ml, li, mt:
+                Forwarded to `LogProbsPrefill.lse_kernel` / `gather_kernel`.
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
+
+        Returns:
+            (selected_log_probs, lse).
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
         # Wrapper exists so CudaGraphManager can graph-cache this call under a separate key.
-        return LogProbsPrefill.softmax_kernel(logits, new_tokens, ri, cu_ml, li, li_range, mt)
+        lse = LogProbsPrefill.lse_kernel(logits, li)
+        slp = LogProbsPrefill.gather_kernel(logits, new_tokens, ri, cu_ml, li, mt, lse)
+        return slp, lse
 
     @staticmethod
     def extract(
@@ -398,7 +408,6 @@ class LogProbsSpeculative:
             self._fp_ri,
             self._fp_cu_ml,
             self._fp_li,
-            self._fp_li_range,
             self._fp_mt,
             self._fp_count_gpu,
         ) = result
@@ -477,7 +486,6 @@ class LogProbsSpeculative:
             fp_ri = self._fp_ri
             fp_cu_ml = self._fp_cu_ml
             fp_li = self._fp_li
-            li_range = self._fp_li_range
             mt = self._fp_mt
             fp_count_gpu = self._fp_count_gpu
 
@@ -488,7 +496,6 @@ class LogProbsSpeculative:
                 fp_ri,
                 fp_cu_ml,
                 fp_li,
-                li_range,
                 mt,
                 eager=eager,
                 cache_key=fp_key,

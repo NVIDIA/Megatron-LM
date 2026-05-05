@@ -1111,14 +1111,20 @@ class TextGenerationController:
         else:
             self._log_probs_prefill.indexing(context, eager=eager)
 
-    def _dynamic_step_log_probs_softmax(self):
-        """Conditionally launch the speculative softmax kernel."""
+    def _dynamic_step_log_probs_lse(self):
+        """Pre-sample LSE precompute on the side stream (overlaps sampling)."""
         if self._log_prob_count == 0:
             return
 
         context = self.inference_wrapped_model.inference_context
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
-        self._log_probs_speculative.softmax(context, self._all_logits_cuda, eager=eager)
+
+        if context.num_speculative_tokens > 0:
+            self._log_probs_speculative.softmax(context, self._all_logits_cuda, eager=eager)
+        elif context.config.materialize_only_last_token_logits or context.is_decode_only():
+            self._log_probs_decode.lse(context, self._all_logits_cuda, eager=eager)
+        else:
+            self._log_probs_prefill.lse(context, self._all_logits_cuda, eager=eager)
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
         """Collect flat routing indices for MoE router recording.
@@ -1187,15 +1193,13 @@ class TextGenerationController:
             return None
 
         context = self.inference_wrapped_model.inference_context
-        logits = self._all_logits_cuda
-        new_tokens = self._sampled_tokens_cuda[: context.padded_active_request_count]
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
 
         if context.num_speculative_tokens > 0:
             return self._log_probs_speculative.calculate(
                 context,
-                logits,
-                new_tokens,
+                self._all_logits_cuda,
+                self._sampled_tokens_cuda,
                 log_prob_request_count,
                 self._accepted_tokens_per_request,
                 self._accepted_token_counts_per_request,
@@ -1205,14 +1209,19 @@ class TextGenerationController:
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
             return self._log_probs_decode.calculate(
                 context,
-                logits,
-                new_tokens,
+                self._all_logits_cuda,
+                self._sampled_tokens_cuda,
                 log_prob_request_count,
                 eager=eager,
                 top_n_max=top_n_max,
             )
         return self._log_probs_prefill.calculate(
-            context, logits, new_tokens, log_prob_request_count, eager=eager, top_n_max=top_n_max
+            context,
+            self._all_logits_cuda,
+            self._sampled_tokens_cuda,
+            log_prob_request_count,
+            eager=eager,
+            top_n_max=top_n_max,
         )
 
     async def run_log_probs_extract(
@@ -1502,10 +1511,9 @@ class TextGenerationController:
             range_push("forward_pass")
             self._dynamic_step_forward_logits(input_ids, position_ids)
 
-            if self.num_speculative_tokens > 0:
-                self._side_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self._side_stream):
-                    self._dynamic_step_log_probs_softmax()
+            self._side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._side_stream):
+                self._dynamic_step_log_probs_lse()
 
             self._side_pre_calc_event.record(self._side_stream)
 
