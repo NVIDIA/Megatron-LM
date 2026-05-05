@@ -163,52 +163,14 @@ class TextGenerationController:
         # Need a sentinel slot for `nonzero_static`.
         self._sampled_tokens_cuda = torch.empty(max_requests + 1, dtype=torch.int64, device=device)
 
-        # Side stream with pre-init bookkeeping.
-        # Runs concurrently with attention mask initialization.
-        self._pre_init_bookkeeping_stream = torch.cuda.Stream(device=device)
-        # Side stream for pre-forward bookkeeping.
-        # Runs concurrently with the forward pass; post-forward consumers wait for the sync.
-        self._pre_forward_bookkeeping_stream = torch.cuda.Stream(device=device)
-        # Side stream for post-forward bookkeeping (e.g. speculative softmax).
-        # Runs concurrently with verification/sampling on the main stream.
-        self._post_forward_bookkeeping_stream = torch.cuda.Stream(device=device)
-        # Whether any work needs to run on the post-forward stream.
-        self._has_post_forward_softmax_work = self.num_speculative_tokens > 0
-        # Side stream for the eager top-n compute hoisted out of `extract`.
-        # Runs concurrently with context bookkeeping and initialization.
-        self._log_probs_topn_stream = torch.cuda.Stream(device=device)
-
-        # GPU-ordering events.
-        self._pre_forward_bookkeeping_event = torch.cuda.Event()
-        self._post_forward_bookkeeping_event = torch.cuda.Event()
-        self._log_probs_topn_event = torch.cuda.Event()
-
-        # CPU-blocking events.
-        self._pre_init_bookkeeping_event = torch.cuda.Event()
-
-        # Pinned CPU tensors for non-blocking D2H copy of log-prob reduction results.
-        # Filled on the bookkeeping stream; guaranteed ready after _pre_init_bookkeeping_event.
-        self._log_prob_count_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
-        self._top_n_max_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
+        self._log_prob_count = 0
+        self._top_n_max = 0
 
         # Log-prob computation backends (graph caching is per-backend).
-        # All three share the same top-n side stream + event so the next
-        # forward only needs to wait on a single point.
-        self._log_probs_decode = LogProbsDecode(
-            self.model_config,
-            topn_stream=self._log_probs_topn_stream,
-            topn_event=self._log_probs_topn_event,
-        )
-        self._log_probs_prefill = LogProbsPrefill(
-            self.model_config,
-            topn_stream=self._log_probs_topn_stream,
-            topn_event=self._log_probs_topn_event,
-        )
-        self._log_probs_speculative = LogProbsSpeculative(
-            self.model_config,
-            topn_stream=self._log_probs_topn_stream,
-            topn_event=self._log_probs_topn_event,
-        )
+        # TODO: Overlap these methods with other compute by running them on side-streams.
+        self._log_probs_decode = LogProbsDecode(self.model_config)
+        self._log_probs_prefill = LogProbsPrefill(self.model_config)
+        self._log_probs_speculative = LogProbsSpeculative(self.model_config)
 
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
@@ -1232,26 +1194,16 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        log_prob_count = context.active_request_metadata["return_log_probs"][
-            :active_request_count
-        ].sum()
-        top_n_max_gpu = (
-            context.active_request_metadata["top_n_logprobs"][:active_request_count].max().long()
+        self._log_prob_count = int(
+            context.active_request_metadata["return_log_probs"][:active_request_count].sum().item()
+        )
+        self._top_n_max = int(
+            context.active_request_metadata["top_n_logprobs"][:active_request_count].max().item()
         )
 
-        self._log_prob_count_pinned.copy_(log_prob_count, non_blocking=True)
-        self._top_n_max_pinned.copy_(top_n_max_gpu, non_blocking=True)
-
-        self._pre_init_bookkeeping_event.record()
-
     def _dynamic_step_log_probs_indexing(self):
-        """Conditionally launch log-prob indexing kernels on the bookkeeping stream."""
-        # CPU-side sync: must read pinned count before deciding whether to launch.
-        # `top_n > 0 implies return_log_probs=True` is enforced at request-add
-        # time (see DynamicInferenceEngine.add_request), so checking
-        # log_prob_count alone covers the top-n case too.
-        self._pre_init_bookkeeping_event.synchronize()
-        if self._log_prob_count_pinned.item() == 0:
+        """Conditionally launch log-prob indexing kernels."""
+        if self._log_prob_count == 0:
             return
 
         context = self.inference_wrapped_model.inference_context
@@ -1267,8 +1219,8 @@ class TextGenerationController:
             self._log_probs_prefill.indexing(context, eager=eager)
 
     def _dynamic_step_log_probs_softmax(self):
-        """Conditionally launch the speculative softmax kernel on the bookkeeping stream."""
-        if self._log_prob_count_pinned.item() == 0:
+        """Conditionally launch the speculative softmax kernel."""
+        if self._log_prob_count == 0:
             return
 
         context = self.inference_wrapped_model.inference_context
@@ -1343,8 +1295,8 @@ class TextGenerationController:
 
     def _dynamic_step_calculate_log_probs(self):
         """Calculate log probs from logits."""
-        log_prob_request_count = self._log_prob_count_pinned.item()
-        top_n_max = self._top_n_max_pinned.item()
+        log_prob_request_count = self._log_prob_count
+        top_n_max = self._top_n_max
         if log_prob_request_count == 0:
             return None
 
@@ -1627,14 +1579,8 @@ class TextGenerationController:
             return None
 
         with torch.inference_mode():
-            # Wait for the previous step's top-n side-stream read of `_all_logits_cuda`.
-            torch.cuda.current_stream().wait_event(self._log_probs_topn_event)
-
-            # Launch log-prob reduction + D2H copy early so the pinned counts
-            # are ready by the time indexing needs them (after context init).
-            self._pre_init_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._pre_init_bookkeeping_stream):
-                self._dynamic_step_log_probs_bookkeeping()
+            # TODO: Overlap compute by launching kernels on multiple streams.
+            self._dynamic_step_log_probs_bookkeeping()
 
             input_ids, position_ids = self._dynamic_step_context_init()
 
@@ -1649,26 +1595,14 @@ class TextGenerationController:
             if config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Launch indexing on the pre-forward side stream so it overlaps with the forward pass.
-            self._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._pre_forward_bookkeeping_stream):
-                self._dynamic_step_log_probs_indexing()
-                self._pre_forward_bookkeeping_event.record()
+            self._dynamic_step_log_probs_indexing()
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
             self._dynamic_step_forward_logits(input_ids, position_ids)
 
-            if self._has_post_forward_softmax_work:
-                self._post_forward_bookkeeping_stream.wait_event(
-                    self._pre_forward_bookkeeping_event
-                )
-                # Launch speculative softmax on the post-forward stream;
-                # it only needs logits and overlaps with verification/sampling on the main stream.
-                self._post_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self._post_forward_bookkeeping_stream):
-                    self._dynamic_step_log_probs_softmax()
-                    self._post_forward_bookkeeping_event.record()
+            if self.num_speculative_tokens > 0:
+                self._dynamic_step_log_probs_softmax()
 
             # Commit Mamba intermediate states before update_requests, which
             # may swap request indices. The Python lists tracking EOS block IDs
@@ -1721,11 +1655,6 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
-            # GPU-side ordering: main stream waits for bookkeeping streams.
-            if self._has_post_forward_softmax_work:
-                torch.cuda.current_stream().wait_event(self._post_forward_bookkeeping_event)
-            else:
-                torch.cuda.current_stream().wait_event(self._pre_forward_bookkeeping_event)
             log_probs_extract = self._dynamic_step_calculate_log_probs()
 
             if skip_bookkeeping:

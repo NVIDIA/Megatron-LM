@@ -407,9 +407,7 @@ class DynamicInferenceEngine(AbstractEngine):
             active_request_count = context.total_request_count - context.paused_request_count
             context.active_request_metadata["return_log_probs"][:active_request_count] = True
 
-            controller._pre_init_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(controller._pre_init_bookkeeping_stream):
-                controller._dynamic_step_log_probs_bookkeeping()
+            controller._dynamic_step_log_probs_bookkeeping()
             controller._dynamic_step_log_probs_indexing()
 
             # Enable routing recording during warmup if routing replay is enabled.
@@ -421,13 +419,8 @@ class DynamicInferenceEngine(AbstractEngine):
             with torch.inference_mode():
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-                if controller._has_post_forward_softmax_work:
-                    controller._post_forward_bookkeeping_stream.wait_stream(
-                        torch.cuda.current_stream()
-                    )
-                    with torch.cuda.stream(controller._post_forward_bookkeeping_stream):
-                        controller._dynamic_step_log_probs_softmax()
-                        controller._post_forward_bookkeeping_event.record()
+                if controller.num_speculative_tokens > 0:
+                    controller._dynamic_step_log_probs_softmax()
 
                 # MTP CUDA graph warmup for this batch dimension.
                 if mtp_warmup_enabled:

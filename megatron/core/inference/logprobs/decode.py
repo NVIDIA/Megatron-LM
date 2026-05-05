@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import functools
-from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -28,15 +27,11 @@ class LogProbsDecode:
     Instance methods wrap the kernels in CUDA-graph capture/replay.
     """
 
-    def __init__(self, config=None, topn_stream=None, topn_event=None):
+    def __init__(self, config=None):
         """
         Args:
             config: Optional MegatronConfig for CUDA graph capture configuration.
-            topn_stream: Optional CUDA stream for running top-n computation asynchronously.
-            topn_event: Optional CUDA event to signal completion of top-n computation.
         """
-        self._topn_stream = topn_stream
-        self._topn_event = topn_event
         if config is not None and config.cuda_graph_impl == "local":
             CudaGraphManager(
                 config,
@@ -179,7 +174,7 @@ class LogProbsDecode:
         eager: bool = False,
         top_n_max: int = 0,
     ):
-        """Run softmax kernel + top-n (on side stream) and return a deferred extract callable.
+        """Run softmax kernel + top-n and return a deferred extract callable.
 
         Args:
             context: The active DynamicInferenceContext.
@@ -201,24 +196,12 @@ class LogProbsDecode:
         )
 
         top_n_v = top_n_i = None
+        # TODO: Overlap eager top-n compute on a side stream with sampling/extract work.
         if top_n_max > 0:
-            # Run top-n on a side stream so it overlaps the main-stream
-            # downstream sampling / extract work. wait_stream defers the side
-            # stream until the softmax above is queued so it can read `logits`.
-            if self._topn_stream is not None:
-                self._topn_stream.wait_stream(torch.cuda.current_stream())
-                stream_ctx = torch.cuda.stream(self._topn_stream)
-            else:
-                stream_ctx = nullcontext()
-            with stream_ctx:
-                # Reuse the LSE from softmax_kernel: top_n_log_probs = topk_raw - lse.
-                raw = logits.squeeze(0)[ri].float()
-                top_n_v_raw, top_n_i = _topk(raw, k=top_n_max)
-                top_n_v = top_n_v_raw - lse.unsqueeze(-1)
-            if self._topn_event is not None:
-                # Signals the next step's main stream that side-stream reads
-                # of `_all_logits_cuda` are done, so it can safely overwrite it.
-                self._topn_event.record(self._topn_stream)
+            # Reuse the LSE from softmax_kernel: top_n_log_probs = topk_raw - lse.
+            raw = logits.squeeze(0)[ri].float()
+            top_n_v_raw, top_n_i = _topk(raw, k=top_n_max)
+            top_n_v = top_n_v_raw - lse.unsqueeze(-1)
 
         active_request_count = context.total_request_count - context.paused_request_count
         # Defer the CPU-side extract: caller invokes the partial after step bookkeeping
