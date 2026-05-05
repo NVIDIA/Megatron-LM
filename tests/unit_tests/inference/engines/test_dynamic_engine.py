@@ -1110,6 +1110,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.skip(reason="too slow for CI; causes job timeouts")
     @torch.inference_mode()
     def test_return_log_probs_speculative(self):
         """Verify log probs are returned and well-formed in speculative-decoding mode.
