@@ -148,6 +148,7 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     enable_async_scheduling: bool = False
+    enable_async_decode_graphs: bool = True
     termination_id: Optional[int] = None
     top_k: int = 0
     top_p: float = 0.0
@@ -290,6 +291,7 @@ class DynamicInferenceEngineTestBase:
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 enable_async_scheduling=test_config.enable_async_scheduling,
+                enable_async_decode_graphs=test_config.enable_async_decode_graphs,
             ),
         )
 

@@ -1314,23 +1314,23 @@ class TextGenerationController:
         # Expose the active slice so downstream code sees the right length.
         self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
 
-    def _dynamic_step_sample_logits(self):
+    def _dynamic_step_sample_logits(
+        self, sample_count: Optional[int] = None, row_indices: Optional[Tensor] = None
+    ) -> None:
         """Sample tokens from logits for dynamic batching."""
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
 
         # Last token logits.
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-
-        if context.config.materialize_only_last_token_logits:
-            # When materialize_only_last_token_logits is true, last_token_logits is
-            # already called in the forward pass of GPT.
-            required_token_logits = self._all_logits_cuda.squeeze(0)[:active_request_count, :]
-        else:
-            required_token_logits = context.last_token_logits(
-                self._all_logits_cuda[:, : context.padded_active_token_count, :]
-            )
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if sample_count is None
+            else sample_count
+        )
+        required_token_logits = self._dynamic_step_required_token_logits(row_indices=row_indices)[
+            :active_request_count
+        ]
 
         if self._sampling_backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
@@ -1346,7 +1346,9 @@ class TextGenerationController:
                 token_list.append(
                     self._torch_sampling_func(required_token_logits[indices, :], temp, top_k, top_p)
                 )
-                indices_list.append(torch.tensor(indices))
+                indices_list.append(
+                    torch.tensor(indices, device=required_token_logits.device, dtype=torch.long)
+                )
 
             # Single write to the output tensor.
             sampled_tokens = torch.cat(token_list, dim=0)
@@ -1392,6 +1394,26 @@ class TextGenerationController:
         """Count a reason that prevented an async launch after scheduling was considered."""
         self._async_disable_reason_counts[reason] = (
             self._async_disable_reason_counts.get(reason, 0) + 1
+        )
+
+    def _active_requests_use_greedy_sampling(
+        self, active_request_count: Optional[int] = None
+    ) -> bool:
+        """Return whether active requests can use the greedy async sampling fast path."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if active_request_count is None
+            else active_request_count
+        )
+        if active_request_count <= 0:
+            return True
+
+        active_metadata = context.active_request_metadata
+        active_slice = slice(0, active_request_count)
+        return bool(
+            (active_metadata["top_k"][active_slice] == 1).all()
+            and (active_metadata["top_p"][active_slice] == 0.0).all()
         )
 
     def _active_request_ids_cpu(self) -> Tensor:
@@ -1486,6 +1508,26 @@ class TextGenerationController:
             ),
         )
         self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
+
+    def _dynamic_step_sample_logits_to_next_input_ids(
+        self, sample_count: Optional[int] = None, row_indices: Optional[Tensor] = None
+    ) -> None:
+        """Sample logits and write sampled ids into next-step GPU inputs."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if sample_count is None
+            else sample_count
+        )
+        if self._active_requests_use_greedy_sampling(active_request_count):
+            self._dynamic_step_sample_logits_greedy_to_next_input_ids(
+                sample_count=active_request_count, row_indices=row_indices
+            )
+        else:
+            self._dynamic_step_sample_logits(
+                sample_count=active_request_count, row_indices=row_indices
+            )
+            self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
 
     def _copy_sampled_decode_tokens_to_next_input_ids(
         self, active_request_count: Optional[int] = None
@@ -2727,9 +2769,9 @@ class TextGenerationController:
 
             if async_next_prepared:
                 if not async_sample_already_launched:
-                    self._dynamic_step_sample_logits_greedy_to_next_input_ids()
+                    self._dynamic_step_sample_logits_to_next_input_ids()
             elif pending_forward_reused and self.num_speculative_tokens == 0:
-                self._dynamic_step_sample_logits_greedy_to_next_input_ids(
+                self._dynamic_step_sample_logits_to_next_input_ids(
                     row_indices=pending_forward_row_indices
                 )
                 async_next_prepared = self._try_prepare_async_decode_after_sampling()
