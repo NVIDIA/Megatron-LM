@@ -47,8 +47,8 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.utils import (
@@ -352,7 +352,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "dynamic_context_parallel": args.dynamic_context_parallel,
     }
 
     # add FIM args to the config
@@ -451,7 +451,8 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
     full_config = pretrain_cfg_container_from_args(args)
-    pretrain(full_config,
+    pretrain(
+        full_config,
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,

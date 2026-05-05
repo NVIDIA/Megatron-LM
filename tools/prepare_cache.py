@@ -74,9 +74,7 @@ def _validate_prepare_cache_args(args: Any) -> None:
     if getattr(args, "fim_data", False):
         raise ValueError("--fim-data is not supported by tools/prepare_cache.py")
     if getattr(args, "step_batch_size_schedule", None) is not None:
-        raise ValueError(
-            "--step-batch-size-schedule is not supported by tools/prepare_cache.py"
-        )
+        raise ValueError("--step-batch-size-schedule is not supported by tools/prepare_cache.py")
 
 
 def _disable_cache_load_only_flags(args: Any) -> Dict[str, bool]:
@@ -156,7 +154,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        dynamic_context_parallel=args.dynamic_context_parallel,
     )
 
 
@@ -201,10 +199,7 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
 
 
 def main() -> Dict[str, Any]:
-    args = parse_args(
-        extra_args_provider=_extra_args_provider,
-        ignore_unknown_args=False,
-    )
+    args = parse_args(extra_args_provider=_extra_args_provider, ignore_unknown_args=False)
     _normalize_prepare_cache_args(args)
     validate_args(args, defaults={"tokenizer_type": "GPT2BPETokenizer"})
     return build_dataset_caches(args)
