@@ -2523,8 +2523,6 @@ def _add_training_args(parser):
     group.add_argument('--check-for-large-grads', action='store_true',
                        help='Check for unexpectedly large grads',
                        dest='check_for_large_grads')
-    group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
-                       help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
 
