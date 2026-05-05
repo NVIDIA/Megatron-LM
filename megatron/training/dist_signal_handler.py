@@ -1,33 +1,62 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import signal
+from typing import Any
 
 import torch
 
-def get_world_size():
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        world_size = torch.distributed.get_world_size()
-    else:
-        world_size = 1
-    return world_size
+from megatron.core._rank_utils import safe_get_world_size
+from megatron.training.utils import print_rank_0
 
+def get_device(local_rank: int | None = None) -> torch.device:
+    """Get the appropriate torch device based on the distributed backend.
 
-def get_device(local_rank=None):
+    Args:
+        local_rank: The local rank, used to specify the CUDA device index for NCCL.
+                    If None, uses the default CUDA device.
+
+    Returns:
+        The torch.device ('cuda' for NCCL, 'cpu' for Gloo).
+
+    Raises:
+        RuntimeError: If the distributed backend is neither 'nccl' nor 'gloo'.
+    """
     backend = torch.distributed.get_backend()
-    if backend == 'nccl':
+    if backend == "nccl":
         if local_rank is None:
-            device = torch.device('cuda')
+            device = torch.device("cuda")
         else:
-            device = torch.device(f'cuda:{local_rank}')
-    elif backend == 'gloo':
-        device = torch.device('cpu')
+            device = torch.device(f"cuda:{local_rank}")
+    elif backend == "gloo":
+        device = torch.device("cpu")
     else:
         raise RuntimeError
     return device
 
 
-def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None):
-    if not torch.distributed.is_available() or \
-       not torch.distributed.is_initialized():
+def all_gather_item(
+    item: Any,
+    dtype: torch.dtype,
+    group: torch.distributed.ProcessGroup | None = None,
+    async_op: bool = False,
+    local_rank: int | None = None,
+) -> list[Any]:
+    """Perform an all_gather operation on a single Python object.
+
+    Converts the item to a tensor, performs all_gather, and converts back to a list
+    of Python objects from all ranks.
+
+    Args:
+        item (Any): The Python object to gather.
+        dtype (torch.dtype): The torch dtype to use for the intermediate tensor.
+        group (Optional[torch.distributed.ProcessGroup]): The process group to gather within
+            (defaults to the global group).
+        async_op (bool): Whether the operation should be asynchronous.
+        local_rank (Optional[int]): The local rank to determine the device.
+
+    Returns:
+        list[Any]: A list containing the gathered items (of type Any) from all ranks in the group.
+    """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return [item]
 
     device = get_device(local_rank)
@@ -35,44 +64,70 @@ def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None):
     if group is not None:
         group_size = group.size()
     else:
-        group_size = get_world_size()
+        group_size = safe_get_world_size()
 
     tensor = torch.tensor([item], device=device, dtype=dtype)
-    output_tensors = [
-        torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
-        for _ in range(group_size)
-    ]
+    output_tensors = [torch.zeros(1, dtype=tensor.dtype, device=tensor.device) for _ in range(group_size)]
     torch.distributed.all_gather(output_tensors, tensor, group, async_op)
     output = [elem.item() for elem in output_tensors]
     return output
 
 
 class DistributedSignalHandler:
+    """Context manager to handle signals gracefully in a distributed setting.
+
+    Installs a signal handler upon entering the context that sets a flag
+    when the specified signal is received. The `signals_received` method
+    can be used to check if any rank received the signal (using all_gather).
+    The original signal handler is restored upon exiting the context.
+
+    Args:
+        sig: The signal number to handle (e.g., signal.SIGTERM).
+             Defaults to signal.SIGTERM.
+    """
+
     def __init__(self, sig: signal.Signals = signal.SIGTERM):
         self.sig = sig
+        self._signal_received = False
+        self.released = False
+        self.original_handler = None
 
-    def signals_received(self):
-        all_received = all_gather_item(
-            self._signal_received, dtype=torch.int32
-        )
+    def signals_received(self) -> list[bool]:
+        """Check if any rank in the default group received the signal.
+
+        Uses all_gather to collect the signal status from all ranks.
+
+        Returns:
+            A list of booleans, where each element indicates if the
+            corresponding rank received the signal.
+        """
+        all_received = all_gather_item(self._signal_received, dtype=torch.int32)
         return all_received
 
-    def __enter__(self):
+    def __enter__(self) -> "DistributedSignalHandler":
         self._signal_received = False
         self.released = False
         self.original_handler = signal.getsignal(self.sig)
 
-        def handler(signum, frame):
+        def handler(signum: int, frame: Any | None) -> None:
+            print_rank_0(f"Received signal {signum}, initiating graceful stop")
             self._signal_received = True
 
         signal.signal(self.sig, handler)
+        print_rank_0(f"Signal handler installed for {self.sig}")
 
         return self
 
-    def __exit__(self, type, value, tb):
+    def __exit__(self, exc_type: Optional[type], exc_val: Optional[Exception], exc_tb: Optional[Any]) -> None:
+        """Release the signal handler and restore the original handler."""
         self.release()
 
-    def release(self):
+    def release(self) -> bool:
+        """Restore the original signal handler.
+
+        Returns:
+            True if the handler was released, False if it was already released.
+        """
         if self.released:
             return False
 
