@@ -528,15 +528,13 @@ class TestMimoModelNonColocated:
             self.hidden_size, self.img_h, self.img_w, self.patch_dim
         )
 
-        mimo_config = MimoModelConfig(
-            language_model_spec=language_model_spec,
-            modality_submodules_spec={"images": vision_submodule_spec},
-            special_token_ids={"images": 50257},
-            module_to_grid_map={MIMO_LANGUAGE_MODULE_KEY: MockGrid()},
-        )
-
         with pytest.raises(ValueError, match="module_to_grid_map keys must match"):
-            MimoModel(mimo_config)
+            MimoModelConfig(
+                language_model_spec=language_model_spec,
+                modality_submodules_spec={"images": vision_submodule_spec},
+                special_token_ids={"images": 50257},
+                module_to_grid_map={MIMO_LANGUAGE_MODULE_KEY: MockGrid()},
+            )
 
     def test_role_determination(self):
         """Test role correctly identifies modules and stage positions."""
@@ -550,7 +548,7 @@ class TestMimoModelNonColocated:
             self.patch_dim,
             {"images": 50257},
         )
-        assert model_no_grid.role.mode == ModuleLayout.UNIFIED
+        assert model_no_grid.role.mode == ModuleLayout.COLOCATED
         assert model_no_grid.role.has_language_module is True
         assert model_no_grid.role.has_modality_modules is True
 
@@ -564,12 +562,15 @@ class TestMimoModelNonColocated:
         assert model_language.role.has_modality_modules is False
         assert model_language.role.has_language_module is True
 
-        # Stage info with PP
+        # Stage info with PP. language_in_grid=False so encoder and language
+        # grids have distinct rank_offsets and role.build dispatches to
+        # _from_grid_map (rather than collapsing to the COLOCATED path).
         model_pp = MimoModel(
-            self._make_config(encoder_in_grid=True, language_in_grid=True, pp_rank=1, pp_size=3)
+            self._make_config(encoder_in_grid=True, language_in_grid=False, pp_rank=1, pp_size=3)
         )
         assert model_pp.role.is_first_stage("images") is False
         assert model_pp.role.is_last_stage("images") is False
+        assert model_pp.colocated_comms == {}
 
     def test_selective_init_encoder_only(self):
         """Test encoder-only rank initializes encoder but not language model."""

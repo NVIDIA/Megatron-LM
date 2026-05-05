@@ -755,16 +755,6 @@ class InferenceTopKRouter(TopKRouter):
 
         super().__init__(config=config, pg_collection=pg_collection)
 
-        self.is_inference_cuda_graphed_iteration = False
-
-    def set_inference_cuda_graphed_iteration(self):
-        """Enable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = True
-
-    def unset_inference_cuda_graphed_iteration(self):
-        """Disable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = False
-
     @staticmethod
     @torch.compile
     def _compiled_topk_routing(
@@ -825,7 +815,7 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
-        if self.training or not self.is_inference_cuda_graphed_iteration:
+        if self.training:
             return super().forward(input, padding_mask)
 
         return self._forward(input, padding_mask)

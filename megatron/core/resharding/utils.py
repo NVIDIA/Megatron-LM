@@ -197,6 +197,38 @@ def assign_resolved_name_inplace(
     assign_ep_resolved_name_inplace(meta, base_name=name)
 
 
+def named_persistent_buffers(module: torch.nn.Module):
+    """Yield ``(full_name, parent_module, buf_name, tensor)`` for every
+    persistent buffer in ``module``.  Skips ``_non_persistent_buffers_set``.
+
+    Persistent buffers (those saved in ``state_dict``) carry training state that
+    must travel with the weights during refit/resharding — e.g. the MoE
+    router's ``expert_bias``, which is updated each step by aux-loss-free load
+    balancing.  Non-persistent buffers are excluded since they hold ephemeral
+    state (e.g. accumulators reset at the next train step).
+    """
+    for module_prefix, sub_module in module.named_modules():
+        non_persistent = sub_module._non_persistent_buffers_set
+        for buf_name, buf in sub_module._buffers.items():
+            if buf is None or buf_name in non_persistent:
+                continue
+            full_name = f"{module_prefix}.{buf_name}" if module_prefix else buf_name
+            yield full_name, sub_module, buf_name, buf
+
+
+def named_refit_tensors(module: torch.nn.Module):
+    """Yield ``(name, tensor)`` pairs for every parameter and persistent buffer.
+
+    Used by the refit planner and executor to enumerate which tensors should
+    travel during resharding.  Persistent buffers are included alongside
+    parameters because they may carry training state (see
+    ``named_persistent_buffers``).
+    """
+    yield from module.named_parameters(recurse=True)
+    for full_name, _sub, _buf_name, buf in named_persistent_buffers(module):
+        yield full_name, buf
+
+
 def _build_layer_module_prefix_map(module: torch.nn.Module) -> dict[str, str]:
     """Build a mapping local_module_prefix -> global_module_prefix for PP layer modules.
 
