@@ -476,26 +476,25 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        return [getattr(sp, field) for field, _, _ in self.get_metadata_types()]
+        return [getattr(sp, field) for field, _ in self.get_metadata_types()]
 
     @staticmethod
-    def get_metadata_types() -> List[Tuple[str, torch.dtype, bool]]:
-        """Keeps track of all request metadata names, dtypes, and target device.
+    def get_metadata_types() -> List[Tuple[str, torch.dtype]]:
+        """Keeps track of all request metadata names and dtypes.
 
         Returns:
-            List[Tuple[str, torch.dtype, bool]]: Mapping from metadata name to:
+            List[Tuple[str, torch.dtype]]: Mapping from metadata name to:
                 name (str) - The name of the metadata field.
                 dtype (torch.dtype) - The datatype of the metadata.
-                on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
         """
         return [
-            ("temperature", torch.float32, False),  # CPU for torch sampling
-            ("top_k", torch.int32, False),  # CPU for torch sampling
-            ("top_p", torch.float32, False),  # CPU for torch sampling
-            ("termination_id", torch.int64, True),
-            ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
+            ("temperature", torch.float32),
+            ("top_k", torch.int32),
+            ("top_p", torch.float32),
+            ("termination_id", torch.int64),
+            ("return_log_probs", torch.bool),
+            ("skip_prompt_log_probs", torch.bool),
+            ("top_n_logprobs", torch.int32),
         ]
 
     def add_event(
