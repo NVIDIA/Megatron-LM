@@ -256,7 +256,9 @@ class DynamicInferenceEngineTestBase:
             inference_config=InferenceConfig(
                 max_sequence_length=test_config.max_sequence_length,
                 num_cuda_graphs=test_config.num_cuda_graphs,
-                use_cuda_graphs_for_non_decode_steps=True,
+                use_cuda_graphs_for_non_decode_steps=(
+                    test_config.use_cuda_graphs_for_non_decode_steps
+                ),
                 buffer_size_gb=test_config.context_buffer_size_gb,
                 paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
                 block_size_tokens=test_config.context_block_size_tokens,
@@ -604,6 +606,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         num_tokens_to_generate = 16
 
         # Run test.
+        # Force decode-only CG capture: capturing mixed graphs across the full range will OOM.
         env = self._run_test(
             num_tokens_to_generate=num_tokens_to_generate,
             model_provider=model_provider,
@@ -611,6 +614,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             cuda_graph_scope=cuda_graph_scope,
             force_build_cuda_graphs=True,
             context_max_requests=128,
+            use_cuda_graphs_for_non_decode_steps=False,
         )
 
         # Validate max_requests, max_tokens.
