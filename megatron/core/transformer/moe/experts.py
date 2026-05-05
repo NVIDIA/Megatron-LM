@@ -335,16 +335,16 @@ class TEGroupedMLP(MegatronModule):
         ops = te.pytorch.ops.Sequential()
 
         # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
-        fc1_single_grouped_parameter = self.linear_fc1.single_grouped_parameter
+        fc1_single_grouped_weight = getattr(self.linear_fc1, "single_grouped_weight", False)
         fc1_weight_dtype = (
             self.linear_fc1.weight.dtype
-            if fc1_single_grouped_parameter
+            if fc1_single_grouped_weight
             else self.linear_fc1.weight0.dtype
         )
-        fc2_single_grouped_parameter = self.linear_fc2.single_grouped_parameter
+        fc2_single_grouped_weight = getattr(self.linear_fc2, "single_grouped_weight", False)
         fc2_weight_dtype = (
             self.linear_fc2.weight.dtype
-            if fc2_single_grouped_parameter
+            if fc2_single_grouped_weight
             else self.linear_fc2.weight0.dtype
         )
 
@@ -358,15 +358,15 @@ class TEGroupedMLP(MegatronModule):
             device="meta",
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
-            single_grouped_parameter=fc1_single_grouped_parameter,
+            single_grouped_weight=fc1_single_grouped_weight,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
-        if fc1_single_grouped_parameter:
+        if fc1_single_grouped_weight:
             setattr(op, "weight", getattr(self.linear_fc1, "weight"))
 
         for idx in range(self.linear_fc1.num_gemms):
-            if not fc1_single_grouped_parameter:
+            if not fc1_single_grouped_weight:
                 setattr(op, f"weight{idx}", getattr(self.linear_fc1, f"weight{idx}"))
             if self.linear_fc1.use_bias:
                 setattr(op, f"bias{idx}", getattr(self.linear_fc1, f"bias{idx}"))
@@ -388,15 +388,15 @@ class TEGroupedMLP(MegatronModule):
             device="meta",
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
-            single_grouped_parameter=fc2_single_grouped_parameter,
+            single_grouped_weight=fc2_single_grouped_weight,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
-        if fc2_single_grouped_parameter:
+        if fc2_single_grouped_weight:
             setattr(op, "weight", getattr(self.linear_fc2, "weight"))
 
         for idx in range(self.linear_fc2.num_gemms):
-            if not fc2_single_grouped_parameter:
+            if not fc2_single_grouped_weight:
                 setattr(op, f"weight{idx}", getattr(self.linear_fc2, f"weight{idx}"))
             if self.linear_fc2.use_bias:
                 setattr(op, f"bias{idx}", getattr(self.linear_fc2, f"bias{idx}"))
