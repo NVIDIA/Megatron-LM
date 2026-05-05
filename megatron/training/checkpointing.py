@@ -443,6 +443,8 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
+    if getattr(args, 'dist_ckpt_use_dtensor_format', False):
+        metadata['use_dtensor_format'] = True
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)

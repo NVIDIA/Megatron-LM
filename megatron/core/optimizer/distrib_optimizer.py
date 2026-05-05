@@ -1701,6 +1701,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return model_space_state
 
+    def _build_dp_shard_dtensor_metadata(self):
+        """Build DTensor device mesh and Shard(0) placements for DP-sharded optimizer tensors."""
+        from torch.distributed import get_process_group_ranks
+        from torch.distributed.distributed_c10d import _get_group_tag
+        from torch.distributed.tensor import DeviceMesh, Shard
+
+        dp_group = self.data_parallel_group
+        with torch.device("cpu"):
+            group_ranks = get_process_group_ranks(dp_group)
+            mesh = torch.tensor(group_ranks, dtype=torch.int)
+        device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('dp',), _init_backend=False)
+        device_mesh._dim_group_infos = [
+            (_get_group_tag(dp_group), group_ranks, dp_group.group_name)
+        ]
+        return device_mesh, [Shard(0)]
+
     def sharded_param_state_dp_reshardable(
         self,
         model_sharded_state_dict: ShardedStateDict,
@@ -1734,7 +1750,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         but we must discard the last padding to DP multiple, because that might
         change during DP resharding - we want the checkpoint tensor to always have size
         `gbuf_world_numel_unpadded` which means everything except for the last padding above.
+
+        When `use_dtensor_format=True` is in metadata, instead of one ShardedTensor per param
+        (which all share the same key, causing duplicates in DTensor save/load), the entire
+        rank's local shard for each optimizer key (param, exp_avg, etc.) is merged into a
+        single ShardedTensor with a unique key. On loading, per-param tensors are wired as
+        views into the merged buffer so DCP loading propagates directly to optimizer state.
         """
+        use_dtensor_format = (metadata or {}).get('use_dtensor_format', False)
         data_parallel_rank = self.data_parallel_group.rank()
         data_parallel_world_size = self.data_parallel_group.size()
 
@@ -1752,6 +1775,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 (0,),
                 replica_id=(self.distributed_optimizer_instance_id, 0, data_parallel_rank),
             )
+
+        if use_dtensor_format:
+            dtensor_device_mesh, dtensor_placements = self._build_dp_shard_dtensor_metadata()
 
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             for dtype, gbuf_range_map_for_all_buckets in state[gbuf_idx].items():
@@ -1813,42 +1839,98 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for index_to_insert in reversed(indices_to_insert):
                         bucket_state.insert(index_to_insert, all_pad_tensors[index_to_insert])
 
-                    # Each tensor is mapped to a slice
-                    # of a DP-local shard of size `gbuf_local_numel`.
-                    for bucket_params_idx in range(len(bucket_state)):
-                        tensors = bucket_state[bucket_params_idx]
-                        gbuf_local_start = tensors.pop('gbuf_local_start')
-                        gbuf_local_end = tensors.pop('gbuf_local_end')
-                        if 'padding' not in tensors:
-                            tensors['padding'] = False
+                    if use_dtensor_format:
+                        # DTensor format: merge all per-param tensors (including padding) for each
+                        # optimizer key into a single ShardedTensor per key. This eliminates
+                        # duplicate keys that arise when multiple params share the same bucket key.
+                        # For loading, per-param tensors become views into the merged buffer so DCP
+                        # loading propagates automatically to optimizer state via storage sharing.
+                        first_real_entry = next(
+                            (e for e in bucket_state if not e.get('padding', False)),
+                            bucket_state[0],
+                        )
+                        tensor_keys = [
+                            k for k, v in first_real_entry.items()
+                            if isinstance(v, torch.Tensor) and k != 'step'
+                        ]
 
-                        for key in tensors:
-                            if key == 'padding':
-                                tensors[key] = LocalNonpersistentObject(tensors[key])
-                                continue
-                            if key == 'step':
-                                # The optimizer state of STEP is a 0-dim tensor and is handled
-                                # separately via param_groups, not as part of the gradient buffer.
-                                tensors[key] = LocalNonpersistentObject(tensors[key])
-                                continue
-                            assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
-                                tensors[key].shape,
-                                gbuf_local_start,
-                                gbuf_local_end,
-                            )
+                        merged_bucket = {}
+                        for k in tensor_keys:
+                            param_list = [
+                                (e['gbuf_local_start'], e['gbuf_local_end'],
+                                 e[k], e.get('padding', False))
+                                for e in bucket_state
+                                if k in e and isinstance(e.get(k), torch.Tensor)
+                            ]
+                            if not is_loading:
+                                merged_data = torch.cat([t for _, _, t, _ in param_list])
+                            else:
+                                total_size = sum(end - start for start, end, _, _ in param_list)
+                                first_t = param_list[0][2]
+                                merged_data = torch.empty(
+                                    total_size, dtype=first_t.dtype, device=first_t.device
+                                )
+                                offset = 0
+                                for start, end, t, is_pad in param_list:
+                                    size = end - start
+                                    if not is_pad:
+                                        # Wire optimizer state tensor as a view so DCP loading
+                                        # into merged_data automatically updates t.
+                                        t.data = merged_data[offset:offset + size]
+                                    offset += size
 
-                            tensors[key] = ShardedTensor(
-                                f'{sharded_bucket_key}.{key}',
-                                tensors[key],
-                                tensors[key].dtype,
-                                tensors[key].shape,
+                            merged_bucket[k] = ShardedTensor(
+                                f'{sharded_bucket_key}.{k}',
+                                merged_data,
+                                merged_data.dtype,
+                                (merged_data.numel(),),
                                 (gbuf_world_numel_unpadded,),
-                                (data_parallel_rank * gbuf_local_numel + gbuf_local_start,),
+                                (data_parallel_rank * gbuf_local_numel,),
                                 axis_fragmentations=None,
                                 flattened_range=None,
-                                allow_shape_mismatch=False,
+                                allow_shape_mismatch=True,
                                 replica_id=(self.distributed_optimizer_instance_id, 0, 0),
+                                dtensor_ckpt_device_mesh=dtensor_device_mesh,
+                                dtensor_ckpt_placements=dtensor_placements,
                             )
+                        state[gbuf_idx][dtype][bucket_idx] = merged_bucket
+                    else:
+                        # Each tensor is mapped to a slice
+                        # of a DP-local shard of size `gbuf_local_numel`.
+                        for bucket_params_idx in range(len(bucket_state)):
+                            tensors = bucket_state[bucket_params_idx]
+                            gbuf_local_start = tensors.pop('gbuf_local_start')
+                            gbuf_local_end = tensors.pop('gbuf_local_end')
+                            if 'padding' not in tensors:
+                                tensors['padding'] = False
+
+                            for key in tensors:
+                                if key == 'padding':
+                                    tensors[key] = LocalNonpersistentObject(tensors[key])
+                                    continue
+                                if key == 'step':
+                                    # The optimizer state of STEP is a 0-dim tensor and is handled
+                                    # separately via param_groups, not as part of the gradient buffer.
+                                    tensors[key] = LocalNonpersistentObject(tensors[key])
+                                    continue
+                                assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
+                                    tensors[key].shape,
+                                    gbuf_local_start,
+                                    gbuf_local_end,
+                                )
+
+                                tensors[key] = ShardedTensor(
+                                    f'{sharded_bucket_key}.{key}',
+                                    tensors[key],
+                                    tensors[key].dtype,
+                                    tensors[key].shape,
+                                    (gbuf_world_numel_unpadded,),
+                                    (data_parallel_rank * gbuf_local_numel + gbuf_local_start,),
+                                    axis_fragmentations=None,
+                                    flattened_range=None,
+                                    allow_shape_mismatch=False,
+                                    replica_id=(self.distributed_optimizer_instance_id, 0, 0),
+                                )
         return state
 
     def sharded_param_state_fs_model_space(
@@ -1952,6 +2034,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                     bucket_state = state_dict[gbuf_idx][dtype][bucket_idx]
+                    # DTensor merged format stores a plain dict keyed by optimizer state name
+                    # (e.g. 'param', 'exp_avg'). Per-param tensors were already wired as views
+                    # into the merged buffer during sharded_param_state_dp_reshardable, so DCP
+                    # loading has already propagated checkpoint data to optimizer state.
+                    if isinstance(bucket_state, dict):
+                        continue
                     bucket_state = [
                         bucket_state_elem
                         for bucket_state_elem in bucket_state
