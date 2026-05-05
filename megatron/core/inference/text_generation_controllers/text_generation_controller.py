@@ -1850,10 +1850,6 @@ class TextGenerationController:
             return "non-greedy top_k"
         if (active_metadata["top_p"][active_slice] != 0.0).any():
             return "top_p sampling"
-        if self.num_speculative_tokens != 0 and (
-            return_log_probs_requested.any() or top_n_logprobs_requested.any()
-        ):
-            return "mtp logprobs requested"
         if (
             (return_log_probs_requested | top_n_logprobs_requested)
             & ~active_metadata["skip_prompt_log_probs"][active_slice]
@@ -1981,7 +1977,9 @@ class TextGenerationController:
             only_last_token_logits=context.config.materialize_only_last_token_logits,
         )
 
-    def _dynamic_step_calculate_log_probs_speculative(self) -> Tuple[List[List[float]], Tensor]:
+    def _dynamic_step_calculate_log_probs_speculative(
+        self, row_indices: Optional[Tensor] = None
+    ) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs from logits for speculative decoding.
 
         For decode requests, computes log probs for each accepted speculative token
@@ -2014,6 +2012,14 @@ class TextGenerationController:
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
         logits_squeezed = logits.squeeze(0).float()
+        if row_indices is not None:
+            assert only_last, "row-mapped MTP async reuse requires last-token logits"
+            stride = self.num_speculative_tokens + 1
+            logits_squeezed = (
+                logits_squeezed.view(-1, stride, self.vocab_size)
+                .index_select(0, row_indices)
+                .reshape(-1, self.vocab_size)
+            )
         if only_last:
             log_probs_tensor = F.log_softmax(logits_squeezed, dim=-1)
         else:
@@ -2746,13 +2752,13 @@ class TextGenerationController:
             top_n_logprobs = None
             if return_log_probs or return_top_n_logprobs:
                 logprob_row_indices = (
-                    pending_forward_row_indices
-                    if pending_forward_row_mapped and self.num_speculative_tokens == 0
-                    else None
+                    pending_forward_row_indices if pending_forward_row_mapped else None
                 )
                 if self.num_speculative_tokens > 0:
                     log_probs, log_probs_tensor = (
-                        self._dynamic_step_calculate_log_probs_speculative()
+                        self._dynamic_step_calculate_log_probs_speculative(
+                            row_indices=logprob_row_indices
+                        )
                     )
                     if return_top_n_logprobs:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
