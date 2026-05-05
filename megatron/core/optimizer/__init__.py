@@ -57,6 +57,7 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
+from ..distributed.fsdp import FullyShardedDataParallel
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
@@ -727,7 +728,7 @@ def _get_mfsdp_models(model_chunks):
     """Extract list of MegatronFSDP instances from FSDP-wrapped model chunks."""
     mfsdp_models = []
     for chunk in model_chunks:
-        if hasattr(chunk, "finish_grad_sync") and hasattr(chunk, "module"):
+        if isinstance(chunk, FullyShardedDataParallel):
             mfsdp_models.append(chunk.module)
     if not mfsdp_models:
         raise RuntimeError(

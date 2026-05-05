@@ -31,6 +31,11 @@ pytestmark = [
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
 
 
+class _FakeFSDP:
+    def __init__(self, module):
+        self.module = module
+
+
 def _skip_if_single_rank():
     return pytest.mark.skipif(WORLD_SIZE <= 1, reason="Multi-rank test requires WORLD_SIZE > 1")
 
@@ -116,23 +121,21 @@ class TestGetMFSDPModels:
 
     def test_extracts_inner_module(self):
         inner_module = MagicMock()
-        chunk = MagicMock()
-        chunk.module = inner_module
-        chunk.finish_grad_sync = MagicMock()
+        chunk = _FakeFSDP(inner_module)
 
-        assert _get_mfsdp_models([chunk]) == [inner_module]
+        with patch("megatron.core.optimizer.FullyShardedDataParallel", _FakeFSDP):
+            assert _get_mfsdp_models([chunk]) == [inner_module]
 
     def test_extracts_from_multiple_chunks(self):
         chunks, inner_modules = [], []
         for _ in range(3):
             inner = MagicMock()
-            chunk = MagicMock()
-            chunk.module = inner
-            chunk.finish_grad_sync = MagicMock()
+            chunk = _FakeFSDP(inner)
             chunks.append(chunk)
             inner_modules.append(inner)
 
-        assert _get_mfsdp_models(chunks) == inner_modules
+        with patch("megatron.core.optimizer.FullyShardedDataParallel", _FakeFSDP):
+            assert _get_mfsdp_models(chunks) == inner_modules
 
 
 @_skip_if_single_rank()
