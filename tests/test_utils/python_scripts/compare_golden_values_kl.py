@@ -209,9 +209,7 @@ def compare_metric(
     q = _normalize(new_vals)
 
     abs_diffs = [abs(a - b) for a, b in zip(old_vals, new_vals)]
-    rel_diffs = [
-        abs(a - b) / max(abs(a), 1e-12) for a, b in zip(old_vals, new_vals)
-    ]
+    rel_diffs = [abs(a - b) / max(abs(a), 1e-12) for a, b in zip(old_vals, new_vals)]
 
     kl_pq = kl_divergence(p, q)
     kl_qp = kl_divergence(q, p)
