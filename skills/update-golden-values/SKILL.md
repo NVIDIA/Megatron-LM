@@ -1,12 +1,12 @@
 ---
-name: update-failing-goldens
-description: Refresh golden values for failing functional tests from a GitHub Actions workflow run, score the change with KL divergence, and produce a PR-ready summary. Use when the user asks to update goldens for a failing CI run, refresh golden values from a workflow ID, or generate a golden-value diff summary for a PR description.
-when_to_use: User provides a GitHub Actions workflow run ID and asks to refresh golden values; user asks to update goldens "for failing tests only"; user asks for a KL-divergence summary of the golden-value diff; user wants a PR description blurb after running download_golden_values.py.
+name: update-golden-values
+description: Refresh golden values from a GitHub Actions workflow run (failing-only or all jobs), score the change with KL divergence, and produce a PR-ready summary. Use when the user asks to update goldens for a CI run, refresh golden values from a workflow ID, or generate a golden-value diff summary for a PR description.
+when_to_use: User provides a GitHub Actions workflow run ID and asks to refresh golden values; user asks to update goldens for "failing tests only" or "all tests"; user asks for a KL-divergence summary of the golden-value diff; user wants a PR description blurb after running download_golden_values.py.
 ---
 
-# Update goldens for failing tests + KL summary
+# Update golden values + KL summary
 
-End-to-end workflow for refreshing golden values from a GitHub Actions workflow run that contains failing functional tests, validating the update with KL divergence, and writing a PR-ready summary.
+End-to-end workflow for refreshing golden values from a GitHub Actions workflow run, validating the update with KL divergence, and writing a PR-ready summary.
 
 The skill orchestrates two scripts that already live in the repo:
 
@@ -17,14 +17,18 @@ The skill orchestrates two scripts that already live in the repo:
 
 1. **GitHub Actions workflow run ID** (e.g. `25341543542`). It's the numeric ID in the run URL.
 2. **Source**: should be `github` for this workflow. (`gitlab` is supported by the download script but uses a different env path.)
-3. **Confirm only-failing**: this skill always passes `--only-failing`. Mention it explicitly if the user wants every test refreshed instead.
+3. **Scope** — accept one of:
+   - `only-failing` → run with `--only-failing` (download from failing/cancelled jobs only). Use this for "fix the broken tests" workflows.
+   - `all` → run without `--only-failing` (download from every job that produced golden values). Use this when the user wants a full refresh.
+
+   If the user doesn't specify, ask. Don't silently default.
 
 ## Workflow
 
 ```
 - [ ] Step 1: Set up env (token + venv with deps)
 - [ ] Step 2: Reset prior golden-value edits
-- [ ] Step 3: Download goldens with --only-failing
+- [ ] Step 3: Download goldens (scope = only-failing | all)
 - [ ] Step 4: Run KL comparison + capture CSV
 - [ ] Step 5: Produce summary blurb
 ```
@@ -56,14 +60,21 @@ git ls-files --others --exclude-standard tests/functional_tests/test_cases/ \
 
 Skip this step when the user explicitly wants to layer a new download on top of an in-progress branch.
 
-### Step 3 — Download (failing only)
+### Step 3 — Download
+
+Build the command from the user-provided scope:
 
 ```bash
+# scope = only-failing (default for "fix broken tests")
 /tmp/gv_venv/bin/python tests/test_utils/python_scripts/download_golden_values.py \
   --source github --pipeline-id <WORKFLOW_RUN_ID> --only-failing
+
+# scope = all (full refresh; omit the flag)
+/tmp/gv_venv/bin/python tests/test_utils/python_scripts/download_golden_values.py \
+  --source github --pipeline-id <WORKFLOW_RUN_ID>
 ```
 
-The script's GitHub path filters at `_fetch_and_filter_artifacts` on `matched_job["conclusion"] == "success"`, so only failing/cancelled jobs contribute artifacts.
+When `--only-failing` is set, the GitHub path filters at `_fetch_and_filter_artifacts` on `matched_job["conclusion"] == "success"`, so only failing/cancelled jobs contribute artifacts. Without the flag, every job's golden-value artifact is pulled.
 
 Capture the final two log lines for the summary; they look like:
 
@@ -114,14 +125,21 @@ for label, pred in buckets:
 
 Use this template verbatim, filling in `<…>` from steps 3–4. Drop sections that don't apply to the run.
 
+Pick the wording for the first line based on the scope used:
+
+- `only-failing` → "Refresh of golden values for failing functional tests from GitHub workflow run …"
+- `all` → "Full refresh of golden values from GitHub workflow run …"
+
+Match the `download_golden_values.py` command in the bullet list to the scope used (with or without `--only-failing`).
+
 ````markdown
 ### Summary
 
-Refresh of golden values for failing functional tests from GitHub workflow run `<WORKFLOW_RUN_ID>`.
+<scope-appropriate sentence> from GitHub workflow run `<WORKFLOW_RUN_ID>`.
 
 **Golden value updates**
 
-- Re-ran `tests/test_utils/python_scripts/download_golden_values.py --source github --pipeline-id <WORKFLOW_RUN_ID> --only-failing`.
+- Re-ran `tests/test_utils/python_scripts/download_golden_values.py --source github --pipeline-id <WORKFLOW_RUN_ID> <--only-failing if scope=only-failing>`.
 - Updated **<N> golden-value files** under `tests/functional_tests/test_cases/`.
 
 ### KL divergence summary

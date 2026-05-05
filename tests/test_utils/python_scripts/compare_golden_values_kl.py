@@ -1,4 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #!/usr/bin/env python3
+
 """Compare old vs. new golden-value JSONs using KL divergence.
 
 The golden-value JSON files produced by `download_golden_values.py` look like:
