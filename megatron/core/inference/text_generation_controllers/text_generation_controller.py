@@ -1839,13 +1839,6 @@ class TextGenerationController:
             self._async_admission_barrier_requested = False
             return "waiting request admission deferred"
 
-        if self._has_active_stop_words_callback is not None:
-            active_request_ids = context.request_ids[
-                context.paused_request_count : context.total_request_count
-            ].tolist()
-            if self._has_active_stop_words_callback(active_request_ids):
-                return "stop words are unsupported"
-
         active_metadata = context.active_request_metadata
         active_slice = slice(0, active_request_count)
         if (active_metadata["top_k"][active_slice] != 1).any():

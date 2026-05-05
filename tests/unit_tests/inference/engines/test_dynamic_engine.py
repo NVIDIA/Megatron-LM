@@ -1863,6 +1863,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.active_request_metadata["return_log_probs"][0] = False
             context.active_request_metadata["top_n_logprobs"][0] = 0
             context.active_request_metadata["termination_id"][0] = -1
+        controller.set_has_active_stop_words_callback(lambda active_request_ids: True)
         assert controller._async_scheduling_disabled_reason() is None
 
         delete_cuda_graphs()
