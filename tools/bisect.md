@@ -29,7 +29,7 @@ Example:
 | 1 | *(commented out)* Stash local changes |
 | 2 | *(commented out)* Fetch and checkout `<COMMIT>` |
 | 3 | *(commented out)* Cherry-pick each commit in `CHERRYPICK_SHAS` onto the tested commit, in order |
-| 4 | Generate local job configs (`generate_local_jobs --environment dev --scope L1`) |
+| 4 | Generate local job configs (`generate_local_jobs --environment dev --scope mr`) |
 | 5 | Run `test_cases/gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic.sh`, tee output to `log.txt` |
 | 6 | Parse `OUTPUT_PATH` from the line `This test wrote results into …` |
 | 7 | Copy `golden_values*.json` from `OUTPUT_PATH` into `tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic/` |

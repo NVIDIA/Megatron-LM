@@ -27,7 +27,7 @@ def load_script(config_path: str) -> str:
 @click.command()
 @click.option("--model", required=False, type=str, help="Filters all tests by matching model")
 @click.option(
-    "--scope", required=False, type=str, default="L1", help="Filters all tests by matching scope"
+    "--scope", required=False, type=str, default="mr", help="Filters all tests by matching scope"
 )
 @click.option(
     "--test-case", required=False, type=str, help="Returns a single test-case with matching name."

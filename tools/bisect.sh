@@ -46,7 +46,7 @@ for sha in "${CHERRYPICK_SHAS[@]}"; do
    git cherry-pick "${sha}"
 done
 
-python -m tests.test_utils.python_scripts.generate_local_jobs --environment dev --scope L1
+python -m tests.test_utils.python_scripts.generate_local_jobs --environment dev --scope mr
 
 # 4. Run the test and tee output to log.txt
 log "Running ${TEST_SCRIPT} (output → ${LOG_FILE})..."
