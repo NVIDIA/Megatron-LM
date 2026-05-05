@@ -190,6 +190,9 @@ class TextGenerationController:
         self._async_chained_decode_graph_launch_count = 0
         self._async_forward_graph_launch_count = 0
         self._async_deferred_mtp_release_count = 0
+        self._async_eligibility_check_count = 0
+        self._async_eligibility_pass_count = 0
+        self._async_disable_reason_counts: Dict[str, int] = {}
         self._async_decode_graph_capture_failed_reason = None
         self._async_decode_graphs: Dict[InferenceBatchDimensions, _AsyncDecodeGraph] = {}
         self._async_forward_graphs: Dict[InferenceBatchDimensions, _AsyncForwardGraph] = {}
@@ -1354,6 +1357,37 @@ class TextGenerationController:
         self._async_add_deferral_count += 1
         self._async_admission_barrier_requested = True
 
+    def get_async_scheduling_diagnostics(self) -> Dict[str, Any]:
+        """Return cheap async scheduling diagnostics for tests and benchmark logs."""
+        return {
+            "enabled": self._async_scheduling_enabled,
+            "pending_forward": self._async_pending_forward,
+            "eligibility_checks": self._async_eligibility_check_count,
+            "eligibility_passes": self._async_eligibility_pass_count,
+            "disable_reason_counts": dict(self._async_disable_reason_counts),
+            "last_disable_reason": self._async_disable_reason,
+            "decode_graph_capture_failed_reason": self._async_decode_graph_capture_failed_reason,
+            "forward_launches": self._async_forward_launch_count,
+            "decode_graph_launches": self._async_decode_graph_launch_count,
+            "chained_decode_graph_launches": self._async_chained_decode_graph_launch_count,
+            "forward_graph_launches": self._async_forward_graph_launch_count,
+            "sample_slot_waits": self._async_sample_slot_wait_count,
+        }
+
+    def _record_async_eligibility_result(self, reason: Optional[str]) -> None:
+        """Record one async eligibility decision without synchronizing with the GPU."""
+        self._async_eligibility_check_count += 1
+        if reason is None:
+            self._async_eligibility_pass_count += 1
+        else:
+            self._record_async_disable_reason(reason)
+
+    def _record_async_disable_reason(self, reason: str) -> None:
+        """Count a reason that prevented an async launch after scheduling was considered."""
+        self._async_disable_reason_counts[reason] = (
+            self._async_disable_reason_counts.get(reason, 0) + 1
+        )
+
     def _active_request_ids_cpu(self) -> Tensor:
         """Return the current active request IDs in row order."""
         context = self.inference_wrapped_model.inference_context
@@ -1711,6 +1745,7 @@ class TextGenerationController:
         """Prepare next-step metadata and launch a captured async decode graph if possible."""
         context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason()
+        self._record_async_eligibility_result(self._async_disable_reason)
         if self._async_disable_reason is not None:
             return False, None, None, None, None, False
 
@@ -1719,11 +1754,13 @@ class TextGenerationController:
         range_pop()
         if not async_next_prepared:
             self._async_disable_reason = "failed to prepare next-step metadata"
+            self._record_async_disable_reason(self._async_disable_reason)
             return False, None, None, None, None, False
 
         async_decode_graph = self._get_async_decode_graph()
         if async_decode_graph is None:
             self._async_disable_reason = "async decode graph not captured"
+            self._record_async_disable_reason(self._async_disable_reason)
             return True, None, None, None, None, False
 
         range_push("async_decode_graph_launch")
@@ -1751,6 +1788,7 @@ class TextGenerationController:
         """Prepare next-step metadata for an async forward launched after sampling."""
         context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason(allow_mtp=True)
+        self._record_async_eligibility_result(self._async_disable_reason)
         if self._async_disable_reason is not None:
             return False
 
@@ -1759,6 +1797,7 @@ class TextGenerationController:
         range_pop()
         if not async_next_prepared:
             self._async_disable_reason = "failed to prepare next-step metadata"
+            self._record_async_disable_reason(self._async_disable_reason)
             return False
 
         return True

@@ -1999,6 +1999,19 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
+            async_diag = self.controller.get_async_scheduling_diagnostics()
+            if async_diag["enabled"]:
+                output_str += " ... async: fwd %d, graph %d, eligible %d/%d" % (
+                    async_diag["forward_launches"],
+                    async_diag["decode_graph_launches"],
+                    async_diag["eligibility_passes"],
+                    async_diag["eligibility_checks"],
+                )
+                if async_diag["disable_reason_counts"]:
+                    reason, count = max(
+                        async_diag["disable_reason_counts"].items(), key=lambda item: item[1]
+                    )
+                    output_str += " ... async top block: %s (%d)" % (reason, count)
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)

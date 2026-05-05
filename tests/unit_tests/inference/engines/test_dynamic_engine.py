@@ -811,6 +811,39 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_scheduling_diagnostics_hybrid_cuda_graph_e2e(self) -> None:
+        """Async diagnostics expose launch counts and eligibility outcomes."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        env = self._run_test(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            model_provider="hybrid",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            enable_async_scheduling=True,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        controller = env.engine.controller
+        diagnostics = controller.get_async_scheduling_diagnostics()
+        assert diagnostics["enabled"]
+        assert diagnostics["eligibility_passes"] > 0
+        assert diagnostics["eligibility_checks"] >= diagnostics["eligibility_passes"]
+        assert diagnostics["forward_launches"] == controller._async_forward_launch_count
+        assert diagnostics["decode_graph_launches"] == controller._async_decode_graph_launch_count
+        assert diagnostics["decode_graph_launches"] > 0
+        assert isinstance(diagnostics["disable_reason_counts"], dict)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_scheduling_decode_finish_boundary_cuda_graph_e2e(self) -> None:
         """Async scheduling keeps pending forward rows correct when requests finish."""
         common_kwargs = dict(
