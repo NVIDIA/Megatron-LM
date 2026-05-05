@@ -347,7 +347,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         Check if we should call the local cudagraph path.
         """
         if (
-            not self.training
+            BaseInferenceContext.is_active()
             and hasattr(self, 'cudagraph_manager')
             and (
                 kwargs.get('inference_context') is not None
@@ -407,7 +407,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = BaseInferenceContext.is_active()
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"

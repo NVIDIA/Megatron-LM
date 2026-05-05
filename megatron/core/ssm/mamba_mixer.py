@@ -427,7 +427,7 @@ class MambaMixer(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = BaseInferenceContext.is_active()
 
         _, batch, dim = hidden_states.shape
         conv_state, ssm_state = None, None

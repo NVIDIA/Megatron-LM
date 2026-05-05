@@ -1024,7 +1024,7 @@ class Attention(MegatronModule, ABC):
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
-        is_inference_mode = inference_context is not None and not self.training
+        is_inference_mode = BaseInferenceContext.is_active()
         # is_using_flash_decode - True is we are using the static inference engine with flash decode
         is_using_flash_decode = is_inference_mode and self.config.flash_decode
         # is_using_flashinfer_rope - True if we are using the dynamic inference engine
@@ -1108,7 +1108,7 @@ class Attention(MegatronModule, ABC):
         in_decode_mode = (
             inference_context is not None
             and inference_context.is_decode_only()
-            and not self.training
+            and BaseInferenceContext.is_active()
         )
 
         # This branch only runs in the decode phase of flash decoding and returns after the linear

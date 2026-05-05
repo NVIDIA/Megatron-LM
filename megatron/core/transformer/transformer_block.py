@@ -614,7 +614,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         Check if we should call the local cudagraph path.
         """
         if (
-            not self.training
+            BaseInferenceContext.is_active()
             and hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (

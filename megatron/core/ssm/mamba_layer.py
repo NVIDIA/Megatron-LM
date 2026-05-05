@@ -198,7 +198,7 @@ class MambaLayer(GraphableMegatronModule):
             and not torch.is_inference_mode_enabled()  # for inference eager dummy_forward
         ):
             return True
-        elif not self.training and (
+        elif BaseInferenceContext.is_active() and (
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None

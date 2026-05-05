@@ -21,6 +21,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import KVCacheManagementMode
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
@@ -256,6 +257,9 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+
+        # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
+        BaseInferenceContext.set_active()
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -740,6 +744,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        BaseInferenceContext.unset_active()
+
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
@@ -788,6 +794,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Skip if not suspended or in the process of suspending.
         if self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
+
+        BaseInferenceContext.set_active()
 
         # Resume.
         with self.__class__.suspend_resume_ctx(
