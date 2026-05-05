@@ -166,16 +166,6 @@ class TextGenerationController:
             )
         else:
             self._all_logits_cuda = None
-        # Speculative path:
-        #     - `self._sampled_tokens_cuda` is pre-allocated by `_init_mtp_sampling_tensors`.
-        #     - The tensor cannot be reused between the Triton kernel and the sampling graph.
-        # Non-speculative path:
-        #     - `self._sampled_tokens_cuda` is rebound to the output of `sample_kernel`,
-        #     which uses CudaGraphManager syntactic sugar to keep it as a static tensor.
-        # Pre-allocate so the engine warmup loop's `_dynamic_step_calculate_log_probs`
-        # has a valid `_sampled_tokens_cuda[:padded_active_request_count]` even before
-        # the first real `sample_kernel` rebinds (matters for the torch backend, which
-        # doesn't graph-capture sampling during warmup).
         self._sampled_tokens_cuda = torch.zeros(max_requests, dtype=torch.int64, device=device)
 
         self._log_prob_count = 0
@@ -220,7 +210,6 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
         device = torch.cuda.current_device()
-        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
         self._sampled_mtp_tokens_cuda = torch.empty(
             [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
         )
@@ -1112,15 +1101,8 @@ class TextGenerationController:
             return
 
         context = self.inference_wrapped_model.inference_context
-
-        logits_seq_len = (
-            context.padded_num_last_token_logits
-            if context.config.materialize_only_last_token_logits
-            else context.padded_active_token_count
-        )
-        logits = self._all_logits_cuda[:, :logits_seq_len, :]
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
-        self._log_probs_speculative.softmax(context, logits, eager=eager)
+        self._log_probs_speculative.softmax(context, self._all_logits_cuda, eager=eager)
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
         """Collect flat routing indices for MoE router recording.
@@ -1189,13 +1171,7 @@ class TextGenerationController:
             return None
 
         context = self.inference_wrapped_model.inference_context
-
-        logits_seq_len = (
-            context.padded_num_last_token_logits
-            if context.config.materialize_only_last_token_logits
-            else context.padded_active_token_count
-        )
-        logits = self._all_logits_cuda[:, :logits_seq_len, :]
+        logits = self._all_logits_cuda
         new_tokens = self._sampled_tokens_cuda[: context.padded_active_request_count]
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
 

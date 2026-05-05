@@ -42,10 +42,7 @@ class ContextGPUView:
         # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
         # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
         # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
-        # `request_query_lengths` and `active_request_last_token_idxs` reserve
-        # one extra trailing slot at index `max_requests` used as the
-        # sentinel-row target by `LogProbsPrefill.indexing_kernel`
-        # (`nonzero_static(..., fill_value=max_requests)`).
+        # `request_query_lengths` and `active_request_last_token_idxs` reserve one extra slot.
         req_4byte_bytes = max_requests * 4
         req_4byte_with_sentinel_bytes = (max_requests + 1) * 4
 
@@ -139,8 +136,7 @@ class ContextGPUView:
         # Request-level tensors (consumed by sampling, log-probs, speculative verification, MTP).
         self.request_in_prefill_status = self._buf[off : off + req_4byte_bytes].view(torch.int32)
         off += req_4byte_bytes
-        # `request_query_lengths` has a trailing zero slot at index `max_requests`
-        # (CPU staging never writes it) for `LogProbsPrefill.indexing_kernel` sentinel reads.
+        # `request_query_lengths` has a trailing zero slot at index `max_requests`.
         self.request_query_lengths = self._buf[off : off + req_4byte_with_sentinel_bytes].view(
             torch.int32
         )
@@ -159,9 +155,7 @@ class ContextGPUView:
         # Per-request last-token row indices (consumed by sampling kernels as `gather_indices`).
         # The CPU side of this slot IS `context.active_request_last_token_idxs`,
         # populated by `build_active_slices` and `pad_active_slices`.
-        # The trailing slot at index `max_requests` is the sentinel target for
-        # `LogProbsPrefill.indexing_kernel`; `pad_active_slices` writes
-        # `padded_active_token_count - 1` into it each step.
+        # The trailing slot at index `max_requests` is the sentinel target for logprobs kernels.
         self.active_request_last_token_idxs = self._buf[
             off : off + req_4byte_with_sentinel_bytes
         ].view(torch.int32)

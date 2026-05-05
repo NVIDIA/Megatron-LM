@@ -345,10 +345,6 @@ class DynamicInferenceEngine(AbstractEngine):
         context = self.context
         controller = self.controller
 
-        # Avoid running sampling during warmup.
-        # TODO: Disable this once sampling is also graphed.
-        controller._sampled_tokens_cuda.zero_()
-
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 

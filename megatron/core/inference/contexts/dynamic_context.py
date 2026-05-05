@@ -958,11 +958,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # staging slots here are refreshed each step by copying the active
         # slice from the persistent `request_*` tensors above.
         #
-        # `request_query_lengths` and `active_request_last_token_idxs` reserve
-        # one extra trailing slot at index `max_requests` used as a sentinel by
-        # `LogProbsPrefill.indexing_kernel` (`nonzero_static(...,
-        # fill_value=max_requests)`); the trailing slot of `request_query_lengths`
-        # stays at zero (never written), and the trailing slot of
+        # `request_query_lengths` and `active_request_last_token_idxs` reserve one extra trailing
+        # slot at index `max_requests` to be used as a sentinel by the log probs kernels.
         # `active_request_last_token_idxs` is set each step in `pad_active_slices`.
         _tok_int64_bytes = self.max_tokens * 8
         _tok_int32_bytes = self.max_tokens * 4
@@ -1067,10 +1064,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             _off : _off + _req_4byte_bytes
         ].view(torch.int32)
         _off += _req_4byte_bytes
-        # `_staging_request_query_lengths` has one extra trailing slot at index
-        # `max_requests`; it stays at zero (initial buffer fill_(0), never written
-        # by transfer_bookkeeping_to_gpu) so `LogProbsPrefill.indexing_kernel` can
-        # index it via the `nonzero_static(..., fill_value=max_requests)` sentinel.
+        # `_staging_request_query_lengths` has one extra trailing slot at index `max_requests`;
+        # to be used as a sentinel by the log probs kernels.
         self._staging_request_query_lengths = self._cpu_bookkeeping_buf[
             _off : _off + _req_4byte_with_sentinel_bytes
         ].view(torch.int32)
@@ -1098,9 +1093,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-request last-token row indices. Aliased with the matching gpu_view slot:
         # build_active_slices/pad_active_slices populate this CPU view.
-        # Has one extra trailing slot at index `max_requests` used as the
-        # sentinel-row target for `LogProbsPrefill.indexing_kernel`. The slot is
-        # set each step in `pad_active_slices`.
+        # Has one extra trailing slot at index `max_requests` used as a sentinel.
         self.active_request_last_token_idxs = self._cpu_bookkeeping_buf[
             _off : _off + _req_4byte_with_sentinel_bytes
         ].view(torch.int32)
@@ -1115,10 +1108,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
-        # GPU mirror of `active_request_metadata["return_log_probs"]`, refreshed
-        # in `transfer_bookkeeping_to_gpu`. Used by `LogProbsPrefill`/`LogProbsDecode`
-        # /`LogProbsSpeculative` indexing kernels (`nonzero_static` requires a
-        # GPU mask for graph capture). Stable address; never reallocated.
+        # GPU mirror of `active_request_metadata["return_log_probs"]`,
+        # refreshed in `transfer_bookkeeping_to_gpu`.
         self.gpu_return_log_probs_mask = torch.zeros(
             self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
         )
@@ -1462,15 +1453,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
         # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
         self.active_request_last_token_idxs[padding_request_slice].fill_(0)
-        # Padded slots must opt out of log-prob computation; LogProbsPrefill.indexing_kernel
-        # gathers `request_indices` from this mask.
+        # Padded slots must opt out of log-prob computation.
         self.active_request_metadata["return_log_probs"][padding_request_slice] = False
 
         # `active_request_last_token_idxs` reserves a permanent sentinel slot at
-        # index `max_requests` (size is `max_requests + 1`). LogProbsPrefill.indexing_kernel
-        # uses `nonzero_static(..., fill_value=max_requests)` and reads at that slot;
-        # the value `padded_active_token_count - 1` lets the slack-absorbing math
-        # produce in-range logit indices for filler rows.
+        # index `max_requests` (size is `max_requests + 1`).
         self.active_request_last_token_idxs[self.max_requests] = self.padded_active_token_count - 1
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
@@ -2352,9 +2339,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 8 redundant launch overheads vs. the prior per-field copies.
         self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
 
-        # `return_log_probs` is bool (1 byte per slot, doesn't share the int32-
-        # aligned coalesced buffer). Refresh the dedicated GPU bool mirror used
-        # by the log-prob indexing kernels.
+        # `return_log_probs` is bool (1 byte per slot, doesn't share the int32-aligned buffer).
         self.gpu_return_log_probs_mask[:padded_active].copy_(
             self.active_request_metadata["return_log_probs"][:padded_active], non_blocking=True
         )
@@ -2516,16 +2501,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 return self.padded_active_request_count
             else:
                 return self.total_request_count - self.paused_request_count
-
-    @property
-    def padded_num_last_token_logits(self) -> int:
-        """Graph-invariant padded version of `num_last_token_logits`."""
-        if self.num_speculative_tokens > 0:
-            return (
-                self.padded_batch_dimensions.decode_req_count * (self.num_speculative_tokens + 1)
-                + self.padded_batch_dimensions.prefill_req_count
-            )
-        return self.padded_active_request_count
 
     def last_token_logits(self, logits: Tensor) -> Tensor:
         """Select the logit positions needed for token generation.
