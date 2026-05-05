@@ -773,6 +773,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and not isinstance(self.mlp, IdentityOp)
             and not self.config.transformer_impl == "inference_optimized"
         )
+        should_chunk_mlp_for_training = (
+            self.config.mlp_chunks_for_training > 1
+            and inference_context is None
+            and self.training
+            and not isinstance(self.mlp, IdentityOp)
+        )
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -797,9 +803,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     False,
                     pre_mlp_layernorm_output,
                 )
-        elif should_chunk_mlp_for_prefill:
+        elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
             # Chunk input along sequence dimension
-            num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
+            num_chunks = min(
+                (
+                    self.config.mlp_chunks_for_prefill
+                    if should_chunk_mlp_for_prefill
+                    else self.config.mlp_chunks_for_training
+                ),
+                pre_mlp_layernorm_output.shape[0],
+            )
+
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
 
             # Compute outputs for each chunk
@@ -808,7 +822,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # Aggregate chunk outputs
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
             bias_chunks = [bias for _, bias in outputs if bias is not None]
-            bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
+            # elements in bias_chunks are the same for all chunks, so we can just use the first one
+            bias_output = bias_chunks[0] if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
             if using_fused_tp_inference_kernel:
