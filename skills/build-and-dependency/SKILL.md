@@ -1,8 +1,7 @@
 ---
 name: build-and-dependency
-description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, updating uv.lock, and linting.
-TRIGGER when: user asks to add, remove, or update a dependency; user edits or asks about pyproject.toml or uv.lock; uv.lock has a merge conflict; user asks to set up a dev environment or pull/build the CI container; user hits a container build error or uv error; user asks to run linting or autoformat.
-DO NOT TRIGGER when: user is only running tests, investigating CI failures, or opening a PR (use ci-test-system instead).
+description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, and updating uv.lock.
+when_to_use: Adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'ModuleNotFoundError'.
 ---
 
 # Build & Dependency Guide
@@ -28,12 +27,30 @@ dependency.
 
 ---
 
+## dev vs lts
+
+Two image variants exist, controlled by the `IMAGE_TYPE` build arg and the
+`container::lts` PR label:
+
+| Variant | Base image pin | uv group | When used |
+|---------|---------------|----------|-----------|
+| **`dev`** | `docker/.ngc_version.dev` | `dev` | Default — CI, local development, most PRs |
+| **`lts`** | `docker/.ngc_version.lts` | `lts` | Stability testing; excludes ModelOpt and other bleeding-edge extras |
+
+**Use `dev` for everything unless you have a specific reason to test `lts`.**
+CI runs `dev` by default; attach `container::lts` to a PR only when verifying
+compatibility with the stable stack (e.g. a dependency upgrade that must not
+break LTS users). The `@pytest.mark.flaky_in_dev` marker skips tests in the
+`dev` environment; `@pytest.mark.flaky` skips them in `lts`.
+
+---
+
 ## Step 1 — Acquire an Image
 
 **Option A — NVIDIA-internal: pull a CI-built image**
 
 > ⚠️ Requires access to the internal GitLab instance.
-> See `tools/trigger_internal_ci.md` for setup (adding the git remote, obtaining a token).
+> See @tools/trigger_internal_ci.md for setup (adding the git remote, obtaining a token).
 
 The internal GitLab CI publishes images to its container registry.
 Derive the registry host from your configured `gitlab` remote — the same
@@ -180,25 +197,6 @@ uv lock                               # re-resolve on top of your pyproject.toml
 
 ---
 
-## Linting
-
-Run before opening a PR:
-
-```bash
-# Check mode (no changes applied)
-BASE_REF=main CHECK_ONLY=true SKIP_DOCS=false bash tools/autoformat.sh
-
-# Fix mode
-BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh
-```
-
-Tools invoked: `black`, `isort`, `pylint`, `ruff`, `mypy`.
-
-After editing imports in any Python files, always run `uv run isort` on those
-files before committing (repo CLAUDE.md requirement).
-
----
-
 ## Common Pitfalls
 
 | Problem | Cause | Fix |
@@ -207,6 +205,5 @@ files before committing (repo CLAUDE.md requirement).
 | `ModuleNotFoundError` after pip install | pip installed outside the uv-managed venv | Use `uv add` and `uv sync`, never bare `pip install` |
 | `uv: command not found` inside container | Wrong container image | Use the `megatron-lm` image built from `Dockerfile.ci.dev` |
 | `No space left on device` during uv ops | Cache fills container's `/root/.cache/` | Mount a host cache dir via `-v $HOME/.cache/uv:/root/.cache/uv` |
-| Pre-commit fails with linting errors | Code style violations | Run `BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh` |
 | `docker build` fails with secret-related error | `Dockerfile.ci.dev` has a `jet` stage that requires an internal secret | Add `--target main` to stop before the `jet` stage |
 | `access forbidden` when pulling | Registry URL includes an explicit port (e.g. `:5005`) | Use `${GITLAB_HOST}/adlr/...` with no port — the sed extracts the hostname only |
