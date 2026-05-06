@@ -598,11 +598,7 @@ def vllm_fused_moe(
     config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
 
     sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
-        routing_map,
-        config['BLOCK_SIZE_M'],
-        num_local_experts,
-        local_expert_start,
-        valid_tokens,
+        routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
     )
     num_valid = max_tokens * topk
 
