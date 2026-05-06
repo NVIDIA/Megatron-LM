@@ -250,8 +250,21 @@ The CODEOWNERS check is a HARD abort — never push if it fails.
 
 ### Commit and Push
 
-After the pre-push invariant checks pass, commit everything and push
-the branch.
+Phase 1 produces a single commit on the sync branch. The merge itself
+creates the merge commit; fold any post-merge work (formatting,
+conflict surgery, restored files, regenerated `uv.lock`) into it
+rather than stacking a second commit:
+
+```bash
+git add -A
+git commit --amend --no-edit  # rewrites the merge commit's tree;
+                              # parents are preserved.
+git push -u origin "$BRANCH"  # only non-force push of the run.
+```
+
+Once pushed, this commit is immutable for the rest of the run.
+Phase 3 fixes go into a separate rolling fix commit on top (see
+Phase 3 step 4 and the two-commit policy in Rules).
 
 ---
 
@@ -418,10 +431,28 @@ does NOT show.
    track of the loop state.
 
 4. Read the tool output:
-   - If `RESULT=FAILURE`: use `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs`
-     (or the equivalent for external contexts) to diagnose, fix the code,
-     commit, push. Then start a NEW outer-loop iteration at step 1 with
-     the new HEAD SHA.
+   - If `RESULT=FAILURE`: diagnose via
+     `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs` (or the
+     external-context equivalent) and fix the code. The Phase 1
+     commit is immutable; fixes accumulate in a single rolling fix
+     commit on top of it:
+     ```bash
+     git add -A
+     if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+       # HEAD has two parents → still the Phase 1 merge commit.
+       # First failure of this run: create the fix commit.
+       git commit -m "fix: post-CI corrections"
+       git push origin "$BRANCH"
+     else
+       # HEAD is the existing fix commit → amend it.
+       git commit --amend --no-edit
+       git push --force-with-lease origin "$BRANCH"
+     fi
+     ```
+     `--force-with-lease` (not `--force`): if a human pushed onto the
+     branch since the bot last fetched, the lease aborts the push
+     instead of clobbering them — fetch and decide what to do.
+     Start a new outer-loop iteration at step 1 with the new HEAD SHA.
    - If `RESULT=GREEN`: outer loop is done. Proceed to Phase 4.
 
 **Why not wait-for-run-to-register first?** `gh pr comment` with
@@ -561,6 +592,13 @@ comment should include:
 
 - Prioritize main over dev on genuine conflicts. Preserve dev-only additions
   that do not conflict.
+- **Two-commit policy:** the PR contains at most two bot-authored
+  commits — the Phase 1 merge commit (immutable once pushed) and a
+  single rolling fix commit on top. The fix commit is created on
+  the first Phase 3 failure (normal push) and amended on every
+  subsequent failure (`git commit --amend --no-edit` +
+  `git push --force-with-lease`). Never modify the Phase 1 commit
+  after pushing it; never let the fix-commit count exceed one.
 - CI triggers via comment: `/ok to test <sha>`
 - CI runs appear on branch `pull-request/<PR_NUMBER>`
 - Git committer identity: `svcnvidia-nemo-ci`
