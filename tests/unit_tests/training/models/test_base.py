@@ -8,7 +8,6 @@ import pytest
 
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 
-
 # ---------------------------------------------------------------------------
 # Dummy concrete implementations
 # ---------------------------------------------------------------------------

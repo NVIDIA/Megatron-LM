@@ -17,8 +17,8 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 import torch.nn as nn
-from megatron.core.enums import ModelType
 
+from megatron.core.enums import ModelType
 from megatron.training.models.dist_utils import (
     _ddp_wrap,
     _print_num_params,
@@ -27,7 +27,6 @@ from megatron.training.models.dist_utils import (
     to_empty_if_meta_device,
     unimodal_build_distributed_models,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
