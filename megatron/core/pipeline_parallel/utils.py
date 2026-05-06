@@ -456,12 +456,11 @@ class ScheduleNode:
                 # Note: unlike the eager path, we do NOT check manual_release_grads here.  
                 # That flag suppresses resize_(0) for per-scope CG (e.g. CudaGraphScope.attn),  
                 # but during full-iteration capture we must reclaim memory in the private pool. 
-                if not self.delay_grads_release:
-                    deferred = [g for g in output_grad if g is not None]
-                    if deferred:
-                        DeferredReleaseRegistry.get_instance().defer_release(
-                            deferred, self.event, self.stream
-                        )
+                deferred = [g for g in output_grad if g is not None]
+                if deferred:
+                    DeferredReleaseRegistry.get_instance().defer_release(
+                        deferred, self.event, self.stream
+                    )
             else:
                 for g in output_grad:
                     if g is not None:
