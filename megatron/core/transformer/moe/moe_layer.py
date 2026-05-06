@@ -573,7 +573,10 @@ class MoELayer(BaseMoELayer):
 
         if shared_expert_output is not None:
             output = output + shared_expert_output
-        elif self._latent_shared_expert_output is not None:
+        elif (
+            isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
+            and self._latent_shared_expert_output is not None
+        ):
             # This codepath is for inference-only shared-expert overlap of latent MoEs.
             # Must happen post-fc2_latent_proj so dimensions match.
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
