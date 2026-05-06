@@ -184,7 +184,62 @@ The tractable-without-GPU subset is small. This pass writes tests for all such f
 - **`text_generation_server/dynamic_text_gen_server/endpoints/*.py` (~600 stmts)** — Quart HTTP endpoints. Testing requires an ASGI test client plus a live `InferenceClient`. Practical via `quart.testing` but each endpoint then needs the full inference coordinator running, which is beyond unit-test scope.
 - **`text_generation_server/text_generation_server.py` (152), `dynamic_text_gen_server/text_generation_server.py` (114), `tokenization.py` files** — All entry-point glue that wires Quart + tokenizer + InferenceClient together. Not tractable without bringing up the full server.
 
-## Combined Final Summary (top-level + subdirectory pass)
+---
+
+# GPU-Required Pass (Round 3)
+
+After the user authorized GPU-using tests on the cw-dfw cluster, we picked up files that
+need `torch.cuda.current_device()`, real CUDA tensors, or HTTP test clients.
+
+## Files Targeted (Round 3)
+
+| File | Before | After | Stmts/Miss | Test File |
+|------|--------|-------|------------|-----------|
+| `contexts/routing_metadata.py` | 26% | **100%** | 35/0 | `contexts/test_routing_metadata.py` |
+| `contexts/attention_context/mha_metadata.py` | 32% | **100%** | 28/0 | `contexts/attention_metadata/test_mha_metadata.py` |
+| `contexts/static_context.py` | 24% | **69%** | 51/16 | `contexts/test_static_context.py` |
+| `text_generation_controllers/encoder_decoder_*.py` | 0% | **100%** | 12/0 | `text_generation_controllers/test_encoder_decoder_and_vlm_controllers.py` |
+| `text_generation_controllers/vlm_*.py` | 0% | **100%** | 14/0 | (same file) |
+| `text_generation_server/dynamic_text_gen_server/endpoints/common.py` | 0% | **100%** | 7/0 | `text_generation_server/dynamic_text_gen_server/endpoints/test_common.py` |
+| `text_generation_server/dynamic_text_gen_server/endpoints/health.py` | 0% | **91%** | 23/2 | `text_generation_server/dynamic_text_gen_server/endpoints/test_health.py` |
+| `text_generation_server/tokenization.py` | 0% | **58%** | 38/16 | `text_generation_server/test_tokenization.py` |
+| `text_generation_server/dynamic_text_gen_server/tokenization.py` | 0% | **50%** | 38/19 | `text_generation_server/dynamic_text_gen_server/test_dynamic_tokenization.py` |
+| `quantization/utils.py` | 18% | **36%** | 129/82 | `quantization/test_utils.py` |
+
+**60 new tests, 0 failures.** Validation run: `c79dc681e9e1412cbde67fade8a46e70`.
+
+## Round 3 Per-File Notes
+
+### contexts/static_context.py (69%)
+
+- Missing lines 73, 85-119 are `__str__` and `__eq__` — both reference
+  `self.materialize_only_last_token_logits` which is on `self.config`, not on the context.
+  The methods would `AttributeError` if called on an in-spec context. Likely-buggy code;
+  not covered until the source is fixed.
+
+### text_generation_server/{,dynamic_text_gen_server/}tokenization.py (58% / 50%)
+
+- The public `tokenize_prompts` function (lines 22-67) requires `torch.distributed`
+  to be initialised so `broadcast_int_list` / `broadcast_tensor` can run. We test the
+  internal `_tokenize_prompts_and_batch` helper exhaustively (all eod/eos/no-token branches,
+  add_BOS, padding lengths). The broadcast wrapper is covered by existing functional tests
+  that bring up a ProcessGroup.
+
+### text_generation_server/dynamic_text_gen_server/endpoints/health.py (91%)
+
+- Missing lines 37-38 are the `except ImportError` branch for quart. With quart installed
+  in the run's venv (now part of the install line), this branch is unreachable.
+
+### quantization/utils.py (36%)
+
+- Tested all CPU-tractable predicates: `_should_quantize_param` (5 input cases), `_to_bf16`
+  (TE / wrapped TE / plain), `collect_mxfp8_param_metadata` (empty model + plain + TE param).
+  Missing lines (164-210, 222-236, 245-264) are the actual quantization paths
+  (`quantize_params_to_mxfp8`, `_mm_mxfp8_flashinfer`, `_mm_mxfp8_torch`, `mm_mxfp8`) which
+  call into FlashInfer / `torch.nn.functional.scaled_mm` and need bf16 → mxfp8 round-tripping
+  on real CUDA. Out of scope for unit tests.
+
+## Combined Final Summary (top-level + subdirectory + GPU passes)
 
 | File | Baseline | Final | Delta |
 |------|----------|-------|-------|
@@ -198,10 +253,20 @@ The tractable-without-GPU subset is small. This pass writes tests for all such f
 | engines/mcore_engine.py | 0% | **100%** | +100% |
 | contexts/base_context.py | 53% | **95%** | +42% |
 | contexts/attention_context/metadata_base.py | 29% | **100%** | +71% |
+| contexts/routing_metadata.py | 26% | **100%** | +74% |
+| contexts/attention_context/mha_metadata.py | 32% | **100%** | +68% |
+| contexts/static_context.py | 24% | **69%** | +45% |
 | quantization/mxfp8_tensor.py | 49% | **76%** | +27% |
+| quantization/utils.py | 18% | **36%** | +18% |
 | sampling/base.py | 0% | **100%** | +100% |
+| text_generation_controllers/encoder_decoder_*.py | 0% | **100%** | +100% |
+| text_generation_controllers/vlm_*.py | 0% | **100%** | +100% |
+| text_generation_server/tokenization.py | 0% | **58%** | +58% |
+| text_generation_server/dynamic_text_gen_server/tokenization.py | 0% | **50%** | +50% |
+| text_generation_server/dynamic_text_gen_server/endpoints/common.py | 0% | **100%** | +100% |
+| text_generation_server/dynamic_text_gen_server/endpoints/health.py | 0% | **91%** | +91% |
 
-**Total across both passes: 12 source files brought to 76–100 % coverage, 156 new test cases, 11 new test files, 0 final failures.**
+**Across all three passes: 22 source files brought to 36–100 % coverage, ~216 new test cases, 19 new test files, 0 final failures.**
 
 ## Learnings Fed Back
 
