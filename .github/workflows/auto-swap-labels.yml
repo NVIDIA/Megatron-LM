@@ -32,7 +32,7 @@ jobs:
         id: get-pr
         if: github.event_name == 'workflow_run'
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: pr-number
           path: pr-number
