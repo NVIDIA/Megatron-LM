@@ -1207,15 +1207,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._total_request_count_gpu = self._context_op_metadata_gpu[4:5]
         self._paused_request_count_gpu = self._context_op_metadata_gpu[5:6]
 
-        # Staleness flag for the CPU counter mirrors. Set True at the end of
-        # ``_finalize_update_requests`` because graph 2 advanced the GPU
-        # bridge scalars (via ``_writeback_gpu_count_mirrors``) without
-        # touching the CPU mirrors. Cleared by ``sync_counters_to_cpu`` (does
-        # the D2H), by ``add_request`` and ``reset_metadata`` (which keep
-        # both sides in sync). The flag dedups back-to-back sync calls in
-        # the engine loop — typically ``has_unfinished_requests`` (between
-        # steps) and ``prepare_attn_init`` (start of step) both want fresh
-        # mirrors but only one of them needs to do the actual D2H.
+        # Slot index of the chunked-prefill request as a GPU scalar. Maintained
+        # by the ``chunked_prefill_request_id`` property setter (records the
+        # just-admitted slot or -1 on clear) and by
+        # ``_graphed_chunked_positioning`` (writes the post-permutation slot
+        # inside the update_requests graph body). Read by
+        # ``get_index_of_chunked_prefill_request`` via a 1-int ``.item()``,
+        # replacing the prior mask + argmax search across ``request_ids``.
+        self._chunked_prefill_slot_idx_gpu = torch.full(
+            (1,), -1, dtype=torch.int64, device=gpu_device
+        )
+        # Underlying storage for the ``chunked_prefill_request_id`` property.
+        # Initialized here so the property getter works during ``__init__``
+        # before ``reset_metadata`` runs.
+        self._chunked_prefill_request_id: int = -1
+
+        # Staleness flag for the CPU counter mirrors. Set True briefly inside
+        # ``_finalize_update_requests`` (after graph 2 advances the GPU bridge
+        # scalars via ``_writeback_gpu_count_mirrors``) and cleared by the
+        # ``sync_counters_to_cpu`` call at the tail of finalize itself.
+        # ``add_request`` and ``reset_metadata`` keep mirror and bridge in
+        # lockstep without touching the flag. The flag remains so that any
+        # path which doesn't go through finalize (e.g. an admission via
+        # ``check_availability`` after a finalize that was somehow skipped)
+        # can still trigger a refresh via the dedup short-circuit.
         self._counters_stale = False
 
         # Latest finalize-step output counts, populated by ``sync_counters_to_cpu``
@@ -1412,14 +1427,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
     def has_unfinished_requests(self) -> bool:
-        """Test if any requests remain."""
-        # Refresh from the GPU bridge scalars before reading. The engine's
-        # main loop calls this between steps to decide whether to call
-        # ``step_modern`` again; without the sync, a stale mirror would loop
-        # forever after a step that finished all requests (graph 2 wrote
-        # ``_total_request_count_gpu = 0`` but ``_finalize_update_requests``
-        # no longer mirrors that to the CPU side).
-        self.sync_counters_to_cpu()
+        """Test if any requests remain.
+
+        The CPU mirror is always fresh at this call site:
+        :meth:`_finalize_update_requests` ends every step with its own
+        :meth:`sync_counters_to_cpu`, and :meth:`add_request` /
+        :meth:`reset_metadata` keep mirror and GPU bridge scalar in
+        lockstep. No defensive sync is needed here.
+        """
         return self.total_request_count > 0
 
     def cu_query_lengths(self) -> Tuple[Tensor, int]:
@@ -2195,14 +2210,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         bucket was found and the controller will fall back to a single-token
         eager forward.
         """
-        # Refresh CPU counter mirrors from the GPU bridge scalars. The
-        # previous step's ``_finalize_update_requests`` deliberately left the
-        # mirrors stale; we sync here because cuda-graph dimension matching
-        # below needs Python ints (``self.active_token_count``,
-        # ``self.num_decode_requests``, ``self.total_request_count``, ...)
-        # one D2H, vs. the mirror writes the previous version did at the end
-        # of finalize.
-        self.sync_counters_to_cpu()
+        # CPU mirrors are kept fresh by ``_finalize_update_requests``'s
+        # tail ``sync_counters_to_cpu`` and by ``add_request``'s lockstep
+        # writes, so no refresh is needed here — graph dimension matching
+        # below reads the mirrors directly.
 
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
@@ -3060,6 +3071,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._total_request_count_gpu.fill_(self.total_request_count)
         self._real_token_count_gpu.fill_(self.active_token_count)
 
+        # If this admission is the chunked-prefill request, snapshot its
+        # slot. Catches the case where ``chunked_prefill_request_id`` was
+        # assigned BEFORE ``add_request``: at assign time the request
+        # wasn't in ``request_ids`` yet, so the setter's search wrote -1.
+        # The post-admit graphed positioning would also fix it, but
+        # writing here keeps the mirror current for callers that read
+        # between admit and the next ``update_requests``.
+        if req.request_id == self._chunked_prefill_request_id:
+            self._chunked_prefill_slot_idx_gpu.fill_(current_id)
+
     def _permute_book_keeping_tensors(
         self, perm: Tensor, next_tokens: Tensor, target: slice = slice(None)
     ) -> None:
@@ -3174,34 +3195,70 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.num_speculative_tokens > 0 and getattr(self, "_ur", None) is not None:
             tensor_swap(self._ur.prev_last_block_ids, src_idxs, dst_idxs)
 
+    @property
+    def chunked_prefill_request_id(self) -> int:
+        """Request ID of the chunked-prefill request, or -1 if none."""
+        return self._chunked_prefill_request_id
+
+    @chunked_prefill_request_id.setter
+    def chunked_prefill_request_id(self, value: int) -> None:
+        """Set the chunked-prefill request id and mirror its slot to GPU.
+
+        Two assignment patterns are supported:
+
+        - ``= -1`` to clear; writes -1 to ``_chunked_prefill_slot_idx_gpu``.
+        - ``= req.request_id``; writes the slot of ``req`` if it is already
+          in ``request_ids``, else -1.
+
+        The engine assigns ``= req.request_id`` immediately after admitting
+        ``req`` (so the search finds it). Tests sometimes assign before
+        admitting; ``add_request`` then catches the match and writes the
+        slot when the request lands in the table. Either order leaves the
+        mirror correct.
+
+        The graph body's ``_graphed_chunked_positioning`` keeps the mirror
+        current as the per-step permutation moves the slot.
+        """
+        self._chunked_prefill_request_id = value
+        if value == -1:
+            self._chunked_prefill_slot_idx_gpu.fill_(-1)
+            return
+        # Pure GPU search — no .item() — over the whole buffer (covers both
+        # active and hidden chunked slots). Finds the request's slot if
+        # present; falls back to -1 otherwise.
+        mask = self.request_ids == value
+        has_any = mask.any()
+        first = mask.to(torch.int32).argmax().to(torch.int64)
+        slot = torch.where(has_any, first, torch.full_like(first, -1))
+        self._chunked_prefill_slot_idx_gpu.copy_(slot.view(1))
+
     def get_index_of_chunked_prefill_request(self, safe: bool = True) -> int:
         """Get the slot index of the chunked prefill request.
 
-        If ``safe`` is True, only ``request_ids[:total_request_count]`` is
-        searched; a hidden chunked request (past the boundary) returns -1.
-        Otherwise the search covers the full ``[0, max_requests)`` range.
+        Reads the maintained ``_chunked_prefill_slot_idx_gpu`` via a single
+        1-int ``.item()`` — replaces the prior mask + argmax search across
+        ``request_ids``. The mirror is updated by the
+        :attr:`chunked_prefill_request_id` setter (on admission/clear) and by
+        :meth:`_graphed_chunked_positioning` (post-permutation, inside the
+        update_requests graph body).
 
-        Uses a single ``.item()`` CPU sync via the any+argmax shape-stable
-        pattern (no variable-length intermediates).
+        When ``safe`` is True a slot at or past ``total_request_count``
+        (i.e. in the hidden tail after positioning) is reported as -1, matching
+        the prior search-based behavior of restricting to
+        ``request_ids[:total_request_count]``.
 
         Returns:
             (int) Slot index of the chunked prefill request, or -1 if none
-            exists in the searched range.
+            exists (or, with ``safe=True``, if the slot is hidden).
         """
-        if self.chunked_prefill_request_id == -1:
+        if self._chunked_prefill_request_id == -1:
             return -1
-
-        request_ids = self.request_ids
-        if safe:
-            request_ids = request_ids[: self.total_request_count]
-
-        mask = request_ids == self.chunked_prefill_request_id
-        any_match = mask.any()
-        # argmax on a bool/int tensor returns the index of the first True
-        # (or 0 if all False); disambiguate via where against a -1 sentinel.
-        first_match = mask.to(torch.int32).argmax()
-        idx_gpu = torch.where(any_match, first_match, torch.full_like(first_match, -1))
-        return int(idx_gpu.item())
+        slot = int(self._chunked_prefill_slot_idx_gpu.item())
+        if slot < 0:
+            return -1
+        if safe and slot >= self.total_request_count:
+            return -1
+        return slot
 
     def is_chunked_prefill_enabled(self) -> bool:
         """Returns whether chunked prefill is enabled."""
@@ -3632,6 +3689,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         sub = is_active_chunked.to(torch.int64).view(1)
         self._ur.new_total_gpu.sub_(sub)
         self._ur.new_active_gpu.sub_(sub)
+
+        # Mirror the post-positioning slot into ``_chunked_prefill_slot_idx_gpu``
+        # so out-of-graph callers (``get_index_of_chunked_prefill_request``)
+        # can read it with a 1-int ``.item()``. After this body the chunked
+        # request — when one exists — sits at ``new_total_gpu`` (post-decrement
+        # for case 1, unchanged for case 2). Use ``has_any`` to distinguish
+        # "no chunked" (-1) from a real slot.
+        post_slot = torch.where(
+            has_any,
+            self._ur.new_total_gpu.view(()),
+            torch.full_like(self._ur.new_total_gpu.view(()), -1),
+        )
+        self._chunked_prefill_slot_idx_gpu.copy_(post_slot.view(1))
 
     def _graphed_eviction_body(self) -> None:
         """Graph-safe eviction: masked no-op when there is no overflow.
