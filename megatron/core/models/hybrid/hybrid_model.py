@@ -62,16 +62,32 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             :class:`HybridModelConfig` (recipe path — the recipe is the
             single source of truth for everything except construction-time
             concerns like ``pg_collection`` and ``vp_stage``) or a stack-
-            level :class:`TransformerConfig` (legacy path).
+            level :class:`TransformerConfig` (legacy path). When a
+            :class:`HybridModelConfig` is passed, the architecture / loss
+            / position-embedding kwargs below (``vocab_size``,
+            ``max_sequence_length``, ``position_embedding_type``,
+            ``rotary_percent``, ``rotary_base``,
+            ``scatter_embedding_sequence_parallel``,
+            ``seq_len_interpolation_factor``, ``fp16_lm_cross_entropy``,
+            ``parallel_output``, ``share_embeddings_and_output_weights``)
+            are read from the recipe's
+            :class:`EmbeddingLayerConfig` / :class:`CrossEntropyLayerConfig`
+            markers and the recipe's
+            ``untie_embeddings_and_output_weights`` field; any explicit
+            values passed alongside a recipe are silently overridden.
         hybrid_stack_spec (ModuleSpec, optional): Module specs for the
             various layer types. Required on the legacy string-pattern path.
             On the recipe path, defaults to the production
             ``hybrid_stack_spec`` in
             :mod:`megatron.core.models.hybrid.hybrid_layer_specs` when not
             supplied.
-        vocab_size (int): Vocabulary size (legacy path).
-        max_sequence_length (int): maximum size of sequence (legacy path).
-            This is used for positional embedding.
+        vocab_size (int): Vocabulary size. Legacy path only — on the
+            recipe path the value comes from
+            ``recipe.embedding_marker.vocab_size``.
+        max_sequence_length (int): Maximum size of sequence used for
+            positional embedding. Legacy path only — on the recipe path
+            the value comes from
+            ``recipe.embedding_marker.max_sequence_length``.
         hybrid_layer_pattern (str): Legacy string-pattern path. Unified
             hybrid layer pattern with optional MTP and pipeline stage
             boundaries.
@@ -94,20 +110,29 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             (used with pipeline parallelism). Defaults to True.
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
-        fp16_lm_cross_entropy (bool, optional): Defaults to False.
+        fp16_lm_cross_entropy (bool, optional): Defaults to False. Legacy path only — on
+            the recipe path the value comes from ``recipe.loss_marker.fp16_lm_cross_entropy``.
         parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor
-            parallel ranks. Defaults to True.
+            parallel ranks. Defaults to True. Legacy path only — on the recipe path the
+            value comes from ``recipe.loss_marker.parallel_output``.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
-            output logit weights are shared. Defaults to False.
+            output logit weights are shared. Defaults to False. Legacy path only — on the
+            recipe path the value is derived as
+            ``not recipe.untie_embeddings_and_output_weights``.
         position_embedding_type (Literal[learned_absolute,rope,yarn,none], optional):  Position
-            embedding type. Defaults to 'none'.
+            embedding type. Defaults to 'none'. Legacy path only — on the recipe path the
+            value comes from ``recipe.embedding_marker.position_embedding_type``.
         rotary_percent (float, optional): Percent of rotary dimension to use for rotary position
             embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
+            Legacy path only — on the recipe path the value comes from
+            ``recipe.embedding_marker.rotary_percent``.
         rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless
-            position_embedding_type is 'rope'. Defaults to 10000.
+            position_embedding_type is 'rope'. Defaults to 10000. Legacy path only — on
+            the recipe path the value comes from ``recipe.embedding_marker.rotary_base``.
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
-             Defaults to None.
+             Defaults to None. Legacy path only — on the recipe path the value comes from
+             ``recipe.embedding_marker.seq_len_interpolation_factor``.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
         vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
     """
@@ -289,11 +314,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if recipe_path:
             # Recipe path: per-layer symbols and configs were lowered from
-            # HybridModelConfig by from_recipe(). Pipeline parallelism and
-            # MTP are not part of the recipe DSL — recipes that need either
-            # must use the legacy hybrid_layer_pattern string DSL. The PP > 1
-            # check below catches launcher/CLI mismatches where a PP group
-            # was constructed despite the recipe being PP-free.
+            # HybridModelConfig by the recipe-dispatch block above (when
+            # ``config`` was a HybridModelConfig). Pipeline parallelism
+            # and MTP are not part of the recipe DSL — recipes that need
+            # either must use the legacy hybrid_layer_pattern string DSL.
+            # The PP > 1 check below catches launcher/CLI mismatches
+            # where a PP group was constructed despite the recipe being
+            # PP-free.
             pp_size = (
                 torch.distributed.get_world_size(self.pg_collection.pp)
                 if self.pg_collection.pp is not None
@@ -580,7 +607,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
-        is_spec_decode: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -672,12 +698,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Check if speculative decoding is active. When it is, MTP must be
         # computed *after* verification so that it is conditioned on verified
         # tokens rather than stale speculative tokens from the previous step.
-        if is_spec_decode is None:
-            is_spec_decode = (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
-            )
+        is_spec_decode = (
+            in_inference_mode
+            and inference_context.is_dynamic_batching()
+            and inference_context.num_speculative_tokens > 0
+        )
 
         mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
         if mtp_forward_ran:
