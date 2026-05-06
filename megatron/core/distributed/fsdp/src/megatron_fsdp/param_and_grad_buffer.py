@@ -2777,14 +2777,39 @@ class ParamAndGradBuffer:
         """
         Zero out the underlying grad_buffer and reset all buckets in preparation
         for the next iteration of training.
+
+        Gradient shards that are not views of Megatron-FSDP sharded gradient buffers
+        will be dereferenced to free memory. Dereferencing is not compatible with
+        CUDA graphability, because we need to preserve this reference to sharded
+        gradients generated during CUDA graph replay (`setattr` in `update_main_grads`
+        is not executed during replay). Because decoupled gradients are never casted
+        and remain a view of the sharded gradient buffer, using a precision-aware
+        optimizer (i.e. `megatron_fsdp_use_decoupled_grad=True`) is CUDA-graphable.
         """
         for name, param in self.optimizer_named_parameters:
-            param.grad = None
-            if hasattr(param, "decoupled_grad"):
+            if (
+                hasattr(param, "grad")
+                and isinstance(param.grad, DTensor)
+                and param.grad._local_tensor._base is None
+            ):
+                # NOTE: Only when param.dtype != group.main_grad_buffer.dtype.
+                param.grad = None
+            if (
+                hasattr(param, "decoupled_grad")
+                and isinstance(param.decoupled_grad, DTensor)
+                and param.decoupled_grad._local_tensor._base is None
+            ):
+                # NOTE: Decoupled gradients should always be a view of Megatron-FSDP buffers.
                 param.decoupled_grad = None
-            if name in self.dist_main_grad:
+            if (
+                name in self.dist_main_grad
+                and self.dist_main_grad[name]._local_tensor._base is None
+            ):
+                # NOTE: Either param.grad or param.decoupled_grad.
                 self.dist_main_grad[name]._local_tensor = None
 
+        # Zero the Megatron-FSDP sharded gradient buffer. If param.grad or param.decoupled_grad
+        # is a view of this buffer, they will be zero'd as well.
         for group in self.parameter_groups:
             if group.main_grad_buffer:
                 group.main_grad_buffer.data.zero_()
@@ -2923,11 +2948,6 @@ class ParamAndGradBuffer:
         from the main gradient buffer. If the model parameters are sharded,
         we only need to update the gradient shard associated with the model
         parameter shard, as both are sharded symmetrically.
-
-        Checks if high-precision main weights are utilized for optimization.
-        Otherwise, falls back to low-precision model weights, and further
-        falls back to the original module parameters not managed by cFSDP
-        in the case of no sharding / cFSDP OFF.
         """
         for name, param in self.optimizer_named_parameters:
             orig_param = param.orig_param
@@ -2948,11 +2968,11 @@ class ParamAndGradBuffer:
             optimizer_grad = group.main_grad_buffer.get_item(
                 item_id, only_shard=sharded_optimizer_state
             )
-            if group.main_weight_buffer is not None:
-                if not self.use_decoupled_grad:
-                    # Convert the gradient to the main weight buffer dtype.
-                    # TODO(@cspades): Why this is necessary? Casted below.
-                    optimizer_grad = optimizer_grad.to(param.dtype)
+            if group.main_weight_buffer is not None and not self.use_decoupled_grad:
+                # Convert the gradient to the main weight data-type for optimization.
+                # Not needed for decoupled gradients, because the precision-aware
+                # optimizer can apply gradients to parameters of different precision!
+                optimizer_grad = optimizer_grad.to(param.dtype)
 
             if name not in self.dist_main_grad:
                 # Register the gradient as a distributed tensor.
@@ -2981,7 +3001,7 @@ class ParamAndGradBuffer:
                 setattr(param, "decoupled_grad", grad)
             else:
                 # Attach the gradient to the optimizer parameter.
-                setattr(param, "grad", grad.to(param.dtype) if grad is not None else None)
+                setattr(param, "grad", grad)
 
     @property
     def num_buckets(self):
