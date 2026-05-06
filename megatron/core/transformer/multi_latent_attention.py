@@ -686,7 +686,7 @@ class MLASelfAttention(MultiLatentAttention):
 
         backend = get_backend(self.config.transformer_impl)
         qk_norm_impl = backend.layer_norm(
-            rms_norm=self.config.normalization == 'RMSNorm', for_qk=True
+            rms_norm=self.config.normalization == "RMSNorm", for_qk=True
         )
         # Unfused linear layer
         linear_impl = backend.column_parallel_linear()
