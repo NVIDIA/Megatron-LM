@@ -841,6 +841,35 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return output
         return output.transpose(0, 1).reshape(mbs * packed_seq_params.tokens_per_sample, 1, -1)
 
+    def _run_pre_mlp_layernorm(self, hidden_states):
+        """Run pre-MLP layernorm (with optional recompute and offload), unpack a
+        tuple-output layernorm, and apply the fp32-residual cast.
+
+        Returns:
+            Tuple ``(pre_mlp_layernorm_output, residual, mlp_state)`` where
+            ``mlp_state`` is an opaque payload subclasses can use to thread
+            extra intermediates (e.g. mHC ``mlp_h_res`` / ``mlp_hc_h_post``)
+            through to ``_apply_mlp_bda_step``. Base returns ``()``.
+        """
+        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+
+        if isinstance(pre_mlp_layernorm_output, tuple):
+            if len(pre_mlp_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of pre_mlp_layernorm is a tuple, it is "
+                    f"expected to have 2 elements (output, residual), but "
+                    f"got {len(pre_mlp_layernorm_output)}"
+                )
+            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+        else:
+            # Residual connection.
+            residual = hidden_states
+
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
+
+        return pre_mlp_layernorm_output, residual, ()
+
     def _forward_mlp(
         self,
         hidden_states: Tensor,
@@ -864,24 +893,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
-
-        # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-
-        if isinstance(pre_mlp_layernorm_output, tuple):
-            if len(pre_mlp_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of pre_mlp_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(pre_mlp_layernorm_output)}"
-                )
-            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
-        else:
-            # Residual connection.
-            residual = hidden_states
-
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
+        pre_mlp_layernorm_output, residual, mlp_state = self._run_pre_mlp_layernorm(hidden_states)
 
         pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
             pre_mlp_layernorm_output, padding_mask, packed_seq_params
@@ -914,7 +926,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
         else:
-            return self._forward_post_mlp(mlp_output_with_bias, residual)
+            return self._apply_mlp_bda_step(mlp_output_with_bias, residual, mlp_state)
 
     def _run_mlp(
         self,
@@ -1006,15 +1018,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="mlp")
         return mlp_output_with_bias
 
-    def _forward_post_mlp(
-        self, mlp_output_with_bias: tuple[Tensor, Tensor | None], residual: Tensor
+    def _apply_mlp_bda_step(
+        self,
+        mlp_output_with_bias: tuple[Tensor, Tensor | None],
+        residual: Tensor,
+        mlp_state: tuple = (),
     ) -> Tensor:
         """
-        Perform operations after the MLP computation.
+        Perform operations after the MLP computation: bias-dropout-add for
+        the MLP output + post-step offload commit + viewless-tensor wrap.
+
+        Subclasses override this to swap in a fused kernel that consumes extra
+        intermediates threaded via ``mlp_state`` (the third element returned
+        by ``_run_pre_mlp_layernorm``). Base ignores ``mlp_state``.
 
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
+            mlp_state: Opaque payload from ``_run_pre_mlp_layernorm``. Default ``()``.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1369,10 +1390,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             nvtx_range_pop(suffix="mlp")
 
             # If we early returned, layernorm recompute hooks were attached to the output buffer
-            # of the cudagraph, so disable the recompute hooks inside _forward_post_mlp
+            # of the cudagraph, so disable the recompute hooks inside _apply_mlp_bda_step
             recompute_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm
             self.recompute_pre_mlp_layernorm = False
-            output = self._forward_post_mlp(mlp_output_with_bias, residual)
+            output = self._apply_mlp_bda_step(mlp_output_with_bias, residual)
             self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorm
         else:
             # If EP overlap is enabled, needs to return same outputs as submodule.attn
@@ -1642,7 +1663,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         # Set per-call by __call__ from kwargs so forward can read it without re-piping
         # the manager through the CUDA-graph kwarg path (CheckpointWithoutOutputManager
-        # is not a CUDA-graph-supported type and gets stripped during capture).
+        # is not a CUDA-graph-supported type and gets stripped during capture). Read by
+        # _run_input_layernorm, _apply_self_attn_bda_step, _run_pre_mlp_layernorm, and
+        # _apply_mlp_bda_step — do not delete; appears unused only at the class level.
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
     def __call__(self, *args, **kwargs):
@@ -1693,17 +1716,22 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support.
 
-        Inherits ``_forward_attention`` from base; the mHC-specific behavior
-        is contained in the ``_run_input_layernorm`` and
-        ``_apply_self_attn_bda_step`` overrides below, which read the manager
-        and the stashed h_res/h_post off ``self``.
+        Inherits ``_forward_attention`` and ``_forward_mlp`` from base; the
+        mHC-specific behavior is contained in the ``_run_input_layernorm``,
+        ``_apply_self_attn_bda_step``, ``_run_pre_mlp_layernorm``, and
+        ``_apply_mlp_bda_step`` overrides, which read the manager off
+        ``self`` and thread per-call intermediates through the
+        ``attn_state`` / ``mlp_state`` slots.
+
+        Override exists only to skip the ``enable_hyper_connections`` assert
+        on base ``TransformerLayer.forward``.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
-            mhc_recompute_manager=self._mhc_recompute_manager,
+            packed_seq_params=kwargs.get("packed_seq_params", None),
         )
         return output, context
 
@@ -1722,10 +1750,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         skeleton's ``residual`` argument, and ``(h_res, h_post)`` flows via
         ``attn_state``.
         """
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as offload_interface,
-        )
-
         # Capture the n-stream residual BEFORE self_attention_hyper_connection
         # aggregates n-stream -> single-stream. The fused bda kernel needs the
         # original n-stream tensor.
@@ -1737,6 +1761,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
 
+        self.attn_norm_manager = self.off_interface(
+            self.offload_attn_norm, hidden_states, "attn_norm"
+        )
         self._input_layernorm_checkpoint_active = self.recompute_input_layernorm or (
             self._mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
         )
@@ -1744,16 +1771,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 ckpt_manager=self._mhc_recompute_manager
             )
-            with offload_interface(
-                self.offload_attn_norm, hidden_states, "attn_norm"
-            ) as hidden_states:
+            with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     self.input_layernorm, hidden_states
                 )
         else:
-            with offload_interface(
-                self.offload_attn_norm, hidden_states, "attn_norm"
-            ) as hidden_states:
+            with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
         return input_layernorm_output, residual, (h_res, h_post)
@@ -1764,10 +1787,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         Unpacks ``h_res`` and ``h_post`` from ``attn_state`` (threaded by
         ``_run_input_layernorm`` via the base skeleton).
         """
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as offload_interface,
-        )
-
         h_res, h_post = attn_state
         nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():
@@ -1785,89 +1804,72 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # HC omits forced_released_tensors — the n-stream residual is consumed
         # by the fused kernel above, so the base class's "release residual after
         # commit" trick doesn't apply.
-        if self.offload_attn_norm:
-            hidden_states = offload_interface.group_commit(hidden_states, name="attn_norm")
+        hidden_states = self.attn_norm_manager.group_offload(hidden_states)
+        self.attn_norm_manager = None
         return hidden_states
 
-    def _forward_mlp(
-        self,
-        hidden_states,
-        inference_context=None,
-        padding_mask=None,
-        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
-    ):
-        """Forward MLP with hyper connection pre/post processing."""
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as offload_interface,
-        )
+    def _run_pre_mlp_layernorm(self, hidden_states):
+        """HC pre-mlp layernorm: hyper-connection pre-wrap + mHC-aware checkpoint.
 
-        is_last_in_recompute_block = bool(
-            mhc_recompute_manager is not None
-            and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
-        )
-        mhc_mlp_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
+        Threads ``mlp_h_res`` and ``mlp_hc_h_post`` (produced by the
+        hyper-connection pre-wrap) to ``_apply_mlp_bda_step`` via the
+        ``mlp_state`` slot in the return tuple.
 
+        Returns ``(pre_mlp_layernorm_output, residual, (mlp_h_res, mlp_hc_h_post))``
+        where ``residual`` is the n-stream hidden state captured before
+        aggregation — it flows to ``_apply_mlp_bda_step`` via the base
+        skeleton's ``residual`` argument, and ``(mlp_h_res, mlp_hc_h_post)``
+        flows via ``mlp_state``.
+        """
+        # Capture the n-stream residual BEFORE mlp_hyper_connection
+        # aggregates n-stream -> single-stream. The fused bda kernel needs the
+        # original n-stream tensor.
         residual = hidden_states
 
         nvtx_range_push(suffix="mlp_hyper_connection")
         hidden_states, mlp_h_res, mlp_hc_h_post = self.mlp_hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states, mhc_recompute_manager=self._mhc_recompute_manager
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
 
-        # Optional Layer norm post the cross-attention.
+        self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
-            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+            self._mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
         )
         if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                ckpt_manager=mhc_recompute_manager
+                ckpt_manager=self._mhc_recompute_manager
             )
-            with offload_interface(
-                self.offload_mlp_norm, hidden_states, "mlp_norm"
-            ) as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     self.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with offload_interface(
-                self.offload_mlp_norm, hidden_states, "mlp_norm"
-            ) as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
-        mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context
-        )
+        return pre_mlp_layernorm_output, residual, (mlp_h_res, mlp_hc_h_post)
 
-        return self._forward_post_mlp_with_fused_hyper_connection(
-            mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_manager
-        )
+    def _apply_mlp_bda_step(self, mlp_output_with_bias, residual, mlp_state):
+        """HC fused bias-dropout-add for MLP: combines apply_h_res + apply_h_post + bda.
 
-    def _forward_post_mlp_with_fused_hyper_connection(
-        self,
-        mlp_output_with_bias,
-        mlp_h_res,
-        residual,
-        mlp_hc_h_post,
-        mhc_mlp_bda_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
-    ):
+        Unpacks ``mlp_h_res`` and ``mlp_hc_h_post`` from ``mlp_state`` (threaded
+        by ``_run_pre_mlp_layernorm`` via the base skeleton). Computes the
+        per-call ``mhc_mlp_bda_manager`` from ``self._mhc_recompute_manager``:
+        the last layer of a recompute block does NOT pass the manager into the
+        fused-bda checkpoint — the block-end finalize hook handles its output
+        discard.
         """
-        Perform operations after the MLP computation with fused hyper connection kernel.
+        mlp_h_res, mlp_hc_h_post = mlp_state
 
-        This method uses the fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
+        is_last_in_recompute_block = bool(
+            self._mhc_recompute_manager is not None
+            and getattr(self._mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
+        )
+        mhc_mlp_bda_manager = None if is_last_in_recompute_block else self._mhc_recompute_manager
 
-        Args:
-            mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
-            mlp_h_res (Tensor): [s, b, n, n] - residual mixing matrix from hyper connection.
-            residual (Tensor): [s, b, n*C] - original residual (n-stream hidden states).
-            mlp_hc_h_post (Tensor): [s, b, n] - expansion weights from hyper connection.
-            mhc_recompute_manager: Optional CheckpointWithoutOutputManager for checkpoint management.
-
-        Returns:
-            output (Tensor): Transformed hidden states of shape [s, b, n*C].
-        """
         if self.recompute_pre_mlp_layernorm or (
-            mhc_mlp_bda_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+            mhc_mlp_bda_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
         ):
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
                 mlp_output_with_bias[0]
@@ -1883,16 +1885,16 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 self.hidden_dropout,
                 self.training,
                 self.config.bias_dropout_fusion,
-                mhc_mlp_bda_recompute_manager,
+                mhc_mlp_bda_manager,
             )
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
 
-        if self.offload_mlp_norm:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as offload_interface,
-            )
-
-            hidden_states = offload_interface.group_commit(hidden_states, name="mlp_norm")
+        # HC omits forced_released_tensors — the n-stream residual is consumed
+        # by the fused kernel above, so the base class's "release residual after
+        # commit" trick doesn't apply.
+        if self.mlp_norm_manager is not None:
+            hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
+            self.mlp_norm_manager = None
 
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
@@ -2080,7 +2082,7 @@ class MoETransformerLayer(TransformerLayer):
 
         self.mlp.fwd_execution_map = "postprocess"
         output = apply_module(self.mlp)(None, intermediate_tensors=(output, shared_expert_output))
-        out = self._forward_post_mlp((output, mlp_bias), residual)
+        out = self._apply_mlp_bda_step((output, mlp_bias), residual)
 
         if is_graph_capturing() and not is_graph_warmup():
             for attr_name, attr in self.token_dispatcher_attrs.items():
