@@ -454,7 +454,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 and inference_context.num_speculative_tokens > 0
             )
 
-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
+        if (
+            mtp_in_postprocess
+            and self.mtp_process
+            and not (in_inference_mode or is_spec_decode)
+        ):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
