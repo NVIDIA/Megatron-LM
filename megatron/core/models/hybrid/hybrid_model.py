@@ -1,7 +1,7 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
 import torch
 from torch import Tensor
@@ -45,21 +45,24 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     A HybridModel is constructed via either of two paths:
 
-    1. **Recipe path (recommended).** Use the
-       :meth:`from_recipe` classmethod with a :class:`HybridModelConfig`.
-       The recipe is the public contract; lowering to the underlying
-       :class:`TransformerConfig`-based representation happens internally.
-       This is the path used by ``--model-recipe``.
-    2. **Legacy string-pattern path.** Pass ``config`` and
-       ``hybrid_layer_pattern`` (a single-character pattern string) to
-       ``__init__``. Retained for backwards compatibility — including
-       pipeline parallelism and MTP, which the recipe DSL does not yet
-       cover. New code should prefer :meth:`from_recipe`.
+    1. **Recipe path (recommended).** Pass a :class:`HybridModelConfig`
+       directly as ``config``: ``HybridModel(config=recipe, ...)``. The
+       recipe is the public contract; lowering to the underlying
+       :class:`TransformerConfig`-based representation happens internally
+       inside ``__init__``. The :meth:`from_recipe` classmethod is retained
+       as a thin alias for backward compatibility.
+    2. **Legacy string-pattern path.** Pass ``config`` (a
+       :class:`TransformerConfig`) together with ``hybrid_layer_pattern``
+       (a single-character pattern string). Retained for backwards
+       compatibility — including pipeline parallelism and MTP, which the
+       recipe DSL does not yet cover.
 
     Args:
-        config (TransformerConfig): Stack-level :class:`TransformerConfig`
-            for the legacy path (ignored on the recipe path, where
-            lowering produces it).
+        config (Union[TransformerConfig, HybridModelConfig]): Either a
+            :class:`HybridModelConfig` (recipe path — the recipe is the
+            single source of truth for everything except construction-time
+            concerns like ``pg_collection`` and ``vp_stage``) or a stack-
+            level :class:`TransformerConfig` (legacy path).
         hybrid_stack_spec (ModuleSpec, optional): Module specs for the
             various layer types. Required on the legacy string-pattern path.
             On the recipe path, defaults to the production
@@ -111,7 +114,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: Union[TransformerConfig, HybridModelConfig],
         hybrid_stack_spec: Optional[ModuleSpec] = None,
         vocab_size: Optional[int] = None,
         max_sequence_length: Optional[int] = None,
@@ -132,12 +135,68 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        # Internal: populated by :meth:`from_recipe` to thread the lowering's
-        # per-layer configs into the recipe path. Recipe authors must not
-        # construct or pass ``_RecipeLowering`` directly — its shape is an
+        # Internal: populated automatically when ``config`` is a
+        # :class:`HybridModelConfig`. Threads the lowering's per-layer
+        # configs into the recipe path. Callers must not construct or
+        # pass ``_RecipeLowering`` directly — its shape is an
         # implementation detail of the current TransformerConfig backend.
         _recipe_lowering: Optional[_RecipeLowering] = None,
     ) -> None:
+        # Recipe path dispatch: when ``config`` is a HybridModelConfig,
+        # lower it inline and substitute the recipe-owned local kwargs.
+        # Construction-time concerns (pg_collection, pre_process,
+        # post_process, vp_stage, optional hybrid_stack_spec) flow through
+        # unchanged. After this block, the rest of __init__ runs the
+        # existing recipe-path logic just as if ``from_recipe`` had been
+        # called — there is exactly one constructor body for both entry
+        # points.
+        if isinstance(config, HybridModelConfig):
+            if (
+                hybrid_layer_pattern is not None
+                or hybrid_override_pattern is not None
+                or (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0)
+                or (hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0)
+            ):
+                raise ValueError(
+                    "HybridModelConfig (Python DSL) and the legacy "
+                    "hybrid_layer_pattern / hybrid_override_pattern / "
+                    "hybrid_attention_ratio / hybrid_mlp_ratio arguments are "
+                    "mutually exclusive; pass exactly one architecture surface."
+                )
+            if _recipe_lowering is not None:
+                raise ValueError(
+                    "_recipe_lowering is populated automatically when ``config`` "
+                    "is a HybridModelConfig; do not pass it explicitly."
+                )
+            recipe = config
+            lowering = recipe._lower()
+            # HybridModel-specific invariant: the inference-optimized stack
+            # does not support fused-TP communication. TC's own
+            # ``__post_init__`` checks fuse-TP-comm → inference_optimized;
+            # the reverse direction (inference_optimized + fuse-TP-comm →
+            # reject for hybrid) is a hybrid-stack-spec constraint that
+            # must live here so it runs on both ``HybridModel(config=recipe)``
+            # and the ``from_recipe`` alias.
+            if (
+                lowering.config.transformer_impl == "inference_optimized"
+                and lowering.config.inference_fuse_tp_communication
+            ):
+                raise ValueError(
+                    "inference_fuse_tp_communication is not supported for HybridModel."
+                )
+            config = lowering.config
+            vocab_size = lowering.vocab_size
+            max_sequence_length = lowering.max_sequence_length
+            position_embedding_type = lowering.position_embedding_type
+            rotary_percent = lowering.rotary_percent
+            rotary_base = lowering.rotary_base
+            scatter_embedding_sequence_parallel = lowering.scatter_embedding_sequence_parallel
+            seq_len_interpolation_factor = lowering.seq_len_interpolation_factor
+            share_embeddings_and_output_weights = not lowering.untie_embeddings_and_output_weights
+            fp16_lm_cross_entropy = lowering.fp16_lm_cross_entropy
+            parallel_output = lowering.parallel_output
+            _recipe_lowering = lowering
+
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
@@ -411,16 +470,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
     ) -> "HybridModel":
         """Construct a :class:`HybridModel` from a :class:`HybridModelConfig`.
 
-        This is the public recipe path: ``HybridModelConfig`` is the source
-        of truth for everything about the model (architecture, embeddings,
-        loss behaviour, parallelism pins). Only construction-time concerns
-        — process groups, pipeline staging, optional stack-spec override —
-        come in as kwargs.
+        .. note::
+           This classmethod is now a thin alias for
+           ``HybridModel(config=recipe, ...)``. New code should call the
+           constructor directly; ``from_recipe`` is retained for backward
+           compatibility with callers that pre-date the constructor's
+           native :class:`HybridModelConfig` support.
 
-        The lowering from DSL → :class:`TransformerConfig` is performed
-        internally and is an implementation detail: the lowering output's
-        shape will change when ``TransformerConfig`` / ``TransformerLayer``
-        are eventually retired, but this signature will not.
+        ``HybridModelConfig`` is the source of truth for everything about
+        the model (architecture, embeddings, loss behaviour, parallelism
+        pins). Only construction-time concerns — process groups, pipeline
+        staging, optional stack-spec override — come in as kwargs.
 
         Args:
             recipe: The recipe to build. Typically returned by a
@@ -440,41 +500,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             :class:`HybridModel` raises if it is constructed under a PP
             group greater than 1 via this path.
         """
-        lowering = recipe._lower()
-        # HybridModel-specific invariant: the inference-optimized stack does
-        # not support fused-TP communication. TC's own ``__post_init__``
-        # checks fuse-TP-comm → inference_optimized; the reverse direction
-        # (inference_optimized + fuse-TP-comm → reject for hybrid) is a
-        # hybrid-stack-spec constraint that has to live here.
-        if (
-            lowering.config.transformer_impl == "inference_optimized"
-            and lowering.config.inference_fuse_tp_communication
-        ):
-            raise ValueError(
-                "inference_fuse_tp_communication is not supported for HybridModel."
-            )
+        # The inference_fuse_tp_communication / inference_optimized
+        # invariant runs inside __init__'s recipe-dispatch block, so it
+        # fires on both this alias and HybridModel(config=recipe) directly.
         return cls(
-            config=lowering.config,
+            config=recipe,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=lowering.vocab_size,
-            max_sequence_length=lowering.max_sequence_length,
             pre_process=pre_process,
             post_process=post_process,
-            fp16_lm_cross_entropy=lowering.fp16_lm_cross_entropy,
-            parallel_output=lowering.parallel_output,
-            share_embeddings_and_output_weights=(
-                not lowering.untie_embeddings_and_output_weights
-            ),
-            position_embedding_type=lowering.position_embedding_type,
-            rotary_percent=lowering.rotary_percent,
-            rotary_base=lowering.rotary_base,
-            scatter_embedding_sequence_parallel=(
-                lowering.scatter_embedding_sequence_parallel
-            ),
-            seq_len_interpolation_factor=lowering.seq_len_interpolation_factor,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
-            _recipe_lowering=lowering,
         )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:

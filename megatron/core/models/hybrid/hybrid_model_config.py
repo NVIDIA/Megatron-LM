@@ -21,7 +21,7 @@ export — returns an instance of this class:
         )
 
 The recipe is the **public contract**: a :class:`HybridModelConfig` is passed
-directly to :class:`HybridModel` (``HybridModel(recipe=...)``), and the
+directly to :class:`HybridModel` (``HybridModel(config=recipe)``), and the
 launcher's ``--model-recipe`` adapter projects recipe fields onto ``args``
 through the public queries on this class (:attr:`num_layers`,
 :attr:`has_multi_latent_attention`, :meth:`derived_moe_metadata`,
@@ -112,7 +112,7 @@ class HybridModelConfig:
     """A complete HybridModel recipe.
 
     Returned by a recipe module's ``make_recipe()`` entry point. Pass an
-    instance directly to :class:`HybridModel` via ``HybridModel(recipe=...)``;
+    instance directly to :class:`HybridModel` via ``HybridModel(config=recipe)``;
     the ``--model-recipe`` adapter loads the recipe and projects its fields
     onto the legacy launcher namespace using the public query methods on
     this class (no lowering object is exposed to callers).
