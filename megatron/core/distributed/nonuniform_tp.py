@@ -11,35 +11,110 @@ making it non-intrusive to the main codebase.
 Usage:
     Instead of using the standard classes, use the NTP variants:
     - NonuniformTPDistributedDataParallel instead of DistributedDataParallel
-    - NonuniformTPOptimizer to wrap your optimizer
     - Call initialize_nonuniform_tp_process_groups() after initialize_model_parallel()
 """
 
+import fnmatch
 import functools
+import inspect
 import logging
+import math
 import sys
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 from .. import parallel_state
-from ..optimizer.param_layout import (
-    FullParamLayout,
-    PerBufferParamLayout,
-    pad_bucket_end,
-    pad_param_start,
-)
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
+from ..utils import log_on_each_pipeline_stage
 from . import distributed_data_parallel as ddp_module
+from . import param_and_grad_buffer as pgb
 from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBucketGroup, _ParamAndGradBuffer
 
 logger = logging.getLogger(__name__)
+
+
+def pad_to_divisor(value: int, divisor: int) -> int:
+    """Round up ``value`` to the nearest multiple of ``divisor``."""
+    return int(math.ceil(value / divisor) * divisor)
+
+
+def pad_param_start(param_start_index: int) -> int:
+    """Align parameter start index to a 64-element boundary."""
+    return pad_to_divisor(param_start_index, 64)
+
+
+def pad_bucket_end(
+    bucket_end_index: int, data_parallel_world_size: int, pad_for_high_nccl_busbw: bool
+) -> int:
+    """Pad bucket end for DP divisibility and optionally high NCCL bus bandwidth."""
+    if pad_for_high_nccl_busbw:
+        divisor = math.lcm(data_parallel_world_size, 128, 2**16)
+    else:
+        divisor = math.lcm(data_parallel_world_size, 128)
+    return pad_to_divisor(bucket_end_index, divisor)
+
+
+@dataclass
+class PerBufferParamLayout:
+    """Layout for parameters within one NTP-owned contiguous DDP buffer."""
+
+    param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(default_factory=dict)
+    side_grad_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(
+        default_factory=dict
+    )
+    bucket_indices: List[Tuple[int, int]] = field(default_factory=list)
+    per_bucket_numel_unpadded: List[int] = field(default_factory=list)
+    param_indices: List[int] = field(default_factory=list)
+
+
+@dataclass
+class FullParamLayout:
+    """Compatibility placeholder for callers that pass precomputed layouts."""
+
+    layouts: Dict[object, PerBufferParamLayout] = field(default_factory=dict)
+
+
+class _NTPAllToAllHandle:
+    """Async all_to_all handle that copies temporary contiguous outputs back into views."""
+
+    def __init__(self, handle, output_copies):
+        self.handle = handle
+        self.output_copies = output_copies
+
+    def wait(self):
+        self.handle.wait()
+        for dst, src in self.output_copies:
+            dst.copy_(src)
+        self.output_copies = []
+
+
+def _ntp_all_to_all(output_tensors, input_tensors, group, async_op: bool = False):
+    """Run all_to_all, preserving non-contiguous output views via temporary buffers."""
+    output_list = []
+    output_copies = []
+    for tensor in output_tensors:
+        if tensor.is_contiguous():
+            output_list.append(tensor)
+        else:
+            contiguous = torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
+            output_list.append(contiguous)
+            output_copies.append((tensor, contiguous))
+
+    handle = dist.all_to_all(output_list, input_tensors, group=group, async_op=async_op)
+    if async_op:
+        return _NTPAllToAllHandle(handle, output_copies)
+
+    for dst, src in output_copies:
+        dst.copy_(src)
+    return None
 
 
 def _ntp_get_non_active_ranks(
@@ -88,6 +163,21 @@ def _ntp_current_rank_should_dp_sync(ntp_config: "NonuniformTPConfig") -> bool:
     return tp_rank < reduced_tp_size
 
 
+def _ntp_can_query_parallel_state() -> bool:
+    """Return True when distributed/model-parallel state is initialized enough for NTP."""
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    try:
+        parallel_state.get_tensor_model_parallel_world_size()
+        parallel_state.get_tensor_model_parallel_rank()
+        parallel_state.get_data_parallel_rank()
+        parallel_state.get_context_parallel_rank()
+        parallel_state.get_pipeline_model_parallel_rank()
+    except Exception:
+        return False
+    return True
+
+
 def _ntp_param_can_reshard(param: torch.nn.Parameter) -> bool:
     """Return True for tensor-parallel params initialized with NTP split metadata."""
     return (
@@ -130,6 +220,25 @@ def _ntp_param_numel(param: torch.nn.Parameter, ntp_config: "NonuniformTPConfig"
     return numel
 
 
+def _ntp_empty_like_partition(
+    param: torch.nn.Parameter, dtype: Optional[torch.dtype] = None
+) -> torch.Tensor:
+    """Create a zero-width tensor matching a TP param's partition dimension."""
+    empty_shape = list(param.shape)
+    empty_shape[param.partition_dim] = 0
+    return torch.empty(empty_shape, device=param.device, dtype=dtype or param.dtype).contiguous()
+
+
+def _ntp_split_for_all_to_all(tensor: torch.Tensor, splits: List[int], dim: int):
+    """Split tensor for all_to_all, preserving zero-sized entries."""
+    return [piece.contiguous() for piece in torch.split(tensor, splits, dim=dim)]
+
+
+def _ntp_split_views_for_all_to_all(tensor: torch.Tensor, splits: List[int], dim: int):
+    """Split tensor into output views for all_to_all receive paths."""
+    return list(torch.split(tensor, splits, dim=dim))
+
+
 def _compute_ntp_per_buffer_param_layout(
     params: List[torch.nn.Parameter],
     bucket_size: Optional[int],
@@ -144,6 +253,7 @@ def _compute_ntp_per_buffer_param_layout(
         return getattr(param, "shared_embedding", False)
 
     param_index_map = {}
+    side_grad_index_map = {}
     bucket_indices = []
     per_bucket_numel_unpadded = []
 
@@ -176,8 +286,12 @@ def _compute_ntp_per_buffer_param_layout(
             bucket_params = set()
             param_start_index = bucket_start_index
 
+        main_numel = param.data.nelement()
+        param_main_end_index = param_start_index + main_numel
         param_end_index = param_start_index + _ntp_param_numel(param, ntp_config)
-        param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+        param_index_map[param] = (param_start_index, param_main_end_index, bucket_id)
+        if param_end_index > param_main_end_index:
+            side_grad_index_map[param] = (param_main_end_index, param_end_index, bucket_id)
         bucket_params.add(param)
 
         if (
@@ -196,6 +310,7 @@ def _compute_ntp_per_buffer_param_layout(
 
     return PerBufferParamLayout(
         param_index_map=param_index_map,
+        side_grad_index_map=side_grad_index_map,
         bucket_indices=bucket_indices,
         per_bucket_numel_unpadded=per_bucket_numel_unpadded,
         param_indices=param_indices if param_indices is not None else [],
@@ -580,6 +695,59 @@ def ntp_init(layer: torch.nn.Module, ntp_config: NonuniformTPConfig):
         ntp_map(layer.mlp, ntp_config, layer.mlp.config.ffn_hidden_size)
 
 
+def _ntp_start_post_sync_grad_reshard(
+    params: List[torch.nn.Parameter], ntp_config: NonuniformTPConfig
+):
+    """Launch async all-to-all that scatters reduced side grads back to extra ranks."""
+    if ntp_config.tp_spares == 0 or not _ntp_can_query_parallel_state():
+        return []
+    if _ntp_current_rank_is_reduced_dp(ntp_config):
+        return []
+    if parallel_state.get_tensor_model_parallel_world_size() != ntp_config.tp_base:
+        return []
+
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    reduced_tp_size = ntp_config.tp_base - ntp_config.tp_spares
+    handles = []
+
+    for param in params:
+        if not _ntp_param_can_reshard(param):
+            continue
+
+        if tp_rank < reduced_tp_size:
+            if not hasattr(param, 'side_grad') or param.side_grad is None:
+                raise RuntimeError(
+                    "NTP core rank is missing side_grad storage for a tensor-parallel param"
+                )
+            input_tensors = [
+                _ntp_empty_like_partition(param, dtype=param.side_grad.dtype)
+                for _ in range(reduced_tp_size)
+            ] + _ntp_split_for_all_to_all(
+                param.side_grad,
+                param.recv_splits[tp_rank][-ntp_config.tp_spares :],
+                param.partition_dim,
+            )
+            output_tensors = [
+                _ntp_empty_like_partition(param, dtype=param.side_grad.dtype)
+                for _ in range(ntp_config.tp_base)
+            ]
+        else:
+            input_tensors = [
+                _ntp_empty_like_partition(param, dtype=param.main_grad.dtype)
+                for _ in range(ntp_config.tp_base)
+            ]
+            output_tensors = _ntp_split_views_for_all_to_all(
+                param.main_grad, param.send_splits[tp_rank], param.partition_dim
+            )
+
+        handles.append(
+            _ntp_all_to_all(output_tensors, input_tensors, group=tp_group, async_op=True)
+        )
+
+    return handles
+
+
 # ======================================================================================
 # NTP-aware ParamAndGradBuffer
 # ======================================================================================
@@ -594,6 +762,7 @@ class NonuniformTPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     def __init__(self, *args, ntp_config: Optional[NonuniformTPConfig] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.ntp_config = ntp_config or NonuniformTPConfig()
+        self.ntp_post_sync_state = None
 
     def _wait_ntp_reshard_handles(self):
         """Wait for NTP all-to-all reshard work touching params in this bucket group."""
@@ -604,6 +773,29 @@ class NonuniformTPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     handle.wait()
                     param.ntp_reshard_handle = None
 
+    def _start_ntp_post_sync_reshard(self):
+        """Start async post-DP-sync gradient reshard for this bucket group."""
+        handles = []
+        for bucket in self.buckets:
+            handles.extend(_ntp_start_post_sync_grad_reshard(bucket.params_list, self.ntp_config))
+        return handles
+
+    def _record_ntp_post_sync_handles(self, handles):
+        """Track post-sync handles and wait for all of them at the last bucket group."""
+        state = self.ntp_post_sync_state
+        if state is None:
+            for handle in handles:
+                handle.wait()
+            return
+
+        state['handles'].extend(handles)
+        if self is state['last_bucket_group']:
+            try:
+                for handle in state['handles']:
+                    handle.wait()
+            finally:
+                state['handles'] = []
+
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """Start DP grad sync after any pending NTP reshard for this bucket is complete."""
         self._wait_ntp_reshard_handles()
@@ -613,13 +805,17 @@ class NonuniformTPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         return super().start_grad_sync(force_all_reduce=force_all_reduce)
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
-        """Finish DP grad sync, treating folded-away healthy spare ranks as no-ops."""
+        """Finish DP grad sync and launch async post-sync NTP gradient reshard."""
         self.param_gather_dispatched = False
         self._wait_ntp_reshard_handles()
         if not _ntp_current_rank_should_dp_sync(self.ntp_config):
-            self._copy_back_extra_main_grads()
+            handles = self._start_ntp_post_sync_reshard()
+            self._record_ntp_post_sync_handles(handles)
             return
-        return super().finish_grad_sync(force_all_reduce=force_all_reduce)
+        result = super().finish_grad_sync(force_all_reduce=force_all_reduce)
+        handles = self._start_ntp_post_sync_reshard()
+        self._record_ntp_post_sync_handles(handles)
+        return result
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -630,22 +826,89 @@ class NonuniformTPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         return super().register_grad_ready(param, force_all_reduce=force_all_reduce)
 
 
+def _compute_default_per_buffer_param_layout(
+    params: List[torch.nn.Parameter],
+    bucket_size: Optional[int],
+    ddp_config: DistributedDataParallelConfig,
+    data_parallel_world_size: int,
+) -> PerBufferParamLayout:
+    """Compute the default DDP layout locally so generic buffer code is untouched."""
+
+    def _does_param_require_new_bucket(param):
+        return getattr(param, "shared_embedding", False) and ddp_config.use_distributed_optimizer
+
+    param_index_map = {}
+    bucket_indices = []
+    per_bucket_numel_unpadded = []
+
+    param_start_index = 0
+    bucket_start_index = 0
+    bucket_params = set()
+    bucket_id = 0
+
+    def _finalize_bucket(param_end_index, current_bucket_start_index):
+        nonlocal bucket_params, bucket_id
+        per_bucket_numel_unpadded.append(param_end_index - current_bucket_start_index)
+        if ddp_config.use_distributed_optimizer:
+            bucket_end_index = pad_bucket_end(
+                param_end_index,
+                data_parallel_world_size,
+                ddp_config.pad_buckets_for_high_nccl_busbw,
+            )
+        else:
+            bucket_end_index = param_end_index
+        bucket_indices.append((current_bucket_start_index, bucket_end_index))
+        bucket_params = set()
+        bucket_id += 1
+        return bucket_end_index
+
+    for param in params[::-1]:
+        if ddp_config.use_distributed_optimizer:
+            param_start_index = pad_param_start(param_start_index)
+
+        if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+            bucket_start_index = _finalize_bucket(param_start_index, bucket_start_index)
+            param_start_index = bucket_start_index
+
+        param_end_index = param_start_index + param.data.nelement()
+        param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+        bucket_params.add(param)
+
+        if (
+            bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
+        ) or _does_param_require_new_bucket(param):
+            bucket_start_index = _finalize_bucket(param_end_index, bucket_start_index)
+            param_start_index = bucket_start_index
+        else:
+            param_start_index = param_end_index
+
+    if len(bucket_params) > 0:
+        _finalize_bucket(param_start_index, bucket_start_index)
+
+    return PerBufferParamLayout(
+        param_index_map=param_index_map,
+        bucket_indices=bucket_indices,
+        per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+    )
+
+
 class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
     """
     NTP-aware version of _ParamAndGradBuffer.
-    Adjusts buffer sizes and splits gradients for NTP.
+    Adjusts buffer sizes and keeps optimizer-visible main_grad ranges contiguous.
     """
 
     def __init__(self, *args, ntp_config: Optional[NonuniformTPConfig] = None, **kwargs):
         self.ntp_config = ntp_config or NonuniformTPConfig()
+        ddp_config = args[0] if len(args) > 0 else kwargs['ddp_config']
+        params_with_names = args[3] if len(args) > 3 else kwargs['params_with_names']
+        data_parallel_group = args[4] if len(args) > 4 else kwargs['data_parallel_group']
+        bucket_size = args[5] if len(args) > 5 else kwargs['bucket_size']
+        param_indices = args[8] if len(args) > 8 else kwargs['param_indices']
+        params = [param for param, _ in params_with_names]
+
         if self.ntp_config.tp_spares > 0:
-            ddp_config = args[0] if len(args) > 0 else kwargs['ddp_config']
-            params_with_names = args[3] if len(args) > 3 else kwargs['params_with_names']
-            data_parallel_group = args[4] if len(args) > 4 else kwargs['data_parallel_group']
-            bucket_size = args[5] if len(args) > 5 else kwargs['bucket_size']
-            param_indices = args[8] if len(args) > 8 else kwargs['param_indices']
-            params = [param for param, _ in params_with_names]
-            kwargs['param_layout'] = _compute_ntp_per_buffer_param_layout(
+            param_layout = _compute_ntp_per_buffer_param_layout(
                 params,
                 bucket_size,
                 data_parallel_group.size(),
@@ -653,24 +916,352 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
                 self.ntp_config,
                 param_indices,
             )
+        else:
+            param_layout = _compute_default_per_buffer_param_layout(
+                params,
+                bucket_size,
+                ddp_config,
+                data_parallel_group.size(),
+            )
+        self._ntp_side_grad_index_map = param_layout.side_grad_index_map
 
-        super().__init__(*args, **kwargs)
+        self._init_with_param_layout(*args, param_layout=param_layout, **kwargs)
 
         if self.ntp_config.tp_spares > 0:
             for param in self.params:
                 if not _ntp_should_expand_param_grad(param, self.ntp_config):
                     continue
-                param_start_index, param_end_index, _ = self.param_index_map[param]
-                main_numel = param.data.nelement()
-                side_numel = param_end_index - param_start_index - main_numel
-                if side_numel <= 0:
+                side_range = self._ntp_side_grad_index_map.get(param)
+                if side_range is None:
                     continue
-
+                side_start, side_end, _ = side_range
                 side_shape = list(param.data.shape)
                 side_shape[param.partition_dim] = _ntp_extra_partition_dim(param, self.ntp_config)
-                assert torch.Size(side_shape).numel() == side_numel
-                side_start = param_start_index + main_numel
-                param.side_grad = self.grad_data[side_start:param_end_index].view(side_shape)
+                assert torch.Size(side_shape).numel() == side_end - side_start
+                param.side_grad = self.grad_data[side_start:side_end].view(side_shape)
+
+    def _init_with_param_layout(self, *args, param_layout: PerBufferParamLayout, **kwargs):
+        ddp_config = args[0] if len(args) > 0 else kwargs['ddp_config']
+        param_dtype = args[1] if len(args) > 1 else kwargs['param_dtype']
+        grad_dtype = args[2] if len(args) > 2 else kwargs['grad_dtype']
+        params_with_names = args[3] if len(args) > 3 else kwargs['params_with_names']
+        data_parallel_group = args[4] if len(args) > 4 else kwargs['data_parallel_group']
+        param_to_name = args[6] if len(args) > 6 else kwargs['param_to_name']
+        gradient_scaling_factor = args[7] if len(args) > 7 else kwargs['gradient_scaling_factor']
+        param_indices = args[8] if len(args) > 8 else kwargs['param_indices']
+        nccl_ub = args[9] if len(args) > 9 else kwargs['nccl_ub']
+        pg_collection = args[10] if len(args) > 10 else kwargs.get('pg_collection')
+
+        if pg_collection is None:
+            self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
+                with_context_parallel=True
+            )
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            assert hasattr(pg_collection, 'tp') and hasattr(pg_collection, 'dp_cp')
+            self.dp_cp_group = pg_collection.dp_cp
+            self.tp_group = pg_collection.tp
+
+        self.ddp_config = ddp_config
+        self.params = [param for (param, _) in params_with_names]
+        self.param_indices = param_indices
+
+        unique_params = set()
+        for param, _ in params_with_names:
+            assert param not in unique_params
+            unique_params.add(param)
+
+        self.param_dtype = param_dtype
+        self.grad_dtype = grad_dtype
+        self.data_parallel_group = data_parallel_group
+        self.data_parallel_world_size = self.data_parallel_group.size()
+        self.gradient_scaling_factor = gradient_scaling_factor
+        self.nccl_ub = nccl_ub
+
+        self.buckets = []
+        self.param_to_bucket = {}
+        self.param_index_map = param_layout.param_index_map
+        self.bucket_indices = param_layout.bucket_indices
+        per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
+
+        self.has_nvfp4_params = any(pgb.is_nvfp4tensor(p) for p in self.params)
+        self.nvfp4_packed_param_index_map = None
+        self.nvfp4_packed_bucket_indices = None
+        if self.has_nvfp4_params:
+            self._compute_nvfp4_packed_layout(params_with_names)
+
+        self.numel = self.bucket_indices[-1][1]
+        self.numel_unpadded = sum(per_bucket_numel_unpadded)
+        if self.has_nvfp4_params:
+            self.nvfp4_packed_numel = self.nvfp4_packed_bucket_indices[-1][1]
+
+        assert self.numel_unpadded <= self.numel
+        if self.has_nvfp4_params:
+            assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
+        if self.ddp_config.use_distributed_optimizer:
+            assert self.numel % self.data_parallel_world_size == 0
+            if self.has_nvfp4_params:
+                assert self.nvfp4_packed_numel % self.data_parallel_world_size == 0
+        else:
+            assert self.numel == self.numel_unpadded
+
+        self.param_data = None
+        self.grad_data = None
+        self.extra_main_grads = []
+
+        if self.nccl_ub:
+            pgb.nccl_allocator.init()
+            pool = pgb.nccl_allocator.create_nccl_mem_pool(
+                symmetric=not self.ddp_config.disable_symmetric_registration
+            )
+            mem_alloc_context = functools.partial(
+                pgb.nccl_allocator.nccl_mem,
+                pool,
+                group=self.data_parallel_group,
+                symmetric=not self.ddp_config.disable_symmetric_registration,
+            )
+            torch.distributed.barrier()
+            tmp_warmup_tensor = torch.zeros([1], device="cuda")
+            torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
+            torch.distributed.barrier()
+        else:
+            mem_alloc_context = nullcontext
+
+        with mem_alloc_context():
+            if self.ddp_config.use_distributed_optimizer and any(
+                pgb.is_mxfp8tensor(p) for p in self.params
+            ):
+                self.shared_buffer = torch.zeros(
+                    self.numel,
+                    dtype=self.grad_dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
+                if self.grad_dtype == torch.float32:
+                    self.param_data = self.shared_buffer[: math.ceil(self.numel / 2)].view(
+                        torch.bfloat16
+                    )
+                else:
+                    self.param_data = self.shared_buffer
+                self.grad_data = self.shared_buffer
+            else:
+                if self.ddp_config.use_distributed_optimizer:
+                    numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
+                    self.param_data = torch.zeros(
+                        numel,
+                        dtype=self.param_dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
+                self.grad_data = torch.zeros(
+                    self.numel,
+                    dtype=self.grad_dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
+
+        self.grad_data_size = 0
+        self.param_data_size = 0
+        self.param_data_cpu = None
+
+        def _create_bucket(bucket_id, bucket_params, bucket_params_with_extra_main_grads):
+            bucket_start_index, bucket_end_index = self.bucket_indices[bucket_id]
+            if self.has_nvfp4_params:
+                nvfp4_packed_start_index, nvfp4_packed_end_index = self.nvfp4_packed_bucket_indices[
+                    bucket_id
+                ]
+            else:
+                nvfp4_packed_start_index, nvfp4_packed_end_index = None, None
+            return self._new_bucket(
+                bucket_params=bucket_params,
+                start_index=bucket_start_index,
+                end_index=bucket_end_index,
+                numel_unpadded=per_bucket_numel_unpadded[bucket_id],
+                bucket_id=bucket_id,
+                bucket_params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+                nvfp4_packed_start_index=nvfp4_packed_start_index,
+                nvfp4_packed_end_index=nvfp4_packed_end_index,
+            )
+
+        bucket_params = []
+        bucket_params_with_extra_main_grads = []
+        cur_bucket_id = 0
+        for param, param_name in params_with_names[::-1]:
+            param_start_index, _, bucket_id = self.param_index_map[param]
+            nvfp4_packed_param_start_index = None
+            if self.has_nvfp4_params:
+                nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
+
+            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not pgb.is_mxfp8tensor(
+                param
+            ):
+                if self.param_data is not None:
+                    if pgb.is_nvfp4tensor(param):
+                        from ..fp4_utils import modify_nvfp4_rowwise_storage
+
+                        packed_shape = pgb.get_nvfp4_rowwise_packed_shape(param.data.shape)
+                        rowwise_bytes_view = self._get(
+                            packed_shape,
+                            nvfp4_packed_param_start_index,
+                            buffer_type=pgb.BufferType.PARAM,
+                        )
+                        modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                    elif pgb.is_float8tensor(param):
+                        new_param_data = self._get(
+                            param.data.shape,
+                            (
+                                nvfp4_packed_param_start_index
+                                if self.has_nvfp4_params
+                                else param_start_index
+                            ),
+                            buffer_type=pgb.BufferType.PARAM,
+                        )
+                        pgb.modify_underlying_storage(param, new_param_data)
+                    else:
+                        new_param_data = self._get(
+                            param.data.shape,
+                            (
+                                nvfp4_packed_param_start_index
+                                if self.has_nvfp4_params
+                                else param_start_index
+                            ),
+                            buffer_type=pgb.BufferType.PARAM,
+                        )
+                        old_param_data = param.data
+                        param.data = new_param_data
+                        assert old_param_data._base is None
+                        param.data.detach().copy_(old_param_data)
+                        del old_param_data
+
+            param.main_grad = self._get(
+                param.data.shape, param_start_index, buffer_type=pgb.BufferType.GRAD
+            )
+
+            promote_main_grads_to_higher_precision = False
+            for param_name_pattern in ddp_config.param_name_patterns_for_fp32_local_accumulation:
+                if fnmatch.fnmatch(param_name, param_name_pattern) or param_name_pattern == 'all':
+                    log_on_each_pipeline_stage(
+                        logger,
+                        logging.INFO,
+                        (
+                            f"Matched {param_name} with '{param_name_pattern}'; promoting "
+                            f"main_grad.type from {param.main_grad.dtype} to torch.float32!"
+                        ),
+                        tp_group=self.tp_group,
+                        dp_cp_group=self.dp_cp_group,
+                    )
+                    promote_main_grads_to_higher_precision = True
+                    break
+            if promote_main_grads_to_higher_precision:
+                param.main_grad_copy_in_grad_buffer = param.main_grad
+                param.main_grad = torch.empty_like(param.main_grad, dtype=torch.float32)
+                self.extra_main_grads.append(param.main_grad)
+
+            if bucket_id != cur_bucket_id:
+                self.buckets.append(
+                    _create_bucket(
+                        cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads
+                    )
+                )
+                bucket_params = []
+                bucket_params_with_extra_main_grads = []
+                assert cur_bucket_id + 1 == len(self.buckets)
+                assert bucket_id == cur_bucket_id + 1
+                cur_bucket_id = bucket_id
+
+            bucket_params.append(param)
+            if promote_main_grads_to_higher_precision:
+                bucket_params_with_extra_main_grads.append(param)
+
+        if len(bucket_params) > 0:
+            self.buckets.append(
+                _create_bucket(cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads)
+            )
+
+        log_strs = [
+            f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}"
+        ]
+        for index, bucket in enumerate(self.buckets):
+            numel = sum(param.data.nelement() for param in bucket.params_list)
+            log_strs.append(
+                f"Params for bucket {index + 1} ({numel} elements, "
+                f"{bucket.grad_data.nelement()} padded size, "
+                f"{len(bucket.params_with_extra_main_grads)} param(s) with extra main_grads):"
+            )
+            for param in bucket.params_list:
+                log_strs.append(f"\t{param_to_name[param]} ({param.main_grad.dtype=})")
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO,
+            "\n".join(log_strs),
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+        )
+
+    def _compute_nvfp4_packed_layout(self, params_with_names):
+        def _pad_start_of_param(param_start_index: int) -> int:
+            if self.ddp_config.use_distributed_optimizer:
+                return pad_param_start(param_start_index)
+            return param_start_index
+
+        def _pad_end_of_bucket(bucket_end_index: int) -> int:
+            if self.ddp_config.use_distributed_optimizer:
+                return pad_bucket_end(
+                    bucket_end_index,
+                    self.data_parallel_world_size,
+                    self.ddp_config.pad_buckets_for_high_nccl_busbw,
+                )
+            return bucket_end_index
+
+        self.nvfp4_packed_param_index_map = {}
+        self.nvfp4_packed_bucket_indices = []
+        nvfp4_packed_per_bucket_numel_unpadded = []
+
+        packed_param_start = 0
+        packed_bucket_start = 0
+        cur_bucket_id = 0
+
+        for param, _ in params_with_names[::-1]:
+            _, _, bucket_id = self.param_index_map[param]
+            param_numel = param.data.nelement()
+            packed_param_start = _pad_start_of_param(packed_param_start)
+
+            if bucket_id != cur_bucket_id:
+                nvfp4_packed_per_bucket_numel_unpadded.append(
+                    packed_param_start - packed_bucket_start
+                )
+                packed_bucket_end = _pad_end_of_bucket(packed_param_start)
+                self.nvfp4_packed_bucket_indices.append((packed_bucket_start, packed_bucket_end))
+                packed_bucket_start = packed_bucket_end
+                packed_param_start = packed_bucket_start
+                cur_bucket_id = bucket_id
+
+            if pgb.is_nvfp4tensor(param):
+                assert (
+                    param_numel % 2 == 0
+                ), f"NVFP4 requires even numel for packing, got {param_numel}"
+                packed_numel = param_numel // 2
+            else:
+                packed_numel = param_numel
+
+            packed_param_end = packed_param_start + packed_numel
+            self.nvfp4_packed_param_index_map[param] = (
+                packed_param_start,
+                packed_param_end,
+                bucket_id,
+            )
+            packed_param_start = packed_param_end
+
+        if packed_param_start > packed_bucket_start:
+            nvfp4_packed_per_bucket_numel_unpadded.append(packed_param_start - packed_bucket_start)
+            packed_bucket_end = _pad_end_of_bucket(packed_param_start)
+            self.nvfp4_packed_bucket_indices.append((packed_bucket_start, packed_bucket_end))
+
+        assert len(self.nvfp4_packed_bucket_indices) == len(self.bucket_indices), (
+            f"Packed bucket count ({len(self.nvfp4_packed_bucket_indices)}) != "
+            f"primary bucket count ({len(self.bucket_indices)})"
+        )
+        self.nvfp4_packed_numel_unpadded = sum(nvfp4_packed_per_bucket_numel_unpadded)
 
 
 # ======================================================================================
@@ -696,6 +1287,24 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
     ):
         self.ntp_config = ntp_config or NonuniformTPConfig()
 
+        def _call_parent_init():
+            parent_kwargs = {
+                'config': config,
+                'ddp_config': ddp_config,
+                'module': module,
+                'disable_bucketing': disable_bucketing,
+                'pg_collection': pg_collection,
+            }
+            if 'full_param_layout' in inspect.signature(
+                DistributedDataParallel.__init__
+            ).parameters:
+                parent_kwargs['full_param_layout'] = full_param_layout
+            elif full_param_layout is not None:
+                logger.warning(
+                    "Ignoring full_param_layout because this DDP base does not accept it"
+                )
+            super(NonuniformTPDistributedDataParallel, self).__init__(**parent_kwargs)
+
         # Use NTP-aware buffer class
         if self.ntp_config.tp_spares > 0:
             # DDP imports _ParamAndGradBuffer into its module namespace, so patch that binding
@@ -705,26 +1314,12 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
                 NonuniformTPParamAndGradBuffer, ntp_config=self.ntp_config
             )
             try:
-                super().__init__(
-                    config=config,
-                    ddp_config=ddp_config,
-                    module=module,
-                    disable_bucketing=disable_bucketing,
-                    pg_collection=pg_collection,
-                    full_param_layout=full_param_layout,
-                )
+                _call_parent_init()
             finally:
                 ddp_module._ParamAndGradBuffer = original_buffer_class
             self._wrap_bucket_groups_for_ntp()
         else:
-            super().__init__(
-                config=config,
-                ddp_config=ddp_config,
-                module=module,
-                disable_bucketing=disable_bucketing,
-                pg_collection=pg_collection,
-                full_param_layout=full_param_layout,
-            )
+            _call_parent_init()
 
     def _wrap_bucket_groups_for_ntp(self):
         """Replace DDP bucket groups with NTP-aware groups and rebuild param lookup."""
@@ -775,6 +1370,12 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
                     for param in bucket.params_list:
                         self.param_to_bucket_group[param] = bucket_group
 
+        all_bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        if all_bucket_groups:
+            post_sync_state = {'handles': [], 'last_bucket_group': all_bucket_groups[-1]}
+            for bucket_group in all_bucket_groups:
+                bucket_group.ntp_post_sync_state = post_sync_state
+
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
         """
         Override to add NTP gradient synchronization between spare and core GPUs.
@@ -806,49 +1407,36 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
                 and not _ntp_current_rank_is_reduced_dp(self.ntp_config)
                 and parallel_state.get_tensor_model_parallel_world_size() == self.ntp_config.tp_base
             ):
-                empty_shape = list(param.shape)
-                empty_shape[param.partition_dim] = 0
                 tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                reduced_tp_size = self.ntp_config.tp_base - self.ntp_config.tp_spares
 
-                if tp_rank < self.ntp_config.tp_base - self.ntp_config.tp_spares:
+                if tp_rank < reduced_tp_size:
                     # Core GPU: receive grads from spare GPUs
                     input = [
-                        torch.empty(
-                            empty_shape, device=param.device, dtype=param.side_grad.dtype
-                        ).contiguous()
+                        _ntp_empty_like_partition(param, dtype=param.side_grad.dtype)
                         for _ in range(parallel_state.get_tensor_model_parallel_world_size())
                     ]
                     # Split side_grad and send to core GPUs
                     output = [
-                        torch.empty(
-                            empty_shape, device=param.device, dtype=param.side_grad.dtype
-                        ).contiguous()
-                        for _ in range(self.ntp_config.tp_base - self.ntp_config.tp_spares)
-                    ] + [
-                        t.contiguous()
-                        for t in torch.split(
-                            param.side_grad, param.recv_splits[tp_rank], dim=param.partition_dim
-                        )
-                    ][
+                        _ntp_empty_like_partition(param, dtype=param.side_grad.dtype)
+                        for _ in range(reduced_tp_size)
+                    ] + _ntp_split_views_for_all_to_all(
+                        param.side_grad, param.recv_splits[tp_rank], dim=param.partition_dim
+                    )[
                         -self.ntp_config.tp_spares :
                     ]
                 else:
                     # Spare GPU: send grads to core GPUs
-                    input = [
-                        t.contiguous()
-                        for t in torch.split(
-                            param.main_grad, param.send_splits[tp_rank], dim=param.partition_dim
-                        )
-                    ]
+                    input = _ntp_split_for_all_to_all(
+                        param.main_grad, param.send_splits[tp_rank], dim=param.partition_dim
+                    )
                     output = [
-                        torch.empty(
-                            empty_shape, device=param.device, dtype=param.main_grad.dtype
-                        ).contiguous()
+                        _ntp_empty_like_partition(param, dtype=param.main_grad.dtype)
                         for _ in range(parallel_state.get_tensor_model_parallel_world_size())
                     ]
 
                 try:
-                    handle = dist.all_to_all(
+                    handle = _ntp_all_to_all(
                         output,
                         input,
                         group=parallel_state.get_tensor_model_parallel_group(),
@@ -871,44 +1459,3 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
                 self.param_to_bucket_group[param].register_grad_ready(param, self.force_all_reduce)
 
         return ntp_hook
-
-
-# ======================================================================================
-# NTP-aware Optimizer Wrapper
-# ======================================================================================
-
-
-class NonuniformTPOptimizer:
-    """
-    Wrapper for optimizers to make gradients contiguous for NTP.
-    """
-
-    def __init__(self, optimizer, ntp_config: NonuniformTPConfig):
-        self.optimizer = optimizer
-        self.ntp_config = ntp_config
-
-    def __getattr__(self, name):
-        """Delegate attribute access to wrapped optimizer."""
-        return getattr(self.optimizer, name)
-
-    def prepare_grads(self, *args, **kwargs):
-        """
-        Override prepare_grads to make gradients contiguous for NTP.
-        """
-        # Call original prepare_grads if it exists
-        if hasattr(self.optimizer, 'prepare_grads'):
-            result = self.optimizer.prepare_grads(*args, **kwargs)
-        else:
-            result = False
-
-        # Make gradients contiguous for NTP
-        if self.ntp_config.tp_spares > 0:
-            for param_group in self.optimizer.param_groups:
-                for param in param_group['params']:
-                    if hasattr(param, 'main_grad') and param.main_grad is not None:
-                        if not param.main_grad.is_contiguous():
-                            param.grad = param.main_grad.contiguous()
-                        else:
-                            param.grad = param.main_grad
-
-        return result

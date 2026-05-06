@@ -23,7 +23,6 @@ from megatron.core.distributed.distributed_data_parallel import DistributedDataP
 from megatron.core.distributed.nonuniform_tp import (
     NonuniformTPConfig,
     NonuniformTPDistributedDataParallel,
-    NonuniformTPOptimizer,
     NonuniformTPParamAndGradBucketGroup,
     NonuniformTPParamAndGradBuffer,
     _compute_ntp_per_buffer_param_layout,
@@ -152,7 +151,8 @@ class TestNonuniformTPBufferLayout:
             param_indices=[0],
         )
 
-        assert layout.param_index_map[param] == (0, 16, 0)
+        assert layout.param_index_map[param] == (0, 8, 0)
+        assert layout.side_grad_index_map[param] == (8, 16, 0)
         assert layout.per_bucket_numel_unpadded == [16]
         assert layout.bucket_indices == [(0, 128)]
         assert layout.param_indices == [0]
@@ -287,78 +287,6 @@ class TestNonuniformTPParameterResharding:
         assert mock_ntp_map.call_args_list[1][0][2] == 4096
 
 
-class TestNonuniformTPOptimizer:
-    """Test NTP optimizer wrapper."""
-
-    def test_optimizer_wrapper_delegates_attributes(self):
-        """Test that optimizer wrapper delegates attribute access."""
-        mock_optimizer = Mock()
-        mock_optimizer.param_groups = []
-        mock_optimizer.state = {}
-
-        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
-        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ntp_config)
-
-        # Should delegate attribute access
-        assert ntp_optimizer.param_groups == []
-        assert ntp_optimizer.state == {}
-
-    def test_optimizer_prepare_grads_no_spares(self):
-        """Test prepare_grads when tp_spares=0 (should be no-op)."""
-        mock_optimizer = Mock()
-        mock_optimizer.param_groups = [{'params': []}]
-        mock_optimizer.prepare_grads = Mock(return_value=False)
-
-        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=0)
-        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ntp_config)
-
-        result = ntp_optimizer.prepare_grads()
-
-        # Should call original prepare_grads
-        mock_optimizer.prepare_grads.assert_called_once()
-        assert result == False
-
-    def test_optimizer_prepare_grads_makes_contiguous(self):
-        """Test prepare_grads makes gradients contiguous for NTP."""
-        # Create parameter with non-contiguous main_grad
-        param = torch.nn.Parameter(torch.randn(10, 10))
-        param.main_grad = torch.randn(10, 10).t()  # Transposed = non-contiguous
-        assert not param.main_grad.is_contiguous()
-
-        mock_optimizer = Mock()
-        mock_optimizer.param_groups = [{'params': [param]}]
-        mock_optimizer.prepare_grads = Mock(return_value=False)
-
-        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
-        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ntp_config)
-
-        ntp_optimizer.prepare_grads()
-
-        # Should have made grad contiguous
-        assert hasattr(param, 'grad')
-        assert param.grad.is_contiguous()
-
-    def test_optimizer_prepare_grads_already_contiguous(self):
-        """Test prepare_grads when gradient is already contiguous."""
-        # Create parameter with contiguous main_grad
-        param = torch.nn.Parameter(torch.randn(10, 10))
-        param.main_grad = torch.randn(10, 10)
-        assert param.main_grad.is_contiguous()
-
-        mock_optimizer = Mock()
-        mock_optimizer.param_groups = [{'params': [param]}]
-        mock_optimizer.prepare_grads = Mock(return_value=False)
-
-        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
-        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ntp_config)
-
-        ntp_optimizer.prepare_grads()
-
-        # Should have set grad directly (no copy)
-        assert hasattr(param, 'grad')
-        assert param.grad is param.main_grad
-
-
 class TestNonuniformTPDDPCompatibility:
     """Test compatibility with current Megatron DDP construction and bucket state."""
 
@@ -455,6 +383,49 @@ class TestNonuniformTPDDPCompatibility:
         assert wrapped_second.next_param_gather_bucket_group is wrapped_first
         assert wrapped_second.inter_distributed_optimizer_instance_group == 'inter-group'
         assert wrapped_second.communication_stream == 'comm-stream'
+        assert wrapped_first.ntp_post_sync_state is wrapped_second.ntp_post_sync_state
+        assert wrapped_first.ntp_post_sync_state['last_bucket_group'] is wrapped_second
+
+
+class TestNonuniformTPBucketGroup:
+    """Test DDP-owned NTP bucket post-sync behavior."""
+
+    def test_post_sync_handles_wait_when_last_bucket_group_finishes(self):
+        first = object.__new__(NonuniformTPParamAndGradBucketGroup)
+        second = object.__new__(NonuniformTPParamAndGradBucketGroup)
+        state = {'handles': [], 'last_bucket_group': second}
+        first.ntp_post_sync_state = state
+        second.ntp_post_sync_state = state
+
+        first_handle = Mock()
+        second_handle = Mock()
+
+        first._record_ntp_post_sync_handles([first_handle])
+        first_handle.wait.assert_not_called()
+        assert state['handles'] == [first_handle]
+
+        second._record_ntp_post_sync_handles([second_handle])
+        first_handle.wait.assert_called_once()
+        second_handle.wait.assert_called_once()
+        assert state['handles'] == []
+
+    @patch('megatron.core.distributed.nonuniform_tp._ntp_current_rank_should_dp_sync')
+    def test_finish_grad_sync_on_folded_rank_launches_post_sync_reshard(self, mock_should_sync):
+        mock_should_sync.return_value = False
+
+        group = object.__new__(NonuniformTPParamAndGradBucketGroup)
+        group.ntp_config = NonuniformTPConfig(tp_base=4, tp_spares=2)
+        group.buckets = []
+        group.param_gather_dispatched = True
+        group.ntp_post_sync_state = None
+        handle = Mock()
+        group._start_ntp_post_sync_reshard = Mock(return_value=[handle])
+
+        group.finish_grad_sync()
+
+        assert group.param_gather_dispatched is False
+        group._start_ntp_post_sync_reshard.assert_called_once()
+        handle.wait.assert_called_once()
 
 
 class TestNonuniformTPIntegration:
