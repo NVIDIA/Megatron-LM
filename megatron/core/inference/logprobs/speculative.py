@@ -174,10 +174,8 @@ class LogProbsSpeculative:
         prefill_new_tokens = new_tokens[
             padded_decode_count : padded_decode_count + padded_prefill_count
         ]
-        prefill_row_range = torch.arange(padded_prefill_count, device=device)
-        prefill_indices = prefill_offset_gpu + prefill_row_range
-        prefill_logits = logits.squeeze(0)[prefill_indices].float()
-        prefill_gathered_raw = prefill_logits[prefill_row_range, prefill_new_tokens]
+        prefill_indices = prefill_offset_gpu + torch.arange(padded_prefill_count, device=device)
+        prefill_gathered_raw = logits.squeeze(0)[prefill_indices, prefill_new_tokens].float()
         prefill_gathered = prefill_gathered_raw - prefill_lse
 
         return decode_gathered, prefill_gathered
