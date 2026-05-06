@@ -1003,7 +1003,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # We need the sampling function to return a 1D tensor for base logits,
         # and a 1D tensor for the flattened MTP logits.
         def mock_sampling_func(logits, *args, **kwargs):
-            if logits.shape[0] == 6:
+            if logits.shape[1] == 6:
                 # Base logits -> return 1D tensor of shape [6]
                 # Req 1: Predicts [11, 12, 99]. Matches T1, T2. Rejects T3. -> Accepts 2 spec tokens.
                 # Req 2: Predicts [99, 22, 23]. Fails at first spec token (99 != 21). -> Accepts 0 spec tokens.

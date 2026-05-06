@@ -749,7 +749,7 @@ class TextGenerationController:
             Tensor: Sampled tokens of shape [num_requests].
         """
         return self._sampling.sample_kernel(
-            logits_2d,
+            logits_2d.unsqueeze(0),
             logits_2d.shape[0],
             self.inference_wrapped_model.inference_context,
             eager=True,
@@ -950,19 +950,17 @@ class TextGenerationController:
 
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.
-            sample_logits = logits.squeeze(0)
             sample_gather_indices = None
         else:
             # Push the gather inside the captured kernel:
             # pass the full per-token logits buffer (constant shape) plus the padded indices.
-            sample_logits = logits.squeeze(0)
             sample_gather_indices = required_logit_indices
         nvtx_range_pop("mtp-spec-decoding/verify/logit-indices")
 
         # Sample tokens from logits
         nvtx_range_push("mtp-spec-decoding/verify/sample")
         output_tokens = self._sampling.sample_speculative(
-            sample_logits,
+            logits,
             sample_num_decode,
             sample_num_prefill,
             self.num_speculative_tokens,
@@ -1062,7 +1060,7 @@ class TextGenerationController:
             else context.gpu_view.active_request_last_token_idxs
         )
         self._sampled_tokens_cuda = self._sampling.sample_kernel(
-            logits.squeeze(0),
+            logits,
             n,
             context,
             gather_indices=gather_indices,
