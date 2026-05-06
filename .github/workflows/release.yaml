@@ -87,7 +87,7 @@ jobs:
              || needs.pre-flight.outputs.is_merge_group == 'true'
              || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       )
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@5cca628871444cd5021723737af05ea2622c9944
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@a0921929733d506dee2de6889c39feee5da623ab
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       validate-only: ${{ github.event_name != 'workflow_dispatch' }}
@@ -130,7 +130,7 @@ jobs:
       github.repository == 'NVIDIA/Megatron-LM'
       && (success() || !failure())
       && !cancelled()
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@5cca628871444cd5021723737af05ea2622c9944
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@a0921929733d506dee2de6889c39feee5da623ab
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       release-version: ${{ needs.bump.outputs.release-version }}
@@ -142,27 +142,22 @@ jobs:
       gh-release-tag-prefix: core_
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
-      publish-docs: false
+      publish-docs: ${{ inputs.publish-docs || true }}
+      docs-target-path: megatron-core/developer-guide
+      publish-as-latest: true
+      run-on-version-tag-only: ${{ github.ref_name != 'main' }}
       app-id: ${{ vars.BOT_ID }}
     secrets:
       BOT_KEY: ${{ secrets.BOT_KEY }}
       SLACK_WEBHOOK: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SLACK_MAIN_CHANNEL_WEBHOOK || secrets.SLACK_CI_CHANNEL_WEBHOOK }}
-
-  publish-docs:
-    needs: [bump, finalize]
-    if: |
-      github.repository == 'NVIDIA/Megatron-LM'
-      && github.event_name == 'workflow_dispatch'
-      && inputs.publish-docs == true
-      && (success() || !failure())
-      && !cancelled()
-    uses: ./.github/workflows/release-docs.yml
-    with:
-      dry-run: ${{ inputs.dry-run }}
-      publish-as-latest: true
-      docs-version-override: ${{ needs.bump.outputs.release-version }}
-      build-docs-ref: ${{ inputs.release-ref || github.sha }}
-    secrets: inherit
+      AWS_ASSUME_ROLE_ARN: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AKAMAI_HOST: ${{ secrets.AKAMAI_HOST }}
+      AKAMAI_CLIENT_TOKEN: ${{ secrets.AKAMAI_CLIENT_TOKEN }}
+      AKAMAI_CLIENT_SECRET: ${{ secrets.AKAMAI_CLIENT_SECRET }}
+      AKAMAI_ACCESS_TOKEN: ${{ secrets.AKAMAI_ACCESS_TOKEN }}
+      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
 
   release-summary:
     needs: [pre-flight, bump, build-test-publish-wheels, finalize]
