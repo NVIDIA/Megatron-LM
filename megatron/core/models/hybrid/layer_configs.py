@@ -44,9 +44,9 @@ class LayerConfig:
     common_config: Optional[CommonLayerConfig] = None
     """Per-layer common config; ``None`` (the default) means
     "inherit from the recipe's :attr:`HybridModelConfig.common_config`",
-    which :meth:`HybridModelConfig.compile` substitutes in. Pass an
+    which the recipe's internal lowering substitutes in. Pass an
     explicit :class:`CommonLayerConfig` to override (e.g. via
-    :meth:`CommonLayerConfig.update`). After ``compile()`` runs, this
+    :meth:`CommonLayerConfig.update`). After lowering runs, this
     field is always non-None."""
 
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -126,10 +126,11 @@ class LayerConfig:
                         f"{shadowed}; set them on HybridModelConfig instead."
                     )
             kwargs.update(self.extra)
-        # Test-friendly fallback: ``compile()`` always supplies a placeholder,
-        # but unit tests calling ``lc.to_transformer_config(num_layers=N)``
-        # directly need a non-zero baseline so TC's ``__post_init__`` doesn't
-        # divide by zero deriving ``kv_channels``.
+        # Test-friendly fallback: the recipe's lowering always supplies a
+        # placeholder, but unit tests calling
+        # ``lc.to_transformer_config(num_layers=N)`` directly need a non-zero
+        # baseline so TC's ``__post_init__`` doesn't divide by zero deriving
+        # ``kv_channels``.
         kwargs.setdefault("num_attention_heads", 1)
         kwargs["num_layers"] = num_layers
         # Drop None values so TransformerConfig defaults apply.
@@ -452,9 +453,9 @@ class EmbeddingLayerConfig:
 
     common_config: Optional[CommonLayerConfig] = None
     """Per-marker common config; ``None`` (the default) means "inherit from
-    the recipe's :attr:`HybridModelConfig.common_config`", which
-    :meth:`HybridModelConfig.compile` substitutes in. After ``compile()``
-    runs, this field is always non-None."""
+    the recipe's :attr:`HybridModelConfig.common_config`", which the
+    recipe's internal lowering substitutes in. After lowering runs,
+    this field is always non-None."""
 
     vocab_size: int = 0
     """Vocabulary size (post-padding)."""
@@ -480,16 +481,16 @@ class EmbeddingLayerConfig:
     yarn: Optional[Dict[str, Any]] = None
     """YARN scaling parameters (consumed only when
     ``position_embedding_type == "yarn"``). These are not
-    :class:`TransformerConfig` dataclass fields today; they are attached
-    as ad-hoc attributes by :meth:`HybridModelConfig.compile` to match
-    the :func:`getattr` lookups in :class:`HybridModel.__init__`.
+    :class:`TransformerConfig` dataclass fields today; the recipe's
+    internal lowering attaches them as ad-hoc attributes to match the
+    :func:`getattr` lookups in :class:`HybridModel.__init__`.
     Recognised keys: ``yarn_rotary_scaling_factor``,
     ``yarn_original_max_position_embeddings``, ``yarn_beta_fast``,
     ``yarn_beta_slow``, ``yarn_mscale``, ``yarn_mscale_all_dim``,
-    ``yarn_correction_range_round_to_int``. Unknown keys raise at compile
+    ``yarn_correction_range_round_to_int``. Unknown keys raise at lowering
     time. When upstream lifts these onto :class:`TransformerConfig`, this
-    field collapses to a plain ``extra`` passthrough and the setattr
-    loop in ``compile()`` goes away."""
+    field collapses to a plain ``extra`` passthrough and the setattr loop
+    in the lowering goes away."""
 
     extra: Dict[str, Any] = field(default_factory=dict)
     """Passthrough kwargs forwarded to the stack-level

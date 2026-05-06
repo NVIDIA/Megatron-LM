@@ -66,7 +66,10 @@ def _loss() -> CrossEntropyLayerConfig:
 
 
 def _build_model_from_recipe(recipe: HybridModelConfig) -> HybridModel:
-    return HybridModel.from_recipe(recipe)
+    # Phase 2: call the new TC-free constructor directly. ``from_recipe``
+    # is now a thin alias; the equivalence between the two paths is
+    # asserted in test_recipe_constructor.py.
+    return HybridModel(config=recipe)
 
 
 @pytest.mark.internal

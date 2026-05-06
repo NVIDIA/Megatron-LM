@@ -350,3 +350,52 @@ class TestRecipeArgProjection:
         assert args.max_position_embeddings == 512
         assert args.padded_vocab_size == 1024
         assert args.tensor_model_parallel_size == 2
+
+    def test_unset_recipe_topology_does_not_clobber_cli_flag(self, monkeypatch):
+        """The headline contract for the recipe→args projection: a recipe
+        that leaves ``tensor_model_parallel_size=None`` (= "defer to the
+        launcher") must NOT overwrite a value the user passed via
+        ``--tensor-model-parallel-size`` on the CLI. Same for CP/EP/ETP.
+
+        Regression guard: the launcher reads topology from the recipe's
+        ``Optional[int]`` fields directly; reading from the lowered stack
+        TC instead would see substituted concrete values (TC always carries
+        them) and silently clobber ``args.tensor_model_parallel_size``."""
+        from megatron.training.arguments import _apply_model_recipe_to_args
+
+        common = _make_common()
+        # No topology pinned on the recipe.
+        recipe = HybridModelConfig(common_config=common, layer_pattern=_make_valid_pattern(common))
+        _register_synthetic_module(
+            monkeypatch, "tests._args_projection_recipe_no_topology", make_recipe=lambda: recipe
+        )
+        # CLI-supplied values that the projection must preserve.
+        args = types.SimpleNamespace(
+            model_recipe="tests._args_projection_recipe_no_topology",
+            num_layers=None,
+            hidden_size=None,
+            num_attention_heads=None,
+            max_position_embeddings=None,
+            padded_vocab_size=None,
+            tensor_model_parallel_size=4,  # ← from CLI; must survive
+            pipeline_model_parallel_size=1,
+            context_parallel_size=2,  # ← from CLI; must survive
+            expert_model_parallel_size=8,  # ← from CLI; must survive
+            expert_tensor_parallel_size=1,  # ← from CLI; must survive
+            position_embedding_type=None,
+            rotary_percent=None,
+            rotary_base=None,
+            rotary_seq_len_interpolation_factor=None,
+            untie_embeddings_and_output_weights=False,
+            fp16_lm_cross_entropy=False,
+            mtp_num_layers=None,
+            encoder_num_layers=None,
+            num_experts=None,
+        )
+
+        _apply_model_recipe_to_args(args)
+
+        assert args.tensor_model_parallel_size == 4
+        assert args.context_parallel_size == 2
+        assert args.expert_model_parallel_size == 8
+        assert args.expert_tensor_parallel_size == 1

@@ -6,46 +6,45 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
+from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.argument_utils import ArgumentGroupFactory
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.core.quantization.utils import (
-    kitchen_quantization_recipe_config,
-    load_quantization_recipe,
-)
-
-from megatron.training.argument_utils import ArgumentGroupFactory
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -325,6 +324,109 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def _apply_model_recipe_to_args(args):
+    """Project a HybridModel recipe onto the legacy argparse namespace.
+
+    ``--model-recipe`` keeps the user-facing model definition in Python DSL
+    objects, but the rest of Megatron's launcher still reads topology and a
+    handful of shape fields from ``args``. This adapter is intentionally
+    one-way: recipe values win, and the recipe itself is cached on
+    ``args._model_recipe`` so ``hybrid_builder`` can reach it via
+    :meth:`HybridModel.from_recipe` without re-loading or re-lowering.
+
+    Reads happen entirely through the public recipe surface
+    (:class:`HybridModelConfig` queries + curated marker fields). The
+    internal lowering is not used here — keeping launcher code decoupled
+    from the lowering output's shape (and from the
+    :class:`TransformerConfig` backend it currently targets).
+    """
+    from megatron.core.models.hybrid.layer_configs import (
+        AttentionLayerConfig,
+        DSALayerConfig,
+        MoELayerConfig,
+    )
+    from megatron.core.models.hybrid.layer_pattern import load_recipe
+
+    # Reject user-supplied conflicts up front; the projection below sets
+    # ``args.hybrid_layer_pattern`` so ``is_hybrid_model(args)`` recognises
+    # recipe-built models on the existing legacy code path.
+    assert getattr(args, 'hybrid_layer_pattern', None) is None, (
+        '--model-recipe and --hybrid-layer-pattern are mutually exclusive. '
+        'The recipe supplies the layer pattern; remove --hybrid-layer-pattern.'
+    )
+    assert getattr(args, 'hybrid_override_pattern', None) is None, (
+        '--model-recipe and --hybrid-override-pattern are mutually exclusive.'
+    )
+
+    recipe = load_recipe(args.model_recipe)
+    args._model_recipe = recipe
+
+    decoder_layers = recipe.flatten_decoder()
+    embedding = recipe.embedding_marker
+    loss = recipe.loss_marker
+    common = recipe.common_config
+
+    # Uniform attention-head count across attention/DSA layers, when one
+    # exists. Heterogeneous attention is rejected by lowering under
+    # RoPE/YARN; under fixed/none position embeddings the launcher has no
+    # single right value and we leave ``args.num_attention_heads`` alone.
+    attention_layers = [
+        lc for lc in decoder_layers if isinstance(lc, (AttentionLayerConfig, DSALayerConfig))
+    ]
+    head_counts = {
+        lc.num_attention_heads
+        for lc in attention_layers
+        if lc.num_attention_heads is not None
+    }
+    num_attention_heads = head_counts.pop() if len(head_counts) == 1 else None
+
+    # Topology values read from the recipe directly; ``None`` on the recipe
+    # = "defer to the launcher's CLI flag", and the ``if value is not None``
+    # skip below relies on that distinction. The lowered stack TC carries
+    # substituted concrete values that would silently overwrite the CLI.
+    recipe_values = {
+        "num_layers": recipe.num_layers,
+        "hidden_size": common.hidden_size,
+        "num_attention_heads": num_attention_heads,
+        "max_position_embeddings": embedding.max_sequence_length,
+        "padded_vocab_size": embedding.vocab_size,
+        "tensor_model_parallel_size": recipe.tensor_model_parallel_size,
+        "context_parallel_size": recipe.context_parallel_size,
+        "expert_model_parallel_size": recipe.expert_model_parallel_size,
+        "expert_tensor_parallel_size": recipe.expert_tensor_parallel_size,
+        "position_embedding_type": embedding.position_embedding_type,
+        "rotary_percent": embedding.rotary_percent,
+        "rotary_base": embedding.rotary_base,
+        "rotary_seq_len_interpolation_factor": embedding.seq_len_interpolation_factor,
+        "untie_embeddings_and_output_weights": recipe.untie_embeddings_and_output_weights,
+        "fp16_lm_cross_entropy": loss.fp16_lm_cross_entropy,
+    }
+    for attr, value in recipe_values.items():
+        if value is not None and hasattr(args, attr):
+            setattr(args, attr, value)
+
+    # The generic num_layers/encoder_num_layers normalization below asserts
+    # they are not both pre-populated. A recipe describes the decoder stack.
+    if hasattr(args, "encoder_num_layers"):
+        args.encoder_num_layers = None
+
+    moe_experts = [lc.num_experts for lc in decoder_layers if isinstance(lc, MoELayerConfig)]
+    args._model_recipe_num_experts = tuple(moe_experts)
+    unique_moe_experts = set(moe_experts)
+    if len(unique_moe_experts) == 1 and hasattr(args, "num_experts"):
+        args.num_experts = unique_moe_experts.pop()
+
+    if recipe.has_multi_latent_attention and hasattr(args, "multi_latent_attention"):
+        args.multi_latent_attention = True
+
+    # Mark the run as hybrid for downstream metrics. ``is_hybrid_model(args)``
+    # in ``megatron/training/utils.py`` keys off ``args.hybrid_layer_pattern``;
+    # without this, recipe-built hybrid models would silently fall back to GPT
+    # FLOP-accounting and MoE-metric paths.
+    args.hybrid_layer_pattern = "".join(type(lc).SYMBOL for lc in decoder_layers)
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -338,8 +440,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -351,6 +454,13 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format == "torch", \
             "legacy model format only supports the 'torch' checkpoint format."
     update_use_dist_ckpt(args)
+
+    # A HybridModel Python recipe is the source of truth for model architecture
+    # and model-parallel topology. Project those values back onto the legacy
+    # argparse namespace early so generic validation/process-group setup sees
+    # the same topology the recipe-built HybridModel will use.
+    if getattr(args, 'model_recipe', None) is not None:
+        _apply_model_recipe_to_args(args)
 
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
 
@@ -642,6 +752,10 @@ def validate_args(args, defaults={}):
 
     # === Hybrid layer pattern: deprecation handling and validation ===
 
+    # The --model-recipe vs --hybrid-layer-pattern mutex check lives at the
+    # start of _apply_model_recipe_to_args (it must run before projection
+    # populates args.hybrid_layer_pattern internally for is_hybrid_model).
+
     # Backward compat: --hybrid-override-pattern is deprecated in favor of --hybrid-layer-pattern
     used_hybrid_override_pattern = False
     if args.hybrid_override_pattern is not None:
@@ -666,8 +780,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -1391,7 +1507,11 @@ def validate_args(args, defaults={}):
     # MoE Spec check
     if args.num_experts == 0:
         args.num_experts = None
-    if args.num_experts is not None and args.moe_ffn_hidden_size is None:
+    if (
+        args.num_experts is not None
+        and args.moe_ffn_hidden_size is None
+        and getattr(args, 'model_recipe', None) is None
+    ):
         args.moe_ffn_hidden_size = args.ffn_hidden_size
         warn_rank_0("moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
@@ -1401,9 +1521,22 @@ def validate_args(args, defaults={}):
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
-        assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
-        assert args.num_experts % args.expert_model_parallel_size == 0, \
-            "Number of experts should be a multiple of expert model parallel_size."
+        if getattr(args, 'model_recipe', None) is not None:
+            recipe_num_experts = getattr(args, '_model_recipe_num_experts', ())
+            assert recipe_num_experts, (
+                "At least one MoE layer in --model-recipe must set num_experts "
+                "when expert model parallelism is enabled."
+            )
+            for num_experts in recipe_num_experts:
+                assert num_experts % args.expert_model_parallel_size == 0, (
+                    "Number of experts should be a multiple of expert model parallel_size. "
+                    f"Got num_experts={num_experts} and "
+                    f"expert_model_parallel_size={args.expert_model_parallel_size}."
+                )
+        else:
+            assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
+            assert args.num_experts % args.expert_model_parallel_size == 0, \
+                "Number of experts should be a multiple of expert model parallel_size."
 
     # MoE router check
     if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
@@ -2530,8 +2663,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -3337,6 +3469,21 @@ def _add_experimental_args(parser):
                        'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
+    group.add_argument('--model-recipe', type=str, default=None,
+                       help='Recipe spec for a HybridModel, accepted in three forms: '
+                       '(1) dotted Python module path, e.g. examples.nemotron3.nano; '
+                       '(2) module path with explicit function selection, e.g. '
+                       'examples.nemotron3.nano:make_recipe; '
+                       '(3) filesystem path to a .py file (anywhere on disk; no '
+                       'PYTHONPATH manipulation needed), with optional :func suffix, e.g. '
+                       '/path/to/recipe.py or /path/to/recipe.py:my_pretrain_config. '
+                       'When :func is omitted, the loader calls make_recipe() from '
+                       'the recipe module. When set, the recipe is the sole source '
+                       'of truth for the model architecture; '
+                       '--hidden-size, --num-layers, --hybrid-layer-pattern, etc. are '
+                       'ignored. CLI flags governing training, data, optimizer, distributed '
+                       'setup, tokenization, and checkpointing still apply. '
+                       'Mutually exclusive with --hybrid-layer-pattern.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Deprecated. Use --hybrid-layer-pattern instead. '
                        'If specified, its value will be forwarded to --hybrid-layer-pattern.')
@@ -3393,7 +3540,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False
