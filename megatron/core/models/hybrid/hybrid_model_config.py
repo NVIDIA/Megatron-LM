@@ -79,6 +79,25 @@ class HybridModelConfig:
     this class (no lowering object is exposed to callers).
     """
 
+    # TODO(recipe-api): two follow-ups deferred from the Phase 1 review:
+    #   (1) Add a public ``validate(self) -> None`` method that runs the
+    #       structural / parallelism / attention-geometry checks
+    #       independently of ``_lower()`` so users can sanity-check a
+    #       recipe from a non-distributed script (no TC construction, no
+    #       process groups). The checks already fire inside ``_lower()``
+    #       before any process-group setup, so this is ergonomic, not
+    #       blocking.
+    #   (2) Document the polarity flip on
+    #       :attr:`untie_embeddings_and_output_weights`: the recipe
+    #       default is ``False`` (i.e., tied / shared by default), but
+    #       :class:`HybridModel`'s legacy default is
+    #       ``share_embeddings_and_output_weights=False`` (i.e., NOT
+    #       shared). Recipe authors migrating from a legacy bash launcher
+    #       must set ``untie_embeddings_and_output_weights=True`` to
+    #       reproduce the legacy default. A migration-note docstring on
+    #       the field would help people not silently drift from their
+    #       legacy baseline.
+
     common_config: CommonLayerConfig
     """Model-wide defaults shared by every layer."""
 
