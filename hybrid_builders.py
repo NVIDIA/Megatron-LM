@@ -13,7 +13,6 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     print_rank_0('building Hybrid model ...')
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
-    assert args.use_legacy_models is False, "Hybrid model only supported in Mcore!"
 
     if config.transformer_impl == "inference_optimized":
         hybrid_stack_spec = hybrid_inference_stack_spec

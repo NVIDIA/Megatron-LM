@@ -142,7 +142,6 @@ NOTE: Other parameters which can be customized for inference:
 --num-tokens-to-generate (Number of tokens to generate for each prompt)
 --inference-batch-times-seqlen-threshold (During inference, if batch-size times sequence-length is smaller than this threshold then we will not use microbatched pipelining.')
 --use-dist-ckpt (If using dist checkpoint format for the model)
---use-legacy-models (If using legacy models instead of MCore models)
 
 ```
 
