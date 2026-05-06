@@ -7,15 +7,18 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..fp4_utils import is_nvfp4tensor
-from ..fp8_utils import is_float8tensor, post_all_gather_processing
+from ..fp8_utils import copy_tensor_to_quantized_param, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from .param_and_grad_buffer import (
+    _ParamAndGradBuffer,
+    _param_uses_quantized_storage,
+    partition_buckets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +140,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 assert param.requires_grad
 
                 param_dtype = param.dtype
-                if is_float8tensor(param) or is_nvfp4tensor(param):
+                if _param_uses_quantized_storage(param):
                     # Currently TE's Float8Tensor is a wrapper of torch.Tensor. It has a "fake"
                     # dtype (usually a higher precision dtype such as bfloat16), but its actual
                     # data is stored in the form of a torch uint8 tensor within the Float8Tensor's
@@ -488,23 +491,23 @@ class DistributedDataParallel(_BaseDataParallel):
             bucket_group.start_param_sync(force_sync=force_sync)
 
             if not self.ddp_config.overlap_param_gather:
-                # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
-                # the param.data, since param buffer is not mapped to model params for MXFP8 case.
-                # The paramaters are cast from bf16 to MXFP8 during copy.
+                # For quantized params using the high-precision param AG buffer, copy the
+                # all-gathered param data back into param.data. The copy casts from the
+                # high-precision AG buffer into the parameter's quantized storage.
                 # In the case of "overlap_param_gather=True", the param copy is done
-                # in "finish_param_sync" stage after zeroing the shared gardient buffers.
+                # in "finish_param_sync" stage after zeroing the shared gradient buffers.
                 if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                     for bucket in bucket_group.buckets:
                         is_bf16_weight_bucket = False
                         for param in bucket.params:
-                            # Skip copying since bf16 weights in the mxfp8 model
-                            # are already mapped to param.data.
-                            if not is_float8tensor(param):
+                            # Skip copying since non-quantized weights are already mapped to
+                            # param.data.
+                            if not _param_uses_quantized_storage(param):
                                 is_bf16_weight_bucket = True
                                 break
                             param_start, param_end = bucket.param_to_index[param]
                             param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                            param.data.copy_(param_slice.view(param.data.shape))
+                            copy_tensor_to_quantized_param(param, param_slice)
                         if is_bf16_weight_bucket:
                             continue
                         # All-gathered params are not needed after being copied to param.data.
@@ -515,13 +518,13 @@ class DistributedDataParallel(_BaseDataParallel):
                         # yet completed AG.
                         bucket.param_data.zero_()
                 else:
-                    fp8_params = []
+                    quantized_params = []
                     for bucket in bucket_group.buckets:
                         for param in bucket.params:
-                            if is_float8tensor(param):
-                                fp8_params.append(param)
-                    if len(fp8_params) > 0:
-                        post_all_gather_processing(fp8_params)
+                            if _param_uses_quantized_storage(param):
+                                quantized_params.append(param)
+                    if len(quantized_params) > 0:
+                        post_all_gather_processing(quantized_params)
 
     def start_grad_sync(self, *unused):
         """
