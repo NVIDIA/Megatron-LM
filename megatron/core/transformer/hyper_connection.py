@@ -388,7 +388,7 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            mhc_recompute_manager: Optional CheckpointWithoutOutputManager for checkpoint management.
+            mhc_recompute_manager: Optional CheckpointWithoutOutputManager for checkpoint mgmt.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
 
         Returns:
