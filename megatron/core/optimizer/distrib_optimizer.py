@@ -1850,15 +1850,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             bucket_state[0],
                         )
                         tensor_keys = [
-                            k for k, v in first_real_entry.items()
+                            k
+                            for k, v in first_real_entry.items()
                             if isinstance(v, torch.Tensor) and k != 'step'
                         ]
 
                         merged_bucket = {}
                         for k in tensor_keys:
                             param_list = [
-                                (e['gbuf_local_start'], e['gbuf_local_end'],
-                                 e[k], e.get('padding', False))
+                                (
+                                    e['gbuf_local_start'],
+                                    e['gbuf_local_end'],
+                                    e[k],
+                                    e.get('padding', False),
+                                )
                                 for e in bucket_state
                                 if k in e and isinstance(e.get(k), torch.Tensor)
                             ]
@@ -1876,7 +1881,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     if not is_pad:
                                         # Wire optimizer state tensor as a view so DCP loading
                                         # into merged_data automatically updates t.
-                                        t.data = merged_data[offset:offset + size]
+                                        t.data = merged_data[offset : offset + size]
                                     offset += size
 
                             merged_bucket[k] = ShardedTensor(
