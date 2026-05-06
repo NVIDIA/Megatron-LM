@@ -121,6 +121,8 @@ def setup(
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=restart_store,
     )
+    # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     # Set CPU affinity for optimal host-device transfers when fine-grained activation offloading is enabled
     if cfg.model.fine_grained_activation_offloading:
