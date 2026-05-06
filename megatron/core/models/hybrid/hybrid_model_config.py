@@ -27,13 +27,14 @@ through the public queries on this class (:attr:`num_layers`,
 :attr:`has_multi_latent_attention`, :meth:`derived_moe_metadata`,
 :attr:`embedding_marker`, etc.).
 
-:meth:`_lower` and :class:`_RecipeLowering` below are intentionally private.
-They are the lowering pass that turns the DSL into the per-layer
-:class:`TransformerConfig` representation today's :class:`HybridModel`
-consumes; that target type is an implementation detail that will be replaced
-when ``TransformerConfig`` / ``TransformerLayer`` are retired. Recipe authors
-must not depend on the lowering output's shape — pass the recipe to
-:class:`HybridModel` and let it own the lowering.
+:meth:`validate` runs the recipe's structural and parallelism checks
+without constructing any TransformerConfigs; :meth:`_lower` is the
+package-internal lowering that produces the per-layer
+:class:`TransformerConfig` triple today's :class:`HybridModel` consumes.
+Both will change (or disappear) when ``TransformerConfig`` /
+``TransformerLayer`` are retired. Recipe authors must not depend on
+``_lower``'s return shape — pass the recipe to :class:`HybridModel`
+and let it own the lowering.
 """
 
 import dataclasses
@@ -65,36 +66,6 @@ _YARN_FIELDS = (
     "yarn_mscale_all_dim",
     "yarn_correction_range_round_to_int",
 )
-
-
-@dataclass
-class _RecipeLowering:
-    """Internal lowering result of :meth:`HybridModelConfig._lower`.
-
-    Carries exactly the data :class:`HybridModel` consumes when constructed
-    with ``recipe=``: a stack-level :class:`TransformerConfig`, per-layer
-    configs and symbols, and the model-wrapping kwargs derived from the
-    embedding / loss markers.
-
-    This type is **private**. :class:`HybridModel` reads it inline during
-    construction; nothing outside the hybrid package should hold references
-    to it. Its shape will change (or disappear) when the underlying layer
-    infrastructure is rewritten with dedicated per-layer config classes.
-    """
-
-    config: TransformerConfig
-    layer_type_list: List[str]
-    layer_config_list: List[TransformerConfig]
-    vocab_size: int
-    max_sequence_length: int
-    position_embedding_type: str
-    rotary_percent: float
-    rotary_base: int
-    seq_len_interpolation_factor: Optional[float]
-    scatter_embedding_sequence_parallel: bool
-    untie_embeddings_and_output_weights: bool
-    fp16_lm_cross_entropy: bool
-    parallel_output: bool
 
 
 @dataclass
@@ -244,14 +215,27 @@ class HybridModelConfig:
     # Internal lowering
     #
     # Do not call from outside the hybrid package. ``HybridModel.__init__``
-    # invokes this when constructed with ``recipe=``; it returns a private
-    # dataclass shaped to match the current TransformerConfig-based
-    # backend. Both this method and its return type are implementation
-    # details that will change when TC / TransformerLayer are retired.
+    # invokes this when constructed with ``config: HybridModelConfig``; it
+    # returns the three pieces HybridModel still needs as TransformerConfig:
+    # the stack-level TC, the per-layer symbol list, and the per-layer TC
+    # list. Embedding-marker fields (vocab_size, position_embedding_type,
+    # …) and loss-marker fields (fp16_lm_cross_entropy, parallel_output)
+    # are NOT included — read them directly from
+    # :attr:`embedding_marker` and :attr:`loss_marker`. This method's
+    # signature and return shape are implementation details that will
+    # change when TC / TransformerLayer are retired.
     # ──────────────────────────────────────────────────────────────────────
 
-    def _lower(self) -> _RecipeLowering:
-        """Lower this recipe into the form :class:`HybridModel` consumes today."""
+    def _lower(self) -> Tuple[TransformerConfig, List[str], List[TransformerConfig]]:
+        """Lower this recipe into ``(stack_tc, layer_symbols, layer_tcs)``.
+
+        The three returned pieces are exactly what :class:`HybridModel`
+        consumes when constructed with a :class:`HybridModelConfig`.
+        Marker-derived fields (vocab_size, max_sequence_length,
+        position_embedding_type, rotary_*, fp16_lm_cross_entropy,
+        parallel_output, …) are not in the return value — read them
+        directly from :attr:`embedding_marker` and :attr:`loss_marker`.
+        """
         embedding, decoder_leaves, loss = _split_pattern(self.layer_pattern)
 
         # Auto-inherit the recipe's common_config into any layer/marker that
@@ -477,21 +461,7 @@ class HybridModelConfig:
                 for name, value in embedding.yarn.items():
                     setattr(stack_config, name, value)
 
-        return _RecipeLowering(
-            config=stack_config,
-            layer_type_list=layer_type_list,
-            layer_config_list=layer_config_list,
-            vocab_size=embedding.vocab_size,
-            max_sequence_length=embedding.max_sequence_length,
-            position_embedding_type=embedding.position_embedding_type,
-            rotary_percent=embedding.rotary_percent,
-            rotary_base=embedding.rotary_base,
-            seq_len_interpolation_factor=embedding.seq_len_interpolation_factor,
-            scatter_embedding_sequence_parallel=embedding.scatter_embedding_sequence_parallel,
-            untie_embeddings_and_output_weights=self.untie_embeddings_and_output_weights,
-            fp16_lm_cross_entropy=loss.fp16_lm_cross_entropy,
-            parallel_output=loss.parallel_output,
-        )
+        return stack_config, layer_type_list, layer_config_list
 
 
 # --- pattern-structure helpers --------------------------------------------
