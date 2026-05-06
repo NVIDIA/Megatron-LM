@@ -14,7 +14,7 @@ from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from ..uneven_dtensor import make_uneven_dtensor
-from .allocator import TemporaryBucketAllocator
+from .allocator import TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .utils import ParamGroupIdx
 
@@ -120,7 +120,7 @@ class ParameterGroup:
         s = self.sharding_strategy
         shard_weights = s == "optim_grads_params"
         shard_main_weights = s != "no_shard"
-        shard_grads = s in ("optim", "optim_grads", "optim_grads_params")
+        shard_grads = s in ("optim_grads", "optim_grads_params")
 
         # Create model weight buffer
         if s != "no_shard":
@@ -137,6 +137,13 @@ class ParameterGroup:
             for i, p in enumerate(self.params):
                 mbuf.set_item(i, p.detach().to(self.main_params_dtype))
             self.main_weight_buffer = mbuf
+
+        # Free the original full parameter tensors now that their data has been
+        # copied into the weight buffers. The module holds DTensor shard views and
+        # unshard() rebinds .data to the all-gathered buffer, so the original
+        # storage is never accessed again.
+        for p in self.params:
+            _free_storage(p.data)
 
         # Create gradient buffer
         if self.requires_grad:
@@ -191,10 +198,10 @@ class ParameterGroup:
         Initialize distributed parameter views (DTensors) into the buffers.
 
         Creates DTensor views of model weights and gradients based on sharding strategy:
-        - "optim_grads_params": both weights and grads sharded
-        - "optim_grads": only grads sharded
-        - "optim": only weights sharded
-        - "no_shard": replicated (no sharding)
+        - "optim_grads_params": weights and grads sharded, full ZeRO-3
+        - "optim_grads": grads sharded, weights replicated (ZeRO-2)
+        - "optim": optimizer state sharding only, weights and grads replicated (ZeRO-1)
+        - "no_shard": replicated, no sharding (DDP-equivalent)
         """
         self.dist_params = []
         self.dist_grads = []

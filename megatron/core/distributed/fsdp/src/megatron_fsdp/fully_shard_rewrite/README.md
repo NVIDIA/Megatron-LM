@@ -5,19 +5,18 @@ This directory contains the **fully_shard_v2** implementation — a PyTorch FSDP
 ## Architecture
 
 ```
-megatron_fsdp/
+fully_shard_rewrite/
+├── README.md                    # This file
 ├── __init__.py                  # Public exports
-├── fully_shard_v2.py            # Core fully_shard() API + FSDPModule class
+├── fully_shard.py               # Core fully_shard() API + FSDPModule class
 ├── param_group.py               # ParameterGroup — groups params with shared buffers
 ├── dp_buffer.py                 # DataParallelBuffer — flat buffer management
 ├── allocator.py                 # TemporaryBucketAllocator — temp buffer reuse
-├── uneven_dtensor.py            # Handling uneven tensor sharding + checkpoint
-├── distributed_data_parallel_config.py  # Config classes
-├── mixed_precision.py           # Mixed precision policies
-└── tests/
-    ├── test_allocator.py
-    └── test_param_group.py
+├── utils.py                     # Internal utility functions
+└── design.md                    # Detailed design documentation (overlap, memory, sync)
 ```
+
+For the broader `megatron_fsdp` package layout, see the parent directory.
 
 ## Key Concepts
 
@@ -61,7 +60,7 @@ Groups parameters sharing the same (device, dtype, requires_grad):
 
 ### Uneven DTensor Handling
 
-`uneven_dtensor.py` provides critical functionality for handling tensors that may be unevenly sharded across ranks:
+See the parent directory `..` for `uneven_dtensor.py` which provides:
 
 - `gather_and_compute_chunk_metadata()` — computes global offsets/sizes for each shard
 - `update_uneven_dtensor_chunk_metadata()` — attaches chunk metadata to DTensor for checkpointing
@@ -71,12 +70,12 @@ Groups parameters sharing the same (device, dtype, requires_grad):
 
 ## Sharding Strategies
 
-| Strategy | Shard Weights | Shard Gradients |
-|----------|---------------|-----------------|
-| `optim` | Yes | No |
-| `optim_grads` | No | Yes |
-| `optim_grads_params` | Yes | Yes |
-| `no_shard` | No | No |
+| Strategy | Shard Weights | Shard Gradients | Notes |
+|----------|---------------|-----------------|-------|
+| `no_shard` | No | No | Like DDP: no sharding |
+| `optim` | No | No | Like ZeRO-1: shard optimizer states only |
+| `optim_grads` | No | Yes | Like ZeRO-2: shard optimizer states + gradients |
+| `optim_grads_params` | Yes | Yes | Like ZeRO-3: full parameter/gradient/optimizer sharding |
 
 ## Integration with Megatron
 

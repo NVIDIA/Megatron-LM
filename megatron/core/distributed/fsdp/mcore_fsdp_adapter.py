@@ -260,8 +260,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     fully_shard(m, mesh=dp_mesh, **kwargs)
         fully_shard(module, mesh=dp_mesh, **kwargs)
 
-        if ddp_config.check_for_nan_in_grad:
-            module._set_nan_check(True)
+        # Per-module NaN checking is disabled by default on the fully_shard
+        # path to avoid the per-parameter synchronization overhead on every
+        # unshard. Enable via a manual call to module._set_nan_check(True).
+        # if ddp_config.check_for_nan_in_grad:
+        #     module._set_nan_check(True)
 
         super().__init__(config=config, module=module)
 
@@ -520,12 +523,19 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
     def stop_communication(self):
         """
-        Stop communication for the module.
+        Cease all pending FSDP communication and synchronize main stream.
+
+        For the fully_shard path: waits on both ag_stream (async all-gather)
+        and rs_stream (async reduce-scatter) to bring their work into the
+        main CUDA stream.
+        For the Megatron-FSDP path: calls synchronize_gradient_reduce and
+        synchronize_param_gather.
         """
         if self.ddp_config.use_fully_shard_api:
-            raise NotImplementedError(
-                "stop_communication is not implemented for the fully_shard API path. "
-            )
+            ctx = self.module._fsdp_root_context
+            torch.cuda.current_stream().wait_stream(ctx.ag_stream)
+            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
+            return
 
         self.module.synchronize_gradient_reduce()
         self.module.synchronize_param_gather()

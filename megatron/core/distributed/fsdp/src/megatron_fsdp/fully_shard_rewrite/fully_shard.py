@@ -250,8 +250,16 @@ class FSDPModule(nn.Module):
         computation. After unsharding, each param.data points to
         the full (unsharded) tensor.
         """
+        torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
+
+        if async_op:
+            # Synchronize ag_stream with current_stream to guarantee that main-stream
+            # writes to parameter data are visible before the all-gather kernel reads them
+            # on ag_stream. Without this barrier, stale or partially-written parameter
+            # shards may be gathered, causing convergence divergence.
+            stream.wait_stream(torch.cuda.current_stream())
 
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
         if async_op:
@@ -272,7 +280,7 @@ class FSDPModule(nn.Module):
                         ).any(), f"NaN detected in dist param for parameter {name}"
 
                 with torch.cuda.stream(stream):
-                    param_group.unshard(async_op=async_op)
+                    param_group.unshard()
 
             # Record event to track when unshard is done for this module
             if async_op:
@@ -290,10 +298,11 @@ class FSDPModule(nn.Module):
                 _replace_module_parameter(self, name, param)
 
             # Optional NaN checking for debugging
-            # FIXME: Need cuda synchronization before checking for NaN to ensure data is ready.
-            # if getattr(self, "_enable_nan_checks", False):
-            #     for name, param in zip(param_names, param_group.params):
-            #         assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
+            if getattr(self, "_enable_nan_checks", False):
+                for name, param in zip(param_names, param_group.params):
+                    assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
+
+        torch.cuda.nvtx.range_pop()
 
     def _get_prefetch_next_modules(self, bwd_pass: bool = False) -> List["FSDPModule"]:
         """Prefetch the next module in the forward/backward pass."""
@@ -317,12 +326,14 @@ class FSDPModule(nn.Module):
 
     def reshard(self):
         """Reshard parameters by replacing with sharded DTensors."""
+        torch.cuda.nvtx.range_push("MFSDP reshard")
         ctx = self._fsdp_root_context
         for param_names, param_group in self._named_param_groups:
             param_group.reshard()
             for name, dist_param in zip(param_names, param_group.dist_params):
                 _replace_module_parameter(self, name, dist_param)
         ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
+        torch.cuda.nvtx.range_pop()
 
     def reduce_grad(self, async_op: bool = False):
         """
@@ -333,6 +344,7 @@ class FSDPModule(nn.Module):
         2. Perform all-reduce or reduce-scatter
         3. Install reduced gradients to distributed parameters
         """
+        torch.cuda.nvtx.range_push("MFSDP reduce_grad")
         ctx = self._fsdp_root_context
         stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
@@ -380,10 +392,9 @@ class FSDPModule(nn.Module):
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     param_group.reduce_grad()
-                    event = torch.cuda.Event()
-                    event.record()
 
-                    ctx.reduce_grad_buckets[id(self)].append((event, param_group))
+                event = stream.record_event()
+                ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
@@ -406,6 +417,8 @@ class FSDPModule(nn.Module):
                         assert not torch.isnan(
                             dist_grad._local_tensor
                         ).any(), f"NaN in dist grad for parameter {name}"
+
+        torch.cuda.nvtx.range_pop()
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):

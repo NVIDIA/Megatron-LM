@@ -1,4 +1,4 @@
-# Design: Unshard Prefetch & Reduce-Grad Overlap in `fully_shard_rewrite`
+# Design: `fully_shard_rewrite` Implementation
 
 ---
 
@@ -7,9 +7,10 @@
 | File | Role in overlap |
 |---|---|
 | `fully_shard.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, all hooks, `unshard()`, `reshard()`, `reduce_grad()`, final callback |
-| `param_group.py` | `ParameterGroup.unshard(async_op)`, `reduce_grad()`, `release_grad_buffer()` |
+| `param_group.py` | `ParameterGroup.unshard(async_op)`, `reduce_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
 | `dp_buffer.py` | `DataParallelBuffer.unshard(async_op)` (all-gather + `p.data` rebind), `reduce_grad()` (reduce-scatter + shard accumulation) |
 | `allocator.py` | `TemporaryBucketAllocator` — pooled memory for unsharded parameter and gradient buffers |
+| `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
 
 No changes to `utils.py` are needed for either overlap feature.
 
@@ -89,7 +90,15 @@ module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 ### `FSDPModule.unshard(async_op, bwd_pass)`
 
 ```
-stream = ctx.ag_stream if async_op else current_stream
+stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
+
+# *** Critical: synchronize ag_stream with current_stream before launching AG ***
+# This ensures main-stream writes to parameter data (e.g. reshard after forward,
+# or tensor-parallel slice writes) are visible before the all-gather reads them.
+# Without this barrier, stale or partially-written parameter shards may be
+# gathered, causing convergence divergence.
+if async_op:
+    stream.wait_stream(torch.cuda.current_stream())
 
 # Build the work list: self + (optionally) next module to prefetch
 if async_op:
@@ -103,10 +112,11 @@ for module in [self] + prefetch:
 
     with torch.cuda.stream(stream):
         for _, param_group in module._named_param_groups:
-            param_group.unshard(async_op=async_op)
-            # → DataParallelBuffer.unshard(async_op):
+            param_group.unshard()
+            # → DataParallelBuffer.unshard():
             #     allocate unsharded bucket, launch all_gather_into_tensor,
             #     rebind p.data → unsharded buffer slice (even before AG done!)
+            # NOTE: async_op is NOT passed; the stream context handles dispatch.
 
     if async_op:
         event = stream.record_event()
@@ -130,6 +140,17 @@ for param_names, param_group in self._named_param_groups:
 NCCL fill is in-flight. The outer `unshard()` guards correctness by calling `event.wait()`
 before calling `_replace_module_parameter`, so the module's parameters are safe to read by
 the time the forward kernel uses them.
+
+**Stream ordering barrier.** When `async_op=True`, `unshard()` inserts a
+`stream.wait_stream(torch.cuda.current_stream())` on `ag_stream` before launching any
+all-gather. This ensures that writes performed on the main stream (e.g., reshard after a
+previous forward, or tensor-parallel slice updates) are fully visible to the all-gather
+kernel. Without this barrier, stale or partially-written parameter shards may be read by
+the NCCL collective, causing convergence divergence.
+
+**NVTX profiling.** `unshard()`, `reshard()`, and `reduce_grad()` each push/pop a
+`torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
+for profiling visibility in tools like Nsight Systems.
 
 Prefetched modules' data also becomes valid when their own pre-hook later calls `event.wait()`
 for them. If a module's pre-hook arrives and its event is already set (prefetch was launched
@@ -174,7 +195,7 @@ module.post_backward_issued = True
 ### `FSDPModule.reduce_grad(async_op)`
 
 ```
-stream = ctx.rs_stream if async_op else current_stream
+stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
 # --- Step 1: Sliding drain — free grad buffers 2 positions back in backward order ---
 if async_op:
@@ -203,15 +224,14 @@ for param_names, param_group in self._named_param_groups:
 
     # --- Step 3: Reduce-scatter on rs_stream ---
     if async_op:
-        stream.wait_stream(current_stream)    # ensure .grad copy is visible to rs_stream
+        stream.wait_stream(torch.cuda.current_stream())    # ensure .grad copy is visible to rs_stream
         with torch.cuda.stream(stream):
             param_group.reduce_grad()
             #   → DataParallelBuffer.reduce_grad() (synchronous within this stream):
             #       fetch_unsharded_buffer() allocates full grad buffer
             #       reduce_scatter_tensor(output=grad_shard, input=full_grad)
             #       self.data[local_idx:...] += grad_shard
-            event = torch.cuda.Event()
-            event.record()
+        event = stream.record_event()
         ctx.reduce_grad_buckets[id(self)].append((event, param_group))
         # param_group.release_grad_buffer() is NOT called here; deferred until drain/final CB
     else:
@@ -352,6 +372,16 @@ modifications for the overlap feature.
 
 ---
 
+## Memory Optimization: Freeing Original Parameter Storage
+
+After `ParameterGroup._init_buffers()` copies parameter data into the internal weight buffers
+(`model_weight_buffer` and optionally `main_weight_buffer`), the original full parameter tensors
+are freed via `_free_storage(p.data)`. The module holds DTensor shard views and `unshard()`
+rebinds `.data` to the all-gathered buffer, so the original storage is dead and freeing it
+reduces peak memory during model construction.
+
+---
+
 ## Configuration
 
 ```python
@@ -366,6 +396,26 @@ fully_shard(
 Setting either flag to `False` assigns `torch.cuda.current_stream()` to the corresponding
 stream variable, making all `with torch.cuda.stream(stream)` blocks no-ops — zero overhead,
 identical to baseline.
+
+---
+
+## `stop_communication()` — Main Stream Synchronization
+
+The `FullyShardedDataParallel.stop_communication()` method (in `mcore_fsdp_adapter.py`) ensures
+all pending FSDP communication is complete and visible to the main CUDA stream. This is called
+before the optimizer step to guarantee that gradient reductions and parameter updates are
+synchronized.
+
+For the `fully_shard` path, the implementation was previously `NotImplementedError`. It now
+calls:
+
+```python
+torch.cuda.current_stream().wait_stream(ctx.ag_stream)  # finish all-gather work
+torch.cuda.current_stream().wait_stream(ctx.rs_stream)   # finish reduce-scatter work
+```
+
+This brings both communication streams into the main stream, ensuring the optimizer sees
+fully-synchronized parameters and gradients.
 
 ---
 
@@ -389,10 +439,9 @@ identical to baseline.
    stream allocation is wasted. A small refactor would pass `root_context` directly to avoid
    the redundant allocation.
 
-4. **`torch.current_stream()` vs `torch.cuda.current_stream()`.** The final callback uses
-   `torch.current_stream().wait_stream(stream)` (no `.cuda`). This is equivalent only when
-   the default device is CUDA; it should be `torch.cuda.current_stream()` for consistency
-   with the rest of the file.
+4. ~~**`torch.current_stream()` vs `torch.cuda.current_stream()`.**~~ **RESOLVED.** The final
+   callback now uses `torch.cuda.current_stream().wait_stream(stream)` consistently with the
+   rest of the file.
 
 5. **Outer-DP / HSDP.** `_FSDPRootContext` does not carry an outer-DP stream for the second
    all-gather needed in hybrid-sharding (outer-DP × inner-FSDP) setups. This mirrors the
