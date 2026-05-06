@@ -6,6 +6,7 @@ from megatron.core._rank_utils import safe_get_rank
 from megatron.core.config import set_experimental_flag
 from megatron.core.jit import disable_jit_fuser
 from megatron.core.utils import get_model_config
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.config import PretrainConfigContainer, SchedulerConfig
 from megatron.training.initialize import initialize_megatron, set_jit_fusion_options
 from megatron.training.utils import print_rank_0
@@ -25,6 +26,14 @@ from megatron.core.optimizer import (
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 
 from megatron.training.state import GlobalState
+
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+
+    HAVE_FSDP2 = True
+except ImportError:
+    HAVE_FSDP2 = False
+
 
 class SetupOutput(NamedTuple):
     """Represents the output of the main setup function.
@@ -60,6 +69,7 @@ def setup(
     get_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
     get_position_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
     restart_store: torch.distributed.Store | None = None,
+    checkpointing_context: dict[str, Any] = {},
     # callback_manager: CallbackManager | None = None,  # TODO (@maanug): migrate
 ) -> SetupOutput:
     """Initialize the training/evaluation environment using an existing GlobalState.
@@ -152,6 +162,7 @@ def setup(
     # Model, optimizer, and learning rate.
     timers("model-and-optimizer-setup", log_level=0).start(barrier=True)
 
+    # TODO (@maanug): PEFT?
     # TODO (@maanug): check and load modelopt state
 
     # Enable CUDA allocator history tracing before any model tensors are allocated,
@@ -174,6 +185,36 @@ def setup(
     )
     timers("model-and-optimizer-setup").stop()
     barrier_and_log("after model, optimizer, and learning rate scheduler are built")
+
+    # TODO (@maanug): check for local checkpoints
+    # TODO (@maanug): load PEFT base checkpoint?
+
+    should_load_checkpoint = (
+        (cfg.checkpoint.load is not None and checkpoint_exists(cfg.checkpoint.load))
+        or (
+            cfg.checkpoint.pretrained_checkpoint is not None
+            and checkpoint_exists(cfg.checkpoint.pretrained_checkpoint)
+        )
+    )
+
+    if should_load_checkpoint:
+        from megatron.training.global_vars import get_args
+
+        timers("load-checkpoint", log_level=0).start(barrier=True)
+        args = get_args()
+        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            checkpointing_context=checkpointing_context,
+            skip_load_to_model_and_opt=HAVE_FSDP2
+            and cfg.dist.use_torch_fsdp2
+            and cfg.checkpoint.ckpt_format == "torch_dist",
+        )
+        state.train_state.step = args.iteration
+        state.train_state.floating_point_operations_so_far = args.num_floating_point_operations_so_far
+        timers("load-checkpoint").stop(barrier=True)
+        timers.log(["load-checkpoint"])
 
 
 def _build_distributed_model(cfg: PretrainConfigContainer, pg_collection: ProcessGroupCollection) -> list[MegatronModule]:
