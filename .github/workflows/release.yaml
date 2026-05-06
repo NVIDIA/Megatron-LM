@@ -87,7 +87,7 @@ jobs:
              || needs.pre-flight.outputs.is_merge_group == 'true'
              || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       )
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@a0921929733d506dee2de6889c39feee5da623ab
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@6afcae295503a63fdafed18ba127c7d6dda24c01
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       validate-only: ${{ github.event_name != 'workflow_dispatch' }}
@@ -130,7 +130,7 @@ jobs:
       github.repository == 'NVIDIA/Megatron-LM'
       && (success() || !failure())
       && !cancelled()
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@a0921929733d506dee2de6889c39feee5da623ab
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@6afcae295503a63fdafed18ba127c7d6dda24c01
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       release-version: ${{ needs.bump.outputs.release-version }}
