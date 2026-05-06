@@ -461,9 +461,7 @@ class MoELayer(BaseMoELayer):
             stream = SharedExpertMLP.stream
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                self._latent_shared_expert_output = apply_module(self.shared_experts)(
-                    hidden_states
-                )
+                self._latent_shared_expert_output = apply_module(self.shared_experts)(hidden_states)
         elif self.config.moe_latent_size:
             assert (
                 not self.shared_expert_overlap
