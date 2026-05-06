@@ -19,6 +19,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -121,7 +122,7 @@ def main():
 
     # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
     # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
-    initialize_megatron(
+    args = parse_and_validate_args(
         extra_args_provider=add_static_inference_args,
         args_defaults={
             'no_load_rng': True,
@@ -130,8 +131,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-
-    args = get_args()
+    initialize_megatron()
 
     model = get_model_for_inference()
 

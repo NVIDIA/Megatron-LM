@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import inspect
 import multiprocessing
 import os
 import random
@@ -739,7 +740,9 @@ def save_checkpoint(
                 validate_sharding_integrity = not args.ckpt_assume_constant_structure
             else:
                 validate_sharding_integrity = True
-                save_strategy = TorchDistSaveShardedStrategy()
+                save_strategy = TorchDistSaveShardedStrategy(
+                    cpu_shm_mode=getattr(args, 'async_ckpt_use_cpu_shm', False)
+                )
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
                     if args.async_save:
@@ -805,8 +808,25 @@ def save_checkpoint(
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
+                _cpu_shm = getattr(args, 'async_ckpt_use_cpu_shm', False)
+                _writer_kwargs = {}
+                if _cpu_shm:
+                    if (
+                        "use_cpu_shm_for_gpu_tensors"
+                        in inspect.signature(FileSystemWriterAsync.__init__).parameters
+                    ):
+                        _writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
+                    else:
+                        raise AssertionError(
+                            "Installed nvidia-resiliency-ext does not support "
+                            "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
+                            "to use --async-ckpt-use-cpu-shm."
+                        )
                 fs_storage_writer = FileSystemWriterAsync(
-                    checkpoint_name, thread_count=args.dist_ckpt_workers, use_msc=args.enable_msc
+                    checkpoint_name,
+                    thread_count=args.dist_ckpt_workers,
+                    use_msc=args.enable_msc,
+                    **_writer_kwargs,
                 )
 
                 save_state_dict_ret = save_state_dict_async_plan(

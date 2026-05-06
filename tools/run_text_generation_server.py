@@ -39,6 +39,7 @@ sys.path.append(
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
@@ -60,16 +61,14 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 
     tokenizer = get_tokenizer()
 
-    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
-    inference_wrapped_model = GPTInferenceWrapper(
-        model, inference_context
+    inference_context = StaticInferenceContext(
+        args.inference_max_requests, args.inference_max_sequence_length
     )
+    inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
-    return StaticInferenceEngine(
-        text_generation_controller=text_generation_controller,
-    )
+    return StaticInferenceEngine(text_generation_controller=text_generation_controller)
 
 
 def add_text_generate_args(parser):
@@ -113,7 +112,7 @@ def add_text_generate_args(parser):
 @torch.inference_mode()
 def main(model_type: str = "gpt"):
     """Runs the text generation server with the specified model type."""
-    initialize_megatron(
+    parse_and_validate_args(
         extra_args_provider=add_text_generate_args,
         args_defaults={
             'no_load_rng': True,
@@ -121,6 +120,7 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
+    initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -177,6 +177,7 @@ def main(model_type: str = "gpt"):
                 pass
         elif choice.item() == 1:
             break
+
 
 if __name__ == "__main__":
     main(model_type="gpt")

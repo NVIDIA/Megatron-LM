@@ -37,6 +37,7 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
@@ -85,6 +86,37 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     return parser
 
 
+def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
+    args = parse_args(extra_args_provider, ignore_unknown_args)
+
+    if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
+        from megatron.training.checkpointing import load_args_from_checkpoint
+
+        assert (
+            args.load is not None or args.pretrained_checkpoint is not None
+        ), "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
+        assert args.non_persistent_ckpt_type != "local", (
+            "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
+            "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
+            "before initializing LocalCheckpointManager."
+        )
+        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
+        load_args_from_checkpoint(args)
+
+    if args.yaml_cfg is not None:
+        from megatron.training.yaml_arguments import validate_yaml
+
+        args = validate_yaml(args, args_defaults)
+    else:
+        validate_args(args, args_defaults)
+
+    # set global args, build tokenizer, and set adlr-autoresume,
+    # tensorboard-writer, and timers.
+    set_global_variables(args)
+
+    return args
+
+
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments', allow_abbrev=False)
@@ -100,6 +132,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
 
     # Experimental yaml
     if args.yaml_cfg is not None:
@@ -237,6 +271,21 @@ def no_rope_freq_type(x):
         return int(x)
 
 
+def compress_ratios_type(x):
+    """Per-layer compress ratios for compressed sparse attention.
+
+    Accepts a string containing a Python list expression, e.g.:
+      "[0,0,4,128,4,128]"
+      "([0]+[4,128]*2)*3"
+    The result must be a list of integers. Each value represents the
+    compression ratio for the corresponding transformer layer.
+    """
+    if isinstance(x, list):
+        return x
+    assert isinstance(x, str)
+    return _eval_pattern(x)
+
+
 def moe_freq_type(x):
     """Frequency between MoE layers and Dense layers.
 
@@ -303,6 +352,12 @@ def tuple_type(x):
 
 
 def validate_args(args, defaults={}):
+
+    # Prep for checkpoint conversion.
+    if args.ckpt_convert_format is not None:
+        assert args.ckpt_convert_save is not None
+        assert args.load is not None
+        args.exit_on_missing_checkpoint = True
 
     # Temporary
     assert args.non_persistent_ckpt_type in [
@@ -618,13 +673,14 @@ def validate_args(args, defaults={}):
         args.phase_transition_iterations = sorted(
             int(x.strip()) for x in args.phase_transition_iterations.split(",")
         )
-        assert (
-            args.rampup_batch_size is None
-        ), "multi-phase training does not support batch size ramp-up"
-
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    is_global_batch_size_explicitly_specified = getattr(
+        args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
+        raise ValueError('Cannot specify both --step-batch-size-schedule and --global-batch-size')
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
@@ -648,7 +704,6 @@ def validate_args(args, defaults={}):
         )
 
         # Ensure that the number of prompts we collect is a multiple of the global batch size.
-        # TODO: Make this account for batch size rampup?
         assert (
             num_generated_samples_per_inference_iteration % args.global_batch_size == 0
         ), f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
@@ -843,6 +898,11 @@ def validate_args(args, defaults={}):
                 "This argument will be ignored.",
                 args.rank,
             )
+
+    # Infer use of MLA from unified pattern
+    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+        args.multi_latent_attention = True
+
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
     # Uneven virtual pipeline parallelism
@@ -1126,6 +1186,16 @@ def validate_args(args, defaults={}):
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
+        assert (
+            args.ckpt_format == "fsdp_dtensor"
+        ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+
+    if args.nccl_ub and args.use_megatron_fsdp:
+        # In Megatron-LM, required implementation for manual registration is already provided.
+        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+        args.fsdp_manual_registration = True
+        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
+
     if args.fsdp_manual_registration:
         assert (
             args.use_megatron_fsdp
@@ -1210,9 +1280,6 @@ def validate_args(args, defaults={}):
         assert args.train_samples is None, 'expected iteration-based training'
         assert args.lr_decay_samples is None, 'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, 'expected iteration-based learning rate warmup'
-        assert (
-            args.rampup_batch_size is None
-        ), 'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert (
                 args.lr_warmup_iters == 0
@@ -1290,6 +1357,8 @@ def validate_args(args, defaults={}):
         if args.save_retain_interval is not None:
             assert args.save_retain_interval > 0
             assert args.save_retain_interval % args.save_interval == 0
+        if args.save_params_interval is not None:
+            assert not args.overlap_param_gather
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
@@ -1951,6 +2020,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
+    kw_args['actual_vocab_size'] = args.padded_vocab_size
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage'] = args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
@@ -1989,6 +2059,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+
+        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+            kw_args['experimental_attention_variant'] = 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -2367,6 +2441,7 @@ def _add_network_size_args(parser):
         "no_rope_freq",
         "moe_layer_freq",
         "linear_attention_freq",
+        "csa_compress_ratios",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
@@ -2421,6 +2496,7 @@ def _add_network_size_args(parser):
         "barrier_with_L1_time",
         # args uses same var with a different name
         "num_moe_experts",
+        "actual_vocab_size",
         "fp8_param",
         "fp4_param",
         # incompatible defaults in dataclass
@@ -3991,8 +4067,7 @@ def _add_data_args(parser):
         type=str,
         default=None,
         help='Comma-separated list of iterations where phase '
-        'transitions occur. Requires fixed global batch size across phases. '
-        'Does not support batch size ramp-up.',
+        'transitions occur. Requires fixed global batch size across phases.',
     )
     group.add_argument(
         '--split',
@@ -4521,6 +4596,18 @@ def _add_mla_args(parser):
         help="Mscale all dimensions for YaRN RoPE in multi-latent attention.",
     )
     group.add_argument(
+        '--o-groups',
+        type=int,
+        default=8,
+        help="Number of groups for grouped output (wo_a). 0 = single linear."
+    )
+    group.add_argument(
+        '--o-lora-rank',
+        type=int,
+        default=1024,
+        help="Low-rank dimension per group for grouped output (wo_a). Used when o-groups > 0."
+    )
+    group.add_argument(
         '--cache-mla-latents',
         action='store_true',
         default=False,
@@ -4552,6 +4639,17 @@ def _add_experimental_attention_variant_args(parser):
         'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
         'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
         '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.',
+    )
+    group.add_argument(
+        '--csa-compress-ratios',
+        type=compress_ratios_type,
+        default=None,
+        help='Per-layer compress ratios for compressed sparse attention. '
+            'Accepts a string containing a Python list expression, e.g.: '
+            '"[0,0,4,128,4,128]" or "([0]+[4,128]*2)*3". '
+            'Each value is the compression ratio for the corresponding '
+            'transformer layer (valid values: 0, 4, 128). '
+            'The list length must equal num_layers.'
     )
     return parser
 
@@ -4638,9 +4736,10 @@ def _add_experimental_args(parser):
         type=str,
         default=None,
         help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-        '* (attention), - (mlp), E (moe). Use | to define pipeline stage '
-        'boundaries for flexible virtual pipeline parallel (fVPP). Use / to '
-        'separate MTP patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+        '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+        'stage boundaries for flexible virtual pipeline parallel (fVPP). '
+        'Use / to separate MTP patterns. '
+        'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
         'When this flag is used, it is the sole indicator that a hybrid model '
         'is being run.',
     )
