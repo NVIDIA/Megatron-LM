@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 import time
 import logging
+from functools import partial
 from typing import NamedTuple, Callable, Any
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.config import set_experimental_flag
@@ -13,8 +14,10 @@ from megatron.training.utils import print_rank_0
 from megatron.training.utils.log_utils import append_to_progress_log, barrier_and_log
 from megatron.training.utils.train_utils import start_memory_history_recording
 import torch
-from megatron.core.transformer import MegatronModule
+from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.optimizer import (
@@ -216,6 +219,35 @@ def setup(
         timers("load-checkpoint").stop(barrier=True)
         timers.log(["load-checkpoint"])
 
+    _update_model_config_funcs(
+        model,
+        cfg.model.transformer,
+        cfg.ddp,
+        optimizer,
+        align_grad_reduce=cfg.dist.align_grad_reduce,
+        pg_collection=pg_collection,
+    )
+
+    # TODO (@maanug): data iterator setup
+
+    print_rank_0("done with setup ...")
+    timers.log(["model-and-optimizer-setup", "train/valid/test-data-iterators-setup"], barrier=True)
+
+    return SetupOutput(
+        state,
+        model,
+        optimizer,
+        scheduler,
+        # train_data_iterator,
+        None,
+        # valid_data_iterator,
+        None,
+        # test_data_iterator,
+        None,
+        # checkpoint_manager,
+        pg_collection,
+    )
+
 
 def _build_distributed_model(cfg: PretrainConfigContainer, pg_collection: ProcessGroupCollection) -> list[MegatronModule]:
     """Build distributed model from ModelConfig."""
@@ -230,6 +262,37 @@ def _build_distributed_model(cfg: PretrainConfigContainer, pg_collection: Proces
         use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
         data_parallel_random_init=cfg.rng.data_parallel_random_init,
     )
+
+
+def _update_model_config_funcs(
+    model: MegatronModule,
+    model_config: TransformerConfig,
+    ddp_config: DistributedDataParallelConfig,
+    optimizer: MegatronOptimizer | None,
+    *,
+    align_grad_reduce: bool = True,
+    pg_collection: ProcessGroupCollection | None = None,
+) -> None:
+    """Update model config sync funcs based on initialized model."""
+    if isinstance(model[0], (DistributedDataParallel, megatron_FSDP)) and ddp_config.overlap_grad_reduce:
+        assert model_config.no_sync_func is None, (
+            "When overlap_grad_reduce is True, config.no_sync_func must be None; "
+            "a custom no_sync_func is not supported when overlapping grad-reduce"
+        )
+        model_config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+        if len(model) == 1:
+            model_config.no_sync_func = model_config.no_sync_func[0]
+        if align_grad_reduce:
+            model_config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
+            if len(model) == 1:
+                model_config.grad_sync_func = model_config.grad_sync_func[0]
+    if ddp_config.overlap_param_gather and ddp_config.align_param_gather:
+        model_config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
+        if len(model) == 1:
+            model_config.param_sync_func = model_config.param_sync_func[0]
+    if optimizer is not None:
+        model_config.finalize_model_grads_func = partial(finalize_model_grads, pg_collection=pg_collection)
+        model_config.grad_scale_func = optimizer.scale_loss
 
 
 def _validate_and_set_vocab_size(model_vocab_size: int | None, tokenizer_vocab_size: int) -> tuple[int, bool]:
