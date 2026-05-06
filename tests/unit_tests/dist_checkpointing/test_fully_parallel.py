@@ -643,8 +643,13 @@ class TestCrossRanksReads:
             )
             save_strategy.save(state_dict, ckpt_dir)
 
+            # Construct the base strategy directly (instead of via
+            # ``get_default_strategy``) so we can pass the
+            # ``replicate_local_replicas`` flag to the load constructor.
             load_strategy = FullyParallelLoadStrategyWrapper(
-                get_default_strategy(StrategyAction.LOAD_SHARDED, 'torch_dist', 1),
+                TorchDistLoadShardedStrategy(
+                    replicate_local_replicas=replicate_local_replicas
+                ),
                 parallelization_group,
                 do_cache_distribution=True,
                 exchange_algo='broadcast',
@@ -689,9 +694,7 @@ class TestCrossRanksReads:
                 return local_plan
 
             with mock.patch.object(MCoreLoadPlanner, 'create_local_plan', mock_local_plan):
-                _ = load_strategy.load(
-                    state_dict, ckpt_dir, replicate_local_replicas=replicate_local_replicas
-                )
+                _ = load_strategy.load(state_dict, ckpt_dir)
 
         Utils.destroy_model_parallel()
 
@@ -831,11 +834,10 @@ class TestLocalReplicaSaveLoad:
                 sh.data = torch.zeros_like(sh.data)
 
             load_strategy = FullyParallelLoadStrategyWrapper(
-                TorchDistLoadShardedStrategy(), parallelization_group
+                TorchDistLoadShardedStrategy(replicate_local_replicas=load_replicate),
+                parallelization_group,
             )
-            loaded = load_strategy.load(
-                load_state_dict, ckpt_dir, replicate_local_replicas=load_replicate
-            )
+            loaded = load_strategy.load(load_state_dict, ckpt_dir)
 
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         expected_local_linear = expected['linear.weight'][2 * tp_rank : 2 * (tp_rank + 1)]

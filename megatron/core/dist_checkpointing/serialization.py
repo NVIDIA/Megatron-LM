@@ -59,7 +59,6 @@ def load(
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
     verify_integrity: bool = False,
-    replicate_local_replicas: bool = False,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -157,10 +156,7 @@ def load(
     )
 
     loaded_state_dict = sharded_strategy.load(
-        sharded_state_dict,
-        checkpoint_dir,
-        async_strategy,
-        replicate_local_replicas=replicate_local_replicas,
+        sharded_state_dict, checkpoint_dir, async_strategy
     )
 
     merge(common_state_dict, loaded_state_dict)

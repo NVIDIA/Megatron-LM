@@ -1229,7 +1229,10 @@ def _load_global_dist_base_checkpoint(
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
     load_strategy = TorchDistLoadShardedStrategy(
-        cache_metadata=args.ckpt_assume_constant_structure
+        cache_metadata=args.ckpt_assume_constant_structure,
+        replicate_local_replicas=getattr(
+            args, 'ckpt_fully_parallel_load_replicate_local', False
+        ),
     )
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
@@ -1252,9 +1255,6 @@ def _load_global_dist_base_checkpoint(
         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
         strict=args.dist_ckpt_strictness,
         verify_integrity=args.verify_integrity,
-        replicate_local_replicas=getattr(
-            args, 'ckpt_fully_parallel_load_replicate_local', False
-        ),
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 

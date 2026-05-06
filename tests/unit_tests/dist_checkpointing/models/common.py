@@ -68,12 +68,12 @@ def common_test_parallel_reconfiguration_e2e(
 ):
     """Test model saving and loading with different TP/PP.
 
-    The ``replicate_local_replicas`` arg is forwarded to both the
-    ``FullyParallelSaveStrategyWrapper`` and to the public ``load`` entry
-    point, so the same callsite covers both halves of the feature when a
-    test wants to exercise it. It is only meaningful when ``use_fpsl``
-    is True (the wrappers run only in that branch); on the no-FP path
-    the flag is ignored.
+    The ``replicate_local_replicas`` arg is passed at construction time
+    to the ``FullyParallelSaveStrategyWrapper`` (save side) and to the
+    ``TorchDistLoadShardedStrategy`` (load side) so both halves of the
+    feature are covered from the same callsite. It is only meaningful
+    when ``use_fpsl`` is True (the wrappers run only in that branch); on
+    the no-FP path the flag is ignored.
     """
     src_model_init_kwargs = src_model_init_kwargs or {}
     dst_model_init_kwargs = dst_model_init_kwargs or {}
@@ -114,7 +114,9 @@ def common_test_parallel_reconfiguration_e2e(
             **dst_model_init_kwargs,
         )
         if use_fpsl:
-            load_strategy = TorchDistLoadShardedStrategy()
+            load_strategy = TorchDistLoadShardedStrategy(
+                replicate_local_replicas=replicate_local_replicas
+            )
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
         else:
             load_strategy = None
@@ -123,7 +125,6 @@ def common_test_parallel_reconfiguration_e2e(
             ckpt_dir_A,
             load_strategy,
             strict=StrictHandling.RETURN_ALL,
-            replicate_local_replicas=replicate_local_replicas,
         )
         # Potential mismatch is because of extra states which is ok
         assert all('_extra_state' in k for k in missing_keys)

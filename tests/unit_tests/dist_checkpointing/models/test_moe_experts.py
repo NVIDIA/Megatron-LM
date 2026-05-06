@@ -246,7 +246,9 @@ class TestExpertLayerReconfiguration:
             )
             model_B = initialize_expert_layer(1, use_glu, expert_type)
             if use_fpsl:
-                load_strategy = TorchDistLoadShardedStrategy()
+                load_strategy = TorchDistLoadShardedStrategy(
+                    replicate_local_replicas=replicate_local_replicas
+                )
                 load_strategy = FullyParallelLoadStrategyWrapper(
                     load_strategy, _get_parallelization_group()
                 )
@@ -256,7 +258,6 @@ class TestExpertLayerReconfiguration:
                 model_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata),
                 ckpt_dir_A,
                 load_strategy,
-                replicate_local_replicas=replicate_local_replicas,
             )
             model_B.load_state_dict(
                 {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}

@@ -250,7 +250,6 @@ class FullyParallelLoadStrategyWrapper:
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
         async_strategy: str = "mcore",
-        replicate_local_replicas: bool = False,
     ) -> StateDict:
         """Distributes the load and calls underlying strategy only for parts of the state dict.
 
@@ -277,18 +276,19 @@ class FullyParallelLoadStrategyWrapper:
             async_strategy (str): which async backend to use for the
                 base-strategy load (``"nvrx"`` or ``"mcore"``). Defaults
                 to ``"mcore"``.
-            replicate_local_replicas (bool): forwarded to the base
-                strategy's ``.load`` so the rank that the load picker
-                chose to read each shard can route to its own
-                ``__shadow_<rank>__<fqn>`` entry in the metadata. Only
-                the picker rank performs the read; the other ranks in
-                the parallelization group receive the data via
-                ``exchange_by_distribution`` and never see the redirect.
 
         Returns:
             StateDict: loaded state dict. The state dict should be equivalent to
             a state dict that would be loaded with the underlying strategy
             without this wrapper.
+
+        Note:
+            The local-replica redirect (``replicate_local_replicas``) is a
+            *property of the base strategy* — pass it to
+            ``TorchDistLoadShardedStrategy(replicate_local_replicas=True)``
+            at construction time. The wrapper does not need to know about
+            the flag; it just forwards ``.load(...)`` calls to the base
+            strategy, which decides whether to perform the redirect.
         """
         from megatron.core.utils import get_pg_size
 
@@ -296,10 +296,7 @@ class FullyParallelLoadStrategyWrapper:
 
         if get_pg_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(
-                sharded_state_dict,
-                checkpoint_dir,
-                async_strategy,
-                replicate_local_replicas=replicate_local_replicas,
+                sharded_state_dict, checkpoint_dir, async_strategy
             )
 
         # Step 1 and 2: exchange load metadata and distribute the load
@@ -334,10 +331,7 @@ class FullyParallelLoadStrategyWrapper:
         with debug_time("base_load_ShardedTensors", logger):
             # Load sharded tensors separately
             loaded_tensors = self.base_strategy.load(
-                to_load_shards,
-                checkpoint_dir,
-                async_strategy,
-                replicate_local_replicas=replicate_local_replicas,
+                to_load_shards, checkpoint_dir, async_strategy
             )
 
         with debug_time("self.exchange_loaded_tensors", logger):
