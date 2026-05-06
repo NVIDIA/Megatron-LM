@@ -358,7 +358,7 @@ def uneven_dtensor_to_full_tensor(dtensor: DTensor) -> torch.Tensor:
         buffer_offset += chunk_numel
 
     # Reconstruct the full tensor by placing chunks at their correct offsets
-    full_tensor = torch.zeros(dtensor.shape, dtype=dtensor.dtype, device=dtensor.device)
+    full_tensor = torch.empty(dtensor.shape, dtype=dtensor.dtype, device=dtensor.device)
     for chunk_info, local_chunk in zip(local_chunks_info, all_local_chunks):
         offset = chunk_info["offset"]
         slices = tuple(slice(o, o + s) for o, s in zip(offset, local_chunk.shape))
