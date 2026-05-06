@@ -175,6 +175,7 @@ class TextGenerationController:
         self._side_stream = torch.cuda.Stream(device=device)
         self._side_pre_calc_event = torch.cuda.Event()
         self._side_step_done_event = torch.cuda.Event()
+        self._forward_done_event = torch.cuda.Event()
         # Dedicated stream for the deferred log-prob extract D2H copies.
         self._extract_stream = torch.cuda.Stream(device=device)
 
@@ -1537,24 +1538,7 @@ class TextGenerationController:
             range_push("forward_pass")
             self._dynamic_step_forward_logits(input_ids, position_ids)
 
-            self._side_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._side_stream):
-                lse_outputs = self._dynamic_step_log_probs_lse(indexing_outputs)
-
-            self._side_pre_calc_event.record(self._side_stream)
-
-            # Commit Mamba intermediate states before update_requests, which
-            # may swap request indices. The Python lists tracking EOS block IDs
-            # and intermediate offsets are not swapped along with tensors, so
-            # commit must run while indices are still valid.
-            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                context.mamba_slot_allocator.commit_intermediate_states()
-
-            # Collect flat routing indices and scatter them into per-block storage.
-            # Must be done before update_requests while token-to-block mappings are valid.
-            # Reconstruction happens from blocks at request completion.
-            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
-            range_pop()
+            self._forward_done_event.record(torch.cuda.current_stream())
 
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
@@ -1582,6 +1566,24 @@ class TextGenerationController:
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits()
+
+            self._side_stream.wait_event(self._forward_done_event)
+            with torch.cuda.stream(self._side_stream):
+                lse_outputs = self._dynamic_step_log_probs_lse(indexing_outputs)
+            self._side_pre_calc_event.record(self._side_stream)
+
+            # Commit Mamba intermediate states before update_requests, which
+            # may swap request indices. The Python lists tracking EOS block IDs
+            # and intermediate offsets are not swapped along with tensors, so
+            # commit must run while indices are still valid.
+            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+                context.mamba_slot_allocator.commit_intermediate_states()
+
+            # Collect flat routing indices and scatter them into per-block storage.
+            # Must be done before update_requests while token-to-block mappings are valid.
+            # Reconstruction happens from blocks at request completion.
+            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+            range_pop()
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
