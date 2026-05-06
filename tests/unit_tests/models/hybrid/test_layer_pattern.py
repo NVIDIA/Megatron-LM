@@ -7,12 +7,13 @@ distributed initialization or a CUDA device.
 """
 
 import dataclasses
+from collections import namedtuple
 
 import pytest
 
 from megatron.core.models.hybrid.common_layer_config import CommonLayerConfig
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-from megatron.core.models.hybrid.hybrid_model_config import HybridModelConfig, _RecipeLowering
+from megatron.core.models.hybrid.hybrid_model_config import HybridModelConfig
 from megatron.core.models.hybrid.layer_configs import (
     AttentionLayerConfig,
     CrossEntropyLayerConfig,
@@ -25,6 +26,20 @@ from megatron.core.models.hybrid.layer_configs import (
     MoELayerConfig,
 )
 from megatron.core.models.hybrid.layer_pattern import flatten_decoder_pattern
+
+# ``HybridModelConfig._lower()`` now returns a 3-tuple
+# ``(stack_tc, layer_symbols, layer_tcs)``; the previous ``_RecipeLowering``
+# named-attribute struct went away when the recipe-API refactor inlined the
+# lowering into ``HybridModel.__init__``. Tests in this module use
+# ``compiled.config`` / ``.layer_type_list`` / ``.layer_config_list`` style
+# access purely for readability — wrap the tuple here so existing
+# assertions stay legible without coupling the production code to a
+# named-attribute return type.
+_Lowered = namedtuple("_Lowered", ["config", "layer_type_list", "layer_config_list"])
+
+
+def _lower(recipe: HybridModelConfig) -> _Lowered:
+    return _Lowered(*recipe._lower())
 
 
 def _make_common(**overrides) -> CommonLayerConfig:
@@ -320,7 +335,7 @@ class TestLayerConfigSymbols:
         emb = EmbeddingLayerConfig(common_config=common, vocab_size=32, max_sequence_length=8)
         g = GDNLayerConfig(common_config=common, num_attention_heads=8)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, g, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, g, loss]))
         assert compiled.layer_type_list == [Symbols.GDN]
         assert compiled.layer_config_list[0].num_attention_heads == 8
 
@@ -411,23 +426,26 @@ class TestHybridModelConfigLowering:
         kwargs.update(overrides)
         return EmbeddingLayerConfig(**kwargs)
 
-    def test_lower_returns_recipe_lowering(self):
+    def test_lower_returns_stack_tc_and_per_layer_tcs(self):
         common = _make_common()
         emb = self._embedding(common)
         m = MambaLayerConfig(common_config=common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
         recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, m, a, loss])
-        compiled = recipe._lower()
-        assert isinstance(compiled, _RecipeLowering)
+        compiled = _lower(recipe)
+        # The lowering produces the stack TC, per-layer symbol list, and
+        # per-layer TC list — exactly what HybridModel needs in addition to
+        # what it reads directly from the recipe's markers.
         assert compiled.layer_type_list == ["M", "*", "M", "*"]
         assert len(compiled.layer_config_list) == 4
-        assert compiled.vocab_size == 32000
-        assert compiled.max_sequence_length == 2048
-        assert compiled.position_embedding_type == "rope"
+        # Marker-derived fields are NOT in the lowering output any more —
+        # they're read directly from the recipe at the call site.
+        assert recipe.embedding_marker.vocab_size == 32000
+        assert recipe.embedding_marker.max_sequence_length == 2048
+        assert recipe.embedding_marker.position_embedding_type == "rope"
         # Default untie=False → share=True at the call site.
-        assert compiled.untie_embeddings_and_output_weights is False
-        # And the public recipe queries match.
+        assert recipe.untie_embeddings_and_output_weights is False
         assert recipe.num_layers == 4
 
     def test_recipe_topology_defaults_to_none(self):
@@ -456,7 +474,7 @@ class TestHybridModelConfigLowering:
         emb = self._embedding(common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]))
         assert compiled.config.tensor_model_parallel_size == 1
 
     def test_recipe_topology_pin_propagates_through_lowering(self):
@@ -477,7 +495,7 @@ class TestHybridModelConfigLowering:
         assert recipe.context_parallel_size == 2
         assert recipe.expert_model_parallel_size is None
         assert recipe.expert_tensor_parallel_size is None
-        compiled = recipe._lower()
+        compiled = _lower(recipe)
         assert compiled.config.tensor_model_parallel_size == 4
         assert compiled.config.context_parallel_size == 2
 
@@ -493,7 +511,7 @@ class TestHybridModelConfigLowering:
         m = MambaLayerConfig()  # No common_config — should auto-inherit.
         a = AttentionLayerConfig(num_attention_heads=4)  # Same.
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, loss]))
         # All per-layer TCs see the recipe's hidden_size, not 0.
         for tc in compiled.layer_config_list:
             assert tc.hidden_size == common.hidden_size
@@ -508,7 +526,7 @@ class TestHybridModelConfigLowering:
         m = MambaLayerConfig(common_config=other_common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, loss]))
         # Mamba layer (idx 0) keeps its explicit hidden_size=512.
         assert compiled.layer_config_list[0].hidden_size == 512
         # Attention layer (idx 1) uses the recipe common's 256.
@@ -526,8 +544,7 @@ class TestHybridModelConfigLowering:
             common_config=common, layer_pattern=[emb, m, a, m, loss], tensor_model_parallel_size=2
         )
 
-        compiled = recipe._lower()
-
+        compiled = _lower(recipe)
         assert compiled.config.num_attention_heads == 8
         assert compiled.config.num_query_groups == 2
         assert compiled.config.kv_channels == 16
@@ -549,8 +566,11 @@ class TestHybridModelConfigLowering:
             layer_pattern=[emb, a, loss],
             untie_embeddings_and_output_weights=True,
         )
-        compiled = recipe._lower()
-        assert compiled.untie_embeddings_and_output_weights is True
+        # ``untie_embeddings_and_output_weights`` is a recipe-level field;
+        # callers (HybridModel.__init__, the launcher) read it directly off
+        # the recipe rather than going through ``_lower``.
+        _lower(recipe)  # smoke-test: lowering succeeds with this setting.
+        assert recipe.untie_embeddings_and_output_weights is True
 
     def test_missing_embedding_raises(self):
         common = _make_common()
@@ -595,7 +615,7 @@ class TestHybridModelConfigLowering:
         emb = self._embedding(common)
         d = DSALayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, d, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, d, loss]))
         assert compiled.config.multi_latent_attention is True
 
     def test_no_dsa_layers_keeps_multi_latent_attention_default(self):
@@ -606,7 +626,7 @@ class TestHybridModelConfigLowering:
         emb = self._embedding(common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]))
         assert compiled.config.multi_latent_attention is False
 
     def test_heterogeneous_attention_under_rope_rejected(self):
@@ -803,7 +823,7 @@ class TestHeterogeneousMoE:
             recipe._lower()
         # With both overrides set, compile succeeds with the pinned values.
         recipe.stack_moe_ffn_hidden_size = 1024
-        compiled = recipe._lower()
+        compiled = _lower(recipe)
         assert compiled.config.num_moe_experts == 128
         assert compiled.config.moe_ffn_hidden_size == 1024
 
@@ -814,7 +834,7 @@ class TestHeterogeneousMoE:
         emb = self._embedding(common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]))
         assert compiled.config.num_moe_experts is None
 
     def test_ep_gt_1_without_moe_layers_rejected(self):
@@ -901,7 +921,7 @@ class TestExtraPassthrough:
         emb = self._embedding(common, extra={"qk_layernorm": True})
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]))
         assert compiled.config.qk_layernorm is True
 
     def test_loss_extra_propagates_to_stack_tc(self):
@@ -909,7 +929,7 @@ class TestExtraPassthrough:
         emb = self._embedding(common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig(extra={"qk_layernorm": True})
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]))
         assert compiled.config.qk_layernorm is True
 
     def test_embedding_extra_unknown_field_raises(self):
@@ -985,7 +1005,7 @@ class TestYarnEmbedding:
             },
         )
         a, loss = self._attention_loss(common)
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]))
         assert compiled.config.yarn_rotary_scaling_factor == 32.0
         assert compiled.config.yarn_original_max_position_embeddings == 131072
         assert compiled.config.yarn_beta_fast == 32.0
@@ -1007,7 +1027,7 @@ class TestYarnEmbedding:
             yarn={"yarn_rotary_scaling_factor": 32.0},
         )
         a, loss = self._attention_loss(common)
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]))
         assert not hasattr(compiled.config, "yarn_rotary_scaling_factor")
 
     def test_yarn_partial_dict_only_stamps_provided_keys(self):
@@ -1023,7 +1043,7 @@ class TestYarnEmbedding:
             yarn={"yarn_rotary_scaling_factor": 32.0},
         )
         a, loss = self._attention_loss(common)
-        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss])._lower()
+        compiled = _lower(HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]))
         assert compiled.config.yarn_rotary_scaling_factor == 32.0
         assert not hasattr(compiled.config, "yarn_beta_fast")
 
@@ -1063,7 +1083,7 @@ class TestNumLayersDerived:
         loss = CrossEntropyLayerConfig()
         # 5 decoder layers.
         recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, m, a, m, loss])
-        compiled = recipe._lower()
+        compiled = _lower(recipe)
         assert len(compiled.layer_config_list) == 5
         for tc in compiled.layer_config_list:
             assert tc.num_layers == 5

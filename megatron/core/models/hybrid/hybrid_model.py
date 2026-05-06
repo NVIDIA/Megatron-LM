@@ -13,7 +13,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.models.hybrid.hybrid_model_config import HybridModelConfig, _RecipeLowering
+from megatron.core.models.hybrid.hybrid_model_config import HybridModelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -135,21 +135,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        # Internal: populated automatically when ``config`` is a
-        # :class:`HybridModelConfig`. Threads the lowering's per-layer
-        # configs into the recipe path. Callers must not construct or
-        # pass ``_RecipeLowering`` directly — its shape is an
-        # implementation detail of the current TransformerConfig backend.
-        _recipe_lowering: Optional[_RecipeLowering] = None,
     ) -> None:
         # Recipe path dispatch: when ``config`` is a HybridModelConfig,
-        # lower it inline and substitute the recipe-owned local kwargs.
-        # Construction-time concerns (pg_collection, pre_process,
-        # post_process, vp_stage, optional hybrid_stack_spec) flow through
-        # unchanged. After this block, the rest of __init__ runs the
-        # existing recipe-path logic just as if ``from_recipe`` had been
-        # called — there is exactly one constructor body for both entry
-        # points.
+        # lower it inline and read the model-wrapping fields directly from
+        # the recipe's embedding/loss markers (``recipe.embedding_marker``,
+        # ``recipe.loss_marker``) and from the recipe itself
+        # (``untie_embeddings_and_output_weights``). Construction-time
+        # concerns (pg_collection, pre_process, post_process, vp_stage,
+        # optional hybrid_stack_spec) flow through unchanged.
+        layer_type_list: Optional[list] = None
+        layer_config_list: Optional[list] = None
+        recipe_path: bool = False
+
         if isinstance(config, HybridModelConfig):
             if (
                 hybrid_layer_pattern is not None
@@ -163,39 +160,40 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "hybrid_attention_ratio / hybrid_mlp_ratio arguments are "
                     "mutually exclusive; pass exactly one architecture surface."
                 )
-            if _recipe_lowering is not None:
-                raise ValueError(
-                    "_recipe_lowering is populated automatically when ``config`` "
-                    "is a HybridModelConfig; do not pass it explicitly."
-                )
             recipe = config
-            lowering = recipe._lower()
+            stack_tc, layer_type_list, layer_config_list = recipe._lower()
             # HybridModel-specific invariant: the inference-optimized stack
             # does not support fused-TP communication. TC's own
-            # ``__post_init__`` checks fuse-TP-comm → inference_optimized;
-            # the reverse direction (inference_optimized + fuse-TP-comm →
-            # reject for hybrid) is a hybrid-stack-spec constraint that
-            # must live here so it runs on both ``HybridModel(config=recipe)``
-            # and the ``from_recipe`` alias.
+            # ``__post_init__`` checks the forward direction
+            # (fuse-TP-comm → inference_optimized); the reverse
+            # (inference_optimized + fuse-TP-comm → reject for hybrid) is
+            # a hybrid-stack-spec constraint that lives here so it fires
+            # on both ``HybridModel(config=recipe)`` and the
+            # ``from_recipe`` alias.
             if (
-                lowering.config.transformer_impl == "inference_optimized"
-                and lowering.config.inference_fuse_tp_communication
+                stack_tc.transformer_impl == "inference_optimized"
+                and stack_tc.inference_fuse_tp_communication
             ):
                 raise ValueError(
                     "inference_fuse_tp_communication is not supported for HybridModel."
                 )
-            config = lowering.config
-            vocab_size = lowering.vocab_size
-            max_sequence_length = lowering.max_sequence_length
-            position_embedding_type = lowering.position_embedding_type
-            rotary_percent = lowering.rotary_percent
-            rotary_base = lowering.rotary_base
-            scatter_embedding_sequence_parallel = lowering.scatter_embedding_sequence_parallel
-            seq_len_interpolation_factor = lowering.seq_len_interpolation_factor
-            share_embeddings_and_output_weights = not lowering.untie_embeddings_and_output_weights
-            fp16_lm_cross_entropy = lowering.fp16_lm_cross_entropy
-            parallel_output = lowering.parallel_output
-            _recipe_lowering = lowering
+            # Read embedding-marker fields directly from the recipe.
+            emb = recipe.embedding_marker
+            vocab_size = emb.vocab_size
+            max_sequence_length = emb.max_sequence_length
+            position_embedding_type = emb.position_embedding_type
+            rotary_percent = emb.rotary_percent
+            rotary_base = emb.rotary_base
+            scatter_embedding_sequence_parallel = emb.scatter_embedding_sequence_parallel
+            seq_len_interpolation_factor = emb.seq_len_interpolation_factor
+            # Read loss-marker fields directly from the recipe.
+            loss = recipe.loss_marker
+            fp16_lm_cross_entropy = loss.fp16_lm_cross_entropy
+            parallel_output = loss.parallel_output
+            # Tied-weights toggle lives on the recipe itself.
+            share_embeddings_and_output_weights = not recipe.untie_embeddings_and_output_weights
+            config = stack_tc
+            recipe_path = True
 
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -222,28 +220,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
 
-        recipe_path = _recipe_lowering is not None
-        if recipe_path:
-            # Recipe path: per-layer symbols and configs come from the
-            # internal lowering ``HybridModel.from_recipe`` produced.
-            layer_type_list: Optional[list] = _recipe_lowering.layer_type_list
-            layer_config_list: Optional[list] = _recipe_lowering.layer_config_list
-            if hybrid_layer_pattern is not None:
-                raise ValueError(
-                    "from_recipe (Python DSL) and "
-                    "hybrid_layer_pattern (string DSL) are mutually exclusive; "
-                    "pass exactly one."
-                )
-        else:
-            layer_type_list = None
-            layer_config_list = None
-            if vocab_size is None or max_sequence_length is None:
-                raise ValueError(
-                    "vocab_size and max_sequence_length are required on the legacy "
-                    "(hybrid_layer_pattern) construction path; pass both explicitly. "
-                    "On the recipe path, HybridModel.from_recipe supplies them from "
-                    "the EmbeddingLayerConfig marker."
-                )
+        # ``recipe_path``, ``layer_type_list``, and ``layer_config_list``
+        # are set above by the recipe dispatch; on the legacy path the
+        # lists stay None and ``HybridStack`` derives them from
+        # ``hybrid_layer_pattern`` further below.
+        if not recipe_path and (vocab_size is None or max_sequence_length is None):
+            raise ValueError(
+                "vocab_size and max_sequence_length are required on the legacy "
+                "(hybrid_layer_pattern) construction path; pass both explicitly. "
+                "On the recipe path, HybridModel reads them from the "
+                "EmbeddingLayerConfig marker."
+            )
 
         # When using a recipe, fall back to the default hybrid_stack_spec so that
         # users do not need to construct or pass a ModuleSpec.
@@ -500,9 +487,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             :class:`HybridModel` raises if it is constructed under a PP
             group greater than 1 via this path.
         """
-        # The inference_fuse_tp_communication / inference_optimized
-        # invariant runs inside __init__'s recipe-dispatch block, so it
-        # fires on both this alias and HybridModel(config=recipe) directly.
         return cls(
             config=recipe,
             hybrid_stack_spec=hybrid_stack_spec,

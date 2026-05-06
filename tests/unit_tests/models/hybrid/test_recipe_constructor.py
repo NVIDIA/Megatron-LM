@@ -157,9 +157,3 @@ class TestRecipeConstructorRejection:
     def test_rejects_legacy_override_pattern(self):
         with pytest.raises(ValueError, match="mutually exclusive"):
             HybridModel(config=_make_recipe(), hybrid_override_pattern="M*-")
-
-    def test_rejects_explicit_recipe_lowering(self):
-        recipe = _make_recipe()
-        lowering = recipe._lower()
-        with pytest.raises(ValueError, match="populated automatically"):
-            HybridModel(config=recipe, _recipe_lowering=lowering)
