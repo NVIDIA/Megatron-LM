@@ -260,7 +260,29 @@ class _ParamAndGradBucketGroup:
         self.is_last_microbatch = True
 
     def _post_param_sync(self):
-        """Run post-processing for quantized params after param all-gather completes."""
+        """Run post-processing after param all-gather completes."""
+        if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            for bucket in self.buckets:
+                is_bf16_weight_bucket = False
+                for param in bucket.params:
+                    # Skip copying since bf16 weights in the mxfp8 model
+                    # are already mapped to param.data.
+                    if not is_float8tensor(param):
+                        is_bf16_weight_bucket = True
+                        break
+                    param_start, param_end = bucket.param_to_index[param]
+                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                    param.data.copy_(param_slice.view(param.data.shape))
+                if is_bf16_weight_bucket:
+                    continue
+                # All-gathered params are not needed after being copied to param.data.
+                # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
+                # We cannot zero out the entire grad buffer because one grad buffer may
+                # correspond to multiple param buffers. If we zero out the entire grad buffer,
+                # it would clear the data of those param buffers that have not yet completed AG.
+                bucket.param_data.zero_()
+            return
+
         quantized_params = []
         for bucket in self.buckets:
             for param in bucket.params:
@@ -327,8 +349,7 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
-                if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                    self._post_param_sync()
+                self._post_param_sync()
                 return
         else:
             assert self.param_gather_handle is None
@@ -347,7 +368,7 @@ class _ParamAndGradBucketGroup:
             dp_size = self.intra_distributed_optimizer_instance_size
             if dp_size == 1:
                 # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
-                if force_sync and not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                if force_sync:
                     self._post_param_sync()
                 self.param_gather_dispatched = True
                 return
@@ -442,7 +463,7 @@ class _ParamAndGradBucketGroup:
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
                 self.param_gather_handle = None
-        if force_sync and not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+        if force_sync:
             self._post_param_sync()
         self.param_gather_dispatched = True
 
@@ -483,30 +504,7 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
-            # we need to copy the param_data from the shared_param/grad_buffer to param.data
-            # after the param all-gather.
-            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                for bucket in self.buckets:
-                    is_bf16_weight_bucket = False
-                    for param in bucket.params:
-                        # Skip copying since bf16 weights in the mxfp8 model
-                        # are already mapped to param.data.
-                        if not is_float8tensor(param):
-                            is_bf16_weight_bucket = True
-                            break
-                        param_start, param_end = bucket.param_to_index[param]
-                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                        param.data.copy_(param_slice.view(param.data.shape))
-                    if is_bf16_weight_bucket:
-                        continue
-                    # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                    # We cannot zero out the entire grad buffer because one grad buffer may
-                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                    # it would clear the data of those param buffers that have not yet completed AG.
-                    bucket.param_data.zero_()
-            elif not self.ddp_config.use_distributed_optimizer:
+            if not self.ddp_config.use_distributed_optimizer:
                 for bucket in self.buckets:
                     if bucket.layerwise_gather_list is None:
                         continue
@@ -524,9 +522,7 @@ class _ParamAndGradBucketGroup:
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
                     bucket.layerwise_gather_list = None
-                self._post_param_sync()
-            else:
-                self._post_param_sync()
+            self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
