@@ -40,8 +40,11 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         else:
             recipe_stack_spec = None
 
-        model = HybridModel.from_recipe(
-            recipe,
+        # Phase 2: call the new TC-free constructor directly.
+        # ``HybridModel(config: HybridModelConfig, ...)`` is the public
+        # surface; ``from_recipe`` now exists only as a thin alias.
+        model = HybridModel(
+            config=recipe,
             hybrid_stack_spec=recipe_stack_spec,
             pre_process=pre_process,
             post_process=post_process,
