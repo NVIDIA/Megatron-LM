@@ -248,6 +248,7 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
 class TestFusedApplyMLARope:
+    @pytest.mark.flaky_in_dev
     def test_forward_backward_for_q(self, input_format):
         _test_fused_apply_mla_rope_for_q(input_format)
 

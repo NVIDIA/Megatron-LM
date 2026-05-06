@@ -139,8 +139,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Experimental yaml
     if args.yaml_cfg is not None:
         from .yaml_arguments import load_yaml
-        assert args.yaml_cfg and not args.use_legacy_models, \
-            "Yaml config is not supported with legacy models."
+
         args = load_yaml(args.yaml_cfg)
 
 
@@ -346,10 +345,6 @@ def validate_args(args, defaults={}):
     # validate model config args from heterogeneous config (if provided).
     validate_model_config_args_from_heterogeneous_config(args)
 
-    # Set args.use_dist_ckpt from args.ckpt_format.
-    if args.use_legacy_models:
-        assert args.ckpt_format == "torch", \
-            "legacy model format only supports the 'torch' checkpoint format."
     update_use_dist_ckpt(args)
 
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
@@ -780,7 +775,6 @@ def validate_args(args, defaults={}):
 
     # MTP validation
     if args.mtp_num_layers:
-        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
         assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
             f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
             + f"The supported position embedding types are rope and none."
@@ -917,8 +911,6 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
-        assert not args.use_legacy_models, \
-            '--overlap-param-gather only supported with MCore models'
 
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
@@ -1006,6 +998,16 @@ def validate_args(args, defaults={}):
         and not is_flashinfer_min_version("0.6.4")
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
+
+    if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
+        try:
+            import flashinfer  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "--inference-dynamic-batching-sampling-backend=flashinfer requires "
+                "the flashinfer package; install it or pass "
+                "--inference-dynamic-batching-sampling-backend=torch."
+            ) from e
 
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -1350,15 +1352,9 @@ def validate_args(args, defaults={}):
         assert is_te_min_version("2.9.0"), \
             '--log-max-attention-logit is only supported with TE >= 2.9.0.'
 
-    if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
-        assert not args.use_legacy_models, \
-            '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
-
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
-    if args.rotary_interleaved and args.use_legacy_models:
-        raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
     if args.position_embedding_type != 'rope':
         args.apply_rope_fusion = False
 
@@ -1385,10 +1381,6 @@ def validate_args(args, defaults={}):
         args.moe_ffn_hidden_size = args.ffn_hidden_size
         warn_rank_0("moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
-    # Context parallel
-    if args.context_parallel_size > 1:
-        assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
-
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
         assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
@@ -1400,10 +1392,6 @@ def validate_args(args, defaults={}):
         args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
-
-    # Distributed checkpointing checks
-    if args.use_dist_ckpt and args.use_legacy_models:
-        raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
 
     # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
     if args.ckpt_format == "torch_dcp":
@@ -1631,7 +1619,6 @@ def validate_args(args, defaults={}):
                 "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
 
     if args.mtp_num_layers:
-        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
         # MTP is compatible with position embedding types that use position_ids.
         supported_position_types = ["learned_absolute", "rope", "mrope", "none"]
         assert args.position_embedding_type in supported_position_types, (
@@ -1678,28 +1665,6 @@ def validate_args(args, defaults={}):
     if args.moe_latent_size is not None:
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
-        assert not args.use_legacy_models, "MoE latent projections are only supported for mcore models."
-
-    if args.tiktoken_special_tokens and not args.tokenizer_special_tokens:
-        warn_rank_0(
-            "--tiktoken-special-tokens argument is deprecated and will be removed soon. "
-            "Use --tokenizer-special-tokens instead."
-        )
-        args.tokenizer_special_tokens = args.tiktoken_special_tokens
-    
-    if args.tokenizer_hf_use_fast:
-        warn_rank_0(
-            "--tokenizer-hf-use-fast argument is deprecated and will be removed soon. "
-            "`use_fast` is set to True by default for HF tokenizers."
-            "Use --tokenizer-hf-no-use-fast if you want to disable `use_fast`."
-        )
-
-    if args.tokenizer_hf_include_special_tokens:
-        warn_rank_0(
-            "--tokenizer-hf-include-special-tokens argument is deprecated and will be removed soon. "
-            "`include_special_tokens` is set to True by default for HF tokenizers."
-            "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
-        )
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1994,6 +1959,12 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
+    group.add_argument('--inference-dynamic-batching-sampling-backend',
+                       type=str, default='torch',
+                       choices=['torch', 'flashinfer'],
+                       help='Which sampling kernels to use during inference. '
+                            'Falls back to "torch" with a warning if "flashinfer" '
+                            'is requested but the package is not installed.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
@@ -2012,6 +1983,11 @@ def _add_inference_args(parser):
                        help='Dtype for the Mamba inference SSM states tensor')
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
+    group.add_argument('--inference-disable-ep-consensus', action=argparse.BooleanOptionalAction,
+                       required=False, default=False,
+                       help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
+                            'Pause/unpause take effect as soon as the signal is delivered to a rank. '
+                            'Only safe when EP coordination is not required (e.g. ep_world_size == 1).')
     return parser
 
 
@@ -2609,10 +2585,7 @@ def _add_training_args(parser):
     group.add_argument('--use-mcore-models', action='store_true',
                        dest='deprecated_use_mcore_models',
                        help='DEPRECATED. Use the implementation from megatron core.'
-                       'Now ignored and mcore models are the default, use '
-                       '--use-legacy-models to not use core models.')
-    group.add_argument('--use-legacy-models', action='store_true',
-                       help='Use the legacy Megatron models, not Megatron-Core models.')
+                       'Now ignored and mcore models are the default.')
 
     return parser
 
@@ -2854,66 +2827,11 @@ def _add_validation_args(parser):
 
 
 def _add_tokenizer_args(parser):
-    group = parser.add_argument_group(title='tokenizer')
-    group.add_argument('--vocab-size', type=int, default=None,
-                       help='Size of vocab before EOD or padding.')
-    group.add_argument('--padded-vocab-size', type=int, default=None,
-                       help='Vocabulary size of the model (padded to be divisible by '
-                       'tensor model parallel size). If not provided, it will be '
-                       'automatically calculated from vocab-size.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file.')
-    group.add_argument('--merge-file', type=str, default=None,
-                       help='Path to the BPE merge file.')
-    group.add_argument('--vocab-extra-ids', type=int, default=0,
-                       help='Number of additional vocabulary tokens. '
-                            'They are used for span masking in the T5 model')
-    group.add_argument('--tokenizer-type', type=str,
-                       default=None,
-                       choices=['BertWordPieceLowerCase',
-                                'BertWordPieceCase',
-                                'GPT2BPETokenizer',
-                                'SentencePieceTokenizer',
-                                'GPTSentencePieceTokenizer',
-                                'HuggingFaceTokenizer',
-                                'Llama2Tokenizer',
-                                'TikTokenizer',
-                                'MultimodalTokenizer',
-                                'NullTokenizer',
-                                'NullMultimodalTokenizer',
-                                'SFTTokenizer'],
-                       help='What type of tokenizer to use.')
-    group.add_argument('--tokenizer-model', type=str, default=None,
-                       help='Sentencepiece tokenizer model.')
-    group.add_argument('--tokenizer-metadata', type=str, default=None,
-                       help='Path to tokenizer metadata in json format.')
-    group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
-                       help='List of special tokens. For TikTokenizer needs to have '
-                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--tiktoken-pattern', type=str, default=None,
-                       help='Which tiktoken pattern to use. Options: [v1, v2]')
-    group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
-                       help='Number of special tokens in tiktoken tokenizer')
-    group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
-                       help='List of tiktoken special tokens, needs to have '
-                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--tokenizer-sentencepiece-legacy', action='store_true', default=False,
-                       help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.')
-    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=True,
-                       help='Whether to use fast HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=True,
-                       help='Converting text to ids will include special for HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
-                       help='Whether to use fast HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true', default=False,
-                       help='Converting text to ids will not include special for HuggingFace tokenizer.')
-    group.add_argument("--trust-remote-code", action="store_true", default=False,
-                       help='Whether or not to allow PreTrainedTokenizer to execute remote code')
-    group.add_argument('--null-tokenizer-eod-id', type=int, default=None,
-                       help='EOD token id for NullTokenizer. Defaults to `vocab_size - 1`.')
-    group.add_argument('--null-tokenizer-pad-id', type=int, default=-1,
-                       help='Pad token id for NullTokenizer. Defaults to -1 (no pad token). '
-                            'Set to a value outside the dataset to avoid masking real tokens.')
+    from megatron.training.config import TokenizerConfig
+
+    tokenizer_factory = ArgumentGroupFactory(TokenizerConfig)
+    group = tokenizer_factory.build_group(parser, "tokenizer")
+
     return parser
 
 
