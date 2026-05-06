@@ -633,11 +633,7 @@ class TextGenerationController:
 
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
-                {
-                    "tokens": input_ids,
-                    "position_ids": position_ids,
-                    "attention_mask": None,
-                }
+                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
             # logits shape: [1, seq_len, vocab_size]
 
@@ -665,10 +661,7 @@ class TextGenerationController:
                 logits = self._all_logits_cuda[:, :logits_seq_len, :]
 
             logits = broadcast_from_last_pipeline_stage(
-                logits_shape,
-                dtype=torch.float32,
-                tensor=logits,
-                pp_group=self.pp_group,
+                logits_shape, dtype=torch.float32, tensor=logits, pp_group=self.pp_group
             )
 
         return logits

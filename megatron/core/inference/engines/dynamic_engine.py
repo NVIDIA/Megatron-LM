@@ -397,9 +397,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 if controller._sampling_backend == "flashinfer":
                     if controller.num_speculative_tokens > 0:
-                        controller._dynamic_step_sample_logits_and_verify_tokens(
-                            input_ids, logits
-                        )
+                        controller._dynamic_step_sample_logits_and_verify_tokens(input_ids, logits)
                     else:
                         controller._dynamic_step_sample_logits(logits)
 
