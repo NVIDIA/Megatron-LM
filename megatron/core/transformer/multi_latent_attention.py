@@ -624,12 +624,11 @@ class MLASelfAttention(MultiLatentAttention):
         norm+linear layer is used.
         """
         backend = get_backend(self.config.transformer_impl)
-        # Unfused linear layer
-        linear_impl = backend.column_parallel_linear()
+        fused_norm_linear_impl = backend.column_parallel_layer_norm_linear()
 
-        def is_unfused_linear(module_spec):
+        def is_fused_norm_linear(module_spec):
             module_cls = module_spec.module if isinstance(module_spec, ModuleSpec) else module_spec
-            return linear_impl is not None and module_cls is linear_impl
+            return fused_norm_linear_impl is not None and module_cls is fused_norm_linear_impl
 
         if (
             self.config.q_lora_rank is None
@@ -638,7 +637,7 @@ class MLASelfAttention(MultiLatentAttention):
         ):
             help_msg = ""
             # Q projection does not include a norm
-            if is_unfused_linear(submodules.linear_q_proj):
+            if not is_fused_norm_linear(submodules.linear_q_proj):
                 help_msg = (
                     f"Please use a fused norm+linear for "
                     f"`linear_q_proj={submodules.linear_q_proj}` if "
@@ -653,7 +652,7 @@ class MLASelfAttention(MultiLatentAttention):
             # Q layernorm is not trivial
             submodules.q_layernorm not in (None, IdentityOp)
             # Q up projection includes a norm
-            and not is_unfused_linear(submodules.linear_q_up_proj)
+            and is_fused_norm_linear(submodules.linear_q_up_proj)
         ):
             raise RuntimeError(
                 f"`q_layernorm={submodules.q_layernorm}` is non-trivial "
@@ -665,7 +664,7 @@ class MLASelfAttention(MultiLatentAttention):
             # KV layernorm is not trivial
             submodules.kv_layernorm not in (None, IdentityOp)
             # KV up projection includes a norm
-            and not is_unfused_linear(submodules.linear_kv_up_proj)
+            and is_fused_norm_linear(submodules.linear_kv_up_proj)
         ):
             raise RuntimeError(
                 f"`kv_layernorm={submodules.kv_layernorm}` is non-trivial "
