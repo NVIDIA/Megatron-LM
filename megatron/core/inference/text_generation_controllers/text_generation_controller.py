@@ -143,6 +143,11 @@ class TextGenerationController:
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
+        if context.config.materialize_only_last_token_logits:
+            # Under MTP, each decode request emits (num_speculative_tokens + 1) logit rows
+            max_logits = max_requests * (self.num_speculative_tokens + 1)
+        else:
+            max_logits = context.max_tokens
 
         # Callback to get request IDs that should be marked as finished due to stop words
         self._get_stop_word_finished_ids_callback = None
@@ -152,6 +157,13 @@ class TextGenerationController:
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
 
+        # NOTE: `_all_logits_cuda` is only used for non-last PP ranks.
+        if self._enable_cuda_graph:
+            self._all_logits_cuda = torch.zeros(
+                (1, max_logits, self.vocab_size), dtype=torch.float32, device=device
+            )
+        else:
+            self._all_logits_cuda = None
         # Speculative path:
         #     - `self._sampled_tokens_cuda` is pre-allocated by `_init_mtp_sampling_tensors`.
         #     - The tensor cannot be reused between the Triton kernel and the sampling graph.
@@ -646,6 +658,11 @@ class TextGenerationController:
 
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
+            else:
+                # Receive directly into the static logits buffer to avoid a
+                # fresh alloc + copy each step. Slice is contiguous because the
+                # leading dim is 1.
+                logits = self._all_logits_cuda[:, :logits_seq_len, :]
 
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape,
