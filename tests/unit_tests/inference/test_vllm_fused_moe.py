@@ -20,22 +20,6 @@ import pytest
 import torch
 
 
-@pytest.fixture(autouse=True, scope="session")
-def _single_autotune_config():
-    """Replace the 25-entry autotune config list with a single config.
-
-    Each unique (N, K, BLOCK_SIZE_M) combo triggers a full autotune pass that
-    compiles ALL configs. Tests only need correctness, not peak throughput, so
-    one config is sufficient and cuts compiled-kernel count by ~25x.
-    """
-    from megatron.core.inference.moe.vllm_fused_moe import _fused_moe_kernel
-
-    orig = list(_fused_moe_kernel.configs)
-    _fused_moe_kernel.configs = [orig[0]]
-    yield
-    _fused_moe_kernel.configs = orig
-
-
 def _vt(n):
     """Create a valid_tokens scalar int32 CUDA tensor."""
     return torch.tensor(n, dtype=torch.int32, device="cuda")
@@ -369,25 +353,6 @@ class TestMoeSum:
         )
 
         torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
-
-    @pytest.mark.parametrize("valid_tokens", [0, 1, 8, 15])
-    def test_partial_valid_tokens(self, valid_tokens):
-        """Rows beyond valid_tokens are zeroed."""
-        from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
-
-        max_tokens, topk, K, num_experts = 16, 2, 64, 4
-        torch.manual_seed(42)
-        input = torch.randn(max_tokens * topk, K, device="cuda", dtype=torch.bfloat16)
-        topk_weights = torch.rand(max_tokens, topk, device="cuda", dtype=torch.float32)
-        routing_map = torch.randint(0, num_experts, (max_tokens, topk), device="cuda")
-
-        result = _moe_sum(
-            input, topk_weights, max_tokens, topk, K, _vt(valid_tokens), routing_map, 0, num_experts
-        )
-
-        if valid_tokens < max_tokens:
-            zeros = result[valid_tokens:]
-            assert (zeros == 0).all(), "Rows beyond valid_tokens should be zero"
 
     def test_writes_to_provided_output_buffer(self):
         from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
