@@ -17,11 +17,7 @@ pytestmark = [
 
 
 def _make_rmsnorm() -> torch.nn.Module:
-    return te_ext.TEFusedResidualRMSNorm(
-        normalized_shape=16,
-        dtype=torch.float32,
-        device="cpu",
-    )
+    return te_ext.TEFusedResidualRMSNorm(normalized_shape=16, dtype=torch.float32, device="cpu")
 
 
 def test_rmsnorm_fused_impl_aliases_source_weight():
@@ -67,8 +63,7 @@ def test_mcore_te_linear_adapter_rejects_plain_te_linear():
 
     with pytest.raises(ValueError) as exc_info:
         te_ext._make_te_ops_basic_linear_from_mcore_te_linear(
-            plain_linear,
-            module_name="plain_linear",
+            plain_linear, module_name="plain_linear"
         )
 
     message = str(exc_info.value)
@@ -98,9 +93,7 @@ def test_mcore_te_linear_adapter_aliases_source_weight():
     )
 
     op = te_ext._make_te_ops_basic_linear_from_mcore_te_linear(
-        linear,
-        module_name="linear",
-        output_features=linear.weight.size(0),
+        linear, module_name="linear", output_features=linear.weight.size(0)
     )
 
     assert isinstance(op, te_ext.te.pytorch.ops.BasicLinear)

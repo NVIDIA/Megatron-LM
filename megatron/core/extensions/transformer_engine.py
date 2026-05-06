@@ -609,7 +609,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 f"{', '.join(missing_attrs)}."
             )
 
-    def _get_te_ops_tensor_parallel_context() -> Tuple[int, Optional[torch.distributed.ProcessGroup]]:
+    def _get_te_ops_tensor_parallel_context() -> (
+        Tuple[int, Optional[torch.distributed.ProcessGroup]]
+    ):
         """Return tensor-parallel world size and group for TE ops."""
         tp_world_size = get_tensor_model_parallel_world_size()
         tp_group = None
@@ -797,9 +799,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Op 2: RMSNorm - shares weight parameter with self
             fused_impl.append(
-                _make_te_ops_rmsnorm_from_te_rmsnorm(
-                    self, module_name=self.__class__.__name__
-                )
+                _make_te_ops_rmsnorm_from_te_rmsnorm(self, module_name=self.__class__.__name__)
             )
 
             return fused_impl
