@@ -73,6 +73,7 @@ def setup(
     get_position_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
     restart_store: torch.distributed.Store | None = None,
     checkpointing_context: dict[str, Any] = {},
+    model_provider_func=None, # TODO (@maanug): temporary until all scripts can use ModelConfig+Builder
     # callback_manager: CallbackManager | None = None,  # TODO (@maanug): migrate
 ) -> SetupOutput:
     """Initialize the training/evaluation environment using an existing GlobalState.
@@ -174,7 +175,7 @@ def setup(
     # so snapshots dumped later in training contain a full timeline + stack context.
     start_memory_history_recording(cfg.profiling)
 
-    model = _build_distributed_model(cfg, pg_collection)
+    model = _build_distributed_model(cfg, pg_collection, model_provider_func)
 
     cfg.model.timers = timers
     cfg.optimizer.timers = timers
@@ -251,19 +252,32 @@ def setup(
     )
 
 
-def _build_distributed_model(cfg: PretrainConfigContainer, pg_collection: ProcessGroupCollection) -> list[MegatronModule]:
+def _build_distributed_model(cfg: PretrainConfigContainer, pg_collection: ProcessGroupCollection, model_provider_func=None) -> list[MegatronModule]:
     """Build distributed model from ModelConfig."""
+    from megatron.training.models import ModelConfig
+
     model_config = cfg.model
-    builder_cls = model_config.get_builder_cls()
-    builder = builder_cls(model_config)
-    return builder.build_distributed_models(
-        pg_collection=pg_collection,
-        ddp_config=cfg.ddp,
-        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
-        use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
-        data_parallel_random_init=cfg.rng.data_parallel_random_init,
-    )
+    if isinstance(model_config, ModelConfig) and hasattr(model_config, "get_builder_cls"):
+        builder_cls = model_config.get_builder_cls()
+        builder = builder_cls(model_config)
+        return builder.build_distributed_models(
+            pg_collection=pg_collection,
+            ddp_config=cfg.ddp,
+            overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+            use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+            data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        )
+    else:
+        from megatron.training.training import get_model
+        from megatron.training.global_vars import get_args
+
+        args = get_args()
+        has_normal_optimizer = not args.skip_train
+        has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
+        skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
+        wrap_with_ddp = not skip_optimizer
+        return get_model(model_provider_func, wrap_with_ddp=wrap_with_ddp)
 
 
 def _update_model_config_funcs(
