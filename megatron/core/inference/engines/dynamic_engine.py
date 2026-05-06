@@ -1727,6 +1727,15 @@ class DynamicInferenceEngine(AbstractEngine):
             self.logging_step_interval > 0
             and (self.context.step_count + 1) % self.logging_step_interval == 0
         )
+        will_log_next_step = (
+            self.logging_step_interval > 0
+            and (self.context.step_count + 2) % self.logging_step_interval == 0
+        )
+        async_step_barrier_reason = None
+        if will_log_this_step:
+            async_step_barrier_reason = "logging sync step barrier"
+        elif will_log_next_step:
+            async_step_barrier_reason = "next logging sync step barrier"
 
         is_decode_only = self.context.is_decode_only()
         if will_log_this_step:
@@ -1752,15 +1761,21 @@ class DynamicInferenceEngine(AbstractEngine):
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
-        if will_log_this_step:
-            self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
-        if will_log_this_step:
-            self.step_end_event.record()
-            self.step_end_event.synchronize()
-            step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
-        else:
-            step_time = 0.0
+        if async_step_barrier_reason is not None:
+            self.controller.set_async_step_barrier(async_step_barrier_reason)
+        try:
+            if will_log_this_step:
+                self.step_start_event.record()
+            result = await self.controller.async_generate_output_tokens_dynamic_batch()
+            if will_log_this_step:
+                self.step_end_event.record()
+                self.step_end_event.synchronize()
+                step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+            else:
+                step_time = 0.0
+        finally:
+            if async_step_barrier_reason is not None:
+                self.controller.clear_async_step_barrier()
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 

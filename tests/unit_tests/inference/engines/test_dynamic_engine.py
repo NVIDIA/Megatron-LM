@@ -145,6 +145,7 @@ class DynamicEngineTestConfig:
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
+    logging_step_interval: int = 0
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     enable_async_scheduling: bool = False
@@ -289,6 +290,7 @@ class DynamicInferenceEngineTestBase:
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
+                logging_step_interval=test_config.logging_step_interval,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 enable_async_scheduling=test_config.enable_async_scheduling,
                 enable_async_decode_graphs=test_config.enable_async_decode_graphs,
@@ -2768,6 +2770,85 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         controller.clear_async_step_barrier()
         assert controller._async_scheduling_disabled_reason(allow_mtp=True) is None
+
+    def _assert_async_logging_interval_parity(
+        self,
+        *,
+        model_provider: str,
+        num_speculative_tokens: int,
+        logging_step_interval: int,
+    ) -> DynamicEngineTestEnv:
+        """Run serial/async decode with logging enabled and compare outputs."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            model_provider=model_provider,
+            num_speculative_tokens=num_speculative_tokens,
+            num_cuda_graphs=1,
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            logging_step_interval=logging_step_interval,
+            termination_id=-1,
+            top_k=1,
+        )
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+
+        assert [request.generated_tokens for request in async_env.requests] == [
+            request.generated_tokens for request in serial_env.requests
+        ]
+        return async_env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_logging_interval_gpt_e2e(self) -> None:
+        """GPT async scheduling continues on non-barrier steps with logging enabled."""
+        async_env = self._assert_async_logging_interval_parity(
+            model_provider="gpt",
+            num_speculative_tokens=0,
+            logging_step_interval=3,
+        )
+        diagnostics = async_env.engine.controller.get_async_scheduling_diagnostics()
+        assert diagnostics["forward_launches"] > 0, diagnostics
+        assert diagnostics["disable_reason_counts"]["logging sync step barrier"] > 0
+        assert diagnostics["disable_reason_counts"]["next logging sync step barrier"] > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_logging_interval_hybrid_mtp_e2e(self) -> None:
+        """Hybrid MTP async scheduling continues on non-barrier steps with logging enabled."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        async_env = self._assert_async_logging_interval_parity(
+            model_provider="hybrid",
+            num_speculative_tokens=2,
+            logging_step_interval=3,
+        )
+        diagnostics = async_env.engine.controller.get_async_scheduling_diagnostics()
+        assert diagnostics["forward_launches"] > 0, diagnostics
+        assert diagnostics["disable_reason_counts"]["logging sync step barrier"] > 0
+        assert diagnostics["disable_reason_counts"]["next logging sync step barrier"] > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_logging_interval_one_blocks_async_e2e(self) -> None:
+        """Logging every step intentionally blocks async scheduling every step."""
+        async_env = self._assert_async_logging_interval_parity(
+            model_provider="gpt",
+            num_speculative_tokens=0,
+            logging_step_interval=1,
+        )
+        diagnostics = async_env.engine.controller.get_async_scheduling_diagnostics()
+        assert diagnostics["forward_launches"] == 0, diagnostics
+        assert diagnostics["disable_reason_counts"]["logging sync step barrier"] > 0
 
     @pytest.mark.internal
     @pytest.mark.skipif(
