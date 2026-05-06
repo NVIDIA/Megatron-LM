@@ -183,7 +183,7 @@ def _load_checkpoint(queue, args):
     try:
         from megatron.core import mpu
         from megatron.core.enums import ModelType
-        from megatron.legacy.model import module
+        from megatron.core.models.common.language_module.language_module import LanguageModule
         from megatron.training.arguments import parse_args, validate_args
         from megatron.training.global_vars import set_args, set_global_variables
     except ModuleNotFoundError:
@@ -256,7 +256,7 @@ def _load_checkpoint(queue, args):
     margs.model_type = ModelType.encoder_or_decoder
 
     # Suppress warning about torch.distributed not being initialized.
-    module.MegatronModule.embedding_warning_printed = True
+    LanguageModule.embedding_warning_printed = True
 
     set_global_variables(margs, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
