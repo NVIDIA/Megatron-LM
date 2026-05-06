@@ -14,7 +14,7 @@ from megatron.training.config.resilience_config import RerunStateMachineConfig, 
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models.hybrid import HybridModelConfig
+from megatron.training.models import Serializable, HybridModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -147,8 +147,8 @@ class ConfigContainerBase:
         """
         if isinstance(value, ConfigContainerBase):
             return value.to_dict()
-        # elif isinstance(value, Serializable): # TODO (@maanug): re-enable after upstreaming ModelConfig+Serializable
-        #     return value.as_dict()
+        elif isinstance(value, Serializable):
+            return value.as_dict()
         elif hasattr(value, "to_cfg_dict"):
             # Allow non-Container classes to implement own custom method
             return value.to_cfg_dict()
