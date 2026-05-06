@@ -1,21 +1,28 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import weakref
 from contextlib import nullcontext
 from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.models.common.utils import (
+    PostProcessNode,
+    PreProcessNode,
+    TransformerLayerNode,
+    TransformerLayerState,
+    _BackwardDWWrapper,
+    should_free_input,
+    weak_method,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
-from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
+from megatron.core.pipeline_parallel.utils import ScheduleNode
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
@@ -23,396 +30,23 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
-from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
-
-def weak_method(method):
-    """Creates a weak reference to a method to prevent circular references.
-
-    This function creates a weak reference to a method and returns a wrapper function
-    that calls the method when invoked. This helps prevent memory leaks from circular
-    references.
-    """
-    method_ref = weakref.WeakMethod(method)
-    del method
-
-    def wrapped_func(*args, **kwarg):
-        # nonlocal object_ref
-        return method_ref()(*args, **kwarg)
-
-    return wrapped_func
-
-
-@internal_api
-def should_free_input(name, is_moe, config, num_local_experts):
-    """Determine if the node should free its input memory.
-
-    Args:
-        name: Node name
-        is_moe: Whether it's a MoE model
-        config: TransformerConfig object
-        num_local_experts: Number of local experts in MoE module
-
-    Returns:
-        bool: Whether to free input memory
-    """
-    # For dense layers [attn, fake, mlp, fake], the input is needed during backward pass
-    if not is_moe:
-        return False
-    enable_deepep = (
-        config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "deepep"
-    )
-    enable_hybridep = (
-        config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "hybridep"
-    )
-    # Define which nodes should free input memory
-    # Since we split the computing graph into multiple nodes, we can manually control
-    # when and how to free the input memory.
-    # The input and output of A2A are not needed anymore after the forward pass,
-    # so we can free the input memory after the forward pass.
-
-    # When low precision fp8/4 is enabled, the casted tensors are saved and the
-    # original bf16 tensors are safe to be freed.
-    free_mlp = config.fp8 is not None or config.fp4 is not None
-    if not free_mlp:
-        # AlltoAll dispatcher with local_num_experts=1 and HybridEP both use identity
-        # operation for `dispatch_postprocess`, hence the mlp inputs will be directly
-        # passed to GroupedGemm and should be saved for backward pass.
-        free_mlp = num_local_experts > 1 or config.moe_token_dispatcher_type != "alltoall"
-        free_mlp = free_mlp and not enable_hybridep
-
-    free_input_nodes = {
-        "mlp": free_mlp,
-        "moe_combine": True,
-        # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
-        # and probs before dispatch A2A and it's not needed anymore after the forward pass
-        # For DeepEP and HybridEP dispatcher mode, they are both needed in backward pass
-        # and cannot be freed.
-        # If moe_preprocess is in cuda graph scope, tokens and probs are fixed size tensors,
-        # so they cannot be freed.
-        "moe_dispatch": not (enable_deepep or enable_hybridep)
-        and (CudaGraphScope.moe_preprocess not in config.cuda_graph_scope),
-    }
-
-    return free_input_nodes.get(name, False)
-
-
-class TransformerLayerState:
-    """State shared within a transformer layer.
-
-    This class holds state that is shared between different nodes
-    within a transformer layer.
-    """
-
-    pass
-
-
-class PreProcessNode(ScheduleNode):
-    """Node responsible for preprocessing operations in the model.
-
-    This node handles embedding and rotary positional embedding computations
-    before the main transformer layers.
-    """
-
-    def __init__(self, gpt_model, chunk_state, event, stream):
-        """Initializes a preprocessing node.
-
-        Args:
-            gpt_model: The GPT model instance.
-            chunk_state (TransformerChunkState): State shared within a chunk
-            event: CUDA event for synchronization.
-            stream: CUDA stream for execution.
-        """
-        super().__init__(weak_method(self.forward_impl), stream, event, name="pre_process")
-        self.gpt_model = gpt_model
-        self.chunk_state = chunk_state
-
-    def forward_impl(self):
-        """forward pass for pre-processing.
-
-        This method handles:
-        1. Decoder embedding computation
-        2. Rotary positional embedding computation
-        3. Sequence length offset computation for flash decoding
-
-        Returns:
-            The processed decoder input tensor.
-        """
-        # Get decoder input
-        if not self.gpt_model.pre_process:
-            self.chunk_state.decoder_input = self.gpt_model.decoder.input_tensor
-        # Run GPTModel._preprocess
-        (
-            decoder_input,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-            padding_mask,
-        ) = self.gpt_model._preprocess(
-            input_ids=self.chunk_state.input_ids,
-            position_ids=self.chunk_state.position_ids,
-            decoder_input=self.chunk_state.decoder_input,
-            packed_seq_params=self.chunk_state.packed_seq_params,
-            padding_mask=self.chunk_state.padding_mask,
-        )
-
-        # Saved for later use
-        self.chunk_state.decoder_input = decoder_input
-        self.chunk_state.rotary_pos_emb = rotary_pos_emb
-        self.chunk_state.rotary_pos_cos = rotary_pos_cos
-        self.chunk_state.rotary_pos_sin = rotary_pos_sin
-        self.chunk_state.sequence_len_offset = sequence_len_offset
-        self.chunk_state.padding_mask = padding_mask
-        return decoder_input
-
-
-class PostProcessNode(ScheduleNode):
-    """Node responsible for postprocessing operations in the model.
-
-    This node handles final layer normalization and output layer computation
-    after the main transformer layers.
-    """
-
-    def __init__(self, gpt_model, chunk_state, event, stream):
-        """Initializes a postprocessing node.
-
-        Args:
-            gpt_model: The GPT model instance.
-            chunk_state (TransformerChunkState): State shared within a chunk
-            event: CUDA event for synchronization.
-            stream: CUDA stream for execution.
-        """
-        super().__init__(weak_method(self.forward_impl), stream, event, name="post_process")
-        self.gpt_model = gpt_model
-        self.chunk_state = chunk_state
-
-    def forward_impl(self, hidden_states):
-        """Implements the forward pass for postprocessing.
-
-        This method handles:
-        1. Output layer computation
-        2. Loss computation if labels are provided
-
-        Args:
-            hidden_states: The hidden states from the transformer layers.
-
-        Returns:
-            The logits or loss depending on whether labels are provided.
-        """
-
-        empty_decoder = len(self.gpt_model.decoder.layers) == 0
-        layer_norm = self.gpt_model.decoder.final_layernorm
-        if not self.gpt_model.config.mtp_num_layers and empty_decoder and layer_norm:
-            hidden_states = layer_norm(hidden_states)
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
-
-        # Run GPTModel._postprocess
-        loss = self.gpt_model._postprocess(
-            hidden_states=hidden_states,
-            input_ids=self.chunk_state.input_ids,
-            position_ids=self.chunk_state.position_ids,
-            labels=self.chunk_state.labels,
-            decoder_input=self.chunk_state.decoder_input,
-            rotary_pos_emb=self.chunk_state.rotary_pos_emb,
-            rotary_pos_cos=self.chunk_state.rotary_pos_cos,
-            rotary_pos_sin=self.chunk_state.rotary_pos_sin,
-            mtp_in_postprocess=False,
-            loss_mask=self.chunk_state.loss_mask,
-            attention_mask=self.chunk_state.attention_mask,
-            packed_seq_params=self.chunk_state.packed_seq_params,
-            sequence_len_offset=self.chunk_state.sequence_len_offset,
-            runtime_gather_output=self.chunk_state.runtime_gather_output,
-            extra_block_kwargs=self.chunk_state.extra_block_kwargs,
-        )
-
-        # For now, 1f1b only supports fp16 module
-        return float16_to_fp32(loss)
-
-
-class TransformerLayerNode(ScheduleNode):
-    """Base class for transformer layer computation nodes.
-
-    This class provides common functionality for different types of
-    transformer layer nodes (attention, MLP, etc.)
-    """
-
-    def __init__(
-        self,
-        stream,
-        event,
-        layer_state,
-        chunk_state,
-        submodule,
-        name="default",
-        bwd_dw_callables=None,
-        extra_args={},
-    ):
-        """Initialize a transformer layer node.
-
-        Args:
-            stream (torch.cuda.Stream): CUDA stream for execution
-            event (torch.cuda.Event): Synchronization event
-            layer_state (TransformerLayerState): State shared within a layer
-            chunk_state (TransformerChunkState): State shared within a chunk
-            submodule (function): The submodule contain forward and dw function
-            it's the per_batch_state_context, o.w. nullcontext
-            name (str): Node name, also used to determine memory strategy
-            bwd_dw_callables (list): List of weight gradient functions for the layer.
-            extra_args (dict): Extra arguments for the node: is_moe, config.
-        """
-        # determine whether to free input memory
-        config = extra_args.get("config", None)
-        assert config is not None, "model config must be passed to TransformerLayerNode."
-        is_moe = extra_args.get("is_moe", False)
-        num_local_experts = extra_args.get("num_local_experts", None)
-        free_input = self._resolve_free_input(name, is_moe, config, num_local_experts)
-        self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
-
-        super().__init__(
-            weak_method(self.forward_impl),
-            stream,
-            event,
-            weak_method(self.backward_impl),
-            free_input=free_input,
-            name=name,
-        )
-        self.layer_state = layer_state
-        self.chunk_state = chunk_state
-        self.submodule = submodule
-        self.detached = tuple()
-        self.before_detached = tuple()
-        self.is_mtp = extra_args.get("is_mtp", False)
-
-        # Create flags to indicate first and last layer
-        self.is_first_layer = extra_args.get("is_first_layer", False)
-        self.is_last_layer = extra_args.get("is_last_layer", False)
-
-        # Initialize list to store registered dw callables
-        self.bwd_dw_callables = []
-        if bwd_dw_callables is not None:
-            self.bwd_dw_callables = (
-                bwd_dw_callables if isinstance(bwd_dw_callables, list) else [bwd_dw_callables]
-            )
-
-    @staticmethod
-    def _resolve_free_input(name, is_moe, config, num_local_experts):
-        """Free-input policy hook. Subclasses override to specialize.
-
-        Default delegates to module-level ``should_free_input`` (the GPT MoE
-        EP-overlap policy).
-        """
-        return should_free_input(name, is_moe, config, num_local_experts)
-
-    def detach(self, t):
-        """Detaches a tensor and stores it for backward computation."""
-        detached = make_viewless(t).detach()
-        detached.requires_grad = t.requires_grad
-        self.before_detached = self.before_detached + (t,)
-        self.detached = self.detached + (detached,)
-        return detached
-
-    def forward_impl(self, *args):
-        """Calls the submodule as the forward pass."""
-        return self.submodule(self, *args)
-
-    def backward_impl(self, outputs, output_grad):
-        """Implements the backward pass for the transformer layer node."""
-        detached_grad = tuple([e.grad for e in self.detached])
-        grads = output_grad + detached_grad
-        self.default_backward_func(outputs + self.before_detached, grads)
-        # release the output grad memory after backward finishes,
-        # except when delay_wgrad_comptue is enabled, the grad should be
-        # kept until all modules' backward_dw has been invoked.
-        if self.delay_wgrad_compute:
-            self.output_grads = grads
-            self.delay_grads_release = len(self.bwd_dw_callables) > 0
-
-        # return grads for record stream
-        return grads
-
-    def backward_dw(self):
-        """Computes the weight gradients for the transformer layer node."""
-        if not self.delay_wgrad_compute:
-            return
-        if isinstance(self.stream, Callable):
-            self.stream = self.stream()
-        with torch.cuda.stream(self.stream):
-            nvtx_msg = f"{self.name} wgrad"
-            nvtx_range_push(nvtx_msg)
-            for module in self.bwd_dw_callables:
-                module.backward_dw()
-            nvtx_range_pop(nvtx_msg)
-
-        # the output grad memory is last used in wgrad compute, should be safe to release.
-        assert self.delay_grads_release, "output grad memory should be valid before wgrad."
-        if self.manual_release_grads:
-            for tensor in self.output_grads:
-                tensor.untyped_storage().resize_(0)
-        self.output_grads = None
-
-        self.bwd_dw_callables = None
-
-    def __del__(self):
-        # Release reference as early as possible, this helps avoid memory leak.
-        self.before_detached = None
-        self.detached = None
-        self.layer_state = None
-        self.chunk_state = None
-        self.submodule = None
-
-
-class _BackwardDWWrapper:
-    """Wrapper for managing backward weight gradient computation of attn module.
-
-    This class handles the execution of weight gradient computations for transformer layers,
-    coordinating between CUDA graphed and non-graphed components. It is used when
-    overlap_moe_expert_parallel_comm and delay_wgrad_compute are enabled to manage
-    the delayed weight gradient computation in MoE models.
-
-    The wrapper stores references to the attention and shared expert backward weight gradient
-    callables, and determines which components should be executed based on whether CUDA graphs
-    are being replayed and which scopes are covered by the graphs.
-    """
-
-    def __init__(self, layer):
-        assert isinstance(
-            layer, GraphableMegatronModule
-        ), "cuda graphed ep overlap only supports GraphableMegatronModule."
-        assert isinstance(
-            layer, TransformerLayer
-        ), "cuda graphed ep overlap only supports TransformerLayer for now."
-        self.layer = layer
-        self.graphed_backward_dw_callable = None
-        self.attn_dw_callable = layer.self_attention.backward_dw
-        if layer.is_moe_layer:
-            self.shared_expert_dw_callable = partial(
-                layer.mlp.backward_dw, routed_experts=False, shared_experts=True
-            )
-        else:
-            self.shared_expert_dw_callable = None
-        self.cuda_graph_scope = layer.config.cuda_graph_scope
-
-    def backward_dw(self):
-        """Execute weight gradients, skipping CUDA graphed components during replay."""
-        is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
-        if self.shared_expert_dw_callable is not None and (
-            not is_replay or CudaGraphScope.moe_router not in self.cuda_graph_scope
-        ):
-            self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphScope.attn not in self.cuda_graph_scope:
-            self.attn_dw_callable()
-        if is_replay and self.graphed_backward_dw_callable is not None:
-            self.graphed_backward_dw_callable()
-        self.layer = None
-
-    def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
-        """Store the CUDA graphed backward weight gradient callable."""
-        self.graphed_backward_dw_callable = graphed_backward_dw_callable
+# Re-export the model-agnostic schedule-plan helpers so existing imports of
+# ``from megatron.core.models.gpt.fine_grained_callables import ...`` keep
+# working. The implementations live in ``megatron.core.models.common.utils``;
+# only the GPT-specific ``build_*_layer_callables`` builders below stay here.
+__all__ = [
+    "PostProcessNode",
+    "PreProcessNode",
+    "TransformerLayerNode",
+    "TransformerLayerState",
+    "_BackwardDWWrapper",
+    "should_free_input",
+    "weak_method",
+    "build_layer_callables",
+    "build_mtp_layer_callables",
+    "build_transformer_layer_callables",
+]
 
 
 def build_transformer_layer_callables(layer: TransformerLayer):

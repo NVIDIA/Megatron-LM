@@ -6,9 +6,11 @@ These extend the GPT-side ``TransformerLayerSchedulePlan`` /
 ``TransformerModelChunkSchedulePlan`` with the per-layer ``layer_type`` symbol
 that HybridStack assigns to each entry of its ``layer_type_list`` (including
 bracketed groups like ``[*-]``). The base classes remain GPT-only; this module
-adds the hybrid-specific dispatch into ``build_hybrid_stack_callables`` and uses
-``HybridStackNode`` so the schedule node's free-input policy can diverge from
-the GPT default.
+adds the hybrid-specific dispatch into ``build_hybrid_stack_callables`` and
+uses ``HybridStackNode`` so the schedule node's free-input policy can diverge
+from the GPT default. The pre/post-process nodes from
+``core.models.common.utils`` are reused as-is — they already call
+``model._preprocess`` / ``model._postprocess`` which work on a HybridModel.
 """
 
 from contextlib import nullcontext
@@ -17,106 +19,6 @@ from megatron.core.models.common.model_chunk_schedule_plan import (
     TransformerLayerSchedulePlan,
     TransformerModelChunkSchedulePlan,
 )
-from megatron.core.models.gpt.fine_grained_callables import (
-    PostProcessNode,
-    PreProcessNode,
-    weak_method,
-)
-from megatron.core.transformer.module import float16_to_fp32
-from megatron.core.transformer.transformer_layer import make_viewless_tensor
-
-
-class HybridPreProcessNode(PreProcessNode):
-    """``PreProcessNode`` that calls ``HybridModel._preprocess``.
-
-    Mirrors the GPT counterpart but takes a HybridModel rather than a GPTModel
-    so the EP-overlap schedule plan does not cross-import a GPT-named class
-    when scheduling a hybrid model. Behavior matches: ``_preprocess`` returns
-    the same 6-tuple shape ``(decoder_input, rotary_pos_emb, rotary_pos_cos,
-    rotary_pos_sin, sequence_len_offset, padding_mask)`` and the chunk_state
-    fields populated here line up with the slots downstream layer nodes read.
-    """
-
-    def __init__(self, hybrid_model, chunk_state, event, stream):
-        # Bypass ``PreProcessNode.__init__`` to avoid binding to a
-        # ``gpt_model``-named attribute; reuse the underlying ScheduleNode.
-        super(PreProcessNode, self).__init__(
-            weak_method(self.forward_impl), stream, event, name="pre_process"
-        )
-        self.hybrid_model = hybrid_model
-        self.chunk_state = chunk_state
-
-    def forward_impl(self):
-        if not self.hybrid_model.pre_process:
-            self.chunk_state.decoder_input = self.hybrid_model.decoder.input_tensor
-        (
-            decoder_input,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-            padding_mask,
-        ) = self.hybrid_model._preprocess(
-            input_ids=self.chunk_state.input_ids,
-            position_ids=self.chunk_state.position_ids,
-            decoder_input=self.chunk_state.decoder_input,
-            packed_seq_params=self.chunk_state.packed_seq_params,
-            padding_mask=self.chunk_state.padding_mask,
-        )
-
-        self.chunk_state.decoder_input = decoder_input
-        self.chunk_state.rotary_pos_emb = rotary_pos_emb
-        self.chunk_state.rotary_pos_cos = rotary_pos_cos
-        self.chunk_state.rotary_pos_sin = rotary_pos_sin
-        self.chunk_state.sequence_len_offset = sequence_len_offset
-        self.chunk_state.padding_mask = padding_mask
-        return decoder_input
-
-
-class HybridPostProcessNode(PostProcessNode):
-    """``PostProcessNode`` that calls ``HybridModel._postprocess``.
-
-    Mirrors the GPT counterpart. Skips MTP inside ``_postprocess`` (sets
-    ``mtp_in_postprocess=False``) because the EP-overlap schedule plan handles
-    MTP as separate layer nodes in the same chunk plan.
-    """
-
-    def __init__(self, hybrid_model, chunk_state, event, stream):
-        super(PostProcessNode, self).__init__(
-            weak_method(self.forward_impl), stream, event, name="post_process"
-        )
-        self.hybrid_model = hybrid_model
-        self.chunk_state = chunk_state
-
-    def forward_impl(self, hidden_states):
-        empty_decoder = len(self.hybrid_model.decoder.layers) == 0
-        layer_norm = getattr(self.hybrid_model.decoder, "final_layernorm", None) or getattr(
-            self.hybrid_model.decoder, "final_norm", None
-        )
-        if not self.hybrid_model.config.mtp_num_layers and empty_decoder and layer_norm:
-            hidden_states = layer_norm(hidden_states)
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
-
-        loss = self.hybrid_model._postprocess(
-            hidden_states=hidden_states,
-            input_ids=self.chunk_state.input_ids,
-            position_ids=self.chunk_state.position_ids,
-            labels=self.chunk_state.labels,
-            decoder_input=self.chunk_state.decoder_input,
-            rotary_pos_emb=self.chunk_state.rotary_pos_emb,
-            rotary_pos_cos=self.chunk_state.rotary_pos_cos,
-            rotary_pos_sin=self.chunk_state.rotary_pos_sin,
-            mtp_in_postprocess=False,
-            loss_mask=self.chunk_state.loss_mask,
-            attention_mask=self.chunk_state.attention_mask,
-            packed_seq_params=self.chunk_state.packed_seq_params,
-            sequence_len_offset=self.chunk_state.sequence_len_offset,
-            runtime_gather_output=self.chunk_state.runtime_gather_output,
-            extra_block_kwargs=self.chunk_state.extra_block_kwargs,
-        )
-        return float16_to_fp32(loss)
 
 
 class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
@@ -209,12 +111,13 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
     Threads HybridStack's ``layer_type_list[layer_idx]`` symbol into each
     layer plan's ``extra_args`` so the per-layer plan can dispatch grouped
     layers correctly. Ordinary GPT/MTP layers (no ``layer_type_list``)
-    default to ``layer_type=None`` and follow the GPT path.
+    default to ``layer_type=None`` and follow the GPT path. The pre/post
+    process nodes inherit from the GPT base class — they already dispatch
+    on ``model._preprocess`` / ``model._postprocess`` which a HybridModel
+    implements.
     """
 
     LAYER_SCHEDULE_PLAN_CLASS = HybridStackSchedulePlan
-    PRE_PROCESS_NODE_CLASS = HybridPreProcessNode
-    POST_PROCESS_NODE_CLASS = HybridPostProcessNode
 
     def _extra_args_for_layer(self, module, layer_idx, num_layers):
         extra_args = super()._extra_args_for_layer(module, layer_idx, num_layers)

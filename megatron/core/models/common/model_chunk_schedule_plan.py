@@ -70,7 +70,7 @@ class TransformerLayerSchedulePlan:
         The event and chunk_state are binded to the TransformerModelChunkSchedulePlan
         and shared across all layers in the model chunk.
         """
-        from megatron.core.models.gpt.fine_grained_callables import TransformerLayerState
+        from megatron.core.models.common.utils import TransformerLayerState
 
         self.config = layer.config
         self.layer_state = TransformerLayerState()
@@ -111,10 +111,8 @@ class TransformerLayerSchedulePlan:
         Builds the callable nodes for the transformer/mtp layer:
             attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
         """
-        from megatron.core.models.gpt.fine_grained_callables import (
-            TransformerLayerNode,
-            build_layer_callables,
-        )
+        from megatron.core.models.common.utils import TransformerLayerNode
+        from megatron.core.models.gpt.fine_grained_callables import build_layer_callables
         from megatron.core.transformer.moe.moe_layer import MoELayer
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
@@ -322,7 +320,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The model chunk schedule plan.
         """
-        from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
+        from megatron.core.models.common.utils import PostProcessNode, PreProcessNode
 
         pre_process_cls = self.PRE_PROCESS_NODE_CLASS or PreProcessNode
         post_process_cls = self.POST_PROCESS_NODE_CLASS or PostProcessNode

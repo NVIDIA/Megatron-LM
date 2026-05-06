@@ -9,7 +9,7 @@ from torch import Tensor
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.gpt.fine_grained_callables import TransformerLayerNode, should_free_input
+from megatron.core.models.common.utils import TransformerLayerNode, should_free_input
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols

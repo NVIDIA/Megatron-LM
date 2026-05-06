@@ -200,7 +200,7 @@ class GraphableMegatronModule(MegatronModule):
 
     def init_backward_dw_wrapper(self):
         """Initialize the backward_dw_wrapper."""
-        from megatron.core.models.gpt.fine_grained_callables import _BackwardDWWrapper
+        from megatron.core.models.common.utils import _BackwardDWWrapper
 
         config = getattr(self, 'config', None)
         assert config is not None, (
