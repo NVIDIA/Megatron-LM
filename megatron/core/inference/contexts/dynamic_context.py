@@ -331,6 +331,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
+        # The flex/DeepEP token dispatcher uses the combined expert-TP × EP
+        # group (tp_ep) for its all-to-all, so the DeepEP V2 ElasticBuffer must
+        # be allocated against the same group — otherwise `_get_deepep_v2_buffer`
+        # sees a different group object and discards the prepared buffer.
+        if pg_collection is not None and getattr(pg_collection, 'tp_ep', None) is not None:
+            self.expert_tp_ep_group = pg_collection.tp_ep
+        else:
+            try:
+                self.expert_tp_ep_group = (
+                    parallel_state.get_expert_tensor_and_model_parallel_group()
+                )
+            except (AssertionError, AttributeError):
+                self.expert_tp_ep_group = self.expert_model_parallel_group
+
+        # Optional CPU-side collective for EP batch-dimension sync. Populated by
+        # the engine via set_ep_zmq_communicator() when available. When set,
+        # match_graph_config() uses this to perform the MAX reduction on the
+        # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
+        self._ep_zmq_communicator = None
+
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -642,24 +662,44 @@ class DynamicInferenceContext(BaseInferenceContext):
                     "inference_moe_token_dispatcher_type='deepep_v2' requires deep_ep with "
                     "ElasticBuffer (install from the epv2-release branch)."
                 )
-                # Pin the ElasticBuffer to the largest captured-graph shape, not
-                # the engine's global max_tokens. cuda_graph_max_tokens is asserted
-                # equal to max_requests * (num_speculative_tokens + 1) above, and
-                # mixed-prefill graphs reuse the same token-count granularity, so
-                # this covers every CUDA-graphed step. An eager (non-graphed)
-                # prefill step that exceeds this triggers a lazy reallocation
-                # inside _get_deepep_v2_buffer that grows the global buffer to the
-                # new high-water mark; the realloc itself is safe (runs outside
-                # graph capture), but the memory is held until process exit. Users
-                # running long prompts without chunked prefill therefore pay the
-                # NVLS-equivalent footprint at most once, the first time they hit
-                # a long step.
+                # The ElasticBuffer uses symmetric NVLink memory: every rank in
+                # the group MUST allocate the same per-rank size, otherwise
+                # cross-rank reads land on undefined offsets and the dispatch
+                # copy epilogue trips its dst_expert_idx dedup assertion.
+                # `_get_deepep_v2_buffer` will lazily realloc on size growth,
+                # but it does so per-rank from local `x.shape[0]`, so chunked
+                # prefill with uneven DP request sizes (e.g. rank A sees 224
+                # tokens while rank B sees 64) breaks the invariant. To avoid
+                # any lazy realloc, pre-allocate to the worst case across both
+                # captured-graph decode steps and eager prefill steps:
+                #   - decode/spec graph cap: max_requests * (num_speculative_tokens + 1)
+                #   - prefill cap:           round_up_tokens(max_tokens)
+                # then divide by tp_size for the per-rank count. This matches
+                # the NVLS allgather_worst_case sizing in the branch below.
                 deepep_graph_cap = (
                     self.max_requests * (self.num_speculative_tokens + 1)
                 )
+                deepep_per_rank_cap = (
+                    max(self.round_up_tokens(deepep_graph_cap), self.round_up_tokens(self.max_tokens))
+                    // tp_size
+                )
+                # DEBUG: confirm this branch runs and the cap math is what we expect.
+                import torch.distributed as _dist
+                if _dist.is_initialized() and _dist.get_rank() == 0:
+                    print(
+                        f"[deepep_v2 prepare] max_requests={self.max_requests} "
+                        f"num_speculative_tokens={self.num_speculative_tokens} "
+                        f"max_tokens={self.max_tokens} tp_size={tp_size} "
+                        f"deepep_graph_cap={deepep_graph_cap} "
+                        f"deepep_per_rank_cap={deepep_per_rank_cap} "
+                        f"moe_hidden_size={moe_hidden_size} "
+                        f"moe_router_topk={model_config.moe_router_topk} "
+                        f"prepare_group_size={get_pg_size(self.expert_tp_ep_group)}",
+                        flush=True,
+                    )
                 prepare_deepep_v2_buffer(
-                    group=self.expert_model_parallel_group,
-                    num_max_tokens_per_rank=self.round_up_tokens(deepep_graph_cap) // tp_size,
+                    group=self.expert_tp_ep_group,
+                    num_max_tokens_per_rank=deepep_per_rank_cap,
                     hidden=moe_hidden_size,
                     num_topk=model_config.moe_router_topk,
                 )

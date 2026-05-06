@@ -291,6 +291,18 @@ _deepep_v2_num_sms_group = None
 _deepep_v2_num_sms_num_experts = None
 _deepep_v2_num_sms_num_topk = None
 
+# Cumulative within-row-duplicate count across all DeepEP V2 dispatches when
+# MCORE_DEEPEP_V2_DEBUG_TOPK_GRAPH=1. Written by the dispatch forward (no host
+# sync, capture-safe). Read it after a synchronization point — e.g.,
+# `torch.cuda.synchronize(); print(_DEEPEP_V2_DUP_COUNTER.item())`.
+_DEEPEP_V2_DUP_COUNTER = None
+
+# Set of (group_size, num_experts, num_topk, num_max_tokens_per_rank, hidden,
+# use_expanded_layout) tuples already printed (MCORE_DEEPEP_V2_DEBUG_DISPATCH=1).
+# We print one line per *distinct* dispatch shape so we can see whether
+# different MoE layers (e.g. MTP vs main decoder) dispatch with different params.
+_DEEPEP_V2_DEBUG_SEEN = set()
+
 
 def _get_deepep_v2_buffer(
     group: torch.distributed.ProcessGroup,
@@ -389,6 +401,24 @@ class DeepEPV2Dispatch(torch.autograd.Function):
     """Fused dispatch operation using DeepEP V2 ElasticBuffer."""
 
     @staticmethod
+    def forward(ctx, x, token_indices, token_probs, num_experts, group, async_finish=False, allocate_on_comm_stream=False,use_expanded_layout=False):
+        # PASSTHROUGH for graph-capture diagnostic
+        fake_recv = torch.zeros(
+            x.shape[0] * num_experts // group.size() * token_indices.shape[1],
+            x.shape[1], dtype=x.dtype, device=x.device,
+        )
+        fake_tpe = torch.zeros(num_experts // group.size(), dtype=torch.int64, device=x.device)
+        fake_handle = type('FakeHandle', (), {
+            'topk_idx': token_indices,
+            'num_max_tokens_per_rank': x.shape[0],
+            'num_sms': 0,
+            'psum_num_recv_tokens_per_expert': torch.zeros_like(fake_tpe).cumsum(0).int(),
+        })()
+        ctx.handle = fake_handle
+        ctx.group = group
+        return fake_recv, None, token_probs[:, 0:1], fake_tpe, fake_handle
+
+    @staticmethod
     def forward(
         ctx,
         x,
@@ -400,14 +430,71 @@ class DeepEPV2Dispatch(torch.autograd.Function):
         allocate_on_comm_stream=False,
         use_expanded_layout=False,
     ):
-        num_max_tokens_per_rank, hidden = x.shape
+        local_num_tokens, hidden = x.shape
         num_topk = token_indices.shape[1]
-        buffer = _get_deepep_v2_buffer(group, num_max_tokens_per_rank, hidden, num_topk)
+        buffer = _get_deepep_v2_buffer(group, local_num_tokens, hidden, num_topk)
+        # Use the buffer's allocated per-rank capacity rather than the local
+        # token count: ElasticBuffer is symmetric NVLink memory, so every rank
+        # MUST pass the same `num_max_tokens_per_rank` to `buffer.dispatch`,
+        # otherwise the kernel templates with mismatched strides per rank and
+        # cross-rank reads land on undefined offsets (manifests as duplicate
+        # `dst_expert_idx` values tripping `dispatch_copy_epilogue.cuh:106`).
+        # `prepare_deepep_v2_buffer` is sized at init time for the worst case
+        # across decode + prefill, so all ranks see the same capacity.
+        num_max_tokens_per_rank = buffer.num_max_tokens_per_rank
+        assert local_num_tokens <= num_max_tokens_per_rank, (
+            f"deepep_v2 dispatch local_num_tokens={local_num_tokens} exceeds "
+            f"pre-allocated num_max_tokens_per_rank={num_max_tokens_per_rank}; "
+            f"increase the cap in dynamic_context._deepep_v2_ep_dispatcher init."
+        )
         num_sms = _get_deepep_v2_num_sms(buffer, group, num_experts, num_topk)
+        # DEBUG: dump dispatch parameters once per (param-tuple) per rank, so
+        # we see *every distinct* dispatch shape across MoE layers (MTP and
+        # main decoder layers may differ). Enable with
+        # MCORE_DEEPEP_V2_DEBUG_DISPATCH=1.
+        import os as _os
+        global _DEEPEP_V2_DEBUG_SEEN
+        if _os.environ.get("MCORE_DEEPEP_V2_DEBUG_DISPATCH", "0") == "1":
+            _key = (group.size(), num_experts, num_topk, local_num_tokens, num_max_tokens_per_rank, hidden, use_expanded_layout)
+            if _key not in _DEEPEP_V2_DEBUG_SEEN:
+                _DEEPEP_V2_DEBUG_SEEN.add(_key)
+                _rank = torch.distributed.get_rank()
+                _group_rank = torch.distributed.get_rank(group=group)
+                _idx_max = int(token_indices.max().item())
+                _idx_min = int(token_indices.min().item())
+                print(
+                    f"[deepep_v2 debug] global_rank={_rank} group_rank={_group_rank} "
+                    f"group_size={group.size()} num_experts={num_experts} "
+                    f"num_topk={num_topk} local_num_tokens={local_num_tokens} "
+                    f"num_max_tokens_per_rank={num_max_tokens_per_rank} "
+                    f"hidden={hidden} use_expanded_layout={use_expanded_layout} "
+                    f"token_indices.shape={tuple(token_indices.shape)} "
+                    f"token_indices.dtype={token_indices.dtype} "
+                    f"token_indices min={_idx_min} max={_idx_max} "
+                    f"token_probs.dtype={token_probs.dtype}",
+                    flush=True,
+                )
         # Inference (use_expanded_layout=True) is the graph-capturable path: we
         # must avoid the dispatch-side host sync, and we recover tokens_per_expert
         # from the device-resident prefix-sum on the handle below.
         do_cpu_sync = False if use_expanded_layout else None
+        # DEBUG: graph-capture-friendly per-token duplicate check on the
+        # token_indices tensor that is about to be handed to DeepEP V2. We
+        # accumulate the duplicate count into a persistent device tensor on
+        # every dispatch (no host sync, survives capture/replay). Read it
+        # from outside the graph via `_DEEPEP_V2_DUP_COUNTER`. Enable with
+        # MCORE_DEEPEP_V2_DEBUG_TOPK_GRAPH=1.
+        import os as _os
+        if _os.environ.get("MCORE_DEEPEP_V2_DEBUG_TOPK_GRAPH", "0") == "1":
+            _idx = token_indices
+            _safe = _idx.clamp(min=0)
+            _sorted, _ = _safe.sort(dim=-1)
+            _dup_mask = (_sorted[:, 1:] == _sorted[:, :-1])
+            _dup_count = _dup_mask.any(dim=-1).to(torch.int64).sum()
+            global _DEEPEP_V2_DUP_COUNTER
+            if _DEEPEP_V2_DUP_COUNTER is None or _DEEPEP_V2_DUP_COUNTER.device != _idx.device:
+                _DEEPEP_V2_DUP_COUNTER = torch.zeros(1, dtype=torch.int64, device=_idx.device)
+            _DEEPEP_V2_DUP_COUNTER += _dup_count
         recv_x, recv_token_indices, recv_token_probs, handle, event = buffer.dispatch(
             x.contiguous(),
             topk_idx=token_indices,
@@ -465,6 +552,17 @@ class DeepEPV2Dispatch(torch.autograd.Function):
 
 class DeepEPV2Combine(torch.autograd.Function):
     """Fused combine operation using DeepEP V2 ElasticBuffer."""
+
+    @staticmethod
+    def forward(ctx, x, group, handle, async_finish=False,
+        allocate_on_comm_stream=False,
+        use_expanded_layout=False):
+        # PASSTHROUGH
+        out = torch.zeros(handle.num_max_tokens_per_rank, x.shape[1], dtype=x.dtype,
+                          device=x.device)
+        ctx.handle = handle
+        ctx.group = group
+        return out, None
 
     @staticmethod
     def forward(

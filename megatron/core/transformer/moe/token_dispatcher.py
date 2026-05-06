@@ -1228,6 +1228,25 @@ class _DeepepManager(_DispatchManager):
             and self.token_indices.dtype != DEEPEP_TOPK_IDX_DTYPE
         ):
             self.token_indices = self.token_indices.to(DEEPEP_TOPK_IDX_DTYPE)
+        # DEBUG (unconditional, capture-gated): surface within-row duplicates
+        # that would trip the `dispatch_copy_epilogue.cuh:106` assertion in
+        # DeepEP V2. Skipped during graph capture because the check uses host
+        # syncs.
+        if not torch.cuda.is_current_stream_capturing():
+            _idx = self.token_indices
+            _valid = _idx >= 0
+            _idx_for_uniq = _idx.masked_fill(~_valid, -1)
+            _sorted, _ = _idx_for_uniq.sort(dim=-1)
+            _has_dup = ((_sorted[:, 1:] == _sorted[:, :-1]) & (_sorted[:, 1:] >= 0)).any(dim=-1)
+            if _has_dup.any():
+                _dup_rows = _has_dup.nonzero(as_tuple=False).flatten()[:5].tolist()
+                raise RuntimeError(
+                    f"[deepep_v2 debug] token_indices has within-row duplicates: "
+                    f"router_topk={self.router_topk}, num_experts={self.num_experts}, "
+                    f"num_tokens={num_tokens}, dup_row_count={int(_has_dup.sum())}, "
+                    f"first_dup_rows={_dup_rows}, "
+                    f"sample_rows={_idx[_dup_rows].tolist()}"
+                )
 
     def dispatch(
         self,

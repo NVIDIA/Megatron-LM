@@ -662,6 +662,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
     ) -> Tuple[torch.Tensor, None]:
+        return torch.zeros_like(permuted_local_hidden_states), None
         """Graph-capturable expert forward for the DeepEP V2 expand-layout dispatch.
 
         DeepEP V2's expand mode (`do_expand=True`) writes one slot per
@@ -686,21 +687,28 @@ class InferenceGroupedMLP(TEGroupedMLP):
             "deepep_v2 expand-layout forward does not yet support add_bias_linear=True."
         )
 
-        # Cumulative offsets per local expert, on device. With expert_alignment=1
-        # (set in DeepEPV2Dispatch.forward), this equals
-        # handle.psum_num_recv_tokens_per_expert exactly.
-        offs = tokens_per_expert.cumsum(0).to(torch.int32)
-
         # PyTorch's CUTLASS grouped_mm (sm90/sm100 BF16) asserts
         # offs[-1] == mat1.shape[0]. The recv buffer is sized to the worst-case
         # `num_max_tokens_per_rank * num_ranks * num_topk` padded total, but
-        # offs[-1] only covers the actually-routed prefix. Extend the last
-        # expert's offset to cover the padding rows: the last expert then
-        # computes garbage over the pad slots, which combine() discards. This
-        # adds at most a small amount of wasted compute on padding rows and
-        # avoids the host-sync we'd need to slice the input down.
+        # the routed prefix `psum[-1]` is smaller. Extend the last expert's
+        # row range to cover the padding rows: the last expert computes garbage
+        # over the pad slots, which combine() discards.
+        #
+        # Naively this is `offs[-1] = N_padded`, but tensor-setitem with a
+        # Python int does a host->device cudaMemcpyAsync, which is forbidden
+        # during CUDA graph capture. Instead we adjust the last token count
+        # via device-side arithmetic so the cumsum's last element naturally
+        # equals N_padded:
+        #   tokens'[i] = tokens[i]                              for i < N-1
+        #   tokens'[N-1] = N_padded - sum(tokens[:N-1])         (rsub.Scalar)
+        # which is `Python_int - tensor` — kernel-with-constant, capture-safe.
         N_padded = permuted_local_hidden_states.shape[0]
-        offs[-1] = N_padded
+        sum_first = tokens_per_expert[:-1].sum()
+        adjusted_last = (N_padded - sum_first).unsqueeze(0)
+        tokens_per_expert_padded = torch.cat(
+            [tokens_per_expert[:-1], adjusted_last]
+        )
+        offs = tokens_per_expert_padded.cumsum(0).to(torch.int32)
 
         # FC1: input [N, hidden] @ weight^T → [N, ffn_hidden * (2 if gated else 1)]
         # _fc1_weight is [num_local_experts, ffn_hidden_out, hidden]; grouped_mm
