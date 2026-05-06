@@ -17,11 +17,11 @@ class ContextGPUView:
         ``context.foo``      -> CPU (source of truth, used by bookkeeping)
         ``context.gpu_view.foo`` -> GPU (snapshot, used by forward pass)
 
-    Layout note: the 9 bookkeeping fields are backed by a single contiguous
+    Layout note: the bookkeeping fields are backed by a single contiguous
     ``uint8`` buffer (``self._buf``). Each field is a ``view(dtype)`` onto a
     slice of that buffer. This matches the pinned-CPU-buffer layout in
     :class:`DynamicInferenceContext` so that the per-step H2D transfer is a
-    single ``cudaMemcpyAsync`` instead of nine small ones.
+    single ``cudaMemcpyAsync`` instead of one per field.
     """
 
     def __init__(
@@ -39,7 +39,10 @@ class ContextGPUView:
         #   max_mamba_chunks == 0).
         tok_int64_bytes = max_tokens * 8  # 2 fields of int64 = 8 bytes/elem
         tok_int32_bytes = max_tokens * 4  # 4 fields of int32 = 4 bytes/elem
-        req_int32_bytes = max_requests * 4  # 3 fields of int32
+        # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
+        # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
+        # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
+        req_4byte_bytes = max_requests * 4
 
         # MHA section: 5 fields shared by both graphed and non-graphed MHAMetadata
         # (only one is active per step, so sharing storage is fine).
@@ -90,7 +93,7 @@ class ContextGPUView:
         total_bytes = (
             2 * tok_int64_bytes
             + 4 * tok_int32_bytes
-            + 3 * req_int32_bytes
+            + 7 * req_4byte_bytes
             + mha_query_lengths_bytes
             + mha_cu_query_seq_lengths_bytes
             + mha_kv_seq_lengths_bytes
@@ -128,12 +131,28 @@ class ContextGPUView:
         off += tok_int32_bytes
 
         # Request-level tensors (consumed by sampling, log-probs, speculative verification, MTP).
-        self.request_in_prefill_status = self._buf[off : off + req_int32_bytes].view(torch.int32)
-        off += req_int32_bytes
-        self.request_query_lengths = self._buf[off : off + req_int32_bytes].view(torch.int32)
-        off += req_int32_bytes
-        self.request_kv_length_offsets = self._buf[off : off + req_int32_bytes].view(torch.int32)
-        off += req_int32_bytes
+        self.request_in_prefill_status = self._buf[off : off + req_4byte_bytes].view(torch.int32)
+        off += req_4byte_bytes
+        self.request_query_lengths = self._buf[off : off + req_4byte_bytes].view(torch.int32)
+        off += req_4byte_bytes
+        self.request_kv_length_offsets = self._buf[off : off + req_4byte_bytes].view(torch.int32)
+        off += req_4byte_bytes
+        # Sampling parameters (consumed by FlashInfer sampling).
+        # Mirror the active slice of `active_request_metadata[{label}]`;
+        # padded slots get neutral defaults from `pad_active_slices` (T=1.0, top_k=0, top_p=0.0).
+        self.temperature = self._buf[off : off + req_4byte_bytes].view(torch.float32)
+        off += req_4byte_bytes
+        self.top_k = self._buf[off : off + req_4byte_bytes].view(torch.int32)
+        off += req_4byte_bytes
+        self.top_p = self._buf[off : off + req_4byte_bytes].view(torch.float32)
+        off += req_4byte_bytes
+        # Per-request last-token row indices (consumed by sampling kernels as `gather_indices`).
+        # The CPU side of this slot IS `context.active_request_last_token_idxs`,
+        # populated by `build_active_slices` and `pad_active_slices`.
+        self.active_request_last_token_idxs = self._buf[off : off + req_4byte_bytes].view(
+            torch.int32
+        )
+        off += req_4byte_bytes
 
         # MHA flash-attention metadata (shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata — only one is active per step).
