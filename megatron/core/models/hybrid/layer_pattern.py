@@ -9,7 +9,7 @@ The Python DSL composes a model from a (possibly nested) list of
 :func:`load_recipe` resolves a recipe spec — either a dotted Python module
 path or a filesystem path, with an optional ``:func`` suffix — and returns
 the :class:`HybridModelConfig` ready to feed into :class:`HybridModel` via
-``HybridModel(recipe=...)``.
+``HybridModel(config=recipe)``.
 """
 
 import hashlib
@@ -178,7 +178,7 @@ def load_recipe(spec: str) -> HybridModelConfig:
     """Resolve a recipe spec and return its :class:`HybridModelConfig`.
 
     The recipe is the public contract: pass it directly to
-    :class:`HybridModel` via ``HybridModel(recipe=...)`` or to the
+    :class:`HybridModel` via ``HybridModel(config=recipe)`` or to the
     ``--model-recipe`` argparse adapter, both of which own the lowering
     internally.
 

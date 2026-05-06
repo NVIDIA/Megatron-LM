@@ -94,3 +94,18 @@ products:
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
+
+  # End-to-end smoke test for the HybridModel Python DSL recipe path:
+  # exercises HybridModel(config: HybridModelConfig, ...) through the real
+  # training launcher (pretrain_hybrid.py --model-recipe), trains for 50
+  # iterations, and locks loss / gradient-norm golden values. Architecture
+  # and entry point are defined in:
+  #   tests/functional_tests/test_cases/hybrid/
+  #     hybrid_recipe_dsl_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G/{recipe.py,model_config.yaml}
+  - test_case: [hybrid_recipe_dsl_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+      # - environment: [lts] # disabled until triton is bumped
+      #   scope: [nightly]
