@@ -485,6 +485,10 @@ class CheckpointConfig:
     async_strategy: Literal["nvrx", "mcore"] = "nvrx"
     """Which async save strategy to use. Available strategies: nvrx, mcore."""
 
+    async_write_results_mp_mode: str = "fork"
+    """Multiprocessing start method for the async write results queue.
+    Options: ``"fork"`` (default), ``"spawn"``, ``"forkserver"``."""
+
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
     worker thread/process for handling async saves. When disabled, uses temporal workers that are
