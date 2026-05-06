@@ -904,11 +904,7 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(
-        self,
-        cache_metadata: bool = False,
-        replicate_local_replicas: bool = False,
-    ):
+    def __init__(self, cache_metadata: bool = False, replicate_local_replicas: bool = False):
         """
         Args:
             cache_metadata (bool): keep the parsed ``.metadata`` pickle alive

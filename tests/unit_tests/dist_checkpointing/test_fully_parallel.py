@@ -647,9 +647,7 @@ class TestCrossRanksReads:
             # ``get_default_strategy``) so we can pass the
             # ``replicate_local_replicas`` flag to the load constructor.
             load_strategy = FullyParallelLoadStrategyWrapper(
-                TorchDistLoadShardedStrategy(
-                    replicate_local_replicas=replicate_local_replicas
-                ),
+                TorchDistLoadShardedStrategy(replicate_local_replicas=replicate_local_replicas),
                 parallelization_group,
                 do_cache_distribution=True,
                 exchange_algo='broadcast',
