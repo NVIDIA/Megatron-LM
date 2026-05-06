@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass, field
 import signal
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional
+
 
 @dataclass(kw_only=True)
 class TrainingConfig:
@@ -143,8 +144,15 @@ class ValidationConfig:
 
     multiple_validation_sets: bool = False
     """If set, multiple datasets listed in the validation split are evaluated independently with a
-       separate loss for each dataset in the list. This argument requires that no weights are 
+       separate loss for each dataset in the list. This argument requires that no weights are
        included in the list.
+    """
+
+    validation_set_names: Optional[List[str]] = None
+    """Optional list of names for multiple validation sets. When provided with
+       --multiple-validation-sets, these names are used instead of numeric indices
+       (e.g. 'validation-wiki' instead of 'validation-0'). The number of names must
+       match the number of validation datasets.
     """
 
 
