@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import torch
 from torch import Tensor
@@ -18,7 +18,12 @@ class FlashInferSampling(Sampling):
     """Fused FlashInfer sampling, with optional CUDA graph capture/replay."""
 
     def __init__(
-        self, vocab_size: int, rng: torch.Generator, config=None, enable_cuda_graph: bool = False
+        self,
+        vocab_size: int,
+        rng: torch.Generator,
+        config=None,
+        enable_cuda_graph: bool = False,
+        pin_input_from: Optional[List[CudaGraphManager]] = None,
     ) -> None:
         self._vocab_size = vocab_size
         self._rng = rng
@@ -29,6 +34,7 @@ class FlashInferSampling(Sampling):
                 function_name="sample_kernel",
                 need_backward=False,
                 inline_capture=True,
+                pin_input_from=pin_input_from,
             )
             CudaGraphManager(
                 config,
@@ -36,6 +42,7 @@ class FlashInferSampling(Sampling):
                 function_name="sample_speculative",
                 need_backward=False,
                 inline_capture=True,
+                pin_input_from=pin_input_from,
             )
 
     def sample_kernel(
@@ -52,7 +59,7 @@ class FlashInferSampling(Sampling):
         """FlashInfer fused top-k / top-p sampling kernel.
 
         Args:
-            logits: Logits tensor of shape `[>=n, vocab_size]`.
+            logits: Logits tensor of shape `[1, >=n, vocab_size]`
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
@@ -82,9 +89,9 @@ class FlashInferSampling(Sampling):
         # Clamp temperature to avoid division by 0.
         temperature = temperature.clamp(min=1e-6)
         if gather_indices is None:
-            scaled = logits[:n] / temperature.unsqueeze(1)
+            scaled = logits[0, :n] / temperature.unsqueeze(1)
         else:
-            scaled = logits[gather_indices[:n], :] / temperature.unsqueeze(1)
+            scaled = logits[0, gather_indices[:n], :] / temperature.unsqueeze(1)
         probs = torch.softmax(scaled, dim=-1)
 
         # Sentinel values disable filtering:

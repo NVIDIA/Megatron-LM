@@ -34,12 +34,16 @@ class LogProbsPrefill:
         *,
         side_stream: Optional[torch.cuda.Stream] = None,
         side_pool_anchor: Optional[CudaGraphManager] = None,
+        pin_input_from: Optional[List[CudaGraphManager]] = None,
     ):
         """
         Args:
             config: Optional MegatronConfig for CUDA graph capture configuration.
             side_stream: Optional CUDA stream the controller hosts indexing, LSE, and top-n on.
             side_pool_anchor: Optional anchor whose mempool the side-stream graphs share.
+            pin_input_from: Optional list of upstream `CudaGraphManager`s whose captured
+                outputs flow into this class's logits-consuming kernels (lse, gather).
+                See `CudaGraphManager.__init__` for the contract.
         """
         self._side_stream = side_stream
         self.side_pool_anchor: Optional[CudaGraphManager] = None
@@ -63,6 +67,7 @@ class LogProbsPrefill:
                 need_backward=False,
                 inline_capture=True,
                 share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+                pin_input_from=pin_input_from,
             )
             CudaGraphManager(
                 config,
@@ -71,6 +76,7 @@ class LogProbsPrefill:
                 need_backward=False,
                 inline_capture=True,
                 share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+                pin_input_from=pin_input_from,
             )
 
     @staticmethod
