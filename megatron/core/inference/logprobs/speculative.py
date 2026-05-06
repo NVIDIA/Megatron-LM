@@ -34,12 +34,16 @@ class LogProbsSpeculative:
         *,
         side_stream: Optional[torch.cuda.Stream] = None,
         side_pool_anchor: Optional[CudaGraphManager] = None,
+        pin_input_from: Optional[List[CudaGraphManager]] = None,
     ):
         """
         Args:
             config: Optional MegatronConfig for CUDA graph capture configuration.
             side_stream: Optional CUDA stream the controller hosts softmax, indexing, and top-n on.
             side_pool_anchor: Optional anchor whose mempool the side-stream graph shares.
+            pin_input_from: Optional list of upstream `CudaGraphManager`s whose captured
+                outputs flow into this class's logits-consuming kernels (softmax, gather,
+                _prefill_softmax). See `CudaGraphManager.__init__` for the contract.
         """
         self._side_stream = side_stream
         # Pinned CPU scalar holding `num_decode * spec_plus_one`.
@@ -57,6 +61,7 @@ class LogProbsSpeculative:
                     if side_pool_anchor is not None
                     else {"new_mempool": True}
                 ),
+                pin_input_from=pin_input_from,
             )
             CudaGraphManager(
                 config,
@@ -73,6 +78,7 @@ class LogProbsSpeculative:
                 need_backward=False,
                 inline_capture=True,
                 share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+                pin_input_from=pin_input_from,
             )
             # Thin wrapper: delegates to LogProbsPrefill's static method.
             CudaGraphManager(
@@ -82,6 +88,7 @@ class LogProbsSpeculative:
                 need_backward=False,
                 inline_capture=True,
                 share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+                pin_input_from=pin_input_from,
             )
 
     @staticmethod

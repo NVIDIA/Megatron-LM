@@ -178,19 +178,31 @@ class TextGenerationController:
         # Dedicated stream for the deferred log-prob extract D2H copies.
         self._extract_stream = torch.cuda.Stream(device=device)
 
+        if self._enable_cuda_graph:
+            model_cgm = unwrap_model(self.inference_wrapped_model.model).cudagraph_manager
+            pin_input_from = [model_cgm]
+        else:
+            pin_input_from = None
+
         # Log-prob computation backends.
         # All side-stream graphs across the three classes share one mempool.
-        self._log_probs_decode = LogProbsDecode(self.model_config, side_stream=self._side_stream)
+        self._log_probs_decode = LogProbsDecode(
+            self.model_config,
+            side_stream=self._side_stream,
+            pin_input_from=pin_input_from,
+        )
         side_pool_anchor = self._log_probs_decode.side_pool_anchor
         self._log_probs_prefill = LogProbsPrefill(
             self.model_config,
             side_stream=self._side_stream,
             side_pool_anchor=side_pool_anchor,
+            pin_input_from=pin_input_from,
         )
         self._log_probs_speculative = LogProbsSpeculative(
             self.model_config,
             side_stream=self._side_stream,
             side_pool_anchor=side_pool_anchor,
+            pin_input_from=pin_input_from,
         )
 
         # Sampling backend: provides the sampling kernel.
@@ -200,6 +212,7 @@ class TextGenerationController:
                 self.sampling_rng,
                 config=self.model_config,
                 enable_cuda_graph=self._enable_cuda_graph,
+                pin_input_from=pin_input_from,
             )
         else:
             self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
@@ -759,7 +772,7 @@ class TextGenerationController:
             Tensor: Sampled tokens of shape [num_requests].
         """
         return self._sampling.sample_kernel(
-            logits_2d,
+            logits_2d.unsqueeze(0),
             logits_2d.shape[0],
             self.inference_wrapped_model.inference_context,
             eager=True,
@@ -962,19 +975,17 @@ class TextGenerationController:
 
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.
-            sample_logits = logits.squeeze(0)
             sample_gather_indices = None
         else:
             # Push the gather inside the captured kernel:
             # pass the full per-token logits buffer (constant shape) plus the padded indices.
-            sample_logits = logits.squeeze(0)
             sample_gather_indices = required_logit_indices
         nvtx_range_pop("mtp-spec-decoding/verify/logit-indices")
 
         # Sample tokens from logits
         nvtx_range_push("mtp-spec-decoding/verify/sample")
         output_tokens = self._sampling.sample_speculative(
-            sample_logits,
+            logits,
             sample_num_decode,
             sample_num_prefill,
             self.num_speculative_tokens,
@@ -1074,7 +1085,7 @@ class TextGenerationController:
             else context.gpu_view.active_request_last_token_idxs
         )
         self._sampled_tokens_cuda = self._sampling.sample_kernel(
-            self._all_logits_cuda.squeeze(0),
+            self._all_logits_cuda,
             n,
             context,
             gather_indices=gather_indices,
@@ -1545,16 +1556,6 @@ class TextGenerationController:
             context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
             range_pop()
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
-
-        with torch.inference_mode():
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
@@ -1582,6 +1583,16 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
+        # This is the best place to yield control back to event loop.
+        # At this point we have enqueued FW pass GPU kernels asynchronously.
+        # While they are running, we can do other useful CPU work.
+        # Note: This can be moved further ahead if sampling can be made
+        # asynchronous.
+        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
+        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
+        await asyncio.sleep(0)
+
+        with torch.inference_mode():
             torch.cuda.current_stream().wait_event(self._side_pre_calc_event)
             log_probs_extract = self._dynamic_step_calculate_log_probs(
                 indexing_outputs, lse_outputs
