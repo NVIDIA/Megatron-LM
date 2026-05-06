@@ -207,6 +207,7 @@ class TextGenerationController:
         self._async_pending_h2d_done_event = None
         self._async_pending_sample_cuda_graph_request_count = None
         self._async_pending_forward_request_ids = None
+        self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
         self._async_row_mapped_forward_count = 0
@@ -1422,11 +1423,21 @@ class TextGenerationController:
         self._async_add_deferral_count += 1
         self._async_admission_barrier_requested = True
 
+    def set_async_step_barrier(self, reason: str) -> None:
+        """Prevent async launches for the current engine step."""
+        assert reason
+        self._async_step_barrier_reason = reason
+
+    def clear_async_step_barrier(self) -> None:
+        """Allow async launches after a temporary step barrier."""
+        self._async_step_barrier_reason = None
+
     def get_async_scheduling_diagnostics(self) -> Dict[str, Any]:
         """Return cheap async scheduling diagnostics for tests and benchmark logs."""
         return {
             "enabled": self._async_scheduling_enabled,
             "pending_forward": self._async_pending_forward,
+            "step_barrier_reason": self._async_step_barrier_reason,
             "eligibility_checks": self._async_eligibility_check_count,
             "eligibility_passes": self._async_eligibility_pass_count,
             "disable_reason_counts": dict(self._async_disable_reason_counts),
@@ -1924,14 +1935,14 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         if not self._async_scheduling_enabled:
             return "disabled"
+        if self._async_step_barrier_reason is not None:
+            return self._async_step_barrier_reason
         if not self._enable_cuda_graph:
             return "requires local cuda graphs"
         if CudaGraphScope.full_iteration_inference not in self.model_config.cuda_graph_scope:
             return "requires full-iteration inference cuda graphs"
         if self.model_is_pipeline_parallel:
             return "pipeline parallel is unsupported"
-        if context.config.logging_step_interval != 0:
-            return "logging sync is enabled"
         if self.num_speculative_tokens != 0 and not allow_mtp:
             return "mtp pre-sampling graph is unsupported"
         if (

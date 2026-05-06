@@ -2688,6 +2688,87 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             "hybrid", num_speculative_tokens=2, memory_pressure=True
         )
 
+    def _build_async_scheduling_eligibility_probe(
+        self, monkeypatch, *, num_speculative_tokens: int = 0
+    ) -> DynamicEngineTestEnv:
+        """Build a minimal decode-only controller state for async eligibility checks."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=1,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_speculative_tokens=num_speculative_tokens,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        context = env.engine.context
+        monkeypatch.setattr(context, "is_decode_only", lambda: True)
+        monkeypatch.setattr(context, "using_cuda_graph_this_step", lambda: True)
+
+        tokens_per_request = num_speculative_tokens + 1
+        context.total_request_count = 1
+        context.paused_request_count = 0
+        context.active_token_count = tokens_per_request
+        context.num_prefill_requests = 0
+        context.padded_batch_dimensions = InferenceBatchDimensions(
+            token_count=tokens_per_request,
+            prefill_req_count=0,
+            decode_req_count=1,
+        )
+        with torch.inference_mode():
+            context.active_request_metadata["top_k"][0] = 1
+            context.active_request_metadata["top_p"][0] = 0.0
+            context.active_request_metadata["return_log_probs"][0] = False
+            context.active_request_metadata["skip_prompt_log_probs"][0] = False
+            context.active_request_metadata["top_n_logprobs"][0] = 0
+            context.active_request_metadata["termination_id"][0] = -1
+        return env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_logging_interval_eligibility(self, monkeypatch) -> None:
+        """Nonzero logging interval no longer globally disables async scheduling."""
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch)
+        controller = env.engine.controller
+        env.engine.context.config.logging_step_interval = 100
+
+        assert controller._async_scheduling_disabled_reason() is None
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_step_barrier(self, monkeypatch) -> None:
+        """Explicit step barriers disable async until cleared and are diagnosable."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        barrier_reason = "logging sync step barrier"
+
+        controller.set_async_step_barrier(barrier_reason)
+        assert controller._async_scheduling_disabled_reason() == barrier_reason
+        assert (
+            controller._async_scheduling_disabled_reason(allow_mtp=True)
+            == barrier_reason
+        )
+        controller._record_async_eligibility_result(barrier_reason)
+        diagnostics = controller.get_async_scheduling_diagnostics()
+        assert diagnostics["step_barrier_reason"] == barrier_reason
+        assert diagnostics["disable_reason_counts"][barrier_reason] == 1
+
+        controller.clear_async_step_barrier()
+        assert controller._async_scheduling_disabled_reason(allow_mtp=True) is None
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
