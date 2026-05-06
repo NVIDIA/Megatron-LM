@@ -651,6 +651,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        # True when load_state_dict() has pinned Adam states to CPU; cleared after the first
+        # optimizer step restores them to GPU via _ensure_adam_states_on_gpu().
+        self._has_cpu_adam_states = False
         self.model_chunks = model_chunks
         self.ddp_config = self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
@@ -988,6 +991,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.optimizer.load_state_dict(
             {"state": state_dict_state, "param_groups": state_dict_param_groups}
         )
+
+        # Offload Adam states to CPU pinned memory so they do not occupy GPU memory
+        # during the first forward pass when resuming from a checkpoint.
+        # _ensure_adam_states_on_gpu() restores them to GPU just before the first
+        # optimizer step, i.e. after activations have been freed.
+        # We always pin the host buffer so that _ensure_adam_states_on_gpu() can
+        # identify our offloaded tensors via val.is_pinned() — leaving other
+        # intentionally-CPU state (e.g. HybridDeviceOptimizer) untouched.
+        _offloaded_any = False
+        for _param_state in self.optimizer.state.values():
+            for _key, _val in list(_param_state.items()):
+                if isinstance(_val, torch.Tensor) and _val.is_cuda:
+                    _param_state[_key] = _val.cpu().pin_memory()
+                    _offloaded_any = True
+        if _offloaded_any:
+            self._has_cpu_adam_states = True
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
@@ -2824,12 +2843,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
+    def _ensure_adam_states_on_gpu(self) -> None:
+        """Move Adam states to GPU if they were offloaded to CPU pinned memory by load_state_dict().
+
+        load_state_dict() pins Adam states to CPU to avoid occupying GPU memory before the
+        first forward pass when resuming from a checkpoint.  This method restores them to
+        GPU just before the first optimizer step, after activations have been freed.  On all
+        subsequent steps _has_cpu_adam_states is False and this method returns immediately.
+
+        We match on val.is_pinned() rather than not val.is_cuda to avoid accidentally
+        moving tensors that are intentionally CPU-resident (e.g. HybridDeviceOptimizer
+        states) — only the pinned buffers we created during offload are restored.
+        """
+        if not self._has_cpu_adam_states:
+            return
+        for param_state in self.optimizer.state.values():
+            for key, val in list(param_state.items()):
+                if isinstance(val, torch.Tensor) and val.is_pinned():
+                    param_state[key] = val.to(device=torch.cuda.current_device(), non_blocking=True)
+        self._has_cpu_adam_states = False
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful.
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
+        self._ensure_adam_states_on_gpu()
         update_successful = super().step_with_ready_grads()
 
         timers = self.config.timers
