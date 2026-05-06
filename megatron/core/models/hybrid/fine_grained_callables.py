@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import nullcontext
-from functools import partial
 from typing import Optional
 
 import torch
@@ -11,13 +10,11 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.hybrid_block import HybridStack
-from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    LayerPatternItem,
-    Symbols as LayerSymbols,
-    is_layer_group,
-)
+from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import is_layer_group
 from megatron.core.pipeline_parallel.utils import ScheduleNode
-from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.transformer.transformer_layer import make_viewless_tensor
 
 
 def _get_inner_quant_context(layer):
@@ -37,32 +34,6 @@ def _as_hybrid_layers(layer, layer_type: Optional[LayerPatternItem]):
     return [(layer_type, layer)]
 
 
-def _apply_attention_layer(
-    layer: TransformerLayer,
-    node: ScheduleNode,
-    hidden_states: Tensor,
-):
-    hidden_states, _ = layer._forward_attention(
-        hidden_states=hidden_states,
-        attention_mask=node.chunk_state.attention_mask,
-        rotary_pos_emb=node.chunk_state.rotary_pos_emb,
-        rotary_pos_cos=node.chunk_state.rotary_pos_cos,
-        rotary_pos_sin=node.chunk_state.rotary_pos_sin,
-        packed_seq_params=node.chunk_state.packed_seq_params,
-        sequence_len_offset=node.chunk_state.sequence_len_offset,
-    )
-    return hidden_states
-
-
-def _apply_mamba_layer(layer, node: ScheduleNode, hidden_states: Tensor):
-    return layer(
-        hidden_states=hidden_states,
-        attention_mask=node.chunk_state.attention_mask,
-        inference_context=getattr(node.chunk_state, "inference_context", None),
-        packed_seq_params=node.chunk_state.packed_seq_params,
-    )
-
-
 def _maybe_apply_final_norm(node: ScheduleNode, hidden_states: Tensor):
     final_norm = getattr(node.chunk_state.model.decoder, "final_norm", None)
     final_norm = final_norm or getattr(node.chunk_state.model.decoder, "final_layernorm", None)
@@ -80,24 +51,6 @@ def _get_moe_padding_mask(node: ScheduleNode):
         # MoELayer.forward receives [batch, seq] and transposes before routing.
         padding_mask = padding_mask.transpose(0, 1).bool()
     return padding_mask
-
-
-class _SharedExpertBackwardDWWrapper:
-    """Backward weight-gradient wrapper for MoE-only hybrid terminal layers."""
-
-    def __init__(self, layer):
-        self.layer = layer
-        self.shared_expert_dw_callable = None
-        if layer.mlp.use_shared_expert:
-            self.shared_expert_dw_callable = partial(
-                layer.mlp.backward_dw, routed_experts=False, shared_experts=True
-            )
-
-    def backward_dw(self):
-        if self.shared_expert_dw_callable is not None:
-            self.shared_expert_dw_callable()
-        self.layer = None
-        self.shared_expert_dw_callable = None
 
 
 def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
@@ -199,13 +152,30 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
         for item_type, item_layer in pre_layers:
             with _get_inner_quant_context(item_layer):
                 if item_type == LayerSymbols.MAMBA:
-                    hidden_states = _apply_mamba_layer(item_layer, node, hidden_states)
+                    hidden_states = item_layer(
+                        hidden_states=hidden_states,
+                        attention_mask=node.chunk_state.attention_mask,
+                        inference_context=getattr(node.chunk_state, "inference_context", None),
+                        packed_seq_params=node.chunk_state.packed_seq_params,
+                    )
                 elif item_type in (
                     LayerSymbols.ATTENTION,
                     LayerSymbols.DS_ATTENTION,
                     LayerSymbols.GDN,
                 ):
-                    hidden_states = _apply_attention_layer(item_layer, node, hidden_states)
+                    # Use _forward_attention rather than __call__: an attention half-layer has
+                    # mlp=IdentityOp / mlp_bda=IdentityFuncOp by default, and TransformerLayer's
+                    # __call__ would route through _forward_mlp + mlp_bda, double-applying the
+                    # post-attention residual.
+                    hidden_states, _ = item_layer._forward_attention(
+                        hidden_states=hidden_states,
+                        attention_mask=node.chunk_state.attention_mask,
+                        rotary_pos_emb=node.chunk_state.rotary_pos_emb,
+                        rotary_pos_cos=node.chunk_state.rotary_pos_cos,
+                        rotary_pos_sin=node.chunk_state.rotary_pos_sin,
+                        packed_seq_params=node.chunk_state.packed_seq_params,
+                        sequence_len_offset=node.chunk_state.sequence_len_offset,
+                    )
                 else:
                     raise ValueError(
                         f"HybridStack overlap does not support layer type '{item_type}' before "
@@ -268,10 +238,18 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
             item_layer.init_backward_dw_wrapper()
             pre_bwd_dw.append(item_layer.backward_dw_wrapper)
     if is_moe:
-        shared_expert_dw = _SharedExpertBackwardDWWrapper(terminal_layer)
-        if shared_expert_dw.shared_expert_dw_callable is not None:
-            pre_bwd_dw.append(shared_expert_dw)
-        backward_dw["mlp"] = terminal_layer.mlp
+        # MoELayer.backward_dw default kwargs (routed_experts=True, shared_experts=False) handle
+        # the routed-experts wgrad. The shared-experts wgrad is registered as a sibling callable
+        # under "mlp" so the schedule node iterates both. Skip registering the shared-experts
+        # callable when shared_expert_overlap is enabled — in that case the shared-experts
+        # forward and backward are folded into the dispatcher's overlap handling.
+        mlp_backward_callables = [terminal_layer.mlp]
+        if (
+            terminal_layer.mlp.use_shared_expert
+            and not terminal_layer.mlp.shared_expert_overlap
+        ):
+            mlp_backward_callables.append(terminal_layer.mlp.shared_experts)
+        backward_dw["mlp"] = mlp_backward_callables
     elif terminal_type == LayerSymbols.MLP:
         backward_dw["mlp"] = terminal_layer.mlp
 

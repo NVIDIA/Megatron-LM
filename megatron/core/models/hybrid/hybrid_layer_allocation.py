@@ -321,6 +321,16 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
 
     _validate_pattern(mtp_pattern, "MTP", allow_pipe=False)
 
+    # MTP layers are themselves a fused unit (each MTP depth contains its own attention
+    # + MLP), so it does not make sense to wrap them in a HybridStack group. Reject
+    # bracketed groups inside MTP patterns to keep downstream construction simple.
+    if Symbols.GROUP_START in mtp_pattern or Symbols.GROUP_END in mtp_pattern:
+        raise ValueError(
+            f"In MTP pattern, layer groups '{Symbols.GROUP_START}...{Symbols.GROUP_END}' "
+            f"are not supported because each MTP depth is already a fused unit. "
+            f"Got MTP pattern: '{mtp_pattern}'."
+        )
+
     return ParsedHybridPattern(
         main_pattern=main_pattern if main_pattern else None,
         mtp_pattern=mtp_pattern,

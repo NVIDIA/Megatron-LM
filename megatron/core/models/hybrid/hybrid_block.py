@@ -19,9 +19,9 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    LayerPatternItem,
-    Symbols as LayerSymbols,
     get_layer_type_physical_count,
     is_layer_group,
 )
@@ -218,6 +218,17 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+    @property
+    def final_layernorm(self):
+        """Alias for ``final_norm`` matching the attribute name on TransformerBlock.
+
+        Lets generic decoder consumers (e.g. ``GPTModel.PostProcessNode``) discover the
+        final norm via the same attribute name they use for non-hybrid decoders, while
+        keeping ``final_norm`` as the registered submodule so existing hybrid checkpoint
+        keys are unchanged.
+        """
+        return getattr(self, "final_norm", None)
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
