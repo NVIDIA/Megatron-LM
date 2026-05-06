@@ -994,7 +994,7 @@ class TextGenerationController:
             gather_indices=sample_gather_indices,
             eager=not use_graph_for_sampling,
             cache_key=(
-                ("sample_speculative", sample_num_decode, sample_num_prefill)
+                ("sample_speculative", context.padded_batch_dimensions)
                 if use_graph_for_sampling
                 else None
             ),
@@ -1091,7 +1091,7 @@ class TextGenerationController:
             context,
             gather_indices=gather_indices,
             eager=not use_graph,
-            cache_key=("sample", n) if use_graph else None,
+            cache_key=("sample", context.padded_batch_dimensions) if use_graph else None,
         )
 
     def _dynamic_step_log_probs_bookkeeping(self):
