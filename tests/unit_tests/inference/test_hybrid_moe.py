@@ -101,6 +101,12 @@ def setup_module(module):
             f"world_size ({Utils.world_size}) must be divisible by EP size ({_EP_SIZE})",
             allow_module_level=True,
         )
+    try:
+        from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
+
+        check_flashinfer_jit_cache_installed()
+    except RuntimeError as exc:
+        pytest.skip(str(exc), allow_module_level=True)
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,

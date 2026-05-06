@@ -318,14 +318,22 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fallback_to_eager_attn": False,
     "inference_disable_triton_nvls_kernels": False,
     "moe_router_force_biased": None,
-    "inference_grouped_gemm_backend": "torch",
+    "inference_grouped_gemm_backend": "auto",
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = set()
+ALLOW_ADDED_FIELDS = {
+    "linear_attention_type",
+    "moe_hybridep_num_sms_preprocessing",
+    "moe_mlp_glu_interleave_size",
+    "moe_single_grouped_bias",
+    "moe_single_grouped_weight",
+    "sequence_packing_scheduler",
+    "use_transformer_engine_op_fuser",
+}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:

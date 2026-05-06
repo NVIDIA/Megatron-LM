@@ -826,6 +826,7 @@ class InferenceTopKRouter(TopKRouter):
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        layer_number: Optional[int] = None,
     ) -> None:
         """Initialize the specialized inference top-k router.
 
@@ -843,7 +844,12 @@ class InferenceTopKRouter(TopKRouter):
             f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
         )
 
-        super().__init__(config=config, pg_collection=pg_collection)
+        super().__init__(
+            config=config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            layer_number=layer_number,
+        )
 
     @staticmethod
     @torch.compile

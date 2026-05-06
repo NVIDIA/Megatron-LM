@@ -772,3 +772,10 @@ def has_nvrx_installed():
         return True
     except (ImportError, ModuleNotFoundError):
         return False
+
+
+def has_nvrx_checkpointing_async_support():
+    """Whether the installed NVRx package exposes the async checkpointing API Megatron uses."""
+    from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+
+    return has_nvrx_async_support()

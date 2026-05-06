@@ -1786,6 +1786,31 @@ def get_optimizer_param_scheduler(optimizer):
     return opt_param_scheduler
 
 
+def get_megatron_ddp_config(args: Any) -> DistributedDataParallelConfig:
+    """Return an MCore DDPConfig from the argparse arguments."""
+
+    kwargs = {}
+    for f in dataclasses.fields(DistributedDataParallelConfig):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
+    kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
+    kwargs["check_for_large_grads"] = args.check_for_large_grads
+    kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
+    kwargs["reduce_scatter_with_fp32_accumulation"] = (
+        args.ddp_reduce_scatter_with_fp32_accumulation
+    )
+    kwargs["param_name_patterns_for_fp32_local_accumulation"] = tuple(
+        args.ddp_param_name_patterns_for_fp32_local_accumulation
+    )
+    kwargs["average_in_collective"] = args.ddp_average_in_collective
+    kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+    kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+    kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+    kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+    return DistributedDataParallelConfig(**kwargs)
+
+
 def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
