@@ -1898,7 +1898,7 @@ def _add_inference_args(parser):
                        default=None, dest='cuda_graph_scope_deprecated',
                        help=argparse.SUPPRESS)  # hidden; use --cuda-graph-modules instead
     group.add_argument('--cuda-graph-modules', nargs='+', type=_parse_cuda_graph_modules_arg, default=[],
-                       help='Selects capture coverage within per-layer CUDA graphs '
+                       help='Selects training capture coverage within per-layer CUDA graphs '
                        '(local and transformer_engine implementations). '
                        'Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba": '
                        '"attn": captures operations in TransformerLayer._forward_attention(). '

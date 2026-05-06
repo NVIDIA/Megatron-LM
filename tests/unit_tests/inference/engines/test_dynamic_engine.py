@@ -183,11 +183,11 @@ class DynamicEngineTestEnv:
 class DynamicInferenceEngineTestBase:
 
     @staticmethod
-    def _assert_full_iteration_inference_compat_state(env) -> None:
+    def _assert_inference_cuda_graphs_disabled(env) -> None:
         model = env.engine.controller.inference_wrapped_model.model
         assert env.engine.cuda_graph_impl == "full_iteration"
-        assert env.engine.context.cuda_graph_token_counts is not None
-        assert env.engine.context.cuda_graph_batch_dimensions_list
+        assert env.engine.inference_cuda_graph_scope == InferenceCudaGraphScope.none
+        assert env.engine.capture_stats is None
         assert not hasattr(model.decoder, 'cudagraph_manager')
         for layer in model.decoder.layers:
             assert not hasattr(layer, 'cudagraph_manager')
@@ -706,25 +706,21 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_full_iteration_impl_preserves_legacy_inference_setup_behavior(self) -> None:
-        """impl=full_iteration must preserve the legacy inference warmup/no-graph path."""
-        with pytest.warns(
-            UserWarning,
-            match="--cuda-graph-impl=full_iteration.*will not create inference CUDA graphs",
-        ):
-            env = self._build_test_env(
-                DynamicEngineTestConfig(
-                    model_provider="gpt",
-                    num_tokens_to_generate=4,
-                    num_cuda_graphs=1,
-                    force_build_cuda_graphs=True,
-                    context_max_requests=128,
-                    cuda_graph_impl="full_iteration",
-                    inference_cuda_graph_scope=InferenceCudaGraphScope.none,
-                )
+    def test_full_iteration_impl_does_not_setup_inference_cuda_graphs(self) -> None:
+        """impl=full_iteration is training-only; inference graph setup follows inference scope."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                model_provider="gpt",
+                num_tokens_to_generate=4,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=128,
+                cuda_graph_impl="full_iteration",
+                inference_cuda_graph_scope=InferenceCudaGraphScope.none,
             )
+        )
 
-        self._assert_full_iteration_inference_compat_state(env)
+        self._assert_inference_cuda_graphs_disabled(env)
 
         with mock.patch.object(
             env.engine.controller,
@@ -732,13 +728,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             wraps=env.engine.controller._dynamic_step_forward_logits,
         ) as forward_logits:
             with torch.inference_mode():
-                with pytest.warns(
-                    UserWarning,
-                    match="--cuda-graph-impl=full_iteration.*will not create inference CUDA graphs",
-                ):
-                    env.engine.create_cuda_graphs()
+                env.engine.create_cuda_graphs()
 
-        assert forward_logits.call_count == len(env.engine.context.cuda_graph_batch_dimensions_list)
+        assert forward_logits.call_count == 0
 
     @pytest.mark.internal
     @pytest.mark.skipif(

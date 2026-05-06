@@ -102,11 +102,9 @@ class InferenceCudaGraphScope(enum.Enum):
     """Inference CUDA graph scope.
 
     This controls the ownership boundary for inference CUDA graphs:
-    - none: inference runs without CUDA graphs.
-    - layer: graphs are owned at the module/layer boundary. This name
-      does not by itself imply any finer-grained replay contract within the layer.
-    - block: graphs are owned by the enclosing block rather than
-      individual modules.
+    - none: inference runs in eager mode (no CUDA graphs).
+    - layer: graphs are owned at the module/layer boundary, e.g. TransformerLayer or MambaLayer.
+    - block: graphs are owned by the enclosing block, e.g. TransformerBlock or HybridBlock.
     """
 
     none = 1
