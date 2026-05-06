@@ -13,6 +13,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -1024,7 +1025,7 @@ class Attention(MegatronModule, ABC):
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
-        is_inference_mode = BaseInferenceContext.is_active()
+        is_inference_mode = InferenceMode.is_active()
         # is_using_flash_decode - True is we are using the static inference engine with flash decode
         is_using_flash_decode = is_inference_mode and self.config.flash_decode
         # is_using_flashinfer_rope - True if we are using the dynamic inference engine
@@ -1108,7 +1109,7 @@ class Attention(MegatronModule, ABC):
         in_decode_mode = (
             inference_context is not None
             and inference_context.is_decode_only()
-            and BaseInferenceContext.is_active()
+            and InferenceMode.is_active()
         )
 
         # This branch only runs in the decode phase of flash decoding and returns after the linear

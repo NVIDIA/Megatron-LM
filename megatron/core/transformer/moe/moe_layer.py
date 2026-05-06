@@ -10,7 +10,7 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -371,7 +371,7 @@ class MoELayer(BaseMoELayer):
         Stores the training dispatcher and creates the inference dispatcher selected
         by config.inference_moe_token_dispatcher_type ('nccl' or 'nvls').
         The active dispatcher is selected at the start of `forward` based on
-        `BaseInferenceContext.is_active()`.
+        `InferenceMode.is_active()`.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
         dispatcher_cls = (
@@ -490,7 +490,7 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and BaseInferenceContext.is_active():
+        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
@@ -563,7 +563,7 @@ class MoELayer(BaseMoELayer):
         # is currently using the model. Only applies when the inference dispatcher
         # was set up (config.transformer_impl == "inference_optimized").
         if hasattr(self, "_inference_token_dispatcher"):
-            if BaseInferenceContext.is_active():
+            if InferenceMode.is_active():
                 self.token_dispatcher = self._inference_token_dispatcher
                 self.shared_expert_overlap = (
                     self._inference_token_dispatcher.shared_experts is not None

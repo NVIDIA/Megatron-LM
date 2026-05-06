@@ -6,7 +6,7 @@ import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.distributed
@@ -15,7 +15,7 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
@@ -36,6 +36,9 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
 
@@ -600,7 +603,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             residual = residual.float()
 
         using_fused_tp_inference_kernel = (
-            BaseInferenceContext.is_active() and self.config.inference_fuse_tp_communication
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
         if using_fused_tp_inference_kernel:
@@ -779,7 +782,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         using_fused_tp_inference_kernel = (
-            BaseInferenceContext.is_active() and self.config.inference_fuse_tp_communication
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
         if self.recompute_mlp:
@@ -868,7 +871,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         using_fused_tp_inference_kernel = (
-            BaseInferenceContext.is_active() and self.config.inference_fuse_tp_communication
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
         if self.recompute_pre_mlp_layernorm:
@@ -1273,7 +1276,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         ):
             return True
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
-        elif BaseInferenceContext.is_active() and (
+        elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (

@@ -8,13 +8,38 @@ from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
-from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
 except PackageNotFoundError:
     FLASHINFER_JIT_CACHE_VERSION = None
+
+
+class InferenceMode:
+    """Process-wide flag indicating whether an inference engine is currently using the model.
+
+    Modules that need to distinguish between inference and non-inference (e.g. training,
+    RL logprobs) paths should read `InferenceMode.is_active()` rather than relying on
+    `self.training`, `torch.is_grad_enabled()`, or `inference_context is not None`.
+    """
+
+    _is_active: bool = False
+
+    @classmethod
+    def is_active(cls) -> bool:
+        """Return True while an inference engine is currently using the model."""
+        return cls._is_active
+
+    @classmethod
+    def set_active(cls) -> None:
+        """Mark the inference engine as active. Idempotent."""
+        cls._is_active = True
+
+    @classmethod
+    def unset_active(cls) -> None:
+        """Mark the inference engine as inactive. Idempotent."""
+        cls._is_active = False
 
 
 def device_memory_summary() -> str:
@@ -80,6 +105,8 @@ def _init_moe_expert_cache(model):
     """
     Initialize the cache of MoE layers once
     """
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
     global moe_layer_cache
     if moe_layer_cache is not None:
         return  # already initialized

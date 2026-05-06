@@ -12,32 +12,11 @@ class BaseInferenceContext(abc.ABC):
     Extend this class for any future contexts types.
     """
 
-    # Process-wide flag indicating whether an inference engine is currently using the model.
-    # Modules that need to distinguish between inference and non-inference (e.g. training,
-    # logprobs) paths should read `BaseInferenceContext.is_active()` rather than relying on
-    # `self.training`, `torch.is_grad_enabled()`, or `inference_context is not None`.
-    _is_active: bool = False
-
     def __init__(self, inference_config: InferenceConfig):
         """
         Args:
         """
         self.config = inference_config
-
-    @classmethod
-    def is_active(cls) -> bool:
-        """Return True while an inference engine is currently using the model."""
-        return cls._is_active
-
-    @classmethod
-    def set_active(cls) -> None:
-        """Mark the inference engine as active. Idempotent."""
-        cls._is_active = True
-
-    @classmethod
-    def unset_active(cls) -> None:
-        """Mark the inference engine as inactive. Idempotent."""
-        cls._is_active = False
 
     @abc.abstractmethod
     def is_static_batching(self) -> bool:

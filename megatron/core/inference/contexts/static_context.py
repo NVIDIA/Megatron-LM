@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.utils import InferenceMode
 
 from .base_context import BaseInferenceContext
 
@@ -19,7 +20,7 @@ class StaticInferenceContext(BaseInferenceContext):
     ):
         config = InferenceConfig(materialize_only_last_token_logits=True)
         super().__init__(inference_config=config)
-        BaseInferenceContext.set_active()
+        InferenceMode.set_active()
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size
         self.sequence_len_offset = 0
