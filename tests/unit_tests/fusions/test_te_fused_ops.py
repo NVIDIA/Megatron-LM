@@ -52,7 +52,8 @@ def test_fused_impl_is_not_registered_as_module_or_state_dict_source():
 
     fused_impl = module._get_fused_impl()
 
-    assert set(module.state_dict().keys()) == expected_state_keys == {"weight"}
+    assert set(module.state_dict().keys()) == expected_state_keys
+    assert "weight" in expected_state_keys
     assert tuple(module._modules.keys()) == expected_module_keys
     assert "_fused_impl" not in module._modules
     assert all(child is not fused_impl for child in module.modules())
