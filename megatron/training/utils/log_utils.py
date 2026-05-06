@@ -8,6 +8,7 @@ from logging import Filter, LogRecord
 from typing import Callable
 
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
+from megatron.training.utils import print_rank_0
 import torch
 
 
@@ -135,3 +136,13 @@ def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> 
             )
 
 
+def barrier_and_log(string: str) -> None:
+    """Perform a distributed barrier and then log a message on rank 0.
+
+    Args:
+        string: The message string to log.
+    """
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print_rank_0(f"[{string}] datetime: {time_str} ")
