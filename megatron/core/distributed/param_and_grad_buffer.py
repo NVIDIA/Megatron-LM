@@ -366,7 +366,7 @@ class _ParamAndGradBucketGroup:
             dp_size = self.intra_distributed_optimizer_instance_size
             if dp_size == 1:
                 # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
-                if force_sync:
+                if force_sync and self.ddp_config.overlap_param_gather:
                     self._post_param_sync()
                 self.param_gather_dispatched = True
                 return
@@ -460,7 +460,7 @@ class _ParamAndGradBucketGroup:
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
                 self.param_gather_handle = None
-        if force_sync:
+        if force_sync and self.ddp_config.overlap_param_gather:
             self._post_param_sync()
         self.param_gather_dispatched = True
 
