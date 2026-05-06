@@ -21,8 +21,8 @@ from megatron.training.models.base import (
     ModelBuilder,
     ModelConfig,
     compose_hooks,
-    unimodal_build_distributed_models,
 )
+from megatron.training.models.dist_utils import unimodal_build_distributed_models
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
