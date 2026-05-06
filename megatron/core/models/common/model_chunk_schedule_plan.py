@@ -27,8 +27,8 @@ class ModelChunkState:
     pass
 
 
-class HybridStackSchedulePlan:
-    """Schedule the executing plan of nodes in a transformer, MTP, or hybrid layer.
+class TransformerLayerSchedulePlan:
+    """Schedule the executing plan of the nodes in a transformer/mtp layer.
 
     This class organizes the sub-modules of a transformer/mtp layer,
     including attention, post attention, MLP, dispatch, combine and
@@ -55,7 +55,7 @@ class HybridStackSchedulePlan:
     mtp_post_process = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
-        """Initializes a layer schedule plan.
+        """Initializes a transformer layer schedule plan.
 
         Args:
             layer (TransformerLayer):
@@ -76,12 +76,11 @@ class HybridStackSchedulePlan:
         self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.layer = layer
-        self.layer_type = extra_args.get("layer_type", None)
         self.event = event
         self.comp_stream = comp_stream
         self.comm_stream = comm_stream
 
-        # get callable nodes for transformer/mtp/hybrid layer
+        # get callable nodes for transformer/mtp layer
         self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
 
     def release_state(self):
@@ -109,35 +108,24 @@ class HybridStackSchedulePlan:
 
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
-        Builds the callable nodes for the transformer/mtp/hybrid layer:
+        Builds the callable nodes for the transformer/mtp layer:
             attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
         """
         from megatron.core.models.gpt.fine_grained_callables import (
             TransformerLayerNode,
             build_layer_callables,
         )
-        from megatron.core.models.hybrid.fine_grained_callables import (
-            build_hybrid_stack_callables,
-        )
-        from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
         from megatron.core.transformer.moe.moe_layer import MoELayer
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
-        layer_type: LayerPatternItem = extra_args.get("layer_type", None)
-        if layer_type is None:
-            # build the forward and backward callables for the transformer/mtp layer
-            fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
+        # build the forward and backward callables for the transformer/mtp layer
+        fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
 
-            # get flags for later use
-            is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
-            transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
-            is_moe = isinstance(transformer_layer.mlp, MoELayer)
-            num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
-        else:
-            fwd_callables, bwd_dw_callable_map, is_moe, num_local_experts = (
-                build_hybrid_stack_callables(self.layer, layer_type=layer_type)
-            )
-            is_mtp = False
+        # get flags for latter use
+        is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
+        transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
+        is_moe = isinstance(transformer_layer.mlp, MoELayer)
+        num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
@@ -148,9 +136,6 @@ class HybridStackSchedulePlan:
         # wrapper to help create TransformerLayerNode
         def create_node(stream, module, name):
             bwd_dw_callables = bwd_dw_callable_map.get(name, None)
-            node_extra_args = dict(extra_args)
-            if bwd_dw_callables is None:
-                node_extra_args["delay_wgrad_compute"] = False
             return TransformerLayerNode(
                 stream,
                 event,
@@ -159,7 +144,7 @@ class HybridStackSchedulePlan:
                 module,
                 name=name,
                 bwd_dw_callables=bwd_dw_callables,
-                extra_args=node_extra_args,
+                extra_args=extra_args,
             )
 
         (
@@ -195,8 +180,6 @@ class HybridStackSchedulePlan:
         use_inner_fp8_context = (
             self.layer.config.fp8 and self.layer.config.fp8_recipe != Fp8Recipe.delayed
         )
-        if self.layer_type is not None or not hasattr(self.layer, "layer_number"):
-            return nullcontext()
         return (
             get_fp8_context(self.layer.config, self.layer.layer_number - 1)
             if use_inner_fp8_context
@@ -271,7 +254,7 @@ class HybridStackSchedulePlan:
         return f_input, b_grad
 
 
-class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
+class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     """Schedule the executing plan of the sub-modules in a model chunk sub-modules.
 
     This class organizes the computation nodes for a model chunk,
@@ -284,7 +267,26 @@ class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
     │   ├── layer[1]: TransformerLayerSchedulePlan
     │   └── ...
     └── post_process: PostProcessNode
+
+    Subclasses can swap the per-layer schedule plan by overriding the
+    ``LAYER_SCHEDULE_PLAN_CLASS`` class attribute (e.g. HybridStack uses a
+    layer plan that understands grouped/inferred layer types). They can also
+    swap the pre/post-process node classes via ``PRE_PROCESS_NODE_CLASS`` /
+    ``POST_PROCESS_NODE_CLASS`` so each model owns its own embedding / output
+    layer node implementations.
     """
+
+    #: The TransformerLayerSchedulePlan-compatible class used to build per-layer
+    #: schedule plans. Subclasses override this to inject a layer-plan variant.
+    LAYER_SCHEDULE_PLAN_CLASS = None
+
+    #: Pre/post-process node classes. Defaults below pull in the GPT-side
+    #: ``PreProcessNode`` / ``PostProcessNode`` (which call ``GPTModel._preprocess`` /
+    #: ``GPTModel._postprocess``). Subclasses set these to model-specific node
+    #: classes so the node calls the right model's ``_preprocess`` /
+    #: ``_postprocess`` methods.
+    PRE_PROCESS_NODE_CLASS = None
+    POST_PROCESS_NODE_CLASS = None
 
     def __init__(
         self,
@@ -322,6 +324,9 @@ class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
         """
         from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
 
+        pre_process_cls = self.PRE_PROCESS_NODE_CLASS or PreProcessNode
+        post_process_cls = self.POST_PROCESS_NODE_CLASS or PostProcessNode
+
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
         self._event = torch.cuda.Event()
@@ -347,7 +352,7 @@ class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.attention_bias = None
 
         # build preprocess
-        self.pre_process = PreProcessNode(
+        self.pre_process = pre_process_cls(
             model, self._model_chunk_state, self._event, get_comp_stream
         )
 
@@ -361,23 +366,18 @@ class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # build post process
         if model.post_process:
-            self.post_process = PostProcessNode(
+            self.post_process = post_process_cls(
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
 
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
         if module is None:
             return
+        plan_cls = self.LAYER_SCHEDULE_PLAN_CLASS or TransformerLayerSchedulePlan
         num_layers = len(module.layers)
         for layer_idx in range(num_layers):
-            extra_args = {
-                "is_first_layer": layer_idx == 0,
-                "is_last_layer": layer_idx == num_layers - 1,
-            }
-            extra_args["layer_type"] = (
-                module.layer_type_list[layer_idx] if hasattr(module, "layer_type_list") else None
-            )
-            layer_plan = HybridStackSchedulePlan(
+            extra_args = self._extra_args_for_layer(module, layer_idx, num_layers)
+            layer_plan = plan_cls(
                 module.layers[layer_idx],
                 self.event,
                 self.state,
@@ -386,6 +386,17 @@ class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
                 extra_args,
             )
             self._transformer_layers.append(layer_plan)
+
+    def _extra_args_for_layer(self, module, layer_idx, num_layers):
+        """Per-layer ``extra_args`` dict passed to the layer plan constructor.
+
+        Subclasses extend this hook to thread additional metadata (e.g. hybrid
+        layer-type symbols) without overriding ``_build_layer_schedule_plan``.
+        """
+        return {
+            "is_first_layer": layer_idx == 0,
+            "is_last_layer": layer_idx == num_layers - 1,
+        }
 
     @property
     def event(self):
@@ -496,7 +507,7 @@ class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer = b_schedule_plan.pop_layer()
             nvtx_msg = f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b"
             nvtx_range_push(nvtx_msg)
-            f_input, b_grad = HybridStackSchedulePlan.run(
+            f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
                 f_input=f_input,
@@ -512,7 +523,7 @@ class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer = b_schedule_plan.pop_layer()
             nvtx_msg = f"layer_{b_schedule_plan.num_layers()}b"
             nvtx_range_push(nvtx_msg)
-            _, b_grad = HybridStackSchedulePlan.run(
+            _, b_grad = TransformerLayerSchedulePlan.run(
                 None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
             )
             if i < b_num_layers - 1:
@@ -524,7 +535,7 @@ class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
             f_layer = f_schedule_plan.get_layer(i)
             nvtx_msg = f"layer_{i}f"
             nvtx_range_push(nvtx_msg)
-            f_input, _ = HybridStackSchedulePlan.run(f_layer, None, f_input=f_input)
+            f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             nvtx_range_pop(nvtx_msg)
 
         if f_schedule_plan is not None and post_forward is not None:
@@ -562,8 +573,3 @@ class HybridStackModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.release_state()
 
         return f_input
-
-
-# Backward-compatible aliases for GPT callers and existing tests.
-TransformerLayerSchedulePlan = HybridStackSchedulePlan
-TransformerModelChunkSchedulePlan = HybridStackModelChunkSchedulePlan

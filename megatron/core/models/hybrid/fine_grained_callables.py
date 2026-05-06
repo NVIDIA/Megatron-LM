@@ -9,12 +9,44 @@ from torch import Tensor
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.gpt.fine_grained_callables import TransformerLayerNode, should_free_input
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_allocation import is_layer_group
 from megatron.core.pipeline_parallel.utils import ScheduleNode
 from megatron.core.transformer.transformer_layer import make_viewless_tensor
+
+
+class HybridStackNode(TransformerLayerNode):
+    """Schedule node for HybridStack-built fine-grained callables.
+
+    Subclassed from ``TransformerLayerNode`` so the runtime backbone (forward /
+    backward / backward_dw plumbing, detach bookkeeping, output-grad release)
+    is shared. The hybrid path keeps a separate node class so its free-input
+    policy can diverge from the GPT defaults — for example, the ``attn`` slot
+    here covers the whole pre-dispatch loop (mamba + attention + …) rather than
+    a single attention block, and group-level decisions about whether the input
+    is needed in backward may differ from ``should_free_input`` in
+    ``gpt/fine_grained_callables.py``. Keep this override thin until a hybrid
+    counter-example forces it to diverge; the explicit subclass exists so the
+    divergence can be made surgically without touching the GPT class.
+    """
+
+    @staticmethod
+    def _resolve_free_input(name, is_moe, config, num_local_experts):
+        """Hybrid free-input policy.
+
+        Currently mirrors the GPT default: dense layers always retain their
+        input for backward; MoE-only "moe_dispatch", "mlp", and "moe_combine"
+        slots can free, subject to the dispatcher / cuda-graph constraints
+        encoded in ``should_free_input``. Hybrid groups have an "attn" slot
+        whose semantics differ, but its policy resolves to ``False`` in
+        ``should_free_input``, which is correct: pre-layer outputs are needed
+        for backward through the loop. Override here when a hybrid-specific
+        rule is needed.
+        """
+        return should_free_input(name, is_moe, config, num_local_experts)
 
 
 def _get_inner_quant_context(layer):

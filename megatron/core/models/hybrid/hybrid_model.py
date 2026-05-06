@@ -542,7 +542,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
 
-        from ..common.model_chunk_schedule_plan import HybridStackModelChunkSchedulePlan
+        from .model_chunk_schedule_plan import HybridStackModelChunkSchedulePlan
 
         return HybridStackModelChunkSchedulePlan(
             self,
@@ -632,62 +632,34 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         It either returns the Loss values if labels are given or the final hidden units
         """
-        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
-        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
-
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         in_inference_mode = inference_context is not None and not self.training
-
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
-        # Decoder embedding.
-        if decoder_input is not None:
-            pass
-        elif self.pre_process:
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
-
-            # Clear the outputs for padding tokens when using dynamic batching with
-            # quantization scales to avoid corrupting amax calculations
-            if (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and is_using_quantization_scales(self.config)
-            ):
-                decoder_input[inference_context.padding_slice] = 0.0
-        else:
-            # intermediate stage of pipeline
-            # decoder will get hidden_states from encoder.input_tensor
-            decoder_input = None
-
-        rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-            )
-        elif self.position_embedding_type == 'yarn':
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
-            rotary_pos_emb, _ = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-            )
-
-        # Wrap decoder_input to allow the decoder (HybridStack) to delete the
-        # reference held by this caller function, enabling early garbage collection
-        # for inference.
-        if in_inference_mode:
-            decoder_input = WrappedTensor(decoder_input)
+        # Mirror GPTModel.forward: delegate the embedding / rotary computation and
+        # the output-layer / MTP / loss computation to the same hooks the
+        # EP-overlap PreProcessNode / PostProcessNode call. Keeps the eager and
+        # combined-1F1B paths on the same code.
+        (
+            decoder_input,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+            padding_mask,
+        ) = self._preprocess(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            decoder_input=decoder_input,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
 
         # The following assert will currently fail when running inference.
         # Commented out for now.
@@ -709,93 +681,21 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             padding_mask=padding_mask,
         )
 
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-
-        # Check if speculative decoding is active. When it is, MTP must be
-        # computed *after* verification so that it is conditioned on verified
-        # tokens rather than stale speculative tokens from the previous step.
-        if is_spec_decode is None:
-            is_spec_decode = (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
-            )
-
-        mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
-        if mtp_forward_ran:
-            hidden_states = self.mtp(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                embedding=self.embedding,
-            )
-
-        if not self.post_process:
-            return hidden_states
-
-        if self.config.mtp_num_layers is not None and self.mtp_process:
-            assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
-                self._decoder_hidden_states_cache = hidden_states
-            else:
-                hidden_states = process_mtp_loss(
-                    hidden_states=hidden_states,
-                    labels=labels,
-                    loss_mask=loss_mask,
-                    output_layer=self.output_layer,
-                    output_weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
-                    is_training=self.training,
-                    compute_language_model_loss=self.compute_language_model_loss,
-                    config=self.config,
-                    cp_group=self.pg_collection.cp,
-                    packed_seq_params=packed_seq_params,
-                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                )
-        sequence_parallel_override = False
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
-
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S', B, H] for the output layer.
-                reshaped = hidden_states.squeeze(1).unsqueeze(0)
-                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
-
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        return self._postprocess(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            mtp_in_postprocess=True,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            runtime_gather_output=runtime_gather_output,
+            inference_context=inference_context,
+            is_spec_decode=is_spec_decode,
         )
-        logits = self._scale_logits(logits)
-
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.config.materialize_only_last_token_logits
-            )
-            self.output_layer.sequence_parallel = True
-
-        if labels is None:
-            # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
-
-        loss = self.compute_language_model_loss(labels, logits)
-
-        return loss

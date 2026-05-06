@@ -270,7 +270,7 @@ class TransformerLayerNode(ScheduleNode):
         assert config is not None, "model config must be passed to TransformerLayerNode."
         is_moe = extra_args.get("is_moe", False)
         num_local_experts = extra_args.get("num_local_experts", None)
-        free_input = should_free_input(name, is_moe, config, num_local_experts)
+        free_input = self._resolve_free_input(name, is_moe, config, num_local_experts)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
@@ -298,6 +298,15 @@ class TransformerLayerNode(ScheduleNode):
             self.bwd_dw_callables = (
                 bwd_dw_callables if isinstance(bwd_dw_callables, list) else [bwd_dw_callables]
             )
+
+    @staticmethod
+    def _resolve_free_input(name, is_moe, config, num_local_experts):
+        """Free-input policy hook. Subclasses override to specialize.
+
+        Default delegates to module-level ``should_free_input`` (the GPT MoE
+        EP-overlap policy).
+        """
+        return should_free_input(name, is_moe, config, num_local_experts)
 
     def detach(self, t):
         """Detaches a tensor and stores it for backward computation."""
