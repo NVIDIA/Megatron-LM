@@ -885,6 +885,83 @@ class DynamicInferenceContext(BaseInferenceContext):
         if inference_config._verbose and torch.distributed.get_rank() == 0:
             logging.info("\n".join(log_lines))
 
+        # ── Side-stream wiring for ``add_request`` ──
+        # ``add_request`` runs on a dedicated side stream so its allocator
+        # mutations and bookkeeping writes don't serialize onto the main
+        # stream's forward kernels. Two CUDA events guard the cross-stream
+        # dependencies on either side:
+        #
+        # * ``_update_done_event``: recorded on the main stream after every
+        #   ``_run_update_requests`` finishes. ``add_request`` on the side
+        #   stream waits on it before mutating allocator state — preventing
+        #   the documented race where an in-flight ``update_requests``'
+        #   release path and a concurrent allocate path both hit
+        #   ``block_ref_counts`` / ``block_bag`` / ``total_avail_gpu`` /
+        #   ``_pc_pending_dereg_*`` etc.
+        # * ``_add_done_event``: recorded on the side stream after each
+        #   ``add_request``. The next step's ``_dynamic_step_context_init``
+        #   makes the main stream wait on it before
+        #   ``initialize_attention_state`` runs — preventing the symmetric
+        #   race where ``prepare_attn_init`` reads the bridge mirrors via
+        #   ``sync_counters_to_cpu`` (and ``_build_active_slices`` reads
+        #   ``request_*`` / ``token_to_*``) while the side stream is still
+        #   writing them.
+        #
+        # The two ``_pending`` flags gate the wait calls so we don't issue
+        # ``wait_event`` on an unrecorded event (engine startup; idle steps
+        # with no admissions). The flags are cleared by the consuming wait
+        # so a second consumer in the same window is a no-op.
+        self._add_request_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        self._update_done_event = torch.cuda.Event()
+        self._add_done_event = torch.cuda.Event()
+        self._update_done_pending = False
+        self._add_request_pending = False
+
+    def add_request_on_side_stream(
+        self, req: "DynamicInferenceRequest", prefill_chunk_length: Optional[int] = None
+    ) -> None:
+        """Run ``add_request`` on the side stream with the cross-stream barriers.
+
+        Drops in for direct ``add_request`` calls in the engine's scheduler.
+        On the host, the call returns once ``add_request``'s Python body
+        finishes (which still includes the prefix-cache ``.tolist()`` —
+        that sync now stalls the side stream rather than the main stream).
+        On the GPU, the side-stream work is ordered after the previous
+        step's ``update_requests`` and the main stream waits on it before
+        the next step starts.
+        """
+        if self._update_done_pending:
+            self._add_request_stream.wait_event(self._update_done_event)
+            self._update_done_pending = False
+        with torch.cuda.stream(self._add_request_stream):
+            self.add_request(req, prefill_chunk_length=prefill_chunk_length)
+        # Re-record on every call so the latest record point covers all
+        # add_requests in the pass; the side stream's serialization makes
+        # the latest record dominate.
+        self._add_done_event.record(self._add_request_stream)
+        self._add_request_pending = True
+
+    def record_update_done(self) -> None:
+        """Mark the end of ``update_requests`` for the side-stream barrier.
+
+        Called by the controller after ``_run_update_requests`` so the next
+        ``add_request_on_side_stream`` can be ordered after the just-finished
+        update_requests' allocator mutations.
+        """
+        self._update_done_event.record(torch.cuda.current_stream())
+        self._update_done_pending = True
+
+    def wait_for_add_request_done(self) -> None:
+        """Make the current stream wait for any pending side-stream add_request.
+
+        Called from ``_dynamic_step_context_init`` at the top of each step
+        before ``initialize_attention_state`` runs. No-op on steps where
+        no ``add_request`` was scheduled.
+        """
+        if self._add_request_pending:
+            torch.cuda.current_stream().wait_event(self._add_done_event)
+            self._add_request_pending = False
+
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer."""
         if self.cache_mla_latent:

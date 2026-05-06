@@ -1525,7 +1525,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     for block_hash in req.precomputed_block_hashes:
                         if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
-                self.context.add_request(req)
+                self.context.add_request_on_side_stream(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
@@ -1618,7 +1618,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             ):
                                 pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
-                    self.context.add_request(req)
+                    self.context.add_request_on_side_stream(req)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -1653,7 +1653,9 @@ class DynamicInferenceEngine(AbstractEngine):
                             can_schedule = False
                             break
 
-                    self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
+                    self.context.add_request_on_side_stream(
+                        req, prefill_chunk_length=prefill_chunk_length
+                    )
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )

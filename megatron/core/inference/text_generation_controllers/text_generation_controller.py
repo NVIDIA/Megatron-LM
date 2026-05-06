@@ -622,6 +622,16 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
 
+        # Side-stream barrier: any ``add_request`` queued on the side stream
+        # must complete before ``initialize_attention_state`` runs. The
+        # ``prepare_attn_init`` phase reads the bridge mirrors (via
+        # ``sync_counters_to_cpu`` D2H) and ``_build_active_slices`` /
+        # ``build_active_slices`` read ``request_*`` / ``token_to_*`` /
+        # ``mamba_metadata.request_to_mamba_state_idx`` — all of which
+        # ``add_request`` writes for the new slot. Without this wait those
+        # reads see torn state.
+        context.wait_for_add_request_done()
+
         # Initialize attention state. Three-phase orchestration:
         # CPU-side prepare -> graphable body (per-bucket CudaGraphManager) ->
         # CPU-side finalize. The unified-buffer H2D and the GPU compute that
@@ -1718,6 +1728,12 @@ class TextGenerationController:
         context._classify_and_resume_body(cache_key="update_requests")
         context._evict_resume_chunked_tokens_body(cache_key="update_requests")
         update_result = context._finalize_update_requests(prep_result["has_chunked"])
+
+        # Mark the end of update_requests on the main stream so the next
+        # scheduling pass's ``add_request_on_side_stream`` can order itself
+        # after the just-finished allocator mutations (block_ref_counts /
+        # block_bag / total_avail_gpu / dereg queue / etc.).
+        context.record_update_done()
 
         return {
             "active_request_ids": prep_result["active_request_ids"],
