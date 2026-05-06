@@ -627,6 +627,10 @@ class MLASelfAttention(MultiLatentAttention):
         # Unfused linear layer
         linear_impl = backend.column_parallel_linear()
 
+        def is_unfused_linear(module_spec):
+            module_cls = module_spec.module if isinstance(module_spec, ModuleSpec) else module_spec
+            return linear_impl is not None and module_cls is linear_impl
+
         if (
             self.config.q_lora_rank is None
             # Q layernorm is not trivial
@@ -634,7 +638,7 @@ class MLASelfAttention(MultiLatentAttention):
         ):
             help_msg = ""
             # Q projection does not include a norm
-            if submodules.linear_q_proj is linear_impl:
+            if is_unfused_linear(submodules.linear_q_proj):
                 help_msg = (
                     f"Please use a fused norm+linear for "
                     f"`linear_q_proj={submodules.linear_q_proj}` if "
@@ -649,7 +653,7 @@ class MLASelfAttention(MultiLatentAttention):
             # Q layernorm is not trivial
             submodules.q_layernorm not in (None, IdentityOp)
             # Q up projection includes a norm
-            and submodules.linear_q_up_proj is not linear_impl
+            and not is_unfused_linear(submodules.linear_q_up_proj)
         ):
             raise RuntimeError(
                 f"`q_layernorm={submodules.q_layernorm}` is non-trivial "
@@ -661,7 +665,7 @@ class MLASelfAttention(MultiLatentAttention):
             # KV layernorm is not trivial
             submodules.kv_layernorm not in (None, IdentityOp)
             # KV up projection includes a norm
-            and submodules.linear_kv_up_proj is not linear_impl
+            and not is_unfused_linear(submodules.linear_kv_up_proj)
         ):
             raise RuntimeError(
                 f"`kv_layernorm={submodules.kv_layernorm}` is non-trivial "
@@ -689,6 +693,14 @@ class MLASelfAttention(MultiLatentAttention):
         linear_impl = backend.column_parallel_linear()
         fused_norm_linear_impl = backend.column_parallel_layer_norm_linear()
 
+        def is_unfused_linear(module_spec):
+            module_cls = module_spec.module if isinstance(module_spec, ModuleSpec) else module_spec
+            return linear_impl is not None and module_cls is linear_impl
+
+        def is_fused_norm_linear(module_spec):
+            module_cls = module_spec.module if isinstance(module_spec, ModuleSpec) else module_spec
+            return fused_norm_linear_impl is not None and module_cls is fused_norm_linear_impl
+
         def is_trivial(module_spec):
             return module_spec in (None, IdentityOp)
 
@@ -713,7 +725,7 @@ class MLASelfAttention(MultiLatentAttention):
                             "qk_layernorm requires TransformerEngine or "
                             "q_layernorm/kv_layernorm to be set in the spec."
                         )
-                    elif linear_q_up_proj_cls is not linear_impl:
+                    elif not is_unfused_linear(linear_q_up_proj_cls):
                         raise ValueError(
                             f"`linear_q_up_proj={submodules.linear_q_up_proj}` is "
                             f"fused norm+linear, which is not supported for DSA, "
@@ -726,7 +738,7 @@ class MLASelfAttention(MultiLatentAttention):
                             "qk_layernorm requires TransformerEngine or "
                             "q_layernorm/kv_layernorm to be set in the spec."
                         )
-                    elif linear_q_proj_cls is not linear_impl:
+                    elif not is_unfused_linear(linear_q_proj_cls):
                         raise ValueError(
                             f"`linear_q_proj={submodules.linear_q_proj}` is "
                             f"fused norm+linear, which is not supported for DSA, "
@@ -735,7 +747,7 @@ class MLASelfAttention(MultiLatentAttention):
 
                 kv_norm_cls = default_if_trivial(submodules.kv_layernorm, qk_norm_impl)
                 linear_kv_up_proj_cls = submodules.linear_kv_up_proj or linear_impl
-                if linear_kv_up_proj_cls is not linear_impl:
+                if not is_unfused_linear(linear_kv_up_proj_cls):
                     raise ValueError(
                         f"`linear_kv_up_proj={submodules.linear_kv_up_proj}` is "
                         f"fused norm+linear, which is not supported for DSA, "
@@ -750,7 +762,9 @@ class MLASelfAttention(MultiLatentAttention):
                         linear_q_up_proj_cls = fused_norm_linear_impl
                     else:
                         linear_q_up_proj_cls = linear_impl
-                    if submodules.linear_q_up_proj not in (linear_impl, fused_norm_linear_impl):
+                    if not is_unfused_linear(
+                        submodules.linear_q_up_proj
+                    ) and not is_fused_norm_linear(submodules.linear_q_up_proj):
                         raise ValueError(
                             f"cannot apply QK norm with unhandled layer type "
                             f"`linear_q_up_proj={submodules.linear_q_up_proj}`"
@@ -763,7 +777,9 @@ class MLASelfAttention(MultiLatentAttention):
                         )
                 else:
                     linear_q_proj_cls = fused_norm_linear_impl
-                    if submodules.linear_q_up_proj not in (linear_impl, fused_norm_linear_impl):
+                    if not is_unfused_linear(submodules.linear_q_proj) and not is_fused_norm_linear(
+                        submodules.linear_q_proj
+                    ):
                         raise ValueError(
                             f"cannot apply QK norm with unhandled layer type "
                             f"`linear_q_proj={submodules.linear_q_proj}`"
@@ -785,7 +801,9 @@ class MLASelfAttention(MultiLatentAttention):
                 else:
                     linear_kv_up_proj_cls = linear_impl
                 linear_kv_up_proj_cls = submodules.linear_kv_up_proj or linear_kv_up_proj_cls
-                if linear_kv_up_proj_cls not in (linear_impl, fused_norm_linear_impl):
+                if not is_unfused_linear(linear_kv_up_proj_cls) and not is_fused_norm_linear(
+                    linear_kv_up_proj_cls
+                ):
                     raise ValueError(
                         f"cannot apply QK norm with unhandled layer type "
                         f"`linear_kv_up_proj={submodules.linear_kv_up_proj}`"
@@ -798,7 +816,7 @@ class MLASelfAttention(MultiLatentAttention):
                 )
         else:
             if self.config.q_lora_rank is not None:
-                if submodules.linear_q_up_proj is fused_norm_linear_impl or not is_trivial(
+                if is_fused_norm_linear(submodules.linear_q_up_proj) or not is_trivial(
                     submodules.q_layernorm
                 ):
                     raise ValueError(
@@ -808,13 +826,13 @@ class MLASelfAttention(MultiLatentAttention):
                     )
                 linear_q_up_proj_cls = linear_impl
             else:
-                if submodules.linear_q_proj is fused_norm_linear_impl:
+                if is_fused_norm_linear(submodules.linear_q_proj):
                     raise ValueError(
                         f"spec sets linear_q_up_proj={submodules.linear_q_proj}, but "
                         "qk_layernorm/qk_l2_norm are supposed to be disabled"
                     )
                 linear_q_proj_cls = linear_impl
-            if submodules.linear_kv_up_proj is fused_norm_linear_impl or not is_trivial(
+            if is_fused_norm_linear(submodules.linear_kv_up_proj) or not is_trivial(
                 submodules.kv_layernorm
             ):
                 raise ValueError(
