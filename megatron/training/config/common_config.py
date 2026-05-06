@@ -151,3 +151,6 @@ class DistributedInitConfig:
 
     disable_jit_fuser: bool = False
     """Disable the JIT fuser."""
+
+    enable_megatron_core_experimental: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--enable-experimental"]}})
+    """Enable experimental features for Megatron Core."""
