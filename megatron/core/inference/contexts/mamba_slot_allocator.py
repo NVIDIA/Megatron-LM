@@ -475,9 +475,8 @@ class MambaSlotAllocator:
         if prefill_count == 0:
             return None, None
 
-        active_start = ctx.paused_request_count
         decode_count = ctx.batch_dimensions.decode_req_count
-        prefill_start = active_start + decode_count
+        prefill_start = decode_count
 
         offsets = self._intermediate_offsets_cpu[prefill_start : prefill_start + prefill_count]
         counts = self._intermediate_counts_cpu[prefill_start : prefill_start + prefill_count]
@@ -544,9 +543,8 @@ class MambaSlotAllocator:
             self._clear_intermediate_state()
             return None
 
-        active_start = ctx.paused_request_count
         decode_count = ctx.batch_dimensions.decode_req_count
-        prefill_start = active_start + decode_count
+        prefill_start = decode_count
 
         # Block IDs and EOS block IDs live on CPU (no GPU sync needed).
         intermediate_count = metadata.intermediate_count
@@ -613,9 +611,8 @@ class MambaSlotAllocator:
         ctx = self.context
         prefill_count = ctx.batch_dimensions.prefill_req_count
         if prefill_count > 0:
-            active_start = ctx.paused_request_count
             decode_count = ctx.batch_dimensions.decode_req_count
-            prefill_start = active_start + decode_count
+            prefill_start = decode_count
             end = prefill_start + prefill_count
             self._intermediate_counts_cpu[prefill_start:end].fill_(0)
             self._intermediate_offsets_cpu[prefill_start:end].fill_(0)
