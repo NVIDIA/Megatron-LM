@@ -22,6 +22,39 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
+def _alloc_n(allocator, n: int):
+    """Allocate ``n`` blocks via the GPU path; return a length-``n`` view.
+
+    Test helper that replaces the removed eager ``allocate_memory_blocks(n)``.
+    Mirrors what production ``add_request`` does after the GPU-only migration:
+    drives the prefix-aware (or vanilla) GPU allocate and write-throughs the
+    host ``total_avail`` mirror.
+    """
+    if n <= 0:
+        return torch.empty(0, dtype=torch.int32, device='cuda')
+    count_gpu = torch.tensor(n, dtype=torch.int32, device='cuda')
+    if allocator.enable_prefix_caching:
+        full = allocator.allocate_memory_blocks_prefix_aware_gpu(count_gpu)
+    else:
+        full = allocator.allocate_memory_blocks_gpu(count_gpu)
+    allocator.total_avail = max(allocator.total_avail - n, 0)
+    result = full[:n]
+    allocator.clear_routing_for_reallocated(result)
+    return result
+
+
+def _release_blocks(allocator, blocks):
+    """Release a 1-D tensor of block IDs via the GPU dynamic release.
+
+    Replaces the removed eager ``release_memory_blocks(blocks)``.
+    """
+    n = blocks.numel()
+    if n == 0:
+        return
+    remove_mask = torch.ones(n, dtype=torch.bool, device=blocks.device)
+    allocator.release_memory_blocks_dynamic_gpu(blocks, remove_mask)
+
+
 class PrefixCachingTestBase:
 
     @classmethod
@@ -373,7 +406,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         p3 = self._prompt(ctx3.block_size_tokens * 2)
         ctx3.add_request(self._req(ctx3, p3.clone()))
         while alloc3.total_avail > 0:
-            alloc3.allocate_memory_blocks(1)
+            _alloc_n(alloc3, 1)
         _, _, kv_available = ctx3.check_availability(self._req(ctx3, p3.clone(), request_id=2))
         assert kv_available
 
@@ -491,8 +524,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         b1_hash = alloc.block_hashes[b1].item()
         assert alloc.block_ref_counts[b0].item() == 2
         assert alloc.block_ref_counts[b1].item() == 2
-        assert b0_hash in alloc.kv_hash_to_block_id
-        assert b1_hash in alloc.kv_hash_to_block_id
+        assert b0_hash in alloc.registry.kv_hash_to_block_id
+        assert b1_hash in alloc.registry.kv_hash_to_block_id
         avail_before = alloc.total_avail
 
         # Finish only request 1. The classify graph's folded release packs
@@ -506,7 +539,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_ref_counts[b1].item() == 1
         assert alloc.block_hashes[b0].item() == b0_hash
         assert alloc.block_hashes[b1].item() == b1_hash
-        assert b0_hash in alloc.kv_hash_to_block_id
+        assert b0_hash in alloc.registry.kv_hash_to_block_id
         assert alloc.total_avail == avail_before  # still held by req 2
 
         # Now finish request 2 (moved to slot 0 by the permutation).
@@ -519,8 +552,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_ref_counts[b1].item() == 0
         assert alloc.block_hashes[b0].item() == -1
         assert alloc.block_hashes[b1].item() == -1
-        assert b0_hash not in alloc.kv_hash_to_block_id
-        assert b1_hash not in alloc.kv_hash_to_block_id
+        assert b0_hash not in alloc.registry.kv_hash_to_block_id
+        assert b1_hash not in alloc.registry.kv_hash_to_block_id
         assert alloc.total_avail == avail_before + 2
 
     @pytest.mark.internal
@@ -552,8 +585,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_ref_counts[b1].item() == 0
         assert alloc.block_hashes[b0].item() == b0_hash
         assert alloc.block_hashes[b1].item() == b1_hash
-        assert b0_hash in alloc.kv_hash_to_block_id
-        assert b1_hash in alloc.kv_hash_to_block_id
+        assert b0_hash in alloc.registry.kv_hash_to_block_id
+        assert b1_hash in alloc.registry.kv_hash_to_block_id
         # The LRU cached list should record both newly-cached blocks.
         assert int(alloc._lru_cached_list_len.item()) == 2
 
@@ -575,7 +608,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         new_tokens = torch.tensor([100], dtype=torch.int64, device='cuda')
         ctx.update_requests(active_mask, new_tokens)
         assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash in alloc.kv_hash_to_block_id
+        assert b0_hash in alloc.registry.kv_hash_to_block_id
 
         # Add a new request with the same prefix; should bind the cached
         # blocks via the dict instead of allocating fresh ones.
@@ -603,7 +636,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
             alloc.block_ref_counts[bid] = 0
             alloc.block_hashes[bid] = h
             alloc.block_timestamps[bid] = ts
-            alloc.kv_hash_to_block_id[h] = bid
+            alloc.registry.kv_hash_to_block_id[h] = bid
         alloc._lru_cached_list[:3] = torch.tensor([10, 20, 30], dtype=torch.int32, device='cuda')
         alloc._lru_cached_list_ts[:3] = torch.tensor([5, 6, 7], dtype=torch.int64, device='cuda')
         alloc._lru_cached_list_len.fill_(3)
@@ -619,9 +652,9 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_hashes[10].item() == -1
         assert alloc.block_hashes[20].item() == -1
         assert alloc.block_hashes[30].item() == 1003
-        assert 1001 not in alloc.kv_hash_to_block_id
-        assert 1002 not in alloc.kv_hash_to_block_id
-        assert 1003 in alloc.kv_hash_to_block_id
+        assert 1001 not in alloc.registry.kv_hash_to_block_id
+        assert 1002 not in alloc.registry.kv_hash_to_block_id
+        assert 1003 in alloc.registry.kv_hash_to_block_id
         # Free pool grew by the two evicted blocks.
         assert int(alloc.total_avail_gpu.item()) == initial_avail + 2
 
@@ -737,8 +770,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_ref_counts[b1].item() == 0
         assert alloc.block_hashes[b0].item() == -1
         assert alloc.block_hashes[b1].item() == -1
-        assert b0_hash not in alloc.kv_hash_to_block_id
-        assert b1_hash not in alloc.kv_hash_to_block_id
+        assert b0_hash not in alloc.registry.kv_hash_to_block_id
+        assert b1_hash not in alloc.registry.kv_hash_to_block_id
         assert alloc.total_avail == avail_before + 2
 
 
@@ -1439,7 +1472,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         num_layers, topk = 4, 2
 
         # Allocate a block
-        block_ids = alloc.allocate_memory_blocks(1)
+        block_ids = _alloc_n(alloc, 1)
         bid = block_ids[0].item()
 
         # Store routing for some positions
@@ -1463,19 +1496,19 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         alloc = ctx.kv_block_allocator
 
         # Allocate, store routing, release, re-allocate
-        block_ids = alloc.allocate_memory_blocks(1)
+        block_ids = _alloc_n(alloc, 1)
         bid = block_ids[0].item()
         positions = np.array([0])
         routing = np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16)
         alloc.store_block_routing(bid, positions, routing)
         assert alloc.get_block_routing(bid) is not None
 
-        alloc.release_memory_blocks(block_ids)
+        _release_blocks(alloc, block_ids)
         # After release, routing still present (persists until re-alloc)
         assert alloc.get_block_routing(bid) is not None
 
         # Re-allocate the same block
-        new_ids = alloc.allocate_memory_blocks(1)
+        new_ids = _alloc_n(alloc, 1)
         new_bid = new_ids[0].item()
         # The re-allocated block should have routing cleared
         assert alloc.get_block_routing(new_bid) is None
@@ -1486,7 +1519,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         ctx = self._ctx()
         alloc = ctx.kv_block_allocator
 
-        block_ids = alloc.allocate_memory_blocks(1)
+        block_ids = _alloc_n(alloc, 1)
         bid = block_ids[0].item()
         alloc.store_block_routing(
             bid, np.array([0]), np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16)
@@ -1519,7 +1552,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         # Release blocks (REF_ZERO deregisters immediately)
         blocks = ctx.request_to_kv_block_ids[0]
         valid_blocks = blocks[blocks >= 0]
-        alloc.release_memory_blocks(valid_blocks)
+        _release_blocks(alloc, valid_blocks)
 
         # Routing data should still be present
         assert alloc.get_block_routing(b0) is not None
@@ -1534,7 +1567,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         num_layers, topk = 4, 2
 
         # Allocate 3 blocks
-        block_ids = alloc.allocate_memory_blocks(3)
+        block_ids = _alloc_n(alloc, 3)
         bids = block_ids.tolist()
 
         # Store routing for all positions in first two blocks (full)
@@ -1589,7 +1622,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         alloc = ctx.kv_block_allocator
         bs = ctx.block_size_tokens
 
-        block_ids = alloc.allocate_memory_blocks(2)
+        block_ids = _alloc_n(alloc, 2)
         bids = block_ids.tolist()
 
         # Only store routing for the first block

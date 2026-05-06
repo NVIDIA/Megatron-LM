@@ -1826,8 +1826,14 @@ class TextGenerationController:
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
 
                 # Phase 4: Release freed blocks. Deferred from Phase 2 so the
-                # data-dependent boolean-mask sync overlaps with MTP GPU work.
-                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+                # GPU pack/dispatch overlaps with MTP GPU work. The dynamic
+                # GPU release packs ``blocks_to_release`` masked entries into
+                # a shape-stable buffer and dispatches to the prefix-aware
+                # (or vanilla) graphed release path; dereg events are queued
+                # for the step-finalize ``drain_pending_dereg``.
+                context.kv_block_allocator.release_memory_blocks_dynamic_gpu(
+                    blocks_to_release, remove_mask
+                )
             else:
                 self._dynamic_step_sample_logits()
 

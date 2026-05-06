@@ -2559,6 +2559,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                       already_allocated_blocks, overall_required_blocks,
                       prefix_skip_tokens, effective_prefill_chunk_length).
         """
+        # Drain any pending dereg events queued by an earlier add_request in
+        # this scheduling pass (LRU eviction during ``allocate_memory_blocks_
+        # prefix_aware_gpu``) so that the host registry reflects the latest
+        # evictions before we read it. The drain self-short-circuits via
+        # ``_pc_dereg_may_have_events`` and is a no-op when no eviction has
+        # run since the last drain.
+        if self.enable_prefix_caching:
+            self.kv_block_allocator.drain_pending_dereg()
+
         finished = req.finished_chunk_token_count
         already_allocated_blocks = (finished + self.block_size_tokens - 1) // self.block_size_tokens
         overall_required_blocks = (
@@ -2711,14 +2720,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self.is_tensor_state_allocated:
             raise TensorStateDeallocatedError(req.request_id)
 
-        # Refresh CPU mirrors before reading. The hot-loop graphs leave the
-        # mirrors stale; ``add_request`` is the canonical cold-path consumer
-        # — slot accounting, the overflow check, and per-request scalar
-        # writes all read CPU mirrors that must reflect post-update state.
-        # When called immediately after ``check_availability`` (the typical
-        # engine flow), this is essentially a no-op because the mirrors were
-        # just refreshed there.
-        self.sync_counters_to_cpu()
+        # No CPU-mirror refresh here. The engine's ``check_availability`` ran
+        # immediately before this call and already brought the mirrors current.
+        # All allocator state mutations below go through the GPU-resident
+        # paths (``allocate_memory_blocks_gpu`` / ``_prefix_aware_gpu``), so
+        # ``add_request`` itself is host-mirror-read-only and never has to
+        # reach back to the GPU for a fresh snapshot.
 
         # Prefill chunk length.
         if prefill_chunk_length is None:
@@ -2751,11 +2758,52 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
 
+        # ── GPU-resident allocation ──
+        # The engine's ``check_availability`` has already verified that
+        # ``num_blocks_from_pool`` fits in the free pool (counting evictable
+        # cached blocks under LRU). Drive the allocation through the
+        # graphed-style GPU path: it updates ``total_avail_gpu``, ref counts,
+        # and timestamps without a single D2H. The eager path's hidden
+        # ``for bid in block_ids.tolist()`` sync is gone with it.
         new_block_ids = None
         if num_blocks_from_pool > 0:
-            new_block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks_from_pool)
-            if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
-                raise BlockOverflowError(req.request_id)
+            count_gpu = torch.tensor(
+                num_blocks_from_pool,
+                dtype=torch.int32,
+                device=self.kv_block_allocator.total_avail_gpu.device,
+            )
+            if self.enable_prefix_caching:
+                allocated_full = (
+                    self.kv_block_allocator.allocate_memory_blocks_prefix_aware_gpu(count_gpu)
+                )
+                # The prefix-aware allocate path may have run LRU eviction,
+                # which queues dereg events GPU-side via
+                # ``_enqueue_dereg_and_clear_hashes``. Arm the host flag so
+                # the next prefix-cache lookup (or step-finalize drain) syncs
+                # the registry. Without this, a later request in the same
+                # scheduling pass could prefix-match against a block that
+                # was just evicted to satisfy *this* allocation.
+                self.kv_block_allocator._pc_dereg_may_have_events = True
+            else:
+                allocated_full = self.kv_block_allocator.allocate_memory_blocks_gpu(count_gpu)
+            # ``allocate_memory_blocks_*_gpu`` returns a fixed ``(max_requests,)``
+            # tensor with the freshly allocated IDs in the first
+            # ``num_blocks_from_pool`` slots; the tail is stale.
+            new_block_ids = allocated_full[:num_blocks_from_pool]
+            # Clear stale per-block MoE routing data for any block that was
+            # just popped from the free pool. No-op when routing replay is
+            # not in use.
+            self.kv_block_allocator.clear_routing_for_reallocated(new_block_ids)
+            # Write-through update of the host mirror so subsequent
+            # ``is_memory_available`` calls in this scheduling pass don't
+            # need a sync. Under LRU eviction the GPU path may temporarily
+            # bump ``total_avail_gpu`` by the evicted count before
+            # subtracting, but the net change observed on host is the same:
+            # ``max(prev - num, 0)`` (eviction tops up to at least ``num``,
+            # then alloc drains exactly ``num``).
+            self.kv_block_allocator.total_avail = max(
+                self.kv_block_allocator.total_avail - num_blocks_from_pool, 0
+            )
 
         # Increment ref counts and update timestamps for matched (shared) blocks
         if num_matched_blocks > 0:

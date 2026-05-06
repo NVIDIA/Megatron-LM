@@ -194,6 +194,20 @@ class KVBlockAllocator:
         # Per-block MoE routing storage (populated when routing replay is enabled)
         self.block_routing: Dict[int, np.ndarray] = {}
 
+        # Pre-allocated buffer for ``release_memory_blocks_dynamic_gpu``:
+        # variable-length releases get packed into ``[:max_release_per_step]``
+        # in shape-stable form. Sized one larger so the masked-scatter sink
+        # at index ``max_release_per_step`` lives outside the slice the GPU
+        # release path consumes; this guarantees no collision between sink
+        # writes (from masked-out lanes) and real packed entries even when
+        # ``max_kv_block_count == 1``.
+        self._release_pack_buffer = torch.full(
+            (self.max_release_per_step + 1,),
+            self.dummy_block_idx,
+            dtype=torch.int32,
+            device=device,
+        )
+
     def __str__(self):
         return (
             f"using: total {self.get_total_used()}/{self.total_count}"
@@ -261,107 +275,6 @@ class KVBlockAllocator:
         # Also count evictable cached blocks
         evictable_count = self.get_evictable_block_count()
         return (self.total_avail + evictable_count) >= num_blocks
-
-    def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
-        """Allocate memory blocks if available, else return None.
-
-        Will attempt LRU eviction of cached blocks if the free pool is insufficient.
-
-        Args:
-            num_blocks (int): Number of blocks to allocate.
-
-        Return:
-            (Optional[Tensor]) Allocated block IDs.
-        """
-        # Try to evict cached blocks if free pool is insufficient
-        if self.total_avail < num_blocks:
-            if (
-                not self.enable_prefix_caching
-                or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
-            ):
-                return None  # RZ: no eviction path; disabled: no cached blocks
-            blocks_needed_from_eviction = num_blocks - self.total_avail
-            if not self.evict_lru_blocks(blocks_needed_from_eviction):
-                return None  # Not enough blocks even after eviction
-
-        # Now allocate from the free pool
-        self.total_avail -= num_blocks
-        block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
-        assert num_blocks == block_ids.numel()
-        self.total_avail_gpu.fill_(self.total_avail)
-
-        if self.enable_prefix_caching:
-            # Initialize ref counts for newly allocated blocks
-            self.block_ref_counts[block_ids] = 1
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-                self.update_timestamps(block_ids)
-
-        # Clear stale routing data for re-allocated blocks
-        for bid in block_ids.tolist():
-            self.block_routing.pop(bid, None)
-
-        return block_ids
-
-    def release_memory_blocks(self, blocks: Tensor) -> None:
-        """Release memory blocks by decrementing reference counts.
-
-        Blocks with ref_count == 0 remain cached (in hash map) for potential reuse.
-        They will be evicted via LRU when space is needed.
-
-        Args:
-            blocks (Tensor): Block IDs to release.
-
-        Return:
-            None
-        """
-        if blocks.numel() == 0:
-            return
-
-        if self.enable_prefix_caching:
-            self.block_ref_counts[blocks] -= 1
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
-                zero_mask = self.block_ref_counts[blocks] == 0
-                if zero_mask.any():
-                    self._deregister_blocks(blocks[zero_mask])
-            elif self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-                # Split the just-zero'd blocks by whether they have a hash:
-                #   - has_hash → cacheable: append to ``_lru_cached_list`` so
-                #     the graphed prefix-aware allocate path can later evict
-                #     them. Without this append, eager and graphed releases
-                #     would maintain divergent caches.
-                #   - no hash → unregistered partial blocks: nothing to keep
-                #     cached, return them to the free pool directly.
-                zero_mask = self.block_ref_counts[blocks] == 0
-                if zero_mask.any():
-                    zero_blocks = blocks[zero_mask]
-                    has_hash_mask = self.block_hashes[zero_blocks] != -1
-
-                    cacheable_blocks = zero_blocks[has_hash_mask]
-                    if cacheable_blocks.numel() > 0:
-                        n = cacheable_blocks.numel()
-                        # Read list_len GPU-side to avoid a sync; the index
-                        # arithmetic happens on-device.
-                        indices = self._lru_cached_list_len + torch.arange(
-                            n, dtype=torch.int64, device=cacheable_blocks.device
-                        )
-                        self._lru_cached_list[indices] = cacheable_blocks.to(torch.int32)
-                        self._lru_cached_list_ts[indices] = self.block_timestamps[
-                            cacheable_blocks
-                        ]
-                        self._lru_cached_list_len.add_(n)
-
-                    unreg_blocks = zero_blocks[~has_hash_mask]
-                    num_unreg = unreg_blocks.numel()
-                    if num_unreg > 0:
-                        self.block_bag[
-                            self.total_avail : self.total_avail + num_unreg
-                        ] = unreg_blocks
-                        self.total_avail += num_unreg
-        else:
-            num_blocks = blocks.numel()
-            self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
-            self.total_avail += num_blocks
-        self.total_avail_gpu.fill_(self.total_avail)
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -438,23 +351,16 @@ class KVBlockAllocator:
         if count == 0:
             return
 
-        # Pack ids (int32) and hashes (int64) into one int64 buffer and
-        # do a single .cpu() to avoid two separate D2H syncs (was 3 in
-        # the slow path: count.item() + ids.tolist() + hashes.tolist()).
-        device = self._pc_pending_dereg_count.device
-        combined = torch.empty(2 * count, dtype=torch.int64, device=device)
-        combined[:count] = self._pc_pending_dereg_ids[:count].to(torch.int64)
-        combined[count:] = self._pc_pending_dereg_hashes[:count]
-        flat = combined.cpu().tolist()
-        ids = flat[:count]
-        hashes = flat[count:]
+        # The registry update only needs the hashes; the routing-replay dict
+        # is preserved past dereg (a request that just finished still calls
+        # ``reconstruct_routing_from_blocks`` over the blocks it owned, and
+        # those blocks may have just been dereg'd in REF_ZERO mode). Routing
+        # for those blocks is cleared instead at re-allocate time, when the
+        # block transitions from free pool to a new owner.
+        hashes = self._pc_pending_dereg_hashes[:count].cpu().tolist()
 
-        keys_to_delete = set(hashes) - {-1}
-        for h in keys_to_delete:
-            self.kv_hash_to_block_id.pop(h, None)
-
-        if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(ids, keys_to_delete)
+        if self.registry is not None:
+            self.registry.evict_kv(hashes)
 
         self._pc_pending_dereg_count.zero_()
 
@@ -485,6 +391,84 @@ class KVBlockAllocator:
         # Gather max_requests entries starting at the new pointer.
         indices = self.total_avail_gpu + self._alloc_arange
         return self.block_bag[indices.long()]
+
+    def clear_routing_for_reallocated(self, block_ids_gpu: Tensor) -> None:
+        """Clear stale MoE routing data for blocks just popped from the free pool.
+
+        The eager ``allocate_memory_blocks`` used to do this in a per-call
+        ``for bid in block_ids.tolist()`` loop. After the GPU allocator
+        migration the loop is gone from the hot path; this helper restores
+        the same semantics for the eager call sites that need routing-replay
+        correctness (``add_request`` and a few tests). The ``.tolist()``
+        D2H is paid only when routing replay is active (i.e. when
+        ``block_routing`` is non-empty); when routing replay is off the
+        function is a single dict-emptiness check and no sync.
+
+        Routing-replay correctness model: a re-allocated block's prior
+        routing data is stale because the new request will overwrite only
+        the positions it actually fills, leaving the tail with the previous
+        owner's data. Clearing on re-allocate (rather than on release/
+        deregister) lets a just-finished request still call
+        ``reconstruct_routing_from_blocks`` over its now-released blocks
+        before they are handed to the next owner.
+        """
+        if not self.block_routing or block_ids_gpu.numel() == 0:
+            return
+        for bid in block_ids_gpu.tolist():
+            self.block_routing.pop(bid, None)
+
+    def release_memory_blocks_dynamic_gpu(
+        self, blocks_to_release: Tensor, remove_mask: Tensor
+    ) -> None:
+        """GPU-only release for a variable-length ``(N,)`` candidate list.
+
+        Replacement for the eager ``release_memory_blocks(blocks_to_release[remove_mask])``
+        pattern: that pattern's ``[remove_mask]`` boolean indexing forces a
+        host-side shape sync, and the eager ``_deregister_blocks`` carries an
+        unconditional ``.tolist()`` D2H per call.  This function packs the
+        masked entries entirely on GPU into the shape-stable
+        ``(max_release_per_step,)`` buffer and dispatches to the appropriate
+        graphed release path; the host-visible dict update is deferred to
+        ``drain_pending_dereg`` (run at step finalize), so ``add_request``
+        callers running concurrently on a side stream never block.
+
+        Args:
+            blocks_to_release: ``(N,)`` int tensor — one candidate block ID
+                per slot. Meaningful only at positions where ``remove_mask``
+                is True; other entries are ignored.
+            remove_mask: ``(N,)`` bool tensor — selects slots to release.
+
+        Note:
+            ``N`` may be any value (typically ``active_request_count``); the
+            packing is shape-stable independent of ``N``. Dereg events
+            queued here are flushed to the host registry by the engine's
+            step-finalize ``drain_pending_dereg``.
+        """
+        # Pack masked entries to the front of ``_release_pack_buffer``.
+        # Masked-out lanes route to the sink at index ``max_release_per_step``,
+        # which lives one slot past the end of the slice we hand to the GPU
+        # release path — so it is never observed.
+        mask_i64 = remove_mask.to(torch.int64)
+        prefix = torch.cumsum(mask_i64, dim=0) - mask_i64
+        sink = self.max_release_per_step
+        targets = torch.where(remove_mask, prefix, torch.full_like(prefix, sink))
+
+        self._release_pack_buffer[targets] = blocks_to_release.to(torch.int32)
+
+        num_valid_gpu = mask_i64.sum().to(torch.int32).view(1)
+
+        packed_view = self._release_pack_buffer[: self.max_release_per_step]
+        if self.enable_prefix_caching:
+            self.release_memory_blocks_prefix_aware_gpu(packed_view, num_valid_gpu)
+        else:
+            self.release_memory_blocks_gpu(packed_view, num_valid_gpu)
+
+        # Arm the host flag so the next ``drain_pending_dereg`` actually
+        # syncs (the prefix-aware path queues dereg events; the non-prefix
+        # path does not, but arming unconditionally is harmless — drain
+        # short-circuits when the queued count is zero).
+        if self.enable_prefix_caching:
+            self._pc_dereg_may_have_events = True
 
     def release_memory_blocks_gpu(self, packed_blocks: Tensor, num_valid_gpu: Tensor) -> None:
         """Shape-stable release that writes a pre-packed buffer onto the stack.
@@ -908,44 +892,8 @@ class KVBlockAllocator:
         id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
-        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
-
-    def _deregister_blocks(self, block_ids: Tensor) -> None:
-        """Remove blocks from prefix caching state and return to free pool.
-
-        Shared cleanup logic for both LRU eviction and RZ proactive eviction.
-
-        Args:
-            block_ids: Tensor of block IDs to deregister.
-        """
-        num_blocks = block_ids.numel()
-        if num_blocks == 0:
-            return
-
-        # Gather hashes via batched tensor indexing
-        block_ids_i64 = block_ids.to(torch.int64)
-        hashes = self.block_hashes[block_ids_i64].tolist()
-
-        # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
-        keys_to_delete = set(hashes) - {-1}
-        deque(
-            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
-            maxlen=0,
-        )
-
-        # Notify Mamba slot allocator (if wired) to clean up its state
-        if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
-
-        # Reset block state (batched tensor ops)
-        self.block_hashes[block_ids] = -1
-        self.block_ref_counts[block_ids] = 0
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-            self.block_timestamps[block_ids] = 0
-
-        # Return blocks to free pool
-        self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
-        self.total_avail += num_blocks
+        if self.registry is not None:
+            self.registry.register_kv(block_ids, block_hashes)
 
     def bump_lru_clock(self) -> None:
         """Advance the LRU clock by one tick.  Call once per engine step.
@@ -989,33 +937,6 @@ class KVBlockAllocator:
         """
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
         return cached_mask.sum()
-
-    def evict_lru_blocks(self, num_blocks_needed: int) -> bool:
-        """Evict LRU cached blocks to free up space in the pool.
-
-        Evicts blocks with ref_count == 0, starting with oldest timestamps.
-
-        Args:
-            num_blocks_needed: Number of blocks to evict.
-
-        Returns:
-            True if enough blocks were evicted, False otherwise.
-        """
-        # Find all cached blocks (ref_count == 0, hash != -1)
-        cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
-        cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
-
-        if cached_block_ids.numel() < num_blocks_needed:
-            return False  # Not enough cached blocks to evict
-
-        # Sort by timestamp (ascending = oldest first)
-        cached_timestamps = self.block_timestamps[cached_block_ids]
-        sorted_indices = torch.argsort(cached_timestamps)
-        blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
-
-        self._deregister_blocks(blocks_to_evict)
-
-        return True
 
     # =========================================================================
     # Per-block routing storage methods (for MoE routing replay)

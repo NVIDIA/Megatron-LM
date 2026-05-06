@@ -22,6 +22,38 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
+def _alloc_n(allocator, n: int):
+    """Allocate ``n`` blocks via the GPU path; return a length-``n`` view.
+
+    Test helper that replaces the removed eager ``allocate_memory_blocks(n)``.
+    Maintains the host-side ``total_avail`` mirror via write-through, the same
+    way the production ``add_request`` does after migrating to ``*_gpu``.
+    """
+    if n <= 0:
+        return torch.empty(0, dtype=torch.int32, device='cuda')
+    count_gpu = torch.tensor(n, dtype=torch.int32, device='cuda')
+    if allocator.enable_prefix_caching:
+        full = allocator.allocate_memory_blocks_prefix_aware_gpu(count_gpu)
+    else:
+        full = allocator.allocate_memory_blocks_gpu(count_gpu)
+    allocator.total_avail = max(allocator.total_avail - n, 0)
+    result = full[:n]
+    allocator.clear_routing_for_reallocated(result)
+    return result
+
+
+def _release_blocks(allocator, blocks):
+    """Release a 1-D tensor of block IDs via the GPU dynamic release.
+
+    Replaces the removed eager ``release_memory_blocks(blocks)``.
+    """
+    n = blocks.numel()
+    if n == 0:
+        return
+    remove_mask = torch.ones(n, dtype=torch.bool, device=blocks.device)
+    allocator.release_memory_blocks_dynamic_gpu(blocks, remove_mask)
+
+
 @contextlib.contextmanager
 def rounder_override(n):
     original_token_rounder = DynamicInferenceContext.TOKEN_ROUNDER
@@ -353,31 +385,21 @@ class TestDynamicContext:
             expected_memory_blocks = [486, 487, 488, 489]
         expected_block_count_avail = expected_memory_blocks[0]
 
+        alloc = dynamic_context.kv_block_allocator
         assert (
-            dynamic_context.kv_block_allocator.allocate_memory_blocks(4)
-            .cpu()
-            .detach()
-            .numpy()
-            .tolist()
-            == expected_memory_blocks
+            _alloc_n(alloc, 4).cpu().detach().numpy().tolist() == expected_memory_blocks
         )
-        assert dynamic_context.kv_block_allocator.total_avail == expected_block_count_avail
-        dynamic_context.kv_block_allocator.release_memory_blocks(
-            torch.tensor(expected_memory_blocks[-2:], device='cuda')
-        )
-        assert dynamic_context.kv_block_allocator.total_avail == expected_block_count_avail + 2
-        assert (
-            dynamic_context.kv_block_allocator.allocate_memory_blocks(1).item()
-            == expected_memory_blocks[-1]
-        )
-        assert dynamic_context.kv_block_allocator.total_avail == expected_block_count_avail + 1
-        # Should return None since we allocate more blocks than what we have.
-        assert (
-            dynamic_context.kv_block_allocator.allocate_memory_blocks(
-                dynamic_context.kv_block_allocator.total_avail + 100
-            )
-            == None
-        )
+        assert alloc.total_avail == expected_block_count_avail
+        _release_blocks(alloc, torch.tensor(expected_memory_blocks[-2:], device='cuda'))
+        # GPU release queues blocks via ``total_avail_gpu``; mirror back to the
+        # host int the same way ``sync_counters_to_cpu`` would at step boundary.
+        alloc.total_avail = int(alloc.total_avail_gpu.item())
+        assert alloc.total_avail == expected_block_count_avail + 2
+        assert _alloc_n(alloc, 1).item() == expected_memory_blocks[-1]
+        assert alloc.total_avail == expected_block_count_avail + 1
+        # Out-of-memory request: ``is_memory_available`` is the GPU-path
+        # equivalent of the eager ``None``-on-overflow return.
+        assert not alloc.is_memory_available(alloc.total_avail + 100)
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -630,7 +652,7 @@ class TestDynamicContext:
         dynamic_context.paused_request_count = 0
         dynamic_context.total_request_count = 3
         dynamic_context.request_kv_block_counts[0:3] = 1
-        new_block_ids = dynamic_context.kv_block_allocator.allocate_memory_blocks(3)
+        new_block_ids = _alloc_n(dynamic_context.kv_block_allocator, 3)
         dynamic_context.request_to_kv_block_ids[0:3, 0] = new_block_ids
 
         if is_hybrid_model:
@@ -803,7 +825,7 @@ class TestDynamicContext:
 
         # Set up the initial state with 5 requests
         # Allocate 5 blocks for 5 requests
-        initial_blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(5)
+        initial_blocks = _alloc_n(dynamic_context.kv_block_allocator, 5)
         dynamic_context.total_request_count = 5
         dynamic_context.paused_request_count = 0
 
@@ -879,7 +901,7 @@ class TestDynamicContext:
 
         # Set up the initial state with 3 requests, where some use multiple blocks
         # Allocate 6 blocks in total for the requests
-        initial_blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(6)
+        initial_blocks = _alloc_n(dynamic_context.kv_block_allocator, 6)
         dynamic_context.total_request_count = 3
         dynamic_context.paused_request_count = 0
 
@@ -2627,7 +2649,7 @@ class TestDynamicContext:
         ctx.request_last_kv_block_offset[0] = 253
 
         # Allocate one initial block manually
-        blocks = ctx.kv_block_allocator.allocate_memory_blocks(1)
+        blocks = _alloc_n(ctx.kv_block_allocator, 1)
         first_block = blocks[0]
         ctx.request_to_kv_block_ids[0, 0] = first_block
         ctx.request_last_kv_block_id[0] = first_block
@@ -2698,7 +2720,7 @@ class TestDynamicContext:
         ctx.request_kv_block_counts[:2] = 1
 
         # Allocate blocks
-        blocks = ctx.kv_block_allocator.allocate_memory_blocks(2)
+        blocks = _alloc_n(ctx.kv_block_allocator, 2)
         ctx.request_to_kv_block_ids[0, 0] = blocks[0]
         ctx.request_to_kv_block_ids[1, 0] = blocks[1]
         ctx.request_last_kv_block_id[:2] = blocks
@@ -2706,6 +2728,7 @@ class TestDynamicContext:
         # Force the allocator to have no available blocks.
         # This guarantees request 0 stays paused and cannot immediately resume.
         ctx.kv_block_allocator.total_avail = 0
+        ctx.kv_block_allocator.total_avail_gpu.zero_()
         ctx.kv_block_allocator.paused_count = 100  # Ensure it doesn't get completely evicted either
 
         active_requests_mask = torch.tensor([1, 1], device='cuda')
@@ -3347,7 +3370,7 @@ class TestDynamicContext:
 
         # Exhaust the remaining pool.
         while ctx.kv_block_allocator.total_avail > 0:
-            ctx.kv_block_allocator.allocate_memory_blocks(1)
+            _alloc_n(ctx.kv_block_allocator, 1)
 
         # A new request with the same prefix should still be schedulable
         # because prefix matching means 0 new blocks are needed from pool.
@@ -3460,13 +3483,14 @@ class TestDynamicContext:
             [bs - 1, 5], device='cuda', dtype=torch.int32
         )
 
-        blocks = ctx.kv_block_allocator.allocate_memory_blocks(2)
+        blocks = _alloc_n(ctx.kv_block_allocator, 2)
         ctx.request_to_kv_block_ids[0, 0] = blocks[0]
         ctx.request_to_kv_block_ids[1, 0] = blocks[1]
         ctx.request_last_kv_block_id[:2] = blocks
 
         # Force OOM condition (no blocks left in the active pool)
         ctx.kv_block_allocator.total_avail = 0
+        ctx.kv_block_allocator.total_avail_gpu.zero_()
         ctx.kv_block_allocator.paused_count = 100  # Prevent immediate eviction out of the system
 
         active_mask = torch.tensor([1, 1], device='cuda', dtype=torch.int32)
@@ -3530,7 +3554,7 @@ class TestDynamicContext:
         ctx.request_last_kv_block_offset[0] = 13  # 0-indexed, 14 tokens in last block
 
         # Allocate 2 blocks manually.
-        blocks = ctx.kv_block_allocator.allocate_memory_blocks(2)
+        blocks = _alloc_n(ctx.kv_block_allocator, 2)
         ctx.request_to_kv_block_ids[0, 0] = blocks[0]
         ctx.request_to_kv_block_ids[0, 1] = blocks[1]
         ctx.request_last_kv_block_id[0] = blocks[1]
