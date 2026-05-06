@@ -6,6 +6,7 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   NON_DETERMINSTIC_RESULTS: 1
 TEST_TYPE: "release"
+LAUNCHER: ft_launcher
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60

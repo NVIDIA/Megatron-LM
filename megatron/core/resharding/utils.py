@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -198,6 +197,38 @@ def assign_resolved_name_inplace(
     assign_ep_resolved_name_inplace(meta, base_name=name)
 
 
+def named_persistent_buffers(module: torch.nn.Module):
+    """Yield ``(full_name, parent_module, buf_name, tensor)`` for every
+    persistent buffer in ``module``.  Skips ``_non_persistent_buffers_set``.
+
+    Persistent buffers (those saved in ``state_dict``) carry training state that
+    must travel with the weights during refit/resharding — e.g. the MoE
+    router's ``expert_bias``, which is updated each step by aux-loss-free load
+    balancing.  Non-persistent buffers are excluded since they hold ephemeral
+    state (e.g. accumulators reset at the next train step).
+    """
+    for module_prefix, sub_module in module.named_modules():
+        non_persistent = sub_module._non_persistent_buffers_set
+        for buf_name, buf in sub_module._buffers.items():
+            if buf is None or buf_name in non_persistent:
+                continue
+            full_name = f"{module_prefix}.{buf_name}" if module_prefix else buf_name
+            yield full_name, sub_module, buf_name, buf
+
+
+def named_refit_tensors(module: torch.nn.Module):
+    """Yield ``(name, tensor)`` pairs for every parameter and persistent buffer.
+
+    Used by the refit planner and executor to enumerate which tensors should
+    travel during resharding.  Persistent buffers are included alongside
+    parameters because they may carry training state (see
+    ``named_persistent_buffers``).
+    """
+    yield from module.named_parameters(recurse=True)
+    for full_name, _sub, _buf_name, buf in named_persistent_buffers(module):
+        yield full_name, buf
+
+
 def _build_layer_module_prefix_map(module: torch.nn.Module) -> dict[str, str]:
     """Build a mapping local_module_prefix -> global_module_prefix for PP layer modules.
 
@@ -257,8 +288,17 @@ def extract_param_metadata(
     num_experts: Optional[int] = None,
     layer_module_prefix_map: Mapping[str, str] | None = None,
     rank_offset: int = 0,
+    _rank_list_cache: dict | None = None,
 ) -> ParameterMetadata:
-    """Extract metadata from a parameter for cross-rank communication."""
+    """Extract metadata from a parameter for cross-rank communication.
+
+    Args:
+        _rank_list_cache: Optional dict used to deduplicate rank lists so
+            that params sharing the same process group reuse one object.
+            This dramatically shrinks pickle size when metadata is gathered
+            across many ranks (pickle uses backreferences for same-``id()``
+            objects, avoiding re-serialization of identical group lists).
+    """
     # TP flags from attributes (set by Megatron linear layers)
     is_tp = bool(getattr(param, 'tensor_model_parallel', False))
     partition_dim = int(getattr(param, 'partition_dim', 0))
@@ -266,15 +306,6 @@ def extract_param_metadata(
     partition_sizes = getattr(param, 'partition_sizes', None)
     if partition_sizes is not None:
         partition_sizes = list(partition_sizes)
-
-    # SwiGLU/GLU compatibility: For gated linear units, fc1 stores interleaved [gate, up] portions
-    # and requires partition_stride=2 for correct resharding. New models set this at construction
-    # time (MLP sets partition_stride=2 on weight when gated_linear_unit=True). For legacy models
-    # where stride=1 was left as default, we apply stride=2 as a fallback for fc1 parameters.
-    # This is safe because: (1) gated models need it, and (2) non-gated models have smaller fc1
-    # and stride doesn't affect single-block transfers.
-    # if 'mlp.linear_fc1' in param_name and is_tp and partition_stride == 1:
-    #     partition_stride = 2
 
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
@@ -293,8 +324,22 @@ def extract_param_metadata(
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
+    # Deduplicate rank lists: params sharing the same TP/DP/EP/PP group get
+    # one shared list object instead of separate copies.  This shrinks pickle
+    # size ~75% when metadata is gathered across many ranks (pickle uses
+    # backreferences for same-id() objects).
+    if _rank_list_cache is None:
+        _rank_list_cache = {}
+
+    def _dedup_ranks(ranks: list[int]) -> list[int]:
+        key = tuple(ranks)
+        if key not in _rank_list_cache:
+            _rank_list_cache[key] = list(key)
+        return _rank_list_cache[key]
+
     def _offset_ranks(ranks: list[int]) -> list[int]:
-        return [r + rank_offset for r in ranks] if rank_offset else ranks
+        result = [r + rank_offset for r in ranks] if rank_offset else ranks
+        return _dedup_ranks(result)
 
     if is_ep or is_expert_param:
         if is_ep:
@@ -339,8 +384,8 @@ def extract_param_metadata(
             dist.get_process_group_ranks(pg_collection.pp)
         )
     else:
-        pipeline_parallel_group_ranks = list(
-            range(rank_offset, rank_offset + dist.get_world_size())
+        pipeline_parallel_group_ranks = _dedup_ranks(
+            list(range(rank_offset, rank_offset + dist.get_world_size()))
         )
 
     meta = ParameterMetadata(
@@ -498,6 +543,3 @@ def select_src_metadata_balanced(
     within_group_idx = (dst_rank // len(sorted_dp_groups)) % len(group_metadata)
     selected = group_metadata[within_group_idx]
     return selected
-
-
-logger = logging.getLogger(__name__)

@@ -10,6 +10,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
+    apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
@@ -697,6 +698,12 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
+        if self.config.moe_router_force_biased is not None:
+            # Apply biased logits with shared random bias across all ranks
+            logits = apply_biased_logits(
+                logits, self.config.moe_router_force_biased, self.layer_number
+            )
+
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
         return probs, routing_map
@@ -747,16 +754,6 @@ class InferenceTopKRouter(TopKRouter):
         )
 
         super().__init__(config=config, pg_collection=pg_collection)
-
-        self.is_inference_cuda_graphed_iteration = False
-
-    def set_inference_cuda_graphed_iteration(self):
-        """Enable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = True
-
-    def unset_inference_cuda_graphed_iteration(self):
-        """Disable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = False
 
     @staticmethod
     @torch.compile
@@ -818,7 +815,7 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
-        if self.training or not self.is_inference_cuda_graphed_iteration:
+        if self.training:
             return super().forward(input, padding_mask)
 
         return self._forward(input, padding_mask)

@@ -11,7 +11,7 @@
 
 This guide walks you through running your first training jobs with Megatron Core. Make sure you have completed [installation](install.md) before proceeding.
 
-## Simple Training Example
+## Minimal Training Example
 
 Run a minimal distributed training loop with mock data on 2 GPUs:
 
@@ -21,7 +21,7 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 ## LLaMA-3 Training Example
 
-Train a LLaMA-3 8B model with FP8 precision on 8 GPUs using mock data:
+Train an LLaMA-3 8B model with FP8 precision on 8 GPUs using mock data:
 
 ```bash
 ./examples/llama/train_llama3_8b_h100_fp8.sh
@@ -56,7 +56,7 @@ python tools/preprocess_data.py \
 
 - `--input`: Path to input JSON/JSONL file
 - `--output-prefix`: Prefix for output binary files (.bin and .idx)
-- `--tokenizer-type`: Tokenizer type (`HuggingFaceTokenizer`, `GPT2BPETokenizer`, etc.)
+- `--tokenizer-type`: Tokenizer type (`HuggingFaceTokenizer`, `GPT2BPETokenizer`, and so on)
 - `--tokenizer-model`: Path to tokenizer model file
 - `--workers`: Number of parallel workers for processing
 - `--append-eod`: Add end-of-document token
@@ -65,4 +65,4 @@ python tools/preprocess_data.py \
 
 - Explore [Parallelism Strategies](../user-guide/parallelism-guide.md) to scale your training
 - Learn about [Data Preparation](../user-guide/data-preparation.md) best practices
-- Check out [Advanced Features](../user-guide/features/index.md) for advanced capabilities
+- Check out [Advanced Features](../user-guide/features/index.md)

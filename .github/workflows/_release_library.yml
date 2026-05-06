@@ -486,13 +486,8 @@ jobs:
     secrets: inherit
 
   notify:
-    needs: [build-test-publish-wheels, create-gh-release]
+    needs: [build-test-publish-wheels, create-gh-release, bump-next-version]
     runs-on: ubuntu-latest
-    env:
-      GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheels.outputs.version }}
-      PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheels.outputs.pypi-name }}/${{ needs.build-test-publish-wheels.outputs.version }}/
-      PROJECT_NAME: Megatron Core
-      VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -505,10 +500,10 @@ jobs:
         uses: ./send-slack-alert/.github/actions/send-slack-alert
         env:
           MESSAGE: |
-            ${{ inputs.dry-run == true && 'This is a dry-run, nothing actually happened: ' || '' }}We have released `${{ env.VERSION }}` of `NVIDIA ${{ env.PROJECT_NAME }}` 🚀✨🎉
+            ${{ inputs.dry-run == true && 'This is a dry-run, nothing actually happened: ' || '' }}We have released `${{ needs.bump-next-version.outputs.release-version }}` of `NVIDIA Megatron Core` 🚀✨🎉
 
-            • <${{ env.GH_URL }}|GitHub release>
-            • <${{ env.PYPI_URL }}|PyPi release>
+            • <https://github.com/${{ github.repository }}/releases/tag/core_v${{ needs.bump-next-version.outputs.release-version }}|GitHub release>
+            • <https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/megatron-core/${{ needs.bump-next-version.outputs.release-version }}/|PyPi release>
 
         with:
           message: ${{ env.MESSAGE }}

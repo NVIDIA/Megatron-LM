@@ -4,7 +4,7 @@
         "end_step": 1,
         "step_interval": 1,
         "values": {
-            "1": 10.86791
+            "1": 29.29548
         }
     },
     "num-zeros": {
@@ -12,7 +12,7 @@
         "end_step": 1,
         "step_interval": 1,
         "values": {
-            "1": 152866448.0
+            "1": 152955200.0
         }
     },
     "mem-allocated-bytes": {
@@ -29,14 +29,6 @@
         "step_interval": 1,
         "values": {
             "1": 67277205504.0
-        }
-    },
-    "iteration-time": {
-        "start_step": 1,
-        "end_step": 1,
-        "step_interval": 1,
-        "values": {
-            "1": 14.45281
         }
     }
 }

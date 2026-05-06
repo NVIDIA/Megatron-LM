@@ -5,12 +5,17 @@ from typing import Optional
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.contexts.mamba_slot_allocator import (
+    MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
+)
 
 
 class MambaMetadata:
     """Manages the metadata tensors required for Mamba layers during inference."""
 
-    def __init__(self, max_requests: int, max_tokens: int, mamba_chunk_size: int = 128):
+    def __init__(
+        self, max_requests: int, max_tokens: int, mamba_chunk_size: int = 128, d_conv: int = 0
+    ):
         """
         Initializes the Mamba slot allocator.
 
@@ -18,23 +23,27 @@ class MambaMetadata:
             max_requests (int): The maximum number of concurrent requests.
             max_tokens (int): The maximum number of tokens.
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
+            d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
+                Used for vectorized conv state extraction at intermediate offsets.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size
+        self.d_conv = d_conv
         self.device = torch.cuda.current_device()
 
         # Maximum possible chunks across all batch configurations
         self.max_chunks = max_tokens // mamba_chunk_size + max_requests
 
-        # Map from requests to slots in the static Mamba state buffer
+        # Map from requests to slots in the static Mamba state buffer (CPU for bookkeeping).
         self.request_to_mamba_state_idx = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests,), -1, dtype=torch.int32, device='cpu'
         )
 
-        # Map from requests to slots in the static Mamba state buffer for active decode requests
+        # Map from requests to slots in the static Mamba state buffer for active decode requests.
+        # int64 so selective_state_update can index directly without a per-layer upcast kernel;
         self._batch_indices_decode_buffer = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=self.device
+            (self.max_requests,), -1, dtype=torch.int64, device=self.device
         )
 
         # Map from requests to slots in the static Mamba state buffer for active prefill requests
@@ -76,13 +85,53 @@ class MambaMetadata:
         self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
         self._conv_seq_start_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
 
-        # Allocator for Mamba state slots
+        # Allocator for Mamba state slots (CPU for bookkeeping).
         self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+            self.max_requests, dtype=torch.int32, device='cpu'
         )
         self.mamba_state_free_slot_count = self.max_requests
 
+        # Intermediate state extraction buffers (CUDA graph compatible)
+        # Each prefill request can produce up to 3 intermediate offsets
+        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * max_requests
+        self._intermediate_chunk_indices_buffer = torch.zeros(
+            self.max_intermediate_count, dtype=torch.int64, device=self.device
+        )
+        self._intermediate_abs_positions_buffer = torch.full(
+            (self.max_intermediate_count,), d_conv, dtype=torch.int32, device=self.device
+        )
+        # Constant gather offsets for conv state extraction: [-d_conv, ..., -1]
+        if d_conv > 0:
+            self.conv_gather_offsets = torch.arange(
+                -d_conv, 0, dtype=torch.int32, device=self.device
+            )
+        else:
+            self.conv_gather_offsets = None
+
+        # Coalesced production path: pinned CPU views + shared GPU views bound
+        # by DynamicInferenceContext so that the per-step Mamba metadata fields
+        # ride along with the single coalesced H2D in transfer_bookkeeping_to_gpu.
+        # The legacy update() path above keeps using the standalone _*_buffer
+        # tensors (exercised only by unit tests that construct MambaMetadata
+        # without a context).
+        self._cpu_bufs = None
+        self._gpu_view = None
+
         self.reset_varlen_metadata()
+
+    def bind_cpu_buffers(self, bufs: dict) -> None:
+        """Attach pinned CPU views from DynamicInferenceContext._cpu_bookkeeping_buf.
+
+        ``bufs`` maps field names to 1D (or (1, max_tokens) for ``seq_idx``)
+        pinned CPU views that compute_cpu_metadata writes into. The matching
+        GPU views on the other side of the H2D are exposed via
+        :meth:`bind_gpu_buffers`.
+        """
+        self._cpu_bufs = bufs
+
+    def bind_gpu_buffers(self, gpu_view) -> None:
+        """Attach shared GPU views from the context's :class:`ContextGPUView`."""
+        self._gpu_view = gpu_view
 
     def reset(self) -> None:
         """
@@ -94,7 +143,7 @@ class MambaMetadata:
 
         # Re-initialize the free slot pool
         self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+            self.max_requests, dtype=torch.int32, device='cpu'
         )
         self.mamba_state_free_slot_count = self.max_requests
 
@@ -117,6 +166,12 @@ class MambaMetadata:
         self.real_prefill_token_count = 0
         self.cu_seqlens_list = [0]
 
+        # Intermediate state extraction views
+        self.intermediate_chunk_indices = None
+        self.intermediate_abs_positions = None
+        self.intermediate_count = 0
+        self.per_request_intermediate_counts = []
+
     def update(
         self,
         active_mamba_indices: torch.Tensor,
@@ -125,6 +180,8 @@ class MambaMetadata:
         batch_dimensions: InferenceBatchDimensions,
         padded_batch_dimensions: InferenceBatchDimensions,
         enable_chunked_prefill: bool,
+        intermediate_offsets_gpu: Optional[torch.Tensor] = None,
+        intermediate_counts_gpu: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Updates the dedicated CUDA graph mapping tensor with the indices
@@ -137,6 +194,10 @@ class MambaMetadata:
             cu_seqlens (Tensor): Cumulative sequence lengths.
             batch_dimensions (InferenceBatchDimensions): Dimensions of the current batch.
             padded_batch_dimensions (InferenceBatchDimensions): Dimensions of the padded batch.
+            intermediate_offsets_gpu (Tensor): [prefill_count, 3] int32 GPU tensor of
+                per-request intermediate token offsets, or None.
+            intermediate_counts_gpu (Tensor): [prefill_count] int32 GPU tensor of
+                per-request intermediate offset counts, or None.
         """
         real_decode_count = batch_dimensions.decode_req_count
         real_prefill_count = batch_dimensions.prefill_req_count
@@ -227,22 +288,22 @@ class MambaMetadata:
             for i in range(padded_prefill_count):
                 start = cu_seqlens_all[i]
                 end = cu_seqlens_all[i + 1]
-                pos = start + chunk_size
-                while pos < end:
-                    chunk_boundaries.append(pos)
-                    chunk_to_seq_list.append(i)
-                    pos += chunk_size
-                chunk_boundaries.append(end)
-                chunk_to_seq_list.append(i)
+                seq_len = end - start
+                n_chunks = max(1, (seq_len + chunk_size - 1) // chunk_size)
+                boundaries = [min(start + (k + 1) * chunk_size, end) for k in range(n_chunks)]
+                chunk_boundaries.extend(boundaries)
+                chunk_to_seq_list.extend([i] * n_chunks)
                 last_chunk_idx_list.append(len(chunk_boundaries) - 2)
 
             # Pad to fixed size for CUDA graph compatibility
             padded_max_chunks = padded_token_count // chunk_size + padded_prefill_count
             last_boundary = chunk_boundaries[-1]
-            while len(chunk_boundaries) < padded_max_chunks + 1:
-                chunk_boundaries.append(last_boundary)
-            while len(chunk_to_seq_list) < padded_max_chunks:
-                chunk_to_seq_list.append(0)
+            pad_b = padded_max_chunks + 1 - len(chunk_boundaries)
+            if pad_b > 0:
+                chunk_boundaries.extend([last_boundary] * pad_b)
+            pad_s = padded_max_chunks - len(chunk_to_seq_list)
+            if pad_s > 0:
+                chunk_to_seq_list.extend([0] * pad_s)
 
             # Fill GPU buffers
             n_cu = padded_max_chunks + 1
@@ -264,18 +325,17 @@ class MambaMetadata:
             # Build conv1d per-token metadata (request ID and request start position)
             real_tokens = self.real_prefill_token_count
             if real_tokens > 0:
-                conv_seq_idx_list = []
-                conv_seq_start_list = []
-                for i in range(real_prefill_count):
-                    start = cu_seqlens_real[i]
-                    length = cu_seqlens_real[i + 1] - start
-                    conv_seq_idx_list.extend([i] * length)
-                    conv_seq_start_list.extend([start] * length)
-                self._conv_seq_idx_buffer[:real_tokens].copy_(
-                    torch.tensor(conv_seq_idx_list, dtype=torch.int32)
+                cu = self._cu_seqlens_buffer[: real_prefill_count + 1]
+                lengths = (cu[1:] - cu[:-1]).to(torch.int64)
+                seq_indices = torch.arange(
+                    real_prefill_count, dtype=torch.int32, device=self.device
                 )
-                self._conv_seq_start_buffer[:real_tokens].copy_(
-                    torch.tensor(conv_seq_start_list, dtype=torch.int32)
+                seq_starts = cu[:real_prefill_count].to(torch.int32)
+                self._conv_seq_idx_buffer[:real_tokens] = torch.repeat_interleave(
+                    seq_indices, lengths
+                )
+                self._conv_seq_start_buffer[:real_tokens] = torch.repeat_interleave(
+                    seq_starts, lengths
                 )
             if padded_token_count > real_tokens:
                 self._conv_seq_idx_buffer[real_tokens:padded_token_count] = 0
@@ -284,11 +344,345 @@ class MambaMetadata:
             self.conv_seq_idx = self._conv_seq_idx_buffer[:padded_token_count]
             self.conv_seq_start = self._conv_seq_start_buffer[:padded_token_count]
 
+            # --- Precompute intermediate state extraction metadata ---
+            # This converts per-request token offsets to chunk indices and
+            # absolute positions, padded to fixed size for CUDA graph compat.
+            self._update_intermediate_metadata(
+                intermediate_offsets_gpu, intermediate_counts_gpu, real_prefill_count
+            )
+
         if padded_decode_count > 0 and padded_prefill_count > 0:
             self._device_decode_prefill_buffer[0] = cu_seqlens[real_decode_count]
             self._device_decode_prefill_buffer[1] = (
                 cu_seqlens[real_decode_count + real_prefill_count] - cu_seqlens[real_decode_count]
             )
+            self.device_decode_prefill = self._device_decode_prefill_buffer
+
+    def _update_intermediate_metadata(
+        self,
+        intermediate_offsets_gpu: Optional[torch.Tensor],
+        intermediate_counts_gpu: Optional[torch.Tensor],
+        real_prefill_count: int,
+        cu_seqlens_gpu: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Precompute intermediate extraction metadata for CUDA graph compatibility.
+
+        Converts per-request token offsets to chunk indices and absolute
+        positions using vectorized GPU operations, padding unused entries
+        to fixed buffer size.
+
+        Args:
+            intermediate_offsets_gpu: [real_prefill_count, 3] int32 GPU tensor
+                of per-request token offsets, or None if no extraction needed.
+            intermediate_counts_gpu: [real_prefill_count] int32 GPU tensor of
+                per-request offset counts (0-3), or None.
+            real_prefill_count: Number of real (non-padding) prefill requests.
+            cu_seqlens_gpu: GPU cu_seqlens tensor to read from. Defaults to
+                the legacy standalone ``_cu_seqlens_buffer`` used by
+                :meth:`update`; the coalesced production path passes the
+                shared ``ContextGPUView.mamba_cu_seqlens`` view.
+        """
+        chunk_size = self.mamba_chunk_size
+        max_count = self.max_intermediate_count
+        if cu_seqlens_gpu is None:
+            cu_seqlens_gpu = self._cu_seqlens_buffer
+
+        if intermediate_offsets_gpu is not None and real_prefill_count > 0:
+            # counts_list is CPU-cheap (source is already CPU from MambaSlotAllocator).
+            counts_list = intermediate_counts_gpu.tolist()
+            total = sum(counts_list)
+
+            # Ensure GPU copies for vectorized GPU ops below.
+            if not intermediate_offsets_gpu.is_cuda:
+                intermediate_offsets_gpu = intermediate_offsets_gpu.to(
+                    self.device, non_blocking=True
+                )
+            if not intermediate_counts_gpu.is_cuda:
+                intermediate_counts_gpu = intermediate_counts_gpu.to(self.device, non_blocking=True)
+
+            if total > 0:
+                # Compute cumulative chunk counts from cu_seqlens (already on GPU)
+                cu = cu_seqlens_gpu[: real_prefill_count + 1]
+                seq_lens = (cu[1 : real_prefill_count + 1] - cu[:real_prefill_count]).to(
+                    torch.int64
+                )
+                num_chunks = torch.clamp((seq_lens + chunk_size - 1) // chunk_size, min=1)
+                cum_chunks = torch.zeros(
+                    real_prefill_count + 1, dtype=torch.int64, device=self.device
+                )
+                torch.cumsum(num_chunks, dim=0, out=cum_chunks[1:])
+
+                seq_starts = cu[:real_prefill_count].to(torch.int64)
+                offsets = intermediate_offsets_gpu.to(torch.int64)
+
+                # Expand per-request values to [real_prefill_count, 3]
+                cum_chunks_exp = cum_chunks[:real_prefill_count].unsqueeze(1).expand_as(offsets)
+                seq_starts_exp = seq_starts.unsqueeze(1).expand_as(offsets)
+
+                # Vectorized computation of chunk indices and absolute positions
+                chunk_indices_2d = cum_chunks_exp + offsets // chunk_size - 1
+                abs_positions_2d = seq_starts_exp + offsets
+
+                # Validity mask: j < count[i] for each request
+                j_indices = torch.arange(
+                    MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, device=self.device
+                ).unsqueeze(0)
+                valid_mask = j_indices < intermediate_counts_gpu.unsqueeze(1)
+
+                # Flatten valid entries into output buffers
+                valid_chunk_indices = chunk_indices_2d[valid_mask]
+                valid_abs_positions = abs_positions_2d[valid_mask]
+
+                real_count = valid_chunk_indices.numel()
+                self._intermediate_chunk_indices_buffer[:real_count] = valid_chunk_indices
+                self._intermediate_abs_positions_buffer[:real_count] = valid_abs_positions.to(
+                    torch.int32
+                )
+
+                # Pad unused slots with safe defaults for CUDA graph replay:
+                # - chunk_indices=0: reads from chunk 0 (always exists), output ignored
+                # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1],
+                #   which are within bounds and produce a valid but unused state
+                if real_count < max_count:
+                    self._intermediate_chunk_indices_buffer[real_count:].fill_(0)
+                    self._intermediate_abs_positions_buffer[real_count:].fill_(self.d_conv)
+
+                self.intermediate_count = real_count
+                self.per_request_intermediate_counts = counts_list
+            else:
+                # All counts are 0
+                self._intermediate_chunk_indices_buffer.fill_(0)
+                self._intermediate_abs_positions_buffer.fill_(self.d_conv)
+                self.intermediate_count = 0
+                self.per_request_intermediate_counts = counts_list
+
+            self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
+            self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+        else:
+            # No extraction: fill with safe defaults for CUDA graph warmup
+            # (same rationale as padding comment above)
+            self._intermediate_chunk_indices_buffer.fill_(0)
+            self._intermediate_abs_positions_buffer.fill_(self.d_conv)
+            self.intermediate_count = 0
+            self.per_request_intermediate_counts = []
+            self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
+            self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+
+    def compute_cpu_metadata(
+        self,
+        active_mamba_indices: torch.Tensor,
+        token_to_request_idx: torch.Tensor,
+        cpu_cu_query: torch.Tensor,
+        batch_dimensions: InferenceBatchDimensions,
+        padded_batch_dimensions: InferenceBatchDimensions,
+        enable_chunked_prefill: bool,
+        intermediate_offsets_gpu: Optional[torch.Tensor] = None,
+        intermediate_counts_gpu: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Compute all Mamba metadata on CPU, writing directly into the bound
+        pinned CPU views.
+
+        The values written here are transferred to GPU by the single coalesced
+        H2D in :meth:`DynamicInferenceContext.transfer_bookkeeping_to_gpu`.
+        The returned dict contains only Python scalars + the intermediate GPU
+        tensors, which :meth:`load_from_cpu` consumes after the H2D.
+
+        Args:
+            active_mamba_indices: CPU tensor of Mamba slot indices for active requests.
+            token_to_request_idx: CPU tensor mapping tokens to request indices.
+            cpu_cu_query: CPU cumulative query lengths from MHA metadata computation.
+            batch_dimensions: Dimensions of the current batch.
+            padded_batch_dimensions: Dimensions of the padded batch.
+            enable_chunked_prefill: Whether chunked prefill is enabled.
+            intermediate_offsets_gpu: GPU tensor of per-request intermediate offsets, or None.
+            intermediate_counts_gpu: GPU tensor of per-request intermediate counts, or None.
+        """
+        assert self._cpu_bufs is not None, "bind_cpu_buffers() must be called first"
+        bufs = self._cpu_bufs
+
+        real_decode_count = batch_dimensions.decode_req_count
+        real_prefill_count = batch_dimensions.prefill_req_count
+        padded_decode_count = padded_batch_dimensions.decode_req_count
+        padded_prefill_count = padded_batch_dimensions.prefill_req_count
+        padded_token_count = padded_batch_dimensions.token_count
+        chunk_size = self.mamba_chunk_size
+
+        result = {
+            "padded_decode_count": padded_decode_count,
+            "padded_prefill_count": padded_prefill_count,
+            "padded_token_count": padded_token_count,
+            "real_decode_count": real_decode_count,
+            "real_prefill_count": real_prefill_count,
+        }
+
+        # Decode batch indices (write into pinned view; padded slots = -1).
+        if padded_decode_count > 0:
+            bufs['batch_indices_decode'][:real_decode_count] = active_mamba_indices[
+                :real_decode_count
+            ]
+            if padded_decode_count > real_decode_count:
+                bufs['batch_indices_decode'][real_decode_count:padded_decode_count] = -1
+
+        # Prefill batch indices, seq_idx, cu_seqlens, chunk/conv metadata.
+        if padded_prefill_count > 0:
+            if real_prefill_count > 0:
+                start = real_decode_count
+                bufs['batch_indices_prefill'][:real_prefill_count] = active_mamba_indices[
+                    start : start + real_prefill_count
+                ]
+            if padded_prefill_count > real_prefill_count:
+                bufs['batch_indices_prefill'][real_prefill_count:padded_prefill_count] = -1
+
+            # seq_idx: normalized token-to-request mapping for prefill tokens.
+            prefill_start_req = real_decode_count
+            end_prefill_req = real_decode_count + real_prefill_count
+            start_token = cpu_cu_query[prefill_start_req].item()
+            end_token = cpu_cu_query[end_prefill_req].item()
+            seq_len = end_token - start_token
+
+            if seq_len > 0:
+                raw = token_to_request_idx[start_token:end_token]
+                bufs['seq_idx'][0, :seq_len] = raw - raw[0]
+            if padded_token_count > seq_len:
+                bufs['seq_idx'][0, seq_len:padded_token_count] = -1
+            result["seq_len"] = seq_len
+
+            # cu_seqlens for prefill.
+            cu_seqlens_view = bufs['cu_seqlens']
+            cu_seqlens_view[0] = 0
+            if real_prefill_count > 0:
+                cu_seqlens_view[1 : real_prefill_count + 1] = (
+                    cpu_cu_query[prefill_start_req + 1 : end_prefill_req + 1]
+                    - cpu_cu_query[prefill_start_req]
+                )
+            if real_prefill_count < padded_prefill_count:
+                last_val = cu_seqlens_view[real_prefill_count].item()
+                cu_seqlens_view[real_prefill_count + 1 : padded_prefill_count + 1] = last_val
+
+            cu_seqlens_list = cu_seqlens_view[: real_prefill_count + 1].tolist()
+            real_prefill_tokens = (
+                cu_seqlens_list[real_prefill_count] if real_prefill_count > 0 else 0
+            )
+            result["cu_seqlens_list"] = cu_seqlens_list
+            result["real_prefill_token_count"] = real_prefill_tokens
+
+            # Chunk metadata (Python loop, pure CPU).
+            cu_seqlens_all = cu_seqlens_view[: padded_prefill_count + 1].tolist()
+            chunk_boundaries = [0]
+            last_chunk_idx_list = []
+            chunk_to_seq_list = []
+
+            for i in range(padded_prefill_count):
+                start = cu_seqlens_all[i]
+                end = cu_seqlens_all[i + 1]
+                s_len = end - start
+                n_chunks = max(1, (s_len + chunk_size - 1) // chunk_size)
+                boundaries = [min(start + (k + 1) * chunk_size, end) for k in range(n_chunks)]
+                chunk_boundaries.extend(boundaries)
+                chunk_to_seq_list.extend([i] * n_chunks)
+                last_chunk_idx_list.append(len(chunk_boundaries) - 2)
+
+            padded_max_chunks = padded_token_count // chunk_size + padded_prefill_count
+            last_boundary = chunk_boundaries[-1]
+            pad_b = padded_max_chunks + 1 - len(chunk_boundaries)
+            if pad_b > 0:
+                chunk_boundaries.extend([last_boundary] * pad_b)
+            pad_s = padded_max_chunks - len(chunk_to_seq_list)
+            if pad_s > 0:
+                chunk_to_seq_list.extend([0] * pad_s)
+
+            n_cu = padded_max_chunks + 1
+            bufs['cu_chunk_seqlens'][:n_cu] = torch.tensor(
+                chunk_boundaries[:n_cu], dtype=torch.int32
+            )
+            bufs['last_chunk_indices'][:padded_prefill_count] = torch.tensor(
+                last_chunk_idx_list, dtype=torch.int32
+            )
+            bufs['seq_idx_for_varlen'][:padded_max_chunks] = torch.tensor(
+                chunk_to_seq_list[:padded_max_chunks], dtype=torch.int32
+            )
+            result["padded_max_chunks"] = padded_max_chunks
+
+            # Conv1d per-token metadata (CPU repeat_interleave).
+            conv_seq_idx_view = bufs['conv_seq_idx']
+            conv_seq_start_view = bufs['conv_seq_start']
+            if real_prefill_tokens > 0:
+                cu_t = cu_seqlens_view[: real_prefill_count + 1]
+                lengths = (cu_t[1:] - cu_t[:-1]).to(torch.int64)
+                seq_indices = torch.arange(real_prefill_count, dtype=torch.int32)
+                seq_starts = cu_t[:real_prefill_count].to(torch.int32)
+                conv_seq_idx_view[:real_prefill_tokens] = torch.repeat_interleave(
+                    seq_indices, lengths
+                )
+                conv_seq_start_view[:real_prefill_tokens] = torch.repeat_interleave(
+                    seq_starts, lengths
+                )
+            if padded_token_count > real_prefill_tokens:
+                conv_seq_idx_view[real_prefill_tokens:padded_token_count] = 0
+                conv_seq_start_view[real_prefill_tokens:padded_token_count] = 0
+
+            # Intermediate metadata still requires GPU data: defer to load_from_cpu.
+            result["intermediate_offsets_gpu"] = intermediate_offsets_gpu
+            result["intermediate_counts_gpu"] = intermediate_counts_gpu
+
+        # device_decode_prefill scalars.
+        if padded_decode_count > 0 and padded_prefill_count > 0:
+            result["decode_prefill_0"] = cpu_cu_query[real_decode_count].item()
+            result["decode_prefill_1"] = (
+                cpu_cu_query[real_decode_count + real_prefill_count].item()
+                - cpu_cu_query[real_decode_count].item()
+            )
+
+        return result
+
+    def load_from_cpu(self, d: dict) -> None:
+        """Point state attributes at the freshly-transferred shared GPU views.
+
+        No H2D copies happen here: the Mamba metadata fields were transferred
+        as part of the coalesced bookkeeping H2D. This method just slices the
+        bound GPU views to the per-step sizes and runs the intermediate
+        metadata computation (which reads from the now-valid GPU cu_seqlens).
+
+        Args:
+            d: Dict returned by compute_cpu_metadata().
+        """
+        assert self._gpu_view is not None, "bind_gpu_buffers() must be called first"
+        v = self._gpu_view
+
+        padded_decode_count = d["padded_decode_count"]
+        padded_prefill_count = d["padded_prefill_count"]
+        padded_token_count = d["padded_token_count"]
+        real_prefill_count = d["real_prefill_count"]
+
+        if padded_decode_count > 0:
+            self.batch_indices_decode = v.mamba_batch_indices_decode[:padded_decode_count]
+
+        if padded_prefill_count > 0:
+            self.batch_indices_prefill = v.mamba_batch_indices_prefill[:padded_prefill_count]
+            self.seq_idx = v.mamba_seq_idx[:, :padded_token_count]
+            self.cu_seqlens = v.mamba_cu_seqlens[: padded_prefill_count + 1]
+            self.cu_seqlens_list = d["cu_seqlens_list"]
+            self.real_prefill_token_count = d["real_prefill_token_count"]
+
+            padded_max_chunks = d["padded_max_chunks"]
+            self.cu_chunk_seqlens = v.mamba_cu_chunk_seqlens[: padded_max_chunks + 1]
+            self.last_chunk_indices = v.mamba_last_chunk_indices[:padded_prefill_count]
+            self.seq_idx_for_varlen = v.mamba_seq_idx_for_varlen[:padded_max_chunks]
+            self.conv_seq_idx = v.mamba_conv_seq_idx[:padded_token_count]
+            self.conv_seq_start = v.mamba_conv_seq_start[:padded_token_count]
+
+            # Intermediate metadata reads from the just-transferred cu_seqlens
+            # to compute chunk indices & absolute positions for state extraction.
+            self._update_intermediate_metadata(
+                d["intermediate_offsets_gpu"],
+                d["intermediate_counts_gpu"],
+                real_prefill_count,
+                cu_seqlens_gpu=v.mamba_cu_seqlens,
+            )
+
+        if padded_decode_count > 0 and padded_prefill_count > 0:
+            self._device_decode_prefill_buffer[0] = d["decode_prefill_0"]
+            self._device_decode_prefill_buffer[1] = d["decode_prefill_1"]
             self.device_decode_prefill = self._device_decode_prefill_buffer
 
     def allocate_slot(self) -> Optional[int]:

@@ -579,7 +579,7 @@ class GPTPipeline(Pipeline):
             "--tokenizer-type",
             "NullTokenizer",
             "--vocab-size",
-            "127",  # ... NullTokenizer adds +1 EOD token.
+            "128",
             "--make-vocab-size-divisible-by",
             "1",
         ]
