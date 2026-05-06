@@ -8,7 +8,7 @@ import os
 import pickle
 import warnings
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -596,7 +596,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         return True
 
     def _validate_te_ops_adapter_module(
-        module: torch.nn.Module, module_name: str, required_attrs: Tuple[str, ...]
+        module: torch.nn.Module, module_name: str, required_attrs: Sequence[str]
     ) -> None:
         """Validate that a module has the MCore/TE wrapper attributes needed by an adapter."""
         missing_attrs = [

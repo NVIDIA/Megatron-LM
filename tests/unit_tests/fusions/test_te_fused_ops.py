@@ -4,8 +4,8 @@ import pytest
 import torch
 
 from megatron.core.extensions import transformer_engine as te_ext
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
-
 
 pytestmark = [
     pytest.mark.skipif(not te_ext.HAVE_TE, reason="Transformer Engine is not available"),
@@ -75,3 +75,33 @@ def test_mcore_te_linear_adapter_rejects_plain_te_linear():
     assert "plain_linear" in message
     assert plain_linear.__class__.__name__ in message
     assert "config.tp_comm_overlap" in message
+
+
+def test_mcore_te_linear_adapter_aliases_source_weight():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=1,
+        use_cpu_initialization=True,
+        params_dtype=torch.float32,
+    )
+    linear = te_ext.TEColumnParallelLinear(
+        16,
+        32,
+        config=config,
+        init_method=torch.nn.init.zeros_,
+        gather_output=False,
+        bias=True,
+        skip_bias_add=True,
+        is_expert=False,
+        tp_comm_buffer_name="fc1",
+    )
+
+    op = te_ext._make_te_ops_basic_linear_from_mcore_te_linear(
+        linear,
+        module_name="linear",
+        output_features=linear.weight.size(0),
+    )
+
+    assert isinstance(op, te_ext.te.pytorch.ops.BasicLinear)
+    assert op.weight is linear.weight
