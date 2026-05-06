@@ -787,11 +787,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_cuda_graph_token_counts(self) -> None:
+    @pytest.mark.parametrize("use_non_decode", [False, True])
+    def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
         """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
-        # Test num_cuda_graphs.
-        for num_cuda_graphs, expected_cuda_graph_token_counts in [
+        decode_only_cases = [
             (0, [80]),
             (1, [80]),
             (2, [80, 40]),
@@ -799,21 +799,38 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             (8, [80, 64, 48, 32, 16]),
             (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
             (32, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-        ]:
+        ]
+        non_decode_cases = [
+            (0, [80]),
+            (1, [80]),
+            (2, [80, 40]),
+            (4, [80, 72, 48, 24]),
+            (8, [80, 64, 48, 32, 16]),
+            (16, [1024, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (32, [1024, 512, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+        ]
+        cases = non_decode_cases if use_non_decode else decode_only_cases
+
+        for num_cuda_graphs, expected_cuda_graph_token_counts in cases:
 
             # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(
-                    context_buffer_size_gb=0.01, num_cuda_graphs=num_cuda_graphs
+                    context_buffer_size_gb=0.01,
+                    num_cuda_graphs=num_cuda_graphs,
+                    use_cuda_graphs_for_non_decode_steps=use_non_decode,
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
-            assert (
-                actual_cuda_graph_token_counts == expected_cuda_graph_token_counts
-            ), "num_cuda_graphs %d ... cuda_graph_token_counts: expected %s, found %s." % (
-                num_cuda_graphs,
-                expected_cuda_graph_token_counts,
-                actual_cuda_graph_token_counts,
+            assert actual_cuda_graph_token_counts == expected_cuda_graph_token_counts, (
+                "num_cuda_graphs %d use_non_decode=%s ... cuda_graph_token_counts: "
+                "expected %s, found %s."
+                % (
+                    num_cuda_graphs,
+                    use_non_decode,
+                    expected_cuda_graph_token_counts,
+                    actual_cuda_graph_token_counts,
+                )
             )
 
     @pytest.mark.internal
