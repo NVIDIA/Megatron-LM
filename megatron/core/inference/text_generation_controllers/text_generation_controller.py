@@ -959,7 +959,7 @@ class TextGenerationController:
         logits = self._all_logits_cuda
         # `speculative_required_logit_indices()` already returns padded indices when
         # running a captured graph (`num_last_token_logits` uses the padded counts and
-        # `pad_active_slices` zero-pads the trailing slots), so the call site does not
+        # `_pad_gpu_active_slices` zero-pads the trailing slots), so the call site does not
         # need to re-pad here.
         required_logit_indices = context.speculative_required_logit_indices()
 
@@ -1643,7 +1643,7 @@ class TextGenerationController:
 
         range_push("active_request_mask")
         # Everything below is 100% CPU.
-        # Use the snapshot taken during build_active_slices: active_request_ids holds the
+        # Use the snapshot taken during _build_cpu_active_slices: active_request_ids holds the
         # request IDs that were active when the step started (before update_requests
         # rearranges slots).
         active_request_ids = context.active_request_ids[:active_request_count]

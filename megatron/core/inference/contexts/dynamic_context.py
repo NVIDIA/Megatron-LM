@@ -1017,14 +1017,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         ].view(torch.int32)
         _off += _req_4byte_bytes
 
-        # Snapshot of request_ids at build_active_slices time. Used by the
+        # Snapshot of request_ids at _build_gpu_active_slices time. Used by the
         # post-step stop-word/finish path to recover the original IDs before
         # update_requests rearranges request slots.
         self.active_request_ids = torch.empty(
             (self.max_requests,), dtype=torch.int64, device='cpu', pin_memory=True
         )
         # Active-slice query lengths (GPU). Populated each step by the graphable
-        # ``build_active_slices`` from ``gpu_view.request_query_lengths`` with
+        # ``_build_gpu_active_slices`` from ``gpu_view.request_query_lengths`` with
         # absorber-style padding so the attention kernel sees a consistent
         # length per slot regardless of CUDA-graph batch-dimension padding.
         self.active_request_query_lengths = torch.empty(
@@ -1049,7 +1049,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-request last-token row indices. Aliased with the matching
         # ``gpu_view.active_request_last_token_idxs``; the value the sampling
-        # kernels read is written from inside ``build_active_slices`` (GPU
+        # kernels read is written from inside ``_build_gpu_active_slices`` (GPU
         # cumsum-1) after the per-step H2D, so the CPU side here is just a
         # buffer slot that the H2D may overwrite with stale bytes — those
         # bytes are immediately replaced by the GPU compute.
@@ -1127,7 +1127,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             (self.max_requests, self.max_kv_block_count), dtype=torch.int32, device=gpu_device
         )
         # GPU active mamba slot indices for hybrid models. Populated each step
-        # by ``build_active_slices`` from ``gpu_view.request_to_mamba_state_idx``.
+        # by ``_build_gpu_active_slices`` from ``gpu_view.request_to_mamba_state_idx``.
         if self.is_hybrid_model:
             self.active_mamba_indices = torch.empty(
                 self.max_requests, dtype=torch.int32, device=gpu_device
@@ -1368,7 +1368,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ``active_request_metadata``) that the post-forward controller path
         reads. The graphable GPU work — query lengths, block table, mamba
         indices, token-level padding, cumulatives — runs in
-        :meth:`build_active_slices` from inside ``run_attn_init_graph_body``.
+        :meth:`_build_gpu_active_slices` from inside ``run_attn_init_graph_body``.
         """
         # Snapshot active request IDs before update_requests rearranges request slots
         # (needed by the post-step stop-word/finish path).
@@ -1382,31 +1382,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
     def _pad_cpu_active_slices(self) -> None:
-        """CPU-side padding for the active slices the controller reads."""
+        """CPU-side padding for the active slices the controller reads.
+
+        Only CPU bookkeeping; GPU-side padding of ``active_logit_idxs`` lives
+        in :meth:`_pad_gpu_active_slices`.
+        """
         active_request_count = self.total_request_count - self.paused_request_count
-        active_decode_count = self.num_decode_requests
-        active_prefill_count = active_request_count - active_decode_count
-        active_decode_token_count = active_decode_count * (self.num_speculative_tokens + 1)
-
-        # Decode prefix: positions [0, 1, ..., active_decode_token_count - 1].
-        self.active_logit_idxs[:active_decode_token_count].copy_(
-            self._decode_logit_idxs[:active_decode_token_count]
-        )
-
-        # Prefill last-token positions: cumsum the prefill query lengths in place,
-        # then shift by (active_decode_token_count - 1) to get absolute positions.
-        # In the [active | paused | dead] layout, the prefill subregion of the active
-        # range is request_query_lengths[active_decode_count : active_request_count].
-        prefill_dst = self.active_logit_idxs[
-            active_decode_token_count : active_decode_token_count + active_prefill_count
-        ]
-        prefill_lengths = self.request_query_lengths[active_decode_count:active_request_count]
-        if active_prefill_count > 0:
-            prefill_cumsum = torch.cumsum(prefill_lengths, dim=0, dtype=torch.int32)
-            prefill_cumsum.add_(active_decode_token_count - 1)
-            prefill_dst.copy_(prefill_cumsum, non_blocking=True)
-
-        self.active_logit_idxs[active_decode_token_count + active_prefill_count :].zero_()
 
         # Sampling metadata: pad with neutral defaults, so that the kernel early-exits.
         padding_request_slice = slice(active_request_count, self.padded_active_request_count)
@@ -1414,7 +1395,61 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_metadata["top_k"][padding_request_slice].fill_(0)
         self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
 
-    def build_active_slices(self) -> None:
+    def _pad_gpu_active_slices(self) -> None:
+        """Graphable GPU work: populate ``active_logit_idxs`` for the step.
+
+        Called from :meth:`run_attn_init_graph_body` after
+        :meth:`_build_gpu_active_slices` so
+        ``gpu_view.active_request_last_token_idxs`` is populated. Uses
+        fixed-shape ``[:num_last_token_logits]`` writes with ``torch.where``
+        masks against the GPU scalars staged in :meth:`prepare_attn_init`,
+        so the body is CUDA-graph capturable.
+
+        Layout produced (n = ``num_last_token_logits``):
+            - ``[0, real_decode_token_count)``       → arange (every decode
+              token gets its own logit row, including speculative tokens)
+            - ``[real_decode_token_count, real_logit_count)`` → gather from
+              ``active_request_last_token_idxs[real_decode_count + j]``
+              (last-token row of the j-th real prefill request)
+            - ``[real_logit_count, n)``              → 0 (padding)
+        """
+        n = self.num_last_token_logits
+        if n == 0:
+            return
+
+        num_spec_plus_one = self.num_speculative_tokens + 1
+
+        # Reuse the precomputed arange ``[0, max_logit_idxs)``.
+        arange = self._decode_logit_idxs[:n]
+
+        # GPU scalars (per-step, fixed shape [1]).
+        real_decode_count = self._real_decode_count_gpu
+        real_decode_token_count = real_decode_count * num_spec_plus_one
+        real_prefill_count = self._real_prefill_count_gpu
+        real_logit_count = real_decode_token_count + real_prefill_count
+
+        # Region masks.
+        in_decode = arange < real_decode_token_count
+        in_prefill = (arange >= real_decode_token_count) & (arange < real_logit_count)
+
+        # Gather index for the prefill region. ``clamp(min=0)`` handles the
+        # decode region's negative offsets; ``clamp(max=max_requests-1)``
+        # keeps the gather in-bounds for the padding region. Both regions'
+        # gather results are masked out below, so the clamped values are
+        # never observed.
+        prefill_offset = (arange - real_decode_token_count).clamp_(min=0)
+        gather_idx = (
+            (real_decode_count + prefill_offset).clamp_(max=self.max_requests - 1).long()
+        )
+        gathered = self.gpu_view.active_request_last_token_idxs.gather(0, gather_idx)
+
+        self.active_logit_idxs[:n] = torch.where(
+            in_decode,
+            arange,
+            torch.where(in_prefill, gathered, 0),
+        )
+
+    def _build_gpu_active_slices(self) -> None:
         """Graphable GPU work: copy active sources into static buffers, pad,
         and compute cumulatives.
 
@@ -2279,8 +2314,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._context_op_metadata_cpu, non_blocking=True
         )
 
-        # GPU compute: build the static active tensors and the cumulatives.
-        self.build_active_slices()
+        # GPU compute: build the static active tensors and the cumulatives,
+        # then populate ``active_logit_idxs`` (consumed by sampling) using
+        # the just-computed ``active_request_last_token_idxs``.
+        self._build_gpu_active_slices()
+        self._pad_gpu_active_slices()
 
         # Mamba metadata GPU compute (no-op on non-hybrid models). The full
         # ``[max_requests, K]`` intermediate buffers are passed; the graphable
