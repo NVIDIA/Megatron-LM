@@ -419,7 +419,7 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         None,  # we don't need to build any datasets for RL training
-        partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,
         forward_step,
+        partial(model_provider, _model_builder),
     )
