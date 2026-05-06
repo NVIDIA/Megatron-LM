@@ -970,15 +970,20 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_impl: Literal['none', 'local', 'transformer_engine', 'full_iteration'] = "none"
     """Determines the CUDA graph capture implementation.
     "none": no CUDA graph.
-    "local": per-layer CUDA graph using MCore's implementation.
-    "transformer_engine": per-layer CUDA graph using TE make_graphed_callables().
-    "full_iteration": full-iteration CUDA graph for the training iteration
-    (1 CUDA graph for the whole forward-backward path excluding the optimizer step).
+    "local": MCore CUDA graph implementation. During training, graphable modules own per-layer
+    CUDA graphs controlled by cuda_graph_modules. During inference, graph ownership is controlled
+    separately by inference_cuda_graph_scope.
+    "transformer_engine": Transformer Engine CUDA graph implementation. During training, TE
+    make_graphed_callables() creates per-layer CUDA graphs controlled by cuda_graph_modules.
+    Inference CUDA graphs are not supported; inference_cuda_graph_scope must be "none".
+    "full_iteration": full-iteration CUDA graph implementation for the training iteration
+    (1 CUDA graph for the whole forward-backward path excluding the optimizer step). Inference
+    CUDA graphs are not supported; inference_cuda_graph_scope must be "none".
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
-    """Selects capture coverage within per-layer CUDA graphs (local and
+    """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
     Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba":
     "attn": captures operations in TransformerLayer._forward_attention().
@@ -1007,11 +1012,11 @@ class TransformerConfig(ModelParallelConfig):
     """Controls the CUDA graph scope during inference.
     When unset, the effective default is derived from cuda_graph_impl:
     "local" -> "layer", all other impls -> "none".
-    "none": inference runs without CUDA graphs.
-    "layer": inference graphs are owned at the layer boundary. This name does not
-    by itself imply any finer-grained replay contract within the layer.
-    "block": inference graphs are owned by the enclosing block rather than
-    individual layers.
+    "none": inference runs in eager mode (no CUDA graphs).
+    "layer": inference graphs are owned at the module/layer boundary, e.g. TransformerLayer or
+    MambaLayer.
+    "block": inference graphs are owned by the enclosing block, e.g. TransformerBlock or
+    HybridBlock.
     Currently supported combinations are:
     cuda_graph_impl="local" -> "layer" or "block";
     all other cuda_graph_impl values -> "none"."""

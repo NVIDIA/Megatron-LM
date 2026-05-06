@@ -14,40 +14,44 @@ CUDA Graphs reduce kernel-launch overhead by recording GPU operations once and r
 For implementation background and design details, see NVIDIA's
 [Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/torch-cuda-graph/te-megatron-cuda-graphs.html).
 That article is a useful conceptual reference, but some examples there still use older flags such as
-`--enable-cuda-graph` or `--cuda-graph-modules full_iteration`; in this repository, prefer
+`--enable-cuda-graph` or `--cuda-graph-scope full_iteration`; in this repository, prefer
 `--cuda-graph-impl local|transformer_engine|full_iteration` as documented below.
 
 ## Overview
 
-| Implementation | Flag | Granularity | Use case |
+CUDA graph behavior is set by three orthogonal flags:
+
+| Flag | Values | Purpose |
+|---|---|---|
+| `--cuda-graph-impl` | `none` / `local` / `transformer_engine` / `full_iteration` | Which capture backend or strategy to use |
+| `--cuda-graph-modules` | `attn` / `mlp` / `moe` / `moe_router` / `moe_preprocess` / `mamba` | Per-layer **training** capture coverage; multi-valued and only meaningful for `local` and `transformer_engine` |
+| `--inference-cuda-graph-scope` | `none` / `layer` / `block` | Granularity of CUDA graphs during **inference**; only `local` supports non-`none` values |
+
+Supported combinations:
+
+| `--cuda-graph-impl` | Backend | Training capture | Inference capture |
 |---|---|---|---|
-| Per-layer (local) | `--cuda-graph-impl local` | Per-layer | Automatic MCore `CudaGraphManager` backend |
-| Per-layer (TE) | `--cuda-graph-impl transformer_engine` | Per-layer | Per-layer TE-backed implementation using `make_graphed_callables()` |
-| Full-iteration | `--cuda-graph-impl full_iteration` | Entire training iteration (excluding optimizer) | Training / validation; maximum overhead reduction |
-
-Think of the configuration in two layers:
-
-- `--cuda-graph-impl` selects the implementation family.
-- `--cuda-graph-modules` refines coverage within the per-layer families (`local` and `transformer_engine`).
-
-`local` and `transformer_engine` differ mainly in backend implementation and feature compatibility,
-not in the user-facing per-layer capture model. The only mode with a fundamentally different
-granularity is `full_iteration`.
+| `none` | — | off | off |
+| `local` | MCore `CudaGraphManager` | per-layer, controlled by `--cuda-graph-modules` | `layer` (default) or `block`, controlled by `--inference-cuda-graph-scope` |
+| `transformer_engine` | TE `make_graphed_callables()` | per-layer, controlled by `--cuda-graph-modules` | not supported (`none` only) |
+| `full_iteration` | MCore `FullCudaGraphWrapper` | one graph per training iteration; `--cuda-graph-modules` must be empty | not supported (`none` only) |
 
 ---
 
-## Per-Layer CUDA Graph — Local Implementation (`--cuda-graph-impl local`)
+## CUDA Graph — Local Implementation (`--cuda-graph-impl local`)
 
-Uses MCore's built-in `CudaGraphManager`. Like `transformer_engine`, this is a per-layer mode:
+Uses MCore's built-in `CudaGraphManager`. During training, this is a per-layer mode:
 leaving `--cuda-graph-modules` unset captures the whole Transformer layer, while specifying
-modules restricts capture to selected sub-regions.
+modules restricts capture to selected sub-regions. During inference, `local` can instead attach
+graphs at either the layer boundary or the enclosing block boundary, as controlled by
+`--inference-cuda-graph-scope`.
 
-Operationally, this path is tightly integrated into MCore itself:
+Operationally, this path is tightly integrated into MCore training and inference:
 
 - graphable modules create and own their `CudaGraphManager` instances automatically
-- the stock training schedules drive warmup/capture/replay automatically
-- users typically select the mode through config flags only; there is no separate helper API to
-  wire into a custom training loop
+- the existing training schedules drive warmup/capture/replay automatically
+- users select the mode through config flags only; there is no separate helper API to
+  wire into a custom training loop or a separate need to handle static input buffers
 
 ### Usage
 
@@ -76,12 +80,13 @@ Operationally, this path is tightly integrated into MCore itself:
 
 ---
 
-## Per-Layer CUDA Graph — Transformer Engine Implementation (`--cuda-graph-impl transformer_engine`)
+## CUDA Graph — Transformer Engine Implementation (`--cuda-graph-impl transformer_engine`)
 
 Uses Transformer Engine's `make_graphed_callables()` path. In Megatron-LM's CLI, this has the
-same user-visible granularity as `local`: leaving `--cuda-graph-modules` unset captures the whole
+same training granularity as `local`: leaving `--cuda-graph-modules` unset captures the whole
 Transformer layer, while specifying modules restricts capture to selected sub-regions. The main difference from
-`local` is the backend implementation and feature compatibility, not the capture granularity.
+`local` is the backend implementation and feature compatibility. Unlike `local`, this path does
+not support inference CUDA graphs.
 
 Compared to `local`, this path exposes a more general and self-contained API via TE's
 `make_graphed_callables()`, giving users greater flexibility and control over how CUDA graphs are
@@ -101,16 +106,19 @@ but custom training scripts must do the same work themselves.
 --cuda-graph-modules attn moe_router moe_preprocess
 ```
 
-The same `--cuda-graph-modules` options apply as for `local`, and the default is likewise
-whole-layer capture when the flag is omitted.
+The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
+whole-layer training capture when the flag is omitted.
 
 ---
 
-## Full-Iteration CUDA Graph (`--cuda-graph-impl full_iteration`)
+## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)
 
 Captures the entire training iteration (excluding optimizer) as a single CUDA graph. The same
 wrapper is also used for training-loop validation/eval in forward-only mode. This provides the
 largest training/validation latency reduction.
+
+This implementation does not create inference CUDA graphs. For inference, use
+`--cuda-graph-impl local --inference-cuda-graph-scope layer|block`.
 
 ### Requirements
 
@@ -180,10 +188,10 @@ models as well:
   capture. Setting it to 0 is not recommended: some operations rely on the first few iterations
   for lazy initialization or autotuning, and capturing too early may produce incorrect or
   suboptimal graphs.
-- Inference CUDA graphs (serving or RL rollout) are controlled by
-  `--inference-cuda-graph-scope`: `layer` (default) owns graphs at the layer
-  level, `block` at the block level. Both are supported with `--cuda-graph-impl local`;
-  the other implementations currently only support `none`, meaning inference runs in eager mode.
+- Inference CUDA graphs (serving or RL rollout) currently require
+  `--cuda-graph-impl local`. Use `--inference-cuda-graph-scope layer|block` with
+  `local`; all other implementations must set `--inference-cuda-graph-scope none`,
+  meaning inference runs in eager mode.
 - Background reference: [Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/torch-cuda-graph/te-megatron-cuda-graphs.html),
   which also covers PyTorch CUDA Graph best practices and lessons learned.
 

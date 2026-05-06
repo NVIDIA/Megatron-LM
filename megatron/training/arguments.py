@@ -2195,7 +2195,7 @@ def _add_inference_args(parser):
         nargs='+',
         type=_parse_cuda_graph_modules_arg,
         default=[],
-        help='Selects capture coverage within per-layer CUDA graphs '
+        help='Selects training capture coverage within per-layer CUDA graphs '
         '(local and transformer_engine implementations). '
         'Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba": '
         '"attn": captures operations in TransformerLayer._forward_attention(). '

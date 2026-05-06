@@ -45,6 +45,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -223,6 +224,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.disable_ep_consensus = inference_config.disable_ep_consensus
         self.ep_consensus_interval = inference_config.ep_consensus_interval
         self.cuda_graph_impl = model_config.cuda_graph_impl
+        self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
         # Initialize engine.
         self.reset()
@@ -330,17 +332,11 @@ class DynamicInferenceEngine(AbstractEngine):
             reset_context (bool): Whether to reset the context after building cuda graphs.
         """
 
-        if self.cuda_graph_impl not in ("local", "full_iteration"):
+        if self.inference_cuda_graph_scope == InferenceCudaGraphScope.none:
             return
 
-        if self.cuda_graph_impl == "full_iteration":
-            warnings.warn(
-                "\n\n*** WARNING: '--cuda-graph-impl=full_iteration' used during inference! "
-                "For compatibility, this preserves the legacy '--cuda-graph-modules=full_iteration' "
-                "behavior and will not create inference CUDA graphs. Use "
-                "'--cuda-graph-impl=local --inference-cuda-graph-scope=block' "
-                "instead. ***\n"
-            )
+        if self.cuda_graph_impl != "local":
+            return
 
         context = self.context
         controller = self.controller
