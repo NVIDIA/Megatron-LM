@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass, field
 import signal
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional
+
 
 @dataclass(kw_only=True)
 class TrainingConfig:
@@ -143,8 +144,15 @@ class ValidationConfig:
 
     multiple_validation_sets: bool = False
     """If set, multiple datasets listed in the validation split are evaluated independently with a
-       separate loss for each dataset in the list. This argument requires that no weights are 
+       separate loss for each dataset in the list. This argument requires that no weights are
        included in the list.
+    """
+
+    validation_set_names: Optional[List[str]] = None
+    """Optional list of names for multiple validation sets. When provided with
+       --multiple-validation-sets, these names are used instead of numeric indices
+       (e.g. 'validation-wiki' instead of 'validation-0'). The number of names must
+       match the number of validation datasets.
     """
 
 
@@ -583,15 +591,22 @@ class CheckpointConfig:
     """Whether to hash checkpointing files during save and validate their integrity during load."""
 
     def __post_init__(self):
-        from megatron.training.utils import has_nvrx_installed
+        from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         assert self.async_strategy in ["nvrx", "mcore"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
 
-        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
-            assert has_nvrx_installed(), (
-                "nvidia-resiliency-ext is not installed. "
-                "Please, install nvidia-resiliency-ext to enable async save."
+        if not self.async_save:
+            self.async_strategy = "mcore"
+
+        if (
+            self.async_save
+            and self.async_strategy == "nvrx"
+            and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
+        ):
+            assert has_nvrx_checkpointing_async_support(), (
+                "A compatible nvidia-resiliency-ext installation is required to enable "
+                "async save with async_strategy='nvrx'."
             )
 
         if self.verify_integrity:
