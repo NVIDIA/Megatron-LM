@@ -1307,8 +1307,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Set ref counts: block 20 is shared (ref=2), block 10 is exclusive (ref=1).
-        ctx.kv_block_allocator.block_ref_counts[20] = 2
-        ctx.kv_block_allocator.block_ref_counts[10] = 1
+        ctx.kv_block_allocator.pc_state.block_ref_counts[20] = 2
+        ctx.kv_block_allocator.pc_state.block_ref_counts[10] = 1
 
         initial_avail = ctx.kv_block_allocator.total_avail
 
@@ -1322,9 +1322,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
 
         # Req 1 should have released block 20 (ref count decremented).
-        assert ctx.kv_block_allocator.block_ref_counts[20].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[20].item() == 1
         # Block 10 should be untouched.
-        assert ctx.kv_block_allocator.block_ref_counts[10].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[10].item() == 1
 
     @pytest.mark.internal
     def test_rewind_kv_cache_does_not_release_shared_prefix_blocks(self):

@@ -267,7 +267,7 @@ class TestMambaPrefixCachingE2E:
 
     def _get_ref_count(self, ctx, block_hash):
         bid = ctx.prefix_cache_registry.kv_hash_to_block_id.get(block_hash)
-        return 0 if bid is None else ctx.kv_block_allocator.block_ref_counts[bid].item()
+        return 0 if bid is None else ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item()
 
     def _assert_step(self, step, reqs_by_group, alloc, step_prefill, num_groups, ctx=None):
         """Shared per-step verification for single-group and multi-group runs."""

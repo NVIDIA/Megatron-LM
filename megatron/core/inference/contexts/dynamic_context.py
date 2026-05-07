@@ -2706,10 +2706,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Increment ref counts and update timestamps for matched (shared) blocks
         if num_matched_blocks > 0:
+            pc_state = self.kv_block_allocator.pc_state
             matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
-            self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
+            pc_state.block_ref_counts[matched_tensor] += 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-                self.kv_block_allocator.update_timestamps(matched_tensor)
+                pc_state.update_timestamps(matched_tensor, self.prefix_cache_lru_clock)
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
@@ -2807,14 +2808,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
+            pc_state = self.kv_block_allocator.pc_state
+
             def _register_range(start: int, end: int):
                 if start >= end:
                     return
                 block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
-                self.kv_block_allocator.register_kv_block_hashes(
-                    block_ids_to_hash, block_hashes_slice
-                )
+                pc_state.register_kv_block_hashes(block_ids_to_hash, block_hashes_slice)
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))

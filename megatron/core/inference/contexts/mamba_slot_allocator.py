@@ -199,9 +199,11 @@ class MambaSlotAllocator:
             List of freed slot indices.
         """
         kv_alloc = self.context.kv_block_allocator
+        pc_state = kv_alloc.pc_state
+        assert pc_state is not None, "_evict_lru_slots_batch requires prefix caching"
         # Find blocks that have mamba slots and ref_count == 0
         has_slot_mask = self.block_to_slot[: kv_alloc.total_count] >= 0
-        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.total_count] == 0
+        ref_zero_mask = pc_state.block_ref_counts[: kv_alloc.total_count] == 0
         candidates = has_slot_mask & ref_zero_mask
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
@@ -210,7 +212,7 @@ class MambaSlotAllocator:
 
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-            timestamps = kv_alloc.block_timestamps[candidate_ids]
+            timestamps = pc_state.block_timestamps[candidate_ids]
             sorted_indices = torch.argsort(timestamps)[:num_needed]
             evict_ids = candidate_ids[sorted_indices]
         else:
@@ -218,7 +220,7 @@ class MambaSlotAllocator:
 
         # Batch gather slots + hashes (2 GPU syncs)
         slots = self.block_to_slot[evict_ids].tolist()
-        hashes = kv_alloc.block_hashes[evict_ids].tolist()
+        hashes = pc_state.block_hashes[evict_ids].tolist()
 
         # Clear block <-> slot mappings up front. The registry's evict
         # callback then runs ``_on_mamba_evicted -> _invalidate_blocks_batch``,
@@ -585,9 +587,11 @@ class MambaSlotAllocator:
 
         # Single batch hash fetch for all block IDs (1 GPU sync)
         all_bids_for_hash = intermediate_bids + eos_bids
-        device = ctx.kv_block_allocator.block_hashes.device
+        pc_state = ctx.kv_block_allocator.pc_state
+        assert pc_state is not None, "compute_and_store_offsets requires prefix caching"
+        device = pc_state.block_hashes.device
         bid_tensor = torch.tensor(all_bids_for_hash, dtype=torch.int64, device=device)
-        all_hashes = ctx.kv_block_allocator.block_hashes[bid_tensor].tolist()
+        all_hashes = pc_state.block_hashes[bid_tensor].tolist()
 
         return intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes
 

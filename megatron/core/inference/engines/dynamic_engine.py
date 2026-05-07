@@ -1111,9 +1111,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.total_count - block_allocator.total_avail
-            if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
-                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+            pc_state = block_allocator.pc_state
+            if pc_state is not None:
+                blocks_hashed_active = int((pc_state.block_ref_counts > 0).sum().item())
+                blocks_ref_count = pc_state.block_ref_counts.sum().item()
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
