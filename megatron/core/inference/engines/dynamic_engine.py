@@ -649,35 +649,36 @@ class DynamicInferenceEngine(AbstractEngine):
             # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
             if hasattr(self.context, "set_ep_zmq_communicator"):
                 self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
-            # EP signal mesh: fully-connected PUSH/PULL. Each rank binds a
-            # PULL and holds a PUSH to every peer. `_ep_signal_recv_loop`
-            # demultiplexes incoming messages:
-            #   b"\x01" (WORK): wake-up so a RUNNING rank without work
-            #     dummy-forwards to stay NCCL-aligned with a peer that has work.
-            #   b"\x02" + int32 (STOP_AT_STEP): rank 0's pause broadcast —
-            #     "everyone pause at this step_count". Stashed in
-            #     `_ep_stop_at_step` for the main loop to read.
-            # PUSH/PULL avoids the PUB/SUB slow-joiner trap where the first
-            # publish can be dropped before a SUB's subscription propagates.
+            # EP "has work" signal: leader binds PULL+PUB, followers PUSH+SUB.
+            # `notify()` is fire-and-forget; `_ep_signal_recv_loop` sets `_ep_has_signal`.
+            # Lets a rank with local work skip the EP all-reduce before stepping.
+            ep_src = get_pg_src_rank(self.pg_collection.ep)
             ip = hostname or socket.gethostname()
-            self._ep_signal_recv = self.zmq_context.socket(zmq.PULL)
-            self._ep_signal_recv.bind_to_random_port(f"tcp://{ip}")
-            my_addr = self._ep_signal_recv.getsockopt_string(zmq.LAST_ENDPOINT)
-            all_addrs: List[Optional[str]] = [None] * self.ep_world_size
-            torch.distributed.all_gather_object(
-                all_addrs, my_addr, group=self.pg_collection.ep
-            )
-            self._ep_signal_sends = []
-            for i, addr in enumerate(all_addrs):
-                if i == self.ep_rank:
-                    continue
-                push = self.zmq_context.socket(zmq.PUSH)
-                push.connect(addr)
-                self._ep_signal_sends.append(push)
+            if self.ep_rank == 0:
+                self._ep_signal_recv = self.zmq_context.socket(zmq.PULL)
+                self._ep_signal_recv.bind_to_random_port(f"tcp://{ip}")
+                self._ep_signal_send = self.zmq_context.socket(zmq.PUB)
+                self._ep_signal_send.bind_to_random_port(f"tcp://{ip}")
+                torch.distributed.broadcast_object_list(
+                    [
+                        self._ep_signal_recv.getsockopt_string(zmq.LAST_ENDPOINT),
+                        self._ep_signal_send.getsockopt_string(zmq.LAST_ENDPOINT),
+                    ],
+                    src=ep_src,
+                    group=self.pg_collection.ep,
+                )
+            else:
+                addrs = [None, None]
+                torch.distributed.broadcast_object_list(
+                    addrs, src=ep_src, group=self.pg_collection.ep
+                )
+                self._ep_signal_send = self.zmq_context.socket(zmq.PUSH)
+                self._ep_signal_send.connect(addrs[0])
+                self._ep_signal_recv = self.zmq_context.socket(zmq.SUB)
+                self._ep_signal_recv.connect(addrs[1])
+                self._ep_signal_recv.setsockopt_string(zmq.SUBSCRIBE, "")
             self._ep_has_signal = asyncio.Event()
-            self._ep_stop_at_step: Optional[int] = None
-            self.zmq_sockets.append(self._ep_signal_recv)
-            self.zmq_sockets += self._ep_signal_sends
+            self.zmq_sockets += [self._ep_signal_send, self._ep_signal_recv]
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
@@ -2306,6 +2307,42 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
+    async def _ep_establish_consensus(
+        self, local_work: int, local_step_count: int
+    ) -> tuple[int, int]:
+        """EP all-reduce for pause step synchronization.
+
+        Called from PAUSING as a background task (every EP rank will eventually
+        fire it once it has received PAUSE); the all-reduce only completes when
+        every peer has joined. The main loop keeps stepping while this task is
+        outstanding so NCCL collectives keep aligning.
+
+        All-reduces two integers at once:
+        - local_work: pending request count on this rank.
+        - local_step_count: this rank's current `context.step_count`.
+
+        Returns (global_work, max_step_count). The caller uses max_step_count
+        to compute a common stop_at_step across EP so every peer transitions
+        to PAUSED on the same iteration.
+        """
+        nvtx_range_push("_ep_establish_consensus")
+
+        if self.ep_world_size > 1:
+            # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
+            # The user may have other tasks running in the event loop that need to be serviced.
+            # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
+            # We have tried that and it blocks the event loop in megatron-rl.
+            global_work, max_step_count = (
+                await self.expert_parallel_zmq_communicator.all_reduce_max(
+                    local_work, local_step_count, async_op=True
+                )
+            )
+        else:
+            global_work, max_step_count = local_work, local_step_count
+
+        nvtx_range_pop("_ep_establish_consensus")
+        return global_work, max_step_count
+
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
 
@@ -2323,20 +2360,14 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_pop("world_barrier")
 
     async def _ep_signal_recv_loop(self):
-        """Background task: demultiplex EP peer signals.
-
-        b"\x01" (WORK) -> set `_ep_has_signal`.
-        b"\x02" + int32 (STOP_AT_STEP) -> stash the step count in
-        `_ep_stop_at_step` (rank 0's broadcast of when to pause).
-        """
+        """Background task: set `_ep_has_signal` on any incoming EP peer signal."""
         try:
             while True:
                 try:
                     msg = self._ep_signal_recv.recv(flags=zmq.NOBLOCK)
-                    if msg[:1] == b"\x02":
-                        self._ep_stop_at_step = struct.unpack('!i', msg[1:5])[0]
-                    else:
-                        self._ep_has_signal.set()
+                    if self.ep_rank == 0:
+                        self._ep_signal_send.send(msg)
+                    self._ep_has_signal.set()
                 except zmq.Again:
                     await asyncio.sleep(0.02)
         except asyncio.CancelledError:
@@ -2351,10 +2382,9 @@ class DynamicInferenceEngine(AbstractEngine):
         State-dependent behavior:
         - RUNNING: Rank with local work notifies EP peers and steps immediately;
           Rank without local work dummy-forwards only when a peer has signaled, otherwise idles.
-        - PAUSING: EP rank 0 picks a common `stop_at_step` (current + margin)
-          and broadcasts it to EP peers via the signal mesh. Every rank keeps
-          stepping (to stay NCCL-aligned) until its `step_count` reaches that
-          value, then transitions to PAUSED via the world barrier.
+        - PAUSING: Fire `_ep_establish_consensus` as a background task and keep stepping.
+          Once the consensus returns, every peer agrees on a common `stop_at_step`;
+          transition to PAUSED via world barrier when this rank's step_count reaches it.
         - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
         - UNPAUSING / SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
         - STOPPED: Teardown and exit.
@@ -2365,8 +2395,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.ep_world_size > 1:
             self._ep_signal_task = self._loop.create_task(self._ep_signal_recv_loop())
 
-        # Target step at which every EP peer transitions to PAUSED. Rank 0 picks
-        # it, broadcasts it, and every peer pauses when its step_count reaches it.
+        # PAUSING bookkeeping: consensus runs in the background so the main loop can keep stepping.
+        pausing_consensus_task: Optional[asyncio.Task] = None
         stop_at_step: Optional[int] = None
         PAUSE_SYNC_MARGIN = 2
 
@@ -2382,19 +2412,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     peer_has_work = False
 
                     if self.state == EngineState.PAUSING:
-                        # Rank 0 decides when to pause and broadcasts; peers read
-                        # the value from `_ep_stop_at_step` (set by the recv loop).
-                        if stop_at_step is None:
-                            if self.ep_rank == 0:
-                                stop_at_step = (
-                                    self.context.step_count + PAUSE_SYNC_MARGIN
+                        # Kick off the consensus once per pause session.
+                        if pausing_consensus_task is None:
+                            pausing_consensus_task = self._loop.create_task(
+                                self._ep_establish_consensus(
+                                    local_pending, self.context.step_count
                                 )
-                                if self.ep_world_size > 1:
-                                    payload = b"\x02" + struct.pack('!i', stop_at_step)
-                                    for push in self._ep_signal_sends:
-                                        push.send(payload)
-                            elif self._ep_stop_at_step is not None:
-                                stop_at_step = self._ep_stop_at_step
+                            )
+                        # When the consensus finishes, every EP peer has entered PAUSING.
+                        if stop_at_step is None and pausing_consensus_task.done():
+                            _, max_step_count = pausing_consensus_task.result()
+                            stop_at_step = max_step_count + PAUSE_SYNC_MARGIN
 
                         if (
                             stop_at_step is not None
@@ -2402,41 +2430,32 @@ class DynamicInferenceEngine(AbstractEngine):
                         ):
                             should_pause = True
                         else:
-                            # Still PAUSING: step every iteration (never idle) to stay
-                            # NCCL-aligned; wake any peer that's still in RUNNING.
+                            # Still PAUSING: step every iteration (never idle) to stay aligned.
                             peer_has_work = True
                             if self.ep_world_size > 1:
-                                for push in self._ep_signal_sends:
-                                    push.send(b"\x01")
+                                self._ep_signal_send.send(b"\x01")
                     else:
                         # RUNNING: read the peer signal; notify peers if we have work.
                         if self.ep_world_size > 1:
                             peer_has_work = self._ep_has_signal.is_set()
                             self._ep_has_signal.clear()
                             if local_pending > 0:
-                                for push in self._ep_signal_sends:
-                                    push.send(b"\x01")
+                                self._ep_signal_send.send(b"\x01")
 
                     if should_pause:
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
+                        pausing_consensus_task = None
                         stop_at_step = None
-                        if self.ep_world_size > 1:
-                            self._ep_stop_at_step = None
                     elif local_pending > 0:
                         await self.async_step()
                     elif peer_has_work:
                         # Dummy forward to participate in the EP collective.
-                        # Poll the CUDA event instead of `synchronize()` so the
-                        # event loop keeps running — the signal recv task needs
-                        # CPU between steps to pick up rank 0's stop-at-step
-                        # broadcast and peer wake-ups.
                         self.step_start_event.record()
                         self.controller.dummy_forward()
                         self.step_end_event.record()
-                        while not self.step_end_event.query():
-                            await asyncio.sleep(0)
+                        self.step_end_event.synchronize()
                         self.context.step_count += 1
                         self.context.prefix_cache_lru_clock += 1
                     else:
@@ -2474,4 +2493,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     break
 
         finally:
+            if pausing_consensus_task is not None and not pausing_consensus_task.done():
+                pausing_consensus_task.cancel()
+                try:
+                    await pausing_consensus_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             await self.shutdown()
