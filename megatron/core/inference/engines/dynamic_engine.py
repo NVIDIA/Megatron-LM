@@ -859,9 +859,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 ),
                 None,
             )
-            error_str = (
-                f"{type(error).__name__}: {error}" if error is not None else "unknown error"
-            )
+            error_str = f"{type(error).__name__}: {error}" if error is not None else "unknown error"
             warnings.warn(
                 f"Request {request_id} failed to be added to the engine ({error_str}). "
                 f"Prompt Tokens: {len(request.prompt_tokens)} "
