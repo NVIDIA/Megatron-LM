@@ -40,6 +40,17 @@ def get_shared_graph_pool():
         _shared_graph_pool = torch.cuda.graph_pool_handle()
     return _shared_graph_pool
 
+
+def get_graph_pool(use_single_mempool):
+    """Return graph pool handle for full-iter/optimizer graph capture.
+
+    When `use_single_mempool` is True, train/eval and optimizer captures reuse one
+    process-wide pool. Otherwise, each capture call gets a new pool handle.
+    """
+    if use_single_mempool:
+        return get_shared_graph_pool()
+    return torch.cuda.graph_pool_handle()
+
 # The below functions traverse through nested data structures (tuples, lists, dicts)
 # present in src and creates a deep copy where all PyTorch tensors are cloned,
 # detached from the computation graph, and moved to CUDA device. Non-tensor objects
@@ -130,10 +141,13 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
 
-    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1):
+    def __init__(
+        self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False
+    ):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
+        self.use_single_mempool = use_single_mempool
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -204,7 +218,7 @@ class FullCudaGraphWrapper:
             with torch.cuda.graph(
                 FullCudaGraphWrapper.cuda_graph[training_str],
                 stream=capture_stream,
-                pool=get_shared_graph_pool(),
+                pool=get_graph_pool(self.use_single_mempool),
                 capture_error_mode="thread_local",
             ):
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(

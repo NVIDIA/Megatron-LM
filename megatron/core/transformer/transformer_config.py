@@ -940,7 +940,10 @@ class TransformerConfig(ModelParallelConfig):
     single mempool, in which all cudagraphs may only be used once per step. If false, cudagraphs may
     be reused across microbatches. Enabling may reduce cudagraph memory overheads due to memory
     fragmentation, however may greatly increase the number of cudagraphs created when the number of
-    microbatches is high."""
+    microbatches is high.
+
+    For `full_iteration` scope, when this flag is set to true, the full-iteration graph replay paths
+    (train/eval) and optimizer graph capture/replay share the same mempool."""
 
     cuda_graph_retain_backward_graph: bool = False
     """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
