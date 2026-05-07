@@ -501,6 +501,70 @@ source itself.
 
 **Across all five rounds: 27 source files brought to 36–100 % coverage, ~289 new test cases, 24 new test files, 0 final failures.**
 
+---
+
+# Round 6 — dynamic_engine.py Mock-Based Unit Tests
+
+After previously listing `engines/dynamic_engine.py` (1069 stmts) as out-of-scope
+because it requires a built MegatronModule + KV cache + ProcessGroup, this
+round adds a complementary mock-based test file that exercises the
+unit-testable surface (standalone helpers, enums, and the engine methods that
+only touch `self.*` state).
+
+## Files Targeted (Round 6)
+
+| File | Before (alone) | After (combined) | Stmts/Miss | Test File |
+|------|----------------|-------------------|------------|-----------|
+| `engines/dynamic_engine.py` | 14% (new tests alone) | **61%** (existing + new at nproc=1) | 1069/417 | `engines/test_dynamic_engine_unit.py` |
+
+**33 new mock-based tests, 0 failures.** Validation runs:
+- New tests alone: `bfce3c9347074bceafcda34715ef97fd` — 33 passed, 14% on dynamic_engine.py
+- Combined (existing `test_dynamic_engine.py` + new): `679f04a21f43436aae38e99c94a67c02` — 123 passed, 87 multi-GPU tests fail at nproc=1 (expected — they need TP/PP > 1), 93 skipped, **61% on dynamic_engine.py**.
+
+## Round 6 Per-File Notes
+
+### engines/dynamic_engine.py (61% combined)
+
+The existing `test_dynamic_engine.py` exercises the engine end-to-end on a
+real model + KV cache + ProcessGroup. Most of its parameterised cases require
+TP/PP > 1 GPUs (`TestDynamicInferenceEngineParallel::test_parallel_inference`,
+`test_sequence_parallel_fp8_inference`, `TestChunkedPrefillCudaGraphs`) — they
+fail at `nproc-per-node=1` with NCCL/world-size errors, but the single-GPU
+subset still produces ~47% coverage.
+
+The new `test_dynamic_engine_unit.py` complements this with 33 mock-based
+tests that need no GPU, no model, no `ProcessGroup`. Specifically tested:
+
+- **Module-level helpers (no engine instance):**
+  - `EngineState` enum (member uniqueness, presence of all protocol states,
+    membership in `_STATE_EVENTS` stable subset)
+  - `EngineSuspendedError` exception
+  - `format_mem_bytes` for all five suffix branches (bytes / kb / mb / gb / tb)
+    plus the trailing fallthrough for 0 bytes
+  - `RequestEntry` kw-only dataclass
+
+- **Engine methods (via `__new__` + injected mock attributes):**
+  - `has_unfinished_requests` (3 cases — context, waiting queue, both empty)
+  - `get_request` (existing id + KeyError on unknown id)
+  - `get_prefix_coordination_metrics`
+  - `_get_and_clear_stop_word_finished_ids` (empty / intersect-and-clear /
+    disjoint)
+  - `_check_stop_words_for_request_post_append` (no stop words, empty list,
+    too-few tokens, end-of-tokens hit, `detokenize_stop_sequence=True`,
+    speculative-decoding mid-sequence trim, no match)
+  - `_find_mamba_match_count` (empty hashes, farthest-match, no match,
+    first-block-only match)
+
+The 417 lines still uncovered fall into three groups:
+- **Cuda-graph capture / suspend / resume** (lines 333-456, 728-770, 776-830):
+  require real `torch.cuda.graph` capture and a live model.
+- **`schedule_*` and `step_*` orchestration** (lines 1544-2003, 2097-2440):
+  require a populated `DynamicInferenceContext` + active requests mid-flight.
+- **`post_process_requests`** (lines 1088-1360): needs a real text generation
+  controller producing logits each step.
+
+These remain covered by the existing functional tests (when run on multi-GPU).
+
 ## Learnings Fed Back
 
 - Added to `run-tests.md` Known Quirks: `omegaconf` is required for `tests/unit_tests/conftest.py` to load — pip install `pytest-cov omegaconf` together when running coverage.
