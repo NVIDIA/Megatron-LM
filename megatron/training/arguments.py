@@ -139,7 +139,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Experimental yaml
     if args.yaml_cfg is not None:
         from .yaml_arguments import load_yaml
-
+        assert args.yaml_cfg and not args.use_legacy_models, \
+            "Yaml config is not supported with legacy models."
         args = load_yaml(args.yaml_cfg)
 
 
@@ -345,6 +346,10 @@ def validate_args(args, defaults={}):
     # validate model config args from heterogeneous config (if provided).
     validate_model_config_args_from_heterogeneous_config(args)
 
+    # Set args.use_dist_ckpt from args.ckpt_format.
+    if args.use_legacy_models:
+        assert args.ckpt_format == "torch", \
+            "legacy model format only supports the 'torch' checkpoint format."
     update_use_dist_ckpt(args)
 
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
@@ -775,6 +780,7 @@ def validate_args(args, defaults={}):
 
     # MTP validation
     if args.mtp_num_layers:
+        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
         assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
             f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
             + f"The supported position embedding types are rope and none."
@@ -911,6 +917,8 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
+        assert not args.use_legacy_models, \
+            '--overlap-param-gather only supported with MCore models'
 
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
@@ -1352,9 +1360,15 @@ def validate_args(args, defaults={}):
         assert is_te_min_version("2.9.0"), \
             '--log-max-attention-logit is only supported with TE >= 2.9.0.'
 
+    if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
+        assert not args.use_legacy_models, \
+            '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
+
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
+    if args.rotary_interleaved and args.use_legacy_models:
+        raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
     if args.position_embedding_type != 'rope':
         args.apply_rope_fusion = False
 
@@ -1381,6 +1395,10 @@ def validate_args(args, defaults={}):
         args.moe_ffn_hidden_size = args.ffn_hidden_size
         warn_rank_0("moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
+    # Context parallel
+    if args.context_parallel_size > 1:
+        assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
+
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
         assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
@@ -1392,6 +1410,10 @@ def validate_args(args, defaults={}):
         args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
+
+    # Distributed checkpointing checks
+    if args.use_dist_ckpt and args.use_legacy_models:
+        raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
 
     # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
     if args.ckpt_format == "torch_dcp":
@@ -1619,6 +1641,7 @@ def validate_args(args, defaults={}):
                 "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
 
     if args.mtp_num_layers:
+        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
         # MTP is compatible with position embedding types that use position_ids.
         supported_position_types = ["learned_absolute", "rope", "mrope", "none"]
         assert args.position_embedding_type in supported_position_types, (
@@ -1665,6 +1688,7 @@ def validate_args(args, defaults={}):
     if args.moe_latent_size is not None:
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
+        assert not args.use_legacy_models, "MoE latent projections are only supported for mcore models."
 
     # Print arguments.
     _print_args("arguments", args)
@@ -2585,7 +2609,10 @@ def _add_training_args(parser):
     group.add_argument('--use-mcore-models', action='store_true',
                        dest='deprecated_use_mcore_models',
                        help='DEPRECATED. Use the implementation from megatron core.'
-                       'Now ignored and mcore models are the default.')
+                       'Now ignored and mcore models are the default, use '
+                       '--use-legacy-models to not use core models.')
+    group.add_argument('--use-legacy-models', action='store_true',
+                       help='Use the legacy Megatron models, not Megatron-Core models.')
 
     return parser
 
