@@ -439,13 +439,10 @@ class TEGroupedMLP(MegatronModule):
                             )
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
-                # Use each ShardedTensor's globally-unique key as the outer dict key so that
-                # different EP ranks don't collide on the same DCP path.
-                sharded_state_dict.update({v.key: v for v in sub_sd.values()})
             else:
                 # Add prefix here to match sequential's keys
                 replace_prefix_for_sharding(sub_sd, f'{name}.', f'{prefix}experts.{name}.')
-                sharded_state_dict.update({f"{prefix}{k}": v for k, v in sub_sd.items()})
+            sharded_state_dict.update({f"{prefix}{k}": v for k, v in sub_sd.items()})
         return sharded_state_dict
 
     def backward_dw(self):
