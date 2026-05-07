@@ -106,7 +106,7 @@ def _build_prepare_cache_args(file_prefixes, data_cache_path, **overrides):
         data_parallel_size=4,
         tensor_model_parallel_size=1,
         sequence_parallel=False,
-        hybrid_context_parallel=False,
+        dynamic_context_parallel=False,
         multiple_validation_sets=False,
         full_validation=False,
         num_dataset_builder_threads=1,

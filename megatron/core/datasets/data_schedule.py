@@ -660,6 +660,8 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # "attention_mask" is not valid for sequence packing, so set it to None.
     return tokens, labels, loss_mask, None, position_ids, packed_seq_params
+
+
 class HybridCPDataLoaderWrapper:
     """
     A wrapper class that wraps around an existing data_iterator.
