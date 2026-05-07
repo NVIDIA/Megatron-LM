@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass, field
-from typing import Literal
 
 
 @dataclass
@@ -26,16 +25,6 @@ class ServeConfig:
 
     port: int = 5000
     """HTTP bind port for the OpenAI-compatible frontend."""
-
-    role: Literal["primary", "worker", "auto"] = "auto"
-    """Per-rank role selector for the serving frontend.
-
-    - ``"primary"``: this rank exposes the HTTP frontend.
-    - ``"worker"``: this rank does not expose HTTP; it participates in the
-      dynamic engine loop only.
-    - ``"auto"``: automatically picks ``"primary"`` on global rank 0 and
-      ``"worker"`` elsewhere.
-    """
 
     parsers: list[str] = field(default_factory=list)
     """Response parser names to enable on the HTTP frontend.

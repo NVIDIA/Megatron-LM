@@ -2,13 +2,13 @@
 
 """Async high-level inference API for Megatron (``MegatronAsyncLLM``)."""
 
-import asyncio
 from typing import List, Optional, Union
 
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference._llm_base import _MegatronLLMBase
+from megatron.inference.serve_config import ServeConfig
 
 
 class MegatronAsyncLLM(_MegatronLLMBase):
@@ -26,11 +26,8 @@ class MegatronAsyncLLM(_MegatronLLMBase):
       raise :class:`RuntimeError`; pass a list of prompts to batch.
     - ``async`` lifecycle controls: ``pause`` / ``unpause`` / ``suspend`` /
       ``resume`` / ``shutdown`` / ``wait_for_shutdown``.
+    - :meth:`serve` for OpenAI-compatible HTTP serving on the primary rank.
     - ``async with`` context-manager protocol; exit calls :meth:`shutdown`.
-
-    Note:
-        ``serve()`` (online HTTP serving) is not yet implemented and will be
-        added in a later stage.
     """
 
     def __init__(
@@ -54,6 +51,8 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         # Concurrency guard for direct-mode generate (asyncio is single-threaded;
         # a plain bool is sufficient).
         self._direct_generate_in_flight: bool = False
+        # Set in serve() when this rank starts the HTTP frontend; consulted by shutdown().
+        self._serve_started: bool = False
 
     async def generate(
         self,
@@ -155,12 +154,80 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         if self._shutdown_called:
             return
         self._shutdown_called = True
+
+        # If we started an HTTP frontend, stop it first so no new requests
+        # arrive while we tear down the coordinator. Invariant:
+        # ``_serve_started`` can only be True when ``use_coordinator=True``
+        # because ``serve()`` raises otherwise.
+        if self._serve_started:
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
+                stop_text_gen_server,
+            )
+
+            stop_text_gen_server()
+            self._serve_started = False
+
         if not self._use_coordinator:
             return
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._shutdown_impl())
-        # Stop the loop in a worker thread so we don't block the caller's loop.
-        await asyncio.to_thread(self._loop_manager.stop)
+        self._loop_manager.stop()
+
+    async def serve(
+        self,
+        serve_config: ServeConfig,
+        *,
+        blocking: bool = True,
+    ) -> None:
+        """Start the OpenAI-compatible HTTP frontend.
+
+        Coordinator mode only. The HTTP frontend runs only on the primary
+        rank (global rank 0); other ranks no-op the HTTP setup but still
+        respect ``blocking`` (so all ranks return together).
+
+        With ``blocking=True`` (default), this awaits the engine loop until
+        :meth:`shutdown` is called -- suitable for standalone serving scripts.
+        With ``blocking=False``, this returns once the HTTP frontend is up
+        (primary) or immediately (workers); the engine loop continues in the
+        background runtime, and the user can call :meth:`generate` /
+        :meth:`shutdown` afterward.
+
+        Raises:
+            ValueError: if ``use_coordinator=False`` (HTTP serving requires
+                the coordinator path).
+        """
+        if not self._use_coordinator:
+            raise ValueError(
+                "MegatronAsyncLLM.serve() requires use_coordinator=True"
+            )
+
+        if self._is_primary_rank:
+            # Lazy import: keep the module importable in environments where
+            # the HTTP server backend (Quart/Hypercorn) isn't installed.
+            import torch.distributed as dist
+
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
+                start_text_gen_server,
+            )
+
+            assert self._coord_runtime is not None
+            start_text_gen_server(
+                coordinator_addr=self._coord_runtime.coord_addr,
+                tokenizer=self._controller.tokenizer,
+                rank=dist.get_rank(),
+                server_port=serve_config.port,
+                parsers=serve_config.parsers,
+                verbose=serve_config.verbose,
+                num_replicas=serve_config.frontend_replicas,
+                hostname=serve_config.host,
+            )
+            self._serve_started = True
+
+        if blocking:
+            # Block until the engine loop terminates (shutdown was invoked
+            # somewhere in this process; for serve(blocking=True) typically by
+            # SIGINT or out-of-band orchestration).
+            await self.wait_for_shutdown()
 
     async def wait_for_shutdown(self) -> None:
         """Block until the engine's background loop task terminates.
