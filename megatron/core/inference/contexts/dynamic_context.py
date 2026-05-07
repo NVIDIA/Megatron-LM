@@ -2283,7 +2283,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return True
 
-    def run_attn_init_graph_body(self, eager: bool = False, cache_key=None) -> None:
+    def run_attn_init_graph_body(self, eager: bool = False, cache_key=None) -> tuple:
         """Graphable body of :meth:`initialize_attention_state`.
 
         Wrapped by :class:`CudaGraphManager` in the text-generation controller
@@ -2366,6 +2366,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # can run their own per-bucket toggles inside the captured body.
         for hook in self._init_body_hooks:
             hook(not eager)
+
+        return ()
 
     def finalize_attn_init(self) -> None:
         """Post-graph phase of :meth:`initialize_attention_state`.
