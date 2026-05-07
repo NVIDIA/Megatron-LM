@@ -387,9 +387,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
             # Force all dummy requests to request log probs so graphs cover
-            # the full padded shape.
+            # the full padded shape. Write to `request_metadata` (the source
+            # of truth) since `_dynamic_step_log_probs_bookkeeping` reads
+            # `request_metadata[:active_count]` — `active_request_metadata`
+            # at this point still holds the previous step's snapshot.
             active_request_count = context.total_request_count - context.paused_request_count
-            context.active_request_metadata["return_log_probs"][:active_request_count] = True
+            context.request_metadata["return_log_probs"][:active_request_count] = True
 
             controller._dynamic_step_log_probs_bookkeeping()
             controller._side_stream.wait_stream(torch.cuda.current_stream())
