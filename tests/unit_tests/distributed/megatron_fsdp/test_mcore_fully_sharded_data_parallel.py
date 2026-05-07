@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import os
 import random
 
 import numpy as np
@@ -711,6 +712,11 @@ class TestMegatronFSDPE2E:
         cfg.update(kwargs)
         cfg["sequence_parallel"] = cfg["tensor_model_parallel_size"] > 1
 
+        if cfg.get("use_megatron_fsdp", False) or cfg.get("use_torch_fsdp2", False):
+            os.environ.pop("CUDA_DEVICE_MAX_CONNECTIONS", None)
+        elif cfg["tensor_model_parallel_size"] > 1 or cfg.get("context_parallel_size", 1) > 1:
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=cfg["tensor_model_parallel_size"],
@@ -814,7 +820,6 @@ class TestMegatronFSDPE2E:
                     fp8="e4m3",
                     fp8_param_gather=True,
                     bf16=True,
-                    num_distributed_optimizer_instances=2,
                     outer_dp_sharding_strategy="optim",
                 ),
                 id="optim_grads_params_mxfp8_double_buffer",
@@ -862,6 +867,16 @@ class TestMegatronFSDPE2E:
             torch.cuda.get_device_capability()[0] < 10 or not HAVE_TE_MXFP8TENSOR
         ):
             pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
+
+        # HFSDP outer-shard strategies (e.g., "optim") require an actual outer-DP
+        # group; skip combinations where the topology doesn't supply one.
+        if (
+            spec_configs.get("outer_dp_sharding_strategy", "no_shard") != "no_shard"
+            and nd_topology.get("num_distributed_optimizer_instances", 1) <= 1
+        ):
+            pytest.skip(
+                "HFSDP outer-shard strategy requires num_distributed_optimizer_instances > 1"
+            )
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
