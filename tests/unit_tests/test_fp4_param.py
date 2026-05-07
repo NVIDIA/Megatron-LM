@@ -326,16 +326,10 @@ class TestFP4Param:
     def run_test_with_eval_transition(self, tp_size, **kwargs):
         """Test fp4_param eval transition with gpt_model."""
         loss_list, eval_loss_list = self._run_test_helper(
-            tp_size,
-            fp4_param_gather=True,
-            eval_transition=True,
-            **kwargs,
+            tp_size, fp4_param_gather=True, eval_transition=True, **kwargs
         )
         loss_list_ref, eval_loss_list_ref = self._run_test_helper(
-            tp_size,
-            fp4_param_gather=False,
-            eval_transition=True,
-            **kwargs,
+            tp_size, fp4_param_gather=False, eval_transition=True, **kwargs
         )
 
         torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
