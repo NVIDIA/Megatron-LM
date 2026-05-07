@@ -452,10 +452,12 @@ class TestA2AOverlap:
         the same results as the reference implementation.
         """
 
+        qk_layernorm = True
         extra_kwargs = {
             "moe_token_dispatcher_type": dispatcher_type,
             "mtp_num_layers": 1,
             "mtp_loss_scaling_factor": 1.1,
+            "qk_layernorm": qk_layernorm,
         }
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
@@ -470,7 +472,7 @@ class TestA2AOverlap:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
                 num_experts=16,
                 moe_grouped_gemm=True,
-                qk_layernorm=True,
+                qk_layernorm=qk_layernorm,
                 multi_latent_attention=True,
             )
             mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, True)
