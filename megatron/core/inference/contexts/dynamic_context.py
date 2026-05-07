@@ -948,7 +948,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Static tensor addresses of active slices to enable fast inference
         # kernels. Pinned CPU mirrors of `request_metadata`, refreshed each
-        # step by `build_active_slices()` from the active subrange.
+        # step by `build_cpu_active_slices()` from the active subrange.
         self.active_request_metadata = {
             label: torch.empty_like(tensor, pin_memory=True)
             for label, tensor in self.request_metadata.items()
@@ -983,7 +983,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # `request_query_lengths` and `active_request_last_token_idxs` reserve one extra trailing
         # slot at index `max_requests` to be used as a sentinel by the log probs kernels
         # (per_request_logprobs's `nonzero_static(fill_value=max_requests)` lands there).
-        # `active_request_last_token_idxs` is set each step in `pad_active_slices`.
+        # `active_request_last_token_idxs` is set each step in `pad_cpu_active_slices`.
         _tok_int64_bytes = self.max_tokens * 8
         _tok_int32_bytes = self.max_tokens * 4
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
@@ -1115,7 +1115,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         _off += _req_4byte_bytes
 
         # Per-request last-token row indices. Aliased with the matching gpu_view slot:
-        # build_active_slices/pad_active_slices populate this CPU view.
+        # build_cpu_active_slices/pad_cpu_active_slices populate this CPU view.
         # Has one extra trailing slot at index `max_requests` used as a sentinel.
         self.active_request_last_token_idxs = self._cpu_bookkeeping_buf[
             _off : _off + _req_4byte_with_sentinel_bytes
@@ -1422,8 +1422,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
 
-    def build_active_slices(self, batch_size: int):
-        """Build the active slices of specific tensors. This is run on every forward step."""
+    def build_cpu_active_slices(self, batch_size: int):
+        """Build the active slices of specific tensors. This is run on every forward step.
+
+        Post-switch ([active | paused | dead] layout), the active region of
+        the persistent tensors is `[:batch_size]` directly — no `padded_slice`
+        offset needed.
+        """
+        # Request metadata all needs to be sliced.
         for label in self.request_metadata:
             self.active_request_metadata[label][:batch_size].copy_(
                 self.request_metadata[label][:batch_size], non_blocking=True
@@ -1436,7 +1442,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.active_request_last_token_idxs[:batch_size].sub_(1)
 
-    def pad_active_slices(self):
+    def pad_cpu_active_slices(self):
         """Pad the active slices of specific tensors."""
         active_request_count = self.total_request_count - self.paused_request_count
         active_decode_count = self.num_decode_requests
@@ -2113,10 +2119,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        self.build_active_slices(
+        self.build_cpu_active_slices(
             min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
         )
-        self.pad_active_slices()
+        self.pad_cpu_active_slices()
 
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
@@ -2332,7 +2338,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_slice
         ]
         # Sampling-parameter staging slots: read from `active_request_metadata`,
-        # which `build_active_slices` + `pad_active_slices` already populated for
+        # which `build_cpu_active_slices` + `pad_cpu_active_slices` already populated for
         # `[:padded_active]` (active values + neutral padding defaults).
         self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
             :padded_active
