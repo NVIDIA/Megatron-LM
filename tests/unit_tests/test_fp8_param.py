@@ -15,6 +15,7 @@ from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -171,6 +172,43 @@ class TestFP8Param:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
+    def copy_main_params_to_param_buffer(self, model_chunks, optimizer):
+        # Mirrors MBridge's pre-eval fix: disable_forward_pre_hook(param_sync=True)
+        # force-syncs params before eval callbacks run, so MXFP8 must repopulate
+        # the shared param/grad buffer before disabling forward hooks.
+        for model_chunk in model_chunks:
+            model_chunk.zero_grad_buffer()
+        for optim_instance in optimizer.chained_optimizers:
+            if isinstance(optim_instance, DistributedOptimizer):
+                optim_instance._copy_main_params_to_param_buffer()
+
+    def run_eval_transition(self, args, model_chunks, optimizer, batch):
+        input_ids, labels, position_ids, attention_mask, loss_mask = batch
+
+        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+            self.copy_main_params_to_param_buffer(model_chunks, optimizer)
+
+        if should_disable_forward_pre_hook(args):
+            disable_forward_pre_hook(model_chunks, param_sync=True)
+
+        model_chunks[0].eval()
+        model_chunks[0].set_is_first_microbatch()
+        with torch.no_grad():
+            eval_output = model_chunks[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+        eval_loss = eval_output.mean()
+        model_chunks[0].train()
+
+        if should_disable_forward_pre_hook(args):
+            enable_forward_pre_hook(model_chunks)
+
+        return eval_loss.item()
+
     def _run_test_helper(
         self,
         tp_size,
@@ -178,6 +216,7 @@ class TestFP8Param:
         inference: bool = False,
         fp8_param_gather: bool = True,
         use_cuda_graph: bool = False,
+        eval_transition: bool = False,
         **kwargs,
     ):
         """Test fp8_param with gpt_model."""
@@ -269,6 +308,7 @@ class TestFP8Param:
                         )
 
         loss_list = []
+        eval_loss_list = []
 
         for i in range(100):
             if not inference:
@@ -290,9 +330,7 @@ class TestFP8Param:
             # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
             # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
             if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                for optim_instance in optimizer.chained_optimizers:
-                    if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
-                        optim_instance._copy_main_params_to_param_buffer()
+                self.copy_main_params_to_param_buffer(gpt_model, optimizer)
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -325,10 +363,22 @@ class TestFP8Param:
 
             loss_list.append(loss.item())
 
+            if eval_transition:
+                eval_loss_list.append(
+                    self.run_eval_transition(
+                        args,
+                        gpt_model,
+                        optimizer,
+                        (input_ids, labels, position_ids, attention_mask, loss_mask),
+                    )
+                )
+
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
             self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
 
+        if eval_transition:
+            return torch.tensor(loss_list), torch.tensor(eval_loss_list)
         return torch.tensor(loss_list)
 
     def run_test(self, tp_size, recipe, inference: bool = False, **kwargs):
@@ -355,6 +405,16 @@ class TestFP8Param:
             tp_size, recipe, fp8_param_gather=True, use_cuda_graph=False, **kwargs
         )
         torch.testing.assert_close(loss, loss_ref, atol=0, rtol=0)
+
+    def run_test_with_eval_transition(self, tp_size, recipe, **kwargs):
+        loss, eval_loss = self._run_test_helper(
+            tp_size, recipe, fp8_param_gather=True, eval_transition=True, **kwargs
+        )
+        loss_ref, eval_loss_ref = self._run_test_helper(
+            tp_size, recipe, fp8_param_gather=False, eval_transition=True, **kwargs
+        )
+        torch.testing.assert_close(loss, loss_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(eval_loss, eval_loss_ref, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.parametrize("tp_size", [2])
@@ -441,6 +501,16 @@ class TestFP8Param:
         """
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_mxfp8_eval_transition(self, tp_size):
+        kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
+        self.run_test_with_eval_transition(tp_size=tp_size, recipe="mxfp8", **kwargs)
 
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
