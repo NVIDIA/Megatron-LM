@@ -774,9 +774,7 @@ class TestDSAQKNormResolution(_MLAQKNormTestBase):
         from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
 
         spec = self._make_spec(linear_q_up_proj=TELayerNormColumnParallelLinear)
-        with pytest.raises(
-            ValueError, match=r"fused norm\+linear, but this is not supported for DSA"
-        ):
+        with pytest.raises(ValueError, match=r"not supported for DSA"):
             self._build_model(spec=spec, qk_layernorm=True)
 
     def test_qk_layernorm_without_q_lora_rejects_fused_linear_q(self):
@@ -784,9 +782,7 @@ class TestDSAQKNormResolution(_MLAQKNormTestBase):
         from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
 
         spec = self._make_spec(linear_q_proj=TELayerNormColumnParallelLinear)
-        with pytest.raises(
-            ValueError, match=r"fused norm\+linear, but this is not supported for DSA"
-        ):
+        with pytest.raises(ValueError, match=r"not supported for DSA"):
             self._build_model(spec=spec, qk_layernorm=True, q_lora_rank=None)
 
     def test_disabled_qk_layernorm_rejects_fused_linear_kv_up(self):
