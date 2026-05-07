@@ -358,6 +358,149 @@ constrained more by what coverage.py can see than by test difficulty.
 
 **Across all four rounds: 25 source files brought to 36–100 % coverage, ~262 new test cases, 22 new test files, 0 final failures.**
 
+---
+
+# Round 5 — Tractable Dynamic-Path Files
+
+This round covers the dynamic-path files where mocking the surrounding context
+makes unit testing tractable. The user authorized skipping static engine code
+entirely, and asked us to either mock the dynamic paths if possible or
+document them as out-of-scope.
+
+## Files Targeted (Round 5)
+
+| File | Before | After | Stmts/Miss | Test File |
+|------|--------|-------|------------|-----------|
+| `contexts/gpu_view.py` | 3% | **100%** | 99/0 | `contexts/test_gpu_view.py` |
+| `contexts/kv_block_allocator.py` | 14% | **50%** | 198/99 | `contexts/test_kv_block_allocator.py` |
+
+**27 new tests, 0 failures.** Validation run: `8941032aad4d4461b47bcadd3b0db6cf`.
+
+## Round 5 Per-File Notes
+
+### contexts/gpu_view.py (100%)
+
+- `ContextGPUView` is a single class whose `__init__` carves a `uint8` buffer
+  into typed views. Tests cover both Mamba and non-Mamba layouts, verify the
+  zero-init guarantee, view aliasing, and the `assert off == total_bytes`
+  layout-bug guard. CUDA-required (`torch.cuda.current_device()` and CUDA
+  device inputs).
+
+### contexts/kv_block_allocator.py (50%)
+
+- Tests cover the no-prefix-caching path (init, `__str__`, allocate/release,
+  reset, get_*_used / get_*_avail) and the prefix-caching path's ref-count
+  bookkeeping, hash registration, REF_ZERO eviction policy.
+- Missing lines (208-225, 252-258, 289-316, 324-329, 337-338, 352-365,
+  383-419, 439-457, 469-474, 485) are LRU eviction bookkeeping
+  (`update_timestamps`, `evict_lru_blocks`, `_deregister_blocks` callback
+  paths), routing-data persistence (`get_block_routing` / `set_block_routing`),
+  and the `lookup_kv_blocks_by_hashes` prefix discovery API. These all touch
+  fields on the surrounding `DynamicInferenceContext`
+  (`prefix_cache_lru_clock`, `request_to_kv_block_ids`,
+  `request_kv_block_counts`, etc.) in ways that are tightly coupled to the
+  full bookkeeping cycle. Out of scope for unit tests; covered by integration
+  tests on the live inference engine.
+
+---
+
+# Out of Scope (Dynamic-Path Files)
+
+After five rounds of unit-test additions, the following files within
+`megatron/core/inference/` remain at low coverage. Each is documented here
+with the specific reason a unit test cannot meaningfully cover it.
+
+## Massive orchestrators (need full inference pipeline)
+
+| File | Stmts | Reason |
+|------|-------|--------|
+| `engines/dynamic_engine.py` | 1069 | Massive orchestrator. Requires a built `MegatronModule` + `DynamicInferenceContext` + KV-cache buffers + a real `ProcessGroup`. The existing `tests/unit_tests/inference/engines/test_dynamic_engine.py` SIGABRTs midway when run with `--cov`, suggesting it requires multi-GPU + specific memory layouts to even start. Covered by integration tests, not unit tests. |
+| `contexts/dynamic_context.py` | 1388 | Massive context machinery (KV cache, slot allocator, GPU view, transfer-bookkeeping). Public API is consumed by `dynamic_engine.py`. To exercise any non-trivial branch, you need the full engine + a model that produces tokens. Not unit-testable. |
+| `text_generation_controllers/text_generation_controller.py` | 869 | Base controller orchestrating prefill / decode / sampling against a real model wrapper. Every method requires a built `inference_wrapped_model`, tokenizer, and active inference context. |
+
+## Mamba-specific dynamic state (need mamba model + chunk config)
+
+| File | Stmts | Reason |
+|------|-------|--------|
+| `contexts/mamba_slot_allocator.py` | 288 | Mamba-specific slot allocator. Needs `MambaInferenceStateConfig` derived from a built mamba/hybrid model and live request tracking. |
+| `contexts/attention_context/mamba_metadata.py` | 326 | Mamba kernel metadata (chunked prefill cu_seqlens, conv state indices). Needs a hybrid model and the surrounding dynamic context's mamba bookkeeping fields populated. |
+
+## HTTP endpoints / live ZMQ services
+
+| File | Stmts | Reason |
+|------|-------|--------|
+| `data_parallel_inference_coordinator.py` | 297 | Long-running ZMQ coordinator daemon driving real inference engines via PUB/SUB + DEALER/ROUTER sockets. Testing a coordinator's coordination logic requires standing up real engines on fake addresses; the result is a functional test, not a unit test. |
+| `text_generation_server/dynamic_text_gen_server/text_generation_server.py` | 114 | Hypercorn ASGI server driven by `multiprocessing.Process` workers. Requires live processes + ports + a coordinator. |
+| `text_generation_server/dynamic_text_gen_server/endpoints/completions.py` | 153 | Quart HTTP endpoint that drives a live `InferenceClient` against a coordinator. Each request awaits a real inference future. The test client setup we used for `health.py` works because `health` only reads `current_app.config['client'] is not None`; `completions` actually exercises the client. |
+| `text_generation_server/dynamic_text_gen_server/endpoints/chat_completions.py` | 412 | Same as above, plus chat-template formatting and tool/parser dispatch — a small unit test of one branch wouldn't move the needle. |
+
+## Triton-bound files (hard coverage.py ceiling)
+
+`@triton.jit` kernel bodies execute as compiled GPU code; Python's trace hooks
+don't fire for them. These files cap out somewhere between ~30 % and ~70 %
+no matter how many tests you write — the missing percentage is the kernel
+source itself.
+
+| File | Stmts | Reason |
+|------|-------|--------|
+| `contexts/fused_kv_append_kernel.py` | 55 | Single Triton kernel + a Python wrapper that asserts `HAVE_TRITON`. |
+| `moe/permute.py` | 229 | Multiple Triton kernels for token permutation. |
+| `moe/activations.py` | 89 | Triton kernels for activation + fused quantize. |
+| `moe/vllm_fused_moe.py` | 170 | vLLM-style fused MoE Triton kernels. |
+| `text_generation_controllers/mtp_utils_triton.py` | 139 | Triton kernels for MTP. |
+| `communication/torch_symm_triton/barrier.py` | 30 | Symmetric-memory barrier Triton kernel. |
+| `communication/torch_symm_triton/collectives.py` | 95 | NVLS collectives Triton kernels. |
+| `communication/torch_symm_triton/fused_collectives.py` | 113 | Fused NVLS collectives. |
+| `communication/torch_symm_triton/multimem_asm.py` | 43 | Inline-PTX multimem store/load. |
+| `communication/torch_symm_triton/utils.py` | 33 | Triton utility helpers (`sync_threads`, etc.). |
+| `communication/torch_symm_triton/variable_collectives.py` | 208 | Variable-sized NVLS collectives. |
+
+## Other model-bound files
+
+| File | Stmts | Reason |
+|------|-------|--------|
+| `model_inference_wrappers/abstract_model_inference_wrapper.py` | 82 | Constructor calls `get_model_config(self.model)` and walks pipeline-parallel groups. Requires a real `MegatronModule`. |
+| `model_inference_wrappers/gpt/gpt_inference_wrapper.py` | 38 | Subclass of the above, takes a built `GPTModel`. |
+| `model_inference_wrappers/t5/t5_inference_wrapper.py` | 67 | Subclass of the above, takes a built `T5Model`. |
+| `text_generation_controllers/mtp_utils_pytorch.py` | 98 | MTP (multi-token-prediction) helpers tied to a built MTP model. |
+| `engines/static_engine.py` | 132 | User instructed to skip static-engine related files. |
+
+---
+
+# Combined Cumulative Summary (Rounds 1-5)
+
+| File | Baseline | Final |
+|------|----------|-------|
+| async_stream.py | 0% | **100%** |
+| headers.py | 0% | **100%** |
+| sampling_params.py | 0% | **100%** |
+| inference_request.py | 0% | **98%** |
+| inference_client.py | 0% | **94%** |
+| symmetric_memory.py | 31% | **94%** |
+| unified_memory.py | 18% | **56%** |
+| engines/abstract_engine.py | 0% | **86%** |
+| engines/mcore_engine.py | 0% | **100%** |
+| engines/async_zmq_communicator.py | 0% | **68%** |
+| contexts/base_context.py | 53% | **95%** |
+| contexts/attention_context/metadata_base.py | 29% | **100%** |
+| contexts/routing_metadata.py | 26% | **100%** |
+| contexts/attention_context/mha_metadata.py | 32% | **100%** |
+| contexts/static_context.py | 24% | **69%** |
+| **contexts/gpu_view.py** | **3%** | **100%** |
+| **contexts/kv_block_allocator.py** | **14%** | **50%** |
+| moe/fused_moe.py | 34% | **40%** |
+| quantization/mxfp8_tensor.py | 49% | **76%** |
+| quantization/utils.py | 18% | **36%** |
+| sampling/base.py | 0% | **100%** |
+| text_generation_controllers/encoder_decoder_*.py | 0% | **100%** |
+| text_generation_controllers/vlm_*.py | 0% | **100%** |
+| text_generation_server/tokenization.py | 0% | **58%** |
+| text_generation_server/dynamic_text_gen_server/tokenization.py | 0% | **50%** |
+| text_generation_server/dynamic_text_gen_server/endpoints/common.py | 0% | **100%** |
+| text_generation_server/dynamic_text_gen_server/endpoints/health.py | 0% | **91%** |
+
+**Across all five rounds: 27 source files brought to 36–100 % coverage, ~289 new test cases, 24 new test files, 0 final failures.**
+
 ## Learnings Fed Back
 
 - Added to `run-tests.md` Known Quirks: `omegaconf` is required for `tests/unit_tests/conftest.py` to load — pip install `pytest-cov omegaconf` together when running coverage.
