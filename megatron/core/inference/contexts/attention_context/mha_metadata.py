@@ -5,17 +5,15 @@ from .metadata_base import MetadataBase
 
 
 class MHAMetadata(MetadataBase):
-    """
-    Metadata for MHA layer using flash-attention.
+    """Metadata for MHA layer using flash-attention.
 
-    GPU storage for the per-step fields (``query_lengths``,
-    ``cu_query_seq_lengths``, ``kv_seq_lengths``, ``cu_kv_seq_lengths``,
-    ``block_table``) lives inside the context's :class:`ContextGPUView`
-    unified buffer. Both :class:`GraphedMHAMetadata` and
-    :class:`NonGraphedMHAMetadata` bind to the same GPU views (only one is
-    active per step), so the single coalesced H2D in
-    :meth:`DynamicInferenceContext.transfer_bookkeeping_to_gpu` covers the
-    MHA fields along with the rest of the bookkeeping state.
+    The per-step fields (``query_lengths``, ``cu_query_seq_lengths``,
+    ``kv_seq_lengths``, ``cu_kv_seq_lengths``, ``block_table``) are stored
+    in static GPU tensors owned by :class:`DynamicInferenceContext`. The
+    context populates them by running GPU kernels on the post-H2D
+    bookkeeping in :class:`ContextGPUView`. Both
+    :class:`GraphedMHAMetadata` and :class:`NonGraphedMHAMetadata` bind to
+    the same buffers (only one is active per step, so sharing is safe).
     """
 
     def __init__(
@@ -30,37 +28,56 @@ class MHAMetadata(MetadataBase):
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
         self.state_data = {}
-        # Set by bind_gpu_buffers(); references shared views in ContextGPUView._buf.
-        self._gpu_view = None
+        # Set by bind_active_tensors(); references shared static GPU tensors
+        # on the context.
+        self._query_lengths_buf = None
+        self._cu_query_seq_lengths_buf = None
+        self._kv_seq_lengths_buf = None
+        self._cu_kv_seq_lengths_buf = None
+        self._block_table_buf = None
 
-    def bind_gpu_buffers(self, gpu_view) -> None:
-        """Attach shared GPU buffer views from the context's ContextGPUView.
+    def bind_active_tensors(
+        self,
+        *,
+        query_lengths_buf: torch.Tensor,
+        cu_query_seq_lengths_buf: torch.Tensor,
+        kv_seq_lengths_buf: torch.Tensor,
+        cu_kv_seq_lengths_buf: torch.Tensor,
+        block_table_buf: torch.Tensor,
+    ) -> None:
+        """Attach the static GPU buffers used to back ``state_data`` slices.
 
-        Called by :class:`DynamicInferenceContext` after ``self.gpu_view`` is
-        constructed. Both graphed and non-graphed MHA metadata bind to the
-        same views; only one is active per step, so sharing storage is safe.
+        Called once by :class:`DynamicInferenceContext` after the buffers are
+        allocated. Each buffer is sized for ``max_requests`` (or
+        ``max_requests + 1`` for cumulative tensors); per-step
+        :meth:`set_state_data` slices them down to ``padded_active_request_count``.
         """
-        self._gpu_view = gpu_view
+        self._query_lengths_buf = query_lengths_buf
+        self._cu_query_seq_lengths_buf = cu_query_seq_lengths_buf
+        self._kv_seq_lengths_buf = kv_seq_lengths_buf
+        self._cu_kv_seq_lengths_buf = cu_kv_seq_lengths_buf
+        self._block_table_buf = block_table_buf
 
     def set_state_data(
         self, padded_active_request_count: int, max_seqlen_q: int, max_seqlen_k: int
     ) -> None:
-        """Build ``state_data`` slices into the bound GPU buffers.
+        """Build ``state_data`` slices into the bound active buffers.
 
-        Called once per step from ``transfer_bookkeeping_to_gpu`` after the
-        coalesced H2D copy. No ``.copy_()`` calls, no kernel launches.
+        Called once per step after the GPU compute that fills those buffers.
+        No ``.copy_()`` calls, no kernel launches.
         """
-        assert self._gpu_view is not None, "bind_gpu_buffers() must be called first"
+        assert (
+            self._query_lengths_buf is not None
+        ), "bind_active_tensors() must be called first"
         n = padded_active_request_count
-        v = self._gpu_view
         self._max_seqlen_q = max_seqlen_q
         self._max_seqlen_k = max_seqlen_k
         self.state_data = {
-            "query_lengths": v.mha_query_lengths[:n],
-            "cu_query_seq_lengths": v.mha_cu_query_seq_lengths[: n + 1],
-            "cu_kv_seq_lengths": v.mha_cu_kv_seq_lengths[: n + 1],
-            "kv_seq_lengths": v.mha_kv_seq_lengths[:n],
-            "block_table": v.mha_block_table[:n, :],
+            "query_lengths": self._query_lengths_buf[:n],
+            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[: n + 1],
+            "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: n + 1],
+            "kv_seq_lengths": self._kv_seq_lengths_buf[:n],
+            "block_table": self._block_table_buf[:n, :],
             "max_seqlen_q": max_seqlen_q,
             "max_seqlen_k": max_seqlen_k,
         }
@@ -68,9 +85,9 @@ class MHAMetadata(MetadataBase):
     def reset(self):
         """Reset the metadata for the next batch.
 
-        The GPU buffers live in the context's unified buffer and are fully
-        overwritten by the next H2D copy; clearing them here would launch
-        redundant CUDA kernels with no correctness benefit.
+        The GPU buffers are owned by the context and fully overwritten by the
+        next ``initialize_attention_state`` step; clearing them here would
+        launch redundant CUDA kernels with no correctness benefit.
         """
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0

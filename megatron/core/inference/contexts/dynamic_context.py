@@ -930,13 +930,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_offset = torch.empty(
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
-        self.request_to_kv_block_ids = torch.full(
-            (self.max_requests, self.max_kv_block_count),
-            -1,
-            dtype=torch.int,
-            device='cpu',
-            pin_memory=True,
-        )
+        # `self.request_to_kv_block_ids` is aliased into the coalesced pinned
+        # CPU bookkeeping buffer below (after the buffer is allocated), so
+        # writes here ride the per-step H2D into ``gpu_view.request_to_kv_block_ids``.
 
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
@@ -972,6 +968,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         #   top_k                            (staging) (int32,   max_requests)
         #   top_p                            (staging) (float32, max_requests)
         #   active_request_last_token_idxs   (alias)   (int32,   max_requests + 1)
+        #   request_to_kv_block_ids          (alias)   (int32,   max_requests, max_kv_blocks)
         #
         # Token fields are aliased with the source-of-truth attributes
         # (`self.token_to_input_ids`, etc.) because the forward pass reads
@@ -989,13 +986,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
         _req_4byte_bytes = self.max_requests * 4
         _req_4byte_with_sentinel_bytes = (self.max_requests + 1) * 4
-        # MHA section: 5 fields (int32) shared between GraphedMHAMetadata and
-        # NonGraphedMHAMetadata. max_bs == max_requests.
-        _mha_query_lengths_bytes = self.max_requests * 4
-        _mha_cu_query_seq_lengths_bytes = (self.max_requests + 1) * 4
-        _mha_kv_seq_lengths_bytes = self.max_requests * 4
-        _mha_cu_kv_seq_lengths_bytes = (self.max_requests + 1) * 4
-        _mha_block_table_bytes = self.max_requests * self.max_kv_block_count * 4
+        # Per-request KV block table (the source for the GPU-side padded
+        # ``active_request_to_kv_block_ids`` consumed by the attention kernels).
+        _request_to_kv_block_ids_bytes = self.max_requests * self.max_kv_block_count * 4
         # Mamba section: 9 int32 fields (hybrid models only). Must match the
         # MambaMetadata shapes (mirrors the layout documented in ContextGPUView).
         if self.is_hybrid_model:
@@ -1025,11 +1018,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             + 4 * _tok_int32_bytes
             + 5 * _req_4byte_bytes
             + 2 * _req_4byte_with_sentinel_bytes
-            + _mha_query_lengths_bytes
-            + _mha_cu_query_seq_lengths_bytes
-            + _mha_kv_seq_lengths_bytes
-            + _mha_cu_kv_seq_lengths_bytes
-            + _mha_block_table_bytes
+            + _request_to_kv_block_ids_bytes
             + _mamba_batch_indices_decode_bytes
             + _mamba_batch_indices_prefill_bytes
             + _mamba_seq_idx_bytes
@@ -1137,32 +1126,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
         )
 
-        # MHA flash-attention metadata views (write-only on CPU, read-only on
-        # GPU via the matching region of ContextGPUView._buf). Populated per
-        # step by initialize_attention_state(); transferred as part of the
-        # single coalesced H2D in transfer_bookkeeping_to_gpu().
-        self._cpu_mha_query_lengths = self._cpu_bookkeeping_buf[
-            _off : _off + _mha_query_lengths_bytes
-        ].view(torch.int32)
-        _off += _mha_query_lengths_bytes
-        self._cpu_mha_cu_query_seq_lengths = self._cpu_bookkeeping_buf[
-            _off : _off + _mha_cu_query_seq_lengths_bytes
-        ].view(torch.int32)
-        _off += _mha_cu_query_seq_lengths_bytes
-        self._cpu_mha_kv_seq_lengths = self._cpu_bookkeeping_buf[
-            _off : _off + _mha_kv_seq_lengths_bytes
-        ].view(torch.int32)
-        _off += _mha_kv_seq_lengths_bytes
-        self._cpu_mha_cu_kv_seq_lengths = self._cpu_bookkeeping_buf[
-            _off : _off + _mha_cu_kv_seq_lengths_bytes
-        ].view(torch.int32)
-        _off += _mha_cu_kv_seq_lengths_bytes
-        self._cpu_mha_block_table = (
-            self._cpu_bookkeeping_buf[_off : _off + _mha_block_table_bytes]
+        # Per-request KV block table (alias into the coalesced pinned CPU
+        # buffer). Source of truth on CPU for all bookkeeping; the per-step H2D
+        # mirrors it into ``gpu_view.request_to_kv_block_ids``, where the
+        # GPU-side ``active_request_to_kv_block_ids`` padding kernel reads.
+        self.request_to_kv_block_ids = (
+            self._cpu_bookkeeping_buf[_off : _off + _request_to_kv_block_ids_bytes]
             .view(torch.int32)
             .view(self.max_requests, self.max_kv_block_count)
         )
-        _off += _mha_block_table_bytes
+        # The unified buffer was zero-initialized; restore the -1 sentinel that
+        # the bookkeeping code expects for unallocated rows.
+        self.request_to_kv_block_ids.fill_(-1)
+        _off += _request_to_kv_block_ids_bytes
 
         # Mamba varlen metadata views (hybrid models only). Populated per step
         # by MambaMetadata.compute_cpu_metadata(); transferred as part of the
@@ -1219,10 +1195,38 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_mamba_chunks=self._max_mamba_chunks,
         )
 
-        # Bind the shared MHA GPU views to both graph and non-graph metadata;
-        # only one is active per step, so sharing storage is safe.
-        self.graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
-        self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+        # Static GPU tensors for the per-step MHA derived metadata. Computed on
+        # GPU after the coalesced H2D from ``gpu_view.request_query_lengths`` /
+        # ``gpu_view.request_kv_length_offsets`` / ``gpu_view.request_to_kv_block_ids``.
+        # Replaces the previous ``_cpu_mha_*`` CPU compute path.
+        gpu_device = torch.cuda.current_device()
+        # ``[0]`` is fixed at 0 forever; only ``[1:n+1]`` is rewritten each step.
+        self.cu_active_request_query_lengths = torch.zeros(
+            self.max_requests + 1, dtype=torch.int32, device=gpu_device
+        )
+        self.active_sequence_lengths = torch.empty(
+            self.max_requests, dtype=torch.int32, device=gpu_device
+        )
+        self.cu_active_sequence_lengths = torch.zeros(
+            self.max_requests + 1, dtype=torch.int32, device=gpu_device
+        )
+        self.active_request_to_kv_block_ids = torch.empty(
+            (self.max_requests, self.max_kv_block_count), dtype=torch.int32, device=gpu_device
+        )
+
+        # Bind the shared active GPU buffers to both graph and non-graph
+        # MHA metadata; only one is active per step, so sharing storage is safe.
+        for attn_metadata in (
+            self.graph_attn_metadata["mha_metadata"],
+            self.non_graph_attn_metadata["mha_metadata"],
+        ):
+            attn_metadata.bind_active_tensors(
+                query_lengths_buf=self.gpu_view.request_query_lengths,
+                cu_query_seq_lengths_buf=self.cu_active_request_query_lengths,
+                kv_seq_lengths_buf=self.active_sequence_lengths,
+                cu_kv_seq_lengths_buf=self.cu_active_sequence_lengths,
+                block_table_buf=self.active_request_to_kv_block_ids,
+            )
 
         # Deferred Mamba GPU operations.  Populated by add_request() /
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
@@ -2141,11 +2145,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             else self.non_graph_attn_metadata  # type: ignore[assignment]
         )
 
-        # Update cu_query_seq_lengths, max_seqlen_q.
+        # In the [active | paused | dead] layout, the active region is request_*[:batch_size].
         active_slice = slice(0, self.total_request_count - self.paused_request_count)
-        query_lengths_view = self.request_query_lengths[active_slice]
-        request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
-        request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
@@ -2160,61 +2161,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                     decode_req_count=adjusted_decode_req_count,
                 )
 
-        assert self.active_attn_metadata is not None
-
-        # Compute MHA metadata directly into the pinned CPU section of
-        # _cpu_bookkeeping_buf. The single coalesced H2D in
-        # transfer_bookkeeping_to_gpu() covers these fields along with the rest
-        # of the bookkeeping state, so no ephemeral tensors and no per-field
-        # cudaMemcpyAsyncs.
         real_bs = attn_dimensions.req_count
         padded_bs = self.padded_batch_dimensions.req_count
         mha = self.active_attn_metadata["mha_metadata"]
 
-        # Query lengths: [0:real_bs] real data, [real_bs:padded_bs] zero pad.
-        self._cpu_mha_query_lengths[:real_bs] = query_lengths_view[:real_bs]
-        if real_bs < padded_bs:
-            self._cpu_mha_query_lengths[real_bs:padded_bs] = 0
-
-        # Cumulative query lengths (padded slots repeat cu[real_bs]).
-        self._cpu_mha_cu_query_seq_lengths[0] = 0
-        if real_bs > 0:
-            self._cpu_mha_cu_query_seq_lengths[1 : real_bs + 1] = torch.cumsum(
-                query_lengths_view[:real_bs], dim=0
-            )
-        if real_bs < padded_bs:
-            self._cpu_mha_cu_query_seq_lengths[real_bs + 1 : padded_bs + 1] = (
-                self._cpu_mha_cu_query_seq_lengths[real_bs]
-            )
-
-        # KV sequence lengths: [0:real_bs] = kv_offsets + query_lengths.
-        self._cpu_mha_kv_seq_lengths[:real_bs] = (
-            request_kv_length_offsets_view[:real_bs] + query_lengths_view[:real_bs]
-        )
-        if real_bs < padded_bs:
-            self._cpu_mha_kv_seq_lengths[real_bs:padded_bs] = 0
-
-        # Cumulative KV lengths.
-        self._cpu_mha_cu_kv_seq_lengths[0] = 0
-        if real_bs > 0:
-            self._cpu_mha_cu_kv_seq_lengths[1 : real_bs + 1] = torch.cumsum(
-                self._cpu_mha_kv_seq_lengths[:real_bs], dim=0
-            )
-        if real_bs < padded_bs:
-            self._cpu_mha_cu_kv_seq_lengths[real_bs + 1 : padded_bs + 1] = (
-                self._cpu_mha_cu_kv_seq_lengths[real_bs]
-            )
-
-        # Block table: [0:real_bs] real, [real_bs:padded_bs] = -1 sentinel.
-        self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
-        if real_bs < padded_bs:
-            self._cpu_mha_block_table[real_bs:padded_bs] = -1
-
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
+        # Computed on CPU from `request_query_lengths` / `request_kv_length_offsets`
+        # to avoid a per-step GPU sync. Matches the post-H2D source for the
+        # GPU-side compute below.
         if not self.using_cuda_graph_this_step() and real_bs > 0:
             # NonGraphedMHAMetadata: use actual max values.
-            max_seqlen_q = self._cpu_mha_query_lengths[:real_bs].max().item()
-            max_seqlen_k = self._cpu_mha_kv_seq_lengths[:real_bs].max().item()
+            max_seqlen_q = self.request_query_lengths[:real_bs].max().item()
+            max_seqlen_k = (
+                self.request_kv_length_offsets[:real_bs] + self.request_query_lengths[:real_bs]
+            ).max().item()
         else:
             # GraphedMHAMetadata: use conservative bounds.
             if self.padded_batch_dimensions.prefill_req_count == 0:
@@ -2226,12 +2186,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_seqlen_q = self.num_speculative_tokens + 1
             max_seqlen_k = 1
 
-        # Bind state_data to GPU views now. set_state_data() only creates Python
-        # slice references into the GPU buffer (no GPU reads), so it's safe to
-        # call before the H2D in transfer_bookkeeping_to_gpu(). This guarantees
-        # that callers reading state_data["block_table"] etc. between
-        # initialize_attention_state() and transfer_bookkeeping_to_gpu() see
-        # populated entries (the actual data fill happens at the H2D).
+        # Bind state_data slices into the static GPU buffers. The actual GPU
+        # compute that fills those buffers happens after the H2D in
+        # transfer_bookkeeping_to_gpu() (see ``_compute_active_mha_metadata``).
         mha.set_state_data(
             padded_active_request_count=padded_bs,
             max_seqlen_q=max_seqlen_q,
@@ -2252,7 +2209,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
                 active_mamba_indices=self.mamba_metadata.request_to_mamba_state_idx[active_slice],
                 token_to_request_idx=self.token_to_request_idx[: self.active_token_count],
-                cpu_cu_query=self._cpu_mha_cu_query_seq_lengths,
+                cpu_query_lengths=self.request_query_lengths,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
@@ -2356,8 +2313,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
-        # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
-        # 8 redundant launch overheads vs. the prior per-field copies.
+        # unused slots is cheap and saves redundant launch overheads vs. the
+        # prior per-field copies.
         self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
 
         # `return_log_probs` is bool (1 byte per slot, doesn't share the int32-aligned buffer).
@@ -2367,14 +2324,59 @@ class DynamicInferenceContext(BaseInferenceContext):
         if padded_active < self.max_requests:
             self.gpu_return_log_probs_mask[padded_active:].fill_(False)
 
-        # MHA metadata GPU views were already bound to state_data in
-        # initialize_attention_state(); the H2D above populates the underlying
-        # bytes. Nothing else to do here for MHA.
+        # MHA derived metadata: GPU compute on the just-transferred bookkeeping.
+        # Cumulative query lengths, kv sequence lengths, padded block table.
+        self._compute_active_mha_metadata(padded_active, n_active)
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+    def _compute_active_mha_metadata(self, padded_active: int, n_active: int) -> None:
+        """Fill the static MHA tensors on GPU using the post-H2D bookkeeping.
+
+        - ``cu_active_request_query_lengths[1 : padded_active + 1]``  :=
+              cumsum(``gpu_view.request_query_lengths[:padded_active]``)
+          (``[0]`` is fixed at 0 by allocation; padded slots [n_active:padded_active]
+          carry zeros from the staging refresh, so cumsum naturally repeats the
+          last real value.)
+
+        - ``active_sequence_lengths[:padded_active]`` :=
+              ``gpu_view.request_query_lengths[:padded_active]`` +
+              ``gpu_view.request_kv_length_offsets[:padded_active]``
+
+        - ``cu_active_sequence_lengths[1 : padded_active + 1]`` :=
+              cumsum(``active_sequence_lengths[:padded_active]``)
+
+        - ``active_request_to_kv_block_ids[:n_active]`` is copied from
+              ``gpu_view.request_to_kv_block_ids[:n_active]``;
+          padded slots ``[n_active:padded_active]`` are filled with -1.
+        """
+        if padded_active == 0:
+            return
+        gpu_v = self.gpu_view
+        torch.cumsum(
+            gpu_v.request_query_lengths[:padded_active],
+            dim=0,
+            out=self.cu_active_request_query_lengths[1 : padded_active + 1],
+        )
+        torch.add(
+            gpu_v.request_query_lengths[:padded_active],
+            gpu_v.request_kv_length_offsets[:padded_active],
+            out=self.active_sequence_lengths[:padded_active],
+        )
+        torch.cumsum(
+            self.active_sequence_lengths[:padded_active],
+            dim=0,
+            out=self.cu_active_sequence_lengths[1 : padded_active + 1],
+        )
+        if n_active > 0:
+            self.active_request_to_kv_block_ids[:n_active].copy_(
+                gpu_v.request_to_kv_block_ids[:n_active]
+            )
+        if n_active < padded_active:
+            self.active_request_to_kv_block_ids[n_active:padded_active].fill_(-1)
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
