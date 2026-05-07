@@ -75,6 +75,7 @@ training = [
     "wandb",
     "transformers",
     "accelerate",
+    "omegaconf",
 ]
 
 ### 'mlm' group is deprecated. please use 'training' instead ###
@@ -85,6 +86,7 @@ mlm = [
     "wandb",
     "transformers",
     "accelerate",
+    "omegaconf",
 ]
 
 dev = [
