@@ -20,11 +20,14 @@ class _FakeGroupedCheckpointTensor:
         return self._members
 
 
-def _grouped_linear_stub(num_gemms, *, use_bias=False, single_grouped_weight=False):
+def _grouped_linear_stub(
+    num_gemms, *, use_bias=False, single_grouped_weight=False, single_grouped_bias=False
+):
     module = te_ext.TEGroupedLinear.__new__(te_ext.TEGroupedLinear)
     module.num_gemms = num_gemms
     module.use_bias = use_bias
     module.single_grouped_weight = single_grouped_weight
+    module.single_grouped_bias = single_grouped_bias
     return module
 
 
@@ -102,7 +105,9 @@ def test_normalize_grouped_parameter_keys_indexed_to_grouped_weight_only():
 
 
 def test_normalize_grouped_parameter_keys_indexed_to_grouped_with_bias():
-    module = _grouped_linear_stub(num_gemms=2, use_bias=True, single_grouped_weight=True)
+    module = _grouped_linear_stub(
+        num_gemms=2, use_bias=True, single_grouped_weight=True, single_grouped_bias=True
+    )
     weights = [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
     biases = [torch.tensor([10.0]), torch.tensor([20.0])]
     state_dict = {
