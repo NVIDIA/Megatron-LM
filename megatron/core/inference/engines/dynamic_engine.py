@@ -847,8 +847,20 @@ class DynamicInferenceEngine(AbstractEngine):
         request = request_entry.record[-1]
 
         if self.rank == 0:
+            errors = [
+                e.payload
+                for e in request.events
+                if e.type
+                in (
+                    DynamicInferenceEventType.ERROR_NONTRANSIENT,
+                    DynamicInferenceEventType.ERROR_TRANSIENT,
+                )
+            ]
+            errors_str = (
+                "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else "unknown error"
+            )
             warnings.warn(
-                f"Request {request_id} failed to be added to the engine due to errors. "
+                f"Request {request_id} failed to be added to the engine ({errors_str}). "
                 f"Prompt Tokens: {len(request.prompt_tokens)} "
                 f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
                 f"Max sequence length: {self.context.max_sequence_length} "
