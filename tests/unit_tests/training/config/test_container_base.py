@@ -8,13 +8,13 @@ from dataclasses import dataclass
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
-from megatron.training.models import Serializable
 import torch
 import yaml
 
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.instantiate_utils import InstantiationMode
+from megatron.training.models import Serializable
 
 
 @pytest.fixture(autouse=True)
