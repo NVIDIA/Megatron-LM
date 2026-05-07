@@ -104,7 +104,6 @@ MODEL_OPTIONS="\
   --tiktoken-pattern v2 \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model ${TOKENIZER_MODEL} \
-  --tokenizer-hf-include-special-tokens \
   --dist-ckpt-strictness log_unexpected \
   --ckpt-format torch_dist \
   --ckpt-fully-parallel-save \

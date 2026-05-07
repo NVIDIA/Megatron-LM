@@ -19,10 +19,6 @@ This directory contains in-depth guides, tutorials, and discussions about optimi
 
 ### Training Guides
 
-- **[Megatron-FSDP User Guide](megatron-fsdp-user-guide/megatron-fsdp-user-guide.md)**
-
-  A practical guide to enable Megatron-FSDP training, including a quick-start example for DeepSeek-V3, required and recommended configurations, and instructions for checkpoint conversion from torch_dist to fsdp_dtensor.
-
 ## Previous News
 
 - **[2025/05]** Megatron Core v0.11.0 brings new capabilities for multi-data center LLM training ([blog](https://developer.nvidia.com/blog/turbocharge-llm-training-across-long-haul-data-center-networks-with-nvidia-nemo-framework/)).
@@ -32,7 +28,7 @@ This directory contains in-depth guides, tutorials, and discussions about optimi
 
 ## Contributing
 
-If you'd like to contribute a guide or tutorial, please follow this structure:
+To contribute a guide or tutorial, follow this structure:
 
 1. Create a new directory: `docs/discussions/your-guide-name/`
 2. Add your main guide: `docs/discussions/your-guide-name/your-guide-name.md`

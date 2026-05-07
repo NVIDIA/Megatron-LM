@@ -8,7 +8,12 @@ import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode, set_streams
+from megatron.core.pipeline_parallel.utils import (
+    AbstractSchedulePlan,
+    ScheduleNode,
+    get_comp_stream,
+    set_streams,
+)
 from megatron.core.utils import get_attr_wrapped_model
 
 # Types
@@ -226,10 +231,15 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     if f_model_chunk_id is not None:
         forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)
     # backward post process
-    if b_model_chunk_id:
+    if b_model_chunk_id is not None:
         # The same as the backward_step_helper
         backward_step_helper_postprocess(b_virtual_microbatch_id)
-        if input_tensor is not None:
+        # Verify backward grad: if backward microbatch received activation from upstream
+        # (b_input_tensor is not None), input_tensor_grad must be produced.
+        # Note: the original assert used forward's input_tensor, which is incorrect when
+        # forward and backward are on different VP stages (backward has chunk reversal:
+        # model_chunk_id = num_chunks - id - 1), causing false failures in interleaved PP.
+        if b_input_tensor is not None:
             assert input_tensor_grad is not None
     return output_tensor, input_tensor_grad
 
@@ -405,7 +415,7 @@ def combined_forward_backward_step(
         from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
 
         loss_node = ScheduleNode(
-            loss_func, torch.cuda.current_stream(), f_schedule_plan.event, name="loss_func"
+            loss_func, get_comp_stream, f_schedule_plan.event, name="loss_func"
         )
         loss_func = loss_node.forward
         output_tensor, num_tokens = forward_step_calc_loss(

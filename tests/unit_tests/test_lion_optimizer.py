@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.optimizer import (
-    HAVE_LION,
+    HAVE_EMERGING_OPTIMIZERS,
     OptimizerConfig,
     _get_megatron_optimizer_based_on_param_groups,
     _get_param_groups,
@@ -22,7 +22,7 @@ from megatron.core.optimizer import (
 from megatron.core.optimizer.optimizer import FP32Optimizer
 
 requires_emerging_optimizers = pytest.mark.skipif(
-    not HAVE_LION, reason="emerging_optimizers package not installed"
+    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package not installed"
 )
 
 
@@ -97,9 +97,9 @@ class TestLionOptimizerConfig:
         """Should raise ImportError with helpful message if emerging_optimizers not installed."""
         import megatron.core.optimizer as opt_module
 
-        original_have_lion = opt_module.HAVE_LION
+        original_have_lion = opt_module.HAVE_EMERGING_OPTIMIZERS
         try:
-            opt_module.HAVE_LION = False
+            opt_module.HAVE_EMERGING_OPTIMIZERS = False
 
             model = SimpleModel()
             config = OptimizerConfig(optimizer="lion", lr=1e-4)
@@ -107,7 +107,7 @@ class TestLionOptimizerConfig:
             with pytest.raises(ImportError, match="emerging_optimizers"):
                 _create_lion_optimizer(model, config)
         finally:
-            opt_module.HAVE_LION = original_have_lion
+            opt_module.HAVE_EMERGING_OPTIMIZERS = original_have_lion
 
 
 @requires_emerging_optimizers
