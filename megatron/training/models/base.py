@@ -68,7 +68,7 @@ class ModelConfig:
     """HuggingFace model identifier."""
 
     generation_config: Any | None = None
-    """Generation configuration."""
+    """HuggingFace GenerationConfig."""
 
     # === pre-wrap and post-wrap hooks ===
     pre_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(default_factory=list)
