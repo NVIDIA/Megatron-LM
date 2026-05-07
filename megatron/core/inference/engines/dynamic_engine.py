@@ -1235,10 +1235,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     ):
                         block_ids = finished_routing_block_ids[request_id]
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-                        request.routing_indices = (
-                            self.context.kv_block_allocator.reconstruct_routing_from_blocks(
-                                block_ids, total_tokens - 1
-                            )
+                        routing_replay = self.context.kv_block_allocator.routing_replay
+                        request.routing_indices = routing_replay.reconstruct_routing_from_blocks(
+                            block_ids, total_tokens - 1
                         )
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
