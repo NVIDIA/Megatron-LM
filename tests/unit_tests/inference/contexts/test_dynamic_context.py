@@ -258,6 +258,46 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_current_input_and_position_ids_view_cache(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        num_tokens = 64
+        dynamic_context.padded_active_token_count = num_tokens
+
+        # First call: cache miss, populates entry.
+        assert num_tokens not in dynamic_context._input_position_views
+        input_ids_view, pos_ids_view = dynamic_context.current_input_and_position_ids()
+        assert num_tokens in dynamic_context._input_position_views
+
+        # Second call: cache hit returns the same tensor objects.
+        cached_input_ids, cached_pos_ids = dynamic_context.current_input_and_position_ids()
+        assert cached_input_ids is input_ids_view
+        assert cached_pos_ids is pos_ids_view
+
+        # Writing new values into the underlying storage must be reflected by the cached views.
+        device = dynamic_context.gpu_view.token_to_input_ids.device
+        new_input_ids = torch.arange(num_tokens, dtype=torch.long, device=device)
+        new_pos_ids = torch.arange(num_tokens, 2 * num_tokens, dtype=torch.long, device=device)
+        dynamic_context.gpu_view.token_to_input_ids[:num_tokens] = new_input_ids
+        dynamic_context.gpu_view.token_to_pos_ids[:num_tokens] = new_pos_ids
+
+        refreshed_input_ids, refreshed_pos_ids = dynamic_context.current_input_and_position_ids()
+        assert refreshed_input_ids is input_ids_view
+        assert refreshed_pos_ids is pos_ids_view
+        assert torch.equal(refreshed_input_ids.squeeze(0), new_input_ids)
+        assert torch.equal(refreshed_pos_ids.squeeze(0), new_pos_ids)
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_reset(self, is_hybrid_model: bool):
 

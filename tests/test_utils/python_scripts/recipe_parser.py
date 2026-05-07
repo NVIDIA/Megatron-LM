@@ -13,7 +13,44 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
 logger = logging.getLogger(__name__)
 
 DEFAULT_CADENCE = ["pr", "nightly", "mergegroup"]
-ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE)
+ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE) | {"weekly"}
+
+# Maps legacy `scope` values (encoded "when" + "which suite" together) onto the
+# new vocabulary: an L-tier (cost class) plus, where the legacy name implied a
+# trigger, a default cadence. The tier acts purely as a suite/cost label;
+# cadence remains the trigger axis.
+#
+# Only GitHub-side scopes (`mr-github-slim`, `mr-github`) are aliased onto the
+# L-tier names. GitLab-only scopes (`mr`, `mr-slim`, `unit-tests`) are
+# intentionally left as pass-through so GitLab `--scope mr*` / `--scope
+# unit-tests` continue to match recipes verbatim and don't bleed into the
+# GitHub L0 / L1 matrix.
+LEGACY_SCOPE_ALIASES = {
+    # GitHub-only scopes are aliased onto the L-tier vocabulary so the GH CI
+    # workflow can filter on `L0` / `L1`. GitLab-only scopes (`mr`, `mr-slim`)
+    # are intentionally NOT aliased: they pass through to recipe rows verbatim
+    # and remain matchable by GitLab's `--scope mr-slim` / `--scope mr` calls,
+    # without bleeding into the GitHub `L0` / `L1` matrix.
+    "mr-github-slim": ("L0", None),
+    "mr-github": ("L1", None),
+    "nightly": ("L2", ["nightly"]),
+    "weekly": ("L3", ["weekly"]),
+}
+
+
+def _apply_scope_alias(scope_value: str, explicit_cadence: Optional[List[str]]) -> tuple:
+    """Resolve a legacy scope value to (new_scope, cadence).
+
+    If the scope value is in the alias map, returns the new tier name. The
+    alias's cadence is used only when `explicit_cadence` is None — explicit
+    per-product or outer cadence always wins.
+    """
+    if scope_value not in LEGACY_SCOPE_ALIASES:
+        return scope_value, explicit_cadence
+    new_scope, alias_cadence = LEGACY_SCOPE_ALIASES[scope_value]
+    if explicit_cadence is not None or alias_cadence is None:
+        return new_scope, explicit_cadence
+    return new_scope, list(alias_cadence)
 
 
 def _validate_cadence(cadence: List[str], test_case: str) -> None:
@@ -81,9 +118,13 @@ def flatten_products(workload_manifest: dotdict) -> dotdict:
             cartesian_values = [param_dict[k] for k in cartesian_keys]
 
             # Resolve effective cadence: inner overrides outer, default loose.
-            effective_cadence = inner_cadence if inner_cadence is not None else outer_cadence
-            if effective_cadence is None:
-                effective_cadence = list(DEFAULT_CADENCE)
+            # `explicit_cadence` is None when neither inner nor outer set it,
+            # which is the only case where a legacy scope alias may inject a
+            # default cadence (e.g. scope: [nightly] -> cadence: [nightly]).
+            explicit_cadence = inner_cadence if inner_cadence is not None else outer_cadence
+            default_cadence = (
+                list(explicit_cadence) if explicit_cadence is not None else list(DEFAULT_CADENCE)
+            )
 
             param_combinations = itertools.product(*cartesian_values)
 
@@ -91,7 +132,17 @@ def flatten_products(workload_manifest: dotdict) -> dotdict:
                 # Map parameter names to their values
                 flattened = dict(zip(cartesian_keys, value_combination))
                 flattened["test_case"] = test_case
-                flattened["cadence"] = effective_cadence
+                # Apply legacy scope alias per row so that scope: [mr, nightly]
+                # produces two rows with the right (tier, cadence) each.
+                row_cadence = default_cadence
+                if "scope" in flattened:
+                    new_scope, aliased_cadence = _apply_scope_alias(
+                        flattened["scope"], explicit_cadence
+                    )
+                    flattened["scope"] = new_scope
+                    if aliased_cadence is not None:
+                        row_cadence = list(aliased_cadence)
+                flattened["cadence"] = row_cadence
                 flattened_products.append(flattened)
 
     workload_manifest.products = flattened_products
