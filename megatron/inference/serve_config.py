@@ -27,22 +27,6 @@ class ServeConfig:
     port: int = 5000
     """HTTP bind port for the OpenAI-compatible frontend."""
 
-    model_name: str = "megatron-model"
-    """Served OpenAI model name.
-
-    Echoed in HTTP responses regardless of ``strict_model_name``. The
-    ``/v1/models`` endpoint always returns this value as the single advertised
-    model id.
-    """
-
-    strict_model_name: bool = True
-    """Whether to validate the request ``model`` field against ``model_name``.
-
-    If True, requests whose ``model`` field does not match ``model_name`` are
-    rejected with HTTP 400 in OpenAI's error shape. If False, the request is
-    accepted regardless of the supplied ``model`` value.
-    """
-
     role: Literal["primary", "worker", "auto"] = "auto"
     """Per-rank role selector for the serving frontend.
 
