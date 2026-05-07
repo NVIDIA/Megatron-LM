@@ -979,6 +979,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+        # Back-compat shim: prior to the MLP-hook refactor this method was named
+        # `_forward_post_mlp` and took only (mlp_output_with_bias, residual). If a
+        # subclass still overrides the legacy name, route through it and emit a
+        # DeprecationWarning. `mlp_state` is dropped — the legacy contract didn't
+        # have it. To be removed in a future release.
+        for klass in type(self).__mro__:
+            if klass is TransformerLayer:
+                break
+            if "_forward_post_mlp" in vars(klass):
+                warnings.warn(
+                    "TransformerLayer._forward_post_mlp has been renamed to "
+                    "_apply_mlp_bda_step and gained an `mlp_state` parameter. "
+                    "Override `_apply_mlp_bda_step` instead; the legacy hook "
+                    "will be removed in a future release.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                return klass._forward_post_mlp(self, mlp_output_with_bias, residual)
+
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as offload_interface,
         )
