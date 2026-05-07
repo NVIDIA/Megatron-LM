@@ -565,6 +565,42 @@ The 417 lines still uncovered fall into three groups:
 
 These remain covered by the existing functional tests (when run on multi-GPU).
 
+---
+
+# Round 7 — dynamic_engine.py Coordinator-Path Mocks
+
+After analysing the 417 still-missing lines, the **coordinator-mode dispatch
+loop** (`schedule_requests`, ~150 lines) and **`shutdown`** (~30 lines) turned
+out to be far more mockable than the original out-of-scope analysis suggested.
+The drain logic, msgpack/Headers dispatch, state transitions, and shutdown
+cleanup are pure Python that just need fake ZMQ sockets injected.
+
+## Files Targeted (Round 7)
+
+| File | Before | After | Stmts/Miss | Test File |
+|------|--------|-------|------------|-----------|
+| `engines/dynamic_engine.py` | 61% | **69%** | 1069/330 | `engines/test_dynamic_engine_coordinator.py` |
+
+**24 new mock-based tests, 0 failures.** Validation runs:
+- New tests alone: `68ff771b91ad4f9791bbffb4df0b6e3b` — 24 passed.
+- Combined (existing + Round-6 unit tests + new coordinator tests): `0b4c3054c80c40e5ade9d53640c880c6` — **168 passed, 2 failed** (same TP=4 multi-GPU tests as before), 157 skipped, **69% on dynamic_engine.py** (87 lines newly covered vs Round 6).
+
+## Round 7 Per-File Notes
+
+### engines/dynamic_engine.py 61% → 69%
+
+The new `test_dynamic_engine_coordinator.py` exercises the `use_coordinator=True`
+branches without a real `DataParallelInferenceCoordinator`:
+
+- **Drain path** (lines 2097-2114): mocked `recv(NOBLOCK)` with callable side_effect; verifies multipart broadcast with TP_BROADCAST header byte. Empty drain still broadcasts.
+- **Subscriber path** (lines 2110-2113): `recv_multipart()` returns frames; leading TP_BROADCAST byte stripped.
+- **Header dispatch** (lines 2116-2192): SUBMIT_REQUEST → `add_request` with deserialised `SamplingParams`; SET_GENERATION_EPOCH → updates `_generation_epoch` + stamps active requests; PAUSE/UNPAUSE/SUSPEND/RESUME/STOP each verified for correct state transition AND AssertionError-from-wrong-state cases; unknown header → `UnknownHeaderError`.
+- **Generation-epoch stamping** (lines 2134-2150): no existing history (`[(0, epoch)]`), with existing history (appends `(total - 1, epoch)`), zero-token request (skips stamping).
+- **Control-signal queueing** (lines 2154-2156): two PAUSEs → first transitions, second queued.
+- **`shutdown()`** (lines 2195-2226): cancels open futures (skips done), sends DISCONNECT, closes sockets with `linger=0`, terminates context, signals STOPPED. Tested with: socket already closed (no DISCONNECT), send raises mid-shutdown (swallowed), optional `expert_parallel_zmq_communicator` / `world_zmq_communicator` present.
+
+The remaining 330 missing lines still need multi-GPU hardware running the existing `TestDynamicInferenceEngineParallel` suite (CUDA-graph capture, inner-loop scheduling, EP consensus synchronization, model-driven `post_process_requests`).
+
 ## Learnings Fed Back
 
 - Added to `run-tests.md` Known Quirks: `omegaconf` is required for `tests/unit_tests/conftest.py` to load — pip install `pytest-cov omegaconf` together when running coverage.
