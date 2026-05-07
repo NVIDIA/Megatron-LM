@@ -2328,26 +2328,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_seqlen_k=self.max_sequence_length,
         )
 
-        # Stage Mamba update kwargs; the actual GPU compute runs in the body.
-        if self.is_hybrid_model:
-            intermediate_offsets_gpu = None
-            intermediate_counts_gpu = None
-            if self.mamba_slot_allocator is not None:
-                intermediate_offsets_gpu, intermediate_counts_gpu = (
-                    self.mamba_slot_allocator.get_intermediate_cpu_data()
-                )
-            self._pending_mamba_update_kwargs = dict(
-                active_mamba_indices=self.active_mamba_indices,
-                token_to_request_idx=self.gpu_view.token_to_request_idx,
-                cu_seqlens=self.cu_active_request_query_lengths,
-                batch_dimensions=attn_dimensions,
-                padded_batch_dimensions=self.padded_batch_dimensions,
-                enable_chunked_prefill=self.is_chunked_prefill_enabled(),
-                intermediate_offsets_gpu=intermediate_offsets_gpu,
-                intermediate_counts_gpu=intermediate_counts_gpu,
-            )
-        else:
-            self._pending_mamba_update_kwargs = None
 
         # Flip NCCLAllGather dispatcher's path selector to not use allgathers.
         # _nccl_ep_dispatcher already implies ep_size > 1, so no extra EP guard.
@@ -2396,10 +2376,32 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._build_gpu_active_slices()
         self._pad_gpu_active_slices()
 
-        # Mamba metadata GPU compute (no-op on non-hybrid models).
-        if self._pending_mamba_update_kwargs is not None:
-            self.mamba_metadata.update(**self._pending_mamba_update_kwargs)
-            self._pending_mamba_update_kwargs = None
+        # Mamba metadata GPU compute (no-op on non-hybrid models). The full
+        # ``[max_requests, K]`` intermediate buffers are passed; the graphable
+        # update gathers a prefill window via ``arange + real_decode_count_gpu``
+        # and masks padding entries.
+        if self.is_hybrid_model:
+            slot_alloc = self.mamba_slot_allocator
+            synced = self._synced_counters_map
+            real_request_count_gpu = (
+                synced['total_request_count'] - synced['paused_request_count']
+            )
+            real_prefill_count_gpu = synced['num_prefill_requests']
+            real_decode_count_gpu = real_request_count_gpu - real_prefill_count_gpu
+            self.mamba_metadata.update(
+                self.active_mamba_indices,
+                self.cu_active_request_query_lengths,
+                real_decode_count_gpu=real_decode_count_gpu,
+                real_prefill_count_gpu=real_prefill_count_gpu,
+                arange_buf=self._arange_requests,
+                padded_batch_dimensions=self.padded_batch_dimensions,
+                intermediate_offsets_gpu=(
+                    slot_alloc._intermediate_offsets_gpu if slot_alloc is not None else None
+                ),
+                intermediate_counts_gpu=(
+                    slot_alloc._intermediate_counts_gpu if slot_alloc is not None else None
+                ),
+            )
 
         # Hooks fired so external owners (e.g. the text-generation controller)
         # can run their own per-bucket toggles inside the captured body.
@@ -3131,10 +3133,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Clear intermediate offset entries for released requests (CPU writes).
         if self.mamba_slot_allocator is not None:
             sa = self.mamba_slot_allocator
-            sa._intermediate_counts_cpu[request_indexes] = 0
-            sa._intermediate_offsets_cpu[request_indexes] = 0
-            sa._intermediate_block_ids_cpu[request_indexes] = -1
-            sa._eos_cache_block_id_cpu[request_indexes] = -1
+            sa._intermediate_counts_gpu[request_indexes] = 0
+            sa._intermediate_offsets_gpu[request_indexes] = 0
+            sa._intermediate_block_ids_gpu[request_indexes] = -1
+            sa._eos_cache_block_id_gpu[request_indexes] = -1
 
     def resume_paused_requests(
         self, active_request_count: int, newly_paused_request_ids: torch.Tensor
