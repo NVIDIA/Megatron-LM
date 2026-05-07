@@ -15,6 +15,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.logprobs import calculate_log_probs
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -578,9 +579,8 @@ class TestDynamicContext:
         mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0].item()
         assert mamba_idx >= 0
 
-        # Mamba state zeroing is deferred until transfer_bookkeeping_to_gpu().
+        # Mamba state zeroing runs as part of the attention-state init.
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
         assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx] == 0)
         assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx] == 0)
 
@@ -650,10 +650,11 @@ class TestDynamicContext:
         # 3. The active requests will also have some requests that have to be paused because of reaching max token limit within block
         # 4. Some of these requests will be resumed.
         # Setup is as follows :
-        # Request ids 0, 1 are paused
-        # Request ids 2, 4, 9 are active requests
-        # Request ids 3 7 8 have completed
-        # Request ids 5 and 6 will require on more block later on because they finished their current block
+        # Indices 0-7 active, indices 8-9 paused
+        # Request ids 0, 1 are paused (at indices 8, 9)
+        # Request ids 2, 4, 9 are active requests that stay active
+        # Request ids 3, 7, 8 have completed
+        # Request ids 5 and 6 will require one more block later on because they finished their current block
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -688,30 +689,34 @@ class TestDynamicContext:
             dynamic_context.kv_block_allocator.total_avail,
             dynamic_context.kv_block_allocator.total_avail + 10,
         )
-        dynamic_context.request_to_kv_block_ids[3][
+        dynamic_context.request_to_kv_block_ids[1][
             1
         ] = dynamic_context.kv_block_allocator.total_avail  # Assign one extra block  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
-        # For 0, 1, 5, 6, the total number of tokens in last block is block size -1, so that they will all need extra blocks
-        dynamic_context.request_kv_length_offsets[0:2] = dynamic_context.block_size_tokens - 1
-        dynamic_context.request_kv_length_offsets[5:7] = dynamic_context.block_size_tokens - 1
-        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size
-        dynamic_context.request_kv_length_offsets[3] = dynamic_context.block_size_bytes + 10
+        # IDs 5, 6 (at indices 3, 4) and IDs 0, 1 (paused at indices 8, 9)
+        # have block_size-1 tokens in their last block, so they all need extra blocks.
+        dynamic_context.request_kv_length_offsets[3:5] = dynamic_context.block_size_tokens - 1
+        dynamic_context.request_kv_length_offsets[8:10] = dynamic_context.block_size_tokens - 1
+        # ID 3 (at index 1) is completed and required 2 blocks.
+        dynamic_context.request_kv_length_offsets[1] = dynamic_context.block_size_bytes + 10
         dynamic_context.request_query_lengths[0:total_request_count] = (
             1  # Everything is in decode phase
         )
 
-        dynamic_context.request_ids[0:total_request_count] = torch.arange(0, total_request_count)
+        # Layout: [active(IDs 2-9) | paused(IDs 0,1)]
+        dynamic_context.request_ids[0:total_request_count] = torch.tensor(
+            [2, 3, 4, 5, 6, 7, 8, 9, 0, 1], device='cuda'
+        )
         dynamic_context.request_kv_block_counts[0:total_request_count] = 1
-        dynamic_context.request_kv_block_counts[3] = 2  # 3rd block alone requies 2 blocks
+        dynamic_context.request_kv_block_counts[1] = 2  # ID 3 (index 1) requires 2 blocks
         dynamic_context.request_last_kv_block_id[0:total_request_count] = torch.arange(
             0, total_request_count
         )
-        dynamic_context.request_last_kv_block_id[3] = 11
+        dynamic_context.request_last_kv_block_id[1] = 11  # ID 3 (index 1)
         dynamic_context.request_last_kv_block_offset[0:total_request_count] = 10
-        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size
-        dynamic_context.request_last_kv_block_offset[0:2] = dynamic_context.block_size_tokens - 1
-        dynamic_context.request_last_kv_block_offset[5:7] = dynamic_context.block_size_tokens - 1
+        # IDs 5, 6 (indices 3, 4) and paused IDs 0, 1 (indices 8, 9)
+        dynamic_context.request_last_kv_block_offset[3:5] = dynamic_context.block_size_tokens - 1
+        dynamic_context.request_last_kv_block_offset[8:10] = dynamic_context.block_size_tokens - 1
 
         if is_hybrid_model:
             # Dummy fill for states to be non-zero before update
@@ -725,45 +730,48 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=next_tokens
         )
 
-        # Then set up the test data
-        dynamic_context.request_ids[0:10] = torch.tensor(
-            [0, 1, 5, 6, 4, 2, 9, 7, 8, 9], device='cpu'
-        )
-
-        # Now verify the values
-        assert dynamic_context.request_ids[0:10].cpu().numpy().tolist() == [
-            0,
-            1,
-            5,
-            6,
-            4,
-            2,
-            9,
-            7,
-            8,
-            9,
-        ]
-
+        # Verify structural invariants.
         assert dynamic_context.paused_request_count == 0
         assert dynamic_context.total_request_count == 7
         assert dynamic_context.active_token_count == 7
 
-        # The first four are zero because they have all obtained a new block
-        assert dynamic_context.request_last_kv_block_offset[0:10].cpu().numpy().tolist() == [
-            0,
-            0,
-            0,
-            0,
-            11,
-            11,
-            11,
-            10,
-            10,
-            10,
-        ]
+        # Layout invariant: [active | paused | dead].
+        active_count = dynamic_context.total_request_count - dynamic_context.paused_request_count
+        active_ids = set(dynamic_context.request_ids[:active_count].cpu().tolist())
+        paused_ids = set(
+            dynamic_context.request_ids[active_count : dynamic_context.total_request_count]
+            .cpu()
+            .tolist()
+        )
+        assert active_ids == {0, 1, 2, 4, 5, 6, 9}  # IDs 3, 7, 8 finished
+        assert paused_ids == set()  # no paused requests
+        # Dead zone should not contain any surviving IDs (stale data cleared).
+        dead_ids = set(
+            dynamic_context.request_ids[dynamic_context.total_request_count : 10].cpu().tolist()
+        )
+        assert dead_ids.isdisjoint(active_ids)
+
+        # IDs that stayed active have offset 10+1=11; IDs that got new blocks
+        # have offset (127+1)%128=0. Check only the live region [0:total).
+        live_offsets = (
+            dynamic_context.request_last_kv_block_offset[: dynamic_context.total_request_count]
+            .cpu()
+            .tolist()
+        )
+        for i, rid in enumerate(
+            dynamic_context.request_ids[: dynamic_context.total_request_count].cpu().tolist()
+        ):
+            if rid in {2, 4, 9}:
+                assert (
+                    live_offsets[i] == 11
+                ), f"request {rid} at index {i}: expected offset 11, got {live_offsets[i]}"
+            else:
+                assert (
+                    live_offsets[i] == 0
+                ), f"request {rid} at index {i}: expected offset 0, got {live_offsets[i]}"
         assert dynamic_context.token_to_input_ids[
             : dynamic_context.active_token_count
-        ].cpu().numpy().tolist() == [0, 1, 5, 6, 4, 2, 9]
+        ].cpu().numpy().tolist() == [2, 9, 4, 5, 6, 0, 1]
 
         assert dynamic_context.token_to_pos_ids[
             : dynamic_context.active_token_count
@@ -1083,17 +1091,7 @@ class TestDynamicContext:
             current_token_idx += data["prefill_len"]
 
         # Simulate prefill step
-        total_active_tokens = dynamic_context.active_token_count
         vocab_size = 50000
-
-        # Populate gpu_view for calculate_log_probs (which reads from gpu_view).
-        dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
-
-        # logits and new_tokens must be on GPU (calculate_log_probs uses gpu_view).
-        prefill_logits = torch.randn(
-            1, total_active_tokens, vocab_size, device='cuda', dtype=torch.float32
-        )
 
         # New tokens from prefill (one token per active request)
         num_active_requests = (
@@ -1101,9 +1099,25 @@ class TestDynamicContext:
         )
         prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
 
+        dynamic_context.initialize_attention_state()
+        # Match production: logits shape is [1, padded_active_token_count, vocab_size].
+        prefill_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
+        # Mark all active requests as wanting log probs.
+        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
+
         # Call the function for prefill
-        prefill_log_probs, _ = dynamic_context.calculate_log_probs(
-            prefill_logits, prefill_new_tokens
+        prefill_log_probs, _ = calculate_log_probs(
+            dynamic_context,
+            prefill_logits,
+            prefill_new_tokens,
+            log_prob_request_count=num_active_requests,
         )
 
         # Calculate expected prefill log probs for the selected tokens
@@ -1125,8 +1139,11 @@ class TestDynamicContext:
 
             for j, token in enumerate(request_tokens):
                 assert (
-                    prefill_log_probs[i][j]
-                    == expected_prefill_log_probs[initial_token_offset + j, token].item()
+                    abs(
+                        prefill_log_probs[i][j]
+                        - expected_prefill_log_probs[initial_token_offset + j, token].item()
+                    )
+                    < 1e-5
                 )
 
         # Simulate decode step
@@ -1137,16 +1154,29 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=prefill_new_tokens
         )
 
-        # Populate gpu_view again after update_requests modified bookkeeping state.
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
 
         # Generate new logits for the decode step. Now each request contributes 1 token.
-        decode_logits = torch.randn(
-            1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
-        )
         decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
-        decode_log_probs, _ = dynamic_context.calculate_log_probs(decode_logits, decode_new_tokens)
+
+        dynamic_context.initialize_attention_state()
+        decode_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
+        # Mark all active requests as wanting log probs.
+        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
+
+        decode_log_probs, _ = calculate_log_probs(
+            dynamic_context,
+            decode_logits,
+            decode_new_tokens,
+            log_prob_request_count=num_active_requests,
+        )
 
         # Verify the stored decode log probabilities
         expected_decode_log_probs = torch.nn.functional.log_softmax(
@@ -1157,7 +1187,7 @@ class TestDynamicContext:
             assert len(decode_log_probs[i]) == 1, len(decode_log_probs[i])
 
             token = decode_new_tokens[i].item()
-            assert decode_log_probs[i][0] == expected_decode_log_probs[i, token].item()
+            assert abs(decode_log_probs[i][0] - expected_decode_log_probs[i, token].item()) < 1e-5
 
         # Simulate mixed prefill and decode step (adding a new request to existing context)
         dynamic_context.update_requests(
@@ -1188,11 +1218,13 @@ class TestDynamicContext:
         # This step will involve both prefill (for the new request) and decode (for existing requests).
 
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
 
-        total_active_tokens_mixed_step = dynamic_context.active_token_count
         mixed_step_logits = torch.randn(
-            1, total_active_tokens_mixed_step, vocab_size, device='cuda', dtype=torch.float32
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
         )
 
         num_active_requests_mixed_step = (
@@ -1202,8 +1234,17 @@ class TestDynamicContext:
             0, 100, (num_active_requests_mixed_step,), device='cuda'
         ).long()
 
-        mixed_step_log_probs, _ = dynamic_context.calculate_log_probs(
-            mixed_step_logits, mixed_step_new_tokens
+        # Mark all active requests as wanting log probs.
+        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.active_request_metadata["return_log_probs"][
+            :num_active_requests_mixed_step
+        ] = True
+
+        mixed_step_log_probs, _ = calculate_log_probs(
+            dynamic_context,
+            mixed_step_logits,
+            mixed_step_new_tokens,
+            log_prob_request_count=num_active_requests_mixed_step,
         )
 
         expected_mixed_step_log_probs = (
@@ -1229,18 +1270,24 @@ class TestDynamicContext:
                 for j in range(expected_len - 1):
                     # For prompt tokens
                     assert (
-                        mixed_step_log_probs[i][j]
-                        == expected_mixed_step_log_probs[
-                            current_global_token_offset + j, prompt_tokens[j]
-                        ].item()
+                        abs(
+                            mixed_step_log_probs[i][j]
+                            - expected_mixed_step_log_probs[
+                                current_global_token_offset + j, prompt_tokens[j]
+                            ].item()
+                        )
+                        < 1e-5
                     )
 
                 # For the newly sampled token
                 assert (
-                    mixed_step_log_probs[i][expected_len - 1]
-                    == expected_mixed_step_log_probs[
-                        current_global_token_offset + expected_len - 1, new_sampled_token
-                    ].item()
+                    abs(
+                        mixed_step_log_probs[i][expected_len - 1]
+                        - expected_mixed_step_log_probs[
+                            current_global_token_offset + expected_len - 1, new_sampled_token
+                        ].item()
+                    )
+                    < 1e-5
                 )
 
                 current_global_token_offset += expected_len
@@ -1253,13 +1300,415 @@ class TestDynamicContext:
                 # For decode, the log prob is for the single new token
                 new_sampled_token = mixed_step_new_tokens[i].item()
                 assert (
-                    mixed_step_log_probs[i][0]
-                    == expected_mixed_step_log_probs[
-                        current_global_token_offset, new_sampled_token
-                    ].item()
+                    abs(
+                        mixed_step_log_probs[i][0]
+                        - expected_mixed_step_log_probs[
+                            current_global_token_offset, new_sampled_token
+                        ].item()
+                    )
+                    < 1e-5
                 )
 
                 current_global_token_offset += expected_len
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
+    @rounder_override(64)
+    def test_calculate_top_n_logprobs(self, skip_prompt_log_probs: bool):
+        """Exercise the top-n path of calculate_log_probs for prefill and decode.
+
+        The top-n computation is folded into the same graphable kernel as the log-softmax,
+        so this validates:
+          - the per-request dict structure (entry count, tuple arity),
+          - skip_prompt_log_probs=True trims prefill to the last token only,
+          - values/indices match a reference torch.topk over the log-softmax.
+        """
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        # Three requests with different prompt lengths.
+        request_lengths = [10, 5, 7]
+        for i, req_len in enumerate(request_lengths):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=1001 + i,
+                    prompt_tokens=torch.randint(0, 100, (req_len,), device='cuda'),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=dynamic_context.max_tokens - req_len
+                    ),
+                )
+            )
+
+        num_active_requests = (
+            dynamic_context.total_request_count - dynamic_context.paused_request_count
+        )
+        vocab_size = 50000
+        top_n = 5
+
+        def _set_active_metadata(n: int):
+            # build_cpu_active_slices (run from initialize_attention_state) overwrites
+            # active_request_metadata from request_metadata, so we patch it after.
+            dynamic_context.active_request_metadata["top_n_logprobs"][:n].fill_(top_n)
+            dynamic_context.active_request_metadata["skip_prompt_log_probs"][:n].fill_(
+                skip_prompt_log_probs
+            )
+            dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+            dynamic_context.active_request_metadata["return_log_probs"][:n] = True
+
+        prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
+
+        dynamic_context.initialize_attention_state()
+        prefill_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
+        _set_active_metadata(num_active_requests)
+
+        _, top_n_dict = calculate_log_probs(
+            dynamic_context,
+            prefill_logits,
+            prefill_new_tokens,
+            log_prob_request_count=num_active_requests,
+            top_n_max=top_n,
+        )
+
+        assert top_n_dict is not None and len(top_n_dict) == num_active_requests
+        expected_log_softmax = torch.nn.functional.log_softmax(prefill_logits.squeeze(0), dim=-1)
+        token_offset = 0
+        for i, req_len in enumerate(request_lengths):
+            entry = top_n_dict[i]
+            expected_count = 1 if skip_prompt_log_probs else req_len
+            assert (
+                len(entry) == expected_count
+            ), f"request {i}: expected {expected_count} tuples, got {len(entry)}"
+            # Each tuple has (values, indices) of shape [top_n].
+            for values, indices in entry:
+                assert values.shape == (top_n,)
+                assert indices.shape == (top_n,)
+
+            # Validate values match a reference topk over the correct logit rows.
+            if skip_prompt_log_probs:
+                row_idxs = [token_offset + req_len - 1]
+            else:
+                row_idxs = list(range(token_offset, token_offset + req_len))
+            for j, row_idx in enumerate(row_idxs):
+                expected = torch.topk(expected_log_softmax[row_idx], k=top_n)
+                got_values, got_indices = entry[j]
+                # Kernel's _topk uses sorted=False; sort by value to get a stable comparison.
+                got_sorted_v, perm = torch.sort(got_values, descending=True)
+                torch.testing.assert_close(got_sorted_v, expected.values.cpu())
+                torch.testing.assert_close(got_indices[perm], expected.indices.cpu())
+            token_offset += req_len
+
+        # ── Decode step ──
+        active_requests_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask, new_tokens=prefill_new_tokens
+        )
+
+        decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
+
+        dynamic_context.initialize_attention_state()
+        decode_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
+        _set_active_metadata(num_active_requests)
+
+        _, decode_top_n = calculate_log_probs(
+            dynamic_context,
+            decode_logits,
+            decode_new_tokens,
+            log_prob_request_count=num_active_requests,
+            top_n_max=top_n,
+        )
+
+        assert decode_top_n is not None and len(decode_top_n) == num_active_requests
+        decode_expected = torch.nn.functional.log_softmax(decode_logits.squeeze(0), dim=-1)
+        for i in range(num_active_requests):
+            entry = decode_top_n[i]
+            assert len(entry) == 1  # decode: exactly one token per request
+            values, indices = entry[0]
+            assert values.shape == (top_n,) and indices.shape == (top_n,)
+            expected = torch.topk(decode_expected[i], k=top_n)
+            # Kernel's _topk uses sorted=False; sort by value to get a stable comparison.
+            sorted_v, perm = torch.sort(values, descending=True)
+            torch.testing.assert_close(sorted_v, expected.values.cpu())
+            torch.testing.assert_close(indices[perm], expected.indices.cpu())
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "log_prob_indices",
+        [
+            [0, 2],  # partial mask: requests 0 and 2 want log probs
+            [0, 1, 2],  # full mask: K == num_active (still K < padded_count)
+            [1],  # single masked request
+        ],
+    )
+    @rounder_override(64)
+    def test_calculate_log_probs_partial_mask(self, log_prob_indices):
+        """Verify per-request masking: masked-out requests get None in the result list,
+        and masked-in requests get correctly-shaped values matching reference log_softmax.
+        """
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        request_lengths = [6, 4, 5]
+        for i, req_len in enumerate(request_lengths):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=2001 + i,
+                    prompt_tokens=torch.randint(0, 100, (req_len,), device='cuda'),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=dynamic_context.max_tokens - req_len
+                    ),
+                )
+            )
+
+        num_active = dynamic_context.total_request_count - dynamic_context.paused_request_count
+        vocab_size = 50000
+        log_prob_request_count = len(log_prob_indices)
+
+        def _set_mask():
+            dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+            for i in log_prob_indices:
+                dynamic_context.active_request_metadata["return_log_probs"][i] = True
+
+        # ── Prefill step ──
+        new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
+
+        dynamic_context.initialize_attention_state()
+        logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
+        _set_mask()
+
+        log_probs, _ = calculate_log_probs(
+            dynamic_context, logits, new_tokens, log_prob_request_count=log_prob_request_count
+        )
+
+        for i, req_len in enumerate(request_lengths):
+            if i in log_prob_indices:
+                assert log_probs[i] is not None
+                assert len(log_probs[i]) == req_len
+            else:
+                assert log_probs[i] is None
+
+        # Verify values for each masked-in request against reference log_softmax.
+        expected = torch.nn.functional.log_softmax(logits.squeeze(0), dim=-1)
+        token_offset = 0
+        for i, req_len in enumerate(request_lengths):
+            if i in log_prob_indices:
+                tok_view = dynamic_context.token_to_input_ids[token_offset : token_offset + req_len]
+                shifted = tok_view[1:].tolist() + [new_tokens[i].item()]
+                for j, tok in enumerate(shifted):
+                    assert abs(log_probs[i][j] - expected[token_offset + j, tok].item()) < 1e-5
+            token_offset += req_len
+
+        # ── Decode step ──
+        active_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
+        dynamic_context.update_requests(active_requests_mask=active_mask, new_tokens=new_tokens)
+
+        decode_new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
+
+        dynamic_context.initialize_attention_state()
+        decode_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
+        _set_mask()
+
+        decode_log_probs, _ = calculate_log_probs(
+            dynamic_context,
+            decode_logits,
+            decode_new_tokens,
+            log_prob_request_count=log_prob_request_count,
+        )
+
+        decode_expected = torch.nn.functional.log_softmax(decode_logits.squeeze(0), dim=-1)
+        for i in range(num_active):
+            if i in log_prob_indices:
+                assert decode_log_probs[i] is not None and len(decode_log_probs[i]) == 1
+                assert (
+                    abs(
+                        decode_log_probs[i][0]
+                        - decode_expected[i, decode_new_tokens[i].item()].item()
+                    )
+                    < 1e-5
+                )
+            else:
+                assert decode_log_probs[i] is None
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_calculate_log_probs_speculative(self):
+        """Speculative-decoding path of calculate_log_probs (decode-only batch).
+
+        Validates that the gather kernel returns `accepted_count + 1` log-probs
+        per request: log-probs of the accepted speculative tokens (positions
+        `0..k-1`) followed by the freshly sampled token at position `k`.
+
+        Covers all three accepted_count regimes in a single batch:
+          - request 0: both spec tokens accepted (k = num_speculative_tokens)
+          - request 1: first spec token accepted, second rejected
+          - request 2: no spec tokens accepted
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        num_spec = 2
+        spec_plus_one = num_spec + 1
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.05,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_speculative_tokens=num_spec,
+        )
+
+        # Add 3 prefill requests; we'll transition them to decode below.
+        request_lengths = [10, 5, 7]
+        for i, req_len in enumerate(request_lengths):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=1001 + i,
+                    prompt_tokens=torch.randint(0, 100, (req_len,), device='cuda'),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=dynamic_context.max_tokens - req_len
+                    ),
+                )
+            )
+
+        num_active = dynamic_context.total_request_count - dynamic_context.paused_request_count
+
+        # Prefill step + transition to decode-only via update_requests.
+        dynamic_context.initialize_attention_state()
+        active_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
+        prefill_new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
+        # Speculative-token layout matches `_sampled_mtp_tokens_cuda`: [num_spec, num_active].
+        new_speculative_tokens = torch.randint(
+            0, 100, (num_spec, num_active), device='cuda', dtype=torch.long
+        )
+        dynamic_context.update_requests(
+            active_requests_mask=active_mask,
+            new_tokens=prefill_new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # Decode step setup.
+        dynamic_context.initialize_attention_state()
+        assert dynamic_context.num_decode_requests == num_active
+
+        # Mark all requests as wanting log probs.
+        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.active_request_metadata["return_log_probs"][:num_active] = True
+
+        # Decode logits: padded to padded_active_token_count to match production.
+        vocab_size = 50000
+        decode_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
+
+        # accepted_tokens layout matches the controller's `_accepted_tokens_per_request`:
+        # shape [max_requests, num_speculative_tokens]; -1 marks rejected slots.
+        spec_tokens = [(42, 17), (99, -1), (-1, -1)]
+        accepted_counts = [2, 1, 0]
+        accepted_tokens = torch.full(
+            (dynamic_context.max_requests, num_spec), -1, device='cuda', dtype=torch.long
+        )
+        for i, (a, b) in enumerate(spec_tokens):
+            accepted_tokens[i, 0] = a
+            accepted_tokens[i, 1] = b
+        accepted_token_counts = torch.tensor(
+            accepted_counts + [0] * (dynamic_context.max_requests - num_active),
+            device='cuda',
+            dtype=torch.long,
+        )
+
+        # Newly sampled tokens (from the verifier on this step). Padded to
+        # max_requests since gather_kernel reads up to padded_active_request_count.
+        new_tokens = torch.randint(
+            0, 100, (dynamic_context.max_requests,), device='cuda', dtype=torch.long
+        )
+
+        # Run speculative calculate_log_probs.
+        log_probs, _ = calculate_log_probs(
+            dynamic_context,
+            decode_logits,
+            new_tokens,
+            log_prob_request_count=num_active,
+            accepted_tokens=accepted_tokens,
+            accepted_token_counts=accepted_token_counts,
+        )
+
+        # Reference: log_softmax row-wise over the decode logit rows. Then for
+        # each request, verify that log_probs[i][j] matches the expected token
+        # at row (i * spec_plus_one + j) for j in [0, accepted_count + 1).
+        expected_log_softmax = torch.nn.functional.log_softmax(decode_logits.squeeze(0), dim=-1)
+
+        for i in range(num_active):
+            ac = accepted_counts[i]
+            expected_count = ac + 1  # accepted spec tokens + new token
+            assert log_probs[i] is not None
+            assert (
+                len(log_probs[i]) == expected_count
+            ), f"Request {i}: expected {expected_count} log_probs, got {len(log_probs[i])}"
+
+            # Positions 0..ac-1: log_prob of accepted spec tokens.
+            for j in range(ac):
+                spec_token = spec_tokens[i][j]
+                row = i * spec_plus_one + j
+                expected = expected_log_softmax[row, spec_token].item()
+                assert (
+                    abs(log_probs[i][j] - expected) < 1e-5
+                ), f"Request {i}, position {j}: got {log_probs[i][j]}, expected {expected}"
+
+            # Position ac: log_prob of the newly sampled token.
+            new_token = new_tokens[i].item()
+            row = i * spec_plus_one + ac
+            expected = expected_log_softmax[row, new_token].item()
+            assert (
+                abs(log_probs[i][ac] - expected) < 1e-5
+            ), f"Request {i}, new token: got {log_probs[i][ac]}, expected {expected}"
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -1827,6 +2276,143 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_chunked_prefill_continuation_while_paused(self):
+        """
+        Adding the next chunk of a chunked-prefill request while another
+        request is paused must not corrupt the [active | paused | dead]
+        layout. The new chunk has to land at the active boundary, with
+        paused entries shifting one slot to the right and the hidden
+        chunked-prefill record (sitting at total_request_count) rolling
+        into the new active slot so its KV blocks survive.
+
+        The scheduler reaches this path via the is_continuing_chunked_prefill
+        bypass in schedule_chunked_prefill, which lets add_request fire even
+        when paused_request_count > 0.
+        """
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.05,
+            block_size_tokens=128,
+            max_tokens=None,
+            enable_chunked_prefill=True,
+            max_requests=16,
+        )
+        bs = dynamic_context.block_size_tokens
+
+        # Two decode requests; index 0 will be parked at the block boundary
+        # so update_requests is forced to pause it.
+        req10 = DynamicInferenceRequest(
+            request_id=10,
+            prompt_tokens=torch.arange(0, 4, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        req11 = DynamicInferenceRequest(
+            request_id=11,
+            prompt_tokens=torch.arange(0, 4, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(req10)
+        dynamic_context.add_request(req11)
+
+        # Pretend prefill already happened: both requests are now in decode
+        # mode. Index 0 sits at the block boundary (offset == bs - 1) so the
+        # next forward step will demand a new block for it.
+        dynamic_context.request_in_prefill_status_tensor[0:2] = 0
+        dynamic_context.request_query_lengths[0:2] = 1
+        dynamic_context.request_kv_length_offsets[0] = bs - 1
+        dynamic_context.request_kv_length_offsets[1] = 5
+        dynamic_context.request_last_kv_block_offset[0] = bs - 1
+        dynamic_context.request_last_kv_block_offset[1] = 5
+        # Clear active_token_count populated by the two prefill add_requests
+        # so the chunked prefill below installs its own active tokens cleanly.
+        dynamic_context.active_token_count = 0
+
+        # Add chunk 1 of a chunked prefill request.
+        req999 = DynamicInferenceRequest(
+            request_id=999,
+            prompt_tokens=torch.arange(0, 200, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.chunked_prefill_request_id = 999
+        dynamic_context.add_request(req999, prefill_chunk_length=8)
+
+        # Snapshot the chunked prefill's KV block before update_requests so
+        # we can later assert it follows the request to its post-rotation slot.
+        chunked_kv_block_before = dynamic_context.request_to_kv_block_ids[2, 0].item()
+        assert chunked_kv_block_before != -1
+
+        # Drain the active block pool so request 10 cannot resume after
+        # being paused; keep the paused-pool capacity high so request 10
+        # isn't immediately evicted out of the system either.
+        dynamic_context.kv_block_allocator.total_avail = 0
+        dynamic_context.kv_block_allocator.paused_count = 100
+
+        # update_requests pauses request 10, keeps request 11 active, and
+        # hides chunked 999 just past total_request_count.
+        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask, new_tokens=new_tokens
+        )
+
+        # Verify the engineered post-step layout:
+        #   index 0: active decode 11
+        #   index 1: paused decode 10
+        #   index 2: hidden chunked 999 (just past total_request_count)
+        assert dynamic_context.paused_request_count == 1
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[0].item() == 11
+        assert dynamic_context.request_ids[1].item() == 10
+        assert dynamic_context.request_ids[2].item() == 999
+
+        # Now simulate the scheduler dispatching the next chunk for 999
+        # while paused_request_count > 0 — the bug path.
+        req999.finished_chunk_token_count = 8
+        dynamic_context.add_request(req999, prefill_chunk_length=8)
+
+        # The new chunk must land at the active boundary (index 1), the
+        # paused decode must shift to index 2, and the chunked's KV block
+        # must follow the request to its new slot.
+        assert dynamic_context.total_request_count == 3
+        assert dynamic_context.paused_request_count == 1
+        new_active_count = (
+            dynamic_context.total_request_count - dynamic_context.paused_request_count
+        )
+        assert new_active_count == 2
+
+        assert dynamic_context.request_ids[0].item() == 11, (
+            f"Active decode 11 should stay at index 0, got "
+            f"{dynamic_context.request_ids[0].item()}"
+        )
+        assert dynamic_context.request_ids[1].item() == 999, (
+            f"New chunked chunk should land at the active boundary "
+            f"(index 1); without the fix it would land at total (index 2) "
+            f"in the paused region. Got request "
+            f"{dynamic_context.request_ids[1].item()}"
+        )
+        assert dynamic_context.request_ids[2].item() == 10, (
+            f"Paused decode 10 should be shifted to index 2, got request "
+            f"{dynamic_context.request_ids[2].item()}"
+        )
+
+        # KV block of the chunked's first chunk must follow the request, or
+        # the next forward step would see a clobbered block table.
+        assert (
+            dynamic_context.request_to_kv_block_ids[1, 0].item()
+            == chunked_kv_block_before
+        ), (
+            f"Chunked prefill's KV block must follow the request to its "
+            f"new position; expected {chunked_kv_block_before} at index 1, "
+            f"got {dynamic_context.request_to_kv_block_ids[1, 0].item()}"
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_update_requests_speculative(self):
         """Test update_requests correctly interleaves sampled and speculative tokens."""
 
@@ -2334,7 +2920,7 @@ class TestDynamicContext:
 
         # Ref counts on the shared full blocks should be 2.
         for bid in first_full_blocks:
-            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item() == 2
 
         # Second request should skip the 3 full cached blocks (96 tokens),
         # leaving only the trailing tokens as the query.
@@ -2434,17 +3020,17 @@ class TestDynamicContext:
 
         # Verify initial ref counts are 2.
         for bid in shared_blocks:
-            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item() == 2
 
         # Release one request. Ref counts should decrement to 1.
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         for bid in shared_blocks:
-            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 1
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item() == 1
 
         # Blocks should still be discoverable via hash map.
         for bid in shared_blocks:
-            h = ctx.kv_block_allocator.block_hashes[bid].item()
-            assert h in ctx.kv_block_allocator.kv_hash_to_block_id
+            h = ctx.kv_block_allocator.pc_state.block_hashes[bid].item()
+            assert h in ctx.prefix_cache_registry.kv_hash_to_block_id
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2520,8 +3106,8 @@ class TestDynamicContext:
         assert new_block != shared_b1
 
         # Shared blocks should remain intact with ref count 2.
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b0].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b1].item() == 2
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2750,13 +3336,14 @@ class TestDynamicContext:
         shared_b1 = ctx.request_to_kv_block_ids[0, 1].item()
 
         # Both blocks should be safely shared with ref count 2
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b0].item() == 2
 
-        # Mock the state to make req1 paused and req2 active
+        # Mock the state to make req2 active and req1 paused.
+        # Layout: [active | paused] => request_ids[0] = active (req2), request_ids[1] = paused (req1).
         ctx.paused_request_count = 1
         ctx.total_request_count = 2
-        ctx.request_ids[0] = 1
-        ctx.request_ids[1] = 2
+        ctx.request_ids[0] = 2
+        ctx.request_ids[1] = 1
         ctx.request_kv_block_counts[0] = 2
         ctx.request_kv_block_counts[1] = 2
 
@@ -2775,8 +3362,8 @@ class TestDynamicContext:
         assert evicted_ids[0].item() == 1
 
         # req2 remains active, so the shared blocks should drop to a ref count of 1
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 1
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b0].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b1].item() == 1
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2981,11 +3568,11 @@ class TestDynamicContext:
         assert ctx.request_kv_block_counts[1].item() == 4
 
         # Verify block references updated appropriately
-        assert ctx.kv_block_allocator.block_ref_counts[req1_blocks[2]].item() == 2
-        assert ctx.kv_block_allocator.block_ref_counts[req1_blocks[3]].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[req1_blocks[2]].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[req1_blocks[3]].item() == 2
 
     # ------------------------------------------------------------------ #
-    #  Tests for active_logit_idxs / last_token_logits / pad_active_slices
+    #  Tests for active_logit_idxs / last_token_logits / _pad_gpu_active_slices
     # ------------------------------------------------------------------ #
 
     def _build_speculative_ctx(self, num_speculative_tokens=2, block_size=256):
@@ -3031,7 +3618,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_active_slices_speculative_decode_only(self):
+    def test_pad_gpu_active_slices_speculative_decode_only(self):
         """Verify active_logit_idxs for a decode-only batch with speculative tokens."""
         num_decode = 3
         num_spec = 2
@@ -3056,7 +3643,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_active_slices_speculative_mixed_batch(self):
+    def test_pad_gpu_active_slices_speculative_mixed_batch(self):
         """Verify active_logit_idxs for a mixed decode+prefill batch with speculative tokens."""
         num_decode = 2
         num_spec = 2
@@ -3097,7 +3684,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_active_slices_speculative_all_prefill(self):
+    def test_pad_gpu_active_slices_speculative_all_prefill(self):
         """Verify active_logit_idxs with only prefill requests (no decode) and speculative tokens."""
         num_spec = 2
         ctx = self._build_speculative_ctx(num_speculative_tokens=num_spec)
@@ -3130,7 +3717,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_active_slices_no_speculative_tokens(self):
+    def test_pad_gpu_active_slices_no_speculative_tokens(self):
         """Verify active_logit_idxs without speculative tokens matches cumsum - 1."""
         ctx = self._build_speculative_ctx(num_speculative_tokens=0)
 

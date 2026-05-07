@@ -10,7 +10,8 @@ class ContextGPUView:
     sampling, log-probs, speculative verification) uses to read context state.
     CPU bookkeeping code accesses context tensors directly.
 
-    Populated once per step by ``DynamicInferenceContext.transfer_bookkeeping_to_gpu()``.
+    Populated once per step inside ``DynamicInferenceContext.run_attn_init_graph_body``
+    via a single coalesced cudaMemcpyAsync from the matching pinned CPU buffer.
     All tensors have fixed addresses for CUDA graph compatibility.
 
     Convention:
@@ -22,6 +23,12 @@ class ContextGPUView:
     slice of that buffer. This matches the pinned-CPU-buffer layout in
     :class:`DynamicInferenceContext` so that the per-step H2D transfer is a
     single ``cudaMemcpyAsync`` instead of one per field.
+
+    Per-step MHA fields (cumulative query lengths, kv sequence lengths,
+    padded block table) and per-step Mamba fields (batch indices, seq_idx,
+    cu_seqlens, chunk and conv metadata) are derived on GPU from these
+    sources after the H2D, so they live as separate static tensors on the
+    context / on :class:`MambaMetadata` — not in this view.
     """
 
     def __init__(
@@ -30,84 +37,36 @@ class ContextGPUView:
         max_tokens: int,
         max_kv_blocks: int,
         device: torch.device,
-        max_mamba_chunks: int = 0,
+        is_hybrid: bool = False,
     ):
         # Field layout (must match DynamicInferenceContext's CPU buffer layout):
         #   int64 token fields first (auto 8-byte alignment), then int32 token
-        #   fields, then int32 request fields, then int32 MHA fields, then
-        #   int32 Mamba fields (hybrid models only; omitted when
-        #   max_mamba_chunks == 0).
+        #   fields, then int32/float32 request fields, then the
+        #   request-to-kv-block-ids matrix, then the request-to-mamba-state-idx
+        #   vector (hybrid models only).
         tok_int64_bytes = max_tokens * 8  # 2 fields of int64 = 8 bytes/elem
         tok_int32_bytes = max_tokens * 4  # 4 fields of int32 = 4 bytes/elem
         # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
         # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
         # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
+        # `request_query_lengths` and `active_request_last_token_idxs` reserve one extra slot.
         req_4byte_bytes = max_requests * 4
+        req_4byte_with_sentinel_bytes = (max_requests + 1) * 4
 
-        # MHA section: 5 fields shared by both graphed and non-graphed MHAMetadata
-        # (only one is active per step, so sharing storage is fine).
-        #   mha_query_lengths          int32 (max_bs,)         = max_bs   * 4
-        #   mha_cu_query_seq_lengths   int32 (max_bs + 1,)     = (max_bs+1) * 4
-        #   mha_kv_seq_lengths         int32 (max_bs,)         = max_bs   * 4
-        #   mha_cu_kv_seq_lengths      int32 (max_bs + 1,)     = (max_bs+1) * 4
-        #   mha_block_table            int32 (max_bs, max_kv_blocks)
-        # max_bs == max_requests in DynamicInferenceContext.
-        max_bs = max_requests
-        mha_query_lengths_bytes = max_bs * 4
-        mha_cu_query_seq_lengths_bytes = (max_bs + 1) * 4
-        mha_kv_seq_lengths_bytes = max_bs * 4
-        mha_cu_kv_seq_lengths_bytes = (max_bs + 1) * 4
-        mha_block_table_bytes = max_bs * max_kv_blocks * 4
+        # Per-request KV block table.
+        request_to_kv_block_ids_bytes = max_requests * max_kv_blocks * 4
 
-        # Mamba section: 9 int32 fields, only present for hybrid models.
-        #   mamba_batch_indices_decode    int32 (max_bs,)
-        #   mamba_batch_indices_prefill   int32 (max_bs,)
-        #   mamba_seq_idx                 int32 (1, max_tokens)
-        #   mamba_cu_seqlens              int32 (max_bs + 1,)
-        #   mamba_cu_chunk_seqlens        int32 (max_mamba_chunks + 1,)
-        #   mamba_last_chunk_indices      int32 (max_bs,)
-        #   mamba_seq_idx_for_varlen      int32 (max_mamba_chunks,)
-        #   mamba_conv_seq_idx            int32 (max_tokens,)
-        #   mamba_conv_seq_start          int32 (max_tokens,)
-        if max_mamba_chunks > 0:
-            mamba_batch_indices_decode_bytes = max_bs * 4
-            mamba_batch_indices_prefill_bytes = max_bs * 4
-            mamba_seq_idx_bytes = max_tokens * 4
-            mamba_cu_seqlens_bytes = (max_bs + 1) * 4
-            mamba_cu_chunk_seqlens_bytes = (max_mamba_chunks + 1) * 4
-            mamba_last_chunk_indices_bytes = max_bs * 4
-            mamba_seq_idx_for_varlen_bytes = max_mamba_chunks * 4
-            mamba_conv_seq_idx_bytes = max_tokens * 4
-            mamba_conv_seq_start_bytes = max_tokens * 4
-        else:
-            mamba_batch_indices_decode_bytes = 0
-            mamba_batch_indices_prefill_bytes = 0
-            mamba_seq_idx_bytes = 0
-            mamba_cu_seqlens_bytes = 0
-            mamba_cu_chunk_seqlens_bytes = 0
-            mamba_last_chunk_indices_bytes = 0
-            mamba_seq_idx_for_varlen_bytes = 0
-            mamba_conv_seq_idx_bytes = 0
-            mamba_conv_seq_start_bytes = 0
+        # Per-request mamba slot index (hybrid models only). Source for the
+        # GPU-side Mamba update kernels via ``gpu_view.request_to_mamba_state_idx``.
+        request_to_mamba_state_idx_bytes = max_requests * 4 if is_hybrid else 0
 
         total_bytes = (
             2 * tok_int64_bytes
             + 4 * tok_int32_bytes
-            + 7 * req_4byte_bytes
-            + mha_query_lengths_bytes
-            + mha_cu_query_seq_lengths_bytes
-            + mha_kv_seq_lengths_bytes
-            + mha_cu_kv_seq_lengths_bytes
-            + mha_block_table_bytes
-            + mamba_batch_indices_decode_bytes
-            + mamba_batch_indices_prefill_bytes
-            + mamba_seq_idx_bytes
-            + mamba_cu_seqlens_bytes
-            + mamba_cu_chunk_seqlens_bytes
-            + mamba_last_chunk_indices_bytes
-            + mamba_seq_idx_for_varlen_bytes
-            + mamba_conv_seq_idx_bytes
-            + mamba_conv_seq_start_bytes
+            + 5 * req_4byte_bytes
+            + 2 * req_4byte_with_sentinel_bytes
+            + request_to_kv_block_ids_bytes
+            + request_to_mamba_state_idx_bytes
         )
 
         # Zero-initialized so pre-transfer reads see zeros (matches prior semantics).
@@ -133,13 +92,16 @@ class ContextGPUView:
         # Request-level tensors (consumed by sampling, log-probs, speculative verification, MTP).
         self.request_in_prefill_status = self._buf[off : off + req_4byte_bytes].view(torch.int32)
         off += req_4byte_bytes
-        self.request_query_lengths = self._buf[off : off + req_4byte_bytes].view(torch.int32)
-        off += req_4byte_bytes
+        # `request_query_lengths` has a trailing zero slot at index `max_requests`.
+        self.request_query_lengths = self._buf[off : off + req_4byte_with_sentinel_bytes].view(
+            torch.int32
+        )
+        off += req_4byte_with_sentinel_bytes
         self.request_kv_length_offsets = self._buf[off : off + req_4byte_bytes].view(torch.int32)
         off += req_4byte_bytes
         # Sampling parameters (consumed by FlashInfer sampling).
         # Mirror the active slice of `active_request_metadata[{label}]`;
-        # padded slots get neutral defaults from `pad_active_slices` (T=1.0, top_k=0, top_p=0.0).
+        # padded slots get neutral defaults from `pad_cpu_active_slices` (T=1.0, top_k=0, top_p=0.0).
         self.temperature = self._buf[off : off + req_4byte_bytes].view(torch.float32)
         off += req_4byte_bytes
         self.top_k = self._buf[off : off + req_4byte_bytes].view(torch.int32)
@@ -148,81 +110,33 @@ class ContextGPUView:
         off += req_4byte_bytes
         # Per-request last-token row indices (consumed by sampling kernels as `gather_indices`).
         # The CPU side of this slot IS `context.active_request_last_token_idxs`,
-        # populated by `build_active_slices` and `pad_active_slices`.
-        self.active_request_last_token_idxs = self._buf[off : off + req_4byte_bytes].view(
-            torch.int32
-        )
-        off += req_4byte_bytes
+        # populated by `build_cpu_active_slices` and `pad_cpu_active_slices`.
+        # The trailing slot at index `max_requests` is the sentinel target for
+        # `LogProbsPrefill.indexing_kernel`'s
+        # `nonzero_static(..., fill_value=max_requests)` gather.
+        self.active_request_last_token_idxs = self._buf[
+            off : off + req_4byte_with_sentinel_bytes
+        ].view(torch.int32)
+        off += req_4byte_with_sentinel_bytes
 
-        # MHA flash-attention metadata (shared between GraphedMHAMetadata and
-        # NonGraphedMHAMetadata — only one is active per step).
-        self.mha_query_lengths = self._buf[off : off + mha_query_lengths_bytes].view(torch.int32)
-        off += mha_query_lengths_bytes
-        self.mha_cu_query_seq_lengths = self._buf[off : off + mha_cu_query_seq_lengths_bytes].view(
-            torch.int32
-        )
-        off += mha_cu_query_seq_lengths_bytes
-        self.mha_kv_seq_lengths = self._buf[off : off + mha_kv_seq_lengths_bytes].view(torch.int32)
-        off += mha_kv_seq_lengths_bytes
-        self.mha_cu_kv_seq_lengths = self._buf[off : off + mha_cu_kv_seq_lengths_bytes].view(
-            torch.int32
-        )
-        off += mha_cu_kv_seq_lengths_bytes
-        self.mha_block_table = (
-            self._buf[off : off + mha_block_table_bytes]
+        # Per-request KV block table — source for the GPU-side ``active_request_to_kv_block_ids``
+        # padding, also read directly by RoPE / KV-append helpers via
+        # ``gpu_view.request_to_kv_block_ids[req_idx, ...]``.
+        self.request_to_kv_block_ids = (
+            self._buf[off : off + request_to_kv_block_ids_bytes]
             .view(torch.int32)
             .view(max_bs, max_kv_blocks)
         )
-        off += mha_block_table_bytes
+        off += request_to_kv_block_ids_bytes
 
-        # Mamba varlen metadata (hybrid models only). Each GPU view matches a
-        # pinned CPU view in DynamicInferenceContext._cpu_bookkeeping_buf; the
-        # per-step coalesced H2D copy covers both MHA and Mamba alongside the
-        # token/request bookkeeping.
-        if max_mamba_chunks > 0:
-            self.mamba_batch_indices_decode = self._buf[
-                off : off + mamba_batch_indices_decode_bytes
+        # Per-request Mamba slot index (hybrid models only). Source for
+        # :meth:`MambaMetadata.update`'s GPU compute.
+        if is_hybrid:
+            self.request_to_mamba_state_idx = self._buf[
+                off : off + request_to_mamba_state_idx_bytes
             ].view(torch.int32)
-            off += mamba_batch_indices_decode_bytes
-            self.mamba_batch_indices_prefill = self._buf[
-                off : off + mamba_batch_indices_prefill_bytes
-            ].view(torch.int32)
-            off += mamba_batch_indices_prefill_bytes
-            self.mamba_seq_idx = (
-                self._buf[off : off + mamba_seq_idx_bytes].view(torch.int32).view(1, max_tokens)
-            )
-            off += mamba_seq_idx_bytes
-            self.mamba_cu_seqlens = self._buf[off : off + mamba_cu_seqlens_bytes].view(torch.int32)
-            off += mamba_cu_seqlens_bytes
-            self.mamba_cu_chunk_seqlens = self._buf[off : off + mamba_cu_chunk_seqlens_bytes].view(
-                torch.int32
-            )
-            off += mamba_cu_chunk_seqlens_bytes
-            self.mamba_last_chunk_indices = self._buf[
-                off : off + mamba_last_chunk_indices_bytes
-            ].view(torch.int32)
-            off += mamba_last_chunk_indices_bytes
-            self.mamba_seq_idx_for_varlen = self._buf[
-                off : off + mamba_seq_idx_for_varlen_bytes
-            ].view(torch.int32)
-            off += mamba_seq_idx_for_varlen_bytes
-            self.mamba_conv_seq_idx = self._buf[off : off + mamba_conv_seq_idx_bytes].view(
-                torch.int32
-            )
-            off += mamba_conv_seq_idx_bytes
-            self.mamba_conv_seq_start = self._buf[off : off + mamba_conv_seq_start_bytes].view(
-                torch.int32
-            )
-            off += mamba_conv_seq_start_bytes
+            off += request_to_mamba_state_idx_bytes
         else:
-            self.mamba_batch_indices_decode = None
-            self.mamba_batch_indices_prefill = None
-            self.mamba_seq_idx = None
-            self.mamba_cu_seqlens = None
-            self.mamba_cu_chunk_seqlens = None
-            self.mamba_last_chunk_indices = None
-            self.mamba_seq_idx_for_varlen = None
-            self.mamba_conv_seq_idx = None
-            self.mamba_conv_seq_start = None
+            self.request_to_mamba_state_idx = None
 
         assert off == total_bytes, f"layout bug: wrote {off} of {total_bytes} bytes"

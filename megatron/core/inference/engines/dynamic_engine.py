@@ -387,6 +387,21 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
 
+            # Force all dummy requests to request log probs so graphs cover
+            # the full padded shape. Write to `request_metadata` (the source
+            # of truth) since `_dynamic_step_log_probs_bookkeeping` reads
+            # `request_metadata[:active_count]` — `active_request_metadata`
+            # at this point still holds the previous step's snapshot.
+            active_request_count = context.total_request_count - context.paused_request_count
+            context.request_metadata["return_log_probs"][:active_request_count] = True
+
+            controller._dynamic_step_log_probs_bookkeeping()
+            controller._side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(controller._side_stream):
+                indexing_outputs = controller._dynamic_step_log_probs_indexing()
+
+            torch.cuda.current_stream().wait_event(controller._side_step_done_event)
+
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
             if model_config.moe_enable_routing_replay:
@@ -394,13 +409,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Forward pass -> logits.
             with torch.inference_mode():
-                controller._dynamic_step_forward_logits(input_ids, position_ids)
+                logits = controller._dynamic_step_forward_logits(input_ids, position_ids)
 
                 if controller._sampling_backend == "flashinfer":
                     if controller.num_speculative_tokens > 0:
-                        controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                        controller._dynamic_step_sample_logits_and_verify_tokens(input_ids, logits)
                     else:
-                        controller._dynamic_step_sample_logits()
+                        controller._dynamic_step_sample_logits(logits)
+
+                controller._side_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(controller._side_stream):
+                    lse_outputs = controller._dynamic_step_log_probs_lse(logits, indexing_outputs)
+
+                controller._side_pre_calc_event.record(controller._side_stream)
 
                 # MTP CUDA graph warmup for this batch dimension.
                 if mtp_warmup_enabled:
@@ -426,6 +447,11 @@ class DynamicInferenceEngine(AbstractEngine):
                                 depth=depth,
                                 cache_key=("mtp", n, depth),
                             )
+
+                # Capture remaining log-prob graphs (gather, extract).
+                torch.cuda.current_stream().wait_event(controller._side_pre_calc_event)
+                controller._dynamic_step_calculate_log_probs(logits, indexing_outputs, lse_outputs)
+                controller._side_step_done_event.record(controller._side_stream)
 
                 context.reset()
 
@@ -1099,9 +1125,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.total_count - block_allocator.total_avail
-            if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
-                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+            pc_state = block_allocator.pc_state
+            if pc_state is not None:
+                blocks_hashed_active = int((pc_state.block_ref_counts > 0).sum().item())
+                blocks_ref_count = pc_state.block_ref_counts.sum().item()
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
@@ -1222,9 +1249,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         block_ids = finished_routing_block_ids[request_id]
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
                         request.routing_indices = (
-                            self.context.kv_block_allocator.reconstruct_routing_from_blocks(
-                                block_ids, total_tokens - 1
-                            )
+                            self.context.kv_block_allocator.routing_replay
+                            .reconstruct_routing_from_blocks(block_ids, total_tokens - 1)
                         )
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
@@ -1440,18 +1466,15 @@ class DynamicInferenceEngine(AbstractEngine):
     def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
         """Find farthest block with cached Mamba state by iterating from the end.
 
-        Not all blocks have Mamba state cached in mamba_hash_to_block_id,
-        only divergence and last-aligned blocks do. Iterating from the end
-        finds the farthest block with cached state, which is the only one
+        Not all blocks have Mamba state cached, only divergence and
+        last-aligned blocks do. The farthest cached block is the only one
         needed for restore since Mamba state is cumulative.
         """
         if not req.precomputed_block_hashes:
             return 0
-        mamba_map = self.context.mamba_slot_allocator.hash_to_block_id
-        for i in range(len(req.precomputed_block_hashes) - 1, -1, -1):
-            if req.precomputed_block_hashes[i] in mamba_map:
-                return i + 1
-        return 0
+        return self.context.prefix_cache_registry.match_mamba_farthest(
+            req.precomputed_block_hashes
+        )
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
@@ -1509,7 +1532,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -1593,7 +1616,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         for block_hash in req.precomputed_block_hashes:
                             if (
                                 block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
+                                not in self.context.prefix_cache_registry.kv_hash_to_block_id
                             ):
                                 pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
@@ -1613,7 +1636,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         for block_hash in req.precomputed_block_hashes:
                             if (
                                 block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
+                                not in self.context.prefix_cache_registry.kv_hash_to_block_id
                             ):
                                 pending_block_hashes.add(block_hash)
                     prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
@@ -1771,8 +1794,9 @@ class DynamicInferenceEngine(AbstractEngine):
             evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
             accepted_tokens = step_result["accepted_tokens"]
-            log_probs = step_result["log_probs"]
-            top_n_logprobs = step_result.get("top_n_logprobs", None)
+            log_probs, top_n_logprobs = await self.controller.run_log_probs_extract(
+                step_result.get("log_probs_extract")
+            )
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
