@@ -411,7 +411,13 @@ def test_legacy_step_reports_matching_decode_only_state(num_prefill_requests, ex
     context.config.async_sched_mode = AsyncScheduleMode.LEGACY
     context.num_prefill_requests = num_prefill_requests
     context.num_decode_requests = 1 - num_prefill_requests
-    context.kv_block_allocator = SimpleNamespace(store_routing_per_block=mock.Mock())
+    context.kv_block_allocator = SimpleNamespace(
+        routing_replay=SimpleNamespace(scatter_routing_to_blocks=mock.Mock()), dummy_block_idx=0
+    )
+    context.token_to_block_idx = torch.zeros(context.max_tokens, dtype=torch.int32)
+    context.token_to_local_position_within_kv_block = torch.zeros(
+        context.max_tokens, dtype=torch.int32
+    )
     controller = _make_async_sched_controller(context)
     controller._dynamic_step_context_init = mock.Mock(
         return_value=(torch.tensor([1]), torch.tensor([0]), None)
@@ -1060,7 +1066,10 @@ def test_legacy_bookkeeping_keeps_partial_chunk_active():
     context.get_index_of_chunked_prefill_request = mock.Mock(return_value=0)
     context.get_active_sequence_lengths.return_value = torch.tensor([3])
     context.get_max_sequence_lengths.return_value = torch.tensor([4])
-    context.kv_block_allocator = SimpleNamespace(block_routing=False, enable_handoff_pinning=True)
+    context.kv_block_allocator = SimpleNamespace(
+        routing_replay=SimpleNamespace(has_data=mock.Mock(return_value=False)),
+        enable_handoff_pinning=True,
+    )
     context.request_to_kv_block_ids = torch.tensor([[1, 2, -1]], dtype=torch.int32)
     controller = _make_async_sched_controller(context)
     controller._sampled_tokens_cuda[0] = 7
@@ -1159,7 +1168,10 @@ def test_finished_routing_blocks_drop_the_speculative_reserve(reserve_blocks):
     drops `moe_topk_indices` from the response.
     """
     context = _make_async_sched_context(total_request_count=2)
-    context.kv_block_allocator = SimpleNamespace(block_routing=True, enable_handoff_pinning=False)
+    context.kv_block_allocator = SimpleNamespace(
+        routing_replay=SimpleNamespace(has_data=mock.Mock(return_value=True)),
+        enable_handoff_pinning=False,
+    )
     context.request_to_kv_block_ids = torch.tensor(
         [[10, 11] + [-1] * (reserve_blocks - 1), list(range(12, 13 + reserve_blocks))],
         dtype=torch.int32,
