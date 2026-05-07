@@ -770,13 +770,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
-            mamba_metadata_cls = MambaMetadata
-            if (
-                self.config.prefix_caching_mamba_gb is not None
-                and self.config.prefix_caching_mamba_gb > 0
-                and self.config.enable_prefix_caching
-            ):
-                mamba_metadata_cls = PrefixCachedMambaMetadata
+            mamba_metadata_cls = (
+                PrefixCachedMambaMetadata
+                if self.is_mamba_prefix_caching_enabled
+                else MambaMetadata
+            )
             # ``request_to_mamba_state_idx_buf`` is the alias into
             # ``_cpu_bookkeeping_buf`` populated above; sharing it here means
             # every CPU-side bookkeeping write to ``request_to_mamba_state_idx``
@@ -1197,12 +1195,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate Mamba prefix cache if configured
         self.mamba_slot_allocator: Optional[MambaSlotAllocator] = None
-        if (
-            self.is_hybrid_model
-            and self.config.prefix_caching_mamba_gb is not None
-            and self.config.prefix_caching_mamba_gb > 0
-            and self.config.enable_prefix_caching
-        ):
+        if self.is_hybrid_model and self.is_mamba_prefix_caching_enabled:
             self._allocate_mamba_cache(self.config.prefix_caching_mamba_gb)
 
         # Reset tensor-related metadata.
@@ -1333,6 +1326,15 @@ class DynamicInferenceContext(BaseInferenceContext):
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
+
+    @property
+    def is_mamba_prefix_caching_enabled(self) -> bool:
+        """Whether Mamba prefix caching is configured for this context."""
+        return (
+            self.config.enable_prefix_caching
+            and self.config.prefix_caching_mamba_gb is not None
+            and self.config.prefix_caching_mamba_gb > 0
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""
