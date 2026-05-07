@@ -188,8 +188,12 @@ class InferenceConfig:
     # =================================
     num_cuda_graphs: Optional[int] = None
     """
-    Maximum number of cuda graphs to capture, where the cuda graph batch sizes range from 1 to
-    `max_requests`. Due to rounding, the actual number of cuda graphs may not equal this argument.
+    Maximum number of cuda graphs to capture.
+    Graph token counts are spaced from 1 up to a per-graph-type budget:
+      - Decode-only graphs are always bounded by `max_requests * (num_speculative_tokens + 1)`.
+      - Prefill/mixed graphs share that same bound by default,
+        or extend up to `max_tokens` when `cuda_graph_all_prefills` is set.
+    Due to rounding, the actual number of cuda graphs may not equal this argument.
     """
 
     cuda_graph_mixed_prefill_count: Optional[int] = 16

@@ -2003,9 +2003,6 @@ def _add_inference_args(parser):
                        help='GPU memory budget (in GB) for the Mamba state cache '
                        'used by prefix caching on hybrid models. When set, Mamba '
                        'states at block boundaries are cached for reuse.')
-    group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
-                       type=int, default=16384,
-                       help='Maximum number of tokens to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
