@@ -8,7 +8,6 @@ from contextlib import nullcontext
 from typing import List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
-import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
@@ -944,12 +943,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         #   token_to_request_idx                       (int32,   max_tokens)
         #   token_to_position_in_request               (int32,   max_tokens)
         #   request_in_prefill_status        (staging) (int32,   max_requests)
-        #   request_query_lengths            (staging) (int32,   max_requests)
+        #   request_query_lengths            (staging) (int32,   max_requests + 1)
         #   request_kv_length_offsets        (staging) (int32,   max_requests)
         #   temperature                      (staging) (float32, max_requests)
         #   top_k                            (staging) (int32,   max_requests)
         #   top_p                            (staging) (float32, max_requests)
-        #   active_request_last_token_idxs   (alias)   (int32,   max_requests)
+        #   active_request_last_token_idxs   (alias)   (int32,   max_requests + 1)
         #
         # Token fields are aliased with the source-of-truth attributes
         # (`self.token_to_input_ids`, etc.) because the forward pass reads
@@ -958,10 +957,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # `[:n_active]` but on CPU at `[paused_count:total_count)` — so the
         # staging slots here are refreshed each step by copying the active
         # slice from the persistent `request_*` tensors above.
+        #
+        # `request_query_lengths` and `active_request_last_token_idxs` reserve one extra trailing
+        # slot at index `max_requests` to be used as a sentinel by the log probs kernels.
+        # `active_request_last_token_idxs` is set each step in `pad_active_slices`.
         _tok_int64_bytes = self.max_tokens * 8
         _tok_int32_bytes = self.max_tokens * 4
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
         _req_4byte_bytes = self.max_requests * 4
+        _req_4byte_with_sentinel_bytes = (self.max_requests + 1) * 4
         # MHA section: 5 fields (int32) shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata. max_bs == max_requests.
         _mha_query_lengths_bytes = self.max_requests * 4
@@ -996,7 +1000,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         _total_bytes = (
             2 * _tok_int64_bytes
             + 4 * _tok_int32_bytes
-            + 7 * _req_4byte_bytes
+            + 5 * _req_4byte_bytes
+            + 2 * _req_4byte_with_sentinel_bytes
             + _mha_query_lengths_bytes
             + _mha_cu_query_seq_lengths_bytes
             + _mha_kv_seq_lengths_bytes
@@ -1059,10 +1064,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             _off : _off + _req_4byte_bytes
         ].view(torch.int32)
         _off += _req_4byte_bytes
+        # `_staging_request_query_lengths` has one extra trailing slot at index `max_requests`;
+        # to be used as a sentinel by the log probs kernels.
         self._staging_request_query_lengths = self._cpu_bookkeeping_buf[
-            _off : _off + _req_4byte_bytes
+            _off : _off + _req_4byte_with_sentinel_bytes
         ].view(torch.int32)
-        _off += _req_4byte_bytes
+        _off += _req_4byte_with_sentinel_bytes
         self._staging_request_kv_length_offsets = self._cpu_bookkeeping_buf[
             _off : _off + _req_4byte_bytes
         ].view(torch.int32)
@@ -1086,10 +1093,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-request last-token row indices. Aliased with the matching gpu_view slot:
         # build_active_slices/pad_active_slices populate this CPU view.
+        # Has one extra trailing slot at index `max_requests` used as a sentinel.
         self.active_request_last_token_idxs = self._cpu_bookkeeping_buf[
-            _off : _off + _req_4byte_bytes
+            _off : _off + _req_4byte_with_sentinel_bytes
         ].view(torch.int32)
-        _off += _req_4byte_bytes
+        _off += _req_4byte_with_sentinel_bytes
 
         # Static tensor addresses to make `last_token_logits` graphable with speculative decoding.
         max_logit_idxs = self.max_requests * (self.num_speculative_tokens + 1)
@@ -1098,6 +1106,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._decode_logit_idxs = torch.arange(
             max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
+        # GPU mirror of `active_request_metadata["return_log_probs"]`,
+        # refreshed in `transfer_bookkeeping_to_gpu`.
+        self.gpu_return_log_probs_mask = torch.zeros(
+            self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
         )
 
         # MHA flash-attention metadata views (write-only on CPU, read-only on
@@ -1439,6 +1453,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
         # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
         self.active_request_last_token_idxs[padding_request_slice].fill_(0)
+        # Padded slots must opt out of log-prob computation.
+        self.active_request_metadata["return_log_probs"][padding_request_slice] = False
+
+        # `active_request_last_token_idxs` reserves a permanent sentinel slot at
+        # index `max_requests` (size is `max_requests + 1`).
+        self.active_request_last_token_idxs[self.max_requests] = self.padded_active_token_count - 1
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -2318,6 +2338,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
         self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+
+        # `return_log_probs` is bool (1 byte per slot, doesn't share the int32-aligned buffer).
+        self.gpu_return_log_probs_mask[:padded_active].copy_(
+            self.active_request_metadata["return_log_probs"][:padded_active], non_blocking=True
+        )
+        if padded_active < self.max_requests:
+            self.gpu_return_log_probs_mask[padded_active:].fill_(False)
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
@@ -3629,77 +3656,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             "newly_paused_request_ids": newly_paused_request_ids,
             "evict_request_ids": evict_request_ids,
         }
-
-    def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> Tuple[List[List[float]], Tensor]:
-        """Calculate log probs for all active requests and return them.
-
-        TODO: @wdykas support top-n log probs.
-
-        Args:
-            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
-            new_tokens (Tensor): The newly sampled tokens.
-            only_last_token_logits (bool): If set, the logits are from only the last token in each request
-
-        Returns:
-            List of lists where each inner list contains log probs for a request in the
-            same order as the active requests (from paused_request_count to total_request_count).
-            log_probs (Tensor): Used to compute top n logprobs later if required.
-        """
-
-        # Calculate log_probs (sequence_length x vocab_size)
-        logits_squeezed = logits.squeeze(0)
-
-        if only_last_token_logits or self.is_decode_only():
-            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
-            selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
-
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
-        # Get the selected token ids for all tokens.
-        # We shift the active token window left by one to remove the first prompt token for
-        # prefill requests and then set the token ids explicitly for the newly generated tokens.
-        # This is necessary because we calculate the log probs *before* updating the request metadata.
-        #
-        # Example (decode & prefill mix):
-        #
-        #   active_query_lengths: [ 1 | 1 | 2 | 5 ]
-        #
-        #   new_tokens          : [ 52 | 12 | 3 | 86 ]
-        #
-        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
-        #
-        #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
-        #
-        #   active_token_ids before left shift:
-        #                       : [ 31 | 75 | 45 16 | 90 12 72 24 88 ]
-        #
-        #   active_token_ids after shift:
-        #                       : [ XX | XX | 16 XX | 12 72 24 88 XX ]   (XX = undefined)
-        #
-        #   active_token_ids[new_token_idx] = new_tokens
-        #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
-        n_active = self.total_request_count - self.paused_request_count
-        active_token_ids = self.gpu_view.token_to_input_ids[: self.active_token_count].roll(-1, 0)
-        active_query_lengths = self.gpu_view.request_query_lengths[:n_active]
-
-        new_token_idx = active_query_lengths.cumsum(0) - 1
-        active_token_ids[new_token_idx] = new_tokens
-
-        # Extract the log probs for only the selected tokens.
-        # (sequence_length x vocab_size) -> (sequence_length)
-        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[seq_idx, active_token_ids]
-
-        # Split the log probs across request boundaries
-        selected_log_probs_list = selected_log_probs.cpu().split(
-            active_query_lengths.tolist(), dim=0
-        )
-
-        # Convert each log prob tensor into a list
-        return [lp.tolist() for lp in selected_log_probs_list], log_probs
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.
