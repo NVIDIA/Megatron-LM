@@ -14,7 +14,16 @@ from packaging import version
 from torch.nn.functional import mse_loss
 from torch.optim import Adam
 
+try:
+    from transformer_engine.pytorch.optimizers import FusedAdam
+
+    HAVE_TE_FUSED_ADAM = True
+except ImportError:
+    HAVE_TE_FUSED_ADAM = False
+
 from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+    MixedPrecisionPolicy,
+    fully_shard,
     fully_shard_model,
     fully_shard_optimizer,
 )
@@ -291,10 +300,6 @@ class TestMegatronFsdpFullyShard:
         don't add any new parameters unless absolutely necessary,
         or if some combinations can be flattened or simplified.
         """
-        from megatron.core.distributed.fsdp.src.megatron_fsdp import (
-            MixedPrecisionPolicy,
-            fully_shard,
-        )
 
         preserve_fp32_weights = common_args["preserve_fp32_weights"]
         init_model_with_meta_device = common_args["init_model_with_meta_device"]
@@ -423,11 +428,6 @@ class TestMegatronFsdpFullyShard:
         Test that an Megatron-FSDP model checkpoint can be saved and loaded accurately.
         """
         from torch.distributed.tensor import DTensor
-
-        from megatron.core.distributed.fsdp.src.megatron_fsdp import (
-            MixedPrecisionPolicy,
-            fully_shard,
-        )
 
         # Skip tests.
         if outer_shard_strategy == OPTIM and shard_strategy != OPTIM_GRADS_PARAMS:
@@ -673,10 +673,6 @@ class TestMegatronFsdpFullyShard:
         """
         Test fully_shard(device_mesh=None). Represents the easiest entrypoint to Megatron-FSDP.
         """
-        from megatron.core.distributed.fsdp.src.megatron_fsdp import (
-            fully_shard_model,
-            fully_shard_optimizer,
-        )
 
         # Construct toy model.
         toy_model, fsdp_unit_modules = build_toy_model(TRANSFORMER, False)
@@ -709,6 +705,177 @@ class TestMegatronFsdpFullyShard:
             optimizer.step()
             optimizer.zero_grad()
 
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.4.0'),
+        reason="Megatron-FSDP requires PyTorch 2.4.0 or later.",
+    )
+    @pytest.mark.skipif(
+        not HAVE_TE_FUSED_ADAM,
+        reason="Full-iteration CUDA graph capture requires TransformerEngine FusedAdam.",
+    )
+    # FSDP (no outer-DP collectives) and HFSDP (outer-DP sharded). Both wrap a
+    # device mesh with DP-Outer=2 / DP-Shard=4 to exercise the full hierarchy.
+    @pytest.mark.parametrize("dp_outer_strategy", [None, OPTIM])
+    def test_full_iteration_cuda_graph(self, dp_outer_strategy):
+        """
+        End-to-end test that a full Megatron-FSDP training iteration (forward +
+        backward) is CUDA-graphable, and that optimizer.zero_grad / optimizer.step
+        between graph replays correctly applies gradients produced inside the graph.
+
+        Exercises the conditional grad-dereferencing path in
+        ``ParamAndGradBuffer.zero_grad``: when ``param.grad`` is a view of an FSDP
+        sharded gradient buffer, ``zero_grad`` must preserve the view between
+        replays so that the next replay populates the same tensor — otherwise the
+        optimizer would see stale gradients on subsequent replays. The companion
+        wrapper for full-iteration capture in production training is
+        ``megatron.core.full_cuda_graph.FullCudaGraphWrapper``.
+
+        Uses TransformerEngine ``FusedAdam`` rather than ``torch.optim.Adam``:
+        the stock Adam unconditionally sets ``param.grad = None`` in
+        ``zero_grad``, which dereferences the FSDP grad-buffer view that the
+        captured graph writes into and breaks replay. ``FusedAdam`` honors
+        ``set_to_none=False`` (zeros the buffer in place) and supports
+        ``capturable=True`` for graph-safe step math.
+        """
+        # Construct (DP-Outer=2, DP-Inner=4) DeviceMesh.
+        device_mesh = build_distributed_environment((2, 4, 1, 1))
+
+        # Construct toy Megatron-FSDP model.
+        toy_model, fsdp_unit_modules = build_toy_model(
+            TRANSFORMER, init_model_with_meta_device=False, seed=0
+        )
+        mfsdp_model = fully_shard_model(
+            module=toy_model,
+            device_mesh=device_mesh,
+            dp_shard_dim=DP_SHARD,
+            # Pure FSDP or Hybrid-FSDP.
+            dp_outer_dim=DP_OUTER if dp_outer_strategy is not None else None,
+            tp_dim=TP,
+            hybrid_fsdp_group=(
+                device_mesh[HSDP].get_group() if dp_outer_strategy is not None else None
+            ),
+            fsdp_unit_modules=fsdp_unit_modules,
+            zero_dp_strategy=OPTIM_GRADS_PARAMS,
+            outer_dp_sharding_strategy=(
+                dp_outer_strategy if dp_outer_strategy is not None else NO_SHARD
+            ),
+            sync_model_each_microbatch=True,
+            # When using CUDA graphs, gradient accumulation precision must
+            # align with main parameter precision. Alternatively, use:
+            # FusedAdam(use_decoupled_grad=True) + fully_shard_model(use_decoupled_grad=True)
+            mixed_precision_policy=MixedPrecisionPolicy(
+                main_params_dtype=torch.float32, main_grads_dtype=torch.float32
+            ),
+        )
+
+        # FusedAdam is REQUIRED for full-iteration CUDA graphs!
+        toy_adam = FusedAdam(params=mfsdp_model.parameters(), lr=0.01, capturable=True)
+        optimizer = fully_shard_optimizer(optimizer=toy_adam)
+
+        # Static input/target buffers reused across capture and replay.
+        static_input = torch.randn(1, DIM_SIZE, DIM_SIZE, device="cuda")
+        static_target = torch.randn(1, DIM_SIZE, DIM_SIZE, device="cuda")
+
+        # CUDA-graphable training loop.
+        def run_step():
+            output = mfsdp_model(static_input, static_input)
+            loss = mse_loss(output, static_target)
+            loss.backward()
+            return loss
+
+        # Side-stream warmup. CUDA graph capture requires that any one-time
+        # allocations and lazy-init state are already populated, so we run
+        # a few eager steps on a non-default stream before capture.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                # set_to_none=False keeps param.grad as a view of the FSDP
+                # sharded gradient buffer — required so that the next replay's
+                # backward writes into the same tensor the optimizer reads.
+                optimizer.zero_grad(set_to_none=False)
+                run_step()
+                optimizer.step()
+        # Synchronize all streams before capture.
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+
+        # Capture forward + backward into a CUDA graph. Optimizer step
+        # is not captured for this test, but FusedAdam is compatible.
+        # (Megatron-FSDP post-backward grad installation is captured.)
+        optimizer.zero_grad(set_to_none=False)
+        graph = torch.cuda.CUDAGraph()
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
+        capture_stream = torch.cuda.Stream()
+        with torch.cuda.graph(graph, stream=capture_stream, capture_error_mode="thread_local"):
+            static_loss = run_step()
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+        def assert_grads_present(step):
+            local_grads_present = any(
+                getattr(p, grad_attr, None) is not None
+                and (
+                    getattr(p, grad_attr)._local_tensor
+                    if hasattr(getattr(p, grad_attr), "_local_tensor")
+                    else getattr(p, grad_attr)
+                )
+                .count_nonzero()
+                .item()
+                > 0
+                for p in mfsdp_model.parameters()
+                for grad_attr in ("grad", "decoupled_grad")
+            )
+            fsdp_group = mfsdp_model.dist_index.get_fsdp_group()
+            gathered = [None] * fsdp_group.size()
+            torch.distributed.all_gather_object(
+                object_list=gathered, obj=local_grads_present, group=fsdp_group
+            )
+            assert any(gathered), (
+                f"No parameter on any FSDP rank has a non-None, non-zero "
+                f"param.grad / param.decoupled_grad after replay step {step}. "
+                f"The CUDA-graph replay did not deliver gradients to the "
+                f"optimizer."
+            )
+
+        # Replay enough steps that a healthy training loop should clearly drive
+        # the loss down on this fixed (input, target) pair.
+        num_replays = 8
+        replay_losses = []
+        for step in range(num_replays):
+            optimizer.zero_grad(set_to_none=False)
+            graph.replay()
+            torch.cuda.synchronize()
+            # Post-backward, pre-step: the freshly produced gradients must be
+            # visible on the optimizer parameters.
+            assert_grads_present(step=step)
+            # Detach and clone the loss, as this buffer will be reused.
+            replay_losses.append(static_loss.detach().clone())
+            # Perform the optimizer step.
+            optimizer.step()
+
+        # All replays must produce finite losses.
+        for step, loss_value in enumerate(replay_losses):
+            assert torch.isfinite(loss_value).all(), (
+                f"Loss at replay step {step} is not finite under full-iteration "
+                f"CUDA graph: {loss_value.item()}"
+            )
+
+        # Loss must clearly decrease across replays. A broken graph-replay path
+        # (e.g. optimizer applying stale or zero grads) typically manifests as
+        # a flat or oscillating loss.
+        first_loss = replay_losses[0].item()
+        last_loss = replay_losses[-1].item()
+        assert last_loss < first_loss, (
+            f"Loss did not decrease across {num_replays} CUDA-graph replays: "
+            f"first={first_loss:.6f}, last={last_loss:.6f}, "
+            f"trace={[l.item() for l in replay_losses]}"
+        )
+
+        # Required to reset the parallelism environment.
+        destroy_device_mesh(device_mesh)
+
     @pytest.mark.parametrize("init_model_with_meta_device", [True, False])
     @pytest.mark.parametrize(
         "te_recipe",
@@ -721,12 +888,6 @@ class TestMegatronFsdpFullyShard:
         if te_recipe == MXFP8_BLOCKWISE_RECIPE:
             # TODO(@cspades, @ko3n1g): Add this test case in.
             pytest.skip(f"[Megatron CI/CD] MXFP8 requires Blackwell nodes to test.")
-
-        from megatron.core.distributed.fsdp.src.megatron_fsdp import (
-            MixedPrecisionPolicy,
-            fully_shard_model,
-            fully_shard_optimizer,
-        )
 
         # Build FP8 recipe.
         te_quant_recipe = None
@@ -901,11 +1062,6 @@ class TestMegatronFsdpFullyShard:
         """
         Test custom data-types for gather and reduce communications.
         """
-        from megatron.core.distributed.fsdp.src.megatron_fsdp import (
-            MixedPrecisionPolicy,
-            fully_shard_model,
-            fully_shard_optimizer,
-        )
 
         if dp_outer_strategy == OPTIM and dp_shard_strategy != OPTIM_GRADS_PARAMS:
             pytest.skip(

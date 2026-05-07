@@ -29,8 +29,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 # Test model for testing FSDP
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 class TestModel(torch.nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
@@ -46,8 +44,6 @@ class TestModel(torch.nn.Module):
 
 
 # Test model with uniform shaped weights for testing FSDP
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 class TestModelUniform(torch.nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
@@ -78,8 +74,6 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 class TestFullyShardedDataParallel:
     @classmethod
     def setup_class(cls):
@@ -623,8 +617,8 @@ class TestFullyShardedDataParallel:
             Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("num_fsdp_group", [2])
-    @pytest.mark.skipIf(
-        torch.cuda.device_count() % 2 == 0, "This test requires an odd number of GPUs"
+    @pytest.mark.skipif(
+        torch.cuda.device_count() % 2 == 0, reason="This test requires an odd number of GPUs"
     )
     def test_fsdp_with_hybrid_sharding(self, num_fsdp_group):
         """Test that FSDP works correctly with hybrid sharding."""
