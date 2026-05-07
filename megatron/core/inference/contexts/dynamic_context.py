@@ -533,16 +533,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefix_cache_registry=self.prefix_cache_registry,
         )
 
-        # GPU mirrors of the host counters that consumers may want to read without a host sync.
-        _synced_counter_names = ()
-        self._synced_counters_buf = torch.zeros(
-            len(_synced_counter_names), dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self._synced_counters_map: Dict[str, torch.Tensor] = {
-            name: self._synced_counters_buf[i : i + 1]
-            for i, name in enumerate(_synced_counter_names)
-        }
-
         # Track request metadata.
         request_metadata_types = inference_config.request_metadata_types
         if request_metadata_types is None:
@@ -899,6 +889,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 "All tensors should be allocated within `initialize_all_tensors()`. "
                 f"Please move tensor '{key}'."
             )
+
+        # GPU mirrors of the host counters that consumers may want to read without a host sync.
+        _synced_counter_names = ()
+        self._synced_counters_buf = torch.zeros(
+            len(_synced_counter_names), dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._synced_counters_map: Dict[str, torch.Tensor] = {
+            name: self._synced_counters_buf[i : i + 1]
+            for i, name in enumerate(_synced_counter_names)
+        }
 
         # Per-request state (CPU, pinned memory for fast H2D transfer).
         self.request_ids = torch.full(
