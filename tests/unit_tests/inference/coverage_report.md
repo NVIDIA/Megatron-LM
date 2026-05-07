@@ -268,6 +268,96 @@ need `torch.cuda.current_device()`, real CUDA tensors, or HTTP test clients.
 
 **Across all three passes: 22 source files brought to 36–100 % coverage, ~216 new test cases, 19 new test files, 0 final failures.**
 
+---
+
+# Round 4 — Heavier Subdirectory Files
+
+This round picks up files that need real ZMQ socket plumbing, CUDA C++ extension
+compilation, or are dominated by Triton kernels — the parts where coverage is
+constrained more by what coverage.py can see than by test difficulty.
+
+## Files Targeted (Round 4)
+
+| File | Before | After | Stmts/Miss | Test File |
+|------|--------|-------|------------|-----------|
+| `engines/async_zmq_communicator.py` | 0% | **68%** | 92/29 | `engines/test_async_zmq_communicator.py` |
+| `moe/fused_moe.py` | 34% | **40%** | 53/32 | `moe/test_fused_moe.py` |
+| `unified_memory.py` | 18% | **56%** | 216/96 | `test_unified_memory.py` |
+
+**46 new tests, 0 failures.** Validation run: `3ffb68b54fe943668acfd7b7ad04123e`.
+
+## Round 4 Per-File Notes
+
+### engines/async_zmq_communicator.py (68%)
+
+- Tests construct the communicator via `__new__` + injected mocks for the gather/bcast
+  ZMQ sockets (rendezvous in `__init__` requires a real ProcessGroup). Both async
+  (`all_reduce_max`) and sync (`sync_all_reduce_max`) leader/follower paths covered,
+  plus `zmq.Again` retry loops, the value-count assertion, single-rank short-circuits,
+  and `close(linger=0)`.
+- Missing lines 13-17 (`zmq` ImportError fallback), 44-73 (the `__init__` rendezvous
+  body that binds sockets and broadcast_object_list-s addresses), and a few branch
+  edges are unreachable without a real ProcessGroup or without uninstalling `zmq`.
+
+### moe/fused_moe.py (40%)
+
+- Pure-Python parts covered: `ActivationType` enum, `_get_activation_func` (both
+  fused/unfused branches and the unsupported-activation `ValueError`).
+- Missing lines 125-193 are the `mcore_fused_moe` orchestration which calls
+  `permute_tokens` / `permute_and_quantize_mxfp8` / `grouped_mm` /
+  `scaled_grouped_mm` — all real Triton/CUDA kernels. Out of scope for unit tests.
+
+### unified_memory.py (56%)
+
+- All trivial guards covered: `prefetch_managed_tensor`, `advise_managed_tensor_*`
+  with `None`, non-tensor `TypeError`, 0-element `numel`, CPU-tensor `ValueError`.
+- Module-walking helpers `prefetch_managed_module_parameters` and
+  `advise_managed_module_parameters_preferred_location` covered with: None module,
+  CPU-only model, CUDA model, shared-storage dedup, `include_buffers=True`, and
+  the `RuntimeError` propagation when the underlying lib returns non-zero.
+- Enums and exception classes covered.
+- `compile_allocator` covered for the short-circuit (already-attempted) and the
+  no-MemPool failure path.
+- `create_unified_mempool` covered for both failure messages (specific reason +
+  fallback "Unknown reason").
+- Missing lines 103-257 are the `_mempool_c_src` triple-quoted CUDA C source
+  string and the `load_inline` build path — hard to test in isolation. Lines
+  280, 339-349, 372-378, 401-407 are the success branches of the CUDA-mem-prefetch
+  helpers and require a real UVM-allocated CUDA tensor; covered by the existing
+  functional/integration tests instead.
+
+## Combined Cumulative Summary (Rounds 1-4)
+
+| File | Baseline | Final |
+|------|----------|-------|
+| async_stream.py | 0% | **100%** |
+| headers.py | 0% | **100%** |
+| sampling_params.py | 0% | **100%** |
+| inference_request.py | 0% | **98%** |
+| inference_client.py | 0% | **94%** |
+| symmetric_memory.py | 31% | **94%** |
+| **unified_memory.py** | **18%** | **56%** |
+| engines/abstract_engine.py | 0% | **86%** |
+| engines/mcore_engine.py | 0% | **100%** |
+| **engines/async_zmq_communicator.py** | **0%** | **68%** |
+| contexts/base_context.py | 53% | **95%** |
+| contexts/attention_context/metadata_base.py | 29% | **100%** |
+| contexts/routing_metadata.py | 26% | **100%** |
+| contexts/attention_context/mha_metadata.py | 32% | **100%** |
+| contexts/static_context.py | 24% | **69%** |
+| **moe/fused_moe.py** | **34%** | **40%** |
+| quantization/mxfp8_tensor.py | 49% | **76%** |
+| quantization/utils.py | 18% | **36%** |
+| sampling/base.py | 0% | **100%** |
+| text_generation_controllers/encoder_decoder_*.py | 0% | **100%** |
+| text_generation_controllers/vlm_*.py | 0% | **100%** |
+| text_generation_server/tokenization.py | 0% | **58%** |
+| text_generation_server/dynamic_text_gen_server/tokenization.py | 0% | **50%** |
+| text_generation_server/dynamic_text_gen_server/endpoints/common.py | 0% | **100%** |
+| text_generation_server/dynamic_text_gen_server/endpoints/health.py | 0% | **91%** |
+
+**Across all four rounds: 25 source files brought to 36–100 % coverage, ~262 new test cases, 22 new test files, 0 final failures.**
+
 ## Learnings Fed Back
 
 - Added to `run-tests.md` Known Quirks: `omegaconf` is required for `tests/unit_tests/conftest.py` to load — pip install `pytest-cov omegaconf` together when running coverage.
