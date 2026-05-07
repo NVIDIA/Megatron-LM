@@ -334,7 +334,16 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.paused_request_count = 0
         context.total_request_count = batch_size
         context.num_prefill_requests = 0
-        context.pad_cpu_active_slices()
+        # The graphable ``_pad_gpu_active_slices`` runs inside the captured init
+        # body and depends on GPU scalars / ``active_request_last_token_idxs``
+        # populated by the rest of that body. This test bypasses the init flow
+        # and sets context fields directly, so populate ``active_logit_idxs``
+        # by hand: a decode-only batch with one token per request gives
+        # ``[0, 1, ..., batch_size - 1]``.
+        n = context.num_last_token_logits
+        context.active_logit_idxs[:n].copy_(
+            torch.arange(n, dtype=torch.int32, device='cuda')
+        )
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
@@ -868,7 +877,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             [3, 3], dtype=torch.int32, device='cuda'
         )  # 1 sampled + 2 spec
         ctx.num_prefill_requests = 0
-        ctx.pad_cpu_active_slices()
+        # See sibling test: bypass the captured init body and populate
+        # ``active_logit_idxs`` for a 2-decode batch with 3 tokens each.
+        n = ctx.num_last_token_logits
+        ctx.active_logit_idxs[:n].copy_(
+            torch.arange(n, dtype=torch.int32, device='cuda')
+        )
 
         # Init accepted tokens tensors
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -1118,7 +1132,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # query lengths for decode with spec tokens is (1 + num_spec) = 4
         ctx.request_query_lengths = torch.tensor([4, 4], dtype=torch.int32, device='cuda')
         ctx.num_prefill_requests = 0
-        ctx.pad_cpu_active_slices()
+        # See sibling test: bypass the captured init body and populate
+        # ``active_logit_idxs`` for a 2-decode batch with 4 tokens each.
+        n = ctx.num_last_token_logits
+        ctx.active_logit_idxs[:n].copy_(
+            torch.arange(n, dtype=torch.int32, device='cuda')
+        )
 
         # Setup inputs
         input_ids = torch.randint(0, self.vocab_size, (1, 8), device='cuda')

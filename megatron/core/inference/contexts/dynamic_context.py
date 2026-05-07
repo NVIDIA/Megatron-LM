@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 from torch import Tensor  # type: ignore
@@ -881,7 +881,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # GPU mirrors of the host counters that consumers may want to read without a host sync.
-        _synced_counter_names = ()
+        # The graphable attention-init body uses these as ``torch.where`` mask
+        # boundaries and as gather offsets, so the mirror has to track the host
+        # counters at every transition (add_request, update_requests, reset).
+        _synced_counter_names = (
+            'total_request_count',
+            'paused_request_count',
+            'num_prefill_requests',
+            'active_token_count',
+        )
         self._synced_counters_buf = torch.zeros(
             len(_synced_counter_names), dtype=torch.int32, device=torch.cuda.current_device()
         )
@@ -1135,7 +1143,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Static GPU tensors for the per-step MHA derived metadata. Computed on
         # GPU after the coalesced H2D from ``gpu_view.request_query_lengths`` /
         # ``gpu_view.request_kv_length_offsets`` / ``gpu_view.request_to_kv_block_ids``.
-        # Replaces the previous ``_cpu_mha_*`` CPU compute path.
         gpu_device = torch.cuda.current_device()
         # ``[0]`` is fixed at 0 forever; only ``[1:n+1]`` is rewritten each step.
         self.cu_active_request_query_lengths = torch.zeros(
@@ -1150,6 +1157,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_to_kv_block_ids = torch.empty(
             (self.max_requests, self.max_kv_block_count), dtype=torch.int32, device=gpu_device
         )
+        # Active-slice query lengths (GPU). Populated each step by the graphable
+        # ``_build_gpu_active_slices`` from ``gpu_view.request_query_lengths`` with
+        # absorber-style padding so the attention kernel sees a consistent
+        # length per slot regardless of CUDA-graph batch-dimension padding.
+        self.active_request_query_lengths = torch.empty(
+            (self.max_requests,), dtype=torch.int32, device=gpu_device
+        )
+        # GPU active mamba slot indices for hybrid models. Populated each step
+        # by ``_build_gpu_active_slices`` from ``gpu_view.request_to_mamba_state_idx``.
+        if self.is_hybrid_model:
+            self.active_mamba_indices = torch.empty(
+                self.max_requests, dtype=torch.int32, device=gpu_device
+            )
+        else:
+            self.active_mamba_indices = None
+
+        # Pre-allocated index tensors for graphable ops (static addresses).
+        self._arange_requests = torch.arange(
+            self.max_requests, dtype=torch.int32, device=gpu_device
+        )
+        self._arange_tokens = torch.arange(
+            self.max_tokens, dtype=torch.int32, device=gpu_device
+        )
+
+        # Hooks fired from ``run_attn_init_graph_body`` so external owners
+        # (e.g. the text-generation controller) can register graphable
+        # bucket-toggling callbacks. Each callback receives ``using_graph: bool``.
+        self._init_body_hooks: List[Callable[[bool], None]] = []
 
         # Bind the shared active GPU buffers to both graph and non-graph
         # MHA metadata; only one is active per step, so sharing storage is safe.
@@ -1158,7 +1193,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.non_graph_attn_metadata["mha_metadata"],
         ):
             attn_metadata.bind_active_tensors(
-                query_lengths_buf=self.gpu_view.request_query_lengths,
+                query_lengths_buf=self.active_request_query_lengths,
                 cu_query_seq_lengths_buf=self.cu_active_request_query_lengths,
                 kv_seq_lengths_buf=self.active_sequence_lengths,
                 cu_kv_seq_lengths_buf=self.cu_active_sequence_lengths,
@@ -1364,11 +1399,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.total_request_count - self.paused_request_count
 
     def build_cpu_active_slices(self, batch_size: int):
-        """Build the active slices of specific tensors. This is run on every forward step.
+        """CPU-side active-slice bookkeeping.
 
-        Post-switch ([active | paused | dead] layout), the active region of
-        the persistent tensors is `[:batch_size]` directly — no `padded_slice`
-        offset needed.
+        Mirrors the active range of ``request_metadata`` into the pinned CPU
+        ``active_request_metadata`` so the post-forward controller path can
+        read CPU-resident metadata without per-step indexing into the
+        full-width tensors. The graphable GPU work (query lengths, block
+        table, mamba indices, token-level padding, cumulatives,
+        last-token indices) runs in :meth:`_build_gpu_active_slices` from
+        inside ``run_attn_init_graph_body``.
         """
         # Request metadata all needs to be sliced.
         for label in self.request_metadata:
@@ -1376,53 +1415,176 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_metadata[label][:batch_size], non_blocking=True
             )
 
-        torch.cumsum(
-            self.request_query_lengths[:batch_size],
-            dim=0,
-            out=self.active_request_last_token_idxs[:batch_size],
-        )
-        self.active_request_last_token_idxs[:batch_size].sub_(1)
-
     def pad_cpu_active_slices(self):
-        """Pad the active slices of specific tensors."""
+        """CPU-side padding for the active slices the controller reads.
+
+        Only CPU bookkeeping; GPU-side padding of ``active_logit_idxs`` and
+        the per-step ``active_request_last_token_idxs`` writes live in
+        :meth:`_pad_gpu_active_slices` / :meth:`_build_gpu_active_slices`.
+        """
         active_request_count = self.total_request_count - self.paused_request_count
-        active_decode_count = self.num_decode_requests
-        active_prefill_count = active_request_count - active_decode_count
-        active_decode_token_count = active_decode_count * (self.num_speculative_tokens + 1)
-
-        # Decode prefix: positions [0, 1, ..., active_decode_token_count - 1].
-        self.active_logit_idxs[:active_decode_token_count].copy_(
-            self._decode_logit_idxs[:active_decode_token_count]
-        )
-
-        # Prefill last-token positions: cumsum the prefill query lengths in place,
-        # then shift by (active_decode_token_count - 1) to get absolute positions.
-        prefill_dst = self.active_logit_idxs[
-            active_decode_token_count : active_decode_token_count + active_prefill_count
-        ]
-        prefill_lengths = self.request_query_lengths[active_decode_count:active_request_count]
-        if active_prefill_count > 0:
-            prefill_cumsum = torch.cumsum(prefill_lengths, dim=0, dtype=torch.int32)
-            prefill_cumsum.add_(active_decode_token_count - 1)
-            prefill_dst.copy_(prefill_cumsum, non_blocking=True)
-
-        self.active_logit_idxs[active_decode_token_count + active_prefill_count :].zero_()
-
-        # Request-level padding.
-        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
 
         # Sampling metadata: pad with neutral defaults, so that the kernel early-exits.
+        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
         self.active_request_metadata["temperature"][padding_request_slice].fill_(1.0)
         self.active_request_metadata["top_k"][padding_request_slice].fill_(0)
         self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
-        # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
-        self.active_request_last_token_idxs[padding_request_slice].fill_(0)
         # Padded slots must opt out of log-prob computation.
         self.active_request_metadata["return_log_probs"][padding_request_slice] = False
 
-        # `active_request_last_token_idxs` reserves a permanent sentinel slot at
-        # index `max_requests` (size is `max_requests + 1`).
-        self.active_request_last_token_idxs[self.max_requests] = self.padded_active_token_count - 1
+    def _build_gpu_active_slices(self) -> None:
+        """Graphable GPU work: copy active sources into static buffers, pad,
+        and compute cumulatives.
+
+        Called from :meth:`run_attn_init_graph_body` after the unified H2D so
+        all sources (``gpu_view.*``) and GPU scalars (mirrored host counters)
+        are valid. Every op uses fixed-shape slices keyed on
+        ``padded_active_request_count`` / ``padded_active_token_count`` and
+        ``torch.where`` masks against the GPU scalars, so the body is
+        CUDA-graph capturable.
+        """
+        n = self.padded_active_request_count
+        v = self.gpu_view
+        if n == 0:
+            return
+
+        synced = self._synced_counters_map
+        real_req = synced['total_request_count'] - synced['paused_request_count']
+        real_token_count = synced['active_token_count']
+
+        # Copy active sources from the just-transferred ``gpu_view``.
+        self.active_request_query_lengths[:n].copy_(v.request_query_lengths[:n])
+        self.active_request_to_kv_block_ids[:n].copy_(v.request_to_kv_block_ids[:n])
+        if self.is_hybrid_model:
+            self.active_mamba_indices[:n].copy_(v.request_to_mamba_state_idx[:n])
+
+        # Request-level padding via torch.where masks keyed on the GPU scalar boundary.
+        arange_n = self._arange_requests[:n]
+        req_pad_mask = arange_n >= real_req
+
+        # Block table padding uses the dummy block id so the attention kernel
+        # never gather-loads from invalid block memory.
+        self.active_request_to_kv_block_ids[:n] = torch.where(
+            req_pad_mask.unsqueeze(1),
+            self.kv_block_allocator.dummy_block_idx,
+            self.active_request_to_kv_block_ids[:n],
+        )
+
+        # Query-length padding uses the absorber pattern: one slot at index
+        # ``real_req`` carries ``padded_token_count - real_token_count`` so the
+        # kernel's per-request token budget sums to ``padded_token_count``;
+        # other padded slots are 0.
+        is_absorber = arange_n == real_req
+        absorber_q_len = self.padded_active_token_count - real_token_count
+        self.active_request_query_lengths[:n] = torch.where(
+            req_pad_mask,
+            torch.where(is_absorber, absorber_q_len, 0),
+            self.active_request_query_lengths[:n],
+        )
+
+        # Token-level padding.
+        padded_token_count = self.padded_active_token_count
+        if padded_token_count > 0:
+            tok_pad_mask = self._arange_tokens[:padded_token_count] >= real_token_count
+            v.token_to_block_idx[:padded_token_count] = torch.where(
+                tok_pad_mask,
+                self.kv_block_allocator.dummy_block_idx,
+                v.token_to_block_idx[:padded_token_count],
+            )
+            v.token_to_local_position_within_kv_block[:padded_token_count] = torch.where(
+                tok_pad_mask, 0, v.token_to_local_position_within_kv_block[:padded_token_count]
+            )
+            v.token_to_position_in_request[:padded_token_count] = torch.where(
+                tok_pad_mask, 0, v.token_to_position_in_request[:padded_token_count]
+            )
+
+        # Cumulatives must run after padding so the sums account for the absorber.
+        torch.cumsum(
+            self.active_request_query_lengths[:n],
+            dim=0,
+            out=self.cu_active_request_query_lengths[1 : n + 1],
+        )
+
+        # Last-token row idx = cumsum - 1 (write through the gpu_view alias).
+        v.active_request_last_token_idxs[:n].copy_(
+            self.cu_active_request_query_lengths[1 : n + 1]
+        )
+        v.active_request_last_token_idxs[:n] -= 1
+
+        # active_sequence_lengths = query + kv_offset for real requests; for the
+        # absorber-padded slots we mirror the query length (the absorber
+        # self-attends within dummies, K len matches Q len).
+        torch.add(
+            self.active_request_query_lengths[:n],
+            v.request_kv_length_offsets[:n],
+            out=self.active_sequence_lengths[:n],
+        )
+        self.active_sequence_lengths[:n] = torch.where(
+            req_pad_mask,
+            self.active_request_query_lengths[:n],
+            self.active_sequence_lengths[:n],
+        )
+        torch.cumsum(
+            self.active_sequence_lengths[:n],
+            dim=0,
+            out=self.cu_active_sequence_lengths[1 : n + 1],
+        )
+
+    def _pad_gpu_active_slices(self) -> None:
+        """Graphable GPU work: populate ``active_logit_idxs`` for the step.
+
+        Called from :meth:`run_attn_init_graph_body` after
+        :meth:`_build_gpu_active_slices` so
+        ``gpu_view.active_request_last_token_idxs`` is populated. Uses
+        fixed-shape ``[:num_last_token_logits]`` writes with ``torch.where``
+        masks against the synced GPU counters, so the body is CUDA-graph
+        capturable.
+
+        Layout produced (n = ``num_last_token_logits``):
+            - ``[0, real_decode_token_count)``       → arange (every decode
+              token gets its own logit row, including speculative tokens)
+            - ``[real_decode_token_count, real_logit_count)`` → gather from
+              ``active_request_last_token_idxs[real_decode_count + j]``
+              (last-token row of the j-th real prefill request)
+            - ``[real_logit_count, n)``              → 0 (padding)
+        """
+        n = self.num_last_token_logits
+        if n == 0:
+            return
+
+        num_spec_plus_one = self.num_speculative_tokens + 1
+
+        # Reuse the precomputed arange ``[0, max_logit_idxs)``.
+        arange = self._decode_logit_idxs[:n]
+
+        # GPU scalars (per-step, fixed shape [1]).
+        synced = self._synced_counters_map
+        real_request_count = synced['total_request_count'] - synced['paused_request_count']
+        real_prefill_count = synced['num_prefill_requests']
+        real_decode_count = real_request_count - real_prefill_count
+        real_decode_token_count = real_decode_count * num_spec_plus_one
+        real_logit_count = real_decode_token_count + real_prefill_count
+
+        # Region masks.
+        in_decode = arange < real_decode_token_count
+        in_prefill = (arange >= real_decode_token_count) & (arange < real_logit_count)
+
+        # Gather index for the prefill region. ``clamp(min=0)`` handles the
+        # decode region's negative offsets; ``clamp(max=max_requests-1)``
+        # keeps the gather in-bounds for the padding region. Both regions'
+        # gather results are masked out below, so the clamped values are
+        # never observed.
+        prefill_offset = (arange - real_decode_token_count).clamp_(min=0)
+        gather_idx = (
+            (real_decode_count + prefill_offset).clamp_(max=self.max_requests - 1).long()
+        )
+        gathered = self.gpu_view.active_request_last_token_idxs.gather(0, gather_idx)
+
+        self.active_logit_idxs[:n] = torch.where(
+            in_decode,
+            arange,
+            torch.where(in_prefill, gathered, 0),
+        )
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1975,13 +2137,47 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
-        Args:
-            construct_graph_dimensions (Optional[InferenceBatchDimensions]):
-                The graph config to use for constructing the cuda graphs.
-            is_expert_parallel_dummy_cuda_graph_step (bool):
-                Whether this is a dummy expert model parallel step.
-        Return:
-            None.
+        Three-phase orchestration:
+
+        1. :meth:`prepare_attn_init` — CPU-only dimension resolution and
+           CPU-side active-slice bookkeeping. The synced GPU counters are
+           the only ``torch.where`` mask boundaries the body needs; they
+           track the host counters via the lockstep mutators in
+           ``add_request`` / ``update_requests``, so no per-step staging.
+        2. :meth:`run_attn_init_graph_body` — single graphable body that
+           performs the unified H2D, the GPU-side build of active slices,
+           and the Mamba update. Wrapped by ``CudaGraphManager`` in the
+           text-generation controller so the body is captured per-bucket.
+        3. :meth:`finalize_attn_init` — post-graph CPU work (resolves
+           ``max_seqlen_q`` / ``max_seqlen_k`` for non-graph steps from the
+           just-populated GPU buffers).
+        """
+        if self.prepare_attn_init(
+            construct_graph_dimensions=construct_graph_dimensions,
+            is_expert_parallel_dummy_cuda_graph_step=is_expert_parallel_dummy_cuda_graph_step,
+        ):
+            self.run_attn_init_graph_body(eager=not self.using_cuda_graph_this_step())
+            self.finalize_attn_init()
+
+    def prepare_attn_init(
+        self,
+        *,
+        construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
+        is_expert_parallel_dummy_cuda_graph_step: bool = False,
+    ) -> bool:
+        """Pre-graph phase of :meth:`initialize_attention_state`.
+
+        Resolves real / padded batch dimensions and runs the CPU-side
+        active-slice bookkeeping. The GPU counters that the graphable body
+        reads as ``torch.where`` mask boundaries are kept in sync by the
+        ``_sync_counters_to_gpu`` calls fired from
+        ``add_request`` / ``update_requests`` / ``reset_metadata``, so this
+        method does not stage any per-step scalars on its own.
+
+        Returns ``True`` if the body + finalize phases should still run, or
+        ``False`` for the EP-dummy fast-path where no compatible CUDA graph
+        bucket was found and the controller will fall back to a single-token
+        eager forward.
         """
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
@@ -2026,6 +2222,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if construct_graph_dimensions is not None:
             assert self._using_cuda_graph_this_step
 
+        if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
+            # No compatible cuda graph for the dummy forward step on this rank.
+            # Fire the body hooks so external owners can still toggle into the
+            # eager-mode bucket; skip the body / finalize phases.
+            for hook in self._init_body_hooks:
+                hook(False)
+            return False
+
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:
@@ -2060,30 +2264,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        self.build_cpu_active_slices(
-            min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
+        # CPU-side active-slice bookkeeping (runs once per step on host).
+        batch_size = min(
+            self.padded_active_request_count, self.max_requests - self.paused_request_count
         )
+        self.build_cpu_active_slices(batch_size)
         self.pad_cpu_active_slices()
-
-        # Update token position indexes.
-        self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
-            self.kv_block_allocator.dummy_block_idx
-        )
-        self.token_to_local_position_within_kv_block[
-            self.active_token_count : self.padded_active_token_count
-        ] = 0
-        self.token_to_position_in_request[
-            self.active_token_count : self.padded_active_token_count
-        ] = 0
 
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]
             if self.using_cuda_graph_this_step()
             else self.non_graph_attn_metadata  # type: ignore[assignment]
         )
-
-        # In the [active | paused | dead] layout, the active region is request_*[:batch_size].
-        active_slice = slice(0, self.total_request_count - self.paused_request_count)
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
@@ -2097,47 +2289,47 @@ class DynamicInferenceContext(BaseInferenceContext):
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
                 )
+        self.attn_dimensions = attn_dimensions
 
-        real_bs = attn_dimensions.req_count
-        padded_bs = self.padded_batch_dimensions.req_count
+        # Refresh the request-level staging slots inside ``_cpu_bookkeeping_buf``
+        # before the H2D inside the graphable body. CPU memcpy on pinned memory.
+        n_active = self.total_request_count - self.paused_request_count
+        active_slice = slice(0, n_active)
+        padded_active = max(n_active, self.padded_active_request_count)
+        self._staging_request_in_prefill_status[:n_active] = (
+            self.request_in_prefill_status_tensor[active_slice]
+        )
+        self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
+        self._staging_request_kv_length_offsets[:n_active] = (
+            self.request_kv_length_offsets[active_slice]
+        )
+        self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
+            :padded_active
+        ]
+        self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][:padded_active]
+        self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][:padded_active]
+        if n_active < padded_active:
+            self._staging_request_in_prefill_status[n_active:padded_active] = 0
+            self._staging_request_query_lengths[n_active:padded_active] = 0
+            self._staging_request_kv_length_offsets[n_active:padded_active] = 0
+
+        # Bind ``state_data`` slices into the static GPU buffers. The actual
+        # data fill happens during ``run_attn_init_graph_body``. Graph mode
+        # uses a conservative ``max_seqlen`` bound; non-graph steps refine it
+        # in ``finalize_attn_init`` once the buffers are populated.
         mha = self.active_attn_metadata["mha_metadata"]
-
-        # Max sequence lengths (Python scalars; consumed as kernel launch args).
-        # Computed on CPU from `request_query_lengths` / `request_kv_length_offsets`
-        # to avoid a per-step GPU sync. Matches the post-H2D source for the
-        # GPU-side compute below.
-        if not self.using_cuda_graph_this_step() and real_bs > 0:
-            # NonGraphedMHAMetadata: use actual max values.
-            max_seqlen_q = self.request_query_lengths[:real_bs].max().item()
-            max_seqlen_k = (
-                self.request_kv_length_offsets[:real_bs] + self.request_query_lengths[:real_bs]
-            ).max().item()
+        if self.padded_batch_dimensions.prefill_req_count == 0:
+            graph_max_seqlen_q = self.num_speculative_tokens + 1
         else:
-            # GraphedMHAMetadata: use conservative bounds.
-            if self.padded_batch_dimensions.prefill_req_count == 0:
-                max_seqlen_q = self.num_speculative_tokens + 1
-            else:
-                max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
-            max_seqlen_k = mha.max_seqlen
-        if not self.using_cuda_graph_this_step() and real_bs == 0:
-            max_seqlen_q = self.num_speculative_tokens + 1
-            max_seqlen_k = 1
-
-        # Bind state_data slices into the static GPU buffers. The actual GPU
-        # compute that fills those buffers happens after the H2D in
-        # transfer_bookkeeping_to_gpu() (see ``_compute_active_mha_metadata``).
+            graph_max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
         mha.set_state_data(
-            padded_active_request_count=padded_bs,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
+            padded_active_request_count=self.padded_batch_dimensions.req_count,
+            max_seqlen_q=graph_max_seqlen_q,
+            max_seqlen_k=self.max_sequence_length,
         )
 
+        # Stage Mamba update kwargs; the actual GPU compute runs in the body.
         if self.is_hybrid_model:
-            # Mamba metadata is computed on GPU after the H2D, reading from the
-            # post-transfer ``gpu_view.request_to_mamba_state_idx``,
-            # ``gpu_view.token_to_request_idx``, and the GPU-side
-            # ``cu_active_request_query_lengths`` (filled by
-            # ``_compute_active_mha_metadata``).
             intermediate_offsets_gpu = None
             intermediate_counts_gpu = None
             if self.mamba_slot_allocator is not None:
@@ -2145,7 +2337,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.mamba_slot_allocator.get_intermediate_cpu_data()
                 )
             self._pending_mamba_update_kwargs = dict(
-                active_mamba_indices=self.gpu_view.request_to_mamba_state_idx,
+                active_mamba_indices=self.active_mamba_indices,
                 token_to_request_idx=self.gpu_view.token_to_request_idx,
                 cu_seqlens=self.cu_active_request_query_lengths,
                 batch_dimensions=attn_dimensions,
@@ -2154,12 +2346,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_offsets_gpu=intermediate_offsets_gpu,
                 intermediate_counts_gpu=intermediate_counts_gpu,
             )
-
-        if self.moe_enable_routing_replay:
-            if self.using_cuda_graph_this_step():
-                self.moe_routing_metadata.enable_static_buffer_recording()
-            else:
-                self.moe_routing_metadata.disable_static_buffer_recording()
+        else:
+            self._pending_mamba_update_kwargs = None
 
         # Flip NCCLAllGather dispatcher's path selector to not use allgathers.
         # _nccl_ep_dispatcher already implies ep_size > 1, so no extra EP guard.
@@ -2168,17 +2356,86 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Flush any Mamba ops queued by add_dummy_requests_for_cudagraph_capture
         # (warmup) or add_dummy_requests_for_expert_parallel_step (EP dummy step).
-        # The earlier call at the top drained ops queued by add_request() before
-        # this function ran; this call covers ops queued during the function.
-        # No-op when the queue is already empty (regular non-warmup steps).
         self._execute_pending_mamba_ops()
 
-        # Run the H2D transfer here so callers that bypass the controller
-        # (e.g. unit tests that call `model.forward()` directly after
-        # `initialize_attention_state()`) see populated GPU bookkeeping. The
-        # text-generation controller still calls `transfer_bookkeeping_to_gpu`
-        # explicitly; that second call is a cheap idempotent re-copy.
-        self.transfer_bookkeeping_to_gpu()
+        return True
+
+    def run_attn_init_graph_body(self, eager: bool = False) -> None:
+        """Graphable body of :meth:`initialize_attention_state`.
+
+        Wrapped by :class:`CudaGraphManager` in the text-generation controller
+        when the step uses a CUDA graph bucket. Every op on the GPU side
+        operates on fixed-shape slices keyed on ``padded_active_*_count`` and
+        uses ``torch.where`` masks against the synced GPU counters
+        (mirrored from the host counters), so the body is capturable as-is.
+
+        Args:
+            eager: ``True`` on non-graphed steps. Has no semantic effect on
+                the GPU work itself; reserved for future hooks.
+        """
+        # Single coalesced H2D for the unified bookkeeping buffer; captured in
+        # the graph so replays always copy the current CPU contents.
+        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+
+        # ``return_log_probs`` is bool (1 byte per slot, doesn't share the
+        # int32-aligned bookkeeping buffer); piggybacks on the body so its
+        # H2D is captured alongside the rest.
+        padded_active = max(
+            self.total_request_count - self.paused_request_count,
+            self.padded_active_request_count,
+        )
+        self.gpu_return_log_probs_mask[:padded_active].copy_(
+            self.active_request_metadata["return_log_probs"][:padded_active], non_blocking=True
+        )
+        if padded_active < self.max_requests:
+            self.gpu_return_log_probs_mask[padded_active:].fill_(False)
+
+        # GPU compute: build the static active tensors and the cumulatives,
+        # then populate ``active_logit_idxs`` (consumed by sampling) using
+        # the just-computed ``active_request_last_token_idxs``.
+        self._build_gpu_active_slices()
+        self._pad_gpu_active_slices()
+
+        # Mamba metadata GPU compute (no-op on non-hybrid models).
+        if self._pending_mamba_update_kwargs is not None:
+            self.mamba_metadata.update(**self._pending_mamba_update_kwargs)
+            self._pending_mamba_update_kwargs = None
+
+        # Hooks fired so external owners (e.g. the text-generation controller)
+        # can run their own per-bucket toggles inside the captured body.
+        for hook in self._init_body_hooks:
+            hook(not eager)
+
+    def finalize_attn_init(self) -> None:
+        """Post-graph phase of :meth:`initialize_attention_state`.
+
+        Resolves the precise ``max_seqlen_q`` / ``max_seqlen_k`` for non-graph
+        steps from the just-populated GPU buffers (the ``.item()`` syncs are
+        free here because the forward pass is still queued). Graph steps use
+        the conservative bounds set in :meth:`prepare_attn_init`; their
+        ``max_seqlen`` values are baked in at capture time.
+        """
+        if self.moe_enable_routing_replay:
+            if self.using_cuda_graph_this_step():
+                self.moe_routing_metadata.enable_static_buffer_recording()
+            else:
+                self.moe_routing_metadata.disable_static_buffer_recording()
+
+        if self.using_cuda_graph_this_step():
+            return
+        n = self.padded_active_request_count
+        mha = self.active_attn_metadata["mha_metadata"]
+        if n > 0:
+            max_seqlen_q = int(self.active_request_query_lengths[:n].max().item())
+            max_seqlen_k = int(self.active_sequence_lengths[:n].max().item())
+        else:
+            max_seqlen_q = self.num_speculative_tokens + 1
+            max_seqlen_k = 1
+        mha._max_seqlen_q = max_seqlen_q
+        mha._max_seqlen_k = max_seqlen_k
+        if mha.state_data:
+            mha.state_data["max_seqlen_q"] = max_seqlen_q
+            mha.state_data["max_seqlen_k"] = max_seqlen_k
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -2205,121 +2462,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._pending_mamba_zeros.clear()
 
     def transfer_bookkeeping_to_gpu(self) -> None:
-        """Batch transfer CPU bookkeeping state to GPU staging buffers.
+        """Backwards-compatible no-op shim.
 
-        Called after initialize_attention_state() and before the forward pass.
-        All copies use non_blocking=True with pinned CPU memory. CUDA stream
-        ordering guarantees the forward pass sees completed transfers.
-
-        The bookkeeping fields are backed by one contiguous pinned CPU buffer
-        and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
-        Request-level staging slots are refreshed from the persistent CPU
-        tensors immediately before the H2D. In the [active | paused | dead]
-        layout, the active region is `request_*[:n_active]` on both sides.
+        The unified H2D, the GPU-side build of active slices, and the Mamba
+        update all run from inside :meth:`run_attn_init_graph_body` (so they
+        are captured by ``CudaGraphManager``). External callers that used to
+        invoke this explicitly continue to work; the work is already done.
         """
-        n_active = self.total_request_count - self.paused_request_count
-        active_slice = slice(0, n_active)
-        padded_active = max(n_active, self.padded_active_request_count)
-
-        # Refresh request-level staging slots from the persistent CPU source.
-        # CPU-to-CPU slice assignment on pinned memory (~15 KB total for 6
-        # 4-byte fields at max_requests=624). Negligible vs. the launch overhead
-        # we save by merging the H2D memcpys into 1.
-        self._staging_request_in_prefill_status[:n_active] = self.request_in_prefill_status_tensor[
-            active_slice
-        ]
-        self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
-        self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
-            active_slice
-        ]
-        # Sampling-parameter staging slots: read from `active_request_metadata`,
-        # which `build_cpu_active_slices` + `pad_cpu_active_slices` already populated for
-        # `[:padded_active]` (active values + neutral padding defaults).
-        self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
-            :padded_active
-        ]
-        self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][:padded_active]
-        self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][:padded_active]
-
-        # Full-iteration CUDA graphs may have captured GPU consumers with the
-        # padded graph request count. Keep those padded staging rows bounded so
-        # graph replay never builds indices from stale request lengths.
-        if n_active < padded_active:
-            self._staging_request_in_prefill_status[n_active:padded_active] = 0
-            self._staging_request_query_lengths[n_active:padded_active] = 0
-            self._staging_request_kv_length_offsets[n_active:padded_active] = 0
-
-        # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
-        # Copying the whole (max_tokens + max_requests)-sized buffer including
-        # unused slots is cheap and saves redundant launch overheads vs. the
-        # prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
-
-        # `return_log_probs` is bool (1 byte per slot, doesn't share the int32-aligned buffer).
-        self.gpu_return_log_probs_mask[:padded_active].copy_(
-            self.active_request_metadata["return_log_probs"][:padded_active], non_blocking=True
-        )
-        if padded_active < self.max_requests:
-            self.gpu_return_log_probs_mask[padded_active:].fill_(False)
-
-        # MHA derived metadata: GPU compute on the just-transferred bookkeeping.
-        # Cumulative query lengths, kv sequence lengths, padded block table.
-        self._compute_active_mha_metadata(padded_active, n_active)
-
-        # Mamba metadata: GPU compute reading from the just-transferred
-        # ``gpu_view.request_to_mamba_state_idx`` / ``gpu_view.token_to_request_idx``
-        # and the post-MHA ``cu_active_request_query_lengths``.
-        if (
-            hasattr(self, '_pending_mamba_update_kwargs')
-            and self._pending_mamba_update_kwargs is not None
-        ):
-            self.mamba_metadata.update(**self._pending_mamba_update_kwargs)
-            self._pending_mamba_update_kwargs = None
-
-    def _compute_active_mha_metadata(self, padded_active: int, n_active: int) -> None:
-        """Fill the static MHA tensors on GPU using the post-H2D bookkeeping.
-
-        - ``cu_active_request_query_lengths[1 : padded_active + 1]``  :=
-              cumsum(``gpu_view.request_query_lengths[:padded_active]``)
-          (``[0]`` is fixed at 0 by allocation; padded slots [n_active:padded_active]
-          carry zeros from the staging refresh, so cumsum naturally repeats the
-          last real value.)
-
-        - ``active_sequence_lengths[:padded_active]`` :=
-              ``gpu_view.request_query_lengths[:padded_active]`` +
-              ``gpu_view.request_kv_length_offsets[:padded_active]``
-
-        - ``cu_active_sequence_lengths[1 : padded_active + 1]`` :=
-              cumsum(``active_sequence_lengths[:padded_active]``)
-
-        - ``active_request_to_kv_block_ids[:n_active]`` is copied from
-              ``gpu_view.request_to_kv_block_ids[:n_active]``;
-          padded slots ``[n_active:padded_active]`` are filled with -1.
-        """
-        if padded_active == 0:
-            return
-        gpu_v = self.gpu_view
-        torch.cumsum(
-            gpu_v.request_query_lengths[:padded_active],
-            dim=0,
-            out=self.cu_active_request_query_lengths[1 : padded_active + 1],
-        )
-        torch.add(
-            gpu_v.request_query_lengths[:padded_active],
-            gpu_v.request_kv_length_offsets[:padded_active],
-            out=self.active_sequence_lengths[:padded_active],
-        )
-        torch.cumsum(
-            self.active_sequence_lengths[:padded_active],
-            dim=0,
-            out=self.cu_active_sequence_lengths[1 : padded_active + 1],
-        )
-        if n_active > 0:
-            self.active_request_to_kv_block_ids[:n_active].copy_(
-                gpu_v.request_to_kv_block_ids[:n_active]
-            )
-        if n_active < padded_active:
-            self.active_request_to_kv_block_ids[n_active:padded_active].fill_(-1)
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""

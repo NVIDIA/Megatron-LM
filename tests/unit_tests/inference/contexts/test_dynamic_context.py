@@ -3576,7 +3576,7 @@ class TestDynamicContext:
         assert ctx.kv_block_allocator.pc_state.block_ref_counts[req1_blocks[3]].item() == 2
 
     # ------------------------------------------------------------------ #
-    #  Tests for active_logit_idxs / last_token_logits / pad_cpu_active_slices
+    #  Tests for active_logit_idxs / last_token_logits / _pad_gpu_active_slices
     # ------------------------------------------------------------------ #
 
     def _build_speculative_ctx(self, num_speculative_tokens=2, block_size=256):
@@ -3622,7 +3622,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_cpu_active_slices_speculative_decode_only(self):
+    def test_pad_gpu_active_slices_speculative_decode_only(self):
         """Verify active_logit_idxs for a decode-only batch with speculative tokens."""
         num_decode = 3
         num_spec = 2
@@ -3647,7 +3647,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_cpu_active_slices_speculative_mixed_batch(self):
+    def test_pad_gpu_active_slices_speculative_mixed_batch(self):
         """Verify active_logit_idxs for a mixed decode+prefill batch with speculative tokens."""
         num_decode = 2
         num_spec = 2
@@ -3688,7 +3688,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_cpu_active_slices_speculative_all_prefill(self):
+    def test_pad_gpu_active_slices_speculative_all_prefill(self):
         """Verify active_logit_idxs with only prefill requests (no decode) and speculative tokens."""
         num_spec = 2
         ctx = self._build_speculative_ctx(num_speculative_tokens=num_spec)
@@ -3721,7 +3721,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_cpu_active_slices_no_speculative_tokens(self):
+    def test_pad_gpu_active_slices_no_speculative_tokens(self):
         """Verify active_logit_idxs without speculative tokens matches cumsum - 1."""
         ctx = self._build_speculative_ctx(num_speculative_tokens=0)
 
