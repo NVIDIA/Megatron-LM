@@ -857,9 +857,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             ]
             errors_str = (
-                "; ".join(f"{type(e).__name__}: {e}" for e in errors)
-                if errors
-                else "unknown error"
+                "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else "unknown error"
             )
             warnings.warn(
                 f"Request {request_id} failed to be added to the engine ({errors_str}). "
