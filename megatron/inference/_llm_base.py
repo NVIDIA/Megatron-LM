@@ -3,24 +3,35 @@
 """Internal building blocks for the Megatron inference high-level API.
 
 This module hosts private helpers shared by the future ``MegatronLLM`` and
-``MegatronAsyncLLM`` classes. In Stage 1 only ``_EventLoopManager`` is
-defined; the coordinator runtime and the base class are added in later
-stages.
+``MegatronAsyncLLM`` classes: ``_EventLoopManager`` (Stage 1),
+``_CoordinatorRuntime`` and ``_MegatronLLMBase`` (Stage 2). The public
+sync/async wrappers are added in subsequent stages.
 """
 
 import asyncio
 import concurrent.futures
 import threading
 import time
-from typing import Coroutine
+from typing import Coroutine, List, Optional, Tuple, Union
+
+from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 
 
 class _EventLoopManager:
     """Per-instance background daemon thread + persistent asyncio event loop.
 
     Bridges sync and async user-thread callers to coroutines that run on the
-    background loop via ``asyncio.run_coroutine_threadsafe``. Mirrors the
-    pattern used by NeMo RL's inference worker.
+    background loop via ``asyncio.run_coroutine_threadsafe``.
     """
 
     def __init__(self) -> None:
@@ -51,6 +62,13 @@ class _EventLoopManager:
 
         self._started = True
 
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        """The background asyncio loop. Raises if ``start()`` has not been called."""
+        if not self._started or self._loop is None:
+            raise RuntimeError("_EventLoopManager.start() must be called before accessing loop.")
+        return self._loop
+
     def submit(self, coro: Coroutine) -> "concurrent.futures.Future":
         """Schedule ``coro`` on the background loop and return its future.
 
@@ -80,3 +98,416 @@ class _EventLoopManager:
         self._thread.join()
         self._stopped = True
         self._started = False
+
+
+class _CoordinatorRuntime:
+    """Owns the dynamic-inference coordinator and ``InferenceClient`` lifecycle.
+
+    Async-native: :meth:`setup` and :meth:`teardown` are coroutines meant to
+    run on a background loop owned by :class:`_EventLoopManager`. The primary
+    rank additionally holds an :class:`InferenceClient` used by the high-level
+    API to submit requests and send control signals.
+    """
+
+    def __init__(
+        self,
+        engine: "DynamicInferenceEngine",
+        *,
+        is_primary: bool,
+        coordinator_host: Optional[str],
+        coordinator_port: Optional[int],
+    ) -> None:
+        self._engine = engine
+        self._is_primary = is_primary
+        self._coordinator_host = coordinator_host
+        self._coordinator_port = coordinator_port
+        self._client: "InferenceClient | None" = None
+        self._coord_addr: Optional[str] = None
+
+    async def setup(self, *, loop: asyncio.AbstractEventLoop) -> None:
+        """Bring the coordinator and (on primary) the ``InferenceClient`` up.
+
+        Calls ``engine.start_listening_to_data_parallel_coordinator(loop=loop)``
+        on every rank. Only host/port kwargs that the caller actually supplied
+        are forwarded so the engine can auto-bind when both are ``None``.
+        """
+        kwargs = {"loop": loop}
+        if self._coordinator_host is not None:
+            kwargs["hostname"] = self._coordinator_host
+        if self._coordinator_port is not None:
+            kwargs["inference_coordinator_port"] = self._coordinator_port
+
+        coord_addr = await self._engine.start_listening_to_data_parallel_coordinator(**kwargs)
+        self._coord_addr = coord_addr
+
+        if self._is_primary:
+            # Lazy import: keep this module importable without pyzmq/msgpack
+            # installed when the user only needs direct mode.
+            from megatron.core.inference.inference_client import InferenceClient
+
+            client = InferenceClient(coord_addr)
+            client.start(loop=loop)
+            self._client = client
+
+    async def teardown(self) -> None:
+        """Primary-only client shutdown.
+
+        Worker ranks are no-ops here; their ``engine_loop_task`` is awaited by
+        :meth:`_MegatronLLMBase._shutdown_impl` after the primary has issued
+        the STOP signal.
+        """
+        if not self._is_primary:
+            return
+        assert self._client is not None
+        self._client.shutdown_coordinator()
+        self._client.stop()
+
+    @property
+    def client(self) -> "InferenceClient | None":
+        """The :class:`InferenceClient` on the primary rank; ``None`` on workers."""
+        return self._client
+
+    @property
+    def coord_addr(self) -> Optional[str]:
+        """Address returned by ``start_listening_to_data_parallel_coordinator``."""
+        return self._coord_addr
+
+
+class _MegatronLLMBase:
+    """Shared base for ``MegatronLLM`` and ``MegatronAsyncLLM``.
+
+    Public async methods (``generate``, ``pause``, ``unpause``, ``suspend``,
+    ``resume``, ``shutdown``, ``wait_for_shutdown``) are inherited as-is by
+    ``MegatronAsyncLLM`` and overridden with sync versions by ``MegatronLLM``.
+    The actual work runs inside private ``_<method>_impl`` coroutines that are
+    scheduled on the background runtime loop in coordinator mode.
+
+    Two execution modes are supported:
+
+    - **Direct mode** (``use_coordinator=False``): every rank is treated as
+      primary and ``generate`` runs the engine synchronously (offloaded to a
+      thread when called from an event loop). ``generate`` is single-caller in
+      direct mode -- concurrent calls (e.g. via ``asyncio.gather``) raise
+      :class:`RuntimeError`; pass a list of prompts instead. Lifecycle methods
+      raise :class:`RuntimeError`.
+    - **Coordinator mode** (``use_coordinator=True``): a background event loop
+      hosts the engine pipeline and an :class:`InferenceClient` (on global
+      rank 0). Only the primary rank may submit requests via ``generate``.
+
+    ``model`` must be in eval mode before construction; this class does not
+    modify the model state.
+    """
+
+    def __init__(
+        self,
+        *,
+        model,
+        tokenizer,
+        inference_config: Optional[InferenceConfig] = None,
+        use_coordinator: bool = False,
+        coordinator_host: Optional[str] = None,
+        coordinator_port: Optional[int] = None,
+    ) -> None:
+        if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
+            raise ValueError("coordinator_host/port require use_coordinator=True")
+
+        if inference_config is None:
+            inference_config = InferenceConfig()
+
+        # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
+        context = DynamicInferenceContext(model.config, inference_config)
+        # TODO: extend for non-GPT models in a future iteration.
+        wrapper = GPTInferenceWrapper(model, context)
+        controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
+        engine = DynamicInferenceEngine(controller=controller, context=context)
+
+        if use_coordinator:
+            # Lazy import so the module imports cleanly without torch installed.
+            import torch.distributed as dist
+
+            is_primary_rank = dist.get_rank() == 0
+        else:
+            is_primary_rank = True
+
+        self._engine = engine
+        self._context = context
+        self._controller = controller
+        self._use_coordinator = use_coordinator
+        self._is_primary_rank = is_primary_rank
+        self._loop_manager: "Optional[_EventLoopManager]" = None
+        self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
+        self._shutdown_called: bool = False
+        self._direct_generate_in_flight: bool = False
+
+        if use_coordinator:
+            loop_manager = _EventLoopManager()
+            loop_manager.start()
+            try:
+                coord_runtime = _CoordinatorRuntime(
+                    engine,
+                    is_primary=is_primary_rank,
+                    coordinator_host=coordinator_host,
+                    coordinator_port=coordinator_port,
+                )
+                loop_manager.run_sync(coord_runtime.setup(loop=loop_manager.loop))
+            except BaseException:
+                loop_manager.stop()
+                raise
+            self._loop_manager = loop_manager
+            self._coord_runtime = coord_runtime
+
+    # ---- properties ----
+
+    @property
+    def is_primary_rank(self) -> bool:
+        """Whether ``generate`` may be called on this rank."""
+        return self._is_primary_rank
+
+    @property
+    def engine(self) -> "DynamicInferenceEngine":
+        """The underlying :class:`DynamicInferenceEngine`."""
+        return self._engine
+
+    @property
+    def context(self) -> "DynamicInferenceContext":
+        """The underlying :class:`DynamicInferenceContext`."""
+        return self._context
+
+    @property
+    def controller(self) -> "TextGenerationController":
+        """The underlying :class:`TextGenerationController`."""
+        return self._controller
+
+    # ---- internal helpers ----
+
+    def _assert_primary(self) -> None:
+        if not self._is_primary_rank:
+            raise RuntimeError(
+                "generate(...) is only valid on the primary rank in coordinator mode"
+            )
+
+    def _assert_coordinator(self) -> None:
+        if not self._use_coordinator:
+            raise RuntimeError("This method requires use_coordinator=True")
+
+    def _normalize_prompts(
+        self, prompts: Union[str, List[int], List[str], List[List[int]]]
+    ) -> Tuple[Union[List[str], List[List[int]]], bool]:
+        """Return ``(normalized_list, is_batch_input)``.
+
+        - ``"abc"`` -> ``(["abc"], False)``
+        - ``[1, 2, 3]`` -> ``([[1, 2, 3]], False)``  (single token-id prompt)
+        - ``["abc", "def"]`` -> ``(["abc", "def"], True)``
+        - ``[[1, 2], [3, 4]]`` -> ``([[1, 2], [3, 4]], True)``
+        - ``[]`` -> ``([], True)``
+
+        Only the first element is inspected to distinguish single vs batch;
+        per-element type validation is left to the engine.
+        """
+        if isinstance(prompts, str):
+            return [prompts], False
+        if isinstance(prompts, list):
+            if not prompts:
+                return [], True
+            first = prompts[0]
+            if isinstance(first, int):
+                return [prompts], False
+            if isinstance(first, (str, list)):
+                return prompts, True
+            raise TypeError(
+                f"Unsupported prompt element type: {type(first)}; "
+                "expected str, list[int], list[str], or list[list[int]]."
+            )
+        raise TypeError(
+            f"prompts must be str, list[int], list[str], or list[list[int]]; "
+            f"got {type(prompts)}"
+        )
+
+    # ---- public async methods (inherited by MegatronAsyncLLM; overridden in MegatronLLM) ----
+
+    async def generate(
+        self,
+        prompts: Union[str, List[int], List[str], List[List[int]]],
+        sampling_params: Optional[SamplingParams] = None,
+    ) -> Union["DynamicInferenceRequest", List["DynamicInferenceRequest"]]:
+        """Run inference for one prompt or a batch of prompts.
+
+        Single input (``str`` or ``list[int]``) returns a single
+        ``DynamicInferenceRequest``; batched input (``list[str]`` or
+        ``list[list[int]]``) returns ``list[DynamicInferenceRequest]`` in
+        input order.
+
+        In direct mode, ``generate`` is single-caller -- concurrent calls raise
+        ``RuntimeError``. Pass batched input instead of using
+        ``asyncio.gather``.
+
+        Raises:
+            RuntimeError: if called on a non-primary rank in coordinator mode,
+                or if a second concurrent call enters in direct mode.
+        """
+        self._assert_primary()
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
+        normalized, is_batch = self._normalize_prompts(prompts)
+
+        if not normalized:
+            # Empty batch: nothing to schedule. ``is_batch`` is always True
+            # here since single input is wrapped to a one-element list.
+            return []
+
+        if self._use_coordinator:
+            assert self._loop_manager is not None
+            results = await self._loop_manager.run_async(
+                self._generate_impl(normalized, sampling_params)
+            )
+        else:
+            if self._direct_generate_in_flight:
+                raise RuntimeError(
+                    "MegatronAsyncLLM.generate in direct mode is single-caller; "
+                    "pass a list of prompts instead of using asyncio.gather."
+                )
+            self._direct_generate_in_flight = True
+            try:
+                results = await self._generate_impl(normalized, sampling_params)
+            finally:
+                self._direct_generate_in_flight = False
+
+        return results if is_batch else results[0]
+
+    async def pause(self) -> None:
+        """Transition the engine to ``PAUSED``.
+
+        Raises:
+            RuntimeError: in direct mode (``use_coordinator=False``).
+        """
+        self._assert_coordinator()
+        assert self._loop_manager is not None
+        await self._loop_manager.run_async(self._pause_impl())
+
+    async def unpause(self) -> None:
+        """Transition the engine from ``PAUSED`` back to ``RUNNING``.
+
+        Raises:
+            RuntimeError: in direct mode (``use_coordinator=False``).
+        """
+        self._assert_coordinator()
+        assert self._loop_manager is not None
+        await self._loop_manager.run_async(self._unpause_impl())
+
+    async def suspend(self) -> None:
+        """Transition the engine to ``SUSPENDED`` (offloads GPU buffers).
+
+        The caller must ``pause()`` first; this method does not enforce that.
+
+        Raises:
+            RuntimeError: in direct mode (``use_coordinator=False``).
+        """
+        self._assert_coordinator()
+        assert self._loop_manager is not None
+        await self._loop_manager.run_async(self._suspend_impl())
+
+    async def resume(self) -> None:
+        """Transition the engine from ``SUSPENDED`` to ``RESUMED``.
+
+        Raises:
+            RuntimeError: in direct mode (``use_coordinator=False``).
+        """
+        self._assert_coordinator()
+        assert self._loop_manager is not None
+        await self._loop_manager.run_async(self._resume_impl())
+
+    async def shutdown(self) -> None:
+        """Stop the engine, tear down the coordinator, and join the runtime thread.
+
+        Idempotent. No-op in direct mode.
+        """
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+        if not self._use_coordinator:
+            return
+        assert self._loop_manager is not None
+        await self._loop_manager.run_async(self._shutdown_impl())
+        # Stop the loop in a worker thread so we don't block the caller's loop.
+        await asyncio.to_thread(self._loop_manager.stop)
+
+    async def wait_for_shutdown(self) -> None:
+        """Block until the engine's background loop task terminates.
+
+        No-op in direct mode.
+        """
+        if not self._use_coordinator:
+            return
+        assert self._loop_manager is not None
+        await self._loop_manager.run_async(self._wait_for_shutdown_impl())
+
+    # ---- private impl coroutines (run on the runtime loop) ----
+    # The coordinator requires a long running runtime event loop, so we define these methods
+    # to route the user's event loop to our runtime loop
+   
+
+    async def _generate_impl(
+        self,
+        prompts: Union[List[str], List[List[int]]],
+        sp: SamplingParams,
+    ) -> List["DynamicInferenceRequest"]:
+        """Run inference for a non-empty list of prompts; returns input-ordered list.
+
+        - Coordinator mode: must run on the runtime loop (via
+          ``_loop_manager.run_async``); enqueues requests through
+          ``client.add_request`` and gathers all futures.
+        - Direct mode: runs on the caller's event loop; offloads the synchronous
+          ``engine.generate`` to a thread.
+        """
+        if self._use_coordinator:
+            # ``add_request`` calls ``asyncio.get_running_loop().create_future()``
+            # so it must be invoked from a coroutine on the runtime loop. This
+            # coroutine runs on that same loop, so ``asyncio.gather`` over the
+            # returned futures is safe.
+            assert self._coord_runtime is not None and self._coord_runtime.client is not None
+            futures = [self._coord_runtime.client.add_request(p, sp) for p in prompts]
+            return list(await asyncio.gather(*futures))
+        # Direct mode: ``engine.generate`` accepts ``list[str]`` or
+        # ``list[list[int]]``; both flow through ``engine.add_request`` which
+        # accepts ``Union[str, List[int], Tensor]`` despite the narrower declared
+        # type on ``engine.generate`` itself. TODO: widen that signature upstream.
+        records = await asyncio.to_thread(self._engine.generate, prompts, sp)
+        return [r.merge() for r in records]
+
+    async def _pause_impl(self) -> None:
+        if self._is_primary_rank:
+            assert self._coord_runtime is not None and self._coord_runtime.client is not None
+            self._coord_runtime.client.pause_engines()
+        await self._engine.wait_until(EngineState.PAUSED)
+
+    async def _unpause_impl(self) -> None:
+        if self._is_primary_rank:
+            assert self._coord_runtime is not None and self._coord_runtime.client is not None
+            self._coord_runtime.client.unpause_engines()
+        await self._engine.wait_until(EngineState.RUNNING)
+
+    async def _suspend_impl(self) -> None:
+        if self._is_primary_rank:
+            assert self._coord_runtime is not None and self._coord_runtime.client is not None
+            self._coord_runtime.client.suspend_engines()
+        await self._engine.wait_until(EngineState.SUSPENDED)
+
+    async def _resume_impl(self) -> None:
+        if self._is_primary_rank:
+            assert self._coord_runtime is not None and self._coord_runtime.client is not None
+            self._coord_runtime.client.resume_engines()
+        await self._engine.wait_until(EngineState.RESUMED)
+
+    async def _shutdown_impl(self) -> None:
+        if self._is_primary_rank:
+            assert self._coord_runtime is not None and self._coord_runtime.client is not None
+            self._coord_runtime.client.stop_engines()
+            await self._engine.wait_until(EngineState.STOPPED)
+            await self._coord_runtime.teardown()
+        else:
+            await self._engine.engine_loop_task
+
+    async def _wait_for_shutdown_impl(self) -> None:
+        await self._engine.engine_loop_task
+
