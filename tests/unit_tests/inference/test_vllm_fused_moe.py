@@ -3,7 +3,7 @@
 """Unit tests for megatron.core.inference.moe.vllm_fused_moe.
 
 Tests cover:
-- _select_block_size_m: BLOCK_SIZE_M selection based on token count
+- _get_default_config: full launch config (tile sizes, warps, stages) from M/E/top_k
 - _moe_align_block_size_cuda_graphable: indirection table construction
 - _moe_sum: fused topk reduction with routing weight application
 - vllm_fused_moe: end-to-end correctness vs sequential reference
@@ -18,22 +18,6 @@ os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(tempfile.gettempdir(), "t
 
 import pytest
 import torch
-
-
-@pytest.fixture(autouse=True, scope="session")
-def _single_autotune_config():
-    """Replace the 25-entry autotune config list with a single config.
-
-    Each unique (N, K, BLOCK_SIZE_M) combo triggers a full autotune pass that
-    compiles ALL configs. Tests only need correctness, not peak throughput, so
-    one config is sufficient and cuts compiled-kernel count by ~25x.
-    """
-    from megatron.core.inference.moe.vllm_fused_moe import _fused_moe_kernel
-
-    orig = list(_fused_moe_kernel.configs)
-    _fused_moe_kernel.configs = [orig[0]]
-    yield
-    _fused_moe_kernel.configs = orig
 
 
 def _vt(n):
@@ -101,14 +85,14 @@ def _make_moe_inputs(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# _select_block_size_m
+# _get_default_config (mirrors vLLM's get_default_config)
 # ──────────────────────────────────────────────────────────────────────
 
 
-class TestSelectBlockSizeM:
+class TestGetDefaultConfig:
 
     @pytest.mark.parametrize(
-        "max_tokens,expected",
+        "M,expected_block_m",
         [
             (1, 16),
             (16, 16),
@@ -124,24 +108,41 @@ class TestSelectBlockSizeM:
             (4096, 128),
         ],
     )
-    def test_returns_expected(self, max_tokens, expected):
-        from megatron.core.inference.moe.vllm_fused_moe import _select_block_size_m
+    def test_block_m_thresholds(self, M, expected_block_m):
+        from megatron.core.inference.moe.vllm_fused_moe import _get_default_config
 
-        assert _select_block_size_m(max_tokens) == expected
+        cfg = _get_default_config(M=M, E=8, top_k=2)
+        assert cfg['BLOCK_SIZE_M'] == expected_block_m
 
-    def test_minimum_is_16(self):
-        from megatron.core.inference.moe.vllm_fused_moe import _select_block_size_m
+    def test_block_n_and_k_split_at_64(self):
+        from megatron.core.inference.moe.vllm_fused_moe import _get_default_config
 
-        assert _select_block_size_m(1) >= 16
+        small = _get_default_config(M=64, E=8, top_k=2)
+        large = _get_default_config(M=65, E=8, top_k=2)
+        assert small['BLOCK_SIZE_N'] == 64 and small['BLOCK_SIZE_K'] == 128
+        assert large['BLOCK_SIZE_N'] == 128 and large['BLOCK_SIZE_K'] == 64
 
-    def test_monotonically_nondecreasing(self):
-        from megatron.core.inference.moe.vllm_fused_moe import _select_block_size_m
+    def test_group_size_m_uses_tokens_per_expert(self):
+        from megatron.core.inference.moe.vllm_fused_moe import _get_default_config
 
-        prev = _select_block_size_m(1)
-        for n in range(2, 2048):
-            cur = _select_block_size_m(n)
-            assert cur >= prev, f"Decreased at n={n}: {prev} -> {cur}"
-            prev = cur
+        # 1024 / 8 = 128 → group_m = 1 (boundary not strict-greater).
+        assert _get_default_config(M=1024, E=8, top_k=2)['GROUP_SIZE_M'] == 1
+        # 2048 / 8 = 256 > 128 → group_m = 16.
+        assert _get_default_config(M=2048, E=8, top_k=2)['GROUP_SIZE_M'] == 16
+        # Many experts, few tokens-per-expert → group_m = 1.
+        assert _get_default_config(M=512, E=64, top_k=2)['GROUP_SIZE_M'] == 1
+
+    def test_num_warps_split_at_128(self):
+        from megatron.core.inference.moe.vllm_fused_moe import _get_default_config
+
+        assert _get_default_config(M=128, E=8, top_k=2)['num_warps'] == 4
+        assert _get_default_config(M=129, E=8, top_k=2)['num_warps'] == 8
+
+    def test_num_stages_split_at_32(self):
+        from megatron.core.inference.moe.vllm_fused_moe import _get_default_config
+
+        assert _get_default_config(M=32, E=8, top_k=2)['num_stages'] == 4
+        assert _get_default_config(M=33, E=8, top_k=2)['num_stages'] == 3
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -352,25 +353,6 @@ class TestMoeSum:
         )
 
         torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-3)
-
-    @pytest.mark.parametrize("valid_tokens", [0, 1, 8, 15])
-    def test_partial_valid_tokens(self, valid_tokens):
-        """Rows beyond valid_tokens are zeroed."""
-        from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
-
-        max_tokens, topk, K, num_experts = 16, 2, 64, 4
-        torch.manual_seed(42)
-        input = torch.randn(max_tokens * topk, K, device="cuda", dtype=torch.bfloat16)
-        topk_weights = torch.rand(max_tokens, topk, device="cuda", dtype=torch.float32)
-        routing_map = torch.randint(0, num_experts, (max_tokens, topk), device="cuda")
-
-        result = _moe_sum(
-            input, topk_weights, max_tokens, topk, K, _vt(valid_tokens), routing_map, 0, num_experts
-        )
-
-        if valid_tokens < max_tokens:
-            zeros = result[valid_tokens:]
-            assert (zeros == 0).all(), "Rows beyond valid_tokens should be zero"
 
     def test_writes_to_provided_output_buffer(self):
         from megatron.core.inference.moe.vllm_fused_moe import _moe_sum

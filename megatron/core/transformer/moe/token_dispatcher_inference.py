@@ -459,18 +459,30 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # When shared_expert_overlap is enabled, the shared expert forward is launched
         # on SharedExpertMLP.stream in dispatch_preprocess and joined in combine_postprocess.
         self._shared_expert_output: Optional[torch.Tensor] = None
+        # When True, the layer (not the dispatcher) is responsible for launching the
+        # shared expert and adding its output. Used for the latent-MoE inference path
+        # where the shared expert must run on full hidden_states (pre-latent) and the
+        # add must happen post-latent-back-projection — both outside the dispatcher's
+        # view. The dispatcher still tracks self.shared_experts so other side-effects
+        # (e.g. AGV CTA cap) keep working.
+        self._external_shared_expert_launch: bool = False
 
     # ── Dispatch path ─────────────────────────────────────────────────────────────
 
     def dispatch_preprocess(self, hidden_states, routing_map, probs):
         """Store routing map and local token count; no inter-rank communication.
 
-        If shared_expert_overlap is enabled (set_shared_experts has been called),
-        launch the entire shared-expert forward on SharedExpertMLP.stream so it
-        runs concurrently with AGV dispatch, expert GEMMs, and RSV combine.
+        If shared_expert_overlap is enabled (set_shared_experts has been called)
+        AND _external_shared_expert_launch is False, launch the entire shared-
+        expert forward on SharedExpertMLP.stream so it runs concurrently with
+        AGV dispatch, expert GEMMs, and RSV combine.
+
+        When _external_shared_expert_launch is True (latent-MoE inference path),
+        the layer launches the shared expert before its fc1_latent_proj on the
+        full hidden_states; the dispatcher does not launch it here.
         """
         self.hidden_shape = hidden_states.shape
-        if self.shared_experts is not None:
+        if self.shared_experts is not None and not self._external_shared_expert_launch:
             stream = SharedExpertMLP.stream
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
@@ -579,8 +591,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def combine_postprocess(self, hidden_states):
         """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H]).
 
-        If shared_expert_overlap is enabled, join SharedExpertMLP.stream and add
-        the shared-expert output produced concurrently during dispatch+combine.
+        If shared_expert_overlap is enabled AND _external_shared_expert_launch
+        is False, join SharedExpertMLP.stream and add the shared-expert output
+        produced concurrently during dispatch+combine.
+
+        When _external_shared_expert_launch is True (latent-MoE inference path),
+        the join+add happens in the layer's postprocess after fc2_latent_proj,
+        so we only restore the shape here.
         """
         output = hidden_states.view(self.hidden_shape)
         if self._shared_expert_output is not None:

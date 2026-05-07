@@ -41,104 +41,63 @@ from megatron.core.inference.moe.permute import (
 # ---------------------------------------------------------------------------
 
 
-def _select_block_size_m(max_tokens: int) -> int:
-    """Select BLOCK_SIZE_M based on the token buffer size.
+def _get_default_config(M: int, E: int, top_k: int) -> dict:
+    """Pick BLOCK_SIZE_*, GROUP_SIZE_M, num_warps, num_stages from M, E, top_k.
 
-    Smaller tiles reduce padding waste in the indirection table when each
-    expert sees few tokens (decode). Larger tiles improve compute density
-    for large batches (prefill). Minimum is 16 (tl.dot requirement on NVIDIA).
+    Mirrors vLLM's ``get_default_config`` (bf16/fp16 branch) verbatim:
+    https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/fused_moe.py
+
+    M here is the host-side token-count hint (``num_tokens_hint`` in
+    ``vllm_fused_moe``), NOT ``hidden_states.size(0)``. The hint is the
+    expected per-step token count; the worst-case buffer size would over-tune
+    for prefill on every decode step.
+
+    Two intuitions drive the choices:
+      1. Small M is memory-bound (favor tall/narrow tiles, more pipeline
+         stages); large M is compute-bound (favor short/wide tiles, more warps).
+      2. Padding tax dominates at small M — the indirection table pads M-tiles
+         per expert, so small M-tiles minimize wasted rows.
     """
-    if max_tokens <= 32:
-        return 16
-    if max_tokens <= 96:
-        return 32
-    if max_tokens <= 512:
-        return 64
-    return 128
+    # BLOCK_SIZE_M: shrink at small M to limit per-expert padding waste.
+    if M <= 32:
+        block_m = 16
+    elif M <= 96:
+        block_m = 32
+    elif M <= 512:
+        block_m = 64
+    else:
+        block_m = 128
+
+    # BLOCK_SIZE_N: small M is memory-bound on weights, narrow N keeps weight
+    # traffic in check; large M has enough FMAs per weight load for wider N.
+    block_n = 64 if M <= 64 else 128
+
+    # BLOCK_SIZE_K: small M needs depth in K to keep tensor cores fed; large M
+    # already has enough M*N work, so shorter K reduces accumulator stall.
+    block_k = 128 if M <= 64 else 64
+
+    # GROUP_SIZE_M: tile-grouping for L2 reuse on weight tiles. Only profitable
+    # when each expert sees enough adjacent M-tiles.
+    tokens_per_expert = M // max(E, 1)
+    group_m = 16 if tokens_per_expert > 128 else 1
+
+    # num_warps: small M doesn't justify register pressure of more warps;
+    # large M is compute-bound and feeds an MMA pipeline that wants more.
+    num_warps = 4 if M <= 128 else 8
+
+    # num_stages: extra prefetch only pays off when memory-bound (very small M).
+    num_stages = 4 if M <= 32 else 3
+
+    return {
+        'BLOCK_SIZE_M': block_m,
+        'BLOCK_SIZE_N': block_n,
+        'BLOCK_SIZE_K': block_k,
+        'GROUP_SIZE_M': group_m,
+        'num_warps': num_warps,
+        'num_stages': num_stages,
+    }
 
 
-# BLOCK_SIZE_M is NOT in these configs — it is selected on the Python side by
-# _select_block_size_m and passed as a caller-provided constexpr. Each unique
-# BLOCK_SIZE_M value triggers independent autotuning over these configs.
-_AUTOTUNE_CONFIGS = [
-    # GROUP_SIZE_M=1: better when each expert has few tokens (decode, sparse activation).
-    triton.Config(
-        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=2
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=3
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=4
-    ),
-    # GROUP_SIZE_M=8: better for large batches where experts see many tokens.
-    triton.Config(
-        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=5
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=4
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=4
-    ),
-    triton.Config(
-        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=5
-    ),
-]
-
-
-@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=['N', 'K'])
 @triton.jit
 def _fused_moe_kernel(
     # Pointers
@@ -153,7 +112,6 @@ def _fused_moe_kernel(
     N,
     K,
     num_valid_tokens,
-    num_sms,
     # Strides
     stride_am,
     stride_ak,
@@ -171,77 +129,90 @@ def _fused_moe_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    """Persistent fused MoE grouped GEMM with indirect token addressing.
+    """Fused MoE grouped GEMM with indirect token addressing.
 
-    Launches a fixed grid of num_sms CTAs. Each CTA loops over its share
-    of tiles, with total tile count determined device-side from
-    num_tokens_post_padded. This decouples grid size from buffer size,
-    keeping the kernel CUDA-graph safe while avoiding excess CTA overhead.
+    Body mirrors vLLM's `fused_moe_kernel` verbatim except for the
+    `FUSE_SQUARED_RELU` branch (Megatron applies relu+square in fp32 on
+    the accumulator before the bf16 cast — strictly more accurate than
+    upstream's separate post-FC1 activation kernel).
+
+    Grid is sized host-side from `num_tokens_hint` (the typical-case token
+    count), not the worst-case buffer length, so launch overhead at decode
+    stays small. When the actual padded length exceeds the hinted grid
+    size (rare prefill spikes), each CTA strides over multiple tiles via
+    the outer `tl.range` loop.
     """
-    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     total_tiles = num_pid_m * num_pid_n
-
-    tiles_per_cta = tl.cdiv(total_tiles, num_sms)
-    tile_start = pid * tiles_per_cta
-    tile_end = tl.minimum(tile_start + tiles_per_cta, total_tiles)
-
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    pid_init = tl.program_id(axis=0)
+    grid_size = tl.num_programs(axis=0)
+
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    for tile_id in tl.range(tile_start, tile_end):
-        # GROUP_SIZE_M swizzle: tile_id → (pid_m, pid_n)
-        group_id = tile_id // num_pid_in_group
+    for pid in tl.range(pid_init, total_tiles, grid_size):
+        # GROUP_SIZE_M swizzle: pid → (pid_m, pid_n).  Mirrors upstream vLLM.
+        group_id = pid // num_pid_in_group
         first_pid_m = group_id * GROUP_SIZE_M
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-        pid_n = (tile_id % num_pid_in_group) // group_size_m
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
 
-        offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-        offs_token_id = pid_m * BLOCK_SIZE_M + offs
-        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
-        token_mask = offs_token < num_valid_tokens
-
+        # Skip padding tiles whose expert slot was never assigned.  In
+        # vLLM this also handles non-local experts via `write_zeros_to_output`;
+        # our scatter excludes non-local pairs from `sorted_token_ids` entirely,
+        # so `expert_id == -1` only fires on tail padding and we just skip.
+        # (Triton's JIT does not support `continue`, so we gate the body.)
         off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+        if off_experts != -1:
+            offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+            offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+            token_mask = offs_token < num_valid_tokens
 
-        a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
-        b_block_ptr = tl.make_block_ptr(
-            base=b_ptr + off_experts * stride_be,
-            shape=(K, N),
-            strides=(stride_bk, stride_bn),
-            offsets=(0, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
-            order=(0, 1),
-        )
+            # `% N` keeps overflow lanes in-bounds; matching C-store mask drops
+            # their contribution.  Saves a 2-D bounds check inside the K loop.
+            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
 
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            a = tl.load(
-                a_ptrs,
-                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-                other=0.0,
+            a_ptrs = a_ptr + (
+                offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
             )
-            b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            accumulator += tl.dot(a, b)
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+            )
 
-        if FUSE_SQUARED_RELU:
-            accumulator = tl.maximum(accumulator, 0.0)
-            accumulator *= accumulator
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+            for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                    other=0.0,
+                )
+                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                accumulator += tl.dot(a, b)
+                a_ptrs += BLOCK_SIZE_K * stride_ak
+                b_ptrs += BLOCK_SIZE_K * stride_bk
 
-        if MUL_ROUTED_WEIGHT:
-            moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
-            accumulator *= moe_weight[:, None]
+            # Megatron-only: squared-relu fused on the fp32 accumulator before
+            # the bf16 cast.  Upstream runs relu+square as a separate bf16 kernel.
+            if FUSE_SQUARED_RELU:
+                accumulator = tl.maximum(accumulator, 0.0)
+                accumulator *= accumulator
 
-        accumulator = accumulator.to(tl.bfloat16)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, accumulator, mask=c_mask)
+            if MUL_ROUTED_WEIGHT:
+                moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+                accumulator *= moe_weight[:, None]
+
+            accumulator = accumulator.to(tl.bfloat16)
+            offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+            c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+            tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -412,19 +383,26 @@ def _invoke_fused_moe_kernel(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
-    block_size_m: int,
+    config: dict,
+    grid_size: int,
     fuse_squared_relu: bool = False,
 ):
-    """Launch the persistent Triton fused-MoE kernel for one GEMM pass.
+    """Launch the Triton fused-MoE kernel for one GEMM pass.
 
-    Uses a fixed grid of NUM_SMS CTAs for CUDA-graph safety. Each CTA
-    loops over its share of tiles, with actual work determined device-side.
+    Body matches upstream vLLM `fused_moe_kernel` (1 CTA per (pid_m, pid_n)
+    tile, raw pointer arithmetic with `% N` on the N axis), apart from the
+    optional fused squared-relu activation in fp32.
+
+    `grid_size` is sized host-side from `num_tokens_hint` so launch overhead
+    at decode is small.  When the actual padded length exceeds the hinted
+    grid size, each CTA strides over additional tiles via the kernel's outer
+    `tl.range`.  The full launch config (tile sizes, warps, stages) is picked
+    host-side by ``_get_default_config`` from M = num_tokens_hint.
     """
     M = A.size(0)
     num_tokens = M * top_k
-    num_sms = _get_num_sms(A.device)
 
-    _fused_moe_kernel[(num_sms,)](
+    _fused_moe_kernel[(grid_size,)](
         A,
         B,
         C,
@@ -435,7 +413,6 @@ def _invoke_fused_moe_kernel(
         B.size(1),
         B.size(2),
         num_tokens,
-        num_sms,
         A.stride(0),
         A.stride(1),
         B.stride(0),
@@ -446,7 +423,12 @@ def _invoke_fused_moe_kernel(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         FUSE_SQUARED_RELU=fuse_squared_relu,
         top_k=top_k,
-        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_M=config['BLOCK_SIZE_M'],
+        BLOCK_SIZE_N=config['BLOCK_SIZE_N'],
+        BLOCK_SIZE_K=config['BLOCK_SIZE_K'],
+        GROUP_SIZE_M=config['GROUP_SIZE_M'],
+        num_warps=config['num_warps'],
+        num_stages=config['num_stages'],
     )
 
 
@@ -466,10 +448,11 @@ def _moe_sum_kernel(
     num_local_experts: tl.constexpr,
     K,
     topk: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
 ):
-    """Reduce topk dimension with valid_tokens gating and routing weight application.
+    """Reduce topk dimension with routing weight application.
 
     input:  [max_tokens * topk, K] bf16
     output: [max_tokens, K] — dtype matches the output buffer (fp32 or bf16)
@@ -478,20 +461,28 @@ def _moe_sum_kernel(
     over topk slots k where the expert is local.  Non-local slots are skipped
     (their values in `input` are undefined because FC2 only processes
     local-expert blocks).
-    For token t >= valid_tokens: output[t] = 0.
+    Rows for t >= valid_tokens are not written; downstream consumers
+    (e.g. reduce-scatter-v) only read the first valid_tokens rows.
     Routing weight multiplication and accumulation in fp32 for numerical accuracy.
+
+    Persistent grid: launches BLOCK_M CTAs that stride over valid_tokens.
+    CUDA-graph safe (grid is static); the loop bound is loaded device-side.
     """
-    token_id = tl.program_id(0).to(tl.int64)
+    pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    is_valid = token_id < valid_tokens
 
-    for k_idx in range(NUM_K_BLOCKS):
-        offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < K
+    for token_id in tl.range(pid, valid_tokens, BLOCK_M):
+        token_id_i64 = token_id.to(tl.int64)
+        base = token_id_i64 * topk * K
 
-        acc = tl.zeros([BLOCK_K], dtype=tl.float32)
-        if is_valid:
-            base = token_id * topk * K
+        # k_idx outer / topk inner keeps the live accumulator at one BLOCK_K tile.
+        # Swapping (topk outer) would need NUM_K_BLOCKS persistent accumulators
+        # (~NUM_K_BLOCKS * BLOCK_K * 4 B), which spills / cuts occupancy at large K.
+        for k_idx in range(NUM_K_BLOCKS):
+            offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+
+            acc = tl.zeros([BLOCK_K], dtype=tl.float32)
             for t in range(topk):
                 eid = tl.load(routing_map_ptr + token_id * topk + t)
                 lid = eid - local_expert_start
@@ -500,7 +491,7 @@ def _moe_sum_kernel(
                     w = tl.load(topk_weights_ptr + token_id * topk + t)
                     acc += v.to(tl.float32) * w
 
-        tl.store(output_ptr + token_id * K + offs_k, acc, mask=k_mask)
+            tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
 
 
 def _moe_sum(
@@ -521,15 +512,17 @@ def _moe_sum(
     Accumulates in fp32. When `out` is None, allocates and returns an fp32
     buffer. When `out` is provided (e.g. the RSV symmetric memory tensor),
     writes directly into it — tl.store handles the cast to the buffer's dtype.
-    Rows beyond valid_tokens are zeroed. Only accumulates contributions from
-    local experts; non-local topk slots are skipped (their values in `input`
-    are undefined).
+    Only writes the first valid_tokens rows; rows beyond are left untouched
+    (downstream RSV reads only the valid range). Only accumulates contributions
+    from local experts; non-local topk slots are skipped (their values in
+    `input` are undefined).
     """
     if out is None:
         out = torch.empty(max_tokens, K, dtype=torch.float32, device=input.device)
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
     NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
-    _moe_sum_kernel[(max_tokens,)](
+    BLOCK_M = _get_num_sms(input.device)
+    _moe_sum_kernel[(BLOCK_M,)](
         input,
         out,
         topk_weights,
@@ -539,6 +532,7 @@ def _moe_sum(
         num_local_experts,
         K,
         topk=topk,
+        BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         NUM_K_BLOCKS=NUM_K_BLOCKS,
     )
@@ -597,15 +591,32 @@ def vllm_fused_moe(
     max_tokens = hidden_states.size(0)
     topk = routing_map.shape[1]
     effective_tokens = num_tokens_hint if num_tokens_hint is not None else max_tokens
-    block_size_m = _select_block_size_m(effective_tokens)
+
+    # Mirror upstream vLLM: pick the full launch config (tile sizes, warps,
+    # stages) host-side from the token-count hint, not from the worst-case
+    # buffer size. Same config is used for both FC1 and FC2 (matches vLLM).
+    config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
 
     sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
-        routing_map, block_size_m, num_local_experts, local_expert_start, valid_tokens
+        routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
     )
     num_valid = max_tokens * topk
 
     N = fc1_weight.size(1)
     K = fc1_weight.size(2)
+
+    # Grid sized for the typical-case token count (num_tokens_hint).  When the
+    # actual num_tokens_post_padded exceeds this, the kernel's outer tl.range
+    # makes each CTA stride over additional tiles — correct but with reduced
+    # parallelism on rare prefill spikes.  EM hint = effective_tokens*topk +
+    # BLOCK_SIZE_M*num_local_experts upper-bounds the per-expert padding.
+    block_m = config['BLOCK_SIZE_M']
+    em_hint = effective_tokens * topk + block_m * num_local_experts
+    num_pid_m_hint = _ceil_div(em_hint, block_m)
+    num_pid_n_fc1 = _ceil_div(N, config['BLOCK_SIZE_N'])
+    num_pid_n_fc2 = _ceil_div(K, config['BLOCK_SIZE_N'])
+    grid_size_fc1 = num_pid_m_hint * num_pid_n_fc1
+    grid_size_fc2 = num_pid_m_hint * num_pid_n_fc2
 
     topk_weights_flat = probs.reshape(-1).contiguous()
 
@@ -624,7 +635,8 @@ def vllm_fused_moe(
         num_post_padded,
         mul_routed_weight=False,
         top_k=topk,
-        block_size_m=block_size_m,
+        config=config,
+        grid_size=grid_size_fc1,
         fuse_squared_relu=True,
     )
 
@@ -646,7 +658,8 @@ def vllm_fused_moe(
         num_post_padded,
         mul_routed_weight=False,
         top_k=1,
-        block_size_m=block_size_m,
+        config=config,
+        grid_size=grid_size_fc2,
     )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]

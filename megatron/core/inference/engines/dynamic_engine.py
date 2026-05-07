@@ -222,6 +222,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.disable_ep_consensus = inference_config.disable_ep_consensus
+        self.ep_consensus_interval = inference_config.ep_consensus_interval
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -2366,7 +2367,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
                         global_work_from_last_consensus == 0
-                        or self._ep_consensus_loop_counter % 20 == 0
+                        or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
                     ):
                         # selectively enter ep_establish_consensus if
                         # 1. there is no global work -> engine is idle. At any step in the future
