@@ -505,7 +505,7 @@ class TestHybridChunkedPrefillIntermediateState:
 
         # Verify req0 cached its Mamba state.
         assert (
-            len(ctx.mamba_slot_allocator.hash_to_block_id) > 0
+            len(ctx.prefix_cache_registry.mamba_hash_to_block_id) > 0
         ), "req0 should have cached Mamba state"
 
         # Phase 2: add req1 + req2 simultaneously.

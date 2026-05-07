@@ -334,7 +334,16 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.paused_request_count = 0
         context.total_request_count = batch_size
         context.num_prefill_requests = 0
-        context.pad_active_slices()
+        # The graphable ``_pad_gpu_active_slices`` runs inside the captured init
+        # body and depends on GPU scalars / ``active_request_last_token_idxs``
+        # populated by the rest of that body. This test bypasses the init flow
+        # and sets context fields directly, so populate ``active_logit_idxs``
+        # by hand: a decode-only batch with one token per request gives
+        # ``[0, 1, ..., batch_size - 1]``.
+        n = context.num_last_token_logits
+        context.active_logit_idxs[:n].copy_(
+            torch.arange(n, dtype=torch.int32, device='cuda')
+        )
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
@@ -863,10 +872,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Prepare sampling params
         top_n = 5
-        context.active_request_metadata["top_n_logprobs"][:batch_size].fill_(top_n)
-        context.active_request_metadata["skip_prompt_log_probs"][:batch_size].fill_(
-            skip_prompt_log_probs
-        )
+        context.request_metadata["top_n_logprobs"][:batch_size].fill_(top_n)
+        context.request_metadata["skip_prompt_log_probs"][:batch_size].fill_(skip_prompt_log_probs)
 
         if materialize_only_last_token_logits:
             # Decode mode: logits for last tokens only
@@ -915,7 +922,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             context.active_token_count = total_tokens
             context.num_prefill_requests = batch_size
             context.request_query_lengths = torch.tensor(
-                [0] * context.paused_request_count + query_lengths, dtype=torch.int32, device='cuda'
+                query_lengths + [0] * context.paused_request_count, dtype=torch.int32, device='cuda'
             )
 
             # Create logits for all tokens
@@ -992,7 +999,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             [3, 3], dtype=torch.int32, device='cuda'
         )  # 1 sampled + 2 spec
         ctx.num_prefill_requests = 0
-        ctx.pad_active_slices()
+        # See sibling test: bypass the captured init body and populate
+        # ``active_logit_idxs`` for a 2-decode batch with 3 tokens each.
+        n = ctx.num_last_token_logits
+        ctx.active_logit_idxs[:n].copy_(
+            torch.arange(n, dtype=torch.int32, device='cuda')
+        )
 
         # Init accepted tokens tensors
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -1086,7 +1098,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
-        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+        ctx.kv_block_allocator.release_memory_blocks_dynamic_gpu(blocks_to_release, remove_mask)
 
         # Assert offsets updated
         assert torch.equal(
@@ -1241,7 +1253,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # query lengths for decode with spec tokens is (1 + num_spec) = 4
         ctx.request_query_lengths = torch.tensor([4, 4], dtype=torch.int32, device='cuda')
         ctx.num_prefill_requests = 0
-        ctx.pad_active_slices()
+        # See sibling test: bypass the captured init body and populate
+        # ``active_logit_idxs`` for a 2-decode batch with 4 tokens each.
+        n = ctx.num_last_token_logits
+        ctx.active_logit_idxs[:n].copy_(
+            torch.arange(n, dtype=torch.int32, device='cuda')
+        )
 
         # Setup inputs
         input_ids = torch.randint(0, self.vocab_size, (1, 8), device='cuda')
@@ -1319,7 +1336,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
-        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+        ctx.kv_block_allocator.release_memory_blocks_dynamic_gpu(blocks_to_release, remove_mask)
 
         # Req 1 should have released block 20 (ref count decremented).
         assert ctx.kv_block_allocator.block_ref_counts[20].item() == 1
@@ -1363,7 +1380,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
-        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+        ctx.kv_block_allocator.release_memory_blocks_dynamic_gpu(blocks_to_release, remove_mask)
 
         # Only block 40 should be released, not blocks 10, 20, or 30.
         assert ctx.request_kv_block_counts[0].item() == 3
