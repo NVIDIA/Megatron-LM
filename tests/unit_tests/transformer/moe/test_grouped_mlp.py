@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 import megatron.core.transformer.moe.experts as experts_module
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -331,6 +332,217 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     assert ops[2].weight1 is module.linear_fc2.weight1
     assert ops[2].bias0 is module.linear_fc2.bias0
     assert ops[2].bias1 is module.linear_fc2.bias1
+
+
+def _make_fake_te_namespace():
+    """Build a fake TE namespace with the activation classes _make_fused_ops uses."""
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(
+            self,
+            num_gemms,
+            in_features,
+            out_features,
+            *,
+            bias,
+            device,
+            dtype,
+            accumulate_into_main_grad,
+            single_grouped_weight,
+            single_grouped_bias=False,
+            delay_wgrad_compute=False,
+        ):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.in_features = in_features
+            self.out_features = out_features
+            self.use_bias = bias
+            self.device = device
+            self.dtype = dtype
+            self.fuse_wgrad_accumulation = accumulate_into_main_grad
+            self.single_grouped_weight = single_grouped_weight
+            self.single_grouped_bias = single_grouped_bias
+            self.delay_wgrad_compute = delay_wgrad_compute
+
+        def need_backward_dw(self):
+            return False
+
+    class FakeScaledSwiGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+
+    class FakeScaledClampedQGeGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size, limit=None):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+            self.limit = limit
+
+    class FakeSequential(list):
+        def register_forward_pre_hook(self, hook):
+            self.forward_pre_hook = hook
+
+    return (
+        SimpleNamespace(
+            pytorch=SimpleNamespace(
+                GroupedLinear=FakeGroupedLinear,
+                ops=SimpleNamespace(
+                    GroupedLinear=FakeGroupedLinear,
+                    ScaledSwiGLU=FakeScaledSwiGLU,
+                    ScaledClampedQGeGLU=FakeScaledClampedQGeGLU,
+                    Sequential=FakeSequential,
+                ),
+            )
+        ),
+        FakeGroupedLinear,
+    )
+
+
+def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
+    """quick_gelu + clamp value → ScaledClampedQGeGLU(limit=clamp)."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=4,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=7.0,
+        gated_linear_unit=True,
+    )
+    module.activation_func = quick_gelu
+    common = dict(
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=False,
+    )
+    module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
+    module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    activation = ops[1]
+    assert type(activation).__name__ == "FakeScaledClampedQGeGLU"
+    assert activation.glu_interleave_size == 4
+    assert activation.limit == 7.0
+
+
+def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
+    """single_grouped_bias=True → bias attached as `bias` (not `bias{idx}`)."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=2,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        gated_linear_unit=True,
+    )
+    module.activation_func = F.silu
+    common = dict(device="cuda", dtype=torch.bfloat16, accumulate_into_main_grad=False)
+    # FC1 stores bias as a single grouped tensor; weights still per-GEMM.
+    module.linear_fc1 = FakeGroupedLinear(
+        2, 4, 8, bias=True, single_grouped_weight=False, single_grouped_bias=True, **common
+    )
+    module.linear_fc2 = FakeGroupedLinear(
+        2, 8, 4, bias=False, single_grouped_weight=False, single_grouped_bias=False, **common
+    )
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.bias = torch.nn.Parameter(torch.zeros(2, 8))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    assert ops[0].weight0 is module.linear_fc1.weight0
+    assert ops[0].weight1 is module.linear_fc1.weight1
+    assert ops[0].bias is module.linear_fc1.bias  # ← single grouped bias attached at "bias"
+    assert not hasattr(
+        ops[0], "bias0"
+    ), "bias should not be split into bias{idx} when single_grouped_bias=True"
+
+
+def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
+    """delay_wgrad_compute=True (via wrapper) → backward_dw calls fused [2] then [0]."""
+
+    class _Recorder:
+        def __init__(self, label):
+            self.label = label
+            self.calls = []
+
+        def backward_dw(self):
+            self.calls.append("backward_dw")
+
+    class _FakeWrapper:
+        def __init__(self, label):
+            self.label = label
+            self.delay_wgrad_compute = True
+            self.backward_dw_calls = 0
+
+        def backward_dw(self):
+            self.backward_dw_calls += 1
+
+    class _FakeSequential:
+        def __init__(self, children):
+            self._children = children
+
+        def children(self):
+            return iter(self._children)
+
+    fc1_op = _Recorder("fc1")
+    activation_op = _Recorder("activation")
+    fc2_op = _Recorder("fc2")
+    fake_seq = _FakeSequential([fc1_op, activation_op, fc2_op])
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._with_fused_impl = True
+    module._fused_ops = (fake_seq,)
+    module.linear_fc1 = _FakeWrapper("fc1_wrapper")
+    module.linear_fc2 = _FakeWrapper("fc2_wrapper")
+    module.config = SimpleNamespace(delay_wgrad_compute=False)  # config flag is irrelevant
+
+    module.backward_dw()
+
+    assert fc2_op.calls == ["backward_dw"]
+    assert fc1_op.calls == ["backward_dw"]
+    assert activation_op.calls == [], "activation op must not be invoked"
+    assert module.linear_fc1.backward_dw_calls == 0, "wrapper backward_dw must be skipped"
+    assert module.linear_fc2.backward_dw_calls == 0
+
+
+def test_backward_dw_falls_back_to_wrappers_when_delay_wgrad_off():
+    """delay_wgrad_compute=False on wrappers → use the original wrapper backward_dw path."""
+
+    class _FakeWrapper:
+        def __init__(self):
+            self.delay_wgrad_compute = False
+            self.backward_dw_calls = 0
+
+        def backward_dw(self):
+            self.backward_dw_calls += 1
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._with_fused_impl = True
+    module._fused_ops = None
+    module.linear_fc1 = _FakeWrapper()
+    module.linear_fc2 = _FakeWrapper()
+    module.config = SimpleNamespace(delay_wgrad_compute=False)
+
+    module.backward_dw()
+
+    assert module.linear_fc1.backward_dw_calls == 1
+    assert module.linear_fc2.backward_dw_calls == 1
 
 
 @pytest.mark.skipif(

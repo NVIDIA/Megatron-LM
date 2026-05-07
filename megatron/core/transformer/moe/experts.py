@@ -358,6 +358,12 @@ class TEGroupedMLP(MegatronModule):
         )
         fc1_single_grouped_bias = self.linear_fc1.single_grouped_bias
         fc2_single_grouped_bias = self.linear_fc2.single_grouped_bias
+        # Mirror the wrapper's combined delay-wgrad mode (config.delay_wgrad_compute OR
+        # config.overlap_dispatch_backward_with_experts_wgrad) — see TEGroupedLinear.__init__.
+        # Using config.delay_wgrad_compute alone would silently drop the overlap optimization
+        # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
+        fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
+        fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
@@ -371,7 +377,7 @@ class TEGroupedMLP(MegatronModule):
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
             single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
-            delay_wgrad_compute=self.config.delay_wgrad_compute,
+            delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -417,7 +423,7 @@ class TEGroupedMLP(MegatronModule):
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
             single_grouped_weight=fc2_single_grouped_weight,
             single_grouped_bias=fc2_single_grouped_bias,
-            delay_wgrad_compute=self.config.delay_wgrad_compute,
+            delay_wgrad_compute=fc2_delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -739,7 +745,11 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
-        if self._with_fused_impl and self.config.delay_wgrad_compute:
+        # Match the wrapper's combined delay-wgrad mode used in _make_fused_ops so that
+        # `overlap_dispatch_backward_with_experts_wgrad`-driven runs invoke the deferred
+        # wgrad pass through the fused children instead of falling through to no-op
+        # backward_dw() on linear_fc{1,2} (whose forward never ran in the fused path).
+        if self._with_fused_impl and self.linear_fc1.delay_wgrad_compute:
             if self._fused_ops is not None:
                 (seq,) = self._fused_ops
                 fused_children = list(seq.children())
