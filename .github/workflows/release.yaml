@@ -146,7 +146,6 @@ jobs:
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
       app-id: ${{ vars.BOT_ID }}
     secrets: inherit
-      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
 
   release-summary:
     needs: [pre-flight, bump, build-test-publish-wheels, finalize]
