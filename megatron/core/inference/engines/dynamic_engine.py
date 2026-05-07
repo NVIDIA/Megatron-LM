@@ -1192,8 +1192,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     # so gate the update to keep the metric a truthful sparse
                     # sample instead of polluting it with zeros.
                     if step_time > 0:
-                        if request.tpot is None:
-                            request.tpot = []
                         per_token_step_time = step_time / len(tokens)
                         request.tpot.extend([per_token_step_time] * len(tokens))
 
