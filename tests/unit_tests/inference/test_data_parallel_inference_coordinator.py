@@ -231,7 +231,11 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             # Graceful stop failed — fall back to forcible cleanup.
-            for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
+            for attr in (
+                'expert_parallel_zmq_communicator',
+                'expert_parallel_consensus_communicator',
+                'world_zmq_communicator',
+            ):
                 comm = getattr(engine, attr, None)
                 if comm is not None:
                     comm.close()
