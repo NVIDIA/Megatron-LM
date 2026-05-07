@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import torch
 from torch import Tensor
@@ -18,7 +18,12 @@ class FlashInferSampling(Sampling):
     """Fused FlashInfer sampling, with optional CUDA graph capture/replay."""
 
     def __init__(
-        self, vocab_size: int, rng: torch.Generator, config=None, enable_cuda_graph: bool = False
+        self,
+        vocab_size: int,
+        rng: torch.Generator,
+        config=None,
+        enable_cuda_graph: bool = False,
+        pin_input_from: Optional[List[CudaGraphManager]] = None,
     ) -> None:
         self._vocab_size = vocab_size
         self._rng = rng
@@ -29,6 +34,7 @@ class FlashInferSampling(Sampling):
                 function_name="sample_kernel",
                 need_backward=False,
                 inline_capture=True,
+                pin_input_from=pin_input_from,
             )
             CudaGraphManager(
                 config,
@@ -36,6 +42,7 @@ class FlashInferSampling(Sampling):
                 function_name="sample_speculative",
                 need_backward=False,
                 inline_capture=True,
+                pin_input_from=pin_input_from,
             )
 
     def sample_kernel(

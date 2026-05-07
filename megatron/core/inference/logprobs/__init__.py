@@ -12,20 +12,24 @@ Three execution paths, each a three-stage pipeline:
 
     stage 1: indexing kernel  - which logit rows / which token IDs to look up;
                                 runs pre-forward on a side stream.
-    stage 2: softmax kernel   - LSE trick: gather selected logits, subtract
-                                logsumexp per row. No full softmax materialized.
-    stage 3: extract          - CPU-side D2H + per-request packaging.
+    stage 2: lse kernel       - per-row logsumexp over selected logit rows;
+                                runs post-forward on a side stream concurrent
+                                with sampling on the main stream.
+    stage 3: gather kernel    - per-token gather of the logit at the sampled
+                                position; subtracts the precomputed lse. Cheap
+                                post-sample step on the main stream.
+    stage 4: extract          - CPU-side D2H + per-request packaging.
 
 Splitting the kernels lets the controller graph each stage and overlap GPU
 work with the forward pass / sampling on side streams; the CPU-side extract
 stage is deferred to the engine via a returned callable. `calculate_log_probs`
-below is the graph-unaware entry point that runs all three stages eagerly
+below is the graph-unaware entry point that runs all stages eagerly
 back-to-back; used by tests and any non-graph caller.
 
 Prefill-path example. Logits at row k predict token k+1, but the newly-sampled
-token isn't in `token_to_input_ids` yet, so the kernel shifts the active token
-window left by one and overwrites each request's final slot with the sampled
-token. Mixed prefill+decode, all four requests want log probs:
+token isn't in `token_to_input_ids` yet, so the gather kernel shifts the active
+token window left by one and overwrites each request's final slot with the
+sampled token. Mixed prefill+decode, all four requests want log probs:
 
     request roles          : [ decode | decode | prefill | prefill         ]
     request_query_lengths  : [   1    |   1    |    2    |    5            ]
@@ -42,15 +46,19 @@ Indexing kernel (LogProbsPrefill.indexing_kernel):
     logit_indices          : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]    rows of `logits` to gather
     masked_tokens (rolled) : [ XX| XX| 16 XX | 12 72 24 88 XX | scratch ]   XX = wrong rolled token
 
-Softmax kernel (LogProbsPrefill.softmax_kernel) overwrites each request's last
+LSE kernel (LogProbsPrefill.lse_kernel) — sampling-independent, runs on side stream:
+
+    selected_logits = logits.squeeze(0)[logit_indices].float()       # [9, V]
+    lse             = logsumexp(selected_logits, dim=-1)             # [9]
+
+Gather kernel (LogProbsPrefill.gather_kernel) overwrites each request's last
 slot with the sampled token; the trailing sentinel is redirected to the scratch
-slot to avoid colliding with request 3's write at slot 8:
+slot to avoid colliding with request 3's write at slot 8. Per-token scalar
+gather + subtract — cheap on main stream post-sample:
 
     masked_tokens (final)  : [ 52 | 12 | 16 3 | 12 72 24 88 86 | scratch ]
 
-    selected_logits = logits.squeeze(0)[logit_indices].float()       # [9, V]
-    lse             = logsumexp(selected_logits, dim=-1)
-    log_probs       = selected_logits[range(9), masked_tokens[:9]] - lse
+    log_probs = logits.squeeze(0)[logit_indices, masked_tokens[:9]].float() - lse
 
 Extract (LogProbsPrefill.extract) splits along masked_lengths and packages
 per request:
@@ -122,13 +130,11 @@ def calculate_log_probs(
 
     # Local naming (kept short to keep kernel call sites compact):
     #   ri              request_indices (output of indexing_kernel)
-    #   padded_arange   arange over padded_active_request_count
     #   cu_ml           cu_masked_lengths (cumulative per-request masked lengths)
     #   li              logit_indices (rows of `logits` to gather, one per active token)
-    #   li_range        arange over padded_active_token_count
     #   mt              masked_tokens (token IDs after roll-and-overwrite)
-    #   slp             selected_log_probs (output of softmax_kernel)
-    #   lse             logsumexp per row (subtracted to convert raw logits -> log-probs)
+    #   lse             logsumexp per row (output of lse_kernel)
+    #   slp             selected_log_probs (output of gather_kernel)
     #   raw             raw (un-LSE-adjusted) logits selected by `ri` or `li`
     #   top_n_v / _i    top-n log-prob values / token indices
 
@@ -153,8 +159,9 @@ def calculate_log_probs(
     # Decode path: one logit row per request. Used both for decode-only steps
     # and when the model only materialized last-token logits during prefill.
     if only_last_token_logits or context.is_decode_only():
-        ri, padded_arange = LogProbsDecode.indexing_kernel(context)
-        slp, lse = LogProbsDecode.softmax_kernel(logits, new_tokens, ri, padded_arange)
+        ri = LogProbsDecode.indexing_kernel(context)
+        lse = LogProbsDecode.lse_kernel(logits, ri)
+        slp = LogProbsDecode.gather_kernel(logits, new_tokens, ri, lse)
 
         top_n_v = top_n_i = None
         if top_n_max > 0:
@@ -175,12 +182,13 @@ def calculate_log_probs(
     else:
         # Mixed prefill+decode path: per-token logits across each request's query length.
         # See module docstring for the indexing/roll example.
-        ri, cu_ml, li, li_range, mt = LogProbsPrefill.indexing_kernel(context)
-        slp, lse = LogProbsPrefill.softmax_kernel(logits, new_tokens, ri, cu_ml, li, li_range, mt)
+        ri, cu_ml, li, mt = LogProbsPrefill.indexing_kernel(context)
+        lse = LogProbsPrefill.lse_kernel(logits, li)
+        slp = LogProbsPrefill.gather_kernel(logits, new_tokens, ri, cu_ml, li, mt, lse)
 
         top_n_v = top_n_i = None
         if top_n_max > 0:
-            # Per-token top-n; LSE-adjusted using the same lse as softmax_kernel.
+            # Per-token top-n; LSE-adjusted using the same lse as lse_kernel.
             raw = logits.squeeze(0)[li].float()
             top_n_v_raw, top_n_i = _topk(raw, k=top_n_max)
             top_n_v = top_n_v_raw - lse.unsqueeze(-1)
@@ -232,7 +240,7 @@ def _calculate_log_probs_speculative(
     #   top_n_v_flat                decode top-n flattened to [num_decode * spec+1, k]
     #   fp_*                        "full prefill": per-token outputs when
     #                               materialize_only_last_token_logits=False
-    #   ri, cu_ml, li, li_range, mt, slp, raw   as in calculate_log_probs (prefill kernel)
+    #   ri, cu_ml, li, mt, slp, raw   as in calculate_log_probs (prefill kernel)
     #   count_gpu                   prefill log-prob request count from prefill_indexing_kernel
     active_request_count = context.total_request_count - context.paused_request_count
     num_decode = context.num_decode_requests
@@ -301,12 +309,11 @@ def _calculate_log_probs_speculative(
     if not only_last_token_logits and num_prefill > 0:
         prefill_offset_pinned = torch.tensor([num_decode * spec_plus_one], dtype=torch.int64)
         # The kernel also returns a GPU copy of the offset; we already have one above, drop it.
-        _, ri, cu_ml, li, li_range, mt, count_gpu = LogProbsSpeculative.prefill_indexing_kernel(
+        _, ri, cu_ml, li, mt, count_gpu = LogProbsSpeculative.prefill_indexing_kernel(
             context, prefill_offset_pinned
         )
-        slp, fp_lse = LogProbsPrefill.softmax_kernel(
-            logits, new_tokens, ri, cu_ml, li, li_range, mt
-        )
+        fp_lse = LogProbsPrefill.lse_kernel(logits, li)
+        slp = LogProbsPrefill.gather_kernel(logits, new_tokens, ri, cu_ml, li, mt, fp_lse)
 
         fp_top_n_v = fp_top_n_i = None
         if top_n_max > 0:

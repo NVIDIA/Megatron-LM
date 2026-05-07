@@ -5,7 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
 import torch
@@ -170,11 +170,40 @@ class TextGenerationController:
         self._log_prob_count = 0
         self._top_n_max = 0
 
-        # Log-prob computation backends (graph caching is per-backend).
-        # TODO: Overlap these methods with other compute by running them on side-streams.
-        self._log_probs_decode = LogProbsDecode(self.model_config)
-        self._log_probs_prefill = LogProbsPrefill(self.model_config)
-        self._log_probs_speculative = LogProbsSpeculative(self.model_config)
+        # Side stream for work that can be overlapped with critical path (forward & sampling).
+        self._side_stream = torch.cuda.Stream(device=device)
+        self._side_pre_calc_event = torch.cuda.Event()
+        self._side_step_done_event = torch.cuda.Event()
+        self._forward_done_event = torch.cuda.Event()
+        # Dedicated stream for the deferred log-prob extract D2H copies.
+        self._extract_stream = torch.cuda.Stream(device=device)
+
+        if self._enable_cuda_graph:
+            model_cgm = unwrap_model(self.inference_wrapped_model.model).cudagraph_manager
+            pin_input_from = [model_cgm]
+        else:
+            pin_input_from = None
+
+        # Log-prob computation backends.
+        # All side-stream graphs across the three classes share one mempool.
+        self._log_probs_decode = LogProbsDecode(
+            self.model_config,
+            side_stream=self._side_stream,
+            pin_input_from=pin_input_from,
+        )
+        side_pool_anchor = self._log_probs_decode.side_pool_anchor
+        self._log_probs_prefill = LogProbsPrefill(
+            self.model_config,
+            side_stream=self._side_stream,
+            side_pool_anchor=side_pool_anchor,
+            pin_input_from=pin_input_from,
+        )
+        self._log_probs_speculative = LogProbsSpeculative(
+            self.model_config,
+            side_stream=self._side_stream,
+            side_pool_anchor=side_pool_anchor,
+            pin_input_from=pin_input_from,
+        )
 
         # Sampling backend: provides the sampling kernel.
         if self._sampling_backend == "flashinfer":
@@ -183,6 +212,7 @@ class TextGenerationController:
                 self.sampling_rng,
                 config=self.model_config,
                 enable_cuda_graph=self._enable_cuda_graph,
+                pin_input_from=pin_input_from,
             )
         else:
             self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
@@ -964,7 +994,7 @@ class TextGenerationController:
             gather_indices=sample_gather_indices,
             eager=not use_graph_for_sampling,
             cache_key=(
-                ("sample_speculative", sample_num_decode, sample_num_prefill)
+                ("sample_speculative", context.padded_batch_dimensions)
                 if use_graph_for_sampling
                 else None
             ),
@@ -1061,7 +1091,7 @@ class TextGenerationController:
             context,
             gather_indices=gather_indices,
             eager=not use_graph,
-            cache_key=("sample", n) if use_graph else None,
+            cache_key=("sample", context.padded_batch_dimensions) if use_graph else None,
         )
 
     def _dynamic_step_log_probs_bookkeeping(self):
@@ -1079,28 +1109,36 @@ class TextGenerationController:
     def _dynamic_step_log_probs_indexing(self):
         """Conditionally launch log-prob indexing kernels."""
         if self._log_prob_count == 0:
-            return
+            return None
 
         context = self.inference_wrapped_model.inference_context
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
 
         if context.num_speculative_tokens > 0:
-            self._log_probs_speculative.prefill_indexing(context, eager=eager)
-            return
+            return self._log_probs_speculative.prefill_indexing(context, eager=eager)
 
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
-            self._log_probs_decode.indexing(context, eager=eager)
-        else:
-            self._log_probs_prefill.indexing(context, eager=eager)
+            return self._log_probs_decode.indexing(context, eager=eager)
+        return self._log_probs_prefill.indexing(context, eager=eager)
 
-    def _dynamic_step_log_probs_softmax(self):
-        """Conditionally launch the speculative softmax kernel."""
+    def _dynamic_step_log_probs_lse(self, logits, indexing_outputs):
+        """Pre-sample LSE precompute on the side stream (overlaps sampling)."""
         if self._log_prob_count == 0:
-            return
+            return None
 
         context = self.inference_wrapped_model.inference_context
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
-        self._log_probs_speculative.softmax(context, self._all_logits_cuda, eager=eager)
+
+        if context.num_speculative_tokens > 0:
+            prefill_offset_gpu = indexing_outputs[0]
+            return self._log_probs_speculative.softmax(
+                context, logits, prefill_offset_gpu, eager=eager
+            )
+        if context.config.materialize_only_last_token_logits or context.is_decode_only():
+            ri = indexing_outputs
+            return self._log_probs_decode.lse(context, logits, ri, eager=eager)
+        _, _, li, _ = indexing_outputs
+        return self._log_probs_prefill.lse(context, logits, li, eager=eager)
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
         """Collect flat routing indices for MoE router recording.
@@ -1161,7 +1199,9 @@ class TextGenerationController:
         _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
         return stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
-    def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
+    def _dynamic_step_calculate_log_probs(
+        self, logits: Tensor, indexing_outputs, lse_outputs
+    ) -> Optional[Callable]:
         """Calculate log probs from logits."""
         log_prob_request_count = self._log_prob_count
         top_n_max = self._top_n_max
@@ -1169,14 +1209,15 @@ class TextGenerationController:
             return None
 
         context = self.inference_wrapped_model.inference_context
-        new_tokens = self._sampled_tokens_cuda[: context.padded_active_request_count]
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
 
         if context.num_speculative_tokens > 0:
             return self._log_probs_speculative.calculate(
                 context,
                 logits,
-                new_tokens,
+                self._sampled_tokens_cuda,
+                indexing_outputs,
+                lse_outputs,
                 log_prob_request_count,
                 self._accepted_tokens_per_request,
                 self._accepted_token_counts_per_request,
@@ -1184,17 +1225,43 @@ class TextGenerationController:
                 top_n_max=top_n_max,
             )
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
+            ri = indexing_outputs
+            lse = lse_outputs
             return self._log_probs_decode.calculate(
                 context,
                 logits,
-                new_tokens,
+                self._sampled_tokens_cuda,
+                ri,
+                lse,
                 log_prob_request_count,
                 eager=eager,
                 top_n_max=top_n_max,
             )
+        ri, cu_ml, li, mt = indexing_outputs
+        lse = lse_outputs
         return self._log_probs_prefill.calculate(
-            context, logits, new_tokens, log_prob_request_count, eager=eager, top_n_max=top_n_max
+            context,
+            logits,
+            self._sampled_tokens_cuda,
+            ri,
+            cu_ml,
+            li,
+            mt,
+            lse,
+            log_prob_request_count,
+            eager=eager,
+            top_n_max=top_n_max,
         )
+
+    async def run_log_probs_extract(
+        self, log_probs_extract: Optional[Callable]
+    ) -> Tuple[Optional[List], Optional[Dict]]:
+        """Run a deferred extract callable from `_dynamic_step_calculate_log_probs`."""
+        if log_probs_extract is None:
+            return None, None
+        self._extract_stream.wait_event(self._side_step_done_event)
+        with torch.cuda.stream(self._extract_stream):
+            return log_probs_extract()
 
     @torch.inference_mode()
     def dummy_forward(self):
@@ -1447,7 +1514,6 @@ class TextGenerationController:
             return None
 
         with torch.inference_mode():
-            # TODO: Overlap compute by launching kernels on multiple streams.
             self._dynamic_step_log_probs_bookkeeping()
 
             input_ids, position_ids = self._dynamic_step_context_init()
@@ -1463,39 +1529,19 @@ class TextGenerationController:
             if config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            self._dynamic_step_log_probs_indexing()
+            self._side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._side_stream):
+                indexing_outputs = self._dynamic_step_log_probs_indexing()
+
+            torch.cuda.current_stream().wait_event(self._side_step_done_event)
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
             range_push("forward_pass")
             logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
-            if self.num_speculative_tokens > 0:
-                self._dynamic_step_log_probs_softmax()
+            self._forward_done_event.record(torch.cuda.current_stream())
 
-            # Commit Mamba intermediate states before update_requests, which
-            # may swap request indices. The Python lists tracking EOS block IDs
-            # and intermediate offsets are not swapped along with tensors, so
-            # commit must run while indices are still valid.
-            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                context.mamba_slot_allocator.commit_intermediate_states()
-
-            # Collect flat routing indices and scatter them into per-block storage.
-            # Must be done before update_requests while token-to-block mappings are valid.
-            # Reconstruction happens from blocks at request completion.
-            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
-            range_pop()
-
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
-
-        with torch.inference_mode():
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
@@ -1523,8 +1569,40 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits(logits)
 
-            log_probs_extract = self._dynamic_step_calculate_log_probs(logits)
+            self._side_stream.wait_event(self._forward_done_event)
+            with torch.cuda.stream(self._side_stream):
+                lse_outputs = self._dynamic_step_log_probs_lse(logits, indexing_outputs)
+            self._side_pre_calc_event.record(self._side_stream)
+
+            # Commit Mamba intermediate states before update_requests, which
+            # may swap request indices. The Python lists tracking EOS block IDs
+            # and intermediate offsets are not swapped along with tensors, so
+            # commit must run while indices are still valid.
+            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+                context.mamba_slot_allocator.commit_intermediate_states()
+
+            # Collect flat routing indices and scatter them into per-block storage.
+            # Must be done before update_requests while token-to-block mappings are valid.
+            # Reconstruction happens from blocks at request completion.
+            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
             range_pop()
+
+        # This is the best place to yield control back to event loop.
+        # At this point we have enqueued FW pass GPU kernels asynchronously.
+        # While they are running, we can do other useful CPU work.
+        # Note: This can be moved further ahead if sampling can be made
+        # asynchronous.
+        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
+        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
+        await asyncio.sleep(0)
+
+        with torch.inference_mode():
+            torch.cuda.current_stream().wait_event(self._side_pre_calc_event)
+            log_probs_extract = self._dynamic_step_calculate_log_probs(
+                logits, indexing_outputs, lse_outputs
+            )
+            self._side_stream.wait_stream(torch.cuda.current_stream())
+            self._side_step_done_event.record(self._side_stream)
 
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do

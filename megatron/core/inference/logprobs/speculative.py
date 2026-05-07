@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -27,27 +28,40 @@ class LogProbsSpeculative:
     When prefill logits are available it delegates to `LogProbsPrefill` for the prefill portion.
     """
 
-    def __init__(self, config=None):
+    def __init__(
+        self,
+        config=None,
+        *,
+        side_stream: Optional[torch.cuda.Stream] = None,
+        side_pool_anchor: Optional[CudaGraphManager] = None,
+        pin_input_from: Optional[List[CudaGraphManager]] = None,
+    ):
         """
         Args:
             config: Optional MegatronConfig for CUDA graph capture configuration.
+            side_stream: Optional CUDA stream the controller hosts softmax, indexing, and top-n on.
+            side_pool_anchor: Optional anchor whose mempool the side-stream graph shares.
+            pin_input_from: Optional list of upstream `CudaGraphManager`s whose captured
+                outputs flow into this class's logits-consuming kernels (softmax, gather,
+                _prefill_softmax). See `CudaGraphManager.__init__` for the contract.
         """
+        self._side_stream = side_stream
         # Pinned CPU scalar holding `num_decode * spec_plus_one`.
         self._prefill_offset_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
+        self.side_pool_anchor: Optional[CudaGraphManager] = None
         if config is not None and config.cuda_graph_impl == "local":
-            CudaGraphManager(
+            self.side_pool_anchor = CudaGraphManager(
                 config,
                 self,
                 function_name="softmax_kernel",
                 need_backward=False,
                 inline_capture=True,
-            )
-            CudaGraphManager(
-                config,
-                self,
-                function_name="gather_kernel",
-                need_backward=False,
-                inline_capture=True,
+                **(
+                    {"share_mempool_with": side_pool_anchor}
+                    if side_pool_anchor is not None
+                    else {"new_mempool": True}
+                ),
+                pin_input_from=pin_input_from,
             )
             CudaGraphManager(
                 config,
@@ -55,6 +69,16 @@ class LogProbsSpeculative:
                 function_name="prefill_indexing_kernel",
                 need_backward=False,
                 inline_capture=True,
+                share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+            )
+            CudaGraphManager(
+                config,
+                self,
+                function_name="gather_kernel",
+                need_backward=False,
+                inline_capture=True,
+                share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+                pin_input_from=pin_input_from,
             )
             # Thin wrapper: delegates to LogProbsPrefill's static method.
             CudaGraphManager(
@@ -63,6 +87,8 @@ class LogProbsSpeculative:
                 function_name="_prefill_softmax",
                 need_backward=False,
                 inline_capture=True,
+                share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+                pin_input_from=pin_input_from,
             )
 
     @staticmethod
@@ -124,7 +150,7 @@ class LogProbsSpeculative:
             logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
             decode_lse (Tensor): Decode lse [padded_decode, spec+1].
             prefill_lse (Tensor): Prefill lse [padded_prefill].
-            new_tokens (Tensor): Newly sampled tokens [padded_active_requests].
+            new_tokens (Tensor): shape [max_requests].
             accepted_tokens (Tensor): Speculative-verified token IDs.
             accepted_token_counts (Tensor): Per-decode-request accepted counts.
             prefill_offset_gpu (Tensor): scalar holding `num_decode * spec_plus_one`.
@@ -193,7 +219,7 @@ class LogProbsSpeculative:
 
         Returns:
             (prefill_offset_gpu, request_indices, cu_masked_lengths, logit_indices,
-             logit_indices_range, masked_tokens, prefill_log_prob_count_gpu).
+             masked_tokens, prefill_log_prob_count_gpu).
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
@@ -206,7 +232,7 @@ class LogProbsSpeculative:
             # Per-token prefill log probs aren't computed when model only emits last-token logits.
             # Return zero-shape placeholders so the call site can unpack without branching.
             empty = torch.zeros(0, dtype=torch.int64, device=device)
-            return prefill_offset_gpu, empty, empty, empty, empty, empty, empty
+            return prefill_offset_gpu, empty, empty, empty, empty, empty
 
         padded_decode_count = context.padded_batch_dimensions.decode_req_count
 
@@ -224,11 +250,11 @@ class LogProbsSpeculative:
             : context.padded_active_request_count
         ].sum()
 
-        ri, cu_ml, li, li_range, mt = LogProbsPrefill.indexing_kernel(context)
+        ri, cu_ml, li, mt = LogProbsPrefill.indexing_kernel(context)
 
         context.gpu_return_log_probs_mask[:padded_decode_count] = saved_mask
 
-        return prefill_offset_gpu, ri, cu_ml, li, li_range, mt, prefill_log_prob_count_gpu
+        return prefill_offset_gpu, ri, cu_ml, li, mt, prefill_log_prob_count_gpu
 
     def _prefill_softmax(
         self,
@@ -237,23 +263,31 @@ class LogProbsSpeculative:
         ri,
         cu_ml,
         li,
-        li_range,
         mt,
         *,
         eager: bool = False,
         cache_key=None,
     ):
-        """Delegate to LogProbsPrefill's softmax kernel (cross-class call).
+        """Compute full-prefill log probs by chaining LogProbsPrefill's split kernels.
+
+        Runs sequentially on the current (main) stream — no overlap with sampling
+        for the spec full-prefill path; that would require a separate spec-side
+        LSE precompute, which we don't do today.
 
         Args:
-            logits, new_tokens, ri, cu_ml, li, li_range, mt:
-                Forwarded as-is to LogProbsPrefill.softmax_kernel; see there for shapes.
+            logits, new_tokens, ri, cu_ml, li, mt:
+                Forwarded to `LogProbsPrefill.lse_kernel` / `gather_kernel`.
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
+
+        Returns:
+            (selected_log_probs, lse).
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
         # Wrapper exists so CudaGraphManager can graph-cache this call under a separate key.
-        return LogProbsPrefill.softmax_kernel(logits, new_tokens, ri, cu_ml, li, li_range, mt)
+        lse = LogProbsPrefill.lse_kernel(logits, li)
+        slp = LogProbsPrefill.gather_kernel(logits, new_tokens, ri, cu_ml, li, mt, lse)
+        return slp, lse
 
     @staticmethod
     def extract(
@@ -361,43 +395,34 @@ class LogProbsSpeculative:
 
         return top_n_dict if top_n_dict else None
 
-    def prefill_indexing(self, context, *, eager: bool = False) -> None:
-        """Run prefill indexing kernel with optional CUDA graph capture/replay.
-
-        Args:
-            context: The active DynamicInferenceContext.
-            eager (bool): If True, skip CUDA graph capture/replay for the kernels.
-        """
+    def prefill_indexing(
+        self, context, *, eager: bool = False
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Run prefill indexing kernel with optional CUDA graph capture/replay."""
         spec_plus_one = context.num_speculative_tokens + 1
         # CPU-side stamp into the pinned scalar;
         # the H2D itself runs inside the graphed kernel below so it gets captured.
         self._prefill_offset_pinned[0] = context.num_decode_requests * spec_plus_one
         key = ("spec_fp_idx", context.padded_batch_dimensions)
-        result = self.prefill_indexing_kernel(
+        return self.prefill_indexing_kernel(
             context, self._prefill_offset_pinned, eager=eager, cache_key=key
         )
-        (
-            self._prefill_offset_gpu,
-            self._fp_ri,
-            self._fp_cu_ml,
-            self._fp_li,
-            self._fp_li_range,
-            self._fp_mt,
-            self._fp_count_gpu,
-        ) = result
 
-    def softmax(self, context, logits: Tensor, *, eager: bool = False) -> None:
+    def softmax(
+        self, context, logits: Tensor, prefill_offset_gpu: Tensor, *, eager: bool = False
+    ) -> Tuple[Tensor, Tensor]:
         """Run post-forward softmax with optional CUDA graph capture/replay.
 
         Args:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
+            prefill_offset_gpu (Tensor): from `prefill_indexing` (first element of its return).
             eager (bool): If True, skip CUDA graph capture/replay for the kernels.
         """
         # Computes per-row LSE only; gather happens later in `calculate` post-verification.
         key = ("spec_sm", context.padded_batch_dimensions)
-        self._decode_lse, self._prefill_lse = self.softmax_kernel(
-            context, logits, self._prefill_offset_gpu, eager=eager, cache_key=key
+        return self.softmax_kernel(
+            context, logits, prefill_offset_gpu, eager=eager, cache_key=key
         )
 
     def calculate(
@@ -405,6 +430,8 @@ class LogProbsSpeculative:
         context,
         logits: Tensor,
         new_tokens: Tensor,
+        prefill_indexing_outputs: Tuple[Tensor, ...],
+        softmax_outputs: Tuple[Tensor, Tensor],
         log_prob_request_count: int,
         accepted_tokens: Tensor,
         accepted_token_counts: Tensor,
@@ -418,6 +445,9 @@ class LogProbsSpeculative:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
             new_tokens (Tensor): Newly sampled tokens.
+            prefill_indexing_outputs: tuple from `prefill_indexing`:
+                (prefill_offset_gpu, fp_ri, fp_cu_ml, fp_li, fp_mt, fp_count_gpu).
+            softmax_outputs: tuple from `softmax`: (decode_lse, prefill_lse).
             log_prob_request_count (int): Number of requests wanting log probs.
             accepted_tokens (Tensor): Speculative-verified token IDs.
             accepted_token_counts (Tensor): Per-decode-request accepted counts.
@@ -433,9 +463,8 @@ class LogProbsSpeculative:
         only_last = context.config.materialize_only_last_token_logits
         spec_plus_one = context.num_speculative_tokens + 1
 
-        # LSE values were precomputed in the post-forward `softmax` stage.
-        decode_lse = self._decode_lse
-        prefill_lse = self._prefill_lse
+        prefill_offset_gpu, fp_ri, fp_cu_ml, fp_li, fp_mt, fp_count_gpu = prefill_indexing_outputs
+        decode_lse, prefill_lse = softmax_outputs
 
         # Gather depends on accepted_tokens / new_tokens which only exist after verification.
         key = ("spec_ga", context.padded_batch_dimensions)
@@ -447,7 +476,7 @@ class LogProbsSpeculative:
             new_tokens,
             accepted_tokens,
             accepted_token_counts,
-            self._prefill_offset_gpu,
+            prefill_offset_gpu,
             eager=eager,
             cache_key=key,
         )
@@ -455,15 +484,7 @@ class LogProbsSpeculative:
         # Full-prefill softmax: only when the model materialized per-token logits for prefills.
         # Reuses LogProbsPrefill via the _prefill_softmax wrapper.
         fp_slp = fp_lse = None
-        fp_ri = fp_cu_ml = fp_li = fp_count_gpu = None
         if not only_last and num_prefill > 0:
-            fp_ri = self._fp_ri
-            fp_cu_ml = self._fp_cu_ml
-            fp_li = self._fp_li
-            li_range = self._fp_li_range
-            mt = self._fp_mt
-            fp_count_gpu = self._fp_count_gpu
-
             fp_key = ("spec_fp_sm", context.padded_batch_dimensions)
             fp_slp, fp_lse = self._prefill_softmax(
                 logits,
@@ -471,8 +492,7 @@ class LogProbsSpeculative:
                 fp_ri,
                 fp_cu_ml,
                 fp_li,
-                li_range,
-                mt,
+                fp_mt,
                 eager=eager,
                 cache_key=fp_key,
             )
@@ -481,37 +501,44 @@ class LogProbsSpeculative:
         prefill_top_n_v = prefill_top_n_i = None
         fp_top_n_v = fp_top_n_i = None
 
-        # TODO: Overlap eager top-n compute on a side stream with sampling/extract work.
         if top_n_max > 0:
-            # Decode region: topk on [num_decode * spec_plus_one] real rows,
-            # LSE-adjust using the pre-computed decode_lse,
-            # reshape to [num_decode, spec+1, top_n_max] for per-position addressing in extract.
-            if num_decode > 0:
-                decode_len = num_decode * spec_plus_one
-                raw_decode = logits.squeeze(0)[:decode_len].float()
-                top_n_v_raw, top_n_i_raw = _topk(raw_decode, k=top_n_max)
-                top_n_v_flat = top_n_v_raw - decode_lse[:num_decode].reshape(decode_len).unsqueeze(
-                    -1
-                )
-                decode_top_n_v = top_n_v_flat.reshape(num_decode, spec_plus_one, -1)
-                decode_top_n_i = top_n_i_raw.reshape(num_decode, spec_plus_one, -1)
+            if self._side_stream is not None:
+                if fp_lse is not None:
+                    fp_lse.record_stream(self._side_stream)
+                self._side_stream.wait_stream(torch.cuda.current_stream())
+                stream_ctx = torch.cuda.stream(self._side_stream)
+            else:
+                stream_ctx = nullcontext()
+            with stream_ctx:
+                # Decode region: topk on [num_decode * spec_plus_one] real rows,
+                # LSE-adjust using the pre-computed decode_lse,
+                # reshape to [num_decode, spec+1, top_n_max] for per-position addressing in extract.
+                if num_decode > 0:
+                    decode_len = num_decode * spec_plus_one
+                    raw_decode = logits.squeeze(0)[:decode_len].float()
+                    top_n_v_raw, top_n_i_raw = _topk(raw_decode, k=top_n_max)
+                    top_n_v_flat = top_n_v_raw - decode_lse[:num_decode].reshape(
+                        decode_len
+                    ).unsqueeze(-1)
+                    decode_top_n_v = top_n_v_flat.reshape(num_decode, spec_plus_one, -1)
+                    decode_top_n_i = top_n_i_raw.reshape(num_decode, spec_plus_one, -1)
 
-            # Last-token prefill region.
-            # In full-prefill mode this is overridden per-request by the full-prefill top-n;
-            # it's still emitted here so only-last mode has it without an extra branch.
-            if num_prefill > 0:
-                decode_len = num_decode * spec_plus_one
-                raw_prefill = logits.squeeze(0)[decode_len : decode_len + num_prefill].float()
-                top_n_v_raw, top_n_i_raw = _topk(raw_prefill, k=top_n_max)
-                prefill_top_n_v = top_n_v_raw - prefill_lse[:num_prefill].unsqueeze(-1)
-                prefill_top_n_i = top_n_i_raw
+                # Last-token prefill region.
+                # In full-prefill mode this is overridden per-request by the full-prefill top-n;
+                # it's still emitted here so only-last mode has it without an extra branch.
+                if num_prefill > 0:
+                    decode_len = num_decode * spec_plus_one
+                    raw_prefill = logits.squeeze(0)[decode_len : decode_len + num_prefill].float()
+                    top_n_v_raw, top_n_i_raw = _topk(raw_prefill, k=top_n_max)
+                    prefill_top_n_v = top_n_v_raw - prefill_lse[:num_prefill].unsqueeze(-1)
+                    prefill_top_n_i = top_n_i_raw
 
-            # Full-prefill region: per-token top-n addressed by fp_li.
-            if fp_slp is not None:
-                raw_full_prefill = logits.squeeze(0)[fp_li].float()
-                top_n_v_raw, top_n_i_raw = _topk(raw_full_prefill, k=top_n_max)
-                fp_top_n_v = top_n_v_raw - fp_lse.unsqueeze(-1)
-                fp_top_n_i = top_n_i_raw
+                # Full-prefill region: per-token top-n addressed by fp_li.
+                if fp_slp is not None:
+                    raw_full_prefill = logits.squeeze(0)[fp_li].float()
+                    top_n_v_raw, top_n_i_raw = _topk(raw_full_prefill, k=top_n_max)
+                    fp_top_n_v = top_n_v_raw - fp_lse.unsqueeze(-1)
+                    fp_top_n_i = top_n_i_raw
 
         # Defer the CPU-side extract: caller invokes the partial after step bookkeeping
         # so D2H copies pay their synchronization cost as late as possible.

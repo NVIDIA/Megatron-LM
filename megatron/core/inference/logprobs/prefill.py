@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import functools
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -27,31 +28,61 @@ class LogProbsPrefill:
     Instance methods wrap the kernels in CUDA-graph capture/replay.
     """
 
-    def __init__(self, config=None):
+    def __init__(
+        self,
+        config=None,
+        *,
+        side_stream: Optional[torch.cuda.Stream] = None,
+        side_pool_anchor: Optional[CudaGraphManager] = None,
+        pin_input_from: Optional[List[CudaGraphManager]] = None,
+    ):
         """
         Args:
             config: Optional MegatronConfig for CUDA graph capture configuration.
+            side_stream: Optional CUDA stream the controller hosts indexing, LSE, and top-n on.
+            side_pool_anchor: Optional anchor whose mempool the side-stream graphs share.
+            pin_input_from: Optional list of upstream `CudaGraphManager`s whose captured
+                outputs flow into this class's logits-consuming kernels (lse, gather).
+                See `CudaGraphManager.__init__` for the contract.
         """
+        self._side_stream = side_stream
+        self.side_pool_anchor: Optional[CudaGraphManager] = None
         if config is not None and config.cuda_graph_impl == "local":
-            CudaGraphManager(
+            self.side_pool_anchor = CudaGraphManager(
                 config,
                 self,
                 function_name="indexing_kernel",
                 need_backward=False,
                 inline_capture=True,
+                **(
+                    {"share_mempool_with": side_pool_anchor}
+                    if side_pool_anchor is not None
+                    else {"new_mempool": True}
+                ),
             )
             CudaGraphManager(
                 config,
                 self,
-                function_name="softmax_kernel",
+                function_name="lse_kernel",
                 need_backward=False,
                 inline_capture=True,
+                share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+                pin_input_from=pin_input_from,
+            )
+            CudaGraphManager(
+                config,
+                self,
+                function_name="gather_kernel",
+                need_backward=False,
+                inline_capture=True,
+                share_mempool_with=side_pool_anchor or self.side_pool_anchor,
+                pin_input_from=pin_input_from,
             )
 
     @staticmethod
     def indexing_kernel(
         context, *, eager: bool = False, cache_key=None
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Build per-token indices for prefill log probs.
 
         Args:
@@ -59,7 +90,7 @@ class LogProbsPrefill:
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
 
         Returns:
-            (request_indices, cu_masked_lengths, logit_indices, logit_indices_range, masked_tokens)
+            (request_indices, cu_masked_lengths, logit_indices, masked_tokens)
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
@@ -106,41 +137,66 @@ class LogProbsPrefill:
         logit_indices = logit_indices_offset + logit_indices_range
         # Roll left by 1: logits[k] predicts token[k+1], so we want token[k+1] at slot k.
         # Each request's last slot ends up holding the wrong token (wrapped in from next request).
-        # softmax_kernel overwrites those slots with the freshly sampled tokens.
-        # The trailing scratch slot is the redirect target for sentinel writes (see softmax_kernel).
+        # gather_kernel overwrites those slots with the freshly sampled tokens.
+        # The trailing scratch slot is the redirect target for sentinel writes (see gather_kernel).
         masked_tokens = torch.nn.functional.pad(
             context.token_to_input_ids[logit_indices].roll(-1, 0), (0, 1)
         )
 
-        return request_indices, cu_masked_lengths, logit_indices, logit_indices_range, masked_tokens
+        return request_indices, cu_masked_lengths, logit_indices, masked_tokens
 
     @staticmethod
-    def softmax_kernel(
+    def lse_kernel(
+        logits: Tensor, logit_indices: Tensor, *, eager: bool = False, cache_key=None
+    ) -> Tensor:
+        """Per-row logsumexp over the rows of `logits` selected by `logit_indices`.
+
+        Independent of the sampled tokens, so it can run on a side stream concurrent
+        with sampling on the main stream.
+
+        Args:
+            logits: shape [1, total_active_tokens, vocab_size].
+            logit_indices: shape [padded_active_token_count].
+            eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
+
+        Returns:
+            lse [padded_active_token_count]
+        """
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
+        selected_logits = logits.squeeze(0)[logit_indices].float()
+        return torch.logsumexp(selected_logits, dim=-1)
+
+    @staticmethod
+    def gather_kernel(
         logits: Tensor,
         new_tokens: Tensor,
         request_indices: Tensor,
         cu_masked_lengths: Tensor,
         logit_indices: Tensor,
-        logit_indices_range: Tensor,
         masked_tokens: Tensor,
+        lse: Tensor,
         *,
         eager: bool = False,
         cache_key=None,
-    ) -> Tuple[Tensor, Tensor]:
-        """Insert sampled tokens, compute prefill log probs and per-row lse.
+    ) -> Tensor:
+        """Insert sampled tokens, gather per-token logits at the target positions, subtract LSE.
+
+        Cheap post-sample step: one scalar per token. The LSE was precomputed by
+        `lse_kernel` on the side stream while sampling was running.
 
         Args:
             logits (Tensor): Raw model output logits [1, total_active_tokens, vocab_size].
-            new_tokens (Tensor): Newly sampled tokens [total_active_requests].
+            new_tokens (Tensor): shape [max_requests].
             request_indices (Tensor): Padded request indices from indexing_kernel.
             cu_masked_lengths (Tensor): Cumulative masked lengths from indexing_kernel.
             logit_indices (Tensor): Indices into the logits tensor from indexing_kernel.
-            logit_indices_range (Tensor): Arange for padded indexing from indexing_kernel.
             masked_tokens (Tensor): Token IDs to gather log probs for from indexing_kernel.
+            lse (Tensor): Per-token logsumexp from lse_kernel.
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
 
         Returns:
-            (selected_log_probs, lse)
+            selected_log_probs [padded_active_token_count]
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
@@ -156,14 +212,11 @@ class LogProbsPrefill:
         # Sentinels redirect to the scratch tail.
         masked_tokens[write_idx] = new_tokens[safe_indices]
 
-        # Drop the scratch slot for the log-prob computation; per-token
-        # compute uses padded_token_count rows.
+        # Drop the scratch slot; per-token gather uses padded_token_count rows.
         masked_tokens_real = masked_tokens[:-1]
-        selected_logits = logits.squeeze(0)[logit_indices].float()
-        # LSE trick (per row); see decode.py for the same pattern.
-        lse = torch.logsumexp(selected_logits, dim=-1)
-        selected_log_probs = selected_logits[logit_indices_range, masked_tokens_real] - lse
-        return selected_log_probs, lse
+        # Advanced-indexing per-row gather: logit at (logit_indices[k], masked_tokens_real[k]).
+        selected_logit = logits.squeeze(0)[logit_indices, masked_tokens_real].float()
+        return selected_logit - lse
 
     @staticmethod
     def extract(
@@ -182,7 +235,7 @@ class LogProbsPrefill:
             context: The active DynamicInferenceContext.
             request_indices (Tensor): Padded indices from indexing_kernel.
             cu_masked_lengths (Tensor): Cumulative masked lengths from indexing_kernel.
-            token_log_probs (Tensor): Per-token log probs from softmax_kernel.
+            token_log_probs (Tensor): Per-token log probs from gather_kernel.
             log_prob_request_count (int): Number of real (non-padding) requests wanting log probs.
             active_request_count (int): Total number of active requests.
             top_n_values (Optional[Tensor]): Pre-computed per-token top-n log-prob values.
@@ -239,33 +292,41 @@ class LogProbsPrefill:
             top_n_dict = built or None
         return result, top_n_dict
 
-    def indexing(self, context, *, eager: bool = False) -> None:
-        """Run indexing kernel with optional CUDA graph capture/replay.
-
-        Args:
-            context: The active DynamicInferenceContext.
-            eager (bool): If True, skip CUDA graph capture/replay for the kernels.
-        """
+    def indexing(
+        self, context, *, eager: bool = False
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Run indexing kernel with optional CUDA graph capture/replay."""
         key = ("prefill_idx", context.padded_batch_dimensions)
-        result = self.indexing_kernel(context, eager=eager, cache_key=key)
-        self._ri, self._cu_ml, self._li, self._li_range, self._mt = result
+        return self.indexing_kernel(context, eager=eager, cache_key=key)
+
+    def lse(self, context, logits: Tensor, li: Tensor, *, eager: bool = False) -> Tensor:
+        """Run LSE precompute on the side stream so it overlaps with sampling."""
+        key = ("prefill_lse", context.padded_batch_dimensions)
+        return self.lse_kernel(logits, li, eager=eager, cache_key=key)
 
     def calculate(
         self,
         context,
         logits: Tensor,
         new_tokens: Tensor,
+        ri: Tensor,
+        cu_masked_lengths: Tensor,
+        logit_indices: Tensor,
+        masked_tokens: Tensor,
+        lse: Tensor,
         log_prob_request_count: int,
         *,
         eager: bool = False,
         top_n_max: int = 0,
     ):
-        """Run softmax kernel + top-n and return a deferred extract callable.
+        """Run gather kernel + top-n and return a deferred extract callable.
 
         Args:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, padded_active_tokens, vocab_size].
             new_tokens (Tensor): Newly sampled tokens.
+            ri, cu_masked_lengths, logit_indices, masked_tokens: outputs of `indexing`.
+            lse (Tensor): output of `lse`.
             log_prob_request_count (int): Number of requests wanting log probs.
             eager (bool): If True, skip CUDA graph capture/replay for the kernels.
             top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
@@ -273,23 +334,27 @@ class LogProbsPrefill:
         Returns:
             A callable that returns (per_request_log_probs, top_n_dict).
         """
-        # Indices were stashed by the earlier `indexing` call.
-        # Run softmax on the main stream (graph-captured under a per-shape key).
-        ri, cu_ml, li, li_range, mt = (self._ri, self._cu_ml, self._li, self._li_range, self._mt)
-        key = ("prefill_sm", context.padded_batch_dimensions)
-        slp, lse = self.softmax_kernel(
-            logits, new_tokens, ri, cu_ml, li, li_range, mt, eager=eager, cache_key=key
+        cu_ml, li, mt = cu_masked_lengths, logit_indices, masked_tokens
+        key = ("prefill_gather", context.padded_batch_dimensions)
+        slp = self.gather_kernel(
+            logits, new_tokens, ri, cu_ml, li, mt, lse, eager=eager, cache_key=key
         )
 
         top_n_v = top_n_i = None
-        # TODO: Overlap eager top-n compute on a side stream with sampling/extract work.
         if top_n_max > 0:
-            # Topk on all padded rows; extract slices to selected_token_count.
-            # The sentinel-fill rows produce throwaway top-n that extract drops.
-            # Reuse the LSE from softmax_kernel: top_n_log_probs = topk_raw - lse.
-            raw = logits.squeeze(0)[li].float()
-            top_n_v_raw, top_n_i = _topk(raw, k=top_n_max)
-            top_n_v = top_n_v_raw - lse.unsqueeze(-1)
+            # Top-n on the side stream; same reasoning as decode (lse and li are
+            # side-stream-resident, logits is the static `_all_logits_cuda` buffer).
+            stream_ctx = (
+                torch.cuda.stream(self._side_stream)
+                if self._side_stream is not None
+                else nullcontext()
+            )
+            with stream_ctx:
+                # Topk on all padded rows; extract slices to selected_token_count.
+                # The sentinel-fill rows produce throwaway top-n that extract drops.
+                raw = logits.squeeze(0)[li].float()
+                top_n_v_raw, top_n_i = _topk(raw, k=top_n_max)
+                top_n_v = top_n_v_raw - lse.unsqueeze(-1)
 
         active_request_count = context.total_request_count - context.paused_request_count
         # Defer the CPU-side extract: caller invokes the partial after step bookkeeping
