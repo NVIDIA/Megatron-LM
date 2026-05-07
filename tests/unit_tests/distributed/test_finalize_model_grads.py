@@ -120,6 +120,7 @@ class TestFinalizeModelGradsMoEExpertBias:
 class TestAllReduceLNGrads:
 
     def init_model(self, share_embeddings_and_output_weights: bool = False):
+        qk_layernorm = True
         self.transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=12,
@@ -127,13 +128,15 @@ class TestAllReduceLNGrads:
             use_cpu_initialization=True,
             tensor_model_parallel_size=self.tp_size,
             pipeline_model_parallel_size=self.pp_size,
-            qk_layernorm=True,
+            qk_layernorm=qk_layernorm,
             pipeline_dtype=torch.float32,
         )
 
         self.model = GPTModel(
             config=self.transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True),
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+                qk_layernorm=qk_layernorm
+            ),
             vocab_size=100,
             max_sequence_length=4,
             share_embeddings_and_output_weights=share_embeddings_and_output_weights,
