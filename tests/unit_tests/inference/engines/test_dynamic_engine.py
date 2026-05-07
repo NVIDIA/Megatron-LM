@@ -121,6 +121,7 @@ class DynamicEngineTestConfig:
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
     use_cuda_graphs_for_non_decode_steps: bool = True
+    cuda_graph_all_prefills: bool = False
     fp8: bool = False
     model_provider: str = "gpt"
     return_log_probs: bool = False
@@ -259,6 +260,7 @@ class DynamicInferenceEngineTestBase:
                 use_cuda_graphs_for_non_decode_steps=(
                     test_config.use_cuda_graphs_for_non_decode_steps
                 ),
+                cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
                 buffer_size_gb=test_config.context_buffer_size_gb,
                 paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
                 block_size_tokens=test_config.context_block_size_tokens,
@@ -819,6 +821,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     context_buffer_size_gb=0.01,
                     num_cuda_graphs=num_cuda_graphs,
                     use_cuda_graphs_for_non_decode_steps=use_non_decode,
+                    cuda_graph_all_prefills=use_non_decode,
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts

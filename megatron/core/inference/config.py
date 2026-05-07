@@ -202,6 +202,14 @@ class InferenceConfig:
     Whether to use CUDA graphs for non-decode steps.
     """
 
+    cuda_graph_all_prefills: bool = False
+    """
+    Whether prefill/mixed CUDA graphs should span up to `max_tokens`.
+    When False (default), prefill/mixed graphs are bounded by the same token limit as decode graphs:
+    `max_requests * (num_speculative_tokens + 1)`.
+    When True, prefill/mixed graph capture is extended to cover the full `max_tokens` budget.
+    """
+
     static_kv_memory_pointers: bool = False
     """
     Whether the KV cache (and Mamba states) will reside at the same memory addresses

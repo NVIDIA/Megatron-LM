@@ -623,12 +623,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             and not (force_disable_non_decode_cuda_graphs)
         )
 
+        # CUDA graph token budget for prefill/mixed graphs. Decode graphs are always
+        # capped at max_requests * (num_speculative_tokens + 1) inside the helper; this
+        # only widens the prefill/mixed range when `cuda_graph_all_prefills` is set.
+        cuda_graph_max_tokens = (
+            self.max_tokens
+            if inference_config.cuda_graph_all_prefills
+            else self.max_requests * (self.num_speculative_tokens + 1)
+        )
+
         # CUDA graph config list.
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=inference_config.num_cuda_graphs,
-                cuda_graph_max_tokens=self.max_tokens,
+                cuda_graph_max_tokens=cuda_graph_max_tokens,
                 cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,

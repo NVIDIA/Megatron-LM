@@ -1949,6 +1949,11 @@ def _add_inference_args(parser):
     group.add_argument('--decode-only-cuda-graphs',
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
+    group.add_argument('--inference-cuda-graph-all-prefills',
+                       action='store_true', default=False,
+                       help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
+                       'By default, all graphs are limited by the decode limit of '
+                       '`max_requests * (num_speculative_tokens + 1)`.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
                        type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
