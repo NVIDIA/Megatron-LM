@@ -2701,22 +2701,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         for module_name, module in model_chunk.named_modules():
             if not (
-                hasattr(module, 'num_gemms')
-                and hasattr(module, '_split_grouped_checkpoint_tensor')
+                hasattr(module, 'num_gemms') and hasattr(module, '_split_grouped_checkpoint_tensor')
             ):
                 continue
 
             clean_name = module_name
             while clean_name.startswith("module."):
-                clean_name = clean_name[len("module."):]
+                clean_name = clean_name[len("module.") :]
 
             num_gemms = module.num_gemms
 
             params_to_check = [("weight", getattr(module, "single_grouped_weight", False))]
             if getattr(module, "use_bias", False):
-                params_to_check.append(
-                    ("bias", getattr(module, "single_grouped_bias", False))
-                )
+                params_to_check.append(("bias", getattr(module, "single_grouped_bias", False)))
 
             for param_name, single_grouped in params_to_check:
                 grouped_suffix = f"{clean_name}.{param_name}" if clean_name else param_name
@@ -2770,9 +2767,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         model_param_to_state_dict_param_map = {}
         for chunk_idx, model_chunk in enumerate(self.model_chunks):
-            self._normalize_state_dict_for_grouped_params(
-                state_dict_list[chunk_idx], model_chunk
-            )
+            self._normalize_state_dict_for_grouped_params(state_dict_list[chunk_idx], model_chunk)
             names_in_state_dict = set(state_dict_list[chunk_idx].keys())
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):
