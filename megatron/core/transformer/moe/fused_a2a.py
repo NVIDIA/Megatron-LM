@@ -269,8 +269,8 @@ else:
 
 
 try:
-    from deep_ep import HybridEPBuffer
     import hybrid_ep_cpp as _hybrid_ep_cpp
+    from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
 except ImportError:
@@ -566,4 +566,3 @@ if HAVE_HYBRIDEP:
 else:
     hybrid_ep_dispatch = None
     hybrid_ep_combine = None
-
