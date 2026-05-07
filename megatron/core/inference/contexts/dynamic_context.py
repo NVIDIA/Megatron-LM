@@ -1184,8 +1184,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
-        # we fix the underlying storage so views are reusable across steps. Bounded by the small set
-        # of token counts that recur (graph sizes + the eager batch size).
+        # we fix the underlying storage so views are reusable across steps. The number of entries
+        # is bounded by the graph sizes plus eager-mode token counts, which are rounded up to
+        # multiples of TOKEN_ROUNDER and capped at max_tokens / TOKEN_ROUNDER distinct values.
         self._input_position_views: Dict[int, Tuple[Tensor, Tensor]] = {}
 
         # Bind the shared MHA GPU views to both graph and non-graph metadata;
