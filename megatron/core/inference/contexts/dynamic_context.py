@@ -932,7 +932,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         }
 
         # Coalesced pinned CPU buffer for the bookkeeping fields that get
-        # transferred to GPU each step via transfer_bookkeeping_to_gpu().
+        # transferred to GPU each step via run_attn_init_graph_body().
         # Layout matches ContextGPUView._buf so a single cudaMemcpyAsync
         # suffices. Int64 token fields come first (8-byte aligned automatically),
         # then int32 token fields, then int32/float32 request-staging fields.
@@ -1025,7 +1025,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         _off += _tok_int32_bytes
 
         # Request-level staging views into the coalesced buffer. Write-only on
-        # CPU (refreshed from persistent tensors in transfer_bookkeeping_to_gpu);
+        # CPU (refreshed from persistent tensors in run_attn_init_graph_body);
         # read-only on GPU via matching slots in ContextGPUView._buf.
         self._staging_request_in_prefill_status = self._cpu_bookkeeping_buf[
             _off : _off + _req_4byte_bytes
@@ -1043,7 +1043,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         _off += _req_4byte_bytes
 
         # Sampling-parameter staging slots, refreshed from `active_request_metadata`
-        # in transfer_bookkeeping_to_gpu(). FlashInfer reads these via
+        # in run_attn_init_graph_body(). FlashInfer reads these via
         # `gpu_view.{temperature, top_k, top_p}`.
         self._staging_temperature = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
             torch.float32
@@ -1076,7 +1076,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # GPU mirror of `active_request_metadata["return_log_probs"]`,
-        # refreshed in `transfer_bookkeeping_to_gpu`.
+        # refreshed in `run_attn_init_graph_body`.
         self.gpu_return_log_probs_mask = torch.zeros(
             self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
         )
@@ -1114,7 +1114,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
         # GPU view: the single interface for GPU code to read context state.
-        # Populated per-step by transfer_bookkeeping_to_gpu().
+        # Populated per-step by run_attn_init_graph_body().
         self.gpu_view = ContextGPUView(
             max_requests=self.max_requests,
             max_tokens=self.max_tokens,
@@ -1170,7 +1170,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._init_body_hooks: List[Callable[[bool], None]] = []
 
         # Deferred Mamba GPU operations.  Populated by add_request() /
-        # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
+        # update_requests() (CPU phase), executed by run_attn_init_graph_body().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
 
@@ -2418,15 +2418,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_conv_states[:, indices] = 0.0
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
-
-    def transfer_bookkeeping_to_gpu(self) -> None:
-        """Backwards-compatible no-op shim.
-
-        The unified H2D, the GPU-side build of active slices, and the Mamba
-        update all run from inside :meth:`run_attn_init_graph_body` (so they
-        are captured by ``CudaGraphManager``). External callers that used to
-        invoke this explicitly continue to work; the work is already done.
-        """
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""

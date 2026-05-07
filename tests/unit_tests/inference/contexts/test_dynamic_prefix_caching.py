@@ -861,9 +861,8 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 0
         ctx3.add_request(req3)
-        # Deferred Mamba ops execute during transfer.
+        # Deferred Mamba ops execute as part of the attention-state init.
         ctx3.initialize_attention_state()
-        ctx3.transfer_bookkeeping_to_gpu()
         assert ctx3.mamba_slot_allocator._eos_cache_block_id_gpu[1].item() >= 0
 
         # intermediate output buffers are pre-allocated
@@ -972,7 +971,6 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
 
         # last_token_logits
         ctx.initialize_attention_state()
-        ctx.transfer_bookkeeping_to_gpu()
         logits = torch.randn(
             1, ctx.padded_active_token_count, vocab_size, device=torch.cuda.current_device()
         )

@@ -10,7 +10,8 @@ class ContextGPUView:
     sampling, log-probs, speculative verification) uses to read context state.
     CPU bookkeeping code accesses context tensors directly.
 
-    Populated once per step by ``DynamicInferenceContext.transfer_bookkeeping_to_gpu()``.
+    Populated once per step inside ``DynamicInferenceContext.run_attn_init_graph_body``
+    via a single coalesced cudaMemcpyAsync from the matching pinned CPU buffer.
     All tensors have fixed addresses for CUDA graph compatibility.
 
     Convention:
