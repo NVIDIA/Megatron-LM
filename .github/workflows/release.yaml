@@ -87,7 +87,7 @@ jobs:
              || needs.pre-flight.outputs.is_merge_group == 'true'
              || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       )
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@43d259e5b5f0a6cb4c14eefa04738a5bdf316fe1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@d2f3dd32aad11b7034f3f1821174556507d61670
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       validate-only: ${{ github.event_name != 'workflow_dispatch' }}
@@ -101,8 +101,7 @@ jobs:
           {"python-package": "megatron.core", "src-dir": ""},
           {"python-package": "megatron_fsdp", "src-dir": "megatron/core/distributed/fsdp/src/"}
         ]
-    secrets:
-      BOT_KEY: ${{ secrets.BOT_KEY }}
+    secrets: inherit
 
   build-test-publish-wheels:
     needs: [pre-flight, bump]
@@ -121,8 +120,7 @@ jobs:
       ref: ${{ inputs.release-ref || github.sha }}
       dry-run: ${{ inputs.dry-run || false }}
       no-publish: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
-    secrets:
-      TWINE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_TOKEN || secrets.SVC_PYPI_TEST_TOKEN }}
+    secrets: inherit
 
   finalize:
     needs: [bump, build-test-publish-wheels]
@@ -130,7 +128,7 @@ jobs:
       github.repository == 'NVIDIA/Megatron-LM'
       && (success() || !failure())
       && !cancelled()
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@43d259e5b5f0a6cb4c14eefa04738a5bdf316fe1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@d2f3dd32aad11b7034f3f1821174556507d61670
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       release-version: ${{ needs.bump.outputs.release-version }}
@@ -147,16 +145,7 @@ jobs:
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
       app-id: ${{ vars.BOT_ID }}
-    secrets:
-      BOT_KEY: ${{ secrets.BOT_KEY }}
-      SLACK_WEBHOOK: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SLACK_MAIN_CHANNEL_WEBHOOK || secrets.SLACK_CI_CHANNEL_WEBHOOK }}
-      AWS_ASSUME_ROLE_ARN: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AKAMAI_HOST: ${{ secrets.AKAMAI_HOST }}
-      AKAMAI_CLIENT_TOKEN: ${{ secrets.AKAMAI_CLIENT_TOKEN }}
-      AKAMAI_CLIENT_SECRET: ${{ secrets.AKAMAI_CLIENT_SECRET }}
-      AKAMAI_ACCESS_TOKEN: ${{ secrets.AKAMAI_ACCESS_TOKEN }}
+    secrets: inherit
       S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
 
   release-summary:
