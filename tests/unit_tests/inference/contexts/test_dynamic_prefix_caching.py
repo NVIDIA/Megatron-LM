@@ -2115,7 +2115,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         routing = np.arange(3 * bs * 4, dtype=np.int16).reshape(3 * bs, 2, 2)
         for block_idx, block_id in enumerate(block_ids):
             start = block_idx * bs
-            ctx.kv_block_allocator.store_block_routing(
+            ctx.kv_block_allocator.routing_replay.store_block_routing(
                 block_id, np.arange(bs), routing[start : start + bs]
             )
 
@@ -2152,7 +2152,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    def test_store_routing_per_block_uses_explicit_forward_layout(self):
+    def test_scatter_routing_to_blocks_uses_explicit_forward_layout(self):
         """A saved forward layout remains valid after context token rows change."""
         ctx = self._ctx()
         alloc = ctx.kv_block_allocator
@@ -2163,11 +2163,13 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         ctx.token_to_block_idx[:3] = -1
         ctx.token_to_local_position_within_kv_block[:3] = -1
-        alloc.store_routing_per_block(routing, routing_block_ids, routing_positions)
+        alloc.routing_replay.scatter_routing_to_blocks(
+            routing, routing_block_ids, routing_positions
+        )
 
-        assert np.array_equal(alloc.get_block_routing(block_ids[0])[0], routing[1])
-        assert np.array_equal(alloc.get_block_routing(block_ids[1])[1], routing[2])
-        assert np.array_equal(alloc.get_block_routing(block_ids[1])[2], routing[0])
+        assert np.array_equal(alloc.routing_replay.get_block_routing(block_ids[0])[0], routing[1])
+        assert np.array_equal(alloc.routing_replay.get_block_routing(block_ids[1])[1], routing[2])
+        assert np.array_equal(alloc.routing_replay.get_block_routing(block_ids[1])[2], routing[0])
 
     @pytest.mark.internal
     def test_store_and_get_block_routing(self):
@@ -2184,10 +2186,10 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         # Store routing for some positions
         positions = np.array([0, 1, 2])
         routing = np.random.randint(-100, 100, size=(3, num_layers, topk), dtype=np.int16)
-        alloc.store_block_routing(bid, positions, routing)
+        alloc.routing_replay.store_block_routing(bid, positions, routing)
 
         # Retrieve and verify
-        stored = alloc.get_block_routing(bid)
+        stored = alloc.routing_replay.get_block_routing(bid)
         assert stored is not None
         assert isinstance(stored, np.ndarray)
         assert stored.shape == (bs, num_layers, topk)
@@ -2206,18 +2208,18 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         bid = block_ids[0].item()
         positions = np.array([0])
         routing = np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16)
-        alloc.store_block_routing(bid, positions, routing)
-        assert alloc.get_block_routing(bid) is not None
+        alloc.routing_replay.store_block_routing(bid, positions, routing)
+        assert alloc.routing_replay.get_block_routing(bid) is not None
 
         alloc.release_memory_blocks(block_ids)
         # After release, routing still present (persists until re-alloc)
-        assert alloc.get_block_routing(bid) is not None
+        assert alloc.routing_replay.get_block_routing(bid) is not None
 
         # Re-allocate the same block
         new_ids = alloc.allocate_memory_blocks(1)
         new_bid = new_ids[0].item()
         # The re-allocated block should have routing cleared
-        assert alloc.get_block_routing(new_bid) is None
+        assert alloc.routing_replay.get_block_routing(new_bid) is None
 
     @pytest.mark.internal
     def test_routing_cleared_on_reset(self):
@@ -2227,14 +2229,14 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         block_ids = alloc.allocate_memory_blocks(1)
         bid = block_ids[0].item()
-        alloc.store_block_routing(
+        alloc.routing_replay.store_block_routing(
             bid, np.array([0]), np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16)
         )
-        assert alloc.get_block_routing(bid) is not None
+        assert alloc.routing_replay.get_block_routing(bid) is not None
 
         alloc.reset()
-        assert alloc.get_block_routing(bid) is None
-        assert len(alloc.block_routing) == 0
+        assert alloc.routing_replay.get_block_routing(bid) is None
+        assert not alloc.routing_replay.has_data()
 
     @pytest.mark.internal
     def test_routing_persists_through_deregister(self):
@@ -2251,7 +2253,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         # Store routing for both blocks
         for bid in [b0, b1]:
-            alloc.store_block_routing(
+            alloc.routing_replay.store_block_routing(
                 bid, np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
             )
 
@@ -2261,8 +2263,51 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         alloc.release_memory_blocks(valid_blocks)
 
         # Routing data should still be present
-        assert alloc.get_block_routing(b0) is not None
-        assert alloc.get_block_routing(b1) is not None
+        assert alloc.routing_replay.get_block_routing(b0) is not None
+        assert alloc.routing_replay.get_block_routing(b1) is not None
+
+    @pytest.mark.internal
+    def test_scatter_routing_to_blocks(self):
+        """scatter_routing_to_blocks routes each token to its block/position."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        num_layers, topk = 4, 2
+
+        # Token layout: fill block 0, write the first `partial` positions of
+        # block 1, then two dummy-block tokens that must be skipped.
+        b0, b1 = alloc.allocate_memory_blocks(2).tolist()
+        dummy = alloc.dummy_block_idx
+        partial = 3
+
+        block_idx = [b0] * bs + [b1] * partial + [dummy] * 2
+        local_pos = list(range(bs)) + list(range(partial)) + [0, 1]
+        active_token_count = len(block_idx)
+
+        block_ids = np.array(block_idx)
+        positions = np.array(local_pos)
+
+        # Distinct value per (token, layer, topk) so placement is verifiable.
+        flat_routing = np.arange(active_token_count * num_layers * topk, dtype=np.int16).reshape(
+            active_token_count, num_layers, topk
+        )
+
+        alloc.routing_replay.scatter_routing_to_blocks(flat_routing, block_ids, positions)
+
+        # Every non-dummy token landed at block_idx[t][local_pos[t]].
+        for t in range(active_token_count):
+            if block_idx[t] == dummy:
+                continue
+            stored = alloc.routing_replay.get_block_routing(block_idx[t])
+            assert stored is not None
+            assert np.array_equal(stored[local_pos[t]], flat_routing[t])
+
+        # Dummy-block tokens were skipped entirely.
+        assert alloc.routing_replay.get_block_routing(dummy) is None
+
+        # The untouched tail of block 1 stays zero.
+        stored_b1 = alloc.routing_replay.get_block_routing(b1)
+        assert (stored_b1[partial:] == 0).all()
 
     @pytest.mark.internal
     def test_reconstruct_routing_from_blocks(self):
@@ -2278,7 +2323,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         # Store routing for all positions in first two blocks (full)
         for bid in bids[:2]:
-            alloc.store_block_routing(
+            alloc.routing_replay.store_block_routing(
                 bid,
                 np.arange(bs),
                 np.arange(bs * num_layers * topk, dtype=np.int16).reshape(bs, num_layers, topk)
@@ -2287,7 +2332,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         # Store routing for partial last block (e.g., 5 tokens)
         partial = 5
-        alloc.store_block_routing(
+        alloc.routing_replay.store_block_routing(
             bids[2],
             np.arange(partial),
             np.arange(partial * num_layers * topk, dtype=np.int16).reshape(
@@ -2299,7 +2344,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         # total_routing_tokens = 2 full blocks + 5 partial = 2*bs + 5
         total_routing_tokens = 2 * bs + partial
 
-        result = alloc.reconstruct_routing_from_blocks(bids, total_routing_tokens)
+        result = alloc.routing_replay.reconstruct_routing_from_blocks(bids, total_routing_tokens)
 
         assert result is not None
         assert isinstance(result, np.ndarray)
@@ -2338,10 +2383,10 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         # Only store routing for the first block
         routing = np.arange(bs * 4 * 2, dtype=np.int16).reshape(bs, 4, 2)
-        alloc.store_block_routing(bids[0], np.arange(bs), routing)
+        alloc.routing_replay.store_block_routing(bids[0], np.arange(bs), routing)
 
         total_routing_tokens = bs + token_offset
-        result = alloc.reconstruct_routing_from_blocks(bids, total_routing_tokens)
+        result = alloc.routing_replay.reconstruct_routing_from_blocks(bids, total_routing_tokens)
         if token_offset > 0:
             assert result is None
         else:
@@ -2363,8 +2408,8 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         # Store routing for both blocks
         routing_b0 = np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
         routing_b1 = np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
-        alloc.store_block_routing(b0, np.arange(bs), routing_b0)
-        alloc.store_block_routing(b1, np.arange(bs), routing_b1)
+        alloc.routing_replay.store_block_routing(b0, np.arange(bs), routing_b0)
+        alloc.routing_replay.store_block_routing(b1, np.arange(bs), routing_b1)
 
         # Release first request's blocks (LRU: blocks stay cached)
         blocks = ctx.request_to_kv_block_ids[0]
@@ -2378,10 +2423,10 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         ctx.add_request(req2)
 
         # The matched blocks should still have routing data
-        assert alloc.get_block_routing(b0) is not None
-        assert np.allclose(alloc.get_block_routing(b0), routing_b0)
-        assert alloc.get_block_routing(b1) is not None
-        assert np.allclose(alloc.get_block_routing(b1), routing_b1)
+        assert alloc.routing_replay.get_block_routing(b0) is not None
+        assert np.allclose(alloc.routing_replay.get_block_routing(b0), routing_b0)
+        assert alloc.routing_replay.get_block_routing(b1) is not None
+        assert np.allclose(alloc.routing_replay.get_block_routing(b1), routing_b1)
 
 
 class TestPrefixCacheReuse(PrefixCachingTestBase):
