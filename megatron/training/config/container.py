@@ -4,7 +4,6 @@ import os
 from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass
 from typing import Any, Type, TypeVar
 import yaml
-from omegaconf import OmegaConf
 from megatron.training.config.common_config import RNGConfig, DistributedInitConfig, ProfilingConfig
 from megatron.training.config.training_config import TokenizerConfig, TrainingConfig, ValidationConfig, SchedulerConfig, LoggerConfig, CheckpointConfig
 from megatron.core.optimizer import OptimizerConfig
@@ -80,6 +79,8 @@ class ConfigContainerBase:
         Returns:
             A new instance of this class initialized with the YAML file values
         """
+        from omegaconf import OmegaConf
+
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
             yaml_path_exists = msc.os.path.exists(yaml_path)
