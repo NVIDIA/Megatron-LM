@@ -162,8 +162,37 @@ class TestFP4Param:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
+    def run_eval_transition(self, args, model_chunks, batch):
+        input_ids, labels, position_ids, attention_mask, loss_mask = batch
+
+        if should_disable_forward_pre_hook(args):
+            disable_forward_pre_hook(model_chunks, param_sync=True)
+
+        model_chunks[0].eval()
+        model_chunks[0].set_is_first_microbatch()
+        with torch.no_grad():
+            eval_output = model_chunks[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+        eval_loss = eval_output.mean()
+        model_chunks[0].train()
+
+        if should_disable_forward_pre_hook(args):
+            enable_forward_pre_hook(model_chunks)
+
+        return eval_loss.item()
+
     def _run_test_helper(
-        self, tp_size, inference: bool = False, fp4_param_gather: bool = True, **kwargs
+        self,
+        tp_size,
+        inference: bool = False,
+        fp4_param_gather: bool = True,
+        eval_transition: bool = False,
+        **kwargs,
     ):
         """Test fp4_param with gpt_model."""
         args = self.create_test_args(
@@ -206,6 +235,7 @@ class TestFP4Param:
             assert num_fp4_params == 4 * fp4_layers
 
         loss_list = []
+        eval_loss_list = []
 
         # CUDA graph setup (transformer_engine implementation)
         cuda_graph_helper = None
@@ -267,6 +297,17 @@ class TestFP4Param:
 
             loss_list.append(loss.item())
 
+            if eval_transition:
+                eval_loss_list.append(
+                    self.run_eval_transition(
+                        args,
+                        gpt_model,
+                        (input_ids, labels, position_ids, attention_mask, loss_mask),
+                    )
+                )
+
+        if eval_transition:
+            return torch.tensor(loss_list), torch.tensor(eval_loss_list)
         return torch.tensor(loss_list)
 
     def run_test(self, tp_size, inference: bool = False, **kwargs):
@@ -282,6 +323,24 @@ class TestFP4Param:
 
             torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
 
+    def run_test_with_eval_transition(self, tp_size, **kwargs):
+        """Test fp4_param eval transition with gpt_model."""
+        loss_list, eval_loss_list = self._run_test_helper(
+            tp_size,
+            fp4_param_gather=True,
+            eval_transition=True,
+            **kwargs,
+        )
+        loss_list_ref, eval_loss_list_ref = self._run_test_helper(
+            tp_size,
+            fp4_param_gather=False,
+            eval_transition=True,
+            **kwargs,
+        )
+
+        torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(eval_loss_list, eval_loss_list_ref, atol=1e-2, rtol=1e-2)
+
     @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
     @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
@@ -293,6 +352,13 @@ class TestFP4Param:
         """
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, inference=False, **kwargs)
+
+    @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
+    @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_nvfp4_eval_transition(self, tp_size):
+        kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
+        self.run_test_with_eval_transition(tp_size=tp_size, **kwargs)
 
     @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
     @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
