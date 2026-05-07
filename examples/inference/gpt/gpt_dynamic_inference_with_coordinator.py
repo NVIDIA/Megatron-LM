@@ -18,13 +18,13 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
     add_inference_args,
     get_dynamic_inference_engine,
     get_model_for_inference,
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
-from megatron.training.arguments import parse_and_validate_args
 
 # pylint: disable=line-too-long
 
@@ -218,6 +218,7 @@ if __name__ == "__main__":
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
         initialize_megatron()
+        configure_nvtx_profiling(True)
 
         tokenizer = get_tokenizer()
 
