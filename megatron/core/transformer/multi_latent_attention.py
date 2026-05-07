@@ -643,7 +643,7 @@ class MLASelfAttention(MultiLatentAttention):
                     f"`linear_q_proj={submodules.linear_q_proj}` if "
                     f"you intend to have a Q-norm."
                 )
-            raise RuntimeError(
+            raise ValueError(
                 f"`q_layernorm={submodules.q_layernorm}` is non-trivial, "
                 f"but `q_lora_rank is None`, meaning it will not be used."
                 f"{help_msg}"
@@ -654,7 +654,7 @@ class MLASelfAttention(MultiLatentAttention):
             # Q up projection includes a norm
             and is_fused_norm_linear(submodules.linear_q_up_proj)
         ):
-            raise RuntimeError(
+            raise ValueError(
                 f"`q_layernorm={submodules.q_layernorm}` is non-trivial "
                 f"and `linear_q_up_proj={submodules.linear_q_up_proj}` is a "
                 f"fused norm+linear; either unset `q_layernorm` or use a "
@@ -666,7 +666,7 @@ class MLASelfAttention(MultiLatentAttention):
             # KV up projection includes a norm
             and is_fused_norm_linear(submodules.linear_kv_up_proj)
         ):
-            raise RuntimeError(
+            raise ValueError(
                 f"`kv_layernorm={submodules.kv_layernorm}` is non-trivial "
                 f"and `linear_kv_up_proj={submodules.linear_kv_up_proj}` is a "
                 f"fused norm+linear; either unset `kv_layernorm` or use a "

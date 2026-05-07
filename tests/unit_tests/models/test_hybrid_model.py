@@ -604,7 +604,7 @@ class TestMLAQKNormSpecValidation(_MLAQKNormTestBase):
         from megatron.core.extensions.transformer_engine import TENorm
 
         spec = self._make_spec(q_layernorm=TENorm)
-        with pytest.raises(RuntimeError, match=r"q_lora_rank is None"):
+        with pytest.raises(ValueError, match=r"q_lora_rank is None"):
             self._build_model(spec=spec, q_lora_rank=None)
 
     def test_q_norm_without_q_lora_rank_hint_for_non_fused_linear(self):
@@ -612,7 +612,7 @@ class TestMLAQKNormSpecValidation(_MLAQKNormTestBase):
         from megatron.core.extensions.transformer_engine import TENorm
 
         spec = self._make_spec(q_layernorm=TENorm)
-        with pytest.raises(RuntimeError, match=r"fused norm\+linear for"):
+        with pytest.raises(ValueError, match=r"fused norm\+linear for"):
             self._build_model(spec=spec, q_lora_rank=None)
 
     def test_fused_linear_q_up_with_q_norm_raises(self):
@@ -625,7 +625,7 @@ class TestMLAQKNormSpecValidation(_MLAQKNormTestBase):
         )
 
         spec = self._make_spec(q_layernorm=TENorm, linear_q_up_proj=TELayerNormColumnParallelLinear)
-        with pytest.raises(RuntimeError, match=r"fused norm\+linear"):
+        with pytest.raises(ValueError, match=r"fused norm\+linear"):
             self._build_model(spec=spec)
 
     def test_fused_linear_kv_up_with_kv_norm_raises(self):
@@ -640,7 +640,7 @@ class TestMLAQKNormSpecValidation(_MLAQKNormTestBase):
         spec = self._make_spec(
             kv_layernorm=TENorm, linear_kv_up_proj=TELayerNormColumnParallelLinear
         )
-        with pytest.raises(RuntimeError, match=r"fused norm\+linear"):
+        with pytest.raises(ValueError, match=r"fused norm\+linear"):
             self._build_model(spec=spec)
 
 
@@ -775,7 +775,7 @@ class TestDSAQKNormResolution(_MLAQKNormTestBase):
 
         spec = self._make_spec(linear_q_up_proj=TELayerNormColumnParallelLinear)
         with pytest.raises(
-            RuntimeError, match=r"fused norm\+linear, but this is not supported for DSA"
+            ValueError, match=r"fused norm\+linear, but this is not supported for DSA"
         ):
             self._build_model(spec=spec, qk_layernorm=True)
 
@@ -785,7 +785,7 @@ class TestDSAQKNormResolution(_MLAQKNormTestBase):
 
         spec = self._make_spec(linear_q_proj=TELayerNormColumnParallelLinear)
         with pytest.raises(
-            RuntimeError, match=r"fused norm\+linear, but this is not supported for DSA"
+            ValueError, match=r"fused norm\+linear, but this is not supported for DSA"
         ):
             self._build_model(spec=spec, qk_layernorm=True, q_lora_rank=None)
 
