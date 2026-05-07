@@ -101,7 +101,7 @@ jobs:
           {"python-package": "megatron.core", "src-dir": ""},
           {"python-package": "megatron_fsdp", "src-dir": "megatron/core/distributed/fsdp/src/"}
         ]
-    secrets: inherit
+    secrets: inherit  # pragma: allowlist secret
 
   build-test-publish-wheels:
     needs: [pre-flight, bump]
@@ -120,7 +120,7 @@ jobs:
       ref: ${{ inputs.release-ref || github.sha }}
       dry-run: ${{ inputs.dry-run || false }}
       no-publish: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
-    secrets: inherit
+    secrets: inherit  # pragma: allowlist secret
 
   finalize:
     needs: [bump, build-test-publish-wheels]
@@ -145,7 +145,7 @@ jobs:
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
       app-id: ${{ vars.BOT_ID }}
-    secrets: inherit
+    secrets: inherit  # pragma: allowlist secret
 
   release-summary:
     needs: [pre-flight, bump, build-test-publish-wheels, finalize]
