@@ -937,7 +937,7 @@ class TextGenerationController:
         logits = self._all_logits_cuda
         # `speculative_required_logit_indices()` already returns padded indices when
         # running a captured graph (`num_last_token_logits` uses the padded counts and
-        # `pad_active_slices` zero-pads the trailing slots), so the call site does not
+        # `pad_cpu_active_slices` zero-pads the trailing slots), so the call site does not
         # need to re-pad here.
         required_logit_indices = context.speculative_required_logit_indices()
 

@@ -139,7 +139,7 @@ class ContextGPUView:
         off += req_4byte_bytes
         # Sampling parameters (consumed by FlashInfer sampling).
         # Mirror the active slice of `active_request_metadata[{label}]`;
-        # padded slots get neutral defaults from `pad_active_slices` (T=1.0, top_k=0, top_p=0.0).
+        # padded slots get neutral defaults from `pad_cpu_active_slices` (T=1.0, top_k=0, top_p=0.0).
         self.temperature = self._buf[off : off + req_4byte_bytes].view(torch.float32)
         off += req_4byte_bytes
         self.top_k = self._buf[off : off + req_4byte_bytes].view(torch.int32)
@@ -148,7 +148,7 @@ class ContextGPUView:
         off += req_4byte_bytes
         # Per-request last-token row indices (consumed by sampling kernels as `gather_indices`).
         # The CPU side of this slot IS `context.active_request_last_token_idxs`,
-        # populated by `build_active_slices` and `pad_active_slices`.
+        # populated by `build_cpu_active_slices` and `pad_cpu_active_slices`.
         self.active_request_last_token_idxs = self._buf[off : off + req_4byte_bytes].view(
             torch.int32
         )
