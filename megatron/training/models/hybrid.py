@@ -28,51 +28,6 @@ from megatron.training.vocab_utils import calculate_padded_vocab_size
 logger = logging.getLogger(__name__)
 
 
-def transformer_engine_hybrid_stack_spec() -> ModuleSpec:
-    """Return the default Hybrid stack spec with Transformer Engine layers.
-
-    This is a named function (not a lambda) to allow proper serialization
-    and reconstruction from checkpoints. Named functions can be imported
-    via their module path, unlike lambdas.
-
-    Returns:
-        Default Hybrid stack specification from megatron.core
-    """
-    return default_hybrid_stack_spec
-
-
-def modelopt_hybrid_stack_spec() -> ModuleSpec:
-    """Hybrid stack specification for quantization with ModelOpt.
-
-    Uses Norm instead of TENorm and ColumnParallelLinear/RowParallelLinear
-    instead of TE layers to enable proper quantizer insertion by ModelOpt.
-
-    Returns:
-        ModuleSpec: Module specification for quantization-ready Hybrid stack
-    """
-    return get_hybrid_stack_modelopt_spec(
-        local_core_attention=False,
-        remap_te_layernorm=False,
-    )
-
-
-def get_default_hybrid_stack_spec(config: "HybridModelConfig") -> ModuleSpec:
-    """Determine the most appropriate Hybrid stack specification based on configuration.
-
-    Args:
-        config: Hybrid configuration object
-
-    Returns:
-        ModuleSpec: Appropriate module specification based on config
-    """
-    if config.transformer.transformer_impl == "inference_optimized":
-        return hybrid_inference_stack_spec
-    elif config.restore_modelopt_state:
-        return modelopt_hybrid_stack_spec()
-    else:
-        return transformer_engine_hybrid_stack_spec()
-
-
 @dataclass(kw_only=True)
 class HybridModelConfig(ModelConfig):
     """Configuration for a Megatron Core Hybrid (SSM) model.
@@ -108,9 +63,7 @@ class HybridModelConfig(ModelConfig):
     rotary_base: int = 10000
     seq_len_interpolation_factor: float | None = None
     make_vocab_size_divisible_by: int = 128
-    hybrid_stack_spec: ModuleSpec | Callable[[], ModuleSpec] | Callable[["HybridModelConfig"], ModuleSpec] = (
-        get_default_hybrid_stack_spec
-    )
+    hybrid_stack_spec: ModuleSpec | None = None
     vocab_size: int | None = None
     should_pad_vocab: bool = False
 
@@ -196,14 +149,16 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             Virtual pipeline model parallelism is not supported for Hybrid models.
         """
         hybrid_stack_spec = self._model_config.hybrid_stack_spec
-        if not isinstance(hybrid_stack_spec, ModuleSpec):
-            # Check if the function accepts config parameter
-            import inspect
-
-            if len(inspect.signature(hybrid_stack_spec).parameters) > 0:
-                hybrid_stack_spec = hybrid_stack_spec(self._model_config)
+        if hybrid_stack_spec is None:
+            if self._model_config.transformer.transformer_impl == "inference_optimized":
+                hybrid_stack_spec = hybrid_inference_stack_spec
+            elif self._model_config.restore_modelopt_state:
+                hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
+                    local_core_attention=False,
+                    remap_te_layernorm=False,
+                )
             else:
-                hybrid_stack_spec = hybrid_stack_spec()
+                hybrid_stack_spec = default_hybrid_stack_spec
 
         assert (
             getattr(self._model_config.transformer, "virtual_pipeline_model_parallel_size", None) is None
