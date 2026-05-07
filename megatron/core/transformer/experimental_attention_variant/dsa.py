@@ -26,6 +26,21 @@ try:
 except ImportError:
     hadamard_transform = None
 
+def _pytorch_hadamard_transform(x, scale=1.0):
+    n = x.shape[-1]
+    result = x.clone()
+    h = 1
+    while h < n:
+        result = result.view(*result.shape[:-1], -1, 2 * h)
+        a = result[..., :h].clone()
+        b = result[..., h:].clone()
+        result[..., :h] = a + b
+        result[..., h:] = a - b
+        result = result.view(*result.shape[:-2], -1)
+        h *= 2
+    return result * scale
+
+
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
@@ -41,9 +56,10 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert (
         x.dtype == torch.bfloat16
     ), f"rotate_activation only support bf16 input, but got {x.dtype}"
-    assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
     hidden_size = x.size(-1)
-    return hadamard_transform(x, scale=hidden_size**-0.5)
+    if hadamard_transform is not None:
+        return hadamard_transform(x, scale=hidden_size**-0.5)
+    return _pytorch_hadamard_transform(x, scale=hidden_size**-0.5)
 
 
 class DSAIndexerLossLoggingHelper:
@@ -346,7 +362,7 @@ def fused_qk_topk_naive(
     # [batch, seqlen, seqlen]
     index_scores = _compute_index_scores(q, weights, k)
     if mask is not None:
-        assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
+        mask = mask.to(index_scores.dtype)
         index_scores = index_scores + mask
 
     # =========================================
