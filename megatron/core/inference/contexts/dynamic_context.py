@@ -954,10 +954,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Token fields are aliased with the source-of-truth attributes
         # (`self.token_to_input_ids`, etc.) because the forward pass reads
         # `gpu_view.token_to_input_ids[:n_tok]` which matches the CPU slot
-        # layout `[0, n_tok)`. Request fields are read on GPU at `[:n_active]`
-        # and, in the [active | paused | dead] layout, the active region of
-        # the persistent CPU tensors is also `[:n_active]` — the staging
-        # slots are refreshed each step by copying that slice.
+        # layout `[0, n_tok)`. Request fields are read on both GPU and CPU at `[:n_active]`.
         _tok_int64_bytes = self.max_tokens * 8
         _tok_int32_bytes = self.max_tokens * 4
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
@@ -1067,18 +1064,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             _off : _off + _req_4byte_bytes
         ].view(torch.int32)
         _off += _req_4byte_bytes
-
-        # Snapshot of request_ids at build_active_slices time. Used by the
-        # post-step stop-word/finish path to recover the original IDs before
-        # update_requests rearranges request slots.
-        self.active_request_ids = torch.empty(
-            (self.max_requests,), dtype=torch.int64, device='cpu', pin_memory=True
-        )
-        # Active-slice query lengths with neutral pad in [active:padded] applied
-        # by pad_active_slices (sourced from request_query_lengths[:active]).
-        self.active_request_query_lengths = torch.empty(
-            (self.max_requests,), dtype=torch.int32, device='cpu', pin_memory=True
-        )
 
         # Sampling-parameter staging slots, refreshed from `active_request_metadata`
         # in transfer_bookkeeping_to_gpu(). FlashInfer reads these via
@@ -1385,43 +1370,27 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
-        active_count = self.total_request_count - self.paused_request_count
         lengths = self.request_kv_length_offsets + self.request_query_lengths
-        return lengths[:active_count]
+        lengths = lengths[:self.total_request_count - self.paused_request_count]
+        return lengths
 
     def get_max_sequence_lengths(self) -> Tensor:
         """Maximum sequence length for active requests."""
-        active_count = self.total_request_count - self.paused_request_count
-        return self.request_output_lengths[:active_count]
+        return self.request_output_lengths[:self.total_request_count - self.paused_request_count]
 
     def get_active_request_count(self):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
 
     def build_active_slices(self, batch_size: int):
-        """Build the active slices of specific tensors. This is run on every forward step.
-
-        With the [active | paused | dead] layout, the active region is request_*[:batch_size].
-        """
-        # Snapshot active request IDs before update_requests rearranges request slots
-        # (needed by the post-step stop-word/finish path).
-        self.active_request_ids[:batch_size].copy_(self.request_ids[:batch_size])
-
-        # Snapshot active query lengths (pad_active_slices fills slots [batch_size:padded]).
-        self.active_request_query_lengths[:batch_size].copy_(
-            self.request_query_lengths[:batch_size]
-        )
-
-        # Mirror request metadata into the active slot. Sampling backends and per-request
-        # logprobs read these via the active_* mirror; pad_active_slices fills neutral pads.
+        """Build the active slices of specific tensors. This is run on every forward step."""
         for label in self.request_metadata:
             self.active_request_metadata[label][:batch_size].copy_(
                 self.request_metadata[label][:batch_size], non_blocking=True
             )
 
-        # Last-token row indices per active request (cumsum of query lengths - 1).
         torch.cumsum(
-            self.active_request_query_lengths[:batch_size],
+            self.request_query_lengths[:batch_size],
             dim=0,
             out=self.active_request_last_token_idxs[:batch_size],
         )
@@ -1441,8 +1410,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Prefill last-token positions: cumsum the prefill query lengths in place,
         # then shift by (active_decode_token_count - 1) to get absolute positions.
-        # In the [active | paused | dead] layout, the prefill subregion of the active
-        # range is request_query_lengths[active_decode_count : active_request_count].
         prefill_dst = self.active_logit_idxs[
             active_decode_token_count : active_decode_token_count + active_prefill_count
         ]
@@ -1454,23 +1421,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.active_logit_idxs[active_decode_token_count + active_prefill_count :].zero_()
 
-        # Token-level padding.
-        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
-        self.token_to_block_idx[padding_token_slice] = self.kv_block_allocator.dummy_block_idx
-        self.token_to_local_position_within_kv_block[padding_token_slice] = 0
-        self.token_to_position_in_request[padding_token_slice] = 0
-
         # Request-level padding.
         padding_request_slice = slice(active_request_count, self.padded_active_request_count)
-        self.active_request_query_lengths[padding_request_slice].fill_(
-            self.num_speculative_tokens + 1
-        )
-        self.active_request_last_token_idxs[padding_request_slice].fill_(0)
 
         # Sampling metadata: pad with neutral defaults, so that the kernel early-exits.
         self.active_request_metadata["temperature"][padding_request_slice].fill_(1.0)
         self.active_request_metadata["top_k"][padding_request_slice].fill_(0)
         self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
+        # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
+        self.active_request_last_token_idxs[padding_request_slice].fill_(0)
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -2115,11 +2074,28 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.pad_active_slices()
 
+        # Update token position indexes.
+        self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
+            self.kv_block_allocator.dummy_block_idx
+        )
+        self.token_to_local_position_within_kv_block[
+            self.active_token_count : self.padded_active_token_count
+        ] = 0
+        self.token_to_position_in_request[
+            self.active_token_count : self.padded_active_token_count
+        ] = 0
+
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]
             if self.using_cuda_graph_this_step()
             else self.non_graph_attn_metadata  # type: ignore[assignment]
         )
+
+        # Update cu_query_seq_lengths, max_seqlen_q.
+        active_slice = slice(0, self.total_request_count - self.paused_request_count)
+        query_lengths_view = self.request_query_lengths[active_slice]
+        request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
+        request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
@@ -2134,14 +2110,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     decode_req_count=adjusted_decode_req_count,
                 )
 
-        batch_size = self.total_request_count - self.paused_request_count
         assert self.active_attn_metadata is not None
-
-        # In the [active | paused | dead] layout, the active region is request_*[:batch_size].
-        active_slice = slice(0, batch_size)
-        query_lengths_view = self.request_query_lengths[active_slice]
-        request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
-        request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
 
         # Compute MHA metadata directly into the pinned CPU section of
         # _cpu_bookkeeping_buf. The single coalesced H2D in

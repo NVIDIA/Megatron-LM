@@ -1427,7 +1427,7 @@ class TextGenerationController:
         # Note: logits may be padded, so we only take the first active_token_count tokens
         log_probs = log_probs_tensor[: context.active_token_count]
 
-        active_query_lengths = context.active_request_query_lengths[:active_request_count]
+        active_query_lengths = context.request_query_lengths[:active_request_count]
 
         # Split log_probs across request boundaries
         # log_probs has shape [active_token_count, vocab_size]
@@ -1621,10 +1621,7 @@ class TextGenerationController:
 
         range_push("active_request_mask")
         # Everything below is 100% CPU.
-        # Use the snapshot taken during build_active_slices: active_request_ids holds the
-        # request IDs that were active when the step started (before update_requests
-        # rearranges slots).
-        active_request_ids = context.active_request_ids[:active_request_count]
+        active_request_ids = context.request_ids[:active_request_count].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
@@ -1653,7 +1650,7 @@ class TextGenerationController:
                         active_request_mask[idx] = 0
 
         finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
-        finished_request_ids = context.active_request_ids[finished_idxs]
+        finished_request_ids = context.request_ids[finished_idxs]
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
