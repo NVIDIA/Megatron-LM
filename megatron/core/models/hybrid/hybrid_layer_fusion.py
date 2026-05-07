@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -187,11 +186,18 @@ def build_fused_layer(
     self_attention = getattr(submodules, _FUSION_SEQUENCE_MIXERS[seq_sym])
     mlp = getattr(submodules, _FUSION_CHANNEL_MIXERS[chan_sym])
 
+    def _get_from_metainfo(spec_or_module, key, default):
+        if isinstance(spec_or_module, ModuleSpec):
+            return spec_or_module.metainfo.get(key, default)
+        return default
+
     # Norms that are not already fused into a primitive's linear layer need
     # to be supplied externally by the enclosing TransformerLayer. Currently
-    # that is only DSA (input layernorm) and MoE (pre-MLP layernorm).
-    input_layernorm = TENorm if seq_sym == LayerSymbols.DS_ATTENTION else IdentityOp
-    pre_mlp_layernorm = TENorm if chan_sym == LayerSymbols.MOE else IdentityOp
+    # this only concerns DSA (input layernorm) and MoE (pre-MLP layernorm)
+    # for the default HybridModel TE specs. Specs can opt into external norms
+    # via primitive ModuleSpec metadata.
+    input_layernorm = _get_from_metainfo(self_attention, "input_layernorm", IdentityOp)
+    pre_mlp_layernorm = _get_from_metainfo(mlp, "pre_mlp_layernorm", IdentityOp)
 
     fused_spec = ModuleSpec(
         module=TransformerLayer,

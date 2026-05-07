@@ -131,6 +131,7 @@ _dsa_mixer_spec = ModuleSpec(
         q_layernorm=IdentityOp,
         kv_layernorm=IdentityOp,
     ),
+    metainfo={"input_layernorm": TENorm},
 )
 
 # Channel mixers (fill the `mlp` slot of a `TransformerLayer`).
@@ -142,6 +143,7 @@ _mlp_mixer_spec = ModuleSpec(
 )
 
 _moe_mixer_spec = moe
+_moe_mixer_spec.metainfo["pre_mlp_layernorm"] = TENorm
 
 # Inference-variant primitives – identical shape, but route through the
 # inference-optimised linear classes where the training specs use TE ones.
