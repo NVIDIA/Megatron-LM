@@ -676,12 +676,29 @@ class DynamicInferenceContext(BaseInferenceContext):
                 #   - prefill cap:           round_up_tokens(max_tokens)
                 # then divide by tp_size for the per-rank count. This matches
                 # the NVLS allgather_worst_case sizing in the branch below.
-                deepep_graph_cap = (
-                    self.max_requests * (self.num_speculative_tokens + 1)
-                )
-                deepep_per_rank_cap = (
-                    max(self.round_up_tokens(deepep_graph_cap), self.round_up_tokens(self.max_tokens))
+                # Pre-allocate two ElasticBuffers — one sized for fixed-shape
+                # decode steps, one for chunked-prefill steps. Decode dispatches
+                # use the small buffer to avoid running dispatch/combine kernels
+                # and `_deepep_v2_expand_forward`'s last-expert grouped_mm over
+                # the prefill-cap padding (~30x compute overhead at decode for
+                # max_tokens=2048, max_requests=64). The engine MUST call
+                # set_deepep_v2_active_dispatch_size before each forward step
+                # with the matching cap (decode_per_rank_cap for decode steps,
+                # prefill_per_rank_cap for prefill chunks).
+                deepep_decode_per_rank_cap = (
+                    self.round_up_tokens(
+                        self.max_requests * (self.num_speculative_tokens + 1)
+                    )
                     // tp_size
+                )
+                deepep_prefill_per_rank_cap = (
+                    self.round_up_tokens(self.max_tokens) // tp_size
+                )
+                # The decode cap may be larger than max_tokens in extreme
+                # configs; ensure prefill cap is at least decode cap so the
+                # fallback "largest pinned buffer" still covers worst-case.
+                deepep_prefill_per_rank_cap = max(
+                    deepep_prefill_per_rank_cap, deepep_decode_per_rank_cap
                 )
                 # DEBUG: confirm this branch runs and the cap math is what we expect.
                 import torch.distributed as _dist
@@ -690,19 +707,30 @@ class DynamicInferenceContext(BaseInferenceContext):
                         f"[deepep_v2 prepare] max_requests={self.max_requests} "
                         f"num_speculative_tokens={self.num_speculative_tokens} "
                         f"max_tokens={self.max_tokens} tp_size={tp_size} "
-                        f"deepep_graph_cap={deepep_graph_cap} "
-                        f"deepep_per_rank_cap={deepep_per_rank_cap} "
+                        f"decode_per_rank_cap={deepep_decode_per_rank_cap} "
+                        f"prefill_per_rank_cap={deepep_prefill_per_rank_cap} "
                         f"moe_hidden_size={moe_hidden_size} "
                         f"moe_router_topk={model_config.moe_router_topk} "
                         f"prepare_group_size={get_pg_size(self.expert_tp_ep_group)}",
                         flush=True,
                     )
+                # Stash the caps so the engine can read them when setting the
+                # active dispatch size per step.
+                self.deepep_v2_decode_per_rank_cap = deepep_decode_per_rank_cap
+                self.deepep_v2_prefill_per_rank_cap = deepep_prefill_per_rank_cap
                 prepare_deepep_v2_buffer(
                     group=self.expert_tp_ep_group,
-                    num_max_tokens_per_rank=deepep_per_rank_cap,
+                    num_max_tokens_per_rank=deepep_decode_per_rank_cap,
                     hidden=moe_hidden_size,
                     num_topk=model_config.moe_router_topk,
                 )
+                if deepep_prefill_per_rank_cap != deepep_decode_per_rank_cap:
+                    prepare_deepep_v2_buffer(
+                        group=self.expert_tp_ep_group,
+                        num_max_tokens_per_rank=deepep_prefill_per_rank_cap,
+                        hidden=moe_hidden_size,
+                        num_topk=model_config.moe_router_topk,
+                    )
             else:
                 NVLSAllGatherVDispatcher.allocate_buffers(
                     per_rank_worst_case_token_count=allgather_worst_case,
@@ -1807,7 +1835,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        self.build_active_slices(self.padded_active_request_count)
+        # If we're using the DeepEP V2 inference dispatcher, tell it which
+        # pinned ElasticBuffer to use for the upcoming forward step. Decode-only
+        # steps use the smaller decode-cap buffer; any step with prefill
+        # requests uses the larger prefill-cap buffer. This decision must be
+        # identical across all ranks in the dispatch group, which it is —
+        # `is_decode_only()` derives from `padded_batch_dimensions`, an
+        # engine-level value that's already EP-synced by this point.
+        if self._deepep_v2_ep_dispatcher:
+            from megatron.core.transformer.moe.fused_a2a import (
+                set_deepep_v2_active_dispatch_size,
+            )
+            if self.is_decode_only():
+                set_deepep_v2_active_dispatch_size(self.deepep_v2_decode_per_rank_cap)
+            else:
+                set_deepep_v2_active_dispatch_size(self.deepep_v2_prefill_per_rank_cap)
+
+        self.build_active_slices(
+            min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
+        )
         self.pad_active_slices()
 
         # Update token position indexes.

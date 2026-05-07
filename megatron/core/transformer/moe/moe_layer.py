@@ -664,12 +664,96 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
+                # DEBUG: per-stage MoE timing for dispatcher A/B comparison.
+                # Enable with MCORE_MOE_TIMING=1. Uses `torch.cuda.synchronize`
+                # around each stage so wall-clock reflects actual GPU work
+                # (slow — benchmarking only). Skips entirely during CUDA graph
+                # capture (synchronize is forbidden inside capture); to get
+                # numbers, run with --cuda-graph-impl none.
+                import os as _os
+                _moe_timing_env_on = _os.environ.get("MCORE_MOE_TIMING", "0") == "1"
+                _is_capturing = torch.cuda.is_current_stream_capturing()
+                # Print a one-shot diagnostic so the user knows whether the
+                # probe is reachable and whether it'll be skipped due to capture.
+                global _MCORE_MOE_TIMING_PROBE_INTROD
+                try:
+                    _MCORE_MOE_TIMING_PROBE_INTROD
+                except NameError:
+                    _MCORE_MOE_TIMING_PROBE_INTROD = False
+                if _moe_timing_env_on and not _MCORE_MOE_TIMING_PROBE_INTROD:
+                    _MCORE_MOE_TIMING_PROBE_INTROD = True
+                    import torch.distributed as _dist
+                    _r = _dist.get_rank() if _dist.is_initialized() else -1
+                    print(
+                        f"[moe timing probe] reached MoE forward on rank={_r} "
+                        f"layer_number={getattr(self, 'layer_number', None)} "
+                        f"is_current_stream_capturing={_is_capturing} "
+                        f"-> {'WILL TIME' if not _is_capturing else 'SKIPPED (run with --cuda-graph-impl none)'}",
+                        flush=True,
+                    )
+                # Only time layer 2 (the first MoE layer in this hybrid model)
+                # so the accumulator reflects per-call cost of one MoE layer
+                # rather than averaging across the ~44 MoE layers per step.
+                _moe_timing_on = (
+                    _moe_timing_env_on
+                    and not _is_capturing
+                    and getattr(self, 'layer_number', None) == 2
+                )
+                if _moe_timing_on:
+                    import time as _time
+                    global _MOE_TIMING_ACC
+                    try:
+                        _MOE_TIMING_ACC
+                    except NameError:
+                        _MOE_TIMING_ACC = {
+                            "dispatch_ms": 0.0,
+                            "experts_ms": 0.0,
+                            "combine_ms": 0.0,
+                            "step_count": 0,
+                        }
+                    torch.cuda.synchronize(); _t0 = _time.perf_counter()
+
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
+
+                if _moe_timing_on:
+                    torch.cuda.synchronize(); _t1 = _time.perf_counter()
+                    _MOE_TIMING_ACC["dispatch_ms"] += (_t1 - _t0) * 1e3
+
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+
+                if _moe_timing_on:
+                    torch.cuda.synchronize(); _t2 = _time.perf_counter()
+                    _MOE_TIMING_ACC["experts_ms"] += (_t2 - _t1) * 1e3
+
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
+
+                if _moe_timing_on:
+                    torch.cuda.synchronize(); _t3 = _time.perf_counter()
+                    _MOE_TIMING_ACC["combine_ms"] += (_t3 - _t2) * 1e3
+                    _MOE_TIMING_ACC["step_count"] += 1
+                    # Log every 50 layer-2 visits on rank 0.
+                    if (
+                        torch.distributed.is_initialized()
+                        and torch.distributed.get_rank() == 0
+                        and _MOE_TIMING_ACC["step_count"] % 50 == 0
+                    ):
+                        _n = _MOE_TIMING_ACC["step_count"]
+                        _disp = _MOE_TIMING_ACC["dispatch_ms"] / _n
+                        _exp = _MOE_TIMING_ACC["experts_ms"] / _n
+                        _comb = _MOE_TIMING_ACC["combine_ms"] / _n
+                        _total = _disp + _exp + _comb
+                        print(
+                            f"[moe timing layer2] dispatcher="
+                            f"{self.config.inference_moe_token_dispatcher_type} "
+                            f"steps={_n} avg_dispatch={_disp:.3f}ms "
+                            f"avg_experts={_exp:.3f}ms avg_combine={_comb:.3f}ms "
+                            f"avg_total={_total:.3f}ms "
+                            f"(experts_pct={_exp / max(_total, 1e-9) * 100:.1f}%)",
+                            flush=True,
+                        )
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
