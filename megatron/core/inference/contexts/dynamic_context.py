@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 from torch import Tensor  # type: ignore
@@ -532,6 +532,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
             prefix_cache_registry=self.prefix_cache_registry,
         )
+
+        # GPU mirrors of the host counters that consumers may want to read without a host sync.
+        _synced_counter_names = ()
+        self._synced_counters_buf = torch.zeros(
+            len(_synced_counter_names), dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._synced_counters_map: Dict[str, torch.Tensor] = {
+            name: self._synced_counters_buf[i : i + 1]
+            for i, name in enumerate(_synced_counter_names)
+        }
 
         # Track request metadata.
         request_metadata_types = inference_config.request_metadata_types
@@ -2415,6 +2425,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
+        # Mirror the just-zeroed counters into the GPU bridge. Pairs with
+        # the lockstep mutators in ``add_request`` / ``update_requests``
+        # so the bridge tracks the host counters at every transition.
+        self._sync_counters_to_gpu()
+
         # Reset step counter and LRU clock
         self.step_count = 0
         self.prefix_cache_lru_clock = 0
@@ -2427,6 +2442,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
+
+    def _sync_counters_to_gpu(self) -> None:
+        """Mirror every host-int counter listed in `_synced_counters_map` into its GPU view."""
+        for name, view in self._synced_counters_map.items():
+            view.fill_(getattr(self, name))
+
+    def sync_counters_to_cpu(self) -> None:
+        """Refresh every host-int counter from its GPU view."""
+        vals = self._synced_counters_buf.cpu().tolist()
+        for (name, _), value in zip(self._synced_counters_map.items(), vals):
+            setattr(self, name, int(value))
 
     def reset(self) -> None:
         """Reset entire context.
@@ -2891,6 +2917,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.num_prefill_requests += 1
 
+        # Mirror the post-admit counters to the GPU bridge.
+        self._sync_counters_to_gpu()
+
     def _move_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens=None, new_speculative_tokens=None
     ):
@@ -3269,6 +3298,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
             self.active_token_count = 0
+            self._sync_counters_to_gpu()
 
             # Reset Mamba state.
             self.reset_mamba_state()
@@ -3648,6 +3678,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
+
+        # Mirror the post-step counters to the GPU bridge.
+        self._sync_counters_to_gpu()
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,
