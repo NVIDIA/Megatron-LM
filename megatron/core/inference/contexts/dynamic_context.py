@@ -42,12 +42,13 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
 
-from .attention_context.mamba_metadata import MambaMetadata
+from .attention_context.mamba_metadata import MambaMetadata, PrefixCachedMambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
+from .prefix_cache_registry import PrefixCacheRegistry
 from .routing_metadata import RoutingMetadata
 
 try:
@@ -517,6 +518,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count = block_count_tensor[0].item()
             paused_block_count = block_count_tensor[1].item()
 
+        # Single owner of host-side hash -> block_id mappings (KV + Mamba),
+        # consumed by both allocators and by ``add_request`` matching.
+        self.prefix_cache_registry = PrefixCacheRegistry()
+
         self.kv_block_allocator = KVBlockAllocator(
             context=self,
             total_count=(
@@ -525,6 +530,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_count=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
+            prefix_cache_registry=self.prefix_cache_registry,
         )
 
         # Track request metadata.
@@ -779,7 +785,14 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(
+            mamba_metadata_cls = MambaMetadata
+            if (
+                self.config.prefix_caching_mamba_gb is not None
+                and self.config.prefix_caching_mamba_gb > 0
+                and self.config.enable_prefix_caching
+            ):
+                mamba_metadata_cls = PrefixCachedMambaMetadata
+            self.mamba_metadata = mamba_metadata_cls(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 mamba_chunk_size=self.mamba_chunk_size,
@@ -1586,9 +1599,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ssm_states_shape=self.mamba_ssm_states_shape,
             conv_states_dtype=self.mamba_conv_states_dtype,
             ssm_states_dtype=self.mamba_ssm_states_dtype,
-        )
-        self.kv_block_allocator.on_blocks_deregistered = (
-            self.mamba_slot_allocator.on_kv_blocks_deregistered
+            prefix_cache_registry=self.prefix_cache_registry,
         )
 
         logging.info(
@@ -2577,13 +2588,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             if num_mamba_matched > 0 and block_aligned:
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
-                    # Back off to previous block with cached Mamba state
-                    mamba_map = self.mamba_slot_allocator.hash_to_block_id
-                    backed_off_blocks = 0
-                    for j in range(num_mamba_matched - 2, -1, -1):
-                        if req.precomputed_block_hashes[j] in mamba_map:
-                            backed_off_blocks = j + 1
-                            break
+                    # Back off to a previous cached Mamba block within the
+                    # already-matched prefix (search [0, num_mamba_matched - 1)).
+                    backed_off_blocks = self.prefix_cache_registry.find_mamba_backoff(
+                        req.precomputed_block_hashes, num_mamba_matched - 1
+                    )
                     prefix_skip_tokens = backed_off_blocks * self.block_size_tokens
                 else:
                     prefix_skip_tokens = raw_skip
@@ -2639,8 +2648,8 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> tuple[list[int], int]:
         """Find cached blocks matching a range of the prompt using precomputed hashes.
 
-        Looks up hashes in req.precomputed_block_hashes[start_block:end_block] against
-        the block allocator's hash-to-block mapping. Stops at the first non-match.
+        Looks up hashes in ``req.precomputed_block_hashes[start_block:end_block]``
+        against the prefix-cache registry. Stops at the first non-match.
 
         Args:
             req: The inference request with precomputed_block_hashes set.
@@ -2667,19 +2676,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return [], 0
 
         hashes = req.precomputed_block_hashes[start_block:end_block]
-        kv_hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
-
-        # Find longest KV prefix by iterating block hashes from end.
-        # Parent-chained hashes guarantee: if hash at position N exists,
-        # all hashes 0..N also exist. So first match from end = longest prefix.
-        for i in range(len(hashes) - 1, -1, -1):
-            if hashes[i] in kv_hash_to_block:
-                num_matched = i + 1
-                matched_blocks = [kv_hash_to_block[hashes[j]] for j in range(num_matched)]
-                parent_hash = hashes[num_matched - 1]
-                return matched_blocks, parent_hash
-
-        return [], 0
+        return self.prefix_cache_registry.match_kv_prefix(hashes)
 
     def add_request(
         self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
@@ -2736,10 +2733,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Increment ref counts and update timestamps for matched (shared) blocks
         if num_matched_blocks > 0:
+            pc_state = self.kv_block_allocator.pc_state
             matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
-            self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
+            pc_state.block_ref_counts[matched_tensor] += 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-                self.kv_block_allocator.update_timestamps(matched_tensor)
+                pc_state.update_timestamps(matched_tensor, self.prefix_cache_lru_clock)
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
@@ -2837,14 +2835,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
+            pc_state = self.kv_block_allocator.pc_state
+
             def _register_range(start: int, end: int):
                 if start >= end:
                     return
                 block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
-                self.kv_block_allocator.register_kv_block_hashes(
-                    block_ids_to_hash, block_hashes_slice
-                )
+                pc_state.register_kv_block_hashes(block_ids_to_hash, block_hashes_slice)
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))
@@ -2868,10 +2866,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self._pending_mamba_zeros.append(mamba_idx)
 
-            # compute_and_store_offsets sets both CPU state (hash_to_block_id,
-            # _eos_cache_block_id_gpu) and GPU staging buffers.  Runs immediately
-            # because commit_intermediate_states() reads the CPU state after the
-            # forward pass.
+            # compute_and_store_offsets writes per-request CPU intermediate
+            # tracking (offsets, block IDs, counts, EOS block ID). Runs
+            # immediately because commit_intermediate_states() reads the CPU
+            # state after the forward pass.
             if self.mamba_slot_allocator is not None:
                 self.mamba_slot_allocator.compute_and_store_offsets(
                     req,
