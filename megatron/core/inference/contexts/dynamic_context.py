@@ -792,29 +792,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and self.config.enable_prefix_caching
             ):
                 mamba_metadata_cls = PrefixCachedMambaMetadata
+            # ``request_to_mamba_state_idx_buf`` is the alias into
+            # ``_cpu_bookkeeping_buf`` populated above; sharing it here means
+            # every CPU-side bookkeeping write to ``request_to_mamba_state_idx``
+            # rides the per-step coalesced H2D into
+            # ``gpu_view.request_to_mamba_state_idx``, which the GPU-side Mamba
+            # update kernels read.
             self.mamba_metadata = mamba_metadata_cls(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
+                request_to_mamba_state_idx_buf=self._cpu_request_to_mamba_state_idx,
             )
-            # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
-            # fields ride along with the single coalesced H2D in
-            # transfer_bookkeeping_to_gpu().
-            self.mamba_metadata.bind_cpu_buffers(
-                {
-                    "batch_indices_decode": self._cpu_mamba_batch_indices_decode,
-                    "batch_indices_prefill": self._cpu_mamba_batch_indices_prefill,
-                    "seq_idx": self._cpu_mamba_seq_idx,
-                    "cu_seqlens": self._cpu_mamba_cu_seqlens,
-                    "cu_chunk_seqlens": self._cpu_mamba_cu_chunk_seqlens,
-                    "last_chunk_indices": self._cpu_mamba_last_chunk_indices,
-                    "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
-                    "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
-                    "conv_seq_start": self._cpu_mamba_conv_seq_start,
-                }
-            )
-            self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
@@ -989,45 +979,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per-request KV block table (the source for the GPU-side padded
         # ``active_request_to_kv_block_ids`` consumed by the attention kernels).
         _request_to_kv_block_ids_bytes = self.max_requests * self.max_kv_block_count * 4
-        # Mamba section: 9 int32 fields (hybrid models only). Must match the
-        # MambaMetadata shapes (mirrors the layout documented in ContextGPUView).
+        # Per-request Mamba slot mapping (hybrid models only; source for the
+        # GPU-side Mamba update kernels).
         if self.is_hybrid_model:
-            self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
-            _mamba_batch_indices_decode_bytes = self.max_requests * 4
-            _mamba_batch_indices_prefill_bytes = self.max_requests * 4
-            _mamba_seq_idx_bytes = self.max_tokens * 4
-            _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
-            _mamba_cu_chunk_seqlens_bytes = (self._max_mamba_chunks + 1) * 4
-            _mamba_last_chunk_indices_bytes = self.max_requests * 4
-            _mamba_seq_idx_for_varlen_bytes = self._max_mamba_chunks * 4
-            _mamba_conv_seq_idx_bytes = self.max_tokens * 4
-            _mamba_conv_seq_start_bytes = self.max_tokens * 4
+            _request_to_mamba_state_idx_bytes = self.max_requests * 4
         else:
-            self._max_mamba_chunks = 0
-            _mamba_batch_indices_decode_bytes = 0
-            _mamba_batch_indices_prefill_bytes = 0
-            _mamba_seq_idx_bytes = 0
-            _mamba_cu_seqlens_bytes = 0
-            _mamba_cu_chunk_seqlens_bytes = 0
-            _mamba_last_chunk_indices_bytes = 0
-            _mamba_seq_idx_for_varlen_bytes = 0
-            _mamba_conv_seq_idx_bytes = 0
-            _mamba_conv_seq_start_bytes = 0
+            _request_to_mamba_state_idx_bytes = 0
         _total_bytes = (
             2 * _tok_int64_bytes
             + 4 * _tok_int32_bytes
             + 5 * _req_4byte_bytes
             + 2 * _req_4byte_with_sentinel_bytes
             + _request_to_kv_block_ids_bytes
-            + _mamba_batch_indices_decode_bytes
-            + _mamba_batch_indices_prefill_bytes
-            + _mamba_seq_idx_bytes
-            + _mamba_cu_seqlens_bytes
-            + _mamba_cu_chunk_seqlens_bytes
-            + _mamba_last_chunk_indices_bytes
-            + _mamba_seq_idx_for_varlen_bytes
-            + _mamba_conv_seq_idx_bytes
-            + _mamba_conv_seq_start_bytes
+            + _request_to_mamba_state_idx_bytes
         )
         self._cpu_bookkeeping_buf = torch.empty(
             _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True
@@ -1140,48 +1104,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_to_kv_block_ids.fill_(-1)
         _off += _request_to_kv_block_ids_bytes
 
-        # Mamba varlen metadata views (hybrid models only). Populated per step
-        # by MambaMetadata.compute_cpu_metadata(); transferred as part of the
-        # single coalesced H2D in transfer_bookkeeping_to_gpu().
+        # Per-request Mamba slot mapping (hybrid models only). Aliased into the
+        # coalesced pinned CPU buffer so writes from add_request / free_slots
+        # ride the per-step H2D into ``gpu_view.request_to_mamba_state_idx``,
+        # where :meth:`MambaMetadata.update` reads it. ``MambaMetadata`` is
+        # constructed below with this view as its
+        # ``request_to_mamba_state_idx_buf`` so the two stay in sync.
         if self.is_hybrid_model:
-            self._cpu_mamba_batch_indices_decode = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_batch_indices_decode_bytes
+            self._cpu_request_to_mamba_state_idx = self._cpu_bookkeeping_buf[
+                _off : _off + _request_to_mamba_state_idx_bytes
             ].view(torch.int32)
-            _off += _mamba_batch_indices_decode_bytes
-            self._cpu_mamba_batch_indices_prefill = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_batch_indices_prefill_bytes
-            ].view(torch.int32)
-            _off += _mamba_batch_indices_prefill_bytes
-            self._cpu_mamba_seq_idx = (
-                self._cpu_bookkeeping_buf[_off : _off + _mamba_seq_idx_bytes]
-                .view(torch.int32)
-                .view(1, self.max_tokens)
-            )
-            _off += _mamba_seq_idx_bytes
-            self._cpu_mamba_cu_seqlens = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_cu_seqlens_bytes
-            ].view(torch.int32)
-            _off += _mamba_cu_seqlens_bytes
-            self._cpu_mamba_cu_chunk_seqlens = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_cu_chunk_seqlens_bytes
-            ].view(torch.int32)
-            _off += _mamba_cu_chunk_seqlens_bytes
-            self._cpu_mamba_last_chunk_indices = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_last_chunk_indices_bytes
-            ].view(torch.int32)
-            _off += _mamba_last_chunk_indices_bytes
-            self._cpu_mamba_seq_idx_for_varlen = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_seq_idx_for_varlen_bytes
-            ].view(torch.int32)
-            _off += _mamba_seq_idx_for_varlen_bytes
-            self._cpu_mamba_conv_seq_idx = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_conv_seq_idx_bytes
-            ].view(torch.int32)
-            _off += _mamba_conv_seq_idx_bytes
-            self._cpu_mamba_conv_seq_start = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_conv_seq_start_bytes
-            ].view(torch.int32)
-            _off += _mamba_conv_seq_start_bytes
+            # Buffer was zero-initialized; restore the -1 "no slot" sentinel.
+            self._cpu_request_to_mamba_state_idx.fill_(-1)
+            _off += _request_to_mamba_state_idx_bytes
+        else:
+            self._cpu_request_to_mamba_state_idx = None
 
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
@@ -1192,7 +1129,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_tokens=self.max_tokens,
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
-            max_mamba_chunks=self._max_mamba_chunks,
+            is_hybrid=self.is_hybrid_model,
         )
 
         # Static GPU tensors for the per-step MHA derived metadata. Computed on
@@ -2196,20 +2133,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         if self.is_hybrid_model:
-            # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
-            # because it writes to GPU buffers. Store the parameters here.
-            # intermediate_offsets_gpu / intermediate_counts_gpu get the CPU-side
-            # slices here; H2D transfer happens in transfer_bookkeeping_to_gpu().
+            # Mamba metadata is computed on GPU after the H2D, reading from the
+            # post-transfer ``gpu_view.request_to_mamba_state_idx``,
+            # ``gpu_view.token_to_request_idx``, and the GPU-side
+            # ``cu_active_request_query_lengths`` (filled by
+            # ``_compute_active_mha_metadata``).
             intermediate_offsets_gpu = None
             intermediate_counts_gpu = None
             if self.mamba_slot_allocator is not None:
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
                     self.mamba_slot_allocator.get_intermediate_cpu_data()
                 )
-            self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
-                active_mamba_indices=self.mamba_metadata.request_to_mamba_state_idx[active_slice],
-                token_to_request_idx=self.token_to_request_idx[: self.active_token_count],
-                cpu_query_lengths=self.request_query_lengths,
+            self._pending_mamba_update_kwargs = dict(
+                active_mamba_indices=self.gpu_view.request_to_mamba_state_idx,
+                token_to_request_idx=self.gpu_view.token_to_request_idx,
+                cu_seqlens=self.cu_active_request_query_lengths,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
@@ -2328,10 +2266,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Cumulative query lengths, kv sequence lengths, padded block table.
         self._compute_active_mha_metadata(padded_active, n_active)
 
-        # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
-        if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
-            self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
-            self._pending_mamba_transfer = None
+        # Mamba metadata: GPU compute reading from the just-transferred
+        # ``gpu_view.request_to_mamba_state_idx`` / ``gpu_view.token_to_request_idx``
+        # and the post-MHA ``cu_active_request_query_lengths``.
+        if (
+            hasattr(self, '_pending_mamba_update_kwargs')
+            and self._pending_mamba_update_kwargs is not None
+        ):
+            self.mamba_metadata.update(**self._pending_mamba_update_kwargs)
+            self._pending_mamba_update_kwargs = None
 
     def _compute_active_mha_metadata(self, padded_active: int, n_active: int) -> None:
         """Fill the static MHA tensors on GPU using the post-H2D bookkeeping.

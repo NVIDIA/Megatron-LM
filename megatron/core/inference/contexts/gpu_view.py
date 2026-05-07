@@ -23,10 +23,11 @@ class ContextGPUView:
     :class:`DynamicInferenceContext` so that the per-step H2D transfer is a
     single ``cudaMemcpyAsync`` instead of one per field.
 
-    Per-step MHA fields that the forward pass reads (cumulative query lengths,
-    kv sequence lengths, padded block table) are derived on GPU from these
+    Per-step MHA fields (cumulative query lengths, kv sequence lengths,
+    padded block table) and per-step Mamba fields (batch indices, seq_idx,
+    cu_seqlens, chunk and conv metadata) are derived on GPU from these
     sources after the H2D, so they live as separate static tensors on the
-    context — not in this view.
+    context / on :class:`MambaMetadata` — not in this view.
     """
 
     def __init__(
@@ -35,13 +36,13 @@ class ContextGPUView:
         max_tokens: int,
         max_kv_blocks: int,
         device: torch.device,
-        max_mamba_chunks: int = 0,
+        is_hybrid: bool = False,
     ):
         # Field layout (must match DynamicInferenceContext's CPU buffer layout):
         #   int64 token fields first (auto 8-byte alignment), then int32 token
         #   fields, then int32/float32 request fields, then the
-        #   request-to-kv-block-ids matrix, then int32 Mamba fields (hybrid
-        #   models only; omitted when max_mamba_chunks == 0).
+        #   request-to-kv-block-ids matrix, then the request-to-mamba-state-idx
+        #   vector (hybrid models only).
         tok_int64_bytes = max_tokens * 8  # 2 fields of int64 = 8 bytes/elem
         tok_int32_bytes = max_tokens * 4  # 4 fields of int32 = 4 bytes/elem
         # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
@@ -51,40 +52,12 @@ class ContextGPUView:
         req_4byte_bytes = max_requests * 4
         req_4byte_with_sentinel_bytes = (max_requests + 1) * 4
 
-        # Per-request KV block table (max_bs == max_requests).
+        # Per-request KV block table.
         request_to_kv_block_ids_bytes = max_requests * max_kv_blocks * 4
 
-        # Mamba section: 9 int32 fields, only present for hybrid models.
-        #   mamba_batch_indices_decode    int32 (max_bs,)
-        #   mamba_batch_indices_prefill   int32 (max_bs,)
-        #   mamba_seq_idx                 int32 (1, max_tokens)
-        #   mamba_cu_seqlens              int32 (max_bs + 1,)
-        #   mamba_cu_chunk_seqlens        int32 (max_mamba_chunks + 1,)
-        #   mamba_last_chunk_indices      int32 (max_bs,)
-        #   mamba_seq_idx_for_varlen      int32 (max_mamba_chunks,)
-        #   mamba_conv_seq_idx            int32 (max_tokens,)
-        #   mamba_conv_seq_start          int32 (max_tokens,)
-        max_bs = max_requests
-        if max_mamba_chunks > 0:
-            mamba_batch_indices_decode_bytes = max_bs * 4
-            mamba_batch_indices_prefill_bytes = max_bs * 4
-            mamba_seq_idx_bytes = max_tokens * 4
-            mamba_cu_seqlens_bytes = (max_bs + 1) * 4
-            mamba_cu_chunk_seqlens_bytes = (max_mamba_chunks + 1) * 4
-            mamba_last_chunk_indices_bytes = max_bs * 4
-            mamba_seq_idx_for_varlen_bytes = max_mamba_chunks * 4
-            mamba_conv_seq_idx_bytes = max_tokens * 4
-            mamba_conv_seq_start_bytes = max_tokens * 4
-        else:
-            mamba_batch_indices_decode_bytes = 0
-            mamba_batch_indices_prefill_bytes = 0
-            mamba_seq_idx_bytes = 0
-            mamba_cu_seqlens_bytes = 0
-            mamba_cu_chunk_seqlens_bytes = 0
-            mamba_last_chunk_indices_bytes = 0
-            mamba_seq_idx_for_varlen_bytes = 0
-            mamba_conv_seq_idx_bytes = 0
-            mamba_conv_seq_start_bytes = 0
+        # Per-request mamba slot index (hybrid models only). Source for the
+        # GPU-side Mamba update kernels via ``gpu_view.request_to_mamba_state_idx``.
+        request_to_mamba_state_idx_bytes = max_requests * 4 if is_hybrid else 0
 
         total_bytes = (
             2 * tok_int64_bytes
@@ -92,15 +65,7 @@ class ContextGPUView:
             + 5 * req_4byte_bytes
             + 2 * req_4byte_with_sentinel_bytes
             + request_to_kv_block_ids_bytes
-            + mamba_batch_indices_decode_bytes
-            + mamba_batch_indices_prefill_bytes
-            + mamba_seq_idx_bytes
-            + mamba_cu_seqlens_bytes
-            + mamba_cu_chunk_seqlens_bytes
-            + mamba_last_chunk_indices_bytes
-            + mamba_seq_idx_for_varlen_bytes
-            + mamba_conv_seq_idx_bytes
-            + mamba_conv_seq_start_bytes
+            + request_to_mamba_state_idx_bytes
         )
 
         # Zero-initialized so pre-transfer reads see zeros (matches prior semantics).
@@ -163,54 +128,14 @@ class ContextGPUView:
         )
         off += request_to_kv_block_ids_bytes
 
-        # Mamba varlen metadata (hybrid models only). Each GPU view matches a
-        # pinned CPU view in DynamicInferenceContext._cpu_bookkeeping_buf; the
-        # per-step coalesced H2D copy covers the Mamba alongside the
-        # token/request bookkeeping.
-        if max_mamba_chunks > 0:
-            self.mamba_batch_indices_decode = self._buf[
-                off : off + mamba_batch_indices_decode_bytes
+        # Per-request Mamba slot index (hybrid models only). Source for
+        # :meth:`MambaMetadata.update`'s GPU compute.
+        if is_hybrid:
+            self.request_to_mamba_state_idx = self._buf[
+                off : off + request_to_mamba_state_idx_bytes
             ].view(torch.int32)
-            off += mamba_batch_indices_decode_bytes
-            self.mamba_batch_indices_prefill = self._buf[
-                off : off + mamba_batch_indices_prefill_bytes
-            ].view(torch.int32)
-            off += mamba_batch_indices_prefill_bytes
-            self.mamba_seq_idx = (
-                self._buf[off : off + mamba_seq_idx_bytes].view(torch.int32).view(1, max_tokens)
-            )
-            off += mamba_seq_idx_bytes
-            self.mamba_cu_seqlens = self._buf[off : off + mamba_cu_seqlens_bytes].view(torch.int32)
-            off += mamba_cu_seqlens_bytes
-            self.mamba_cu_chunk_seqlens = self._buf[off : off + mamba_cu_chunk_seqlens_bytes].view(
-                torch.int32
-            )
-            off += mamba_cu_chunk_seqlens_bytes
-            self.mamba_last_chunk_indices = self._buf[
-                off : off + mamba_last_chunk_indices_bytes
-            ].view(torch.int32)
-            off += mamba_last_chunk_indices_bytes
-            self.mamba_seq_idx_for_varlen = self._buf[
-                off : off + mamba_seq_idx_for_varlen_bytes
-            ].view(torch.int32)
-            off += mamba_seq_idx_for_varlen_bytes
-            self.mamba_conv_seq_idx = self._buf[off : off + mamba_conv_seq_idx_bytes].view(
-                torch.int32
-            )
-            off += mamba_conv_seq_idx_bytes
-            self.mamba_conv_seq_start = self._buf[off : off + mamba_conv_seq_start_bytes].view(
-                torch.int32
-            )
-            off += mamba_conv_seq_start_bytes
+            off += request_to_mamba_state_idx_bytes
         else:
-            self.mamba_batch_indices_decode = None
-            self.mamba_batch_indices_prefill = None
-            self.mamba_seq_idx = None
-            self.mamba_cu_seqlens = None
-            self.mamba_cu_chunk_seqlens = None
-            self.mamba_last_chunk_indices = None
-            self.mamba_seq_idx_for_varlen = None
-            self.mamba_conv_seq_idx = None
-            self.mamba_conv_seq_start = None
+            self.request_to_mamba_state_idx = None
 
         assert off == total_bytes, f"layout bug: wrote {off} of {total_bytes} bytes"
