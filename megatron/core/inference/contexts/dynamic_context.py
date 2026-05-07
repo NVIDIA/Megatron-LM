@@ -2224,7 +2224,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
-        self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
         # CPU-side active-slice bookkeeping (runs once per step on host).
         batch_size = min(
@@ -2307,6 +2306,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # Force the prefill kernel to launch for prefill graphs.
                 self._max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
             self._max_seqlen_k = self.max_sequence_length
+            self.padding_slice = slice(
+                self.active_token_count, self.padded_active_token_count
+            )
 
         # Single coalesced H2D for the unified bookkeeping buffer; captured in
         # the graph so replays always copy the current CPU contents.
@@ -2387,6 +2389,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self._max_seqlen_q = self.num_speculative_tokens + 1
             self._max_seqlen_k = 1
+        self.padding_slice = slice(
+            self.active_token_count, self.padded_active_token_count
+        )
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
