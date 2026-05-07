@@ -724,13 +724,18 @@ class TestMLAQKNormResolution(_MLAQKNormTestBase):
         with pytest.raises(ValueError, match=r"supposed to be disabled"):
             self._build_model(spec=spec)
 
-    def test_disabled_qk_layernorm_rejects_spec_kv_norm(self):
-        """When `qk_layernorm` is off, spec must not carry an explicit kv_layernorm."""
+    def test_disabled_qk_layernorm_rejects_spec_norms(self):
+        """When `qk_layernorm` is off, spec must not carry explicit q/kv layernorms."""
         from megatron.core.extensions.transformer_engine import TENorm
 
-        spec = self._make_spec(kv_layernorm=TENorm)
-        with pytest.raises(ValueError, match=r"supposed to be disabled"):
-            self._build_model(spec=spec)
+        for overrides in (
+            {"q_layernorm": TENorm},
+            {"kv_layernorm": TENorm},
+            {"q_layernorm": TENorm, "kv_layernorm": TENorm},
+        ):
+            spec = self._make_spec(**overrides)
+            with pytest.raises(ValueError, match=r"supposed to be disabled"):
+                self._build_model(spec=spec)
 
 
 class TestDSAQKNormResolution(_MLAQKNormTestBase):
@@ -791,6 +796,19 @@ class TestDSAQKNormResolution(_MLAQKNormTestBase):
         spec = self._make_spec(linear_kv_up_proj=TELayerNormColumnParallelLinear)
         with pytest.raises(ValueError, match=r"supposed to be disabled"):
             self._build_model(spec=spec)
+
+    def test_disabled_qk_layernorm_rejects_spec_norms(self):
+        """When `qk_layernorm` is off, spec must not carry explicit q/kv layernorms."""
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        for overrides in (
+            {"q_layernorm": TENorm},
+            {"kv_layernorm": TENorm},
+            {"q_layernorm": TENorm, "kv_layernorm": TENorm},
+        ):
+            spec = self._make_spec(**overrides)
+            with pytest.raises(ValueError, match=r"supposed to be disabled"):
+                self._build_model(spec=spec)
 
 
 class TestMLADownProjFusion:
