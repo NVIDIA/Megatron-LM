@@ -1,5 +1,20 @@
 ### Megatron Core Inference Documentation
-This guide provides an example for Megatron Core for running model inference. 
+This guide provides an example for Megatron Core for running model inference.
+
+### Folder structure
+```
+examples/inference
+ legacy/
+  gpt_dynamic_inference_with_coordinator.py
+  gpt_dynamic_inference.py
+  gpt_static_inference.py
+  simple_t5_batch_inference.py
+ offline_inference.py
+ launch_inference_server.py
+ utils.py
+ run_offline_inference.sh
+ run_inference_server.sh
+```
 
 ### Contents
 - [Megatron Core Inference Documentation](#megatron-core-inference-documentation)

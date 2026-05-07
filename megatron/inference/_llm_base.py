@@ -146,7 +146,9 @@ class _CoordinatorRuntime:
             # installed when the user only needs direct mode.
             from megatron.core.inference.inference_client import InferenceClient
 
-            client = InferenceClient(coord_addr)
+            # deserialize=True returns DynamicInferenceRequest objects from
+            # add_request futures, matching the high-level API contract.
+            client = InferenceClient(coord_addr, deserialize=True)
             client.start(loop=loop)
             self._client = client
 
@@ -354,11 +356,9 @@ class _MegatronLLMBase:
             assert self._coord_runtime is not None and self._coord_runtime.client is not None
             futures = [self._coord_runtime.client.add_request(p, sp) for p in prompts]
             return list(await asyncio.gather(*futures))
-        # Direct mode: ``engine.generate`` accepts ``list[str]`` or
-        # ``list[list[int]]``; both flow through ``engine.add_request`` which
-        # accepts ``Union[str, List[int], Tensor]`` despite the narrower declared
-        # type on ``engine.generate`` itself. TODO: widen that signature upstream.
-        records = await asyncio.to_thread(self._engine.generate, prompts, sp)
+        # TODO: replace with an upstream ``engine.async_generate`` so direct-mode
+        # async generate doesn't block the caller's event loop.
+        records = self._engine.generate(prompts, sp)
         return [r.merge() for r in records]
 
     async def _pause_impl(self) -> None:
@@ -388,6 +388,12 @@ class _MegatronLLMBase:
     async def _shutdown_impl(self) -> None:
         if self._is_primary_rank:
             assert self._coord_runtime is not None and self._coord_runtime.client is not None
+            # The coordinator only honors STOP from PAUSED or SUSPENDED. If
+            # the engine is RUNNING (the typical state at shutdown), pause
+            # first so the STOP isn't ignored.
+            if self._engine.state == EngineState.RUNNING:
+                self._coord_runtime.client.pause_engines()
+                await self._engine.wait_until(EngineState.PAUSED)
             self._coord_runtime.client.stop_engines()
             await self._engine.wait_until(EngineState.STOPPED)
             await self._coord_runtime.teardown()
