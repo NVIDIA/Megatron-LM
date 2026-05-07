@@ -393,7 +393,7 @@ class TEGroupedMLP(MegatronModule):
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU or clamped quick-GEGL)
+        # Activation and post-multiply probs (SwiGLU or clamped quick-GeGLU)
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         if self.activation_func == F.silu and self.config.gated_linear_unit:
             op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
