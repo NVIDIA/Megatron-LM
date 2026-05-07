@@ -338,8 +338,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
-        self.text_generation_controller._all_logits_cuda = logits
-        self.text_generation_controller._dynamic_step_sample_logits()
+        self.text_generation_controller._dynamic_step_sample_logits(logits)
         sampled_logits = self.text_generation_controller._sampled_tokens_cuda[:batch_size]
         vocab_indices = torch.arange(self.vocab_size).cuda()
 
@@ -1004,7 +1003,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # We need the sampling function to return a 1D tensor for base logits,
         # and a 1D tensor for the flattened MTP logits.
         def mock_sampling_func(logits, *args, **kwargs):
-            if logits.shape[0] == 6:
+            if logits.shape[1] == 6:
                 # Base logits -> return 1D tensor of shape [6]
                 # Req 1: Predicts [11, 12, 99]. Matches T1, T2. Rejects T3. -> Accepts 2 spec tokens.
                 # Req 2: Predicts [99, 22, 23]. Fails at first spec token (99 != 21). -> Accepts 0 spec tokens.
@@ -1021,9 +1020,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Mock logits matching input shape
         logits = torch.randn(1, 6, self.vocab_size, device='cuda')
-        self.text_generation_controller._all_logits_cuda = logits
 
-        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+            input_ids, logits
+        )
 
         # Verify acceptance counts
         accepted_counts = self.text_generation_controller._accepted_token_counts_per_request[:2]
@@ -1256,9 +1256,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.active_request_metadata["top_k"][:2] = 0
         ctx.active_request_metadata["top_p"][:2] = 0.9
 
-        self.text_generation_controller._all_logits_cuda = logits
         try:
-            self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+            self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
+                input_ids, logits
+            )
         except RuntimeError as e:
             if "prob_dist must be 1 or 2 dim" in str(e):
                 pytest.fail("MTP logits were not flattened before calling multinomial sampling.")

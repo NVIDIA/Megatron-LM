@@ -559,6 +559,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.output_layer.sequence_parallel = True
 
         if labels is None:
+            if in_inference_mode and inference_context.is_dynamic_batching():
+                # Optimization: a contiguous [1, s, h] can be re-viewed as a contiguous
+                # [s, 1, h] via squeeze/unsqueeze. Dynamic batching always has B=1.
+                return logits.squeeze(1).unsqueeze(0).float()
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 

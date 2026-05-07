@@ -219,9 +219,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         if is_pipeline_last_stage(self.pp_group):
             logits = output_tensor
 
-            # Explicitly cast logits to expected dtype
-            logits = logits.to(self.config.params_dtype)
-
         return logits
 
     @torch.inference_mode()
