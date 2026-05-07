@@ -662,7 +662,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
     ) -> Tuple[torch.Tensor, None]:
-        return torch.zeros_like(permuted_local_hidden_states), None
         """Graph-capturable expert forward for the DeepEP V2 expand-layout dispatch.
 
         DeepEP V2's expand mode (`do_expand=True`) writes one slot per

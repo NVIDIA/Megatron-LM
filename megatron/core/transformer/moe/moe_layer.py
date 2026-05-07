@@ -531,13 +531,76 @@ class MoELayer(BaseMoELayer):
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed."""
+        # DEBUG: confirm postprocess is reached at all (independent of layer-0 latch).
+        import os as _os
+        global _MCORE_DEEPEP_V2_POSTPROCESS_HIT
+        try:
+            _MCORE_DEEPEP_V2_POSTPROCESS_HIT
+        except NameError:
+            _MCORE_DEEPEP_V2_POSTPROCESS_HIT = False
+        if (
+            _os.environ.get("MCORE_DEEPEP_V2_DEBUG_LAYER0", "0") == "1"
+            and not _MCORE_DEEPEP_V2_POSTPROCESS_HIT
+        ):
+            _MCORE_DEEPEP_V2_POSTPROCESS_HIT = True
+            import torch.distributed as _dist
+            _rank = _dist.get_rank() if _dist.is_initialized() else -1
+            print(
+                f"[moe postprocess hit] rank={_rank} layer_number={getattr(self, 'layer_number', None)} "
+                f"input_shape={tuple(output.shape)} dispatcher={self.config.inference_moe_token_dispatcher_type}",
+                flush=True,
+            )
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 
+        # Snapshot the routed-only output BEFORE adding shared expert, so we
+        # can A/B routed and shared contributions independently.
+        _routed_only_for_debug = output
+
         if shared_expert_output is not None:
             output = output + shared_expert_output
+        # DEBUG: split the post-combine checksum into routed-only, shared-only,
+        # and final. Fires once per process on the first MoE postprocess call.
+        # Enable with MCORE_DEEPEP_V2_DEBUG_LAYER0=1.
+        import os as _os
+        global _MCORE_DEEPEP_V2_LAYER0_DUMPED
+        try:
+            _MCORE_DEEPEP_V2_LAYER0_DUMPED
+        except NameError:
+            _MCORE_DEEPEP_V2_LAYER0_DUMPED = False
+        if (
+            _os.environ.get("MCORE_DEEPEP_V2_DEBUG_LAYER0", "0") == "1"
+            and not _MCORE_DEEPEP_V2_LAYER0_DUMPED
+        ):
+            _MCORE_DEEPEP_V2_LAYER0_DUMPED = True
+            import torch.distributed as _dist
+            _rank = _dist.get_rank() if _dist.is_initialized() else -1
+            _dispatcher = self.config.inference_moe_token_dispatcher_type
+            _layer = getattr(self, 'layer_number', None)
+
+            def _stats(name, t):
+                if t is None:
+                    return f"{name}=None"
+                _f = t.detach().float().flatten()
+                _f8 = [round(float(v), 6) for v in _f[:4].tolist()]
+                return (
+                    f"{name}_norm={float(_f.norm()):.6e} "
+                    f"{name}_mean={float(_f.mean()):.6e} "
+                    f"{name}_std={float(_f.std()):.6e} "
+                    f"{name}_first4={_f8}"
+                )
+
+            print(
+                f"[moe firstcall debug] dispatcher={_dispatcher} rank={_rank} "
+                f"layer_number={_layer} shape={tuple(output.shape)} "
+                f"shared_present={shared_expert_output is not None} | "
+                f"{_stats('routed', _routed_only_for_debug)} | "
+                f"{_stats('shared', shared_expert_output)} | "
+                f"{_stats('final', output)}",
+                flush=True,
+            )
         return output
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
