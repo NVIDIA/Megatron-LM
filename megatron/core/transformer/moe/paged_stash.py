@@ -882,7 +882,8 @@ class PagedStashManager:
             or tensor.dim() == 0
             or not hasattr(tensor, 'grouped_tensor_scale_inv')
         ):
-            return tensor.detach()
+            # Keep autograd connectivity for grad-bearing tensors.
+            return tensor if tensor.requires_grad else tensor.detach()
 
         assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"
 
