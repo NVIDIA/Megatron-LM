@@ -2,10 +2,11 @@
 
 """Internal building blocks for the Megatron inference high-level API.
 
-This module hosts private helpers shared by the future ``MegatronLLM`` and
-``MegatronAsyncLLM`` classes: ``_EventLoopManager`` (Stage 1),
-``_CoordinatorRuntime`` and ``_MegatronLLMBase`` (Stage 2). The public
-sync/async wrappers are added in subsequent stages.
+This module hosts private helpers shared by ``MegatronLLM`` and
+``MegatronAsyncLLM``: ``_EventLoopManager``, ``_CoordinatorRuntime``, and
+``_MegatronLLMBase``. The public sync/async wrappers live on the subclasses;
+this base only exposes shared engine state, runtime spawn, validation
+helpers, and the private ``_<method>_impl`` coroutines.
 """
 
 import asyncio
@@ -174,22 +175,24 @@ class _CoordinatorRuntime:
 
 
 class _MegatronLLMBase:
-    """Shared base for ``MegatronLLM`` and ``MegatronAsyncLLM``.
+    """Private base shared by ``MegatronLLM`` and ``MegatronAsyncLLM``.
 
-    Public async methods (``generate``, ``pause``, ``unpause``, ``suspend``,
-    ``resume``, ``shutdown``, ``wait_for_shutdown``) are inherited as-is by
-    ``MegatronAsyncLLM`` and overridden with sync versions by ``MegatronLLM``.
-    The actual work runs inside private ``_<method>_impl`` coroutines that are
-    scheduled on the background runtime loop in coordinator mode.
+    This base intentionally exposes no public ``generate`` / lifecycle
+    methods -- those live on the subclasses, which call into the private
+    ``_<method>_impl`` coroutines defined here. The base owns:
+
+    - the engine pipeline (engine, context, controller),
+    - the per-instance background runtime (``_loop_manager``,
+      ``_coord_runtime``) when ``use_coordinator=True``,
+    - validation helpers (``_assert_primary``, ``_assert_coordinator``) and
+      the input shape helper (``_normalize_prompts``).
 
     Two execution modes are supported:
 
     - **Direct mode** (``use_coordinator=False``): every rank is treated as
       primary and ``generate`` runs the engine synchronously (offloaded to a
-      thread when called from an event loop). ``generate`` is single-caller in
-      direct mode -- concurrent calls (e.g. via ``asyncio.gather``) raise
-      :class:`RuntimeError`; pass a list of prompts instead. Lifecycle methods
-      raise :class:`RuntimeError`.
+      thread when called from an event loop). Lifecycle methods are invalid
+      and raise :class:`RuntimeError` via ``_assert_coordinator``.
     - **Coordinator mode** (``use_coordinator=True``): a background event loop
       hosts the engine pipeline and an :class:`InferenceClient` (on global
       rank 0). Only the primary rank may submit requests via ``generate``.
@@ -237,7 +240,6 @@ class _MegatronLLMBase:
         self._loop_manager: "Optional[_EventLoopManager]" = None
         self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
         self._shutdown_called: bool = False
-        self._direct_generate_in_flight: bool = False
 
         if use_coordinator:
             loop_manager = _EventLoopManager()
@@ -323,129 +325,13 @@ class _MegatronLLMBase:
             f"got {type(prompts)}"
         )
 
-    # ---- public async methods (inherited by MegatronAsyncLLM; overridden in MegatronLLM) ----
-
-    async def generate(
-        self,
-        prompts: Union[str, List[int], List[str], List[List[int]]],
-        sampling_params: Optional[SamplingParams] = None,
-    ) -> Union["DynamicInferenceRequest", List["DynamicInferenceRequest"]]:
-        """Run inference for one prompt or a batch of prompts.
-
-        Single input (``str`` or ``list[int]``) returns a single
-        ``DynamicInferenceRequest``; batched input (``list[str]`` or
-        ``list[list[int]]``) returns ``list[DynamicInferenceRequest]`` in
-        input order.
-
-        In direct mode, ``generate`` is single-caller -- concurrent calls raise
-        ``RuntimeError``. Pass batched input instead of using
-        ``asyncio.gather``.
-
-        Raises:
-            RuntimeError: if called on a non-primary rank in coordinator mode,
-                or if a second concurrent call enters in direct mode.
-        """
-        self._assert_primary()
-        if sampling_params is None:
-            sampling_params = SamplingParams()
-
-        normalized, is_batch = self._normalize_prompts(prompts)
-
-        if not normalized:
-            # Empty batch: nothing to schedule. ``is_batch`` is always True
-            # here since single input is wrapped to a one-element list.
-            return []
-
-        if self._use_coordinator:
-            assert self._loop_manager is not None
-            results = await self._loop_manager.run_async(
-                self._generate_impl(normalized, sampling_params)
-            )
-        else:
-            if self._direct_generate_in_flight:
-                raise RuntimeError(
-                    "MegatronAsyncLLM.generate in direct mode is single-caller; "
-                    "pass a list of prompts instead of using asyncio.gather."
-                )
-            self._direct_generate_in_flight = True
-            try:
-                results = await self._generate_impl(normalized, sampling_params)
-            finally:
-                self._direct_generate_in_flight = False
-
-        return results if is_batch else results[0]
-
-    async def pause(self) -> None:
-        """Transition the engine to ``PAUSED``.
-
-        Raises:
-            RuntimeError: in direct mode (``use_coordinator=False``).
-        """
-        self._assert_coordinator()
-        assert self._loop_manager is not None
-        await self._loop_manager.run_async(self._pause_impl())
-
-    async def unpause(self) -> None:
-        """Transition the engine from ``PAUSED`` back to ``RUNNING``.
-
-        Raises:
-            RuntimeError: in direct mode (``use_coordinator=False``).
-        """
-        self._assert_coordinator()
-        assert self._loop_manager is not None
-        await self._loop_manager.run_async(self._unpause_impl())
-
-    async def suspend(self) -> None:
-        """Transition the engine to ``SUSPENDED`` (offloads GPU buffers).
-
-        The caller must ``pause()`` first; this method does not enforce that.
-
-        Raises:
-            RuntimeError: in direct mode (``use_coordinator=False``).
-        """
-        self._assert_coordinator()
-        assert self._loop_manager is not None
-        await self._loop_manager.run_async(self._suspend_impl())
-
-    async def resume(self) -> None:
-        """Transition the engine from ``SUSPENDED`` to ``RESUMED``.
-
-        Raises:
-            RuntimeError: in direct mode (``use_coordinator=False``).
-        """
-        self._assert_coordinator()
-        assert self._loop_manager is not None
-        await self._loop_manager.run_async(self._resume_impl())
-
-    async def shutdown(self) -> None:
-        """Stop the engine, tear down the coordinator, and join the runtime thread.
-
-        Idempotent. No-op in direct mode.
-        """
-        if self._shutdown_called:
-            return
-        self._shutdown_called = True
-        if not self._use_coordinator:
-            return
-        assert self._loop_manager is not None
-        await self._loop_manager.run_async(self._shutdown_impl())
-        # Stop the loop in a worker thread so we don't block the caller's loop.
-        await asyncio.to_thread(self._loop_manager.stop)
-
-    async def wait_for_shutdown(self) -> None:
-        """Block until the engine's background loop task terminates.
-
-        No-op in direct mode.
-        """
-        if not self._use_coordinator:
-            return
-        assert self._loop_manager is not None
-        await self._loop_manager.run_async(self._wait_for_shutdown_impl())
-
-    # ---- private impl coroutines (run on the runtime loop) ----
-    # The coordinator requires a long running runtime event loop, so we define these methods
-    # to route the user's event loop to our runtime loop
-   
+    # ---- private impl coroutines ----
+    # Subclasses' public methods bridge to these via ``_EventLoopManager``
+    # (coordinator mode, on the runtime loop) or await them directly
+    # (direct mode, on the caller's event loop).
+    # We need this bridge in coordinator mode because the coordinator requires
+    # a long running event loop, so we need to route the user's event
+    # loop to our runtime loop
 
     async def _generate_impl(
         self,
