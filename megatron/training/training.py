@@ -1635,26 +1635,6 @@ def get_model(
                     model_chunk_idx > 0
                 ) or args.overlap_param_gather_with_optimizer_step
 
-                # Pre-compute parameter layouts for the distributed optimizer.
-                # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if args.use_distributed_optimizer and DP is DDP:
-                    all_params = [p for p in model_chunk.parameters() if p.requires_grad]
-                    pp_rank = mpu.get_pipeline_model_parallel_rank()
-                    effective_bucket_size = (
-                        None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
-                    )
-                    chunk_kwargs["full_param_layout"] = (
-                        DistributedOptimizer.compute_full_param_layout(
-                            all_params,
-                            effective_bucket_size,
-                            mpu.get_data_parallel_world_size(with_context_parallel=True),
-                            ddp_config,
-                            expert_data_parallel_world_size=(
-                                mpu.get_expert_data_parallel_world_size()
-                            ),
-                        )
-                    )
-
                 wrapped_model.append(
                     DP(
                         config=config,

@@ -898,12 +898,18 @@ class InferenceTopKRouter(TopKRouter):
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
         """Simplified forward pass for inference - returns dense tensors only.
 
         Args:
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
+            input_ids (torch.Tensor, optional): Not used in inference.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -912,6 +918,6 @@ class InferenceTopKRouter(TopKRouter):
         """
 
         if self.training:
-            return super().forward(input, padding_mask)
+            return super().forward(input, padding_mask, input_ids)
 
         return self._forward(input, padding_mask)
