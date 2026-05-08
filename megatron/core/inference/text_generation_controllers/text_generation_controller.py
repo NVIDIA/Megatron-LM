@@ -22,6 +22,7 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
+from megatron.core.inference.ep_async_protocol import EPStepBeginDecision
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -225,6 +226,7 @@ class TextGenerationController:
         self._async_sample_slot_copy_counts = [0] * self._async_sample_slot_count
         self._async_sample_slot_wait_count = 0
         self._request_sampling_rngs: Dict[int, torch.Generator] = {}
+        self._ep_async_protocol = None
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -1418,6 +1420,10 @@ class TextGenerationController:
         """Whether a speculative async forward has already been launched for the next step."""
         return self._async_pending_forward
 
+    def set_ep_async_protocol(self, protocol) -> None:
+        """Attach the EP async protocol used by coordinator-driven EP decoding."""
+        self._ep_async_protocol = protocol
+
     def request_async_admission_barrier(self) -> None:
         """Stop chaining async forwards once so waiting requests can be admitted."""
         self._async_add_deferral_count += 1
@@ -1506,6 +1512,28 @@ class TextGenerationController:
             return True
         return torch.equal(pending_request_ids, self._active_request_ids_cpu())
 
+    def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
+        """Return whether the pending forward is reusable and whether row mapping is needed."""
+        pending_request_ids = self._async_pending_forward_request_ids
+        if pending_request_ids is None:
+            return True, False
+
+        current_request_ids = self._active_request_ids_cpu()
+        if current_request_ids.numel() == 0:
+            return False, False
+        if torch.equal(pending_request_ids, current_request_ids):
+            return True, False
+
+        pending_row_by_request_id = {
+            int(request_id): row
+            for row, request_id in enumerate(pending_request_ids.tolist())
+        }
+        for request_id in current_request_ids.tolist():
+            if int(request_id) not in pending_row_by_request_id:
+                return False, False
+
+        return True, True
+
     def _resolve_pending_async_forward_rows(self) -> tuple[bool, Optional[Tensor], bool]:
         """Map current active rows back to the pending speculative forward rows.
 
@@ -1545,6 +1573,53 @@ class TextGenerationController:
         )
         self._async_row_mapped_forward_count += 1
         return True, row_indices, True
+
+    def _clear_pending_async_sample(self) -> None:
+        """Discard a pending async sampled-token result without consuming it."""
+        self._async_pending_sampled_tokens_cpu = None
+        self._async_pending_sampled_mtp_tokens_cpu = None
+        self._async_pending_sample_ready_event = None
+        self._async_pending_h2d_done_event = None
+        self._async_pending_sample_cuda_graph_request_count = None
+
+    def _discard_pending_async_forward(self) -> None:
+        """Discard a pending async forward and release resources reserved for it."""
+        context = self.inference_wrapped_model.inference_context
+        if self._async_pending_forward:
+            context.release_deferred_async_kv_blocks()
+            self._async_pending_forward = False
+            self._async_pending_cuda_graph_request_count = None
+            self._async_pending_forward_request_ids = None
+            self._async_discarded_forward_count += 1
+
+    def _decide_ep_step_begin(
+        self, *, has_real_work: bool, pending_async_sample: bool
+    ) -> EPStepBeginDecision:
+        """Synchronize pending async state at the beginning of an EP work step."""
+        pending_forward_reusable = True
+        pending_forward_row_mapped = False
+        if self._async_pending_forward:
+            pending_forward_reusable, pending_forward_row_mapped = (
+                self._pending_async_forward_row_status()
+            )
+
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            return self._ep_async_protocol.decide_step_begin(
+                has_real_work=has_real_work,
+                has_pending_forward=self._async_pending_forward,
+                has_pending_async_sample=pending_async_sample,
+                pending_forward_reusable=pending_forward_reusable,
+                pending_forward_row_mapped=pending_forward_row_mapped,
+            )
+
+        return EPStepBeginDecision(
+            step_id=-1,
+            has_real_work=has_real_work,
+            use_pending_async_sample=pending_async_sample,
+            reuse_pending_forward=bool(self._async_pending_forward and pending_forward_reusable),
+            discard_pending_forward=bool(self._async_pending_forward and not pending_forward_reusable),
+            row_mapped_forward=bool(self._async_pending_forward and pending_forward_row_mapped),
+        )
 
     def _dynamic_step_required_token_logits(self, row_indices: Optional[Tensor] = None) -> Tensor:
         """Return the per-active-request logits consumed by sampling."""
@@ -2444,6 +2519,7 @@ class TextGenerationController:
         on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
+        self._decide_ep_step_begin(has_real_work=False, pending_async_sample=False)
 
         # attempt to use cuda-graph if possible
         input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
@@ -2747,6 +2823,14 @@ class TextGenerationController:
         pending_forward_row_indices = None
         pending_forward_row_mapped = False
         pending_async_sample = self._async_pending_sampled_tokens_cpu is not None
+        ep_step_begin_decision = self._decide_ep_step_begin(
+            has_real_work=True, pending_async_sample=pending_async_sample
+        )
+        if pending_async_sample and not ep_step_begin_decision.use_pending_async_sample:
+            self._clear_pending_async_sample()
+            pending_async_sample = False
+        if ep_step_begin_decision.discard_pending_forward:
+            self._discard_pending_async_forward()
 
         if pending_async_sample:
             async_next_prepared = True

@@ -816,6 +816,59 @@ class TestEPAsyncStepProtocol:
             ("sync", EPAsyncPhase.GRAPH_SHAPE.value, 0, None, (4, 8))
         ]
 
+    @pytest.mark.asyncio
+    async def test_step_begin_uses_active_step_id_for_pending_reuse(self):
+        communicator = _RecordingEPCommunicator()
+        protocol = EPAsyncStepProtocol(communicator)
+
+        await protocol.establish_work_consensus(1, False)
+        decision = protocol.decide_step_begin(
+            has_real_work=True,
+            has_pending_forward=True,
+            has_pending_async_sample=False,
+            pending_forward_reusable=True,
+            pending_forward_row_mapped=True,
+        )
+
+        assert decision.step_id == 0
+        assert decision.reuse_pending_forward
+        assert not decision.discard_pending_forward
+        assert decision.row_mapped_forward
+        assert communicator.calls[-1] == (
+            "sync",
+            EPAsyncPhase.STEP_BEGIN.value,
+            0,
+            None,
+            (1, 1, 0, 1, 1, 0, 0, 1),
+        )
+        protocol.complete_idle_step()
+
+    @pytest.mark.asyncio
+    async def test_step_begin_discards_when_real_rank_cannot_reuse(self):
+        communicator = _RecordingEPCommunicator()
+        protocol = EPAsyncStepProtocol(communicator)
+
+        await protocol.establish_work_consensus(1, False)
+        decision = protocol.decide_step_begin(
+            has_real_work=True,
+            has_pending_forward=True,
+            has_pending_async_sample=True,
+            pending_forward_reusable=False,
+            pending_forward_row_mapped=False,
+        )
+
+        assert decision.use_pending_async_sample
+        assert not decision.reuse_pending_forward
+        assert decision.discard_pending_forward
+        assert communicator.calls[-1] == (
+            "sync",
+            EPAsyncPhase.STEP_BEGIN.value,
+            0,
+            None,
+            (1, 1, 1, 0, 0, 1, 0, 0),
+        )
+        protocol.complete_idle_step()
+
 
 def _set_hash_rank(coord, h, rank_identity, timestamp):
     """Test helper: set a hash→rank timestamp in the coordinator's dict."""

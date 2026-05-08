@@ -649,6 +649,8 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             if hasattr(self.context, "set_ep_async_protocol"):
                 self.context.set_ep_async_protocol(self.ep_async_step_protocol)
+            if hasattr(self.controller, "set_ep_async_protocol"):
+                self.controller.set_ep_async_protocol(self.ep_async_step_protocol)
             # Give the context a CPU-side MAX-reduction primitive so
             # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
             if hasattr(self.context, "set_ep_zmq_communicator"):
