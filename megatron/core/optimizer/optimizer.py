@@ -118,12 +118,31 @@ def _multi_tensor_copy_this_to_that(
 # expert-parallel sharding), so we list them explicitly.
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 
+
+def _param_group_override_keys() -> tuple[str, ...]:
+    """Return every field declared on ``ParamGroupOverride``.
+
+    For any TypedDict, ``__annotations__.keys() == __required_keys__ | __optional_keys__``
+    — the (required, optional) pair is just a *partition* of the declared set
+    based on the TypedDict's totality choice and any ``Required[]`` /
+    ``NotRequired[]`` wrappers. We want the whole declared set, regardless of
+    how it's partitioned, so we read ``__annotations__`` directly. Reading just
+    one side of the partition would silently miss fields if a future maintainer
+    flipped totality or introduced wrappers:
+
+        total=False (current):  optional={max_lr, min_lr, ...}, required=∅
+        total=True:             required={max_lr, min_lr, ...}, optional=∅
+        mixed Required/NotRequired:  fields split between the two sides
+    """
+    return tuple(sorted(_ParamGroupOverride.__annotations__.keys()))
+
+
 param_group_identifier_keys = (
     # Per-group user-overridable keys (single source of truth: ParamGroupOverride).
     # The scheduler reads ``max_lr``/``min_lr`` in ``get_lr`` and ``start_wd``/``end_wd``
     # in ``get_wd``; ``wd_mult`` is multiplied into ``weight_decay`` in ``step``;
     # ``optimizer`` selects per-group optimizer class.
-    *sorted(_ParamGroupOverride.__optional_keys__),
+    *_param_group_override_keys(),
     # Optimizer-side structural flags (not user-overridable via ParamGroupOverride):
     'lr_mult',
     'is_expert_parallel',

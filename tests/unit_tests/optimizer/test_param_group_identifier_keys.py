@@ -32,18 +32,47 @@ def _make_pg(**kw) -> dict:
 
 
 def test_identifier_keys_cover_all_param_group_override_fields():
-    """REGRESSION: every key in ``ParamGroupOverride`` must be in the identifier.
+    """REGRESSION: every field declared on ``ParamGroupOverride`` must be in
+    the identifier. If someone adds a new field (per-group user-facing config),
+    it must also appear in ``param_group_identifier_keys`` — otherwise two
+    groups distinguishable only by that field will collide on load.
 
-    If someone adds a new field to ``ParamGroupOverride`` (per-group user-facing
-    config), it must also appear in ``param_group_identifier_keys`` — otherwise
-    two groups distinguishable only by that field will collide on load. This
-    test fails loudly when the two get out of sync.
+    We use ``__annotations__.keys()`` as the source of truth for "declared
+    fields". For any TypedDict that equals ``__required_keys__ | __optional_keys__``,
+    so the test is invariant to the TypedDict's ``total=`` setting or to a
+    future split between ``Required[]`` / ``NotRequired[]`` wrappers — see
+    the docstring on ``_param_group_override_keys`` in ``optimizer.py``.
     """
-    missing = set(ParamGroupOverride.__optional_keys__) - set(param_group_identifier_keys)
+    declared = set(ParamGroupOverride.__annotations__.keys())
+    missing = declared - set(param_group_identifier_keys)
     assert not missing, (
         f"ParamGroupOverride fields not in param_group_identifier_keys: {missing}. "
         f"Either add to identifier_keys, or argue why this field should NOT participate "
         f"in save/load matching."
+    )
+
+
+def test_identifier_keys_invariant_to_totality():
+    """The identifier-key derivation must work regardless of whether
+    ``ParamGroupOverride`` is declared ``total=False`` (current),
+    ``total=True``, or mixed via ``Required[]`` / ``NotRequired[]``.
+
+    This guards against a future maintainer flipping the totality setting and
+    silently emptying the identifier (which would re-introduce the LR-restart
+    bug class).
+    """
+    # Verify every field is captured by __annotations__ (the source we use).
+    assert set(ParamGroupOverride.__annotations__.keys()) >= {
+        'max_lr', 'min_lr', 'start_wd', 'end_wd', 'wd_mult', 'optimizer'
+    }, (
+        "ParamGroupOverride lost expected fields. If a field was renamed, update "
+        "this test AND any consumers of the identifier."
+    )
+    # Verify the identifier-derivation function returns exactly the annotation set.
+    from megatron.core.optimizer.optimizer import _param_group_override_keys
+    assert set(_param_group_override_keys()) == set(ParamGroupOverride.__annotations__.keys()), (
+        "_param_group_override_keys() must return ParamGroupOverride.__annotations__ verbatim "
+        "so the identifier survives totality / Required[] / NotRequired[] changes."
     )
 
 
