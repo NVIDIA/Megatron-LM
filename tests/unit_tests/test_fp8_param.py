@@ -408,18 +408,10 @@ class TestFP8Param:
 
     def run_test_with_eval_transition(self, tp_size, recipe, **kwargs):
         loss, eval_loss = self._run_test_helper(
-            tp_size,
-            recipe,
-            fp8_param_gather=True,
-            eval_transition=True,
-            **kwargs,
+            tp_size, recipe, fp8_param_gather=True, eval_transition=True, **kwargs
         )
         loss_ref, eval_loss_ref = self._run_test_helper(
-            tp_size,
-            recipe,
-            fp8_param_gather=False,
-            eval_transition=True,
-            **kwargs,
+            tp_size, recipe, fp8_param_gather=False, eval_transition=True, **kwargs
         )
         torch.testing.assert_close(loss, loss_ref, atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(eval_loss, eval_loss_ref, atol=1e-4, rtol=1e-4)
