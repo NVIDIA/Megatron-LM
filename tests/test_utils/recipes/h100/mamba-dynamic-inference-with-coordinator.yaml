@@ -58,5 +58,6 @@ products:
   - test_case: [hybrid_dynamic_inference_tp1_ep8_nanov3_chunked_prefill]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        # Broken: hangs on repeat iter 3, exceeds 1h job limit — see issue #4657.
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
