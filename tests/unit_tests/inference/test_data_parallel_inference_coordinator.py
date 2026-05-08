@@ -682,6 +682,59 @@ class TestCoordinator:
             await cleanup_engine(engine, client, timeout=60.0)
 
 
+class TestAsyncZMQCommunicator:
+    """Focused tests for tagged ZMQ collectives."""
+
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_tagged_all_reduce_max(self, initialize_model_parallel, test_case_communicator):
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+
+        result = await asyncio.wait_for(
+            test_case_communicator.all_reduce_max(
+                rank, rank + 11, phase="ep_protocol_step_begin", step_id=7
+            ),
+            timeout=30.0,
+        )
+        assert result == (world_size - 1, world_size + 10)
+
+        sync_result = test_case_communicator.sync_all_reduce_max(
+            rank + 3, phase="ep_protocol_graph_shape", step_id=8
+        )
+        assert sync_result == world_size + 2
+
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mismatch", ["phase", "step", "shape"])
+    async def test_tagged_all_reduce_max_mismatch_fails(
+        self, initialize_model_parallel, mismatch
+    ):
+        rank = torch.distributed.get_rank()
+        ctx = zmq.Context()
+        comm = AsyncZMQCommunicator(ctx, process_group=None)
+        try:
+            phase = "ep_protocol_expected"
+            step_id = 13
+            values = (rank,)
+            if rank != 0:
+                if mismatch == "phase":
+                    phase = "ep_protocol_wrong"
+                elif mismatch == "step":
+                    step_id = 14
+                elif mismatch == "shape":
+                    values = (rank, rank)
+
+            with pytest.raises(RuntimeError, match="ZMQ collective"):
+                await asyncio.wait_for(
+                    comm.all_reduce_max(*values, phase=phase, step_id=step_id),
+                    timeout=30.0,
+                )
+        finally:
+            comm.close()
+            ctx.term()
+
+
 def _set_hash_rank(coord, h, rank_identity, timestamp):
     """Test helper: set a hash→rank timestamp in the coordinator's dict."""
     rank_idx = coord.identity_to_rank_index[rank_identity]
