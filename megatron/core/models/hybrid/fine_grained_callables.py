@@ -40,8 +40,10 @@ class HybridStackNode(TransformerLayerNode):
         Currently mirrors the GPT default: dense layers always retain their
         input for backward; MoE-only "moe_dispatch", "mlp", and "moe_combine"
         slots can free, subject to the dispatcher / cuda-graph constraints
-        encoded in ``should_free_input``. Hybrid groups have an "attn" slot
-        whose semantics differ, but its policy resolves to ``False`` in
+        encoded in ``should_free_input``. Hybrid groups have a
+        "pre_dispatch_computation" slot whose semantics differ (it covers a
+        loop over Mamba/attention/GDN sub-layers, not a single attention
+        block), but its policy resolves to ``False`` in
         ``should_free_input``, which is correct: pre-layer outputs are needed
         for backward through the loop. Override here when a hybrid-specific
         rule is needed.
@@ -286,7 +288,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
         backward_dw["mlp"] = terminal_layer.mlp
 
     if pre_bwd_dw:
-        backward_dw["attn"] = pre_bwd_dw
+        backward_dw["pre_dispatch_computation"] = pre_bwd_dw
 
     forward_funcs = [
         pre_dispatch_computation,

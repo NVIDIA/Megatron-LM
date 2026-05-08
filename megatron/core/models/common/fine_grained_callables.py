@@ -92,19 +92,27 @@ def build_mtp_layer_callables(layer):
         with rng_context:
             return func(*args, **kwargs)
 
-    # Build forward and backward callable functions
-    # attn_forward already has rng context, no need to wrap
-    attn_func = submodule_mtp_attn_forward
+    # Build forward and backward callable functions.
+    # pre_dispatch_func already has rng context (rolled into submodule_mtp_attn_forward),
+    # so it does not need to be wrapped.
+    pre_dispatch_func = submodule_mtp_attn_forward
     dispatch_func = partial(rng_context_wrapper, dispatch_forward)
     mlp_func = partial(rng_context_wrapper, mlp_forward)
     combine_func = partial(rng_context_wrapper, combine_forward)
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
-    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, mtp_post_process_func]
-    if isinstance(backward_dw["attn"], list):
-        backward_dw["attn"].append(layer.eh_proj)
+    forward_funcs = [
+        pre_dispatch_func,
+        dispatch_func,
+        mlp_func,
+        combine_func,
+        mtp_post_process_func,
+    ]
+    pre_dispatch_bwd = backward_dw["pre_dispatch_computation"]
+    if isinstance(pre_dispatch_bwd, list):
+        pre_dispatch_bwd.append(layer.eh_proj)
     else:
-        backward_dw["attn"] = [backward_dw["attn"], layer.eh_proj]
+        backward_dw["pre_dispatch_computation"] = [pre_dispatch_bwd, layer.eh_proj]
 
     return forward_funcs, backward_dw
 

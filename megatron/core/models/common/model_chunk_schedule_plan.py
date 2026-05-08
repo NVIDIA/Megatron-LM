@@ -35,20 +35,23 @@ class TransformerLayerSchedulePlan:
     mtp post process nodes.
 
     layer (TransformerLayerSchedulePlan)
-    ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
+    ├── pre_dispatch_computation (TransformerLayerNode):
+    │     attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
-    moe_dispatch, mlp, moe_combine, but contains extra operations in attn and mtp_post_process:
-    * mtp.attn wraps around transformer_layer.attn with extra norm, proj and embedding operations.
+    moe_dispatch, mlp, moe_combine, but contains extra operations in
+    pre_dispatch_computation and mtp_post_process:
+    * mtp.pre_dispatch_computation wraps around transformer_layer.pre_dispatch_computation with
+      extra norm, proj and embedding operations.
     * mtp.mtp_post_process contains output_layer, mtp loss operations, whereas
       transformer_layer.mtp_post_process is empty.
     """
 
-    attn = None
+    pre_dispatch_computation = None
     moe_dispatch = None
     mlp = None
     moe_combine = None
@@ -85,9 +88,12 @@ class TransformerLayerSchedulePlan:
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
-        if hasattr(self, 'attn') and self.attn is not None:
-            del self.attn
-            self.attn = None
+        if (
+            hasattr(self, 'pre_dispatch_computation')
+            and self.pre_dispatch_computation is not None
+        ):
+            del self.pre_dispatch_computation
+            self.pre_dispatch_computation = None
         if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
             del self.moe_dispatch
             self.moe_dispatch = None
@@ -146,7 +152,7 @@ class TransformerLayerSchedulePlan:
             )
 
         (
-            attn_module,
+            pre_dispatch_module,
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
@@ -155,7 +161,9 @@ class TransformerLayerSchedulePlan:
 
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
-        self.attn = create_node(comp_stream, attn_module, "attn")
+        self.pre_dispatch_computation = create_node(
+            comp_stream, pre_dispatch_module, "pre_dispatch_computation"
+        )
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
@@ -216,7 +224,7 @@ class TransformerLayerSchedulePlan:
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
-                f_input = f_layer.attn.forward(f_input)
+                f_input = f_layer.pre_dispatch_computation.forward(f_input)
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
@@ -230,7 +238,7 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
         if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.attn.backward(b_grad)
+            b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
@@ -242,12 +250,12 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.mtp_post_process.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.attn.backward(b_grad)
+            b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
-        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
-        # for overlapping with the p2p comm
+        # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad
+        # of the first layer) for overlapping with the p2p comm.
         if b_layer is not None and not is_last_layer_in_bwd:
-            b_layer.attn.backward_dw()
+            b_layer.pre_dispatch_computation.backward_dw()
 
         return f_input, b_grad
 
@@ -549,11 +557,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.wait_current_stream()
             post_backward(b_grad, b_schedule_plan.vp_stage)
 
-        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
-        # for overlapping with the p2p comm
+        # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad
+        # of the first layer) for overlapping with the p2p comm.
         if b_num_layers > 0:
             assert b_layer is not None
-            b_layer.attn.backward_dw()
+            b_layer.pre_dispatch_computation.backward_dw()
             b_layer.release_state()
 
         # post process forward

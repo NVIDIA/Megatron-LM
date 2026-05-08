@@ -75,14 +75,16 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
             )
 
         (
-            attn_module,
+            pre_dispatch_module,
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
             mtp_post_process_module,
         ) = fwd_callables
 
-        self.attn = create_node(comp_stream, attn_module, "attn")
+        self.pre_dispatch_computation = create_node(
+            comp_stream, pre_dispatch_module, "pre_dispatch_computation"
+        )
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")

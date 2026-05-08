@@ -249,14 +249,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         raise NotImplementedError("This callable is not implemented for Dense layer.")
 
     # Build forward and backward callable functions
-    attn_func = submodule_attn_forward
+    pre_dispatch_func = submodule_attn_forward
     dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented
 
     layer.init_backward_dw_wrapper()
 
-    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, None]
-    backward_dw = {"attn": layer.backward_dw_wrapper, "mlp": layer.mlp}
+    forward_funcs = [pre_dispatch_func, dispatch_func, mlp_func, combine_func, None]
+    backward_dw = {
+        "pre_dispatch_computation": layer.backward_dw_wrapper,
+        "mlp": layer.mlp,
+    }
     return forward_funcs, backward_dw
 
