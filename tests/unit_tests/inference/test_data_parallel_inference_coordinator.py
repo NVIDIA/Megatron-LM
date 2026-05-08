@@ -169,7 +169,9 @@ class DummyEngine(DynamicInferenceEngine):
 
         return self.requests[request_id].future
 
-    async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
+    async def async_step(
+        self, *, verbose: Optional[bool] = False, send_coordinator_replies: bool = True
+    ) -> Dict:
         """Dummy async_step."""
         await asyncio.sleep(0)
 
@@ -188,7 +190,7 @@ class DummyEngine(DynamicInferenceEngine):
                 entry.future.set_result(entry.record)
                 to_remove.append(request_id)
                 # Send signal to coordinator.
-                if self.is_mp_coordinator:
+                if send_coordinator_replies and self.is_mp_coordinator:
                     payload = msgpack.packb(
                         [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]],
                         use_bin_type=True,
@@ -787,6 +789,52 @@ class TestAsyncZMQCommunicator:
         finally:
             comm.close()
             ctx.term()
+
+
+class TestCoordinatorEPWorkStep:
+    """Focused tests for coordinator-driven EP work-step ordering."""
+
+    @pytest.mark.asyncio
+    async def test_coordinator_replies_are_sent_after_ep_completion(
+        self, initialize_model_parallel
+    ):
+        engine = DummyEngine()
+        order = []
+        record = DynamicInferenceRequestRecord.from_request(
+            DynamicInferenceRequest(
+                request_id=123,
+                prompt="1 2",
+                prompt_tokens=torch.tensor([1, 2], dtype=torch.int64),
+                generated_tokens=[3],
+                sampling_params=SamplingParams(num_tokens_to_generate=1),
+                status=Status.COMPLETED,
+            )
+        )
+
+        async def fake_async_step(*, send_coordinator_replies=True):
+            order.append(("async_step", send_coordinator_replies))
+            return {"finished_request_records": [record]}
+
+        async def fake_ep_complete_work_step():
+            order.append("ep_complete")
+
+        def fake_send_finished_records(records):
+            order.append(("send", records))
+
+        engine.async_step = fake_async_step
+        engine._ep_complete_work_step = fake_ep_complete_work_step
+        engine._send_finished_records_to_coordinator = fake_send_finished_records
+
+        try:
+            await engine._run_ep_work_step(local_pending=1)
+            assert order == [
+                ("async_step", False),
+                "ep_complete",
+                ("send", [record]),
+            ]
+        finally:
+            engine.world_zmq_communicator.close()
+            engine.zmq_context.term()
 
 
 class _RecordingEPCommunicator:
