@@ -151,7 +151,16 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
             return hidden_states + 1
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
-    module.config = SimpleNamespace(fp8=False, fp4=False, moe_router_padding_for_quantization=False)
+    # `_fused_forward` calls `skip_routed_expert_padding(config)` (added by PR 4071), which
+    # reads `moe_token_dispatcher_type` and `moe_flex_dispatcher_backend` after the
+    # `moe_router_padding_for_quantization` short-circuit fails.
+    module.config = SimpleNamespace(
+        fp8=False,
+        fp4=False,
+        moe_router_padding_for_quantization=False,
+        moe_token_dispatcher_type=None,
+        moe_flex_dispatcher_backend=None,
+    )
     module._fused_ops = None
     fused_ops = FakeFusedOps()
     module._make_fused_ops = lambda: fused_ops
