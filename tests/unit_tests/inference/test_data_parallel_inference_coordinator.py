@@ -24,6 +24,7 @@ from megatron.core.inference.engines.dynamic_engine import (
     EngineState,
     RequestEntry,
 )
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase, EPAsyncStepProtocol
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -733,6 +734,55 @@ class TestAsyncZMQCommunicator:
         finally:
             comm.close()
             ctx.term()
+
+
+class _RecordingEPCommunicator:
+    """Tiny communicator double that records tagged protocol calls."""
+
+    world_size = 2
+
+    def __init__(self):
+        self.calls = []
+
+    async def all_reduce_max(self, *local_vals, async_op=True, phase=None, step_id=None):
+        self.calls.append(("async", phase, step_id, async_op, local_vals))
+        return local_vals[0] if len(local_vals) == 1 else local_vals
+
+    def sync_all_reduce_max(self, *local_vals, phase=None, step_id=None):
+        self.calls.append(("sync", phase, step_id, None, local_vals))
+        return local_vals[0] if len(local_vals) == 1 else local_vals
+
+
+class TestEPAsyncStepProtocol:
+    """Focused tests for the EP protocol owner."""
+
+    @pytest.mark.asyncio
+    async def test_work_consensus_uses_tagged_ordered_phase(self):
+        communicator = _RecordingEPCommunicator()
+        protocol = EPAsyncStepProtocol(communicator)
+
+        first = await protocol.establish_work_consensus(3, False, async_op=True)
+        second = await protocol.establish_work_consensus(0, True, async_op=False)
+
+        assert first.global_work == 3
+        assert not first.all_pausing
+        assert second.global_work == 0
+        assert second.all_pausing
+        assert communicator.calls == [
+            ("async", EPAsyncPhase.WORK_CONSENSUS.value, 0, True, (3, 0)),
+            ("async", EPAsyncPhase.WORK_CONSENSUS.value, 1, False, (0, -1)),
+        ]
+
+    def test_sync_collective_uses_independent_phase_ordering(self):
+        communicator = _RecordingEPCommunicator()
+        protocol = EPAsyncStepProtocol(communicator)
+
+        result = protocol.sync_all_reduce_max(EPAsyncPhase.GRAPH_SHAPE, 4, 8)
+
+        assert result == (4, 8)
+        assert communicator.calls == [
+            ("sync", EPAsyncPhase.GRAPH_SHAPE.value, 0, None, (4, 8))
+        ]
 
 
 def _set_hash_rank(coord, h, rank_identity, timestamp):

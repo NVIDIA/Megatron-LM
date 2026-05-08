@@ -31,6 +31,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.ep_async_protocol import EPAsyncStepProtocol
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -638,9 +639,13 @@ class DynamicInferenceEngine(AbstractEngine):
         # initialize zmq-based EP communicator
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
+        self.ep_async_step_protocol = EPAsyncStepProtocol()
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
+            )
+            self.ep_async_step_protocol = EPAsyncStepProtocol(
+                self.expert_parallel_zmq_communicator
             )
             # Give the context a CPU-side MAX-reduction primitive so
             # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
@@ -2353,8 +2358,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         nvtx_range_push("_ep_establish_consensus")
 
-        consensus_val = -1 if signal_consensus else 0
-
         # Signals can be received asynchronously on EP ranks.
         # We do not want a rank to pause prematurely if its peers have yet to receive the signal.
         # So this is an *attempt* to process the signal. This rank has received the signal
@@ -2368,16 +2371,20 @@ class DynamicInferenceEngine(AbstractEngine):
             # The user may have other tasks running in the event loop that need to be serviced.
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
             # We have tried that and it blocks the event loop in megatron-rl.
-            global_work, global_consensus = (
-                await self.expert_parallel_zmq_communicator.all_reduce_max(
-                    local_work, consensus_val, async_op=(not self.use_synchronous_zmq_collectives)
-                )
+            consensus = await self.ep_async_step_protocol.establish_work_consensus(
+                local_work,
+                signal_consensus,
+                async_op=(not self.use_synchronous_zmq_collectives),
             )
         else:
-            global_work, global_consensus = local_work, consensus_val
+            consensus = await self.ep_async_step_protocol.establish_work_consensus(
+                local_work,
+                signal_consensus,
+                async_op=(not self.use_synchronous_zmq_collectives),
+            )
 
         nvtx_range_pop("_ep_establish_consensus")
-        return global_work, global_consensus == -1
+        return consensus.global_work, consensus.all_pausing
 
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
