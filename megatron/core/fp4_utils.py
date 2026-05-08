@@ -81,7 +81,8 @@ def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: tor
     ), "Rowwise NVFP4 storage must be uint8"
     # Preserve existing values and then swap storage
     new_rowwise_data.detach().copy_(old_rowwise)
-    setattr(fp4_tensor, "_rowwise_data", new_rowwise_data)
+    fp4_tensor._rowwise_data = new_rowwise_data
+    del old_rowwise
 
 
 def quantize_nvfp4_param_shard(
