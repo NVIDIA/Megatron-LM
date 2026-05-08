@@ -280,7 +280,7 @@ _hybrid_ep_buffer = None
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
-    seq_len: int,
+    num_tokens: int,
     num_local_experts: int,
     num_sms_dispatch_api: Optional[int] = None,
     num_sms_combine_api: Optional[int] = None,
@@ -330,7 +330,7 @@ def init_hybrid_ep_buffer(
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
-        max_num_of_tokens_per_rank=seq_len,
+        max_num_of_tokens_per_rank=num_tokens,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
         **kwargs,
@@ -387,12 +387,25 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_unpermute = None
 
         if _hybrid_ep_buffer is None:
-            seq_len, hidden_dim = x.shape[-2:]
+            num_tokens, hidden_dim = x.shape[-2:]
+
+            # --- Hardware Limit Guardrail ---
+            # DeepEP calculates tx_depth = 3 * num_tokens + 1.
+            # InfiniBand strictly asserts tx_depth < 65536.
+            tx_depth = 3 * num_tokens + 1
+            if tx_depth >= 65536:
+                raise ValueError(
+                    f"HybridEP RDMA Queue Pair depth ({tx_depth}) exceeds the InfiniBand "
+                    f"hardware limit of 65535. This occurs because the total tokens per rank "
+                    f"({num_tokens}) too high. Reduce sequence length or micro-batch size, "
+                    f"or increase Tensor Parallelism (TP) / Context Parallelism (CP) to reduce "
+                    f"the number of tokens processed per rank."
+                )
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
                 hidden_dim,
-                seq_len,
+                num_tokens,
                 num_local_experts,
                 num_sms_dispatch_api,
                 num_sms_combine_api,
