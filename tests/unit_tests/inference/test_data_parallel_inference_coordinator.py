@@ -741,15 +741,21 @@ class _RecordingEPCommunicator:
 
     world_size = 2
 
-    def __init__(self):
+    def __init__(self, *, sync_results=None, async_results=None):
         self.calls = []
+        self.sync_results = list(sync_results or [])
+        self.async_results = list(async_results or [])
 
     async def all_reduce_max(self, *local_vals, async_op=True, phase=None, step_id=None):
         self.calls.append(("async", phase, step_id, async_op, local_vals))
+        if self.async_results:
+            return self.async_results.pop(0)
         return local_vals[0] if len(local_vals) == 1 else local_vals
 
     def sync_all_reduce_max(self, *local_vals, phase=None, step_id=None):
         self.calls.append(("sync", phase, step_id, None, local_vals))
+        if self.sync_results:
+            return self.sync_results.pop(0)
         return local_vals[0] if len(local_vals) == 1 else local_vals
 
 
@@ -867,6 +873,71 @@ class TestEPAsyncStepProtocol:
             None,
             (1, 1, 1, 0, 0, 1, 0, 0),
         )
+        protocol.complete_idle_step()
+
+    @pytest.mark.asyncio
+    async def test_async_handoff_launches_when_no_rank_skips(self):
+        communicator = _RecordingEPCommunicator()
+        protocol = EPAsyncStepProtocol(communicator)
+
+        await protocol.establish_work_consensus(1, False)
+        decision = protocol.decide_async_handoff(
+            has_real_work=True, can_launch_async_handoff=True
+        )
+
+        assert decision.step_id == 0
+        assert decision.has_real_work
+        assert decision.launch_async_forward
+        assert not decision.skip_async_forward
+        assert decision.any_launch_request
+        assert not decision.any_skip_request
+        assert communicator.calls[-1] == (
+            "sync",
+            EPAsyncPhase.ASYNC_HANDOFF.value,
+            0,
+            None,
+            (1, 1, 0),
+        )
+        protocol.complete_idle_step()
+
+    @pytest.mark.asyncio
+    async def test_async_handoff_publishes_explicit_skip(self):
+        communicator = _RecordingEPCommunicator()
+        protocol = EPAsyncStepProtocol(communicator)
+
+        await protocol.establish_work_consensus(1, False)
+        decision = protocol.decide_async_handoff(
+            has_real_work=False, can_launch_async_handoff=False
+        )
+
+        assert decision.step_id == 0
+        assert not decision.launch_async_forward
+        assert decision.skip_async_forward
+        assert not decision.any_launch_request
+        assert decision.any_skip_request
+        assert communicator.calls[-1] == (
+            "sync",
+            EPAsyncPhase.ASYNC_HANDOFF.value,
+            0,
+            None,
+            (0, 0, 1),
+        )
+        protocol.complete_idle_step()
+
+    @pytest.mark.asyncio
+    async def test_async_handoff_global_skip_overrides_local_launch(self):
+        communicator = _RecordingEPCommunicator(sync_results=[(1, 1, 1)])
+        protocol = EPAsyncStepProtocol(communicator)
+
+        await protocol.establish_work_consensus(1, False)
+        decision = protocol.decide_async_handoff(
+            has_real_work=True, can_launch_async_handoff=True
+        )
+
+        assert not decision.launch_async_forward
+        assert decision.skip_async_forward
+        assert decision.any_launch_request
+        assert decision.any_skip_request
         protocol.complete_idle_step()
 
 

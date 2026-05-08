@@ -36,6 +36,18 @@ class EPStepBeginDecision:
     row_mapped_forward: bool
 
 
+@dataclass(frozen=True)
+class EPAsyncHandoffDecision:
+    """EP-wide decision for launching or skipping the async forward handoff."""
+
+    step_id: int
+    has_real_work: bool
+    launch_async_forward: bool
+    skip_async_forward: bool
+    any_launch_request: bool
+    any_skip_request: bool
+
+
 class EPAsyncStepProtocol:
     """Owns tagged EP async collectives and their per-phase step ordering."""
 
@@ -209,4 +221,31 @@ class EPAsyncStepProtocol:
             reuse_pending_forward=reuse_pending_forward,
             discard_pending_forward=discard_pending_forward,
             row_mapped_forward=bool(any_row_mapped and reuse_pending_forward),
+        )
+
+    def decide_async_handoff(
+        self, *, has_real_work: bool, can_launch_async_handoff: bool
+    ) -> EPAsyncHandoffDecision:
+        """Synchronize whether the current EP work step launches an async forward."""
+        step_id = self._step_id_for_phase(EPAsyncPhase.ASYNC_HANDOFF)
+        local_real = int(has_real_work)
+        local_launch = int(can_launch_async_handoff)
+        local_skip = int(not can_launch_async_handoff)
+
+        any_real, any_launch, any_skip = self._sync_all_reduce_max_at_step(
+            EPAsyncPhase.ASYNC_HANDOFF,
+            step_id,
+            local_real,
+            local_launch,
+            local_skip,
+        )
+        launch_async_forward = bool(any_launch and not any_skip)
+
+        return EPAsyncHandoffDecision(
+            step_id=step_id,
+            has_real_work=bool(any_real),
+            launch_async_forward=launch_async_forward,
+            skip_async_forward=not launch_async_forward,
+            any_launch_request=bool(any_launch),
+            any_skip_request=bool(any_skip),
         )

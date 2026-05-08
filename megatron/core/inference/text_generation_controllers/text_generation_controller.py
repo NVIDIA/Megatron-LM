@@ -22,7 +22,7 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
-from megatron.core.inference.ep_async_protocol import EPStepBeginDecision
+from megatron.core.inference.ep_async_protocol import EPAsyncHandoffDecision, EPStepBeginDecision
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -227,6 +227,7 @@ class TextGenerationController:
         self._async_sample_slot_wait_count = 0
         self._request_sampling_rngs: Dict[int, torch.Generator] = {}
         self._ep_async_protocol = None
+        self._ep_async_handoff_decided_this_step = False
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -1596,6 +1597,7 @@ class TextGenerationController:
         self, *, has_real_work: bool, pending_async_sample: bool
     ) -> EPStepBeginDecision:
         """Synchronize pending async state at the beginning of an EP work step."""
+        self._ep_async_handoff_decided_this_step = False
         pending_forward_reusable = True
         pending_forward_row_mapped = False
         if self._async_pending_forward:
@@ -1619,6 +1621,34 @@ class TextGenerationController:
             reuse_pending_forward=bool(self._async_pending_forward and pending_forward_reusable),
             discard_pending_forward=bool(self._async_pending_forward and not pending_forward_reusable),
             row_mapped_forward=bool(self._async_pending_forward and pending_forward_row_mapped),
+        )
+
+    def _decide_ep_async_handoff(
+        self, *, has_real_work: bool, can_launch_async_handoff: bool
+    ) -> EPAsyncHandoffDecision:
+        """Synchronize whether this EP work step launches the async forward handoff."""
+        self._ep_async_handoff_decided_this_step = True
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            return self._ep_async_protocol.decide_async_handoff(
+                has_real_work=has_real_work,
+                can_launch_async_handoff=can_launch_async_handoff,
+            )
+
+        return EPAsyncHandoffDecision(
+            step_id=-1,
+            has_real_work=has_real_work,
+            launch_async_forward=can_launch_async_handoff,
+            skip_async_forward=not can_launch_async_handoff,
+            any_launch_request=can_launch_async_handoff,
+            any_skip_request=not can_launch_async_handoff,
+        )
+
+    def _ensure_ep_async_handoff_decided(self, *, has_real_work: bool) -> None:
+        """Publish an explicit EP async handoff skip when this step did not attempt one."""
+        if self._ep_async_handoff_decided_this_step:
+            return
+        self._decide_ep_async_handoff(
+            has_real_work=has_real_work, can_launch_async_handoff=False
         )
 
     def _dynamic_step_required_token_logits(self, row_indices: Optional[Tensor] = None) -> Tensor:
@@ -1992,7 +2022,15 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason(allow_mtp=True)
         self._record_async_eligibility_result(self._async_disable_reason)
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=True,
+            can_launch_async_handoff=(self._async_disable_reason is None),
+        )
         if self._async_disable_reason is not None:
+            return False
+        if not handoff_decision.launch_async_forward:
+            self._async_disable_reason = "ep async handoff skipped"
+            self._record_async_disable_reason(self._async_disable_reason)
             return False
 
         range_push("async_prepare_next_step")
@@ -2539,6 +2577,8 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
+        self._ensure_ep_async_handoff_decided(has_real_work=False)
+
         # clear the context of any temporary state from the dummy forward
         context.reset()
 
@@ -3039,6 +3079,8 @@ class TextGenerationController:
                 )
                 self._async_deferred_mtp_release_count += 1
                 range_pop()
+
+            self._ensure_ep_async_handoff_decided(has_real_work=True)
 
             range_pop()
 
