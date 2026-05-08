@@ -1651,6 +1651,32 @@ class TextGenerationController:
             has_real_work=has_real_work, can_launch_async_handoff=False
         )
 
+    def _try_launch_dummy_async_handoff(self) -> bool:
+        """Mirror the real-rank async forward handoff on an EP dummy rank."""
+        context = self.inference_wrapped_model.inference_context
+        self._async_disable_reason = self._async_scheduling_disabled_reason(allow_mtp=True)
+        self._record_async_eligibility_result(self._async_disable_reason)
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=False,
+            can_launch_async_handoff=(self._async_disable_reason is None),
+        )
+        if self._async_disable_reason is not None:
+            return False
+        if not handoff_decision.launch_async_forward:
+            self._async_disable_reason = "ep async handoff skipped"
+            self._record_async_disable_reason(self._async_disable_reason)
+            return False
+
+        context.reset()
+        range_push("ep_dummy_async_handoff")
+        try:
+            input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+            self._async_forward_launch_count += 1
+        finally:
+            range_pop()
+        return True
+
     def _dynamic_step_required_token_logits(self, row_indices: Optional[Tensor] = None) -> Tensor:
         """Return the per-active-request logits consumed by sampling."""
         context = self.inference_wrapped_model.inference_context
@@ -2577,7 +2603,9 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
-        self._ensure_ep_async_handoff_decided(has_real_work=False)
+        launched_async_handoff = self._try_launch_dummy_async_handoff()
+        if launched_async_handoff:
+            torch.cuda.current_stream().synchronize()
 
         # clear the context of any temporary state from the dummy forward
         context.reset()

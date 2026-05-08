@@ -31,6 +31,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.ep_async_protocol import EPAsyncHandoffDecision
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -3107,6 +3108,128 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             async_env.engine.controller._async_forward_launch_count > 0
         ), async_env.engine.controller._async_disable_reason
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+
+    @pytest.mark.internal
+    def test_ep_dummy_async_handoff_launches_mirror_forward(self, monkeypatch) -> None:
+        """A dummy EP rank mirrors the async handoff when the protocol launches it."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        controller = env.engine.controller
+        calls = []
+
+        class LaunchingProtocol:
+            enabled = True
+
+            def decide_async_handoff(self, *, has_real_work, can_launch_async_handoff):
+                calls.append(("handoff", has_real_work, can_launch_async_handoff))
+                return EPAsyncHandoffDecision(
+                    step_id=0,
+                    has_real_work=True,
+                    launch_async_forward=True,
+                    skip_async_forward=False,
+                    any_launch_request=True,
+                    any_skip_request=False,
+                )
+
+        token_ids = torch.zeros(
+            (1, 1), device=torch.cuda.current_device(), dtype=torch.long
+        )
+        controller.set_ep_async_protocol(LaunchingProtocol())
+        monkeypatch.setattr(
+            controller, "_async_scheduling_disabled_reason", lambda allow_mtp=False: None
+        )
+        monkeypatch.setattr(
+            controller,
+            "_record_async_eligibility_result",
+            lambda reason: calls.append(("eligible", reason)),
+        )
+        monkeypatch.setattr(env.engine.context, "reset", lambda: calls.append(("reset",)))
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_context_init",
+            lambda is_dummy_forward=False: (
+                calls.append(("init", is_dummy_forward)) or (token_ids, token_ids)
+            ),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_forward_logits",
+            lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
+        )
+
+        assert controller._try_launch_dummy_async_handoff()
+        assert calls == [
+            ("eligible", None),
+            ("handoff", False, True),
+            ("reset",),
+            ("init", True),
+            ("forward", (1, 1)),
+        ]
+        assert controller._async_forward_launch_count == 1
+
+    @pytest.mark.internal
+    def test_ep_dummy_async_handoff_skip_does_not_forward(self, monkeypatch) -> None:
+        """A dummy EP rank consumes a protocol skip without entering a mirror forward."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        controller = env.engine.controller
+        calls = []
+
+        class SkippingProtocol:
+            enabled = True
+
+            def decide_async_handoff(self, *, has_real_work, can_launch_async_handoff):
+                calls.append(("handoff", has_real_work, can_launch_async_handoff))
+                return EPAsyncHandoffDecision(
+                    step_id=0,
+                    has_real_work=True,
+                    launch_async_forward=False,
+                    skip_async_forward=True,
+                    any_launch_request=True,
+                    any_skip_request=True,
+                )
+
+        controller.set_ep_async_protocol(SkippingProtocol())
+        monkeypatch.setattr(
+            controller, "_async_scheduling_disabled_reason", lambda allow_mtp=False: None
+        )
+        monkeypatch.setattr(controller, "_record_async_eligibility_result", lambda reason: None)
+        monkeypatch.setattr(
+            controller,
+            "_record_async_disable_reason",
+            lambda reason: calls.append(("disable", reason)),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_context_init",
+            lambda is_dummy_forward=False: calls.append(("unexpected-init",)),
+        )
+
+        assert not controller._try_launch_dummy_async_handoff()
+        assert calls == [
+            ("handoff", False, True),
+            ("disable", "ep async handoff skipped"),
+        ]
 
     @pytest.mark.internal
     @pytest.mark.skipif(
