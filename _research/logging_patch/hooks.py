@@ -31,6 +31,10 @@ _STATE: dict[str, Any] = {
     "log_act_stats": False,
     "log_loss_spikes": False,
     "log_top1_acc": False,
+    # |x| > log_act_threshold is counted as an FP8 saturation risk for the
+    # frac_outlier stat. Default 240.0 mirrors NVIDIA's E4M3 input dynamic
+    # range proxy (E4M3 max = 448, scale headroom kept at ~240).
+    "log_act_threshold": 240.0,
     "act_accum": {},
     "top1_correct": 0.0,
     "top1_total": 0.0,
@@ -44,6 +48,7 @@ def configure(writer: JsonLogger, cfg: dict[str, Any]) -> None:
     _STATE["log_loss_spikes"] = cfg.get("log_loss_spikes", False)
     _STATE["log_top1_acc"] = cfg.get("log_top1_acc", False)
     _STATE["loss_spike_k"] = cfg.get("loss_spike_k", 3.0)
+    _STATE["log_act_threshold"] = float(cfg.get("log_act_threshold", 240.0))
 
 
 def _count_params(model: Any) -> tuple[int, int]:
@@ -82,10 +87,23 @@ def _count_params(model: Any) -> tuple[int, int]:
 
 
 def _register_act_hooks(model: Any) -> None:
-    """Attach forward hooks that record output norm and max per transformer layer."""
+    """Attach forward hooks that accumulate FP8-stability stats per block.
+
+    Stats per block (transformer self-attention + mlp outputs):
+
+    - ``amax``: running max of |output| (what TE uses for per-tensor FP8 scaling)
+    - ``l2``: mean L2 norm of output across hook calls
+    - ``frac_outlier``: mean fraction of activations with |x| > threshold
+      (default 240.0, NVIDIA's E4M3 input range proxy)
+    - ``rms``: sqrt(mean(x^2)), distribution width
+
+    All reductions stay on GPU; no ``.item()`` happens in the hot path. Drain
+    (``_drain_act_accum``) does a single batched ``.tolist()`` per log step.
+    """
     import torch
 
-    accum: dict[str, dict[str, float]] = _STATE["act_accum"]
+    accum: dict[str, dict[str, Any]] = _STATE["act_accum"]
+    threshold = float(_STATE["log_act_threshold"])
 
     def make_hook(name: str):
         def hook(_mod, _inp, out):
@@ -93,10 +111,27 @@ def _register_act_hooks(model: Any) -> None:
             if not isinstance(t, torch.Tensor):
                 return
             with torch.no_grad():
-                entry = accum.setdefault(name, {"norm": 0.0, "max": 0.0, "n": 0})
-                entry["norm"] += float(t.detach().float().norm().item())
-                entry["max"] = max(entry["max"], float(t.detach().float().abs().max().item()))
-                entry["n"] += 1
+                td = t.detach().float()
+                abs_t = td.abs()
+                cur_amax = abs_t.amax()
+                cur_l2 = td.norm()
+                cur_frac = (abs_t > threshold).to(torch.float32).mean()
+                cur_sqm = (td * td).mean()
+                entry = accum.get(name)
+                if entry is None:
+                    accum[name] = {
+                        "amax": cur_amax,
+                        "l2_sum": cur_l2,
+                        "frac_sum": cur_frac,
+                        "sqsum_sum": cur_sqm,
+                        "n": 1,
+                    }
+                else:
+                    entry["amax"] = torch.maximum(entry["amax"], cur_amax)
+                    entry["l2_sum"].add_(cur_l2)
+                    entry["frac_sum"].add_(cur_frac)
+                    entry["sqsum_sum"].add_(cur_sqm)
+                    entry["n"] += 1
         return hook
 
     chunks = model if isinstance(model, list) else [model]
@@ -107,11 +142,35 @@ def _register_act_hooks(model: Any) -> None:
 
 
 def _drain_act_accum() -> dict[str, dict[str, float]]:
+    """Move all accumulated GPU stats to host in one batched sync.
+
+    Each block contributes 4 stats; we stack everything into one [n_blocks, 4]
+    tensor and call ``.tolist()`` once. This bounds the host-sync cost to one
+    per logging step regardless of block count or microbatches per step.
+    """
+    import torch
+
     accum = _STATE["act_accum"]
+    if not accum:
+        return {}
+    names = list(accum.keys())
+    rows = []
+    counts: list[int] = []
+    for name in names:
+        e = accum[name]
+        rows.append(torch.stack([e["amax"], e["l2_sum"], e["frac_sum"], e["sqsum_sum"]]))
+        counts.append(e["n"])
+    big = torch.stack(rows)  # [n_blocks, 4]
+    vals = big.tolist()
     snapshot: dict[str, dict[str, float]] = {}
-    for name, entry in accum.items():
-        n = max(1, entry["n"])
-        snapshot[name] = {"norm_mean": entry["norm"] / n, "max": entry["max"]}
+    for name, (amax, l2_sum, frac_sum, sqsum_sum), n in zip(names, vals, counts):
+        n_eff = max(1, n)
+        snapshot[name] = {
+            "amax": amax,
+            "l2": l2_sum / n_eff,
+            "frac_outlier": frac_sum / n_eff,
+            "rms": math.sqrt(max(0.0, sqsum_sum / n_eff)),
+        }
     _STATE["act_accum"] = {}
     return snapshot
 

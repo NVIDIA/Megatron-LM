@@ -114,6 +114,7 @@ def install() -> None:
     hooks.configure(writer, {
         "log_per_layer_grads": os.environ.get("APERTUS_LOG_PER_LAYER_GRADS") == "1",
         "log_act_stats": os.environ.get("APERTUS_LOG_ACT_STATS", "1") != "0",
+        "log_act_threshold": float(os.environ.get("APERTUS_LOG_ACT_THRESHOLD", "240")),
         "log_loss_spikes": os.environ.get("APERTUS_LOG_LOSS_SPIKES") == "1",
         "log_top1_acc": os.environ.get("APERTUS_LOG_TOP1_ACC", "1") != "0",
     })
