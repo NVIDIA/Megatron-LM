@@ -49,7 +49,12 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
-from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
+from ..fp8_utils import (
+    dequantize_fp8_tensor,
+    is_float8tensor,
+    is_grouped_tensor_with_quantized_storage,
+    quantize_param_shard,
+)
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
@@ -940,68 +945,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return tensors
 
     @staticmethod
-    def _is_grouped_quantized_tensor(tensor: torch.Tensor) -> bool:
-        """Check if tensor is a TE GroupedTensor using quantized storage."""
-        return (
-            hasattr(tensor, "split_into_quantized_tensors")
-            and callable(tensor.split_into_quantized_tensors)
-            and getattr(tensor, "quantizer", None) is not None
-        )
-
-    @classmethod
-    def _is_distopt_quantized_param(cls, tensor: torch.Tensor) -> bool:
+    def _is_distopt_quantized_param(tensor: torch.Tensor) -> bool:
         """Check if tensor should follow quantized parameter path in dist optimizer."""
-        return is_float8tensor(tensor) or cls._is_grouped_quantized_tensor(tensor)
-
-    def _expand_quantized_param_shard_for_cast(
-        self,
-        model_param: torch.Tensor,
-        shard_main_param: Optional[torch.Tensor],
-        start_offset: Optional[int],
-    ):
-        """Expand one quantized model param to cast-ready entries.
-
-        For grouped quantized tensors, split into member quantized tensors and map the sharded
-        master slice to per-member offset ranges, while preserving deterministic ordering across
-        DP ranks.
-        """
-        if not self._is_grouped_quantized_tensor(model_param):
-            return [model_param], [shard_main_param], [start_offset]
-
-        quantized_members = model_param.quantized_tensors
-        if quantized_members is None:
-            quantized_members = model_param.split_into_quantized_tensors()
-
-        shard_start = 0 if start_offset is None else start_offset
-        shard_size = 0 if shard_main_param is None else shard_main_param.numel()
-        shard_end = shard_start + shard_size
-        shard_flat = None if shard_main_param is None else shard_main_param.view(-1)
-
-        expanded_model_params = []
-        expanded_shard_main_params = []
-        expanded_start_offsets = []
-        member_offset = 0
-        for member in quantized_members:
-            member_numel = member.numel()
-            member_start = member_offset
-            member_end = member_start + member_numel
-            overlap_start = max(member_start, shard_start)
-            overlap_end = min(member_end, shard_end)
-
-            member_master = None
-            member_start_offset = None
-            if overlap_start < overlap_end:
-                local_start = overlap_start - shard_start
-                local_end = overlap_end - shard_start
-                member_master = shard_flat[local_start:local_end]
-                member_start_offset = overlap_start - member_start
-
-            expanded_model_params.append(member)
-            expanded_shard_main_params.append(member_master)
-            expanded_start_offsets.append(member_start_offset)
-            member_offset = member_end
-
-        return expanded_model_params, expanded_shard_main_params, expanded_start_offsets
+        return is_float8tensor(tensor) or is_grouped_tensor_with_quantized_storage(tensor)
 
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
         """Set the main param and optimizer states corresponding to the input model_param.
@@ -2609,25 +2555,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
             self._get_fp8_params_and_shard_fp32_from_fp8()
         )
-        expanded_fp8_params = []
-        expanded_shard_fp32_from_fp8 = []
-        expanded_shard_offsets_in_fp8 = []
-        for model_param, shard_main_param, start_offset in zip(
-            fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
-        ):
-            sub_model_params, sub_shard_main_params, sub_start_offsets = (
-                self._expand_quantized_param_shard_for_cast(
-                    model_param, shard_main_param, start_offset
-                )
+        if any(is_grouped_tensor_with_quantized_storage(model_param) for model_param in fp8_params):
+            raise RuntimeError(
+                "Single grouped quantized weights require high-precision parameter all-gather "
+                "with reuse_grad_buf_for_mxfp8_param_ag. Quantize-before-all-gather does not "
+                "support grouped partial cast."
             )
-            expanded_fp8_params.extend(sub_model_params)
-            expanded_shard_fp32_from_fp8.extend(sub_shard_main_params)
-            expanded_shard_offsets_in_fp8.extend(sub_start_offsets)
 
         quantize_param_shard(
-            expanded_fp8_params,
-            expanded_shard_fp32_from_fp8,
-            expanded_shard_offsets_in_fp8,
+            fp8_params,
+            shard_fp32_from_fp8,
+            shard_offsets_in_fp8,
             self.data_parallel_group,
         )
 
@@ -2828,7 +2766,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         model_param = model_param_to_state_dict_param_map[model_param]
 
                     if self._is_distopt_quantized_param(model_param):
-                        if self._is_grouped_quantized_tensor(model_param):
+                        if is_grouped_tensor_with_quantized_storage(model_param):
                             dequantized_model_param = model_param.float()
                         else:
                             dequantized_model_param = dequantize_fp8_tensor(model_param)

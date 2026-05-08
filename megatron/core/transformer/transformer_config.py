@@ -1458,6 +1458,11 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_single_grouped_weight and moe_single_grouped_bias require "
                     f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
                 )
+            if self.fp4 or not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "moe_single_grouped_weight and moe_single_grouped_bias are currently "
+                    "supported only with fp8 mode and fp8_recipe='mxfp8'."
+                )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
 
