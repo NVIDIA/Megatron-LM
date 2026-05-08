@@ -625,6 +625,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_speculative_tokens=self.num_speculative_tokens,
             )
         )
+        self.smallest_non_decode_cuda_graph_size = min(
+            (
+                graph_dim.token_count
+                for graph_dim in self.cuda_graph_batch_dimensions_list
+                if graph_dim.prefill_req_count > 0
+            ),
+            default=0,
+        )
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
@@ -641,10 +649,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     hidden_size=moe_hidden_size,
                     ep_group=self.expert_model_parallel_group,
                 )
-
-        self.smallest_non_decode_cuda_graph_size = min(
-            inference_config.cuda_graph_mixed_prefill_count, self.max_requests
-        )
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill

@@ -76,6 +76,7 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        use_cuda_graphs_for_non_decode_steps: bool = True,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -102,7 +103,7 @@ class TestDynamicContext:
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
                 num_cuda_graphs=num_cuda_graphs,
-                use_cuda_graphs_for_non_decode_steps=True,
+                use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
                 buffer_size_gb=buffer_size_gb,
                 paused_buffer_size_gb=(
                     0.2 * buffer_size_gb if paused_buffer_size_gb is None else paused_buffer_size_gb
@@ -159,6 +160,43 @@ class TestDynamicContext:
 
         # Check initializations to -1
         assert torch.all(dynamic_context.request_ids == -1)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("use_cuda_graphs_for_non_decode_steps", [False, True])
+    def test_smallest_non_decode_cuda_graph_size_initialized(
+        self, use_cuda_graphs_for_non_decode_steps: bool
+    ):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_cuda_graphs=4,
+            use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
+        )
+
+        non_decode_graph_token_counts = [
+            graph_dim.token_count
+            for graph_dim in dynamic_context.cuda_graph_batch_dimensions_list
+            if graph_dim.prefill_req_count > 0
+        ]
+        assert dynamic_context.smallest_non_decode_cuda_graph_size == min(
+            non_decode_graph_token_counts, default=0
+        )
+
+        decode_graph = next(
+            graph_dim
+            for graph_dim in dynamic_context.cuda_graph_batch_dimensions_list
+            if graph_dim.prefill_req_count == 0
+        )
+        assert dynamic_context._match_cuda_graph_batch_dimensions(
+            decode_graph, strict=False
+        ) is not None
 
     @pytest.mark.internal
     def test_is_static_batching(self):
