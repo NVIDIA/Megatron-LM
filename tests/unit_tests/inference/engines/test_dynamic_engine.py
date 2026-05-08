@@ -7370,9 +7370,12 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("num_speculative_tokens", [0, 2])
     @torch.inference_mode()
-    def test_async_scheduling_hybrid_ep_chunked_prefill_cuda_graph_e2e(self) -> None:
-        """Async scheduling stays eligible for the nano-v3-style hybrid EP decode path."""
+    def test_async_scheduling_hybrid_ep_chunked_prefill_cuda_graph_e2e(
+        self, num_speculative_tokens: int
+    ) -> None:
+        """Async scheduling stays eligible for nano-v3-style hybrid EP decode."""
         skip_if_mamba_sequence_packing_not_available("hybrid")
         ep_size = 4
         world_size = (
@@ -7387,13 +7390,14 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             num_requests=4,
             min_prompt_length=4,
             max_prompt_length=4,
-            num_tokens_to_generate=4,
+            num_tokens_to_generate=6 if num_speculative_tokens > 0 else 4,
             num_gap_steps=0,
             model_provider="hybrid",
             expert_model_parallel_size=ep_size,
             inference_moe_token_dispatcher_type="alltoall",
             moe_pad_experts_for_cuda_graph_inference=True,
             enable_chunked_prefill=True,
+            num_speculative_tokens=num_speculative_tokens,
             num_cuda_graphs=1,
             cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
             force_build_cuda_graphs=True,
@@ -7413,10 +7417,20 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         diagnostics = controller.get_async_scheduling_diagnostics()
 
         assert controller._async_forward_launch_count > 0, controller._async_disable_reason
-        assert (
-            controller._async_decode_graph_launch_count > 0
-        ), controller._async_decode_graph_capture_failed_reason
+        if num_speculative_tokens > 0:
+            assert (
+                controller._async_forward_graph_launch_count > 0
+            ), controller._async_decode_graph_capture_failed_reason
+            assert controller._async_deferred_mtp_release_count > 0
+        else:
+            assert (
+                controller._async_decode_graph_launch_count > 0
+            ), controller._async_decode_graph_capture_failed_reason
         assert diagnostics["eligibility_passes"] > 0
+        if diagnostics["ep_protocol"] is not None:
+            assert diagnostics["ep_protocol"]["enabled"]
+            assert diagnostics["ep_protocol"]["phase_mismatches"] == 0
+            assert diagnostics["ep_protocol"]["handoff_launches"] > 0
         assert "chunked prefill is unsupported" not in diagnostics["disable_reason_counts"]
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 

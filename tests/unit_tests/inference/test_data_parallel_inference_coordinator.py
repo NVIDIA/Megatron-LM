@@ -736,6 +736,58 @@ class TestAsyncZMQCommunicator:
             comm.close()
             ctx.term()
 
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("delayed_role", ["real", "dummy"])
+    async def test_ep_protocol_delayed_rank_pending_sample_handoff_order(
+        self, initialize_model_parallel, delayed_role
+    ):
+        rank = torch.distributed.get_rank()
+        ctx = zmq.Context()
+        comm = AsyncZMQCommunicator(ctx, process_group=None)
+        protocol = EPAsyncStepProtocol(comm)
+        is_real_rank = rank == 0
+        is_delayed_rank = (delayed_role == "real" and rank == 0) or (
+            delayed_role == "dummy" and rank == torch.distributed.get_world_size() - 1
+        )
+
+        try:
+            if is_delayed_rank:
+                await asyncio.sleep(0.05)
+
+            consensus = await asyncio.wait_for(
+                protocol.establish_work_consensus(int(is_real_rank), False),
+                timeout=30.0,
+            )
+            begin_decision = protocol.decide_step_begin(
+                has_real_work=is_real_rank,
+                has_pending_forward=is_real_rank,
+                has_pending_async_sample=is_real_rank,
+                pending_forward_reusable=is_real_rank,
+                pending_forward_row_mapped=is_real_rank,
+            )
+            handoff_decision = protocol.decide_async_handoff(
+                has_real_work=is_real_rank, can_launch_async_handoff=True
+            )
+            await asyncio.wait_for(protocol.complete_work_step(), timeout=30.0)
+
+            diagnostics = protocol.diagnostics()
+            assert consensus.global_work == 1
+            assert not consensus.all_pausing
+            assert begin_decision.step_id == consensus.step_id
+            assert begin_decision.has_real_work
+            assert begin_decision.use_pending_async_sample
+            assert begin_decision.reuse_pending_forward
+            assert handoff_decision.step_id == consensus.step_id
+            assert handoff_decision.launch_async_forward
+            assert diagnostics["work_consensus"] == 1
+            assert diagnostics["work_completions"] == 1
+            assert diagnostics["handoff_launches"] == 1
+            assert diagnostics["phase_mismatches"] == 0
+        finally:
+            comm.close()
+            ctx.term()
+
 
 class _RecordingEPCommunicator:
     """Tiny communicator double that records tagged protocol calls."""
