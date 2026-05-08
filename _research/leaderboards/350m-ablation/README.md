@@ -8,33 +8,19 @@ All entries share architecture, data, schedule, seed (42); only the
 optimizer block differs. W&B project:
 [megatron-lm-research-baseline](https://wandb.ai/ischlag/megatron-lm-research-baseline).
 
-The `baseline` column records the git tag (and short SHA) of the
-megatron-lm-research-baseline state at which each row was executed, so
-results stay reproducible across upstream syncs. Tag list:
+The `commit` column records the git tag (and short SHA) of the
+megatron-lm-research-baseline state at which each row was last executed,
+so results stay reproducible across upstream syncs. Tag list:
 [`baseline-*`](https://github.com/ischlag/megatron-lm-research-baseline/tags).
 
-| rank | optimizer | matrix LR | final loss | min loss | sbatch | wandb | baseline |
+| rank | optimizer | matrix LR | final loss | min loss | sbatch | wandb | commit |
 | ---: | --- | ---: | ---: | ---: | --- | --- | --- |
-| 1 | NorMuon | 3.6e-4 | **2.221** | **2.058** | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [ispegm6g](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/ispegm6g) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 1 | NorMuon | 3.6e-4 | **2.222** | **2.060** | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [fhhli28t](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/fhhli28t) | [`baseline-2026-05-08-49875a8`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-49875a8) |
 | 2 | Muon (shape_scaling) | 2e-2 | 2.226 | 2.068 | [`03-muon-kj-lr2e-2.sbatch`](runs/03-muon-kj-lr2e-2.sbatch) | [f7uvsbai](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/f7uvsbai) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 3 | NorMuon | 2e-4 | 2.227 | 2.063 | [`02-normuon-lr2e-4.sbatch`](runs/02-normuon-lr2e-4.sbatch) | [heevf919](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 4 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 5 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 6 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-
-## Post-sync verification
-
-Re-running the rank-1 recipe (NorMuon @ matrix LR 3.6e-4) on the
-post-upstream-sync baseline (`baseline-2026-05-08-49875a8`, merging 144
-upstream commits) reproduces the original result within the accept
-window (`final loss 2.221 ± 0.02`):
-
-| rank | optimizer | matrix LR | final loss | min loss | sbatch | wandb | baseline |
-| ---: | --- | ---: | ---: | ---: | --- | --- | --- |
-| 1 (rerun) | NorMuon | 3.6e-4 | 2.222 | 2.060 | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [fhhli28t](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/fhhli28t) | [`baseline-2026-05-08-49875a8`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-49875a8) |
-
-Deltas vs the pre-sync rank-1 entry: final loss +0.001, min loss +0.002.
-Both well within numerical noise. Throughput unchanged at ~310 TFLOP/s/GPU.
 
 ## Notes on entries
 
