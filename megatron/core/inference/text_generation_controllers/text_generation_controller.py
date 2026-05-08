@@ -228,6 +228,7 @@ class TextGenerationController:
         self._request_sampling_rngs: Dict[int, torch.Generator] = {}
         self._ep_async_protocol = None
         self._ep_async_handoff_decided_this_step = False
+        self._ep_async_handoff_decision_this_step: Optional[EPAsyncHandoffDecision] = None
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -1603,6 +1604,7 @@ class TextGenerationController:
     ) -> EPStepBeginDecision:
         """Synchronize pending async state at the beginning of an EP work step."""
         self._ep_async_handoff_decided_this_step = False
+        self._ep_async_handoff_decision_this_step = None
         pending_forward_reusable = True
         pending_forward_row_mapped = False
         if self._async_pending_forward:
@@ -1632,14 +1634,19 @@ class TextGenerationController:
         self, *, has_real_work: bool, can_launch_async_handoff: bool
     ) -> EPAsyncHandoffDecision:
         """Synchronize whether this EP work step launches the async forward handoff."""
+        if self._ep_async_handoff_decision_this_step is not None:
+            return self._ep_async_handoff_decision_this_step
+
         self._ep_async_handoff_decided_this_step = True
         if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
-            return self._ep_async_protocol.decide_async_handoff(
+            decision = self._ep_async_protocol.decide_async_handoff(
                 has_real_work=has_real_work,
                 can_launch_async_handoff=can_launch_async_handoff,
             )
+            self._ep_async_handoff_decision_this_step = decision
+            return decision
 
-        return EPAsyncHandoffDecision(
+        decision = EPAsyncHandoffDecision(
             step_id=-1,
             has_real_work=has_real_work,
             launch_async_forward=can_launch_async_handoff,
@@ -1647,6 +1654,8 @@ class TextGenerationController:
             any_launch_request=can_launch_async_handoff,
             any_skip_request=not can_launch_async_handoff,
         )
+        self._ep_async_handoff_decision_this_step = decision
+        return decision
 
     def _ensure_ep_async_handoff_decided(self, *, has_real_work: bool) -> None:
         """Publish an explicit EP async handoff skip when this step did not attempt one."""
@@ -2965,6 +2974,10 @@ class TextGenerationController:
                         pending_forward_row_indices,
                         pending_forward_row_mapped,
                     ) = self._resolve_pending_async_forward_rows()
+                    pending_forward_row_mapped = (
+                        pending_forward_row_mapped
+                        or ep_step_begin_decision.row_mapped_forward
+                    )
                     context.release_deferred_async_kv_blocks()
                     if pending_forward_reused and self.num_speculative_tokens > 0:
                         input_ids, _ = context.current_input_and_position_ids()
@@ -3002,7 +3015,7 @@ class TextGenerationController:
                     )
                     range_pop()
 
-                if not pending_forward_row_mapped:
+                if not pending_forward_row_mapped and self.num_speculative_tokens == 0:
                     (
                         async_next_prepared,
                         async_sampled_tokens_cpu,

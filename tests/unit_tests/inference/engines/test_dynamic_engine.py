@@ -3383,6 +3383,138 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ]
 
     @pytest.mark.internal
+    def test_ep_async_handoff_decision_is_idempotent_within_step(self) -> None:
+        """A rank must publish at most one EP async handoff collective per step."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        controller = env.engine.controller
+        calls = []
+
+        class CountingProtocol:
+            enabled = True
+
+            def decide_async_handoff(self, *, has_real_work, can_launch_async_handoff):
+                calls.append((has_real_work, can_launch_async_handoff))
+                return EPAsyncHandoffDecision(
+                    step_id=5,
+                    has_real_work=True,
+                    launch_async_forward=True,
+                    skip_async_forward=False,
+                    any_launch_request=True,
+                    any_skip_request=False,
+                )
+
+        controller.set_ep_async_protocol(CountingProtocol())
+
+        first = controller._decide_ep_async_handoff(
+            has_real_work=True, can_launch_async_handoff=True
+        )
+        second = controller._decide_ep_async_handoff(
+            has_real_work=True, can_launch_async_handoff=False
+        )
+
+        assert first is second
+        assert calls == [(True, True)]
+
+    @pytest.mark.internal
+    def test_ep_global_row_map_defers_handoff_until_after_sampling(self, monkeypatch) -> None:
+        """If any EP rank row-maps a pending forward, all ranks use the same handoff site."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        calls = []
+
+        with torch.inference_mode():
+            context.paused_request_count = 0
+            context.total_request_count = 1
+            context.active_token_count = 1
+            context.request_ids[:1] = torch.tensor([7], device="cpu")
+            controller._async_pending_forward = True
+            controller._async_pending_cuda_graph_request_count = None
+            controller._async_pending_forward_request_ids = torch.tensor([7], device="cpu")
+
+        monkeypatch.setattr(
+            controller,
+            "_decide_ep_step_begin",
+            lambda *, has_real_work, pending_async_sample: EPStepBeginDecision(
+                step_id=6,
+                has_real_work=True,
+                use_pending_async_sample=False,
+                reuse_pending_forward=True,
+                discard_pending_forward=False,
+                row_mapped_forward=True,
+            ),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_resolve_pending_async_forward_rows",
+            lambda: calls.append(("resolve",)) or (True, None, False),
+        )
+        monkeypatch.setattr(
+            context,
+            "release_deferred_async_kv_blocks",
+            lambda: calls.append(("release",)),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_try_launch_async_decode_graph",
+            lambda active_request_count, require_captured_graph=False: calls.append(
+                ("unexpected-pre-sampling-handoff",)
+            ),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_should_collect_dynamic_sampling_bookkeeping",
+            lambda **kwargs: False,
+        )
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_sample_logits_to_next_input_ids",
+            lambda row_indices=None: calls.append(("sample", row_indices)),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_try_prepare_async_decode_after_sampling",
+            lambda: calls.append(("post-sampling-handoff",)) or False,
+        )
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_context_bookkeeping",
+            lambda **kwargs: calls.append(("bookkeeping",)) or {"sample": torch.zeros(1)},
+        )
+
+        asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+        assert ("unexpected-pre-sampling-handoff",) not in calls
+        assert calls[:4] == [
+            ("resolve",),
+            ("release",),
+            ("sample", None),
+            ("post-sampling-handoff",),
+        ]
+
+    @pytest.mark.internal
     def test_ep_dummy_work_step_does_not_block_before_completion(self, monkeypatch) -> None:
         """The engine must publish EP STEP_COMPLETE without waiting on dummy GPU work."""
         env = self._build_test_env(
