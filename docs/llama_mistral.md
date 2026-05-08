@@ -210,14 +210,6 @@ python Megatron-Bridge/examples/conversion/convert_checkpoints.py import \
 
 After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
 
-## (Optional) Validate checkpoints
-
-A Megatron-LM text generation server for Llama3 can be launched using the script `examples/inference/llama_mistral/run_text_generation_llama3.sh <PATH_TO_CONVERTED_CORE_CHECKPOINT> <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT>`. For Llama3.1, please use `examples/inference/llama_mistral/run_text_generation_llama3.1.sh`.
-
-Once running, query the server with `curl 'http://<TEXT_GENERATION_SERVER_IP>:5000/api' -X 'PUT' -H 'Content-Type: application/json; charset=UTF-8'  -d '{"prompts":["<SOME_PROMPT>"], "tokens_to_generate":100, "top_k":1}'`.
-
-A reference generation for comparison can be obtained from the Huggingface transformers library by running `python examples/llama_mistral/huggingface_reference.py --model_path <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT> --prompt <SOME_PROMPT>`.
-
 ## Launch model
 
 If loading for either inference or finetuning, use the following arguments for Llama 3.0:
@@ -313,14 +305,6 @@ python Megatron-Bridge/examples/conversion/convert_checkpoints.py import \
 ```
 
 After this conversion, we are ready to load the checkpoints into a Megatron GPT model.
-
-## (Optional) Validate checkpoints
-
-A Megatron-LM text generation server for Mistral-7B can be launched using the script `examples/inference/llama_mistral/run_text_generation_mistral.sh <PATH_TO_CONVERTED_MCORE_CHECKPOINT> <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT>`.
-
-Once running, query the server with `curl 'http://<TEXT_GENERATION_SERVER_IP>:5000/api' -X 'PUT' -H 'Content-Type: application/json; charset=UTF-8'  -d '{"prompts":["<SOME_PROMPT>"], "tokens_to_generate":100, "top_k":1}'`.
-
-A reference generation for comparison can be obtained from the Huggingface transformers library by running `python examples/inference/llama_mistral/huggingface_reference.py --model_path <PATH_TO_DOWNLOADED_HUGGINGFACE_CHECKPOINT> --prompt <SOME_PROMPT>`.
 
 ## Launch model
 
