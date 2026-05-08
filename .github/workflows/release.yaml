@@ -78,15 +78,11 @@ jobs:
   bump:
     needs: [pre-flight]
     if: |
-      !cancelled()
-      && (needs.pre-flight.result == 'success' || needs.pre-flight.result == 'skipped')
+      !cancelled() && !failure()
       && github.repository == 'NVIDIA/Megatron-LM'
-      && (
-        github.event_name == 'workflow_dispatch'
-        || !(needs.pre-flight.outputs.docs_only == 'true'
-             || needs.pre-flight.outputs.is_merge_group == 'true'
-             || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-      )
+      && !(needs.pre-flight.outputs.docs_only == 'true'
+           || needs.pre-flight.outputs.is_merge_group == 'true'
+           || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@v1.0.0
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
@@ -106,9 +102,7 @@ jobs:
   build-test-publish-wheels:
     needs: [pre-flight, bump]
     if: |
-      !cancelled()
-      && (needs.pre-flight.result == 'success' || needs.pre-flight.result == 'skipped')
-      && needs.bump.result == 'success'
+      !cancelled() && !failure() && needs.bump.result == 'success'
       && github.repository == 'NVIDIA/Megatron-LM'
       && (
         github.event_name == 'workflow_dispatch'
