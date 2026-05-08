@@ -2611,11 +2611,21 @@ class TextGenerationController:
         on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
-        self._decide_ep_step_begin(has_real_work=False, pending_async_sample=False)
+        step_begin_decision = self._decide_ep_step_begin(
+            has_real_work=False, pending_async_sample=False
+        )
 
-        # attempt to use cuda-graph if possible
-        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
-        self._dynamic_step_forward_logits(input_ids, position_ids)
+        # Mirror only the GPU phases real ranks execute in this EP step. If
+        # real ranks are consuming a pending async result, the base forward
+        # already ran in the previous step and dummy ranks must not issue an
+        # extra dummy base forward here.
+        if not (
+            step_begin_decision.use_pending_async_sample
+            or step_begin_decision.reuse_pending_forward
+        ):
+            # attempt to use cuda-graph if possible
+            input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+            self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
