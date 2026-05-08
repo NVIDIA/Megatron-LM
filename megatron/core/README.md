@@ -30,7 +30,7 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 ### Parallelism Strategies
 - **Tensor Parallelism (TP)**: Layer-wise parallelization (activation memory footprint can be further reduced using sequence parallelism)
 - **Pipeline Parallelism (PP)**: Depth-wise model splitting and pipelining of microbatches to improve efficiency
-- **Context Parallelism (CP)**: Long sequence handling ([documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/context_parallel.html))
+- **Context Parallelism (CP)**: Long sequence handling ([documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/context_parallel.html))
 - **Expert Parallelism (EP)**: Split experts of an MoE model across multiple GPUs
 
 

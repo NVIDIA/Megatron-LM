@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 
 from functools import partial
 from typing import Optional
@@ -23,7 +23,7 @@ def get_moe_module_spec(
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE.
 
-    Called by mamba_layer_specs.py for standard (non-inference) MoE specs.
+    Called by hybrid_layer_specs.py for standard (non-inference) MoE specs.
     The GPT layer specs call get_moe_module_spec_for_backend directly.
 
     Args:
@@ -78,7 +78,7 @@ def get_inference_optimized_moe_spec() -> ModuleSpec:
     InferenceTopKRouter, InferenceGroupedMLP. MoELayer detects inference mode
     via config.transformer_impl and sets up the inference dispatcher internally.
 
-    Called by mamba_layer_specs.py and gpt_layer_specs.py.
+    Called by hybrid_layer_specs.py and gpt_layer_specs.py.
     """
     backend = InferenceSpecProvider()
     activation_func = backend.activation_func()

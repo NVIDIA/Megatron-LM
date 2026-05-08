@@ -1,15 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import importlib
 import os
 import socket
-from datetime import timedelta
-
-try:
-    import nvidia_resiliency_ext.inprocess as inprocess
-except ImportError:
-    inprocess = None
-
 import warnings
+from datetime import timedelta
 
 import torch
 
@@ -22,12 +17,20 @@ from megatron.training.async_utils import (
 from . import arguments
 
 
+def _get_inprocess_module():
+    try:
+        return importlib.import_module("nvidia_resiliency_ext.inprocess")
+    except ImportError:
+        return None
+
+
 def destroy_state():
     from . import training
     training.destroy_global_state()
     rerun_state_machine.destroy_rerun_state_machine()
 
 def inprocess_restart(train, args):
+    inprocess = _get_inprocess_module()
     if inprocess is None:
         warnings.warn('In-process restart is not available')
         return train
@@ -80,16 +83,18 @@ def inprocess_restart(train, args):
     )
 
     class AbortCheckpoint(inprocess.abort.Abort):
+        def __init__(self, async_strategy):
+            self.async_strategy = async_strategy
         def __call__(
             self, state: inprocess.state.FrozenState
         ) -> inprocess.state.FrozenState:
-            reset_persistent_async_worker()
+            reset_persistent_async_worker(self.async_strategy)
             return state
 
     abort = inprocess.Compose(
         inprocess.abort.AbortTransformerEngine(),
         inprocess.abort.AbortTorchDistributed(),
-        AbortCheckpoint(),
+        AbortCheckpoint(args.async_strategy),
         inprocess.nested_restarter.NestedRestarterHandlingStarting(),
     )
     completion = inprocess.nested_restarter.NestedRestarterFinalized()

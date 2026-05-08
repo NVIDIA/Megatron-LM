@@ -9,6 +9,8 @@
 
 # Fine-Grained Activation Offloading
 
+Contributed in collaboration with RedNote.
+
 Fine-grained activation offloading reduces GPU memory by asynchronously transferring activations to CPU at the granularity of individual submodules within a transformer layer. Unlike layer-level offloading, it allows precise control over which activations to offload, enabling a tradeoff between memory savings and PCIe bandwidth overhead.
 
 ## User Guide
