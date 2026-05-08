@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope, LayerType
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
@@ -882,30 +883,14 @@ class TransformerConfig(ModelParallelConfig):
     In pure NVL scenarios, 16 SMs can generally achieve good bandwidth."""
 
     moe_hybridep_num_blocks_permute: Optional[int] = None
-    """Number of cuda threads blocks to use for permute part in HybridEP. 
-    If permute_fusion_into_hybridep is True, this is the number of sms 
-    to use for the permute part."""
+    """Number of CUDA thread blocks for the permute part in HybridEP.
+    When permute_fusion_into_hybridep is True, this sets the number
+    of SMs for the permute part (only 1 block per SM)."""
 
     moe_hybridep_num_blocks_unpermute: Optional[int] = None
-    """Number of cuda threads blocks to use for unpermute part in HybridEP. 
-    If permute_fusion_into_hybridep is True, this is the number of sms to 
-    use for the unpermute part."""
-
-    moe_hybridep_num_sms_preprocessing: int = 108
-    """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
-
-    moe_mlp_glu_interleave_size: Optional[int] = None
-    """When set, GLU activations in the MoE grouped MLP layer will use a
-    block interleaved format. Instead of interpreting the input tensor
-    as a concatenation of gates and linear units, it will be
-    interpreted as alternating blocks of gates and linear units.
-    This data format is experimental and primarily intended to enable
-    advanced fused kernels."""
-
-    moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
-    exceeding this budget will be dropped. None means no token will be dropped. 
-    The default is None."""
+    """Number of CUDA thread blocks for the unpermute part in HybridEP.
+    When permute_fusion_into_hybridep is True, this sets the number
+    of SMs for the unpermute part (only 1 block per SM)."""
 
     ##################
     # Context Parallel
@@ -1061,16 +1046,14 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
+    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
-    - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
-      and torch.nn.functional.grouped_mm for non-CUDA-graphed iterations (falls back to TE
-      if unavailable). Note: the heuristic for choosing backends in 'auto' mode may change
-      in future releases.
-    - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
-      mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
-    - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
+    - 'flashinfer': Uses FlashInfer cutlass_fused_moe. Not compatible with MXFP8.
+    - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
+      Supports both BF16 and MXFP8.
+    - 'vllm': Uses vLLM's Triton fused MoE kernel (BF16). Avoids physical token
+      permutation via indirect addressing.
     """
 
     inference_moe_disable_fused_quant_kernels: bool = False
@@ -1078,6 +1061,14 @@ class TransformerConfig(ModelParallelConfig):
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
+
+    inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
+    """Token dispatcher to use for MoE expert parallelism during inference.
+    - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
+      decode-only CUDA graphs (forced automatically).
+    - 'nvls': Variable-count AllGather-V/ReduceScatter-V via NVLS multimem kernels.
+      Requires Hopper+ GPUs with NVLink and symmetric memory. Default.
+    Only applies when transformer_impl='inference_optimized' and EP > 1."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -1107,6 +1098,9 @@ class TransformerConfig(ModelParallelConfig):
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
     during prefill."""
+    mlp_chunks_for_training: int = 1
+    """The number of chunks along the sequence dimension to use for MLP computation
+    during training."""
 
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
@@ -1391,13 +1385,10 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
-            if self.gated_linear_unit and self.cuda_graph_impl == "local":
+            if self.gated_linear_unit:
                 raise ValueError(
-                    "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
-                    "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
-                    "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
-                    "graphs (--cuda-graph-impl=none) or use a non-gated activation "
-                    "(e.g. squared_relu)."
+                    "--transformer-impl='inference_optimized' does not yet support "
+                    "gated linear units (SwiGLU/GeGLU)."
                 )
 
             if self.fp8 == "mxfp8":
@@ -1408,18 +1399,33 @@ class TransformerConfig(ModelParallelConfig):
                         "Please set --fp8-param-gather."
                     )
 
-            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
-                f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
-                f"got '{self.inference_grouped_gemm_backend}'"
-            )
+            try:
+                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
+                    self.inference_grouped_gemm_backend
+                )
+            except ValueError:
+                raise ValueError(
+                    f"inference_grouped_gemm_backend must be 'flashinfer', 'torch', or 'vllm', "
+                    f"got '{self.inference_grouped_gemm_backend}'"
+                )
 
-            if self.cuda_graph_impl == "local":
-                if self.inference_grouped_gemm_backend == "te":
-                    raise ValueError(
-                        "TE GroupedGEMM is not supported with CUDA graphs. Please set "
-                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
-                        "CUDA graphs (--cuda-graph-impl=none)."
-                    )
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and self.fp8 == "mxfp8"
+            ):
+                raise ValueError(
+                    "FlashInfer is not compatible with MXFP8 quantization. "
+                    "Set inference_grouped_gemm_backend to 'torch'."
+                )
+
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
+                and self.fp8 == "mxfp8"
+            ):
+                raise ValueError(
+                    "vLLM Triton fused MoE only supports BF16. "
+                    "Set inference_grouped_gemm_backend to 'torch' for MXFP8."
+                )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
