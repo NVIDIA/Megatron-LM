@@ -27,8 +27,11 @@ set -euo pipefail
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
-REPO_DIR=/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline
-WORKDIR=${SLURM_SUBMIT_DIR:-$REPO_DIR}
+# REPO_DIR follows WORKDIR so a cluster-side sidecar clone (one per local
+# worktree) is fully self-contained — caches, packages, TB, wandb all land
+# next to the sbatch. See AGENTS.md "Cluster-side worktrees".
+WORKDIR=${SLURM_SUBMIT_DIR:-/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline}
+REPO_DIR=$WORKDIR
 cd $WORKDIR
 
 PACKAGE_DIR=$REPO_DIR/_research/packages
