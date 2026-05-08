@@ -277,7 +277,7 @@ class TestHybridBlock:
         assert mtp_post_process is None
         assert is_moe
         assert num_local_experts == 8
-        assert "attn" in bwd_dw_callable_map
+        assert "pre_dispatch_computation" in bwd_dw_callable_map
         assert "mlp" in bwd_dw_callable_map
 
     def test_invalid_layer_types_cause_failure(self):
