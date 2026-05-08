@@ -28,9 +28,7 @@ def fake_model_and_tokenizer():
 
 class TestAsyncLLMServeGuard:
     @pytest.mark.asyncio
-    async def test_serve_requires_use_coordinator(
-        self, mock_pipeline, fake_model_and_tokenizer
-    ):
+    async def test_serve_requires_use_coordinator(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
         llm = MegatronAsyncLLM(model=model, tokenizer=tok)  # direct mode
         with pytest.raises(ValueError, match="requires use_coordinator=True"):

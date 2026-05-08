@@ -47,9 +47,7 @@ def _make_worker_instance(cls):
 class TestDirectModeLifecycleGuards:
     """Direct mode: pause/unpause/suspend/resume must raise; shutdown is a no-op."""
 
-    def test_sync_lifecycle_raises_in_direct_mode(
-        self, mock_pipeline, fake_model_and_tokenizer
-    ):
+    def test_sync_lifecycle_raises_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
         llm = MegatronLLM(model=model, tokenizer=tok)
         for method in ("pause", "unpause", "suspend", "resume"):
@@ -89,9 +87,7 @@ class TestCoordinatorWorkerRankGuards:
 
 
 class TestShutdownIdempotence:
-    def test_sync_shutdown_idempotent_in_direct_mode(
-        self, mock_pipeline, fake_model_and_tokenizer
-    ):
+    def test_sync_shutdown_idempotent_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
         llm = MegatronLLM(model=model, tokenizer=tok)
         llm.shutdown()

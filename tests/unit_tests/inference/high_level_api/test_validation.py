@@ -33,28 +33,16 @@ class TestConstructorValidation:
     ):
         model, tok = fake_model_and_tokenizer
         with pytest.raises(ValueError, match="coordinator_host/port require use_coordinator=True"):
-            cls(
-                model=model,
-                tokenizer=tok,
-                use_coordinator=False,
-                coordinator_host="x",
-            )
+            cls(model=model, tokenizer=tok, use_coordinator=False, coordinator_host="x")
 
     def test_coordinator_port_without_use_coordinator_raises(
         self, cls, mock_pipeline, fake_model_and_tokenizer
     ):
         model, tok = fake_model_and_tokenizer
         with pytest.raises(ValueError, match="coordinator_host/port require use_coordinator=True"):
-            cls(
-                model=model,
-                tokenizer=tok,
-                use_coordinator=False,
-                coordinator_port=5000,
-            )
+            cls(model=model, tokenizer=tok, use_coordinator=False, coordinator_port=5000)
 
-    def test_direct_mode_constructor_succeeds(
-        self, cls, mock_pipeline, fake_model_and_tokenizer
-    ):
+    def test_direct_mode_constructor_succeeds(self, cls, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
         llm = cls(model=model, tokenizer=tok)
         assert llm.is_primary_rank is True

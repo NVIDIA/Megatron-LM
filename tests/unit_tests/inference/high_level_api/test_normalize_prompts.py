@@ -31,10 +31,10 @@ class TestNormalizePrompts:
     @pytest.mark.parametrize(
         "bad_input",
         [
-            {1, 2},          # set
-            1.5,             # float
-            [1.5],           # list of floats (first elem is float)
-            {"k": "v"},      # dict
+            {1, 2},  # set
+            1.5,  # float
+            [1.5],  # list of floats (first elem is float)
+            {"k": "v"},  # dict
         ],
     )
     def test_unsupported_inputs_raise_typeerror(self, bad_input):

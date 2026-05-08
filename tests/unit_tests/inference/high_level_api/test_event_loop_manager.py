@@ -29,6 +29,7 @@ class TestEventLoopManager:
         mgr = _EventLoopManager()
         mgr.start()
         try:
+
             async def coro():
                 return 42
 
