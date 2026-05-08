@@ -35,7 +35,11 @@ from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
@@ -949,6 +953,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     len(extract_layer_indices) == 0
                 ), "Feature extraction is not supported with mHC + MTP."
                 mhc_multistream = hidden_states
+            # DSv4 introduced the new output contraction for mHC.
             # [s, b, n*C] -> [s, b, C]
             hidden_states = learned_output_contract(
                 hidden_states,
@@ -1072,5 +1077,24 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         tp_group=self.tp_group,
                     )
                 )
+
+        # Save bare parameters/buffers that are direct attributes of this block
+        # (e.g. hyper-connection learned weights: hc_head_fn, hc_head_base,
+        # hc_head_scale). The named_children loop above would silently drop
+        # these since they are not nn.Module children. Mirrors the handling in
+        # MegatronModule.sharded_state_dict.
+        local_state_dict: dict = {}
+        self._save_to_state_dict(local_state_dict, '', keep_vars=True)
+        if local_state_dict:
+            metadata = ensure_metadata_has_dp_cp_group(metadata)
+            sharded_state_dict.update(
+                make_sharded_tensors_for_checkpoint(
+                    local_state_dict,
+                    prefix,
+                    sharded_offsets=sharded_offsets,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            )
 
         return sharded_state_dict
