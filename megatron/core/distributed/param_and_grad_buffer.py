@@ -431,6 +431,11 @@ class _ParamAndGradBucketGroup:
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
                     bucket.layerwise_gather_list = None
+                    # Zero out grad_data since it was reused as the all-gather
+                    # receive buffer. Without this, accumulation into main_grad
+                    # (a view into grad_data) would start from the result of the
+                    # latest parameter all-gather instead of zero.
+                    bucket.grad_data.zero_()
                 self.param_gather_handle = None
         else:
             # Standard distributed optimizer path: use _coalescing_manager.
@@ -519,6 +524,11 @@ class _ParamAndGradBucketGroup:
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
                     bucket.layerwise_gather_list = None
+                    # Zero out grad_data since it was reused as the all-gather
+                    # receive buffer. Without this, accumulation into main_grad
+                    # (a view into grad_data) would start from the result of the
+                    # latest parameter all-gather instead of zero.
+                    bucket.grad_data.zero_()
             self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
