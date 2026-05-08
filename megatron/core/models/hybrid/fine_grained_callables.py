@@ -269,8 +269,18 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
     pre_bwd_dw = []
     for item_type, item_layer in pre_layers:
         if item_type in (LayerSymbols.ATTENTION, LayerSymbols.DS_ATTENTION, LayerSymbols.GDN):
+            # TransformerLayer-backed pre-layers go through the standard
+            # _BackwardDWWrapper which coordinates attn / shared-expert wgrad
+            # with cuda-graph replay scopes.
             item_layer.init_backward_dw_wrapper()
             pre_bwd_dw.append(item_layer.backward_dw_wrapper)
+        elif item_type == LayerSymbols.MAMBA:
+            # MambaLayer is not a TransformerLayer, so init_backward_dw_wrapper
+            # would assert. MambaLayer.backward_dw delegates to its mixer, which
+            # in turn calls backward_dw on the in_proj / out_proj linears. The
+            # schedule node iterates this list and calls .backward_dw() on each;
+            # registering the layer directly is sufficient.
+            pre_bwd_dw.append(item_layer)
     if is_moe:
         # MoELayer.backward_dw default kwargs (routed_experts=True, shared_experts=False) handle
         # the routed-experts wgrad. The shared-experts wgrad is registered as a sibling callable
