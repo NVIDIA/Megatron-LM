@@ -309,6 +309,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Coordinator state.
         self.use_coordinator = False
+        self._coordinator_reply_tasks = set()
+        self._coordinator_reply_executor = None
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -1037,19 +1039,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 prompt_token_ids = self.controller.tokenize_prompt(
                     self.controller.tokenizer, prompt
                 )
-            tokens = torch.tensor(
-                prompt_token_ids, dtype=torch.int64, device=torch.cuda.current_device()
-            )
+            tokens = torch.tensor(prompt_token_ids, dtype=torch.int64)
         elif isinstance(prompt, list):
             # Convert List[int] -> Tensor.
-            tokens = torch.tensor(prompt, dtype=torch.int64, device=torch.cuda.current_device())
+            tokens = torch.tensor(prompt, dtype=torch.int64)
         elif isinstance(prompt, torch.Tensor):
             # Prompt already tokenized.
             assert prompt.dtype == torch.int64, prompt.dtype
-            assert prompt.device == torch.device(
-                f"cuda:{torch.cuda.current_device()}"
-            ), prompt.device
-            tokens = prompt
+            tokens = prompt.detach().cpu()
 
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
@@ -1813,7 +1810,12 @@ class DynamicInferenceEngine(AbstractEngine):
     def _send_finished_records_to_coordinator(
         self, finished_request_records: list[DynamicInferenceRequestRecord]
     ) -> None:
-        """Send completed request records to the data-parallel coordinator."""
+        """Queue completed request records for the data-parallel coordinator.
+
+        Response serialization can be large for long prompts. Keep it out of the EP
+        scheduling loop so the next work-consensus phase is not delayed by msgpack
+        packing or by any accidental tensor materialization.
+        """
         if not self.use_coordinator or not self.is_mp_coordinator:
             return
 
@@ -1825,13 +1827,81 @@ class DynamicInferenceEngine(AbstractEngine):
         if not records_to_send:
             return
 
-        nvtx_range_push("coordinator_communication")
-        payload = msgpack.packb(
-            [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
-            use_bin_type=True,
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            payload = self._pack_finished_records_for_coordinator(records_to_send)
+            self._send_coordinator_reply_payload(payload)
+            return
+
+        tasks = getattr(self, "_coordinator_reply_tasks", None)
+        if tasks is None:
+            self._coordinator_reply_tasks = set()
+            tasks = self._coordinator_reply_tasks
+
+        task = loop.create_task(self._send_finished_records_to_coordinator_async(records_to_send))
+        tasks.add(task)
+        task.add_done_callback(self._coordinator_reply_done)
+
+    @staticmethod
+    def _pack_finished_records_for_coordinator(
+        records_to_send: list[DynamicInferenceRequestRecord],
+    ) -> bytes:
+        """Serialize finished request records for a coordinator reply."""
+        nvtx_range_push("coordinator_reply_pack")
+        try:
+            return msgpack.packb(
+                [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
+                use_bin_type=True,
+            )
+        finally:
+            nvtx_range_pop("coordinator_reply_pack")
+
+    def _get_coordinator_reply_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the single-worker executor used for coordinator reply packing."""
+        executor = getattr(self, "_coordinator_reply_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="coordinator-reply"
+            )
+            self._coordinator_reply_executor = executor
+        return executor
+
+    def _send_coordinator_reply_payload(self, payload: bytes) -> None:
+        """Send an already-packed coordinator reply payload."""
+        nvtx_range_push("coordinator_reply_send")
+        try:
+            self.socket_for_receiving_requests.send(payload)
+        finally:
+            nvtx_range_pop("coordinator_reply_send")
+
+    async def _send_finished_records_to_coordinator_async(
+        self, records_to_send: list[DynamicInferenceRequestRecord]
+    ) -> None:
+        """Pack a coordinator reply off the engine loop, then send it on the loop."""
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(
+            self._get_coordinator_reply_executor(),
+            self._pack_finished_records_for_coordinator,
+            records_to_send,
         )
-        self.socket_for_receiving_requests.send(payload)
-        nvtx_range_pop("coordinator_communication")
+        self._send_coordinator_reply_payload(payload)
+
+    def _coordinator_reply_done(self, task: asyncio.Task) -> None:
+        """Drop completed reply tasks and surface unexpected failures."""
+        self._coordinator_reply_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logging.exception("Failed to send coordinator reply")
+
+    async def _drain_coordinator_reply_tasks(self) -> None:
+        """Wait for all queued coordinator replies to be sent."""
+        tasks = getattr(self, "_coordinator_reply_tasks", None)
+        if tasks:
+            await asyncio.gather(*list(tasks), return_exceptions=True)
 
     async def async_bookkeep(
         self,
@@ -2303,6 +2373,12 @@ class DynamicInferenceEngine(AbstractEngine):
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
+
+        await self._drain_coordinator_reply_tasks()
+        executor = getattr(self, "_coordinator_reply_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+            self._coordinator_reply_executor = None
 
         # Cleanup the request futures.
         for entry in self.requests.values():

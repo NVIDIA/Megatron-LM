@@ -119,6 +119,8 @@ class DummyEngine(DynamicInferenceEngine):
         self.use_coordinator = False
 
         self.ep_world_size = 1
+        self._coordinator_reply_tasks = set()
+        self._coordinator_reply_executor = None
 
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
@@ -794,6 +796,17 @@ class TestAsyncZMQCommunicator:
 class TestCoordinatorEPWorkStep:
     """Focused tests for coordinator-driven EP work-step ordering."""
 
+    def test_dynamic_prompt_tokens_are_cpu_resident(self, initialize_model_parallel):
+        """Dynamic requests keep response-owned prompt metadata on CPU."""
+        request = DynamicInferenceRequest(
+            request_id=123,
+            prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64, device="cuda"),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+
+        assert request.prompt_tokens.device.type == "cpu"
+        assert request.remaining_prompt_tokens.device.type == "cpu"
+
     @pytest.mark.asyncio
     async def test_coordinator_replies_are_sent_after_ep_completion(
         self, initialize_model_parallel
@@ -833,6 +846,76 @@ class TestCoordinatorEPWorkStep:
                 ("send", [record]),
             ]
         finally:
+            engine.world_zmq_communicator.close()
+            engine.zmq_context.term()
+
+    @pytest.mark.asyncio
+    async def test_coordinator_reply_packing_does_not_block_ep_loop(
+        self, initialize_model_parallel
+    ):
+        engine = DummyEngine()
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        order = []
+        record = DynamicInferenceRequestRecord.from_request(
+            DynamicInferenceRequest(
+                request_id=123,
+                prompt="1 2",
+                prompt_tokens=torch.tensor([1, 2], dtype=torch.int64),
+                generated_tokens=[3],
+                sampling_params=SamplingParams(num_tokens_to_generate=1),
+                status=Status.COMPLETED,
+            )
+        )
+
+        class FakeSocket:
+            def __init__(self):
+                self.payloads = []
+
+            def send(self, payload):
+                order.append("send")
+                self.payloads.append(payload)
+
+        async def fake_async_step(*, send_coordinator_replies=True):
+            order.append(("async_step", send_coordinator_replies))
+            return {"finished_request_records": [record]}
+
+        async def fake_ep_complete_work_step():
+            order.append("ep_complete")
+
+        def slow_pack(records):
+            assert records == [record]
+            order.append("pack_start")
+            time.sleep(0.25)
+            order.append("pack_done")
+            return b"payload"
+
+        engine.async_step = fake_async_step
+        engine._ep_complete_work_step = fake_ep_complete_work_step
+        engine._pack_finished_records_for_coordinator = slow_pack
+        engine.socket_for_receiving_requests = FakeSocket()
+
+        try:
+            start = time.monotonic()
+            await engine._run_ep_work_step(local_pending=1)
+            elapsed = time.monotonic() - start
+
+            assert elapsed < 0.2
+            assert order[:2] == [("async_step", False), "ep_complete"]
+
+            await engine._drain_coordinator_reply_tasks()
+            assert engine.socket_for_receiving_requests.payloads == [b"payload"]
+            assert order == [
+                ("async_step", False),
+                "ep_complete",
+                "pack_start",
+                "pack_done",
+                "send",
+            ]
+        finally:
+            executor = getattr(engine, "_coordinator_reply_executor", None)
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=False)
             engine.world_zmq_communicator.close()
             engine.zmq_context.term()
 
