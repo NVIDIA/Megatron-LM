@@ -3247,6 +3247,47 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ]
 
     @pytest.mark.internal
+    def test_ep_dummy_work_step_does_not_block_before_completion(self, monkeypatch) -> None:
+        """The engine must publish EP STEP_COMPLETE without waiting on dummy GPU work."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        engine = env.engine
+        calls = []
+
+        class UnexpectedSyncEvent:
+            def record(self):
+                calls.append(("unexpected-record",))
+                raise AssertionError("dummy EP work step should not record timing events")
+
+            def synchronize(self):
+                calls.append(("unexpected-sync",))
+                raise AssertionError("dummy EP work step must not synchronize")
+
+        async def complete_work_step():
+            calls.append(("complete",))
+
+        monkeypatch.setattr(engine.controller, "dummy_forward", lambda: calls.append(("dummy",)))
+        monkeypatch.setattr(engine, "_ep_complete_work_step", complete_work_step)
+        engine.step_start_event = UnexpectedSyncEvent()
+        engine.step_end_event = UnexpectedSyncEvent()
+
+        asyncio.run(engine._run_ep_work_step(local_pending=0))
+
+        assert calls == [("dummy",), ("complete",)]
+        assert engine.context.step_count == 1
+        assert engine.context.prefix_cache_lru_clock == 1
+
+    @pytest.mark.internal
     def test_ep_dummy_async_handoff_skip_does_not_forward(self, monkeypatch) -> None:
         """A dummy EP rank consumes a protocol skip without entering a mirror forward."""
         env = self._build_test_env(

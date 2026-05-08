@@ -2498,10 +2498,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records = step_result["finished_request_records"]
         else:
             # Dummy forward to participate in the EP collective.
-            self.step_start_event.record()
             self.controller.dummy_forward()
-            self.step_end_event.record()
-            self.step_end_event.synchronize()
             self.context.step_count += 1
             self.context.prefix_cache_lru_clock += 1
 
