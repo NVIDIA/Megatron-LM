@@ -26,7 +26,9 @@ Index storage optimization:
 
 import concurrent.futures
 import glob
+import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -34,7 +36,7 @@ import tarfile
 import warnings
 from collections import OrderedDict
 from contextlib import nullcontext
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -47,8 +49,8 @@ except ImportError:
 from megatron.core import parallel_state
 from megatron.core.msc_utils import open_file
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.training import get_args
-from megatron.training.utils import print_rank_0
+from megatron.training import get_args, get_tensorboard_writer
+from megatron.training.utils import get_blend_and_blend_per_split, print_rank_0
 
 logger = logging.getLogger(__name__)
 
@@ -59,19 +61,6 @@ _ACTIVE_LOGITS_SAVER: Optional["LogitsSaverHooks"] = None
 def get_logits_saver() -> Optional["LogitsSaverHooks"]:
     """Return the active :class:`LogitsSaverHooks` instance, or *None*."""
     return _ACTIVE_LOGITS_SAVER
-
-
-def get_current_iteration() -> int:
-    """Return the current training iteration from ``get_args()``.
-
-    Prefers ``args.curr_iteration`` (set during forward/backward) and
-    falls back to ``args.iteration``.
-    """
-    args = get_args()
-    iteration = getattr(args, 'curr_iteration', None)
-    if iteration is None:
-        iteration = getattr(args, 'iteration')
-    return iteration
 
 
 _MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
@@ -87,6 +76,101 @@ _FOLDER_NAMES_PREFIX = "logprobs_iter"
 _BATCHED_TAR_RE = re.compile(
     r"^(?:tp(?P<tp>\d+)_)?cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
 )
+
+# Name of the metadata member written as the first entry of every batched
+# tar.  Contains the dataset-identity hash and the fields that produced it,
+# so the student-side loader can verify alignment per-tar via WebDataset.
+META_TAR_MEMBER = "_meta.json"
+
+
+def get_current_iteration() -> int:
+    """Return the current training iteration from ``get_args()``.
+
+    Prefers ``args.curr_iteration`` (set during forward/backward) and
+    falls back to ``args.iteration``.
+    """
+    args = get_args()
+    iteration = getattr(args, 'curr_iteration', None)
+    if iteration is None:
+        iteration = getattr(args, 'iteration')
+    return iteration
+
+
+def _blend_identifiers(args: Any) -> Dict[str, Any]:
+    """Build a path-agnostic representation of the training data blend.
+
+    Reuses :func:`megatron.training.utils.get_blend_and_blend_per_split`
+    to resolve all of Megatron's blend-source variants (``data_path``,
+    ``data_args_path``, ``train_data_path`` / ``valid_data_path`` /
+    ``test_data_path``, ``per_split_data_args_path``) into the canonical
+    ``(prefixes, weights)`` shape, then normalises each prefix to its
+    basename (without extension) so the same teacher cache can be reused
+    across machines that mount the data at different locations.
+
+    Returns ``{"mock": True}`` when no blend is configured (e.g. mock
+    data runs).
+    """
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
+
+    def _normalise(blend_tuple) -> Optional[List[List[Any]]]:
+        if blend_tuple is None:
+            return None
+        prefixes, weights = blend_tuple
+        if weights is None:
+            weights = [1.0] * len(prefixes)
+        return [
+            [float(w), os.path.splitext(os.path.basename(str(p)))[0]]
+            for w, p in zip(weights, prefixes)
+        ]
+
+    if blend is not None:
+        return {"kind": "blend", "blend": _normalise(blend)}
+    if blend_per_split is not None:
+        # Index 0 is the train split (see ``megatron.core.datasets.utils.Split``).
+        # Only the train blend influences which teacher logits are produced.
+        return {"kind": "blend_per_split", "train": _normalise(blend_per_split[0])}
+    return {"kind": "mock", "mock": True}
+
+
+def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
+    """Compute the dataset-identity hash for the current training run.
+
+    Modeled after Megatron's ``unique_description_hash`` mechanism in
+    :mod:`megatron.core.datasets.megatron_dataset`: build a deterministic
+    ``OrderedDict`` of identifying fields, JSON-serialise it, and MD5-hash
+    the result.  Reads the current run configuration via :func:`get_args`.
+
+    The fields included are exactly those that determine the global
+    sample stream itself: ``seed``, ``sequence_length``, ``train_samples``
+    (with a fall-back to ``train_iters * global_batch_size``), and the
+    data ``blend``.  Tokenizer name, split string, and ``global_batch_size``
+    are intentionally excluded — none of them change the underlying
+    sample stream; leaving GBS out in particular keeps the cache valid
+    for future GBS-rescaling on the loader side.
+
+    Returns:
+        ``(md5_hex, identifiers_dict)`` – the hash and the dict it was
+        computed from (useful for diagnostics on mismatch).
+    """
+    args = get_args()
+    train_samples = getattr(args, 'train_samples', None)
+    if train_samples is None:
+        train_iters = getattr(args, 'train_iters', None)
+        global_batch_size = getattr(args, 'global_batch_size', None)
+        if train_iters is not None and global_batch_size is not None:
+            train_samples = int(train_iters) * int(global_batch_size)
+
+    identifiers = OrderedDict()
+    identifiers["seed"] = getattr(args, 'seed', None)
+    identifiers["sequence_length"] = getattr(args, 'seq_length', None)
+    identifiers["train_samples"] = train_samples
+    identifiers["blend"] = _blend_identifiers(args)
+
+    description = json.dumps(identifiers, sort_keys=False, separators=(',', ':'))
+    md5_hex = hashlib.md5(
+        description.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
+    return md5_hex, dict(identifiers)
 
 
 def _batched_tar_filename(
@@ -286,18 +370,39 @@ class LogitsSaverHooks:
         self._mtp_num_layers = args.mtp_num_layers or 0
         self._curr_mtp_passes = 0
 
+        # Dataset-identity hash + serialised metadata, written as the
+        # first member of every batched tar so the student loader can
+        # verify alignment per-tar without an extra tarfile.open.
+        self.dataset_hash, self._dataset_identifiers = compute_dataset_hash()
+        self.metadata_dict: Dict[str, Any] = {
+            "hash": self.dataset_hash,
+            "identifiers": self._dataset_identifiers,
+            "saver": {
+                "k": self.k,
+                "p": self.p,
+                "min_k": self.min_k,
+                "save_dtype": save_dtype,
+                "compress_zstd": bool(compress_zstd),
+                "flush_interval": self.flush_interval,
+            },
+        }
+        self._meta_bytes: bytes = json.dumps(
+            self.metadata_dict, sort_keys=False, separators=(',', ':'),
+        ).encode("utf-8")
+
         # Hook states – store already-processed top-K results (not full logits)
         self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self._hook_handles: List[Any] = []
 
         # Zstd compression setup
-        if zstandard is not None:
+        if compress_zstd and zstandard is not None:
             self._zstd_compressor = zstandard.ZstdCompressor(level=3)
         else:
-            warnings.warn(
-                "zstandard package not found; disabling zstd compression for log-probs."
-            )
             self._zstd_compressor = None
+            if compress_zstd:
+                warnings.warn(
+                    "zstandard package not found; disabling zstd compression for log-probs."
+                )
 
         # Batched tar state (active when flush_interval > 1)
         self._pending_writes: OrderedDict[int, Tuple[bytes, str]] = OrderedDict()
@@ -307,6 +412,9 @@ class LogitsSaverHooks:
             else None
         )
         self._flush_futures: List[concurrent.futures.Future] = []
+
+        # Top-P logging: per-microbatch kept counts (populated by _apply_topp_truncation)
+        self._topp_kept_counts: List[float] = []
 
         # Create save directory if needed
         os.makedirs(self.save_dir, exist_ok=True)
@@ -390,6 +498,13 @@ class LogitsSaverHooks:
             all_high_bits.append(high_bit.cpu())
 
         self._write_to_disk(all_values, all_indices_low, all_high_bits)
+
+        if self._topp_kept_counts:
+            # Log the average number of top-P kept tokens per microbatch to tensorboard
+            avg_kept = sum(self._topp_kept_counts) / len(self._topp_kept_counts)
+            self._topp_kept_counts.clear()
+            if (writer := get_tensorboard_writer()) is not None:
+                writer.add_scalar('avg-logprobs-kept', avg_kept, get_current_iteration())
 
     def _process_single_microbatch(
         self, logits: torch.Tensor
@@ -575,8 +690,12 @@ class LogitsSaverHooks:
         arange = torch.arange(k, device=values.device)
         keep_mask = keep_mask | (arange < min_keep)
 
+        kept_per_token = keep_mask.sum(dim=-1)
+        # For logging purposes
+        self._topp_kept_counts.append(kept_per_token.float().mean().item())
+
         # Truncate to reduce storage
-        max_kept = int(keep_mask.sum(dim=-1).max().item())
+        max_kept = int(kept_per_token.max().item())
         values = values[..., :max_kept]
         indices = indices[..., :max_kept]
         keep_mask = keep_mask[..., :max_kept]
@@ -660,7 +779,7 @@ class LogitsSaverHooks:
         tar_path = os.path.join(self.save_dir, tar_filename)
 
         future = self._flush_executor.submit(
-            LogitsSaverHooks._write_batched_tar, tar_path, writes,
+            LogitsSaverHooks._write_batched_tar, tar_path, writes, self._meta_bytes,
         )
         self._flush_futures.append(future)
 
@@ -670,13 +789,24 @@ class LogitsSaverHooks:
     def _write_batched_tar(
         tar_path: str,
         writes: "OrderedDict[int, Tuple[bytes, str]]",
+        meta_bytes: bytes,
     ) -> None:
         """Write a tar archive containing multiple iterations (runs in background thread).
 
-        Each member is named ``{iteration}{suffix}`` so that WebDataset
-        groups them as individual samples keyed by iteration number.
+        The dataset-identity metadata is written as the **first** member
+        (named :data:`META_TAR_MEMBER`) so the student-side WebDataset
+        loader sees it as the very first sample of the shard and can
+        verify alignment before any iteration data is decoded.
+
+        Each subsequent member is named ``{iteration}{suffix}`` so that
+        WebDataset groups them as individual samples keyed by iteration
+        number.
         """
         with tarfile.open(tar_path, "w") as tar:
+            info = tarfile.TarInfo(name=META_TAR_MEMBER)
+            info.size = len(meta_bytes)
+            tar.addfile(info, io.BytesIO(meta_bytes))
+
             for iteration, (data, entry_suffix) in writes.items():
                 member_name = f"{iteration}{entry_suffix}"
                 info = tarfile.TarInfo(name=member_name)
@@ -869,20 +999,43 @@ def load_log_probs_by_rank(
 
 def decode_logprobs_sample(
     sample: dict,
-) -> Tuple[int, List[torch.Tensor], List[torch.Tensor]]:
+    expected_hash: Optional[str] = None,
+) -> Optional[Tuple[int, List[torch.Tensor], List[torch.Tensor]]]:
     """WebDataset map function: decode a single tar member into tensors.
 
     Handles both ``.pt`` and ``.pt.zst`` extensions produced by
     :class:`LogitsSaverHooks` when ``flush_interval > 1``.
 
+    The first member of every batched tar is the :data:`META_TAR_MEMBER`
+    sample (see :meth:`LogitsSaverHooks._write_batched_tar`).  When that
+    sample is encountered, its parsed contents are compared against
+    *expected_hash* (if provided) and the function returns ``None`` to
+    signal the caller to skip it.  This makes per-tar dataset-identity
+    verification automatic for any consumer of the WebDataset pipeline
+    without requiring an extra filter step.
+
     Args:
         sample: WebDataset sample dict with ``__key__`` and one data field.
+        expected_hash: Dataset-identity hash the student run expects every
+            tar to advertise in its ``_meta.json`` member.  When ``None``,
+            verification is skipped (legacy data, debugging).
 
     Returns:
-        ``(iteration, values_list, indices_list)`` – the same tuple shape
-        returned by :func:`load_log_probs_by_rank`.
+        ``(iteration, values_list, indices_list)`` for iteration samples,
+        or ``None`` for the per-tar metadata sample (caller should skip).
     """
     key: str = sample["__key__"]
+
+    if key == META_TAR_MEMBER.split(".")[0]:
+        saved_hash = json.loads(sample["json"]).get("hash")
+        if expected_hash is not None and saved_hash != expected_hash:
+            raise RuntimeError(
+                f"Teacher tar {sample.get('__url__')} was saved with hash "
+                f"{saved_hash} but the current student run has hash "
+                f"{expected_hash}. Data does not align!"
+            )
+        return None
+
     iteration = int(key)
 
     if "pt.zst" in sample:

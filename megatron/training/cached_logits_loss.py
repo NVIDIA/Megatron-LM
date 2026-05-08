@@ -59,6 +59,7 @@ Usage example
 """
 
 import concurrent.futures
+import functools
 import glob
 import logging
 import os
@@ -84,6 +85,7 @@ from megatron.training.logits_saver import (
   _FOLDER_NAMES_PREFIX,
   _batched_tar_prefix,
   _sorted_batched_tars,
+  compute_dataset_hash,
   decode_logprobs_sample,
   get_current_iteration,
   load_log_probs_by_rank,
@@ -274,6 +276,15 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         self.dp_rank = dp_rank
         self.start_iteration = start_iteration
 
+        # Per-tar dataset-identity verification: pass the student-side
+        # hash into every decode_logprobs_sample call so it raises
+        # RuntimeError when a tar's _meta.json hash doesn't match.
+        student_hash, _ = compute_dataset_hash()
+        self._decode = functools.partial(
+            decode_logprobs_sample,
+            expected_hash=student_hash,
+        )
+
         self._decode_threads = max(1, int(decode_threads))
         if decode_lookahead is None:
             decode_lookahead = max(2 * self._decode_threads, 4)
@@ -425,7 +436,10 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
     def _iter_pipeline_serial(self, pipeline) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
         """Yield decoded, DP-sliced microbatches from a single pipeline."""
         for sample in pipeline:
-            iteration, values_list, indices_list = decode_logprobs_sample(sample)
+            decoded = self._decode(sample)
+            if decoded is None:
+                continue  # per-tar metadata sample (verified inside decode_logprobs_sample)
+            iteration, values_list, indices_list = decoded
             if iteration < self.start_iteration:
                 continue
             yield self._slice_microbatches(values_list, indices_list)
@@ -456,7 +470,7 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
             except StopIteration:
                 exhausted = True
                 return
-            pending.append(pool.submit(decode_logprobs_sample, sample))
+            pending.append(pool.submit(self._decode, sample))
 
         for _ in range(self._decode_lookahead):
             submit_next()
@@ -466,9 +480,12 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         while pending:
             fut = pending.popleft()
             try:
-                iteration, values_list, indices_list = fut.result()
+                decoded = fut.result()
             finally:
                 submit_next()
+            if decoded is None:
+                continue  # per-tar metadata sample (verified inside decode_logprobs_sample)
+            iteration, values_list, indices_list = decoded
             if iteration < self.start_iteration:
                 continue
             yield self._slice_microbatches(values_list, indices_list)
@@ -486,7 +503,13 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         all_indices: List[List[torch.Tensor]] = []
         ref_iteration: Optional[int] = None
         for sample in samples:
-            iteration, vals, inds = decode_logprobs_sample(sample)
+            decoded = self._decode(sample)
+            if decoded is None:
+                # Per-tar metadata sample (verified inside decode_logprobs_sample).
+                # Because the saver writes _meta first in every tar and pipelines
+                # advance in lockstep, the meta samples align across sources.
+                continue
+            iteration, vals, inds = decoded
             if ref_iteration is None:
                 ref_iteration = iteration
             elif iteration != ref_iteration:
@@ -497,7 +520,7 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
                 )
             all_values.append(vals)
             all_indices.append(inds)
-        if ref_iteration < self.start_iteration:
+        if ref_iteration is None or ref_iteration < self.start_iteration:
             return None
         return self._interleave_microbatches(all_values, all_indices)
 
