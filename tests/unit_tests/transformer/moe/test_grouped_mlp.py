@@ -472,7 +472,9 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
 
 
 def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
-    """delay_wgrad_compute=True (via wrapper) → backward_dw calls fused [2] then [0]."""
+    """delay_wgrad_compute=True (via wrapper) → backward_dw calls fused [2] then [0],
+    then triggers the wrapper-side wgrad/reduce hooks (PR 4311) so DDP's reduce-scatter
+    fires on the original linear_fc1/fc2 modules."""
 
     class _Recorder:
         def __init__(self, label):
@@ -487,9 +489,13 @@ def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
             self.label = label
             self.delay_wgrad_compute = True
             self.backward_dw_calls = 0
+            self.trigger_calls = 0
 
         def backward_dw(self):
             self.backward_dw_calls += 1
+
+        def _trigger_wgrad_accumulation_and_reduce_hooks(self):
+            self.trigger_calls += 1
 
     class _FakeSequential:
         def __init__(self, children):
@@ -518,6 +524,10 @@ def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
     assert activation_op.calls == [], "activation op must not be invoked"
     assert module.linear_fc1.backward_dw_calls == 0, "wrapper backward_dw must be skipped"
     assert module.linear_fc2.backward_dw_calls == 0
+    # PR 4311: DDP reduce-scatter hooks live on the original wrappers and must be triggered
+    # explicitly because the fused path's backward_dw runs on the new GroupedLinear instances.
+    assert module.linear_fc2.trigger_calls == 1
+    assert module.linear_fc1.trigger_calls == 1
 
 
 def test_backward_dw_falls_back_to_wrappers_when_delay_wgrad_off():
