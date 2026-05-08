@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@f141c07f94a13e21d40d5a73c12ccca8d08332ff
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   build-test-publish-wheels:
