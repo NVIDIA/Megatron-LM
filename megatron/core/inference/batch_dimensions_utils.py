@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 
@@ -147,6 +148,7 @@ class InferenceBatchDimensions:
         smallest_non_decode_cuda_graph_size: int = 0,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         num_speculative_tokens: int = 0,
+        ep_async_protocol=None,
         ep_zmq_communicator=None,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjust CUDA graph batch dimensions for expert parallelism.
@@ -163,6 +165,9 @@ class InferenceBatchDimensions:
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
+            ep_async_protocol: Optional EPAsyncStepProtocol over the EP group. When
+                      provided, the cross-rank MAX reduction runs as the tagged
+                      EP graph-shape phase for the active protocol step.
             ep_zmq_communicator: Optional AsyncZMQCommunicator over the EP group. When
                       provided, the cross-rank MAX reduction runs on the CPU via ZMQ
                       (no GPU kernel, no H2D/D2H), avoiding a per-step NCCL AllReduce
@@ -178,7 +183,20 @@ class InferenceBatchDimensions:
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
 
-        if ep_zmq_communicator is not None:
+        if ep_async_protocol is not None:
+            # CPU-only sync via the tagged EP protocol: avoids a NCCL
+            # AllReduce kernel and keeps graph-shape selection ordered with
+            # the rest of the EP async step.
+            (max_token_count, max_is_non_decode, max_prefill_count, max_decode_count) = (
+                ep_async_protocol.sync_all_reduce_max(
+                    EPAsyncPhase.GRAPH_SHAPE,
+                    local_batch_dims.token_count,
+                    int(is_non_decode),
+                    local_batch_dims.prefill_req_count,
+                    local_batch_dims.decode_req_count,
+                )
+            )
+        elif ep_zmq_communicator is not None:
             # CPU-only sync via ZMQ: avoids a NCCL AllReduce kernel on the
             # compute stream plus the H2D/D2H pair that sandwiches it.
             (max_token_count, max_is_non_decode, max_prefill_count, max_decode_count) = (
@@ -534,6 +552,7 @@ class CUDAGraphBatchDimensionBuilder:
         decode_only_cuda_graphs: bool = True,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         num_speculative_tokens: int = 0,
+        ep_async_protocol=None,
         ep_zmq_communicator=None,
         match_ep_token_counts: bool = True,
     ) -> Optional[InferenceBatchDimensions]:
@@ -551,6 +570,10 @@ class CUDAGraphBatchDimensionBuilder:
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
+            ep_async_protocol: Optional EPAsyncStepProtocol over the EP group. When
+                      provided, batch-dimension MAX reduction uses the tagged
+                      EP graph-shape protocol phase. Forwarded to
+                      adjust_batch_dims_for_expert_parallelism.
             ep_zmq_communicator: Optional AsyncZMQCommunicator over the EP group. When
                       provided, batch-dimension MAX reduction uses a CPU-only ZMQ sync
                       instead of a GPU NCCL AllReduce. Forwarded to
@@ -577,6 +600,7 @@ class CUDAGraphBatchDimensionBuilder:
                 ep_group=ep_group,
                 smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
                 num_speculative_tokens=num_speculative_tokens,
+                ep_async_protocol=ep_async_protocol,
                 ep_zmq_communicator=ep_zmq_communicator,
             )
 

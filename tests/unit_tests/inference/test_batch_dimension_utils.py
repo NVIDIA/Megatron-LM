@@ -13,6 +13,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase
 from tests.unit_tests.test_utilities import Utils
 
 BD = InferenceBatchDimensions
@@ -48,6 +49,18 @@ def _match(real, graph_list, ep_group, strict=False):
         ep_group=ep_group,
         match_ep_token_counts=True,
     )
+
+
+class _RecordingEPGraphShapeProtocol:
+    """Protocol double that records graph-shape sync calls."""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def sync_all_reduce_max(self, phase, *local_vals):
+        self.calls.append((phase, local_vals))
+        return self.result
 
 
 def _assert_consistent_across_ranks(result, ep_group):
@@ -136,6 +149,23 @@ class TestMatchGraphConfigWithEP:
     def _get_ep_group():
         """Return the EP group created by initialize_model_parallel."""
         return ps.get_expert_model_parallel_group()
+
+    @pytest.mark.internal
+    def test_ep_graph_shape_sync_uses_protocol_phase(self):
+        """Graph-shape sync should use the tagged EP protocol when available."""
+        ep_group = self._get_ep_group()
+        protocol = _RecordingEPGraphShapeProtocol((16, 0, 0, 16))
+
+        result = BD.adjust_batch_dims_for_expert_parallelism(
+            BD(token_count=8, prefill_req_count=0, decode_req_count=8),
+            ep_group=ep_group,
+            ep_async_protocol=protocol,
+        )
+
+        assert result == BD(token_count=16, prefill_req_count=0, decode_req_count=8)
+        assert protocol.calls == [
+            (EPAsyncPhase.GRAPH_SHAPE, (8, 0, 0, 8)),
+        ]
 
     # ------------------------------------------------------------------ #
     # 1. All ranks same decode batch → consistent match
