@@ -46,7 +46,21 @@ class _EventLoopManager:
         if self._started:
             return
 
+        # PyTorch's CUDA current-device is thread-local and defaults to 0 on
+        # new threads. Capture the spawning thread's device so NCCL ops
+        # scheduled on the runtime loop (e.g. inside
+        # ``start_listening_to_data_parallel_coordinator``) hit the right GPU
+        # under torchrun, where every process sees all GPUs and rank-to-device
+        # mapping is set on the main thread only.
+        import torch
+
+        parent_device = (
+            torch.cuda.current_device() if torch.cuda.is_available() else None
+        )
+
         def _run_loop() -> None:
+            if parent_device is not None:
+                torch.cuda.set_device(parent_device)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             self._loop = loop
