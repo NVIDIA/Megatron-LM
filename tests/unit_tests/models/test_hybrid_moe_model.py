@@ -153,6 +153,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "memory_efficient_layer_norm": False,
     "microbatch_group_size_per_vp_stage": 1,
     "mlp_chunks_for_prefill": 1,
+    "mlp_chunks_for_training": 1,
     "moe_apply_probs_on_input": False,
     "moe_aux_loss_coeff": 0.0,
     "moe_deepep_num_sms": 20,
@@ -289,7 +290,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "max_seqlen_per_dp_cp_rank": None,
     "inference_disable_triton_nvls_kernels": False,
     "moe_router_force_biased": None,
-    "inference_grouped_gemm_backend": "torch",
+    "inference_grouped_gemm_backend": "vllm",
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",
 }
