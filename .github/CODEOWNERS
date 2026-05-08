@@ -31,6 +31,8 @@ megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mixtu
 
 megatron/core/inference/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference
 
+megatron/inference/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference
+
 megatron/core/parallel_state.py @NVIDIA/core-adlr @NVIDIA/core-nemo
 
 megatron/core/post_training/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-training
