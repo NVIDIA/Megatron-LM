@@ -762,16 +762,48 @@ class TestEPAsyncStepProtocol:
         protocol = EPAsyncStepProtocol(communicator)
 
         first = await protocol.establish_work_consensus(3, False, async_op=True)
+        protocol.complete_idle_step()
         second = await protocol.establish_work_consensus(0, True, async_op=False)
+        protocol.complete_idle_step()
 
+        assert first.step_id == 0
         assert first.global_work == 3
         assert not first.all_pausing
+        assert second.step_id == 1
         assert second.global_work == 0
         assert second.all_pausing
         assert communicator.calls == [
             ("async", EPAsyncPhase.WORK_CONSENSUS.value, 0, True, (3, 0)),
             ("async", EPAsyncPhase.WORK_CONSENSUS.value, 1, False, (0, -1)),
         ]
+
+    @pytest.mark.asyncio
+    async def test_work_step_completion_uses_same_step_id(self):
+        communicator = _RecordingEPCommunicator()
+        protocol = EPAsyncStepProtocol(communicator)
+
+        first = await protocol.establish_work_consensus(2, False)
+        await protocol.complete_work_step()
+        second = await protocol.establish_work_consensus(1, False)
+        await protocol.complete_work_step(async_op=False)
+
+        assert first.step_id == 0
+        assert second.step_id == 1
+        assert communicator.calls == [
+            ("async", EPAsyncPhase.WORK_CONSENSUS.value, 0, True, (2, 0)),
+            ("async", EPAsyncPhase.STEP_COMPLETE.value, 0, True, (1,)),
+            ("async", EPAsyncPhase.WORK_CONSENSUS.value, 1, True, (1, 0)),
+            ("async", EPAsyncPhase.STEP_COMPLETE.value, 1, False, (1,)),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_work_consensus_rejects_nested_step(self):
+        protocol = EPAsyncStepProtocol(_RecordingEPCommunicator())
+
+        await protocol.establish_work_consensus(1, False)
+        with pytest.raises(RuntimeError, match="still active"):
+            await protocol.establish_work_consensus(1, False)
+        protocol.complete_idle_step()
 
     def test_sync_collective_uses_independent_phase_ordering(self):
         communicator = _RecordingEPCommunicator()

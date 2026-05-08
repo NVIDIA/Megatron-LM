@@ -2386,6 +2386,17 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_pop("_ep_establish_consensus")
         return consensus.global_work, consensus.all_pausing
 
+    async def _ep_complete_work_step(self) -> None:
+        """Keep real and dummy EP ranks aligned before the next work consensus."""
+        if self.ep_world_size > 1:
+            nvtx_range_push("_ep_complete_work_step")
+            await self.ep_async_step_protocol.complete_work_step(
+                async_op=(not self.use_synchronous_zmq_collectives)
+            )
+            nvtx_range_pop("_ep_complete_work_step")
+        else:
+            self.ep_async_step_protocol.complete_idle_step()
+
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
 
@@ -2432,6 +2443,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
+                        self.ep_async_step_protocol.complete_idle_step()
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
@@ -2447,8 +2459,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_end_event.synchronize()
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
+                        await self._ep_complete_work_step()
                     else:
                         # No work, but not all pausing: idle.
+                        self.ep_async_step_protocol.complete_idle_step()
                         await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.PAUSED:
