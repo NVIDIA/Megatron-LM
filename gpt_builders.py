@@ -70,7 +70,6 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 use_transformer_engine=use_te,
                 normalization=args.normalization,
                 qk_l2_norm=args.qk_l2_norm,
-                vp_stage=vp_stage,
             )
             transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
         # Use spec of the last layer in decoder block as spec of the transformer layer in MTP

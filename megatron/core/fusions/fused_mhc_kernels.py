@@ -27,7 +27,13 @@ _CUTILE_AVAILABLE = False
 try:
     import cuda.tile as ct
 
-    _CUTILE_AVAILABLE = True
+    # cuTile (tileiras compiler) requires compute capability 10.x+; on Hopper
+    # (sm_90) the bundled compiler rejects ``--gpu-name sm_90`` and the kernels
+    # cannot run. Gate availability on the active CUDA device's capability.
+    if torch.cuda.is_available():
+        _major, _ = torch.cuda.get_device_capability()
+        if _major >= 10:
+            _CUTILE_AVAILABLE = True
 except ImportError:
     pass
 
