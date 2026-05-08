@@ -104,7 +104,7 @@ def should_free_input(name, is_moe, config, num_local_experts):
     return free_input_nodes.get(name, False)
 
 
-class TransformerLayerState:
+class LayerState:
     """State shared between the schedule nodes that come from one logical layer.
 
     Empty placeholder; nodes attach their own attributes (residual, dispatched

@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from megatron.core.models.gpt.fine_grained_callables import build_layer_callables
+from megatron.core.models.common.fine_grained_callables import build_layer_callables
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
