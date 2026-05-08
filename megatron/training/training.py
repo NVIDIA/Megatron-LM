@@ -1705,8 +1705,6 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
         kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
         kwargs["check_for_large_grads"] = args.check_for_large_grads
-        kwargs["num_buckets"] = args.ddp_num_buckets
-        kwargs["bucket_size"] = args.ddp_bucket_size
         kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
         kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
         kwargs["param_name_patterns_for_fp32_local_accumulation"] = \
@@ -1717,6 +1715,16 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
         kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+        if (
+            args.use_megatron_fsdp
+            and args.cuda_graph_impl == "local"
+            and CudaGraphScope.full_iteration in args.cuda_graph_scope
+        ):
+            # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
+            # during start_param_sync(), which is called during the DistOpt.step(). This
+            # causes an error when we wait() on a CUDA kernel launched in a stream beyond
+            # the scope of the full-iter / FWD-BWD CUDA graph capture.
+            kwargs["fsdp_all_gather_in_start_param_sync"] = False
 
         return DistributedDataParallelConfig(**kwargs)
 

@@ -1047,11 +1047,22 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
     
-    if args.nccl_ub and args.use_megatron_fsdp:
-        # In Megatron-LM, required implementation for manual registration is already provided.
-        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
-        args.fsdp_manual_registration = True
-        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
+        if args.nccl_ub:
+            # In Megatron-LM, required implementation for manual registration is already provided.
+            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+            args.fsdp_manual_registration = True
+            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
+        
+        if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+            # CUDA graph-ability requires a mixed-precision / decoupled gradient in FusedAdam, or
+            # it requires no casting between the sharded gradient and optimizer parameter, which
+            # allocates extra memory overhead and should be deallocated post-optimizer.
+            assert args.use_precision_aware_optimizer or (
+                args.megatron_fsdp_main_params_dtype == args.megatron_fsdp_main_grads_dtype
+            ), (
+                "Megatron-FSDP full-iteration CUDA graphability requires --use-precision-aware-optimizer "
+                "or --megatron-fsdp-main-params-dtype == --megatron-fsdp-main-grads-dtype."
+            )
 
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
