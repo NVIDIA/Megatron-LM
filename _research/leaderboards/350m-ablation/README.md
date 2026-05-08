@@ -22,6 +22,20 @@ results stay reproducible across upstream syncs. Tag list:
 | 5 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 6 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 
+## Post-sync verification
+
+Re-running the rank-1 recipe (NorMuon @ matrix LR 3.6e-4) on the
+post-upstream-sync baseline (`baseline-2026-05-08-49875a8`, merging 144
+upstream commits) reproduces the original result within the accept
+window (`final loss 2.221 ± 0.02`):
+
+| rank | optimizer | matrix LR | final loss | min loss | sbatch | wandb | baseline |
+| ---: | --- | ---: | ---: | ---: | --- | --- | --- |
+| 1 (rerun) | NorMuon | 3.6e-4 | 2.222 | 2.060 | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [fhhli28t](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/fhhli28t) | [`baseline-2026-05-08-49875a8`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-49875a8) |
+
+Deltas vs the pre-sync rank-1 entry: final loss +0.001, min loss +0.002.
+Both well within numerical noise. Throughput unchanged at ~310 TFLOP/s/GPU.
+
 ## Notes on entries
 
 - **Rank 1** is the recommended NorMuon recipe: matrix LR 3.6e-4 (NorMuon
