@@ -3232,6 +3232,123 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ]
 
     @pytest.mark.internal
+    def test_ep_fallback_async_forward_votes_handoff_without_async_graph(
+        self, monkeypatch
+    ) -> None:
+        """The non-graph async fallback forward is still an EP handoff."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=1,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        controller = env.engine.controller
+        calls = []
+
+        class LaunchingProtocol:
+            enabled = True
+
+            def decide_async_handoff(self, *, has_real_work, can_launch_async_handoff):
+                calls.append(("handoff", has_real_work, can_launch_async_handoff))
+                return EPAsyncHandoffDecision(
+                    step_id=0,
+                    has_real_work=True,
+                    launch_async_forward=True,
+                    skip_async_forward=False,
+                    any_launch_request=True,
+                    any_skip_request=False,
+                )
+
+        controller.set_ep_async_protocol(LaunchingProtocol())
+        monkeypatch.setattr(
+            controller, "_async_scheduling_disabled_reason", lambda allow_mtp=False: None
+        )
+        monkeypatch.setattr(
+            controller,
+            "_record_async_eligibility_result",
+            lambda reason: calls.append(("eligible", reason)),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_record_async_disable_reason",
+            lambda reason: calls.append(("disable", reason)),
+        )
+        monkeypatch.setattr(
+            env.engine.context,
+            "prepare_async_decode_next_step",
+            lambda: calls.append(("prepare",)) or True,
+        )
+        monkeypatch.setattr(controller, "_get_async_decode_graph", lambda: None)
+        monkeypatch.setattr(controller, "_active_requests_need_logprob_results", lambda: False)
+        monkeypatch.setattr(
+            controller, "_active_requests_use_greedy_sampling", lambda active_count: True
+        )
+
+        result = controller._try_launch_async_decode_graph(active_request_count=1)
+
+        assert result == (True, None, None, None, None, False)
+        assert calls == [
+            ("eligible", None),
+            ("prepare",),
+            ("handoff", True, True),
+        ]
+
+    @pytest.mark.internal
+    def test_ep_chained_async_decode_requires_captured_graph(self, monkeypatch) -> None:
+        """Default async scheduling does not enter the graph-only chained path."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=1,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        controller = env.engine.controller
+        calls = []
+
+        class UnexpectedProtocol:
+            enabled = True
+
+            def decide_async_handoff(self, *, has_real_work, can_launch_async_handoff):
+                calls.append(("unexpected-handoff", has_real_work, can_launch_async_handoff))
+                raise AssertionError("graph-only chained path should not publish handoff")
+
+        controller.set_ep_async_protocol(UnexpectedProtocol())
+        monkeypatch.setattr(
+            controller, "_async_scheduling_disabled_reason", lambda allow_mtp=False: None
+        )
+        monkeypatch.setattr(controller, "_record_async_eligibility_result", lambda reason: None)
+        monkeypatch.setattr(
+            controller,
+            "_record_async_disable_reason",
+            lambda reason: calls.append(("disable", reason)),
+        )
+        monkeypatch.setattr(
+            env.engine.context,
+            "prepare_async_decode_next_step",
+            lambda: calls.append(("unexpected-prepare",)) or True,
+        )
+        monkeypatch.setattr(controller, "_get_async_decode_graph", lambda: None)
+
+        result = controller._try_launch_async_decode_graph(
+            active_request_count=1, require_captured_graph=True
+        )
+
+        assert result == (False, None, None, None, None, False)
+        assert calls == [("disable", "async decode graph not captured")]
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

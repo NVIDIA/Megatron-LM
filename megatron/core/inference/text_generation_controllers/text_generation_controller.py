@@ -1992,7 +1992,7 @@ class TextGenerationController:
         )
 
     def _try_launch_async_decode_graph(
-        self, active_request_count: int
+        self, active_request_count: int, *, require_captured_graph: bool = False
     ) -> Tuple[
         bool,
         Optional[Tensor],
@@ -2001,11 +2001,26 @@ class TextGenerationController:
         Optional[torch.cuda.Event],
         bool,
     ]:
-        """Prepare next-step metadata and launch a captured async decode graph if possible."""
+        """Prepare next-step metadata and launch a captured async decode graph if possible.
+
+        When async decode graphs are disabled, the primary path still prepares the next
+        step and later launches the ordinary H2D + forward fallback. The optional
+        ``require_captured_graph`` mode is for after-bookkeeping chaining, where there
+        is no later fallback launch site in the current step.
+        """
         context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason()
         self._record_async_eligibility_result(self._async_disable_reason)
         if self._async_disable_reason is not None:
+            self._decide_ep_async_handoff(
+                has_real_work=True, can_launch_async_handoff=False
+            )
+            return False, None, None, None, None, False
+
+        async_decode_graph = self._get_async_decode_graph()
+        if require_captured_graph and async_decode_graph is None:
+            self._async_disable_reason = "async decode graph not captured"
+            self._record_async_disable_reason(self._async_disable_reason)
             return False, None, None, None, None, False
 
         range_push("async_prepare_next_step")
@@ -2014,6 +2029,17 @@ class TextGenerationController:
         if not async_next_prepared:
             self._async_disable_reason = "failed to prepare next-step metadata"
             self._record_async_disable_reason(self._async_disable_reason)
+            self._decide_ep_async_handoff(
+                has_real_work=True, can_launch_async_handoff=False
+            )
+            return False, None, None, None, None, False
+
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=True, can_launch_async_handoff=True
+        )
+        if not handoff_decision.launch_async_forward:
+            self._async_disable_reason = "ep async handoff skipped"
+            self._record_async_disable_reason(self._async_disable_reason)
             return False, None, None, None, None, False
 
         if self._active_requests_need_logprob_results():
@@ -2021,10 +2047,7 @@ class TextGenerationController:
         if not self._active_requests_use_greedy_sampling(active_request_count):
             return True, None, None, None, None, False
 
-        async_decode_graph = self._get_async_decode_graph()
         if async_decode_graph is None:
-            self._async_disable_reason = "async decode graph not captured"
-            self._record_async_disable_reason(self._async_disable_reason)
             return True, None, None, None, None, False
 
         range_push("async_decode_graph_launch")
@@ -3155,7 +3178,9 @@ class TextGenerationController:
                         pending_sample_ready_event,
                         pending_h2d_done_event,
                         pending_sample_launched,
-                    ) = self._try_launch_async_decode_graph(next_active_request_count)
+                    ) = self._try_launch_async_decode_graph(
+                        next_active_request_count, require_captured_graph=True
+                    )
                     if pending_sample_launched:
                         assert pending_sampled_tokens_cpu is not None
                         assert pending_sample_ready_event is not None
