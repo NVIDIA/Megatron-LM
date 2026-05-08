@@ -222,6 +222,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.disable_ep_consensus = inference_config.disable_ep_consensus
+        self.ep_consensus_interval = inference_config.ep_consensus_interval
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -846,8 +847,20 @@ class DynamicInferenceEngine(AbstractEngine):
         request = request_entry.record[-1]
 
         if self.rank == 0:
+            errors = [
+                e.payload
+                for e in request.events
+                if e.type
+                in (
+                    DynamicInferenceEventType.ERROR_NONTRANSIENT,
+                    DynamicInferenceEventType.ERROR_TRANSIENT,
+                )
+            ]
+            errors_str = (
+                "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else "unknown error"
+            )
             warnings.warn(
-                f"Request {request_id} failed to be added to the engine due to errors. "
+                f"Request {request_id} failed to be added to the engine ({errors_str}). "
                 f"Prompt Tokens: {len(request.prompt_tokens)} "
                 f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
                 f"Max sequence length: {self.context.max_sequence_length} "
@@ -1191,8 +1204,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     # so gate the update to keep the metric a truthful sparse
                     # sample instead of polluting it with zeros.
                     if step_time > 0:
-                        if request.tpot is None:
-                            request.tpot = []
                         per_token_step_time = step_time / len(tokens)
                         request.tpot.extend([per_token_step_time] * len(tokens))
 
@@ -2366,7 +2377,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
                         global_work_from_last_consensus == 0
-                        or self._ep_consensus_loop_counter % 20 == 0
+                        or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
                     ):
                         # selectively enter ep_establish_consensus if
                         # 1. there is no global work -> engine is idle. At any step in the future
