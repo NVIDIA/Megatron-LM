@@ -2509,6 +2509,22 @@ def save_checkpoint_and_time(
     timers('interval-time', log_level=0).start(barrier=True)
 
 
+def _run_gpu_sniff_test(tag):
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.training.gpu_sniff_test import run_gpu_sniff_test
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['ep', 'dp', 'tp'],
+    )
+    print_datetime(f'running GPU sniff test ({tag})')
+    timers = get_timers()
+    timers('gpu-sniff-test', log_level=0).start(barrier=True)
+    run_gpu_sniff_test(tag, pg_collection=pg_collection)
+    timers('gpu-sniff-test').stop(barrier=True)
+    timers.log(['gpu-sniff-test'])
+    print_datetime(f'finished GPU sniff test ({tag})')
+
+
 def post_training_step_callbacks(
     model,
     optimizer,
@@ -2569,6 +2585,13 @@ def post_training_step_callbacks(
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
             if nsys_nvtx_context is not None:
                 nsys_nvtx_context.__exit__(None, None, None)
+
+    # GPU sniff test.
+    if (
+        args.gpu_sniff_test_interval is not None
+        and iteration % args.gpu_sniff_test_interval == 0
+    ):
+        _run_gpu_sniff_test(f'iteration {iteration:7d}')
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -2879,6 +2902,11 @@ def train(
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
+
+    # GPU sniff test at start of training.
+    if args.gpu_sniff_test_interval is not None:
+        _run_gpu_sniff_test('before training')
+
     report_memory_flag = True
     pre_hook_enabled = False
     should_exit = False

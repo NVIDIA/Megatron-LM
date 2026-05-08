@@ -54,6 +54,11 @@ class TrainingConfig:
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 
+    gpu_sniff_test_interval: int | None = None
+    """Interval (in iterations) to run GPU performance sniff tests (GEMMs, all-to-all, send/recv).
+    Flags any rank whose throughput differs from the mean by more than one standard deviation.
+    If not specified, sniff tests are not run."""
+
     train_sync_interval: int | None = None
     """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""
 
