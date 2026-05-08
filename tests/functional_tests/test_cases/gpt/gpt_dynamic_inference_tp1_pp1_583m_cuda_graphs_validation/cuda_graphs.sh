@@ -97,7 +97,7 @@ if [ "${NUM_CUDA_GRAPHS}" != "0" ]; then
 fi
 
 # Command.
-CMD="python -m examples.inference.gpt.gpt_dynamic_inference ${ARGS}"
+CMD="python -m examples.inference.legacy.gpt_dynamic_inference ${ARGS}"
 echo "~~~"
 echo "CMD ...${CMD}."
 echo "~~~"
