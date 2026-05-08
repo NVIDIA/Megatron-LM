@@ -568,7 +568,7 @@ class MoELayer(BaseMoELayer):
         if (
             hasattr(self, "_inference_token_dispatcher")
             and self.is_inference_cuda_graphed_iteration
-            and not self.training:
+            and not self.training
         ):
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
