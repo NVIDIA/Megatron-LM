@@ -151,14 +151,14 @@ class TestHybridModelConfigSetAttr:
         assert "hidden_size" not in self.config.__dict__
 
 
-# class TestHybridModelConfigFinalize:
-#     """Tests for HybridModelConfig.finalize() — validation logic."""
+class TestHybridModelConfigFinalize:
+    """Tests for HybridModelConfig.finalize() — validation logic."""
 
-#     def test_calls_transformer_finalize(self):
-#         config = _make_hybrid_config()
-#         with patch.object(config.transformer, "finalize") as mock_finalize:
-#             config.finalize()
-#         mock_finalize.assert_called_once()
+    def test_calls_transformer_finalize(self):
+        config = _make_hybrid_config()
+        with patch.object(config.transformer, "finalize") as mock_finalize:
+            config.finalize()
+        mock_finalize.assert_called_once()
 
 
 # =============================================================================
