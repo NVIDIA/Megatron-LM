@@ -3153,7 +3153,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             "_record_async_eligibility_result",
             lambda reason: calls.append(("eligible", reason)),
         )
-        monkeypatch.setattr(env.engine.context, "reset", lambda: calls.append(("reset",)))
+        monkeypatch.setattr(
+            env.engine.context, "reset", lambda: calls.append(("reset",))
+        )
         monkeypatch.setattr(
             controller,
             "_dynamic_step_context_init",
@@ -3176,6 +3178,73 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             ("forward", (1, 1)),
         ]
         assert controller._async_forward_launch_count == 1
+
+    @pytest.mark.internal
+    def test_ep_dummy_async_handoff_does_not_block_step_completion(self, monkeypatch) -> None:
+        """Dummy async handoff must not synchronize before EP STEP_COMPLETE."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                enable_async_scheduling=True,
+                top_k=1,
+                termination_id=-1,
+            )
+        )
+        controller = env.engine.controller
+        calls = []
+
+        class UnexpectedSyncStream:
+            def synchronize(self):
+                calls.append(("unexpected-sync",))
+                raise AssertionError("dummy async handoff must not synchronize")
+
+        token_ids = torch.zeros(
+            (1, 1), device=torch.cuda.current_device(), dtype=torch.long
+        )
+        monkeypatch.setattr(
+            controller,
+            "_decide_ep_step_begin",
+            lambda *, has_real_work, pending_async_sample: calls.append(
+                ("begin", has_real_work, pending_async_sample)
+            ),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_context_init",
+            lambda is_dummy_forward=False: (
+                calls.append(("init", is_dummy_forward)) or (token_ids, token_ids)
+            ),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_forward_logits",
+            lambda input_ids, position_ids: calls.append(("forward",)),
+        )
+        monkeypatch.setattr(
+            controller, "_dummy_serial_mtp_forward", lambda: calls.append(("mtp",))
+        )
+        monkeypatch.setattr(
+            controller,
+            "_try_launch_dummy_async_handoff",
+            lambda: calls.append(("handoff",)) or True,
+        )
+        monkeypatch.setattr(env.engine.context, "reset", lambda: calls.append(("reset",)))
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: UnexpectedSyncStream())
+
+        controller.dummy_forward()
+
+        assert calls == [
+            ("begin", False, False),
+            ("init", True),
+            ("forward",),
+            ("mtp",),
+            ("handoff",),
+            ("reset",),
+        ]
 
     @pytest.mark.internal
     def test_ep_dummy_async_handoff_skip_does_not_forward(self, monkeypatch) -> None:

@@ -2631,11 +2631,13 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
-        launched_async_handoff = self._try_launch_dummy_async_handoff()
-        if launched_async_handoff:
-            torch.cuda.current_stream().synchronize()
+        self._try_launch_dummy_async_handoff()
 
         # clear the context of any temporary state from the dummy forward
+        # GPU consumers were enqueued on the same stream as any reset-time GPU
+        # writes, so stream ordering is enough here. Synchronizing would block
+        # the CPU EP completion protocol behind the async handoff and can
+        # deadlock with real ranks that correctly leave their handoff in flight.
         context.reset()
 
     @torch.inference_mode()
