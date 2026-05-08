@@ -316,6 +316,15 @@ _DEEPEP_V2_DUP_COUNTER = None
 # different MoE layers (e.g. MTP vs main decoder) dispatch with different params.
 _DEEPEP_V2_DEBUG_SEEN = set()
 
+# Routing-imbalance probe (MCORE_DEEPEP_V2_DEBUG_BALANCE=1). Persistent device
+# tensors holding running stats of (max-rank-load / mean-rank-load) per
+# dispatch. Capture-safe: written by the dispatch forward inside captured
+# graphs; readable from outside via host sync. See the probe code in
+# DeepEPV2Dispatch.forward for the read recipe.
+_DEEPEP_V2_BALANCE_MAX_RATIO_SUM = None   # cumulative sum of per-dispatch ratios
+_DEEPEP_V2_BALANCE_MAX_RATIO_PEAK = None  # running peak ratio observed
+_DEEPEP_V2_BALANCE_COUNT = None           # number of dispatches accumulated
+
 
 def set_deepep_v2_active_dispatch_size(num_max_tokens_per_rank):
     """Tell the DeepEP V2 dispatcher which pinned buffer to use for the next dispatch(es).
@@ -555,6 +564,75 @@ class DeepEPV2Dispatch(torch.autograd.Function):
             if _DEEPEP_V2_DUP_COUNTER is None or _DEEPEP_V2_DUP_COUNTER.device != _idx.device:
                 _DEEPEP_V2_DUP_COUNTER = torch.zeros(1, dtype=torch.int64, device=_idx.device)
             _DEEPEP_V2_DUP_COUNTER += _dup_count
+        # DEBUG: routing-imbalance probe. Computes per-rank token load
+        # (number of (token, slot) pairs whose target expert lives on each
+        # rank in the EP group) and tracks max/mean ratio. At EP > a few,
+        # imbalance bottlenecks the dispatch — the most-loaded rank gates
+        # the step. Capture-safe: writes summary stats to persistent device
+        # tensors. Enable with MCORE_DEEPEP_V2_DEBUG_BALANCE=1.
+        # Outside the captured graph (e.g., between steps or at run end),
+        # read on rank 0:
+        #     from megatron.core.transformer.moe.fused_a2a import (
+        #         _DEEPEP_V2_BALANCE_MAX_RATIO_SUM,
+        #         _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK,
+        #         _DEEPEP_V2_BALANCE_COUNT,
+        #     )
+        #     n = _DEEPEP_V2_BALANCE_COUNT.item()
+        #     avg = _DEEPEP_V2_BALANCE_MAX_RATIO_SUM.item() / max(n, 1)
+        #     peak = _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK.item()
+        #     print(f"avg max/mean rank-load ratio = {avg:.2f}, peak = {peak:.2f} over {n} dispatches")
+        if _os.environ.get("MCORE_DEEPEP_V2_DEBUG_BALANCE", "0") == "1":
+            _idx = token_indices
+            _ep_size = group.size()
+            _num_local_experts = num_experts // _ep_size
+            # Map each (token, slot) to its destination rank; the dummy `_ep_size`
+            # bucket absorbs invalid (-1) slots and gets dropped after.
+            _valid = _idx >= 0
+            _dst_rank = torch.where(_valid, _idx // _num_local_experts, _idx.new_full((), _ep_size))
+            # Capture-safe histogram via scatter_add_ on a pre-allocated tensor.
+            # `torch.bincount` is NOT capture-safe (internally syncs to size the
+            # output) even with `minlength`. scatter_add_ has fully static shape.
+            _bins = torch.zeros(_ep_size + 1, dtype=torch.int64, device=_idx.device)
+            _flat = _dst_rank.flatten().to(torch.int64)
+            _bins.scatter_add_(0, _flat, torch.ones_like(_flat))
+            _load = _bins[:_ep_size].to(torch.float32)
+            _mean = _load.mean()
+            _max = _load.max()
+            # Avoid division by zero on empty steps (rare but possible during warmup).
+            _ratio = torch.where(_mean > 0, _max / _mean, _max.new_zeros(()))
+            global _DEEPEP_V2_BALANCE_MAX_RATIO_SUM
+            global _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK
+            global _DEEPEP_V2_BALANCE_COUNT
+            if (
+                _DEEPEP_V2_BALANCE_MAX_RATIO_SUM is None
+                or _DEEPEP_V2_BALANCE_MAX_RATIO_SUM.device != _idx.device
+            ):
+                _DEEPEP_V2_BALANCE_MAX_RATIO_SUM = torch.zeros(1, dtype=torch.float32, device=_idx.device)
+                _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK = torch.zeros(1, dtype=torch.float32, device=_idx.device)
+                _DEEPEP_V2_BALANCE_COUNT = torch.zeros(1, dtype=torch.int64, device=_idx.device)
+            _DEEPEP_V2_BALANCE_MAX_RATIO_SUM += _ratio
+            _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK = torch.maximum(
+                _DEEPEP_V2_BALANCE_MAX_RATIO_PEAK, _ratio.unsqueeze(0)
+            )
+            _DEEPEP_V2_BALANCE_COUNT += 1
+            # In eager (non-capturing) mode, also print every 50 dispatches
+            # on rank 0 so you get live feedback during warmup or eager runs.
+            if not torch.cuda.is_current_stream_capturing():
+                _n_int = int(_DEEPEP_V2_BALANCE_COUNT.item())
+                if (
+                    _n_int > 0 and _n_int % 50 == 0
+                    and torch.distributed.is_initialized()
+                    and torch.distributed.get_rank() == 0
+                ):
+                    _avg = float(_DEEPEP_V2_BALANCE_MAX_RATIO_SUM.item()) / _n_int
+                    _peak = float(_DEEPEP_V2_BALANCE_MAX_RATIO_PEAK.item())
+                    _last = float(_ratio.item())
+                    print(
+                        f"[deepep_v2 balance] dispatches={_n_int} ep_size={_ep_size} "
+                        f"last_max/mean={_last:.2f} avg_max/mean={_avg:.2f} peak_max/mean={_peak:.2f} "
+                        f"(1.0=perfect balance, 2.0=hot rank has 2x mean, etc.)",
+                        flush=True,
+                    )
         recv_x, recv_token_indices, recv_token_probs, handle, event = buffer.dispatch(
             x.contiguous(),
             topk_idx=token_indices,

@@ -795,6 +795,19 @@ class InferenceTopKRouter(TopKRouter):
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
+        # Honour debug/benchmark routing-override flags at inference. The parent
+        # `TopKRouter.forward` applies these before calling `routing()`; this
+        # inference path bypasses `forward()`, so we must replicate the logic
+        # explicitly. Without this, the flags silently no-op for
+        # `transformer_impl=inference_optimized`, which makes routing-imbalance
+        # diagnostics misleading.
+        if self.config.moe_router_force_load_balancing:
+            logits = apply_random_logits(logits)
+        if self.config.moe_router_force_biased is not None:
+            logits = apply_biased_logits(
+                logits, self.config.moe_router_force_biased, self.layer_number
+            )
+
         probs, routing = self._compiled_topk_routing(
             logits,
             self.topk,
