@@ -104,7 +104,7 @@ def learned_output_contract(
     scale = scale.to(torch.float32)
     rsqrt = torch.rsqrt(hidden_states.square().mean(-1, keepdim=True) + eps)
     mixes = F.linear(hidden_states, head_fn) * rsqrt
-    pre = torch.sigmoid(mixes * scale + base) + 1e-6
+    pre = torch.sigmoid(mixes * scale + base) + eps
     y = torch.sum(pre.unsqueeze(-1) * hidden_states.view(*hidden_states.shape[:-1], n, -1), dim=-2)
     return y.to(dtype)
 
