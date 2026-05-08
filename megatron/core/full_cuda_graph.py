@@ -51,6 +51,7 @@ def get_graph_pool(use_single_mempool):
         return get_shared_graph_pool()
     return torch.cuda.graph_pool_handle()
 
+
 # The below functions traverse through nested data structures (tuples, lists, dicts)
 # present in src and creates a deep copy where all PyTorch tensors are cloned,
 # detached from the computation graph, and moved to CUDA device. Non-tensor objects
@@ -141,9 +142,7 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
 
-    def __init__(
-        self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False
-    ):
+    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
