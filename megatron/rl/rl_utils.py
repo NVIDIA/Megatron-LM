@@ -1569,7 +1569,9 @@ def prepare_data_for_update(
                 and CudaGraphScope.full_iteration in args.cuda_graph_scope
             ):
                 forward_backward_func = FullCudaGraphWrapper(
-                    forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
+                    forward_backward_func,
+                    cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+                    use_single_mempool=args.cuda_graph_use_single_mempool,
                 )
 
             dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
