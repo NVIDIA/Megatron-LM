@@ -1513,7 +1513,9 @@ def prepare_data_for_update(
             forward_backward_func = get_forward_backward_func()
             if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
                 forward_backward_func = FullCudaGraphWrapper(
-                    forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
+                    forward_backward_func,
+                    cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+                    use_single_mempool=args.cuda_graph_use_single_mempool,
                 )
 
             dtype = (

@@ -849,12 +849,11 @@ class TransformerConfig(ModelParallelConfig):
     CUDA graph (1 CUDA graph for whole iteration excluding optimizer) is enabled. --cuda-graph-scope
     determines the scope of graph capture."""
 
-    cuda_graph_use_single_mempool: bool = False
-    """[For `local` implementation only] When set to true, cudagraphs will be captured inside a
-    single mempool, in which all cudagraphs may only be used once per step. If false, cudagraphs may
-    be reused across microbatches. Enabling may reduce cudagraph memory overheads due to memory
-    fragmentation, however may greatly increase the number of cudagraphs created when the number of
-    microbatches is high."""
+    cuda_graph_use_single_mempool: bool = True
+    """For cuda_graph_impl "local" with cuda_graph_scope "full_iteration" only.
+
+    When True, full-iteration graph replay (training and evaluation) and optimizer graph
+    capture/replay share the same CUDA graph memory pool."""
 
     cuda_graph_retain_backward_graph: bool = False
     """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
