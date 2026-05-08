@@ -17,10 +17,7 @@ keys that aren't present on every group (e.g. ``start_wd``/``end_wd``/
 explicitly override them).
 """
 
-from megatron.core.optimizer.optimizer import (
-    MegatronOptimizer,
-    param_group_identifier_keys,
-)
+from megatron.core.optimizer.optimizer import MegatronOptimizer, param_group_identifier_keys
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 
 
@@ -63,13 +60,19 @@ def test_identifier_keys_invariant_to_totality():
     """
     # Verify every field is captured by __annotations__ (the source we use).
     assert set(ParamGroupOverride.__annotations__.keys()) >= {
-        'max_lr', 'min_lr', 'start_wd', 'end_wd', 'wd_mult', 'optimizer'
+        'max_lr',
+        'min_lr',
+        'start_wd',
+        'end_wd',
+        'wd_mult',
+        'optimizer',
     }, (
         "ParamGroupOverride lost expected fields. If a field was renamed, update "
         "this test AND any consumers of the identifier."
     )
     # Verify the identifier-derivation function returns exactly the annotation set.
     from megatron.core.optimizer.optimizer import _param_group_override_keys
+
     assert set(_param_group_override_keys()) == set(ParamGroupOverride.__annotations__.keys()), (
         "_param_group_override_keys() must return ParamGroupOverride.__annotations__ verbatim "
         "so the identifier survives totality / Required[] / NotRequired[] changes."
@@ -168,7 +171,7 @@ def test_filter_reorder_tolerates_missing_optional_keys():
             max_lr=1e-3,
             min_lr=1e-4,
             # NOT setting start_wd, end_wd, optimizer — these are absent.
-        ),
+        )
     ]
     saved = [
         _make_pg(
@@ -179,7 +182,7 @@ def test_filter_reorder_tolerates_missing_optional_keys():
             max_lr=1e-3,
             min_lr=1e-4,
             _tag="saved_match",
-        ),
+        )
     ]
     reordered = MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
     assert len(reordered) == 1
@@ -201,7 +204,7 @@ def test_filter_reorder_distinguishes_by_optional_override_key():
     )
     current = [
         _make_pg(**common, start_wd=0.05),  # explicit per-group start_wd
-        _make_pg(**common),                  # default start_wd (absent → sentinel)
+        _make_pg(**common),  # default start_wd (absent → sentinel)
     ]
     saved = [
         _make_pg(**common, _tag="default_wd"),
@@ -219,12 +222,7 @@ def test_filter_reorder_handles_nemo_pre_prefix():
     The matcher's per-key fallback must look up ``pre_<key>`` if ``<key>`` is
     missing — this preserves NeMo-saved checkpoint compatibility.
     """
-    common = dict(
-        is_expert_parallel=False,
-        is_decoupled_lr=False,
-        max_lr=1e-3,
-        min_lr=1e-4,
-    )
+    common = dict(is_expert_parallel=False, is_decoupled_lr=False, max_lr=1e-3, min_lr=1e-4)
     # Current uses standard names, saved uses NeMo's pre_-prefixed names.
     current = [_make_pg(**common, wd_mult=1.0, lr_mult=1.0)]
     saved = [_make_pg(**common, pre_wd_mult=1.0, pre_lr_mult=1.0, _tag="from_nemo")]
