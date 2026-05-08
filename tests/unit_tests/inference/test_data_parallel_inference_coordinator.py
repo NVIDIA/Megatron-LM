@@ -731,6 +731,7 @@ class TestAsyncZMQCommunicator:
                     comm.all_reduce_max(*values, phase=phase, step_id=step_id),
                     timeout=30.0,
                 )
+            assert comm.protocol_mismatch_count > 0
         finally:
             comm.close()
             ctx.term()
@@ -757,6 +758,18 @@ class _RecordingEPCommunicator:
         if self.sync_results:
             return self.sync_results.pop(0)
         return local_vals[0] if len(local_vals) == 1 else local_vals
+
+
+class _FailingEPCommunicator(_RecordingEPCommunicator):
+    """Communicator double that fails every collective."""
+
+    async def all_reduce_max(self, *local_vals, async_op=True, phase=None, step_id=None):
+        self.calls.append(("async", phase, step_id, async_op, local_vals))
+        raise RuntimeError("forced collective failure")
+
+    def sync_all_reduce_max(self, *local_vals, phase=None, step_id=None):
+        self.calls.append(("sync", phase, step_id, None, local_vals))
+        raise RuntimeError("forced collective failure")
 
 
 class TestEPAsyncStepProtocol:
@@ -938,6 +951,60 @@ class TestEPAsyncStepProtocol:
         assert decision.skip_async_forward
         assert decision.any_launch_request
         assert decision.any_skip_request
+        protocol.complete_idle_step()
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_count_protocol_decisions(self):
+        communicator = _RecordingEPCommunicator()
+        communicator.protocol_mismatch_count = 2
+        protocol = EPAsyncStepProtocol(communicator)
+
+        await protocol.establish_work_consensus(1, False)
+        protocol.decide_step_begin(
+            has_real_work=True,
+            has_pending_forward=True,
+            has_pending_async_sample=True,
+            pending_forward_reusable=True,
+            pending_forward_row_mapped=True,
+        )
+        protocol.decide_async_handoff(has_real_work=True, can_launch_async_handoff=True)
+        await protocol.complete_work_step()
+
+        await protocol.establish_work_consensus(1, False)
+        protocol.decide_step_begin(
+            has_real_work=True,
+            has_pending_forward=True,
+            has_pending_async_sample=True,
+            pending_forward_reusable=False,
+            pending_forward_row_mapped=False,
+        )
+        protocol.decide_async_handoff(has_real_work=True, can_launch_async_handoff=False)
+        protocol.complete_idle_step()
+
+        diagnostics = protocol.diagnostics()
+        assert diagnostics["enabled"]
+        assert diagnostics["active_step_id"] is None
+        assert diagnostics["next_step_id"] == 2
+        assert diagnostics["work_consensus"] == 2
+        assert diagnostics["work_completions"] == 1
+        assert diagnostics["idle_completions"] == 1
+        assert diagnostics["step_begin_reuses"] == 1
+        assert diagnostics["step_begin_discards"] == 1
+        assert diagnostics["handoff_launches"] == 1
+        assert diagnostics["handoff_skips"] == 1
+        assert diagnostics["collective_errors"] == 0
+        assert diagnostics["phase_mismatches"] == 2
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_count_collective_errors(self):
+        protocol = EPAsyncStepProtocol(_FailingEPCommunicator())
+
+        with pytest.raises(RuntimeError, match="forced collective failure"):
+            await protocol.establish_work_consensus(1, False)
+
+        diagnostics = protocol.diagnostics()
+        assert diagnostics["collective_errors"] == 1
+        assert diagnostics["active_step_id"] == 0
         protocol.complete_idle_step()
 
 

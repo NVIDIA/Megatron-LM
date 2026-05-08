@@ -57,6 +57,7 @@ class AsyncZMQCommunicator:
         src_rank = dist.get_process_group_ranks(process_group)[0]
         self._async_collective_step = 0
         self._sync_collective_step = 0
+        self.protocol_mismatch_count = 0
 
         if self.is_leader:
             local_ip = hostname or socket.gethostname()
@@ -157,6 +158,20 @@ class AsyncZMQCommunicator:
             )
         return struct.unpack(f"!{value_count}i", msg[values_start:values_end])
 
+    def _unpack_collective_values_message(
+        self, msg: bytes, *, expected_phase: str, expected_step_id: int, expected_count: int
+    ) -> tuple[int, ...]:
+        try:
+            return self._unpack_values_message(
+                msg,
+                expected_phase=expected_phase,
+                expected_step_id=expected_step_id,
+                expected_count=expected_count,
+            )
+        except ZMQCollectiveError:
+            self.protocol_mismatch_count += 1
+            raise
+
     @staticmethod
     def _pack_error_message(message: str) -> bytes:
         encoded = message.encode("utf-8")
@@ -222,7 +237,7 @@ class AsyncZMQCommunicator:
                     else:
                         msg = self.gather_sock.recv()
                     rows.append(
-                        self._unpack_values_message(
+                        self._unpack_collective_values_message(
                             msg,
                             expected_phase=phase,
                             expected_step_id=step_id,
@@ -253,7 +268,7 @@ class AsyncZMQCommunicator:
                         msg = self.result_recv_sock.recv(flags=zmq.NOBLOCK)
                     else:
                         msg = self.result_recv_sock.recv()
-                    result = self._unpack_values_message(
+                    result = self._unpack_collective_values_message(
                         msg,
                         expected_phase=phase,
                         expected_step_id=step_id,
@@ -301,7 +316,7 @@ class AsyncZMQCommunicator:
                 while len(rows) < self.world_size:
                     msg = self.gather_sock.recv()
                     rows.append(
-                        self._unpack_values_message(
+                        self._unpack_collective_values_message(
                             msg,
                             expected_phase=phase,
                             expected_step_id=step_id,
@@ -317,7 +332,7 @@ class AsyncZMQCommunicator:
         else:
             self.gather_sock.send(payload)
             msg = self.result_recv_sock.recv()
-            result = self._unpack_values_message(
+            result = self._unpack_collective_values_message(
                 msg,
                 expected_phase=phase,
                 expected_step_id=step_id,

@@ -328,12 +328,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
-        # Optional CPU-side collective for EP batch-dimension sync. Populated by
-        # the engine when available. The protocol path keeps graph-shape sync
-        # ordered with other EP async step phases; the communicator path is a
-        # temporary fallback for call sites not yet using the protocol.
+        # Optional CPU-side protocol for EP batch-dimension sync. Populated by
+        # the engine when available so graph-shape selection is ordered with the
+        # rest of the EP async step phases.
         self._ep_async_protocol = None
-        self._ep_zmq_communicator = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
@@ -1652,20 +1650,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         return key
 
-    def set_ep_zmq_communicator(self, communicator) -> None:
-        """Attach an EP-group ZMQ communicator for CPU-side sync collectives.
-
-        When set, match_graph_config() uses this communicator's
-        sync_all_reduce_max() to perform the EP batch-dimension MAX reduction on
-        the CPU instead of launching a NCCL AllReduce kernel on the compute
-        stream. Expected to be called once by the inference engine after both
-        the context and the communicator have been created.
-
-        Args:
-            communicator: AsyncZMQCommunicator over the EP process group.
-        """
-        self._ep_zmq_communicator = communicator
-
     def set_ep_async_protocol(self, protocol) -> None:
         """Attach the EP async protocol for graph-shape sync collectives.
 
@@ -1980,7 +1964,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             ep_group=self.expert_model_parallel_group,
             num_speculative_tokens=self.num_speculative_tokens,
             ep_async_protocol=self._ep_async_protocol,
-            ep_zmq_communicator=self._ep_zmq_communicator,
             match_ep_token_counts=self._nccl_ep_dispatcher,
         )
 

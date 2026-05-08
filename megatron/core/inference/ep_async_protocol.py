@@ -11,7 +11,6 @@ class EPAsyncPhase(str, Enum):
     STEP_COMPLETE = "ep_step_complete"
     GRAPH_SHAPE = "ep_graph_shape"
     STEP_BEGIN = "ep_step_begin"
-    PENDING_FORWARD_REUSE = "ep_pending_forward_reuse"
     ASYNC_HANDOFF = "ep_async_handoff"
 
 
@@ -56,11 +55,36 @@ class EPAsyncStepProtocol:
         self._phase_step_ids: dict[EPAsyncPhase, int] = {phase: 0 for phase in EPAsyncPhase}
         self._next_ep_step_id = 0
         self._active_ep_step_id: int | None = None
+        self._work_consensus_count = 0
+        self._work_completion_count = 0
+        self._idle_completion_count = 0
+        self._step_begin_reuse_count = 0
+        self._step_begin_discard_count = 0
+        self._async_handoff_launch_count = 0
+        self._async_handoff_skip_count = 0
+        self._collective_error_count = 0
 
     @property
     def enabled(self) -> bool:
         """Whether this rank participates in multi-rank EP protocol collectives."""
         return self.communicator is not None and self.communicator.world_size > 1
+
+    def diagnostics(self) -> dict[str, int | bool | None]:
+        """Return protocol counters for tests and benchmark logs."""
+        return {
+            "enabled": self.enabled,
+            "active_step_id": self._active_ep_step_id,
+            "next_step_id": self._next_ep_step_id,
+            "work_consensus": self._work_consensus_count,
+            "work_completions": self._work_completion_count,
+            "idle_completions": self._idle_completion_count,
+            "step_begin_reuses": self._step_begin_reuse_count,
+            "step_begin_discards": self._step_begin_discard_count,
+            "handoff_launches": self._async_handoff_launch_count,
+            "handoff_skips": self._async_handoff_skip_count,
+            "collective_errors": self._collective_error_count,
+            "phase_mismatches": getattr(self.communicator, "protocol_mismatch_count", 0),
+        }
 
     def _next_step_id(self, phase: EPAsyncPhase) -> int:
         step_id = self._phase_step_ids[phase]
@@ -94,18 +118,26 @@ class EPAsyncStepProtocol:
     ) -> int | tuple[int, ...]:
         if not self.enabled:
             return local_vals[0] if len(local_vals) == 1 else local_vals
-        return await self.communicator.all_reduce_max(
-            *local_vals, async_op=async_op, phase=phase.value, step_id=step_id
-        )
+        try:
+            return await self.communicator.all_reduce_max(
+                *local_vals, async_op=async_op, phase=phase.value, step_id=step_id
+            )
+        except Exception:
+            self._collective_error_count += 1
+            raise
 
     def _sync_all_reduce_max_at_step(
         self, phase: EPAsyncPhase, step_id: int, *local_vals: int
     ) -> int | tuple[int, ...]:
         if not self.enabled:
             return local_vals[0] if len(local_vals) == 1 else local_vals
-        return self.communicator.sync_all_reduce_max(
-            *local_vals, phase=phase.value, step_id=step_id
-        )
+        try:
+            return self.communicator.sync_all_reduce_max(
+                *local_vals, phase=phase.value, step_id=step_id
+            )
+        except Exception:
+            self._collective_error_count += 1
+            raise
 
     async def all_reduce_max(
         self, phase: EPAsyncPhase, *local_vals: int, async_op: bool = True
@@ -140,6 +172,7 @@ class EPAsyncStepProtocol:
             consensus_val,
             async_op=async_op,
         )
+        self._work_consensus_count += 1
 
         return EPWorkConsensus(
             step_id=step_id,
@@ -156,11 +189,14 @@ class EPAsyncStepProtocol:
             await self._all_reduce_max_at_step(
                 EPAsyncPhase.STEP_COMPLETE, step_id, 1, async_op=async_op
             )
+            self._work_completion_count += 1
         finally:
             self._finish_ep_step()
 
     def complete_idle_step(self) -> None:
         """Close an EP step that ended at consensus without model work."""
+        if self._active_ep_step_id is not None:
+            self._idle_completion_count += 1
         self._finish_ep_step()
 
     def decide_step_begin(
@@ -213,6 +249,10 @@ class EPAsyncStepProtocol:
             and not any_real_missing_forward
         )
         discard_pending_forward = bool(any_pending_forward and not reuse_pending_forward)
+        if reuse_pending_forward:
+            self._step_begin_reuse_count += 1
+        if discard_pending_forward:
+            self._step_begin_discard_count += 1
 
         return EPStepBeginDecision(
             step_id=step_id,
@@ -240,6 +280,10 @@ class EPAsyncStepProtocol:
             local_skip,
         )
         launch_async_forward = bool(any_launch and not any_skip)
+        if launch_async_forward:
+            self._async_handoff_launch_count += 1
+        else:
+            self._async_handoff_skip_count += 1
 
         return EPAsyncHandoffDecision(
             step_id=step_id,

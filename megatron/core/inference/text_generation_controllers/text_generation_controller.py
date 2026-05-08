@@ -1455,6 +1455,11 @@ class TextGenerationController:
             "chained_decode_graph_launches": self._async_chained_decode_graph_launch_count,
             "forward_graph_launches": self._async_forward_graph_launch_count,
             "sample_slot_waits": self._async_sample_slot_wait_count,
+            "ep_protocol": (
+                self._ep_async_protocol.diagnostics()
+                if self._ep_async_protocol is not None
+                else None
+            ),
         }
 
     def _record_async_eligibility_result(self, reason: Optional[str]) -> None:
