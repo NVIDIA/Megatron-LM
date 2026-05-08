@@ -149,15 +149,7 @@ jobs:
 
   release-summary:
     needs: [pre-flight, bump, build-test-publish-wheels, finalize]
-    if: |
-      github.repository == 'NVIDIA/Megatron-LM'
-      && (
-        needs.pre-flight.outputs.docs_only == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
-        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-        || always()
-      )
-      && !cancelled()
+    if: github.repository == 'NVIDIA/Megatron-LM' && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - name: Result
