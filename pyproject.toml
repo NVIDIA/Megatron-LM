@@ -98,7 +98,7 @@ dev = [
     "flash-linear-attention~=0.4.0",
     "megatron-energon[av_decode]~=6.0",
     "av",
-    "flashinfer-python~=0.5.0",
+    "flashinfer-python>=0.5.0,<0.7.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -118,7 +118,7 @@ lts = [
     "opentelemetry-api~=1.33.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
-    "flashinfer-python~=0.5.0",
+    "flashinfer-python>=0.5.0,<0.7.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
