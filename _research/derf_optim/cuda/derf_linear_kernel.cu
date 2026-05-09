@@ -1,12 +1,12 @@
 // Option 3: hand-written CUDA fused (Derf|DyT) + Linear forward.
 //
 // Performs y = (gamma * f(alpha*x + s) + beta) @ W^T  [+ b_lin]
-// where f = erf for Derf and f = tanh for DyT.
+// where f = erf for Derf, f = tanh for DyT.
 //
-// Tiled SMEM matmul (no tensor cores) — correctness-first reference. Beats
-// the unfused path by avoiding the round-trip through global memory between
-// the norm and the matmul. Won't beat cuBLAS-only for the matmul itself but
-// is a fair "what does CUDA-level fusion buy?" data point next to Triton.
+// Naive thread-per-output-element kernel: each thread loops over K, applying
+// the norm in registers and accumulating one output. Correctness-first
+// (no SMEM tiling, no tensor cores). Won't beat cuBLAS — the goal is a
+// fair "what does plain CUDA fusion buy?" data point next to Triton.
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -16,11 +16,7 @@
 #define CHECK_CONTIG(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIG(x)
 
-constexpr int BLOCK_M = 32;
-constexpr int BLOCK_N = 64;
-constexpr int BLOCK_K = 32;
 
-// Derf prologue applied per-element after loading x, before matmul accumulate.
 template <int NORM_KIND>
 __device__ __forceinline__ float apply_norm(
     float x, float gamma, float beta, float alpha, float s
@@ -28,78 +24,52 @@ __device__ __forceinline__ float apply_norm(
     float z = alpha * x + s;
     float fz;
     if constexpr (NORM_KIND == 0) {
-        fz = erff(z);  // Derf
+        fz = erff(z);
     } else {
-        fz = tanhf(z);  // DyT
+        fz = tanhf(z);
     }
     return gamma * fz + beta;
 }
 
-// Forward kernel: out[m, n] = sum_k pre[m, k] * w[n, k]
-// where pre[m, k] = gamma[k] * f(alpha*x[m, k] + s) + beta[k].
-// One thread block computes a BLOCK_M x BLOCK_N tile.
-template <typename scalar_t, int NORM_KIND, bool HAS_S>
+
+// One thread per (m, n) output element. block.x indexes N (contiguous),
+// blockIdx.y indexes M. Each thread loops over the K dim.
+template <typename scalar_t, int NORM_KIND, bool HAS_S, bool HAS_B_LIN>
 __global__ void norm_linear_fwd_kernel(
-    const scalar_t* __restrict__ x,         // [M, K]
-    const scalar_t* __restrict__ w_lin,     // [N, K]
-    const scalar_t* __restrict__ w_norm,    // [K]
-    const scalar_t* __restrict__ b_norm,    // [K]
-    const scalar_t* __restrict__ alpha_p,   // scalar
-    const scalar_t* __restrict__ s_p,       // scalar (or unused)
-    const scalar_t* __restrict__ b_lin,     // [N] or null
-    scalar_t* __restrict__ out,             // [M, N]
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ w_lin,
+    const scalar_t* __restrict__ w_norm,
+    const scalar_t* __restrict__ b_norm,
+    const scalar_t* __restrict__ alpha_p,
+    const scalar_t* __restrict__ s_p,
+    const scalar_t* __restrict__ b_lin,
+    scalar_t* __restrict__ out,
     int M, int N, int K
 ) {
-    int row = blockIdx.x * BLOCK_M + threadIdx.y;  // M
-    int col = blockIdx.y * BLOCK_N + threadIdx.x;  // N
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int m = blockIdx.y;
+    if (n >= N || m >= M) return;
 
-    __shared__ float pre_smem[BLOCK_M][BLOCK_K];
-    __shared__ float w_smem[BLOCK_N][BLOCK_K];
-
-    float alpha = static_cast<float>(*alpha_p);
-    float s = HAS_S ? static_cast<float>(*s_p) : 0.0f;
+    const float alpha = static_cast<float>(*alpha_p);
+    const float s = HAS_S ? static_cast<float>(*s_p) : 0.0f;
 
     float accum = 0.0f;
+    const scalar_t* x_row = x + m * K;
+    const scalar_t* w_row = w_lin + n * K;
 
-    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
-        // Load x tile, apply norm, store to smem (one thread per tile element).
-        if (threadIdx.x < BLOCK_K) {
-            int kk = k0 + threadIdx.x;
-            int m = row;
-            float xv = (m < M && kk < K) ? static_cast<float>(x[m * K + kk]) : 0.0f;
-            float gamma = (kk < K) ? static_cast<float>(w_norm[kk]) : 0.0f;
-            float beta = (kk < K) ? static_cast<float>(b_norm[kk]) : 0.0f;
-            pre_smem[threadIdx.y][threadIdx.x] = (m < M && kk < K)
-                ? apply_norm<NORM_KIND>(xv, gamma, beta, alpha, s)
-                : 0.0f;
-        }
-        // Load w tile.
-        if (threadIdx.y < BLOCK_K) {
-            int kk = k0 + threadIdx.y;
-            int n = col;
-            w_smem[threadIdx.x][threadIdx.y] = (n < N && kk < K)
-                ? static_cast<float>(w_lin[n * K + kk])
-                : 0.0f;
-        }
-        __syncthreads();
-
-        // Compute partial sum for this k-tile.
-        if (row < M && col < N) {
-            #pragma unroll
-            for (int kk = 0; kk < BLOCK_K; ++kk) {
-                accum += pre_smem[threadIdx.y][kk] * w_smem[threadIdx.x][kk];
-            }
-        }
-        __syncthreads();
+    for (int k = 0; k < K; ++k) {
+        float xv = static_cast<float>(x_row[k]);
+        float gamma = static_cast<float>(w_norm[k]);
+        float beta = static_cast<float>(b_norm[k]);
+        float pre = apply_norm<NORM_KIND>(xv, gamma, beta, alpha, s);
+        accum += pre * static_cast<float>(w_row[k]);
     }
-
-    if (row < M && col < N) {
-        if (b_lin != nullptr) {
-            accum += static_cast<float>(b_lin[col]);
-        }
-        out[row * N + col] = static_cast<scalar_t>(accum);
+    if constexpr (HAS_B_LIN) {
+        accum += static_cast<float>(b_lin[n]);
     }
+    out[m * N + n] = static_cast<scalar_t>(accum);
 }
+
 
 template <int NORM_KIND, bool HAS_S>
 torch::Tensor _launch_fwd(
@@ -109,7 +79,7 @@ torch::Tensor _launch_fwd(
     torch::Tensor b_norm,
     torch::Tensor alpha,
     torch::Tensor s,
-    torch::Tensor b_lin  /* empty () when no bias */
+    torch::Tensor b_lin
 ) {
     int M = x_2d.size(0);
     int K = x_2d.size(1);
@@ -117,22 +87,37 @@ torch::Tensor _launch_fwd(
 
     auto out = torch::empty({M, N}, x_2d.options());
 
-    dim3 block(BLOCK_N, BLOCK_M);
-    dim3 grid((M + BLOCK_M - 1) / BLOCK_M, (N + BLOCK_N - 1) / BLOCK_N);
+    constexpr int THREADS_X = 128;
+    dim3 block(THREADS_X, 1);
+    dim3 grid((N + THREADS_X - 1) / THREADS_X, M);
+
+    bool has_b_lin = b_lin.defined() && b_lin.numel() > 0;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
         x_2d.scalar_type(), "norm_linear_fwd", [&] {
-        norm_linear_fwd_kernel<scalar_t, NORM_KIND, HAS_S><<<grid, block>>>(
-            x_2d.data_ptr<scalar_t>(),
-            w_lin.data_ptr<scalar_t>(),
-            w_norm.data_ptr<scalar_t>(),
-            b_norm.data_ptr<scalar_t>(),
-            alpha.data_ptr<scalar_t>(),
-            HAS_S ? s.data_ptr<scalar_t>() : nullptr,
-            (b_lin.defined() && b_lin.numel() > 0) ? b_lin.data_ptr<scalar_t>() : nullptr,
-            out.data_ptr<scalar_t>(),
-            M, N, K
-        );
+        if (has_b_lin) {
+            norm_linear_fwd_kernel<scalar_t, NORM_KIND, HAS_S, true><<<grid, block>>>(
+                x_2d.data_ptr<scalar_t>(),
+                w_lin.data_ptr<scalar_t>(),
+                w_norm.data_ptr<scalar_t>(),
+                b_norm.data_ptr<scalar_t>(),
+                alpha.data_ptr<scalar_t>(),
+                HAS_S ? s.data_ptr<scalar_t>() : nullptr,
+                b_lin.data_ptr<scalar_t>(),
+                out.data_ptr<scalar_t>(),
+                M, N, K);
+        } else {
+            norm_linear_fwd_kernel<scalar_t, NORM_KIND, HAS_S, false><<<grid, block>>>(
+                x_2d.data_ptr<scalar_t>(),
+                w_lin.data_ptr<scalar_t>(),
+                w_norm.data_ptr<scalar_t>(),
+                b_norm.data_ptr<scalar_t>(),
+                alpha.data_ptr<scalar_t>(),
+                HAS_S ? s.data_ptr<scalar_t>() : nullptr,
+                nullptr,
+                out.data_ptr<scalar_t>(),
+                M, N, K);
+        }
     });
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "kernel launch: ", cudaGetErrorString(err));
