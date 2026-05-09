@@ -1,23 +1,21 @@
 #!/bin/bash
 #
-# 350M ablation leaderboard - rank 1 (new)
-# Optimizer: Aurora (Tilde Research, 2026), leverage-uniform polar.
-#            matrix LR 1e-2, scalar LR 1.5e-3, scalar WD 0, spectral scale,
-#            Nesterov, momentum 0.95, polar bf16, pp_iterations=2, pp_beta=0.5,
-#            12-step simple-quintic Newton-Schulz.
-# Architecture diff vs 12-aurora-qkn-derf: forces RMSNorm at QK
-# (APERTUS_DERF_QK_RMSNORM=1) to isolate block-norm vs QK-norm contribution
-# (per-head Derf on Q and K too — same dispatch). WD stays off
-# (default rule: shape-1 params skip WD).
-# Final loss: tba   Min loss: tba
-# W&B: (run added at submit)
-# Executed at git sha: tba
+# 350M ablation leaderboard - Aurora + QK-norm + Derf at block sites.
+# Optimizer: Aurora @ 1e-2 (same as 09-aurora-qkn).
+# Norm:      Derf (Chen et al. 2025) at input_layernorm / pre_mlp_layernorm /
+#            final_layernorm. RMSNorm at the per-head QK sites
+#            (APERTUS_DERF_QK_RMSNORM=1) — Derf at QK was tested separately
+#            and lost ~0.06 nats vs RMSNorm at QK.
+# Final loss: 2.217   Min loss: 2.057   (vs leader 2.185 / 2.025)
+# W&B: https://wandb.ai/ischlag/lm-research-baseline-dev/runs/94h3m6bs
+# Executed at git sha: dffead810
 #
-# Reference: https://blog.tilderesearch.com/blog/aurora
+# Reference: https://arxiv.org/abs/2512.10938 (Stronger Normalization-Free
+# Transformers — Derf = gamma * erf(alpha*x + s) + beta).
 #
 # To reproduce bitwise:
-#   git checkout <sha at submit time>
-#   sbatch _research/leaderboards/350m-ablation/runs/09-aurora-qkn.sbatch
+#   git checkout dffead810
+#   sbatch _research/leaderboards/350m-ablation/runs/10-aurora-qkn-derf-rmsqk.sbatch
 #
 #SBATCH --job-name=350m-abl-aurora-qkn-derf-rmsqk
 #SBATCH --time=01:00:00
