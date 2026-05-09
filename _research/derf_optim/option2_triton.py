@@ -113,10 +113,12 @@ def _norm_linear_fwd_kernel(
         b_lin = tl.load(b_lin_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
         accum += b_lin[None, :]
 
+    # Cast back to the output dtype. `x_tile` is loop-local in Triton, so we
+    # use the output pointer's element type instead.
     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(
         out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
-        accum.to(x_tile.dtype),
+        accum.to(out_ptr.dtype.element_ty),
         mask=out_mask,
     )
 
