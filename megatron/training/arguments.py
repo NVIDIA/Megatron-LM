@@ -3193,6 +3193,33 @@ def _add_mla_args(parser):
 
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
+    group.add_argument('--experimental-attention-variant',
+                       choices=['gated_delta_net', 'dsa', 'delta_net', 'kda'],
+                       default=None,
+                       help='Select the experimental attention variant. '
+                            'gated_delta_net: GDN (Yang et al. 2025); '
+                            'dsa: DeepSeek sparse attention; '
+                            'delta_net: Schlag et al. 2021 chunkwise; '
+                            'kda: Kimi Delta Attention (MoonshotAI 2025).')
+    group.add_argument('--linear-attention-allow-neg-eigval', action='store_true', default=False,
+                       help='Use beta = 2*sigmoid(...) (instead of sigmoid) so the delta-rule '
+                            'update (I - beta k k^T) admits eigenvalues in (-1, 1). Applies to '
+                            'gated_delta_net and delta_net variants. Grazzi et al. 2025; OLMo Hybrid.')
+    group.add_argument('--linear-attention-use-decay',
+                       action=argparse.BooleanOptionalAction, default=True,
+                       help='If True (default), the delta-rule layer uses per-head scalar decay '
+                            '(GDN). Pass --no-linear-attention-use-decay for vanilla DeltaNet '
+                            '(Schlag et al. 2021): forces g=0 so exp(g)=1.')
+    group.add_argument('--linear-attention-qk-norm',
+                       choices=['l2norm', 'rmsnorm'], default='l2norm',
+                       help='Normalization on Q,K after SiLU/conv1d. l2norm matches FLA/GDN '
+                            'default; rmsnorm is a learnable per-channel RMSNorm used for the '
+                            'Schlag-style DeltaNet variant.')
+    group.add_argument('--linear-attention-use-output-gate',
+                       action=argparse.BooleanOptionalAction, default=True,
+                       help='Apply sigmoid output gate after the output RMSNorm '
+                            '(FLA/GDN convention). Pass --no-linear-attention-use-output-gate '
+                            'for true Schlag-2021 vanilla DeltaNet (no output gate).')
     # Linear attention
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'

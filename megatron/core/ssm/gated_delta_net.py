@@ -53,6 +53,25 @@ except ImportError:
 
     HAVE_FLA = False
 
+
+class _PerChannelRMSNorm(nn.Module):
+    """Per-head-dim RMSNorm for Q,K in the Schlag-style DeltaNet variant.
+    Applied in float32 for numerical stability, cast back to input dtype.
+    Weight shape [head_dim], replicated across TP/heads (no cross-head reduction)."""
+
+    def __init__(self, head_dim: int, eps: float = 1e-6, dtype=torch.float32):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.ones(head_dim, dtype=dtype, device=torch.cuda.current_device())
+        )
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [..., head_dim]; reduce on last dim
+        v = x.float()
+        rms = torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (v * rms * self.weight).to(x.dtype)
+
 logger = logging.getLogger(__name__)
 
 
@@ -209,6 +228,14 @@ class GatedDeltaNet(MegatronModule):
             self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
+
+        # Optional per-head-dim RMSNorm for Q, K (Schlag-style DeltaNet variant)
+        if self.config.linear_attention_qk_norm == "rmsnorm":
+            self.qk_rmsnorm = _PerChannelRMSNorm(
+                self.key_head_dim, eps=self.config.layernorm_epsilon
+            )
+        else:
+            self.qk_rmsnorm = None
 
         # Output layernorm before projection
         self.out_norm = build_module(
@@ -448,9 +475,10 @@ class GatedDeltaNet(MegatronModule):
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])
         y = self.out_norm(x)
-        # Output gate
-        gate = gate.reshape(-1, gate.shape[-1])
-        y = y * self.act_fn(gate.float())
+        # Output gate (skipped for Schlag-style vanilla DeltaNet)
+        if self.config.linear_attention_use_output_gate:
+            gate = gate.reshape(-1, gate.shape[-1])
+            y = y * self.act_fn(gate.float())
         y = y.to(x_dtype)
         return y
 
@@ -471,9 +499,13 @@ class GatedDeltaNet(MegatronModule):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Apply L2 norm to query and key
+        # Apply normalization to query and key (l2norm by default; rmsnorm for Schlag variant)
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            query_key = query_key.contiguous()
+            if self.qk_rmsnorm is not None:
+                query_key = self.qk_rmsnorm(query_key)
+            else:
+                query_key = l2norm(query_key)
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
@@ -500,9 +532,18 @@ class GatedDeltaNet(MegatronModule):
         """
         Compute g (decay) and beta (sigmoid) for gated delta rule.
         Fuses exp, softplus, mul, neg, and sigmoid operations.
+        When config.linear_attention_allow_neg_eigval is True, beta is doubled so
+        that (I - beta k k^T) admits eigenvalues in (-1, 1) (OLMo Hybrid recipe).
+        When config.linear_attention_use_decay is False, g is forced to zero so
+        exp(g) == 1, recovering the vanilla Schlag-2021 DeltaNet (no decay).
         """
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
+        if self.config.linear_attention_use_decay:
+            g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # fp32
+        else:
+            g = torch.zeros_like(alpha, dtype=torch.float32)
         beta = beta.sigmoid()
+        if self.config.linear_attention_allow_neg_eigval:
+            beta = beta * 2.0
         return g, beta
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):

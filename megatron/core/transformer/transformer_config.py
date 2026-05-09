@@ -263,8 +263,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'delta_net', 'kda']] = None
+    """Type of attention variant to use. Supports gated_delta_net (Yang et al. 2025),
+    dsa (DeepSeek sparse attention), delta_net (Schlag et al. 2021 with chunkwise FLA op),
+    and kda (Kimi Delta Attention, MoonshotAI 2025)."""
 
     ####################
     # DSA
@@ -309,6 +311,26 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    linear_attention_allow_neg_eigval: bool = False
+    """If True, parameterize the delta-rule write strength as `beta = 2 * sigmoid(...)` so
+    `(I - beta k k^T)` admits eigenvalues in (-1, 1), unlocking state tracking
+    (Grazzi et al. 2025; OLMo Hybrid). Applies to gated_delta_net and delta_net variants."""
+
+    linear_attention_use_decay: bool = True
+    """If True (default), the delta-rule layer computes a per-head scalar decay g (gated_delta_net).
+    If False, decay is disabled (g forced to zero so exp(g)=1) for vanilla DeltaNet (Schlag et al.
+    2021). The corresponding alpha/dt_bias/A_log slots in the in-projection are still produced
+    but ignored to keep the projection layout uniform across variants."""
+
+    linear_attention_qk_norm: Literal['l2norm', 'rmsnorm'] = 'l2norm'
+    """Normalization applied to Q, K after the SiLU/conv1d in the delta-rule layer. 'l2norm' is the
+    FLA default for GDN/DeltaNet. 'rmsnorm' applies a learnable per-channel RMSNorm (used for
+    the Schlag-style DeltaNet variant in this repo)."""
+
+    linear_attention_use_output_gate: bool = True
+    """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
+    matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""
 
     ####################
     # initialization
@@ -1087,10 +1109,11 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.experimental_attention_variant == "gated_delta_net":
+        if self.experimental_attention_variant in ("gated_delta_net", "delta_net", "kda"):
             assert (
                 self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear gated_delta_net."
+            ), f"linear_attention_freq must be set for linear-attention variants " \
+               f"(got {self.experimental_attention_variant})."
 
             # Check required parameters
             assert (

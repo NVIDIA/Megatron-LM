@@ -137,10 +137,17 @@ def get_experimental_attention_variant_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    if config.experimental_attention_variant == "gated_delta_net":
+    if config.experimental_attention_variant in ("gated_delta_net", "delta_net"):
+        # Schlag DeltaNet ("delta_net") reuses the GDN module spec; the differences
+        # (use_decay, qk_norm, use_output_gate) are config-driven inside GatedDeltaNet.
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
+    elif config.experimental_attention_variant == "kda":
+        from megatron.core.ssm.kimi_delta_attention import (
+            get_kimi_delta_attention_module_spec,
+        )
+        return get_kimi_delta_attention_module_spec(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -287,7 +294,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
+    linear_attention_variants = ["gated_delta_net", "delta_net", "kda"]
     return experimental_attention_variant in linear_attention_variants
 
 
