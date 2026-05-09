@@ -59,10 +59,15 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """
 
     dynamic_context_parallel: bool = False
-    """Option to enable dynamic context parallelism. When setting this to True, 
+    """Option to enable dynamic context parallelism. When setting this to True,
     each sample should be divisible by the data parallel size * context parallel size * 2.
-    If sequence parallel is enabled, it should be divisible by the 
+    If sequence parallel is enabled, it should be divisible by the
     data parallel size * context parallel size * sequence parallel size * 2.
+    """
+
+    hybrid_context_parallel: bool = False
+    """Deprecated. Use ``dynamic_context_parallel`` instead. Kept for backwards
+    compatibility with callers that still pass this kwarg by its old name.
     """
 
     sequences_per_dataset: Optional[Dict[str, int]] = None

@@ -201,10 +201,19 @@ runs:
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
       run: |
-        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(uuidgen)
+        gen_uuid() {
+          if command -v uuidgen >/dev/null 2>&1; then
+            uuidgen
+          elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+            cat /proc/sys/kernel/random/uuid
+          else
+            python3 -c 'import uuid; print(uuid.uuid4())'
+          fi
+        }
+        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(gen_uuid)
         echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
         if [[ "$IS_UNIT_TEST" == "true" ]]; then
-          coverage_report=coverage-unit-test-${{ github.run_id }}-$(uuidgen)
+          coverage_report=coverage-unit-test-${{ github.run_id }}-$(gen_uuid)
         else
           coverage_report=none
         fi

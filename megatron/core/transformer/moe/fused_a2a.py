@@ -287,6 +287,7 @@ def init_hybrid_ep_buffer(
     num_blocks_permute: Optional[int] = None,
     num_blocks_unpermute: Optional[int] = None,
     fp8_dispatch: bool = False,
+    num_sms_preprocessing_api: Optional[int] = None,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -301,8 +302,8 @@ def init_hybrid_ep_buffer(
             Process group for HybridEP all-to-all communication.
         hidden_dim (int):
             Hidden dimension of the input tensor.
-        seq_len (int):
-            Maximum sequence length of the input tensor.
+        num_tokens (int):
+            Maximum number of tokens per rank for the buffer.
         num_local_experts (int):
             Number of local experts.
         num_sms_dispatch_api (Optional[int]):
@@ -329,6 +330,8 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_permute'] = num_blocks_permute
     if num_blocks_unpermute is not None:
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
+    if num_sms_preprocessing_api is not None:
+        kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
