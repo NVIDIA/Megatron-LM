@@ -54,6 +54,13 @@ except ImportError:
 
     HAVE_FLA = False
 
+try:
+    from fla.ops.gated_delta_product import chunk_gated_delta_product
+    HAVE_DP = True
+except ImportError:
+    chunk_gated_delta_product = None
+    HAVE_DP = False
+
 
 class _PerChannelRMSNorm(nn.Module):
     """Per-head-dim RMSNorm with learnable scale for Q,K in the Schlag-style
@@ -173,10 +180,23 @@ class GatedDeltaNet(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
+        # Number of Householder updates per token (DeltaProduct). 1 = standard GDN/DN.
+        self.n_hh = max(1, int(self.config.linear_attention_n_householder))
+        if self.n_hh > 1 and not HAVE_DP:
+            raise ImportError(
+                "DeltaProduct requires fla.ops.gated_delta_product.chunk_gated_delta_product. "
+                "Install/upgrade flash-linear-attention (fla-core>=0.5.0)."
+            )
+
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
-        # TODO: for now, output gate is forced for GDN.
-        # We may remove this restriction in the future.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.num_value_heads * 2
+        # The output gate (z) is per-token; q,k,v,beta,alpha are per-Householder.
+        self.in_proj_dim = (
+            self.n_hh * self.qk_dim * 2
+            + self.n_hh * self.v_dim
+            + self.v_dim                       # gate (per-token)
+            + self.n_hh * self.num_value_heads  # beta (per-Householder)
+            + self.n_hh * self.num_value_heads  # alpha (per-Householder)
+        )
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
@@ -197,8 +217,8 @@ class GatedDeltaNet(MegatronModule):
             tp_group=self.pg_collection.tp,
         )
 
-        # Conv1d for QKV
-        self.conv_dim = self.qk_dim * 2 + self.v_dim
+        # Conv1d for QKV (replicated per Householder for n_hh>1)
+        self.conv_dim = self.n_hh * (self.qk_dim * 2 + self.v_dim)
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
 
         # weight shape: [conv_dim, 1, d_conv]
@@ -242,7 +262,10 @@ class GatedDeltaNet(MegatronModule):
         setattr(self.A_log, "tensor_model_parallel", True)
         setattr(self.A_log, "partition_dim", 0)
 
-        if self.config.deterministic_mode:
+        if self.n_hh > 1:
+            # DeltaProduct kernel; chains n_hh Householder updates per token.
+            self.gated_delta_rule = chunk_gated_delta_product
+        elif self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
@@ -406,18 +429,19 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
+        n_hh = self.n_hh
         qkvzba = tensor_a2a_cp2hp(
             qkvzba,
             seq_dim=0,
             head_dim=-1,
             cp_group=self.pg_collection.cp,
             split_sections=[
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-                self.v_dim_local_tp,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
+                n_hh * self.qk_dim_local_tp,
+                n_hh * self.qk_dim_local_tp,
+                n_hh * self.v_dim_local_tp,
+                self.v_dim_local_tp,                              # gate (per-token)
+                n_hh * (self.num_value_heads // self.tp_size),
+                n_hh * (self.num_value_heads // self.tp_size),
             ],
         )
 
@@ -429,24 +453,30 @@ class GatedDeltaNet(MegatronModule):
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
+                n_hh * (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
                 self.v_dim_local_tp // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
+                n_hh * (self.num_value_heads // self.tp_size) // self.cp_size,
+                n_hh * (self.num_value_heads // self.tp_size) // self.cp_size,
             ],
             dim=-1,
         )
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-        beta = beta.reshape(batch, seq_len, -1)
-        alpha = alpha.reshape(batch, seq_len, -1)
+        # For DeltaProduct (n_hh > 1): interleave n Householder slots into seq dim so the
+        # FLA op sees each "logical token" as n consecutive entries.
+        if n_hh > 1:
+            beta = beta.reshape(batch, seq_len, n_hh, -1).reshape(batch, seq_len * n_hh, -1)
+            alpha = alpha.reshape(batch, seq_len, n_hh, -1).reshape(batch, seq_len * n_hh, -1)
+        else:
+            beta = beta.reshape(batch, seq_len, -1)
+            alpha = alpha.reshape(batch, seq_len, -1)
 
-        # Convolution on qkv
+        # Convolution on qkv (n_hh-replicated for DeltaProduct)
         nvtx_range_push(suffix="conv1d")
         seq_len = qkv.shape[1]
         qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
+            n_hh * self.qk_dim_local_tp,
+            n_hh * self.qk_dim_local_tp,
+            n_hh * self.v_dim_local_tp,
         ]
         conv1d_weight = get_parameter_local_cp(
             self.conv1d.weight,
@@ -489,10 +519,19 @@ class GatedDeltaNet(MegatronModule):
             )
         nvtx_range_pop(suffix="conv1d")
 
+        # For DeltaProduct: interleave n Householder slots into the seq dim. After this,
+        # the FLA op sees a sequence of length seq_len * n_hh, with each original token
+        # contributing n consecutive entries.
+        if n_hh > 1:
+            qkv = qkv.reshape(batch, seq_len, n_hh, -1).reshape(batch, seq_len * n_hh, -1)
+            fla_seq_len = seq_len * n_hh
+        else:
+            fla_seq_len = seq_len
+
         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
         query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-            qkv, gate, beta, alpha, batch, seq_len
+            qkv, gate, beta, alpha, batch, fla_seq_len
         )
         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
 
@@ -538,6 +577,7 @@ class GatedDeltaNet(MegatronModule):
         need_final_state = self._carry_enabled or log_state_stats
 
         nvtx_range_push(suffix="gated_delta_rule")
+        fla_extra_kwargs = {"num_householder": n_hh} if n_hh > 1 else {}
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
             query,
             key,
@@ -547,8 +587,18 @@ class GatedDeltaNet(MegatronModule):
             initial_state=initial_state,
             output_final_state=need_final_state,
             use_qk_l2norm_in_kernel=False,
+            **fla_extra_kwargs,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
+        # chunk_gated_delta_product returns one output per ORIGINAL token, but if its
+        # output happens to be n_hh-interleaved (returning [b, s*n, h, d_v]), reduce by
+        # taking every n_hh-th entry. Empirically the kernel returns [b, s, h, d_v].
+        if n_hh > 1 and core_attn_out.shape[1] != seq_len:
+            assert core_attn_out.shape[1] == seq_len * n_hh, (
+                f"unexpected core_attn_out shape {core_attn_out.shape}"
+            )
+            # Take the last Householder slot per token (the one that "reads")
+            core_attn_out = core_attn_out.reshape(batch, seq_len, n_hh, *core_attn_out.shape[2:])[:, :, -1]
 
         # Carry-over: keep full per-batch-element state (no mean reduction).
         if self._carry_enabled and last_recurrent_state is not None:

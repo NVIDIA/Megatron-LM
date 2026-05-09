@@ -339,6 +339,13 @@ class TransformerConfig(ModelParallelConfig):
     in the buffer for the next forward. Zero (default) disables the cap. Applied per-rank,
     per-batch-element on the buffer only; intra-forward state is not capped."""
 
+    linear_attention_n_householder: int = 1
+    """Number of Householder-style updates per token (DeltaProduct). 1 (default) recovers
+    standard DeltaNet/GDN. n>1 routes the FLA op to chunk_gated_delta_product, which chains
+    n rank-1 reflections per token. Each token must produce n sets of (q, k, v, beta, alpha);
+    in_proj output dim grows by ~n* for those slots while the output gate stays per-token.
+    Recurrence and projection compute scale ~n*."""
+
     linear_attention_use_output_gate: bool = True
     """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
     matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""
