@@ -207,6 +207,8 @@ def get_gpt_layer_with_transformer_engine_submodules(
     kitchen_attention_backend: str = "sdpa",
     mla_down_proj_fusion: bool = False,
     unfuse_norm: bool = False,
+    derf_optim: Optional[str] = None,
+    derf_norm_kind: Optional[str] = None,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -335,7 +337,29 @@ def get_gpt_layer_with_transformer_engine_submodules(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
-        if unfuse_norm:
+        if derf_optim == "compile":
+            # Option 1: torch.compile-fused (DyT|Derf + plain F.linear). The
+            # fused module subsumes the input/pre-mlp layernorm into the linear,
+            # mirroring TE's LayerNormColumnParallelLinear shape but in pure
+            # PyTorch so Inductor can fuse the elementwise norm into the matmul
+            # prologue. TP=1 only.
+            from _research.derf_optim.option1_compile import make_qkv_class
+            fused_cls = make_qkv_class(derf_norm_kind)
+            linear_qkv = fused_cls
+            input_layernorm = IdentityOp
+            pre_mlp_layernorm = IdentityOp
+            # Replace the dense MLP fc1 with the same fused class so pre_mlp
+            # also fuses. (No-op when num_experts is set.)
+            if num_experts is None:
+                mlp = ModuleSpec(
+                    module=mlp.module,
+                    submodules=MLPSubmodules(
+                        linear_fc1=fused_cls,
+                        linear_fc2=mlp.submodules.linear_fc2,
+                        activation_func=mlp.submodules.activation_func,
+                    ),
+                )
+        elif unfuse_norm:
             linear_qkv = backend.column_parallel_linear()
             input_layernorm = backend.layer_norm(has_residual=True)
             pre_mlp_layernorm = backend.layer_norm(has_residual=True)
