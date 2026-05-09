@@ -20,10 +20,13 @@
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIG(x)
 
 // 8 bf16/fp16 elements = 16 bytes (LDG.128). 4 fp32 elements = 16 bytes.
+// AT_DISPATCH_FLOATING_TYPES_AND2 surfaces c10::BFloat16 / c10::Half wrappers
+// (binary-compatible with __nv_bfloat16 / __half) plus float and double.
 template <typename scalar_t> struct VecBytes;
-template <> struct VecBytes<__nv_bfloat16> { static constexpr int VEC = 8; };
-template <> struct VecBytes<__half>        { static constexpr int VEC = 8; };
+template <> struct VecBytes<c10::BFloat16> { static constexpr int VEC = 8; };
+template <> struct VecBytes<c10::Half>     { static constexpr int VEC = 8; };
 template <> struct VecBytes<float>         { static constexpr int VEC = 4; };
+template <> struct VecBytes<double>        { static constexpr int VEC = 2; };
 
 
 template <int NORM_KIND>
