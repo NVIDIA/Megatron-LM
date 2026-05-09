@@ -1,13 +1,13 @@
 #!/bin/bash
 #
-# Option 2 throughput test: Triton fused (Derf + Linear).
-# Runs 200 iters of the Aurora @ 1e-2 recipe with --normalization Derf
-# and APERTUS_DERF_OPTIM=triton so the spec swaps in our fused composite.
+# Option 1 throughput test: torch.compile fused (DyT + nn.Linear).
+# Runs 200 iters of the Aurora @ 1e-2 recipe with --normalization DyT
+# and APERTUS_DERF_OPTIM=compile so the spec swaps in our fused composite.
 #
 # Reference (unfused Derf): ~217 TFLOP/s/GPU (job 2075996, mid-run).
 # Reference (RMSNorm baseline): ~310 TFLOP/s/GPU (Aurora rank 1).
 #
-#SBATCH --job-name=o2-derf-triton
+#SBATCH --job-name=o1-dyt-compile
 #SBATCH --time=00:20:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -43,8 +43,8 @@ export TMPDIR=$TMP_CACHE_DIR
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Option 1 switch.
-export APERTUS_DERF_OPTIM=triton
-# Option 2 uses Triton; no separate compile flag
+export APERTUS_DERF_OPTIM=compile
+export APERTUS_DERF_COMPILE=1
 
 mkdir -p $DATASET_CACHE_DIR $TRITON_CACHE_DIR $TORCHINDUCTOR_CACHE_DIR $TMP_CACHE_DIR $PACKAGE_DIR _research/results/runs _research/results/performance
 
@@ -52,10 +52,10 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=o2-derf-triton-$(git rev-parse --short HEAD)
+EXP_NAME=o1-dyt-compile-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=derf-optim-option2-triton
+export APERTUS_FEATURE=dyt-optim-option1-compile
 export APERTUS_TRACK=derf-throughput-bench
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=0
@@ -76,7 +76,7 @@ MEGATRON_ARGS=(
     --position-embedding-type rope
     --rotary-base 500000
     --make-vocab-size-divisible-by 128
-    --normalization Derf
+    --normalization DyT
     --swiglu
     --untie-embeddings-and-output-weights
     --attention-backend auto
@@ -156,6 +156,7 @@ ENV_SETUP="export MASTER_ADDR=$MASTER_ADDR; \
     export PYTHONPATH=$WORKDIR:$PACKAGE_DIR:$WORKDIR\${PYTHONPATH:+:\$PYTHONPATH}; \
     export PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF; \
     export APERTUS_DERF_OPTIM=$APERTUS_DERF_OPTIM; \
+    export APERTUS_DERF_COMPILE=$APERTUS_DERF_COMPILE; \
     cd $WORKDIR"
 
 TRAINING_CMD="bash $WORKDIR/_research/launch/install_python_deps.sh $PACKAGE_DIR && python3 $WORKDIR/pretrain_gpt.py $MEGATRON_ARGS_STR"

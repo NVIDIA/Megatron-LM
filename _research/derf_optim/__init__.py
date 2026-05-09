@@ -1,15 +1,18 @@
-"""Derf throughput optimization experiments.
+"""Throughput optimisation for the DyT/Derf normalisation path.
 
-Three approaches to recover the ~27% throughput lost from unfusing TE's
-LayerNormColumnParallelLinear when --normalization Derf is selected:
+When ``--normalization`` is `DyT` or `Derf`, the spec unfuses the TE
+LayerNormColumnParallelLinear (TE's fused norm-linear kernel only knows
+LayerNorm and RMSNorm), costing roughly 27% throughput vs the RMSNorm
+baseline at our 350M / bf16 / TP=1 shape.
 
-* option1_compile.py  -- torch.compile of (Derf + nn.Linear) composite
-* option2_triton.py   -- custom Triton fused norm-linear kernel
-* option3_te_patch/   -- vendored TE fork with Derf in the CUDA template
+This package provides one Python-side recovery path:
 
-Each option exposes a `make_qkv_class()` and `make_fc1_class()` factory that
-returns a class matching Megatron's expected `linear_qkv` / `linear_fc1`
-submodule interface (forward returns `(output, bias)` tuple), with the
-norm fused in. The spec wiring in `megatron/core/models/gpt/gpt_layer_specs.py`
-checks `APERTUS_DERF_OPTIM` and swaps these in when set.
+* ``option1_compile.py`` -- a TP=1 composite module that wraps the norm and
+  ``F.linear`` in a ``torch.compile(fullgraph=True)`` region. Inductor
+  fuses the elementwise norm into the matmul prologue, recovering most of
+  the throughput. Wired via ``APERTUS_DERF_OPTIM=compile``.
+
+See ``RESULTS.md`` for the empirical comparison against five other
+approaches (Triton-fused matmul, hand-rolled CUDA, TE-style two-kernel
+pipeline, etc.) and why this is the recommended ship.
 """

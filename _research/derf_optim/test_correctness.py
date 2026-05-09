@@ -1,9 +1,9 @@
-"""Forward + backward correctness gate for Derf/DyT optimization options.
+"""Forward + backward correctness gate for the Option 1 fused (DyT|Derf + linear).
 
-Run as ``python -m _research.derf_optim.test_correctness --option 1``.
-Asserts each candidate fused implementation matches a pure-Python (Derf|DyT) +
-nn.Linear reference within 1e-3 relative on forward output, parameter grads,
-and input grad. Run before launching a throughput sbatch.
+Run as ``python -m _research.derf_optim.test_correctness --dtype fp32`` (or bf16).
+Asserts the torch.compile-wrapped composite matches a pure-Python
+``norm(x) + F.linear`` reference within tolerance on forward output, parameter
+grads, and input grad.
 """
 
 from __future__ import annotations
@@ -88,8 +88,6 @@ def test_option1(seq=64, batch=2, hidden=128, output=192, dtype=torch.float32):
     print(f"[option1] dtype={dtype} seq={seq} batch={batch} hidden={hidden} output={output}")
     from _research.derf_optim.option1_compile import _compiled_derf_linear, _compiled_dyt_linear
 
-    # bf16 has 7 mantissa bits; tolerance must accommodate single-rounding drift
-    # between the eager and compiled paths (Inductor may reorder additions).
     # bf16 has 7 mantissa bits; reductions can drift relative to fp32 reference
     # by a few percent at small magnitudes. Tolerances tuned for cumulative
     # gradients across seq*batch reduction (the largest source of drift).
@@ -105,105 +103,13 @@ def test_option1(seq=64, batch=2, hidden=128, output=192, dtype=torch.float32):
     return ok
 
 
-def test_option2(seq=64, batch=2, hidden=128, output=192, dtype=torch.float32):
-    """Option 2: Triton fused (Derf|DyT)+linear, save x for backward, recompute pre."""
-    print(f"[option2] dtype={dtype} seq={seq} batch={batch} hidden={hidden} output={output}")
-    import torch.nn.functional as F
-    from _research.derf_optim.option2_triton import _triton_derf_linear, _triton_dyt_linear
-
-    if dtype is torch.bfloat16:
-        rtol, atol = 1e-1, 5e-2
-    else:
-        # fp32 backward goes through Triton fwd then fp32 PyTorch ops; matmul
-        # paths differ from eager (fp32 cuBLAS). Allow a touch more drift.
-        rtol, atol = 5e-3, 1e-3
-
-    # Triton requires CUDA. Skip if no GPU.
-    if not torch.cuda.is_available():
-        print("[option2] SKIP (no CUDA)")
-        return True
-
-    device = "cuda"
-
-    def _eager_derf_full(x, w_lin, w_norm, b_norm, alpha, s, b_lin):
-        return _eager_derf_linear(x, w_lin, w_norm, b_norm, alpha, s, b_lin)
-
-    def _triton_derf_full(x, w_lin, w_norm, b_norm, alpha, s, b_lin):
-        return _triton_derf_linear(x, w_lin, w_norm, b_norm, alpha, s, b_lin)
-
-    def _eager_dyt_full(x, w_lin, w_norm, b_norm, alpha, b_lin):
-        return _eager_dyt_linear(x, w_lin, w_norm, b_norm, alpha, b_lin)
-
-    def _triton_dyt_full(x, w_lin, w_norm, b_norm, alpha, b_lin):
-        return _triton_dyt_linear(x, w_lin, w_norm, b_norm, alpha, b_lin)
-
-    ok = True
-    ok &= _run_pair(_eager_derf_full, _triton_derf_full, True,  "Derf-tri", seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
-    ok &= _run_pair(_eager_dyt_full,  _triton_dyt_full,  False, "DyT-tri",  seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
-    print(f"[option2] {'OK' if ok else 'FAIL'}")
-    return ok
-
-
-def test_option3(seq=64, batch=2, hidden=128, output=192, dtype=torch.float32):
-    """Option 3: CUDA fused (Derf|DyT)+linear, save x, recompute pre."""
-    print(f"[option3] dtype={dtype} seq={seq} batch={batch} hidden={hidden} output={output}")
-    if not torch.cuda.is_available():
-        print("[option3] SKIP (no CUDA)")
-        return True
-    from _research.derf_optim.option3_cuda import _cuda_derf_linear, _cuda_dyt_linear
-
-    if dtype is torch.bfloat16:
-        rtol, atol = 1e-1, 5e-2
-    else:
-        rtol, atol = 5e-3, 1e-3
-
-    device = "cuda"
-
-    ok = True
-    ok &= _run_pair(_eager_derf_linear, _cuda_derf_linear, True,  "Derf-cu", seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
-    ok &= _run_pair(_eager_dyt_linear,  _cuda_dyt_linear,  False, "DyT-cu",  seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
-    print(f"[option3] {'OK' if ok else 'FAIL'}")
-    return ok
-
-
-def test_option4(seq=64, batch=2, hidden=128, output=192, dtype=torch.float32):
-    """Option 4: Triton norm-only + F.linear (cuBLAS), TE-style two-kernel pipeline."""
-    print(f"[option4] dtype={dtype} seq={seq} batch={batch} hidden={hidden} output={output}")
-    if not torch.cuda.is_available():
-        print("[option4] SKIP (no CUDA)")
-        return True
-    from _research.derf_optim.option4_te_style import _te_style_derf_linear, _te_style_dyt_linear
-
-    if dtype is torch.bfloat16:
-        rtol, atol = 1e-1, 5e-2
-    else:
-        rtol, atol = 5e-3, 1e-3
-
-    device = "cuda"
-    ok = True
-    ok &= _run_pair(_eager_derf_linear, _te_style_derf_linear, True,  "Derf-te4", seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
-    ok &= _run_pair(_eager_dyt_linear,  _te_style_dyt_linear,  False, "DyT-te4",  seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
-    print(f"[option4] {'OK' if ok else 'FAIL'}")
-    return ok
-
-
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--option", choices=["1", "2", "3", "4"], default="1")
     p.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
     args = p.parse_args()
 
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
-    if args.option == "1":
-        ok = test_option1(dtype=dtype)
-    elif args.option == "2":
-        ok = test_option2(dtype=dtype)
-    elif args.option == "3":
-        ok = test_option3(dtype=dtype)
-    elif args.option == "4":
-        ok = test_option4(dtype=dtype)
-    else:
-        raise NotImplementedError(f"option {args.option} test not yet wired")
+    ok = test_option1(dtype=dtype)
     sys.exit(0 if ok else 1)
 
 
