@@ -156,7 +156,6 @@ ENV_SETUP="export MASTER_ADDR=$MASTER_ADDR; \
     export PYTHONPATH=$WORKDIR:$PACKAGE_DIR:$WORKDIR\${PYTHONPATH:+:\$PYTHONPATH}; \
     export PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF; \
     export APERTUS_DERF_OPTIM=$APERTUS_DERF_OPTIM; \
-    # (no compile flag for option2) \
     cd $WORKDIR"
 
 TRAINING_CMD="bash $WORKDIR/_research/launch/install_python_deps.sh $PACKAGE_DIR && python3 $WORKDIR/pretrain_gpt.py $MEGATRON_ARGS_STR"
