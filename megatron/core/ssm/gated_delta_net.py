@@ -535,12 +535,14 @@ class GatedDeltaNet(MegatronModule):
         When config.linear_attention_allow_neg_eigval is True, beta is doubled so
         that (I - beta k k^T) admits eigenvalues in (-1, 1) (OLMo Hybrid recipe).
         When config.linear_attention_use_decay is False, g is forced to zero so
-        exp(g) == 1, recovering the vanilla Schlag-2021 DeltaNet (no decay).
+        exp(g) == 1, recovering the vanilla Schlag-2021 DeltaNet (no decay). The
+        decay computation still flows so A_log and dt_bias receive zero gradient
+        rather than no gradient (Megatron's DDP asserts every parameter sees a
+        grad each step).
         """
-        if self.config.linear_attention_use_decay:
-            g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # fp32
-        else:
-            g = torch.zeros_like(alpha, dtype=torch.float32)
+        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # fp32
+        if not self.config.linear_attention_use_decay:
+            g = g * 0.0
         beta = beta.sigmoid()
         if self.config.linear_attention_allow_neg_eigval:
             beta = beta * 2.0
