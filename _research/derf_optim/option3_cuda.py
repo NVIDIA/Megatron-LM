@@ -64,7 +64,8 @@ class _DerfLinearCudaFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_norm, b_norm, alpha, s, w_lin, b_lin):
         ext = _ensure_loaded()
-        out = ext.derf_linear_fwd(x.contiguous(), w_lin.contiguous(), w_norm, b_norm, alpha, s, b_lin)
+        b_lin_arg = b_lin if b_lin is not None else torch.empty(0, dtype=x.dtype, device=x.device)
+        out = ext.derf_linear_fwd(x.contiguous(), w_lin.contiguous(), w_norm, b_norm, alpha, s, b_lin_arg)
         ctx.save_for_backward(x, w_norm, b_norm, alpha, s, w_lin)
         ctx.has_linear_bias = b_lin is not None
         return out
@@ -100,7 +101,8 @@ class _DyTLinearCudaFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_norm, b_norm, alpha, w_lin, b_lin):
         ext = _ensure_loaded()
-        out = ext.dyt_linear_fwd(x.contiguous(), w_lin.contiguous(), w_norm, b_norm, alpha, b_lin)
+        b_lin_arg = b_lin if b_lin is not None else torch.empty(0, dtype=x.dtype, device=x.device)
+        out = ext.dyt_linear_fwd(x.contiguous(), w_lin.contiguous(), w_norm, b_norm, alpha, b_lin_arg)
         ctx.save_for_backward(x, w_norm, b_norm, alpha, w_lin)
         ctx.has_linear_bias = b_lin is not None
         return out

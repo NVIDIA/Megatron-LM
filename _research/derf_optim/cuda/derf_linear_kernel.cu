@@ -109,7 +109,7 @@ torch::Tensor _launch_fwd(
     torch::Tensor b_norm,
     torch::Tensor alpha,
     torch::Tensor s,
-    c10::optional<torch::Tensor> b_lin
+    torch::Tensor b_lin  /* empty () when no bias */
 ) {
     int M = x_2d.size(0);
     int K = x_2d.size(1);
@@ -129,7 +129,7 @@ torch::Tensor _launch_fwd(
             b_norm.data_ptr<scalar_t>(),
             alpha.data_ptr<scalar_t>(),
             HAS_S ? s.data_ptr<scalar_t>() : nullptr,
-            b_lin.has_value() ? b_lin.value().data_ptr<scalar_t>() : nullptr,
+            (b_lin.defined() && b_lin.numel() > 0) ? b_lin.data_ptr<scalar_t>() : nullptr,
             out.data_ptr<scalar_t>(),
             M, N, K
         );
@@ -147,11 +147,11 @@ torch::Tensor derf_linear_fwd(
     torch::Tensor b_norm,
     torch::Tensor alpha,
     torch::Tensor s,
-    c10::optional<torch::Tensor> b_lin
+    torch::Tensor b_lin  /* empty () when no bias */
 ) {
     CHECK_INPUT(x); CHECK_INPUT(w_lin); CHECK_INPUT(w_norm); CHECK_INPUT(b_norm);
     CHECK_INPUT(alpha); CHECK_INPUT(s);
-    if (b_lin.has_value()) CHECK_INPUT(b_lin.value());
+    if (b_lin.defined() && b_lin.numel() > 0) CHECK_INPUT(b_lin);
 
     auto orig_shape = x.sizes().vec();
     int K = orig_shape.back();
@@ -171,11 +171,11 @@ torch::Tensor dyt_linear_fwd(
     torch::Tensor w_norm,
     torch::Tensor b_norm,
     torch::Tensor alpha,
-    c10::optional<torch::Tensor> b_lin
+    torch::Tensor b_lin  /* empty () when no bias */
 ) {
     CHECK_INPUT(x); CHECK_INPUT(w_lin); CHECK_INPUT(w_norm); CHECK_INPUT(b_norm);
     CHECK_INPUT(alpha);
-    if (b_lin.has_value()) CHECK_INPUT(b_lin.value());
+    if (b_lin.defined() && b_lin.numel() > 0) CHECK_INPUT(b_lin);
 
     auto orig_shape = x.sizes().vec();
     int K = orig_shape.back();
