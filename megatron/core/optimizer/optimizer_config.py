@@ -327,6 +327,22 @@ class OptimizerConfig:
     adaptive_muon_eps: float = 1e-8
     """The eps parameter for the Adaptive Muon optimizer."""
 
+    # Aurora (Tilde Research, 2026): Muon with leverage-uniform polar update.
+    # Reuses muon_momentum / muon_nesterov / muon_scalar_* / muon_scale_mode.
+    polar_precision: str = "bf16"
+    """Precision for Aurora's polar Newton-Schulz iteration. 'bf16' (default) matches
+    Tilde's reference and Keller Jordan modded-nanogpt track-3. Affects Aurora only;
+    Muon uses muon_fp32_matmul_prec for its polar."""
+
+    aurora_pp_iterations: int = 2
+    """Number of alternating polar+rebalance passes in Aurora. Default 2 (Tilde)."""
+
+    aurora_pp_beta: float = 0.5
+    """Damping exponent for Aurora's row-norm rebalancing, in (0, 1]. Default 0.5."""
+
+    aurora_num_ns_steps: int = 12
+    """Newton-Schulz iterations inside Aurora's polar. Default 12 (Tilde)."""
+
     #######################
     # Distributed optimizer
     #######################

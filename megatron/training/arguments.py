@@ -2338,6 +2338,29 @@ def _add_regularization_args(parser):
                        help='Second-moment accumulation method for adaptive_muon. '
                        '"normuon" applies per-row (neuron) normalisation after '
                        'Newton-Schulz (NorMuon, arXiv 2510.05491). Default "adamuon".')
+    # Aurora optimizer flags (Tilde Research, 2026; arXiv blog post). Aurora is
+    # structurally Muon with a leverage-uniform polar update; it reuses the
+    # --muon-momentum / --muon-nesterov / --muon-scalar-* flags via the shared
+    # 'muon' prefix in emerging_optimizers._aurora_config_to_kwargs.
+    group.add_argument('--polar-precision', type=str, default='bf16',
+                       choices=['bf16', 'fp32'],
+                       help='Precision for Aurora\'s polar (Newton-Schulz) iteration. '
+                       'Default bf16 matches Tilde\'s reference impl and Keller Jordan\'s '
+                       'modded-nanogpt track-3. Affects Aurora only; Muon uses '
+                       '--muon-fp32-matmul-prec for its own polar precision.')
+    group.add_argument('--aurora-pp-iterations', type=int, default=2,
+                       help='Number of alternating polar+rebalance passes in Aurora\'s '
+                       'leverage-uniform projection. Higher refines toward the row-uniform '
+                       'fixed point at the cost of one extra polar() call per iteration. '
+                       'Default 2 (Tilde reference).')
+    group.add_argument('--aurora-pp-beta', type=float, default=0.5,
+                       help='Damping exponent for Aurora\'s row-norm rebalancing step, '
+                       'in (0, 1]. Default 0.5 (undamped square-root step). Lower values '
+                       'damp oscillation between odd/even D iterates.')
+    group.add_argument('--aurora-num-ns-steps', type=int, default=12,
+                       help='Number of Newton-Schulz iterations inside Aurora\'s polar '
+                       'function. Default 12 (Tilde reference); drives all input '
+                       'singular values in (0, sqrt(2)) to ~1 within bf16 precision.')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')
@@ -2560,7 +2583,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon', 'aurora'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')

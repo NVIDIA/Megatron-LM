@@ -165,7 +165,9 @@ def get_mup_config_overrides(
     optimizer_type_lower = optimizer_type.lower()
     is_sgd_optimizer = optimizer_type_lower == 'sgd'
     is_adam_optimizer = 'adam' in optimizer_type_lower
-    is_muon_optimizer = 'muon' in optimizer_type_lower
+    # Aurora is structurally Muon (matrix-only spectral update), so it shares
+    # the muon scalar-group routing and MuP matrix-managed predicates.
+    is_muon_optimizer = 'muon' in optimizer_type_lower or 'aurora' in optimizer_type_lower
 
     decoupled_lr_enabled = config.decoupled_lr is not None
     if decoupled_lr_enabled:
@@ -786,7 +788,7 @@ def _get_megatron_emerging_optimizer(
     # (Adam/Lion) group when --muon-scalar-lr / --muon-scalar-weight-decay are
     # set. combine_param_group_overrides merges the {optimizer: adam} route
     # registered above with these lr/wd fields into a single override.
-    if eopt_name in ('muon', 'adaptive_muon'):
+    if eopt_name in ('muon', 'adaptive_muon', 'aurora'):
         muon_scalar_lr = getattr(config, 'muon_scalar_lr', None)
         muon_scalar_wd = getattr(config, 'muon_scalar_weight_decay', None)
 

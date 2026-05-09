@@ -40,6 +40,8 @@ except ImportError:
     OrthogonalizedOptimizer = object
     AdaptiveMuon = object
 
+from .aurora import TensorParallelAurora
+
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +399,24 @@ def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     return kwargs
 
 
+def _aurora_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Convert OptimizerConfig to TensorParallelAurora constructor kwargs.
+
+    Aurora reuses muon_* fields for shared knobs (momentum, nesterov, scale_mode,
+    scalar group routing) and adds aurora_* / polar_precision fields for its own
+    hyperparameters.
+    """
+    kwargs = _kwargs_from_config(TensorParallelAurora, "muon", config)
+    # Aurora-specific fields (polar_precision, pp_iterations, pp_beta, num_ns_steps)
+    # are exposed under their own prefix; pull them in and let _kwargs_from_config's
+    # name fallback handle polar_precision (no prefix needed since it's a global flag).
+    kwargs.update(_kwargs_from_config(TensorParallelAurora, "aurora", config))
+    kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
+    kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
+    kwargs["pg_collection"] = pg_collection
+    return kwargs
+
+
 def _default_adam_based_eopt_config_to_kwargs(
     eopt_name, config, model_chunks, pg_collection
 ) -> Dict[str, Any]:
@@ -427,6 +447,18 @@ _EMERGING_OPTIMIZERS.update(
             optimizer_cls=TensorParallelAdaptiveMuon,
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_adaptive_muon_config_to_kwargs,
+            default_param_overrides={
+                ParamKey(
+                    predicate=ParamPredicate(
+                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
+                    )
+                ): {'optimizer': 'adam'}
+            },
+        ),
+        "aurora": EmergingOptimizerEntry(
+            optimizer_cls=TensorParallelAurora,
+            init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=_aurora_config_to_kwargs,
             default_param_overrides={
                 ParamKey(
                     predicate=ParamPredicate(
