@@ -332,6 +332,26 @@ class TransformerConfig(ModelParallelConfig):
     """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
     matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""
 
+    linear_attention_qk_norm_init_scale: float = 1.0
+    """Multiplier applied to the QK-RMSNorm weight init for the Schlag DeltaNet variant. The
+    base init is 1/sqrt(head_dim) (unit-norm output); values < 1 produce sub-unit-norm Q,K which
+    leaves a stability margin for delta-rule eigenvalues, useful for the neg-eigval variant."""
+
+    linear_attention_beta_scale: float = 1.0
+    """Post-sigmoid multiplier on the delta-rule write strength beta. With allow_neg_eigval the
+    base beta is 2*sigmoid(...); a scale of 0.95 caps beta at 1.9. Without allow_neg_eigval the
+    base is sigmoid(...); a scale of 0.9 caps beta at 0.9."""
+
+    linear_attention_beta_bias_init: float = 0.0
+    """Additive bias on the beta projection logit (pre-sigmoid). A negative value (e.g. -2) makes
+    beta start near 0.12 instead of 0.5, slowing initial writes so the recurrent state forms
+    before strong updates land. Adds a small per-head learnable parameter."""
+
+    linear_attention_learnable_initial_state: bool = False
+    """If True, learn a per-head initial state S0 of shape [num_v_heads_local_tp, key_head_dim,
+    value_head_dim] and pass it as `initial_state` to the FLA chunkwise op. Useful for cold-start:
+    the first few tokens of each sequence read from a learned baseline rather than zero."""
+
     ####################
     # initialization
     ####################

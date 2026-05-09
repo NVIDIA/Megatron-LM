@@ -67,9 +67,15 @@ class _PerChannelRMSNorm(nn.Module):
     norm ~sqrt(d_k); we deliberately deviate to keep the variant comparable to
     L2norm-based variants while still exposing a learnable per-channel scale."""
 
-    def __init__(self, head_dim: int, eps: float = 1e-6, dtype=torch.float32):
+    def __init__(
+        self,
+        head_dim: int,
+        eps: float = 1e-6,
+        dtype=torch.float32,
+        init_scale: float = 1.0,
+    ):
         super().__init__()
-        init = head_dim ** -0.5
+        init = init_scale * (head_dim ** -0.5)
         self.weight = nn.Parameter(
             torch.full(
                 (head_dim,), init, dtype=dtype, device=torch.cuda.current_device()
@@ -243,10 +249,45 @@ class GatedDeltaNet(MegatronModule):
         # Optional per-head-dim RMSNorm for Q, K (Schlag-style DeltaNet variant)
         if self.config.linear_attention_qk_norm == "rmsnorm":
             self.qk_rmsnorm = _PerChannelRMSNorm(
-                self.key_head_dim, eps=self.config.layernorm_epsilon
+                self.key_head_dim,
+                eps=self.config.layernorm_epsilon,
+                init_scale=self.config.linear_attention_qk_norm_init_scale,
             )
         else:
             self.qk_rmsnorm = None
+
+        # Optional learnable beta logit bias (idea: small beta at init slows initial writes).
+        # Per-head, broadcast over batch + seq when added to the projected beta logit.
+        if self.config.linear_attention_beta_bias_init != 0.0:
+            self.beta_bias = nn.Parameter(
+                torch.full(
+                    (self.num_value_heads // self.tp_size,),
+                    float(self.config.linear_attention_beta_bias_init),
+                    dtype=config.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            )
+            setattr(self.beta_bias, "tensor_model_parallel", True)
+            setattr(self.beta_bias, "partition_dim", 0)
+        else:
+            self.beta_bias = None
+
+        # Optional learnable initial state S0 per head (cold-start helper).
+        if self.config.linear_attention_learnable_initial_state:
+            num_v_heads_local = self.num_value_heads // self.tp_size
+            self.initial_state_param = nn.Parameter(
+                torch.zeros(
+                    num_v_heads_local,
+                    self.key_head_dim,
+                    self.value_head_dim,
+                    dtype=config.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            )
+            setattr(self.initial_state_param, "tensor_model_parallel", True)
+            setattr(self.initial_state_param, "partition_dim", 0)
+        else:
+            self.initial_state_param = None
 
         # Output layernorm before projection
         self.out_norm = build_module(
@@ -445,6 +486,16 @@ class GatedDeltaNet(MegatronModule):
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
+        # Optional learnable initial state: broadcast per-head S0 over batch
+        if self.initial_state_param is not None:
+            initial_state = (
+                self.initial_state_param.unsqueeze(0)
+                .expand(batch, -1, -1, -1)
+                .contiguous()
+            )
+        else:
+            initial_state = None
+
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
             query,
@@ -452,7 +503,7 @@ class GatedDeltaNet(MegatronModule):
             value,
             g=g,
             beta=beta,
-            initial_state=None,
+            initial_state=initial_state,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
         )
@@ -550,13 +601,19 @@ class GatedDeltaNet(MegatronModule):
         decay computation still flows so A_log and dt_bias receive zero gradient
         rather than no gradient (Megatron's DDP asserts every parameter sees a
         grad each step).
+        Optional ablations (linear_attention_beta_bias_init, _beta_scale) apply a
+        learnable additive bias on the beta logit and a post-sigmoid scale.
         """
         g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # fp32
         if not self.config.linear_attention_use_decay:
             g = g * 0.0
+        if self.beta_bias is not None:
+            beta = beta + self.beta_bias
         beta = beta.sigmoid()
         if self.config.linear_attention_allow_neg_eigval:
             beta = beta * 2.0
+        if self.config.linear_attention_beta_scale != 1.0:
+            beta = beta * self.config.linear_attention_beta_scale
         return g, beta
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
