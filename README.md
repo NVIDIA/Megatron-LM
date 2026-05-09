@@ -167,6 +167,24 @@ The JSONL writer scales O(1) per step (no full-file rewrite). An analysis
 loader at `_research/analyse/load_runs.py` reads both the new JSONL format and
 legacy single-file JSON for backward compatibility.
 
+**Aurora-style neuron utilization** (`APERTUS_LOG_ROW_CV`, `APERTUS_LOG_NEURON_STATS`).
+Two complementary probes for the dead-neuron / row-imbalance pathology described
+in Tilde's [Aurora optimizer post](https://blog.tilderesearch.com/blog/aurora):
+Muon's polar update on tall matrices does not balance row norms, so over training
+some MLP neurons receive persistently small updates and stop contributing.
+
+- `row_cv` (free, every step): per-2D-parameter `std/mean` of row L2 norms.
+  Cumulative effect on the weight matrix; expected to be near-flat for AdamW
+  and Aurora, drift upward for plain Muon. Logged for every matrix param so
+  per-MLP / per-attention trends are visible.
+- `neuron_stats` (opt-in, every `APERTUS_LOG_NEURON_INTERVAL` steps): forward
+  pre-hook on each `*.mlp.linear_fc2` taps the post-gate-mul activation
+  (`[s, b, d_ff]`); per-neuron mean\|x\| accumulates each microbatch and is
+  summarized per layer (`mean`, `cv`, `dead_frac`, `p10`/`p50`/`p90`). The
+  activation-side counterpart of `row_cv`.
+
+Both metrics are rank-local (per TP/EP shard); see `_research/logging_patch/README.md`.
+
 ### Muon / NorMuon (`--optimizer muon`, `--optimizer adaptive_muon`)
 
 Muon uses Newton-Schulz orthogonalization on the momentum matrix to take
