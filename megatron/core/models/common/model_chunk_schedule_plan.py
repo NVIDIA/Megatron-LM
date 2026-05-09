@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -179,18 +180,27 @@ class TransformerLayerSchedulePlan:
             self.mlp.manual_grads_release = False
             self.moe_combine.manual_grads_release = False
 
-    def get_fp8_context(self):
+    def get_low_precision_context(self):
         """
-        Get the fp8 context for the transformer layer.
+        Get the low precision context for the transformer layer.
         """
+
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
         use_inner_fp8_context = (
             self.layer.config.fp8 and self.layer.config.fp8_recipe != Fp8Recipe.delayed
         )
-        return (
-            get_fp8_context(self.layer.config, self.layer.layer_number - 1)
-            if use_inner_fp8_context
-            else nullcontext()
+        use_inner_fp4_context = (
+            self.layer.config.fp4 and not isinstance(self.layer, MultiTokenPredictionLayer)
         )
+
+        if use_inner_fp8_context:
+            low_precision_context = get_fp8_context(self.layer.config, self.layer.layer_number - 1)
+        elif use_inner_fp4_context:
+            low_precision_context = get_fp4_context(self.layer.config, self.layer.layer_number - 1)
+        else:
+            nullcontext()
+        return low_precision_context
 
     @staticmethod
     def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
@@ -223,14 +233,14 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.attn.forward(f_input)
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.moe_dispatch.forward(f_input)
 
         if b_layer is not None:
@@ -241,18 +251,18 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.attn.backward(b_grad)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.mlp.forward(f_input)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.moe_combine.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.mtp_post_process.forward(f_input)
 
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
