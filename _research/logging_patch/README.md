@@ -23,7 +23,8 @@ Because `PYTHONPATH=$WORKDIR` is set in the sbatch scripts, the package is impor
 | `APERTUS_FEATURE`                | git branch                           | Feature label for the run (override if different from branch) |
 | `APERTUS_DETERMINISTIC`          | unset                                | `1` enables deterministic cudnn + `torch.use_deterministic_algorithms` |
 | `APERTUS_LOG_PER_LAYER_GRADS`    | unset                                | `1` emits `per_layer_grad_norm` dict per step (~1 float per parameter tensor) |
-| `APERTUS_LOG_ACT_STATS`          | `1` (on)                             | `0` disables the forward hooks on every attention + mlp submodule; otherwise emits `act_stats` per step |
+| `APERTUS_LOG_ACT_STATS`          | `1` (on)                             | `0` disables the forward hooks on every attention + mlp submodule; otherwise emits `act_stats` per step (`amax`, `l2`, `frac_outlier`, `rms`) |
+| `APERTUS_LOG_ACT_THRESHOLD`      | `240`                                | Threshold used by the `frac_outlier` activation stat: mean fraction of \|x\| > T per block. Default mirrors NVIDIA's E4M3 input range proxy (E4M3 max = 448; scale headroom kept at ~240). |
 | `APERTUS_LOG_LOSS_SPIKES`        | unset                                | `1` emits a boolean `loss_spike` per step based on rolling z-score |
 | `APERTUS_LOG_TOP1_ACC`           | `1` (on)                             | `0` disables top-1 next-token accuracy; otherwise emits `top1_accuracy` per log interval and mirrors to wandb |
 
@@ -54,7 +55,7 @@ One file per run: `<log_dir>/<run_name>.json`. Rewritten atomically every log in
     "params_norm": [123.4, ...],
     "tput":        [12345.6, ...],
     "per_layer_grad_norm": [ {"decoder.layers.0.self_attention...": 0.12, ...}, ... ],
-    "act_stats":   [ {"decoder.layers.0.self_attention": {"norm_mean": 42.1, "max": 128.0}, ...}, ... ],
+    "act_stats":   [ {"decoder.layers.0.self_attention": {"amax": 128.0, "l2": 42.1, "frac_outlier": 0.0, "rms": 1.3}, ...}, ... ],
     "loss_spike":  [false, false, ...],
     "top1_accuracy": [0.01, 0.02, ...]
   }

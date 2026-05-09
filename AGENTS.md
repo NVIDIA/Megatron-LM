@@ -65,7 +65,10 @@ git checkout <sha> && sbatch _research/leaderboards/<size>/runs/NN-*.sbatch
   new site, edit the header block and `--data-path`; the rest is
   portable.
 - **Commits are not signed with AI attributions**. Don't push to `main`;
-  open a PR.
+  open a PR against `ischlag/megatron-lm-research-baseline` (this fork).
+  Never open a PR against `NVIDIA/Megatron-LM` upstream — `gh repo
+  set-default` is already configured to the fork, so plain
+  `gh pr create` is correct; do not pass `--repo NVIDIA/Megatron-LM`.
 - **Sync with upstream**: `git fetch upstream && git merge upstream/main`.
   Expect conflicts only in the files listed above.
 
