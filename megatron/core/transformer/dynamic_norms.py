@@ -16,8 +16,18 @@ parameters are replicated, not TP-sharded).
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
+
+
+def _env_float(key: str, default: float) -> float:
+    """Read an init-time hyperparameter from an env var, with default."""
+    val = os.environ.get(key)
+    if val is None or val == "":
+        return default
+    return float(val)
 
 
 class DyT(nn.Module):
@@ -42,6 +52,9 @@ class DyT(nn.Module):
         if hidden_size is None:
             raise ValueError("DyT requires hidden_size")
         self.hidden_size = hidden_size
+        # APERTUS_DERF_ALPHA_INIT lets a single env var override alpha_init
+        # across all DyT/Derf sites. Useful for sweeps.
+        alpha_init = _env_float("APERTUS_DERF_ALPHA_INIT", alpha_init)
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.bias = nn.Parameter(torch.zeros(hidden_size))
@@ -75,6 +88,8 @@ class Derf(nn.Module):
         if hidden_size is None:
             raise ValueError("Derf requires hidden_size")
         self.hidden_size = hidden_size
+        alpha_init = _env_float("APERTUS_DERF_ALPHA_INIT", alpha_init)
+        s_init = _env_float("APERTUS_DERF_S_INIT", s_init)
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
         self.s = nn.Parameter(torch.tensor(float(s_init)))
         self.weight = nn.Parameter(torch.ones(hidden_size))

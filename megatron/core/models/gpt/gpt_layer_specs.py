@@ -337,6 +337,24 @@ def get_gpt_layer_with_transformer_engine_submodules(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
+        # APERTUS_DERF_QK_RMSNORM=1 forces QK norm to use TE's RMSNorm even
+        # when the global --normalization is DyT/Derf. Lets us isolate the
+        # block-norm contribution (DyT/Derf only at input/pre-MLP/final, with
+        # standard RMSNorm at attention QK).
+        import os as _os_module  # local alias to avoid touching module-level imports
+        if _os_module.environ.get("APERTUS_DERF_QK_RMSNORM") == "1":
+            from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
+            class _TERMSNormForQK:
+                def __new__(cls, config, hidden_size, eps=1e-5, **kwargs):
+                    import transformer_engine.pytorch as te_pt
+                    return te_pt.RMSNorm(
+                        normalized_shape=hidden_size,
+                        eps=eps,
+                        sequence_parallel=config.sequence_parallel,
+                        zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                        **_get_extra_te_kwargs(config),
+                    )
+            qk_norm = _TERMSNormForQK
         if derf_optim == "compile":
             # APERTUS_DERF_OPTIM=compile: torch.compile-fused (DyT|Derf + linear)
             # composite. Inductor folds the elementwise norm into the matmul
