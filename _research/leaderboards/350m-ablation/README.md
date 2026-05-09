@@ -24,6 +24,20 @@ so results stay reproducible across upstream syncs. Tag list:
 | 7 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 8 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 
+## Normalization ablations (Aurora @ 1e-2 recipe, only `--normalization` swapped)
+
+| variant | final loss | min loss | TFLOP/s/GPU | sbatch | wandb | commit |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| RMSNorm (rank 1, baseline) | **2.200** | **2.038** | 310 | [`08-aurora-lr1e-2.sbatch`](runs/08-aurora-lr1e-2.sbatch) | [czxm4be0](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/czxm4be0) | [`c51a272dd`](https://github.com/ischlag/megatron-lm-research-baseline/tree/c51a272dd) |
+| DyT (Zhu et al. 2025) | 2.337 | 2.175 | 225 | [`09-aurora-dyt.sbatch`](runs/09-aurora-dyt.sbatch) | [`co3j5ika`](https://wandb.ai/ischlag/lm-research-baseline-dev/runs/co3j5ika) (run 2075995) | [`116fdc380`](https://github.com/ischlag/megatron-lm-research-baseline/tree/116fdc380) |
+| Derf (Chen et al. 2025) | 2.335 | 2.174 | 217 | [`10-aurora-derf.sbatch`](runs/10-aurora-derf.sbatch) | (run 2075996) | [`116fdc380`](https://github.com/ischlag/megatron-lm-research-baseline/tree/116fdc380) |
+
+DyT and Derf cost about 0.137 nats vs RMSNorm at this 350M / 1B-token scale.
+They are also slower because the TE fused norm-linear kernel only knows
+LayerNorm/RMSNorm; our spec wiring unfuses the norm from the attention QKV and
+dense MLP fc1, costing ~30% throughput. Per-norm fusion experiments live in
+[`_research/derf_optim/`](../../derf_optim/).
+
 ## Notes on entries
 
 - **Rank 1** is Aurora (Tilde Research, 2026): leverage-uniform polar
