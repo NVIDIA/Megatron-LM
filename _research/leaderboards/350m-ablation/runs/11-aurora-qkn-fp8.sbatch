@@ -6,14 +6,18 @@
 #            only (params and master weights stay bf16; no --fp8-param-gather,
 #            no fp8_param). Matches 07-normuon-fp8.
 # Architecture diff vs 09-aurora-qkn: adds --fp8-format e4m3 --fp8-recipe blockwise.
-# Final loss: tba   Min loss: tba
-# W&B: (run added at submit)
-# Executed at git sha: tba
+# Final loss: 2.188   Min loss: 2.027   (vs bf16 leader 2.185 / 2.025)
+# Throughput: ~246 TFLOP/s/GPU (vs bf16 leader ~265). At 350M / hidden 1024 the
+# FP8 matmul gain doesn't amortize the amax-tracking overhead, and QK-norm adds
+# 48 bf16 norm sites that don't speed up. Compare to 07-normuon-fp8 (no QKN,
+# +1% throughput from FP8).
+# W&B: https://wandb.ai/ischlag/lm-research-baseline-dev/runs/guwuunre
+# Executed at git sha: 6db3a8f8b
 #
 # Reference: https://blog.tilderesearch.com/blog/aurora
 #
 # To reproduce bitwise:
-#   git checkout <sha at submit time>
+#   git checkout 6db3a8f8b
 #   sbatch _research/leaderboards/350m-ablation/runs/11-aurora-qkn-fp8.sbatch
 #
 #SBATCH --job-name=350m-abl-aurora-qkn-fp8
