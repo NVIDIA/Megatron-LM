@@ -346,6 +346,14 @@ class TransformerConfig(ModelParallelConfig):
     in_proj output dim grows by ~n* for those slots while the output gate stays per-token.
     Recurrence and projection compute scale ~n*."""
 
+    linear_attention_n_erase: int = 0
+    """Number of pure-erase Householders per token (subset of n_householder). The last
+    n_erase positions of each token's n_householder updates have v forced to zero, so they
+    contribute only the (I - beta k k^T) erasure factor to the chained transform — no v k^T
+    addition. Useful for explicitly removing past info along key directions without writing
+    new info. n_householder must be > n_erase. The erase positions still consume v projection
+    slots in in_proj (those values are wasted)."""
+
     linear_attention_use_output_gate: bool = True
     """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
     matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""

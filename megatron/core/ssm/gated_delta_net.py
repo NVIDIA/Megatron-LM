@@ -182,6 +182,11 @@ class GatedDeltaNet(MegatronModule):
 
         # Number of Householder updates per token (DeltaProduct). 1 = standard GDN/DN.
         self.n_hh = max(1, int(self.config.linear_attention_n_householder))
+        self.n_erase = max(0, int(self.config.linear_attention_n_erase))
+        assert self.n_erase < self.n_hh, (
+            f"linear_attention_n_erase ({self.n_erase}) must be strictly less than "
+            f"linear_attention_n_householder ({self.n_hh})"
+        )
         if self.n_hh > 1 and not HAVE_DP:
             raise ImportError(
                 "DeltaProduct requires fla.ops.gated_delta_product.chunk_gated_delta_product. "
@@ -189,13 +194,21 @@ class GatedDeltaNet(MegatronModule):
             )
 
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
-        # The output gate (z) is per-token; q,k,v,beta,alpha are per-Householder.
+        # FLA's chunk_gated_delta_product convention:
+        #   q: per-token (B, T, H, K)
+        #   k: per-Householder (B, T*n, H, K)
+        #   v: per-Householder (B, T*n, H, V)
+        #   beta: per-Householder (B, T*n, H)
+        #   g (decay): per-token (B, T, H)  ->  alpha is per-token
+        #   gate (z): per-token output gate
+        # For n_hh=1 this collapses to the usual GDN layout (qk*2 + v*2 + num_v_heads*2).
         self.in_proj_dim = (
-            self.n_hh * self.qk_dim * 2
-            + self.n_hh * self.v_dim
-            + self.v_dim                       # gate (per-token)
+            self.qk_dim                       # Q (per-token)
+            + self.n_hh * self.qk_dim         # K (per-Householder)
+            + self.n_hh * self.v_dim          # V (per-Householder)
+            + self.v_dim                      # gate (z, per-token)
             + self.n_hh * self.num_value_heads  # beta (per-Householder)
-            + self.n_hh * self.num_value_heads  # alpha (per-Householder)
+            + self.num_value_heads            # alpha (per-token for g)
         )
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -217,8 +230,9 @@ class GatedDeltaNet(MegatronModule):
             tp_group=self.pg_collection.tp,
         )
 
-        # Conv1d for QKV (replicated per Householder for n_hh>1)
-        self.conv_dim = self.n_hh * (self.qk_dim * 2 + self.v_dim)
+        # Conv1d for QKV: Q is per-token (1*qk), K is per-Householder (n*qk),
+        # V is per-Householder (n*v).
+        self.conv_dim = self.qk_dim + self.n_hh * self.qk_dim + self.n_hh * self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
 
         # weight shape: [conv_dim, 1, d_conv]
@@ -430,18 +444,19 @@ class GatedDeltaNet(MegatronModule):
 
         # CP All to All: CP to HP
         n_hh = self.n_hh
+        num_v_heads_tp = self.num_value_heads // self.tp_size
         qkvzba = tensor_a2a_cp2hp(
             qkvzba,
             seq_dim=0,
             head_dim=-1,
             cp_group=self.pg_collection.cp,
             split_sections=[
-                n_hh * self.qk_dim_local_tp,
-                n_hh * self.qk_dim_local_tp,
-                n_hh * self.v_dim_local_tp,
-                self.v_dim_local_tp,                              # gate (per-token)
-                n_hh * (self.num_value_heads // self.tp_size),
-                n_hh * (self.num_value_heads // self.tp_size),
+                self.qk_dim_local_tp,                # Q (per-token)
+                n_hh * self.qk_dim_local_tp,         # K (per-Householder)
+                n_hh * self.v_dim_local_tp,          # V (per-Householder)
+                self.v_dim_local_tp,                 # gate (per-token)
+                n_hh * num_v_heads_tp,               # beta (per-Householder)
+                num_v_heads_tp,                      # alpha (per-token)
             ],
         )
 
@@ -449,34 +464,33 @@ class GatedDeltaNet(MegatronModule):
         # From sbhd to bshd format
         qkvzba = qkvzba.transpose(0, 1)
 
-        # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
+        # Split into qkv (Q + K_n + V_n), gate, beta, alpha. The qkv block goes through
+        # conv1d before being split apart again; gate/beta/alpha go directly to their reshape.
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                n_hh * (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
+                (self.qk_dim_local_tp + n_hh * self.qk_dim_local_tp + n_hh * self.v_dim_local_tp) // self.cp_size,
                 self.v_dim_local_tp // self.cp_size,
-                n_hh * (self.num_value_heads // self.tp_size) // self.cp_size,
-                n_hh * (self.num_value_heads // self.tp_size) // self.cp_size,
+                n_hh * num_v_heads_tp // self.cp_size,
+                num_v_heads_tp // self.cp_size,
             ],
             dim=-1,
         )
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-        # For DeltaProduct (n_hh > 1): interleave n Householder slots into seq dim so the
-        # FLA op sees each "logical token" as n consecutive entries.
+        # alpha is per-token; beta is per-Householder (interleaved into seq dim for FLA).
+        alpha = alpha.reshape(batch, seq_len, -1)
         if n_hh > 1:
             beta = beta.reshape(batch, seq_len, n_hh, -1).reshape(batch, seq_len * n_hh, -1)
-            alpha = alpha.reshape(batch, seq_len, n_hh, -1).reshape(batch, seq_len * n_hh, -1)
         else:
             beta = beta.reshape(batch, seq_len, -1)
-            alpha = alpha.reshape(batch, seq_len, -1)
 
-        # Convolution on qkv (n_hh-replicated for DeltaProduct)
+        # Convolution on qkv (Q is per-token, K and V are per-Householder).
         nvtx_range_push(suffix="conv1d")
         seq_len = qkv.shape[1]
         qkv_channels_split_sections = [
-            n_hh * self.qk_dim_local_tp,
-            n_hh * self.qk_dim_local_tp,
-            n_hh * self.v_dim_local_tp,
+            self.qk_dim_local_tp,                # Q
+            n_hh * self.qk_dim_local_tp,         # K_n
+            n_hh * self.v_dim_local_tp,          # V_n
         ]
         conv1d_weight = get_parameter_local_cp(
             self.conv1d.weight,
@@ -519,37 +533,66 @@ class GatedDeltaNet(MegatronModule):
             )
         nvtx_range_pop(suffix="conv1d")
 
-        # For DeltaProduct: interleave n Householder slots into the seq dim. After this,
-        # the FLA op sees a sequence of length seq_len * n_hh, with each original token
-        # contributing n consecutive entries. The conv-output channel layout is
-        # [n*Q | n*K | n*V]; within each block the n Householders are outer (consecutive).
-        # We split into Q/K/V, reshape each so n becomes the inner seq dim, then re-cat.
+        # Prepare QKV tensors. For n_hh=1 we use the existing helper. For n_hh>1
+        # we split Q (per-token), K (per-Householder), V (per-Householder), interleave
+        # K and V into the seq dim, normalize Q and K independently, and GQA-expand.
+        nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
         if n_hh > 1:
-            q_part, k_part, v_part = torch.split(
-                qkv,
-                [
-                    n_hh * (self.qk_dim_local_tp // self.cp_size),
-                    n_hh * (self.qk_dim_local_tp // self.cp_size),
-                    n_hh * (self.v_dim_local_tp // self.cp_size),
-                ],
-                dim=-1,
-            )
             qk_local = self.qk_dim_local_tp // self.cp_size
             v_local = self.v_dim_local_tp // self.cp_size
-            q_part = q_part.reshape(batch, seq_len, n_hh, qk_local).reshape(batch, seq_len * n_hh, qk_local)
-            k_part = k_part.reshape(batch, seq_len, n_hh, qk_local).reshape(batch, seq_len * n_hh, qk_local)
-            v_part = v_part.reshape(batch, seq_len, n_hh, v_local).reshape(batch, seq_len * n_hh, v_local)
-            qkv = torch.cat([q_part, k_part, v_part], dim=-1)
+            q_part, k_part, v_part = torch.split(
+                qkv, [qk_local, n_hh * qk_local, n_hh * v_local], dim=-1,
+            )
+            num_qk_heads_local = self.num_key_heads // self.tp_size // self.cp_size
+            num_v_heads_local = self.num_value_heads // self.tp_size // self.cp_size
+            # Q stays per-token: [b, s, qk_local] -> [b, s, num_qk_heads_local, key_head_dim]
+            query = q_part.reshape(batch, seq_len, num_qk_heads_local, self.key_head_dim).contiguous()
+            # K_n: [b, s, n*qk_local] -> [b, s, n, num_qk_heads_local, d_k] -> [b, s*n, num_qk_heads_local, d_k]
+            key = k_part.reshape(
+                batch, seq_len, n_hh, num_qk_heads_local, self.key_head_dim
+            ).reshape(batch, seq_len * n_hh, num_qk_heads_local, self.key_head_dim).contiguous()
+            # V_n: [b, s, n*v_local] -> [b, s, n, num_v_heads_local, d_v] -> [b, s*n, num_v_heads_local, d_v]
+            value = v_part.reshape(
+                batch, seq_len, n_hh, num_v_heads_local, self.value_head_dim
+            ).reshape(batch, seq_len * n_hh, num_v_heads_local, self.value_head_dim).contiguous()
+            # Q,K norm (independently)
+            if self.use_qk_l2norm:
+                if self.qk_rmsnorm is not None:
+                    query = self.qk_rmsnorm(query)
+                    key = self.qk_rmsnorm(key)
+                else:
+                    query = l2norm(query)
+                    key = l2norm(key)
+            # GQA expansion: query and key heads -> num_v_heads
+            if self.num_value_heads // self.num_key_heads > 1:
+                repeat_factor = self.num_value_heads // self.num_key_heads
+                query = query.repeat_interleave(repeat_factor, dim=2)
+                key = key.repeat_interleave(repeat_factor, dim=2)
             fla_seq_len = seq_len * n_hh
         else:
+            query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
+                qkv, gate, beta, alpha, batch, seq_len
+            )
             fla_seq_len = seq_len
-
-        # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
-        nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
-        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-            qkv, gate, beta, alpha, batch, fla_seq_len
-        )
         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
+
+        # Erase positions: zero out v at the last n_erase of each token's n_hh slots so
+        # they contribute only the (I - beta k k^T) factor (no v k^T addition).
+        if n_hh > 1 and self.n_erase > 0:
+            n_erase = self.n_erase
+            n_write = n_hh - n_erase
+            mask_per_token = torch.cat(
+                [
+                    torch.ones(n_write, device=value.device, dtype=value.dtype),
+                    torch.zeros(n_erase, device=value.device, dtype=value.dtype),
+                ]
+            )  # shape [n_hh]
+            # value: [b, seq_len*n_hh, h, d_v]; reshape to apply mask along the n_hh axis.
+            v_shape = value.shape
+            value = (
+                value.reshape(batch, seq_len, n_hh, *v_shape[2:])
+                * mask_per_token.view(1, 1, n_hh, *([1] * (len(v_shape) - 2)))
+            ).reshape(*v_shape).contiguous()
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
