@@ -337,16 +337,19 @@ def get_gpt_layer_with_transformer_engine_submodules(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
-        if derf_optim in ("compile", "triton"):
+        if derf_optim in ("compile", "triton", "cuda"):
             # Option 1 (compile): torch.compile-fused norm+linear.
             # Option 2 (triton): custom Triton fused kernel + PyTorch backward.
-            # In both cases the norm subsumes into the linear, mirroring TE's
-            # LayerNormColumnParallelLinear shape so we keep the same
-            # input_layernorm=IdentityOp + linear_qkv=<fused> spec layout.
+            # Option 3 (cuda):  hand-written CUDA fused kernel + PyTorch backward.
+            # All three subsume the norm into the linear, mirroring TE's
+            # LayerNormColumnParallelLinear shape: input_layernorm=IdentityOp
+            # and linear_qkv=<fused class>.
             if derf_optim == "compile":
                 from _research.derf_optim.option1_compile import make_qkv_class
-            else:
+            elif derf_optim == "triton":
                 from _research.derf_optim.option2_triton import make_qkv_class
+            else:
+                from _research.derf_optim.option3_cuda import make_qkv_class
             fused_cls = make_qkv_class(derf_norm_kind)
             linear_qkv = fused_cls
             input_layernorm = IdentityOp

@@ -144,6 +144,28 @@ def test_option2(seq=64, batch=2, hidden=128, output=192, dtype=torch.float32):
     return ok
 
 
+def test_option3(seq=64, batch=2, hidden=128, output=192, dtype=torch.float32):
+    """Option 3: CUDA fused (Derf|DyT)+linear, save x, recompute pre."""
+    print(f"[option3] dtype={dtype} seq={seq} batch={batch} hidden={hidden} output={output}")
+    if not torch.cuda.is_available():
+        print("[option3] SKIP (no CUDA)")
+        return True
+    from _research.derf_optim.option3_cuda import _cuda_derf_linear, _cuda_dyt_linear
+
+    if dtype is torch.bfloat16:
+        rtol, atol = 1e-1, 5e-2
+    else:
+        rtol, atol = 5e-3, 1e-3
+
+    device = "cuda"
+
+    ok = True
+    ok &= _run_pair(_eager_derf_linear, _cuda_derf_linear, True,  "Derf-cu", seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
+    ok &= _run_pair(_eager_dyt_linear,  _cuda_dyt_linear,  False, "DyT-cu",  seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
+    print(f"[option3] {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--option", choices=["1", "2", "3"], default="1")
@@ -155,6 +177,8 @@ def main():
         ok = test_option1(dtype=dtype)
     elif args.option == "2":
         ok = test_option2(dtype=dtype)
+    elif args.option == "3":
+        ok = test_option3(dtype=dtype)
     else:
         raise NotImplementedError(f"option {args.option} test not yet wired")
     sys.exit(0 if ok else 1)
