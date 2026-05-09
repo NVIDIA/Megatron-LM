@@ -48,6 +48,21 @@ from megatron.core.transformer.dynamic_norms import Derf, DyT
 # -----------------------------------------------------------------------------
 
 
+# Hopper-friendly autotune configs. Spread over (BLOCK_M, BLOCK_N, BLOCK_K,
+# num_stages, num_warps). Triton's autotune times each, caches the winner per
+# (M, N, K) key. First call has overhead; subsequent calls match the best.
+_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32}, num_stages=3, num_warps=8),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=8),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64}, num_stages=4, num_warps=4),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 64}, num_stages=2, num_warps=4),
+]
+
+
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["M", "N", "K"])
 @triton.jit
 def _norm_linear_fwd_kernel(
     x_ptr, w_lin_ptr, w_norm_ptr, b_norm_ptr, alpha_ptr, s_ptr, b_lin_ptr, out_ptr,
@@ -59,7 +74,7 @@ def _norm_linear_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     HAS_LINEAR_BIAS: tl.constexpr,
-    HAS_S: tl.constexpr,  # Derf has s, DyT does not
+    HAS_S: tl.constexpr,
     NORM_KIND: tl.constexpr,  # 0=Derf (erf), 1=DyT (tanh)
 ):
     pid_m = tl.program_id(0)
@@ -81,11 +96,11 @@ def _norm_linear_fwd_kernel(
         offs_kk = k0 + offs_k
         k_mask = offs_kk < K
 
+        # x tile: [BLOCK_M, BLOCK_K]
         x_mask = (offs_m[:, None] < M) & (k_mask[None, :])
         x_tile = tl.load(
             x_ptr + offs_m[:, None] * stride_xm + offs_kk[None, :] * stride_xk,
-            mask=x_mask,
-            other=0.0,
+            mask=x_mask, other=0.0,
         )
         w_norm = tl.load(w_norm_ptr + offs_kk, mask=k_mask, other=0.0)
         b_norm = tl.load(b_norm_ptr + offs_kk, mask=k_mask, other=0.0)
@@ -98,23 +113,24 @@ def _norm_linear_fwd_kernel(
             fz = (tl.exp(z) - tl.exp(-z)) / (tl.exp(z) + tl.exp(-z))
         pre = w_norm[None, :].to(tl.float32) * fz + b_norm[None, :].to(tl.float32)
 
-        w_mask = (offs_n[:, None] < N) & k_mask[None, :]
+        # W tile loaded directly in K-major layout [BLOCK_K, BLOCK_N] so we
+        # don't need tl.trans (which can break Triton's TC layout selection).
+        # W's logical shape is [N, K], strides (stride_wn, stride_wk).
+        # Walking [k, n] in this layout: ptr + k*stride_wk + n*stride_wn.
+        w_mask = (k_mask[:, None]) & (offs_n[None, :] < N)
         w_tile = tl.load(
-            w_lin_ptr + offs_n[:, None] * stride_wn + offs_kk[None, :] * stride_wk,
-            mask=w_mask,
-            other=0.0,
+            w_lin_ptr + offs_kk[:, None] * stride_wk + offs_n[None, :] * stride_wn,
+            mask=w_mask, other=0.0,
         )
 
-        # `pre @ W^T`: pre is [BLOCK_M, BLOCK_K], W is [BLOCK_N, BLOCK_K].
-        # tl.dot wants [M,K] @ [K,N], so transpose W tile.
-        accum += tl.dot(pre.to(x_tile.dtype), tl.trans(w_tile.to(x_tile.dtype)))
+        # tl.dot uses Tensor Cores when both operands are bf16/fp16 with fp32
+        # accumulator. Output dtype set by `accum`'s float32, no trans needed.
+        accum += tl.dot(pre.to(x_tile.dtype), w_tile.to(x_tile.dtype))
 
     if HAS_LINEAR_BIAS:
         b_lin = tl.load(b_lin_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
         accum += b_lin[None, :]
 
-    # Cast back to the output dtype. `x_tile` is loop-local in Triton, so we
-    # use the output pointer's element type instead.
     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(
         out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
@@ -142,14 +158,15 @@ def _triton_fused_fwd(x, w_lin, w_norm, b_norm, alpha, s, b_lin, kind: str):
     N = w_lin.shape[0]
     out = torch.empty(M, N, dtype=x.dtype, device=x.device)
 
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 64
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    # Grid uses the autotuned BLOCK_M/BLOCK_N picked at compile time per shape.
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_M"]),
+        triton.cdiv(N, meta["BLOCK_N"]),
+    )
 
     s_dummy = torch.zeros((), dtype=alpha.dtype, device=alpha.device)
     s_used = s if s is not None else s_dummy
-    b_lin_used = b_lin if b_lin is not None else x  # any tensor; mask=False protects load
+    b_lin_used = b_lin if b_lin is not None else x
 
     _norm_linear_fwd_kernel[grid](
         x_2d, w_lin.contiguous(), w_norm.contiguous(), b_norm.contiguous(),
@@ -158,7 +175,6 @@ def _triton_fused_fwd(x, w_lin, w_norm, b_norm, alpha, s, b_lin, kind: str):
         x_2d.stride(0), x_2d.stride(1),
         w_lin.stride(0), w_lin.stride(1),
         out.stride(0), out.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         HAS_LINEAR_BIAS=b_lin is not None,
         HAS_S=(s is not None),
         NORM_KIND=0 if kind == "Derf" else 1,
