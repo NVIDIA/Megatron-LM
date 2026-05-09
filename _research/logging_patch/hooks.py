@@ -451,8 +451,8 @@ def _emit_top1_accuracy(row: dict[str, Any], iteration: int) -> None:
     acc = float(counts[0].item()) / total
     row["top1_accuracy"] = acc
 
-    if int(os.environ.get("RANK", "0")) != 0:
-        return
+    # wandb is initialised on rank == world_size - 1 (Megatron convention),
+    # not rank 0; gate solely on wandb.run.
     try:
         import wandb
         if wandb.run is not None:
@@ -481,10 +481,15 @@ def _mirror_extras_to_wandb(row: dict[str, Any], iteration: int) -> None:
     a single chart panel per top-level key.
 
     Skips fields owned by Megatron's built-in wandb integration to avoid
-    duplicate scalar streams. Rank-0 only.
+    duplicate scalar streams.
+
+    Rank handling: Megatron initialises wandb on rank == world_size - 1
+    (see megatron/training/global_vars.py::_set_wandb_writer). On every
+    other rank wandb.run is None and this is a no-op. Note that with TP/EP
+    sharding the row's per-shard stats (row_cv, etc.) on the last rank can
+    differ slightly from the JSONL written by rank 0; same caveat already
+    applies to per_layer_grad_norm.
     """
-    if int(os.environ.get("RANK", "0")) != 0:
-        return
     try:
         import wandb
     except ImportError:
