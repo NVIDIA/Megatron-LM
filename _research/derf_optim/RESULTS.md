@@ -18,6 +18,7 @@ TP=1, bf16). Steady-state TFLOP/s/GPU averaged over iter 50–200 of a
 | Option 2′ — Triton fused matmul (autotuned, K-major W) | 202 | -15 | -108 | 2076363 |
 | Option 3 — hand-rolled CUDA fused matmul + Derf | (timed out) | — | — | 2076308 |
 | Option 4 — explicit Triton norm + cuBLAS (`F.linear`) | 230 | +13 | -80 | 2077391 |
+| Option 5 — Triton norm + TE `general_gemm` (cuBLAS) | 231 | +14 | -79 | 2077708 |
 
 Loss curves of all three options match the unfused reference within bf16
 single-rounding noise (numerical correctness gated via
@@ -91,6 +92,27 @@ GEMM, kernel-scheduling overlaps, activation buffer reuse with FP8/SP-aware
 layout). Recovering it requires landing Derf inside TE's actual kernel
 machinery (the Option 3 rebuild path documented in `OPTION_3_4_PLAN.md`),
 not more Python-side optimisation.
+
+### Option 5 — Triton norm + TE's `general_gemm`  (negative result, informative)
+Same as Option 4 but the matmul is dispatched through
+`transformer_engine.pytorch.cpp_extensions.gemm.general_gemm` (the same
+function TE's `LayerNormLinear` uses internally) instead of `F.linear`.
+
+Result: **231 TFLOP/s** — identical to Option 4 (230, within noise). So
+TE's gemm wrapper is NOT the lever; both `F.linear` and `general_gemm`
+end up calling the same cuBLAS kernel with the same workspace. The 80
+TFLOP/s gap to TE's baseline must therefore be in **TE's hand-tuned
+RMSNorm CUDA kernel** itself or in **TE's specific kernel pipelining**
+(async data movement between norm and GEMM, workspace cache state),
+not in the Python-side gemm dispatch.
+
+This rules out a whole class of would-be optimisations and narrows the
+remaining work to "match TE's RMSNorm kernel quality" or "land Derf
+inside TE's pipeline" — both requiring a TE source rebuild.
+
+Build pipeline confirmed: unmodified TE 2.11.0 (commit `c188b533`)
+builds cleanly in our container in 13 min. Path forward documented in
+`OPTION_3_4_PLAN.md`.
 
 ## Recommendation
 
