@@ -117,6 +117,9 @@ def install() -> None:
         "log_act_threshold": float(os.environ.get("APERTUS_LOG_ACT_THRESHOLD", "240")),
         "log_loss_spikes": os.environ.get("APERTUS_LOG_LOSS_SPIKES") == "1",
         "log_top1_acc": os.environ.get("APERTUS_LOG_TOP1_ACC", "1") != "0",
+        "log_row_cv": os.environ.get("APERTUS_LOG_ROW_CV", "1") != "0",
+        "log_neuron_stats": os.environ.get("APERTUS_LOG_NEURON_STATS") == "1",
+        "log_neuron_interval": int(os.environ.get("APERTUS_LOG_NEURON_INTERVAL", "100")),
     })
     hooks.patch_setup_model_and_optimizer()
     hooks.patch_training_log()
