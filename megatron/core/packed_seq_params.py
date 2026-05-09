@@ -68,6 +68,52 @@ class PackedSeqParams:
             )
 
 
+def _pad_seq_tensor(t: Optional[Tensor], target_len: int) -> Optional[Tensor]:
+    """Pad a [..., seq] tensor to ``target_len`` along the last dim with zeros.
+
+    Asserts the actual length does not exceed ``target_len``: an oversize input
+    would silently desync the captured graph from replay shapes.
+    """
+    if t is None:
+        return None
+    actual_len = t.shape[-1]
+    assert actual_len <= target_len, (
+        f"Sequence-length tensor (last dim = {actual_len}) exceeds target "
+        f"({target_len}); refusing to silently truncate. Increase "
+        f"--max-seqlen-per-dp-cp-rank or filter overlong samples upstream."
+    )
+    if actual_len == target_len:
+        return t
+    return F.pad(t, (0, target_len - actual_len), value=0)
+
+
+def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Optional[Tensor]:
+    """Pad a cu_seqlens tensor to exactly ``target_entries`` entries.
+
+    Asserts the actual entry count does not exceed ``target_entries``: this is
+    the reviewer-flagged overflow case and corresponds to "too many packed
+    sequences in this microbatch for thd_max_num_seqs". Failing fast prevents
+    a silent CUDA-graph shape mismatch at replay.
+    """
+    if cu_seqlens is None:
+        return None
+    actual_entries = cu_seqlens.shape[0]
+    assert actual_entries <= target_entries, (
+        f"Actual num_seqs ({actual_entries - 1}) exceeds thd_max_num_seqs "
+        f"({target_entries - 1}). Increase --thd-max-num-seqs, decrease "
+        f"--max-seqlen-per-dp-cp-rank, or filter shorter samples upstream so "
+        f"the packing scheduler stops earlier."
+    )
+    if actual_entries == target_entries:
+        return cu_seqlens
+    pad_value = cu_seqlens[-1].item()
+    padded = torch.full(
+        (target_entries,), pad_value, dtype=cu_seqlens.dtype, device=cu_seqlens.device
+    )
+    padded[:actual_entries] = cu_seqlens
+    return padded
+
+
 def pad_thd_for_cuda_graph(
     tokens: Optional[Tensor],
     labels: Optional[Tensor],
@@ -95,27 +141,6 @@ def pad_thd_for_cuda_graph(
         Padded (tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask)
         padding_mask: [1, max_seqlen] bool tensor, True at padding positions.
     """
-
-    def _pad_seq_tensor(t, target_len):
-        if t is None:
-            return None
-        actual_len = t.shape[-1]
-        if actual_len >= target_len:
-            return t
-        return F.pad(t, (0, target_len - actual_len), value=0)
-
-    def _pad_cu_seqlens(cu_seqlens, target_entries):
-        if cu_seqlens is None:
-            return None
-        actual_entries = cu_seqlens.shape[0]
-        if actual_entries >= target_entries:
-            return cu_seqlens
-        pad_value = cu_seqlens[-1].item()
-        padded = torch.full(
-            (target_entries,), pad_value, dtype=cu_seqlens.dtype, device=cu_seqlens.device
-        )
-        padded[:actual_entries] = cu_seqlens
-        return padded
 
     actual_T = None
     mask_device = None
