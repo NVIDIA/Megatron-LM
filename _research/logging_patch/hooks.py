@@ -451,12 +451,72 @@ def _emit_top1_accuracy(row: dict[str, Any], iteration: int) -> None:
     acc = float(counts[0].item()) / total
     row["top1_accuracy"] = acc
 
-    if int(os.environ.get("RANK", "0")) != 0:
-        return
+    # wandb is initialised on rank == world_size - 1 (Megatron convention),
+    # not rank 0; gate solely on wandb.run.
     try:
         import wandb
         if wandb.run is not None:
             wandb.log({"top1_accuracy": acc}, step=int(iteration))
+    except Exception:
+        pass
+
+
+# Megatron's built-in wandb callback already logs these per-step scalars; we
+# skip them in _mirror_extras_to_wandb to avoid duplicate streams. top1_accuracy
+# is mirrored explicitly in _emit_top1_accuracy above (kept for backward compat).
+_MEGATRON_OWNED_WANDB_KEYS: frozenset[str] = frozenset({
+    "step", "wall",
+    "train_loss", "lr", "grad_norm", "params_norm", "tput",
+    "top1_accuracy",
+})
+
+
+def _mirror_extras_to_wandb(row: dict[str, Any], iteration: int) -> None:
+    """Flatten dict-valued extra logging fields to wandb scalars.
+
+    Mirrors row_cv, neuron_stats, act_stats, per_layer_grad_norm, loss_spike
+    (and any future scalar/dict additions) by flattening one or two dict
+    levels into wandb keys like ``row_cv/<param>`` or
+    ``act_stats/<layer>/<stat>``. Wandb groups these by the prefix into
+    a single chart panel per top-level key.
+
+    Skips fields owned by Megatron's built-in wandb integration to avoid
+    duplicate scalar streams.
+
+    Rank handling: Megatron initialises wandb on rank == world_size - 1
+    (see megatron/training/global_vars.py::_set_wandb_writer). On every
+    other rank wandb.run is None and this is a no-op. Note that with TP/EP
+    sharding the row's per-shard stats (row_cv, etc.) on the last rank can
+    differ slightly from the JSONL written by rank 0; same caveat already
+    applies to per_layer_grad_norm.
+    """
+    try:
+        import wandb
+    except ImportError:
+        return
+    if wandb.run is None:
+        return
+
+    flat: dict[str, Any] = {}
+    for k, v in row.items():
+        if k in _MEGATRON_OWNED_WANDB_KEYS:
+            continue
+        if isinstance(v, bool):
+            flat[k] = int(v)
+        elif isinstance(v, (int, float)):
+            flat[k] = v
+        elif isinstance(v, dict):
+            for subk, subv in v.items():
+                if isinstance(subv, dict):
+                    for sk, sv in subv.items():
+                        if isinstance(sv, (int, float, bool)):
+                            flat[f"{k}/{subk}/{sk}"] = float(sv) if isinstance(sv, bool) else sv
+                elif isinstance(subv, (int, float, bool)):
+                    flat[f"{k}/{subk}"] = float(subv) if isinstance(subv, bool) else subv
+    if not flat:
+        return
+    try:
+        wandb.log(flat, step=int(iteration))
     except Exception:
         pass
 
@@ -558,6 +618,7 @@ def patch_training_log() -> None:
             _emit_top1_accuracy(row, int(iteration))
 
         writer.append(**row)
+        _mirror_extras_to_wandb(row, int(iteration))
 
         n_layers = _STATE.get("n_layers")
         hidden = _STATE.get("hidden")
