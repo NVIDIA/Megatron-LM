@@ -150,6 +150,7 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.no_save_optim = False
     args.no_save_rng = False
     args.ckpt_assume_constant_structure = False
+    args.ckpt_load_validate_sharding_integrity = True
     args.log_progress = False
     args.auto_detect_ckpt_format = False
     args.exit_on_missing_checkpoint = False
