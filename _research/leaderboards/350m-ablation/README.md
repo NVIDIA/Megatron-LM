@@ -30,9 +30,21 @@ reference. Roots have an empty `parent`.
 | 7 | normuon-lr6e-4 | normuon-lr3.6e-4 | LR 3.6e-4 -> 6e-4 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 8 | adamw-lr1e-3 |  | root: AdamW baseline (decoupled WD), LR 1e-3 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 9 | adamw-lr5e-4 | adamw-lr1e-3 | LR 1e-3 -> 5e-4 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| -- | aurora-qkn-derf-rmsqk | aurora-qkn | swap RMSNorm for Derf at block norms (input/pre-MLP/final); keep RMSNorm at QK (`APERTUS_DERF_QK_RMSNORM=1`) | Aurora + QK norm + Derf | 1e-2 | 2.217 | 2.057 | [`10-aurora-qkn-derf-rmsqk.sbatch`](runs/10-aurora-qkn-derf-rmsqk.sbatch) | [94h3m6bs](https://wandb.ai/ischlag/lm-research-baseline-dev/runs/94h3m6bs) | [`dffead810`](https://github.com/ischlag/megatron-lm-research-baseline/tree/dffead810) |
 
 ## Notes on entries
 
+- **`aurora-qkn-derf-rmsqk`** (representative entry from a `feat/dyt-derf-norm`
+  ablation series): Derf normalisation at block sites, RMSNorm at the per-head
+  QK sites. Out-of-the-box Derf+QKN at all sites lands at 2.278 (+0.093 vs
+  RMSNorm leader); keeping RMSNorm at QK closes most of that gap to +0.032.
+  Hyperparameter sweeps on Derf (`alpha_init` 0.2 / 0.5 / 0.8, Aurora LR
+  8e-3 / 1e-2) move final loss only ~0.02 nats and don't recover the gap.
+  DyT under the same recipe lands at 2.307 (+0.122). Wired via
+  `--normalization Derf` + `APERTUS_DERF_OPTIM=compile` (torch.compile
+  fusion, `_research/derf_optim/option1_compile.py`) which recovers most
+  of the throughput lost from unfusing TE's `LayerNormColumnParallelLinear`
+  (270 vs 217 TFLOP/s/GPU at this shape).
 - **`aurora-qkn`**: per-head RMSNorm on Q and K (TENorm under
   `--normalization RMSNorm`). WD stays off on the new q/k norm gains
   (default skip-WD-on-shape-1 rule); a paired ablation with
