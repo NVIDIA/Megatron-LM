@@ -1210,7 +1210,7 @@ class TestMHCMTPIntegration:
             mtp_num_layers=2,
         )
         block_mtp = TransformerBlock(config_mtp, spec).cuda()
-        hidden_states = torch.randn(seq_len, batch_size, n * h, device='cuda', requires_grad=True)
+        hidden_states = torch.randn(seq_len, batch_size, h, device='cuda', requires_grad=True)
         output = block_mtp(hidden_states=hidden_states, attention_mask=None)
 
         assert isinstance(output, tuple)
@@ -1232,7 +1232,7 @@ class TestMHCMTPIntegration:
             mtp_num_layers=None,
         )
         block_no_mtp = TransformerBlock(config_no_mtp, spec).cuda()
-        hs2 = torch.randn(seq_len, batch_size, n * h, device='cuda')
+        hs2 = torch.randn(seq_len, batch_size, h, device='cuda')
         output2 = block_no_mtp(hidden_states=hs2, attention_mask=None)
         assert isinstance(output2, Tensor)
         assert output2.shape == (seq_len, batch_size, h)
@@ -1287,10 +1287,15 @@ class TestMHCMTPIntegration:
             pre_process=True,
             post_process=True,
             layer_spec_fn=get_gpt_layer_with_transformer_engine_spec,
+            config=None,
+            pg_collection=None,
+            vp_stage=None,
+            **kwargs,
         ):
             model_parallel_cuda_manual_seed(_SEED)
             a = get_args()
-            config = core_transformer_config_from_args(a)
+            if config is None:
+                config = core_transformer_config_from_args(a)
             layer_spec = layer_spec_fn(
                 a.num_experts,
                 a.moe_grouped_gemm,
@@ -1313,6 +1318,8 @@ class TestMHCMTPIntegration:
                 share_embeddings_and_output_weights=not a.untie_embeddings_and_output_weights,
                 position_embedding_type=a.position_embedding_type,
                 rotary_percent=a.rotary_percent,
+                pg_collection=pg_collection,
+                vp_stage=vp_stage,
             )
 
         gpt_model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
