@@ -11,12 +11,13 @@ TP=1, bf16). Steady-state TFLOP/s/GPU averaged over iter 50–200 of a
 
 | variant | TFLOP/s/GPU | Δ vs unfused | Δ vs RMSNorm baseline | wall job |
 | --- | ---: | ---: | ---: | --- |
-| RMSNorm baseline (TE fused norm-linear) | **310** | +93 | 0 | (Aurora rank-1 leaderboard) |
+| RMSNorm baseline (TE pipeline: tuned norm + cuBLAS) | **310** | +93 | 0 | (Aurora rank-1 leaderboard) |
 | Unfused Derf (reference) | 217 | 0 | -93 | 2075996 (full 1B-token) |
-| **Option 1** — torch.compile fused (Derf + nn.Linear) | **271** | **+54** | **-39** | 2076258 |
-| Option 2 — Triton fused (naive 64x64x64, 1 config) | 170 | -47 | -140 | 2076274 |
-| Option 2′ — Triton fused (autotuned, K-major W) | 202 | -15 | -108 | 2076363 |
-| Option 3 — hand-rolled CUDA fused (Derf + matmul) | (timed out) | — | — | 2076308 |
+| **Option 1** — torch.compile (Inductor fuses norm into matmul prologue) | **271** | **+54** | **-39** | 2076258 |
+| Option 2 — Triton fused matmul + Derf prologue (naive) | 170 | -47 | -140 | 2076274 |
+| Option 2′ — Triton fused matmul (autotuned, K-major W) | 202 | -15 | -108 | 2076363 |
+| Option 3 — hand-rolled CUDA fused matmul + Derf | (timed out) | — | — | 2076308 |
+| Option 4 — explicit Triton norm + cuBLAS (`F.linear`) | 230 | +13 | -80 | 2077391 |
 
 Loss curves of all three options match the unfused reference within bf16
 single-rounding noise (numerical correctness gated via
@@ -64,6 +65,33 @@ need CUTLASS or a hand-written Tensor Core mainloop with proper tile
 quantisation, which is multi-day scope and clearly out of band for an
 autonomous session.
 
+### Option 4 — explicit Triton norm + cuBLAS  (loses to Option 1, informative)
+A custom `torch.autograd.Function` that calls a hand-tuned Triton elementwise
+Derf kernel and then `F.linear` (cuBLAS) for the matmul. Backward is the
+same post-norm-recompute pattern as Option 2.
+
+Numerically correct (loss 4.44 matches Option 1's 4.43 at iter 200).
+Throughput **230 TFLOP/s** — better than the unfused reference (217)
+because the norm becomes a single fast Triton kernel instead of 5+ eager
+PyTorch ops, but **41 TFLOP/s under Option 1**.
+
+This is the cleanest evidence that **Inductor's `torch.compile` is fusing
+the Derf elementwise into the matmul prologue itself** (Inductor-generated
+Triton matmul, not just a back-to-back kernel pair). When we deliberately
+split norm from matmul (Triton norm → DRAM → cuBLAS), we materialise the
+post-norm activation in global memory and lose that fusion. The 41 TFLOP/s
+delta between Options 1 and 4 is the cost of that materialisation at our
+shape (`[seq*batch=65536, hidden=1024]` bf16 = 134 MiB per site, written
+then re-read).
+
+So the remaining 39 TFLOP/s gap to the RMSNorm baseline (310 - 271) is NOT
+about kernel quality — Option 1 already has activation-prologue fusion.
+That gap is TE's specific pipelining (async data movement between norm and
+GEMM, kernel-scheduling overlaps, activation buffer reuse with FP8/SP-aware
+layout). Recovering it requires landing Derf inside TE's actual kernel
+machinery (the Option 3 rebuild path documented in `OPTION_3_4_PLAN.md`),
+not more Python-side optimisation.
+
 ## Recommendation
 
 **Ship Option 1.** It's a ~50-line composite module gated by
@@ -71,10 +99,12 @@ autonomous session.
 keeps the spec wiring in pure Python, and inherits whatever future cuBLAS
 improvements the container's PyTorch picks up.
 
-The other two are only worth the engineering cost if (a) we move to a
-shape where cuBLAS itself becomes the bottleneck (long-context or larger
-hidden), or (b) a CUTLASS-based DerfLinear with TC support is available.
-The right place to do the latter is upstream (TE), not in this fork.
+The remaining options are only worth the engineering cost if (a) we move
+to a shape where cuBLAS itself becomes the bottleneck (long-context or
+larger hidden), or (b) we want to close the 39 TFLOP/s gap to the RMSNorm
+baseline, which now we know requires landing Derf inside TE's actual
+kernel pipeline — not more Python-side fusion (since Option 1 already has
+that). See `OPTION_3_4_PLAN.md` for the surgery plan against TE 2.11.0.
 
 ## Reproducing
 
@@ -82,13 +112,14 @@ The right place to do the latter is upstream (TE), not in this fork.
 # Local correctness gate (CPU; fp32 + bf16 numerical match):
 python -m _research.derf_optim.test_correctness --option 1 --dtype fp32
 python -m _research.derf_optim.test_correctness --option 1 --dtype bf16
-# Options 2 and 3 require CUDA, run on cluster instead.
+# Options 2/3/4 require CUDA, run on cluster instead.
 
 # Cluster throughput (200-iter Aurora recipe, --normalization Derf):
 sbatch _research/derf_optim/runs/o1-derf-compile-throughput.sbatch
 sbatch _research/derf_optim/runs/o2-derf-triton-throughput.sbatch
-sbatch _research/derf_optim/runs/o3-derf-cuda-throughput.sbatch  # incomplete impl
+sbatch _research/derf_optim/runs/o3-derf-cuda-throughput.sbatch       # incomplete impl
+sbatch _research/derf_optim/runs/o4-derf-te-style-throughput.sbatch
 ```
 
-The spec wiring switches via `APERTUS_DERF_OPTIM=compile|triton|cuda`
+The spec wiring switches via `APERTUS_DERF_OPTIM=compile|triton|cuda|te_style`
 (see `megatron/core/models/gpt/gpt_layer_specs.py:309-340`).
