@@ -47,7 +47,10 @@ class DyT(nn.Module):
         self.bias = nn.Parameter(torch.zeros(hidden_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.weight * torch.tanh(self.alpha * x) + self.bias
+        dtype = x.dtype
+        x_f = x.float()
+        out = self.weight * torch.tanh(self.alpha * x_f) + self.bias
+        return out.to(dtype)
 
 
 class Derf(nn.Module):
@@ -76,4 +79,7 @@ class Derf(nn.Module):
         self.bias = nn.Parameter(torch.zeros(hidden_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.weight * torch.erf(self.alpha * x + self.s) + self.bias
+        dtype = x.dtype
+        x_f = x.float()
+        out = self.weight * torch.erf(self.alpha * x_f + self.s) + self.bias
+        return out.to(dtype)
