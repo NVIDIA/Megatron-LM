@@ -113,6 +113,8 @@ LINEAR_ATTENTION_ARGS=(
     --linear-num-value-heads 8
     --linear-conv-kernel-dim 4
     --linear-attention-carry-state
+    --linear-attention-n-householder 2
+    --linear-attention-allow-neg-eigval
 )
 
 TRAINING_ARGS=(
