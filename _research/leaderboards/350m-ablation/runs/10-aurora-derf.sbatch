@@ -43,6 +43,10 @@ export TORCHINDUCTOR_CACHE_DIR=$REPO_DIR/cache/inductor
 export TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export TMPDIR=$TMP_CACHE_DIR
+# DyT/Derf unfuse the TE norm-linear; activation memory is ~6 GiB tighter
+# per rank than the RMSNorm baseline. Reduce fragmentation so the
+# fused-cross-entropy 12.28 GiB temp buffer can land in the residual.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 mkdir -p $DATASET_CACHE_DIR $TRITON_CACHE_DIR $TORCHINDUCTOR_CACHE_DIR $TMP_CACHE_DIR $PACKAGE_DIR _research/results/runs _research/results/performance
 
