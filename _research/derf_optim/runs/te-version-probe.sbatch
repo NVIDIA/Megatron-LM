@@ -11,7 +11,8 @@
 set -euo pipefail
 WORKDIR=${SLURM_SUBMIT_DIR:-/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline}
 cd $WORKDIR
-srun --network=disable_rdzv_get --environment=$WORKDIR/_research/launch/alps3.toml \
+srun -lu --mpi=pmix --network=disable_rdzv_get --environment=$WORKDIR/_research/launch/alps3.toml \
+    --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 \
     bash -c "python3 -c '
 import transformer_engine, os
 print(\"version:\", transformer_engine.__version__)
