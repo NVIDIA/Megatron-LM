@@ -352,6 +352,13 @@ class TransformerConfig(ModelParallelConfig):
     value_head_dim] and pass it as `initial_state` to the FLA chunkwise op. Useful for cold-start:
     the first few tokens of each sequence read from a learned baseline rather than zero."""
 
+    linear_attention_output_gate_form: Literal['per_channel', 'scalar'] = 'per_channel'
+    """Form of the output gate when use_output_gate=True. 'per_channel' (default, GDN/FLA
+    behavior) applies SiLU(z) per value-channel; gate has shape [b, s, h, d_v]. 'scalar' mean-
+    pools the gate projection over d_v to a single scalar per head per token, then broadcasts
+    SiLU(scalar) over the output channels. The scalar form provides a softer, single-knob
+    gate that commutes with the linear read (per-head) and uses fewer effective dofs."""
+
     ####################
     # initialization
     ####################

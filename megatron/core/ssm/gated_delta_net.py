@@ -539,8 +539,14 @@ class GatedDeltaNet(MegatronModule):
         y = self.out_norm(x)
         # Output gate (skipped for Schlag-style vanilla DeltaNet)
         if self.config.linear_attention_use_output_gate:
-            gate = gate.reshape(-1, gate.shape[-1])
-            y = y * self.act_fn(gate.float())
+            if self.config.linear_attention_output_gate_form == 'scalar':
+                # gate shape [b, s, h, d_v] -> mean over d_v -> [b, s, h, 1].
+                # Flatten to [b*s*h, 1] to match y, then broadcast SiLU(scalar) over d_v.
+                gate_scalar = gate.mean(dim=-1, keepdim=True).reshape(-1, 1).float()
+                y = y * self.act_fn(gate_scalar)
+            else:
+                gate = gate.reshape(-1, gate.shape[-1])
+                y = y * self.act_fn(gate.float())
         y = y.to(x_dtype)
         return y
 
