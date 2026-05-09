@@ -1,15 +1,15 @@
 #!/bin/bash
 #
-# Transformer++ 350M ablation, Schlag DeltaNet (3:1 hybrid), 1 GH200 node (4 GPUs).
-# 24L / 1024H / 2560F. SwiGLU MLP. SDPA every 4th layer; the other 18 are DeltaNet.
+# Transformer++ 350M ablation, GatedDeltaNet baseline (3:1 hybrid), 1 GH200 node (4 GPUs).
+# 24L / 1024H / 2560F. SwiGLU MLP. SDPA every 4th layer; the other 18 are GDN.
 # NorMuon (matrix LR 3.6e-4, scalar LR 1.5e-3), WSD, bf16.
 # 1B tokens on ClimbMix, ~244141 samples (~30 min).
 #
-# Variant: delta_net (Schlag, Irie, Schmidhuber 2021; chunkwise via FLA).
-# No decay (g forced to 0 so exp(g)=1), per-channel RMSNorm on Q,K after SiLU,
-# no output gate. Reuses the GatedDeltaNet class with config flags.
+# Variant: gated_delta_net + negative eigenvalues (OLMo Hybrid recipe; Grazzi et al. 2025).
+# Same as GDN baseline but with beta = 2*sigmoid(...) so (I - beta k k^T) admits eigenvalues
+# in (-1, 1), unlocking state tracking.
 #
-#SBATCH --job-name=transformer-pp-350m-ablation-muon-deltanet-carry
+#SBATCH --job-name=transformer-pp-350m-ablation-muon-gdn-neg-carry-v2
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -67,7 +67,7 @@ PP=1
 CP=1
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=transformer-pp-350m-ablation-muon-deltanet-$(git rev-parse --short HEAD)
+EXP_NAME=transformer-pp-350m-ablation-muon-gdn-neg-carry-v2-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=deltanet-variants
@@ -100,13 +100,10 @@ NETWORK_SIZE_ARGS=(
     --seq-length $SEQ_LEN
 )
 
-# Hybrid 3:1 (DeltaNet, DeltaNet, DeltaNet, attn) repeated 6x = 24 layers.
-# Schlag-style DeltaNet flags: no decay, RMSNorm on Q,K, no output gate.
+# Hybrid 3:1 (GDN, GDN, GDN, attn) repeated 6x = 24 layers.
 LINEAR_ATTENTION_ARGS=(
-    --experimental-attention-variant delta_net
-    --no-linear-attention-use-decay
-    --linear-attention-qk-norm rmsnorm
-    --no-linear-attention-use-output-gate
+    --experimental-attention-variant gated_delta_net
+    --linear-attention-allow-neg-eigval
     --linear-attention-freq 4
     --linear-key-head-dim 64
     --linear-value-head-dim 64

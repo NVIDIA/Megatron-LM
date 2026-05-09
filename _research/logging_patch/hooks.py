@@ -261,6 +261,8 @@ def _register_state_hooks(model: Any) -> None:
                         "amax": stats["amax"].clone(),
                         "abs_mean_sum": stats["abs_mean"].clone(),
                         "std_sum": stats["std"].clone(),
+                        "init_frob_sum": stats.get("init_frob", torch.zeros_like(stats["frob"])).clone(),
+                        "delta_frob_sum": stats.get("delta_frob", stats["frob"]).clone(),
                         "n": 1,
                     }
                 else:
@@ -268,6 +270,10 @@ def _register_state_hooks(model: Any) -> None:
                     entry["amax"] = torch.maximum(entry["amax"], stats["amax"])
                     entry["abs_mean_sum"].add_(stats["abs_mean"])
                     entry["std_sum"].add_(stats["std"])
+                    if "init_frob" in stats:
+                        entry["init_frob_sum"].add_(stats["init_frob"])
+                    if "delta_frob" in stats:
+                        entry["delta_frob_sum"].add_(stats["delta_frob"])
                     entry["n"] += 1
         return hook
 
@@ -304,31 +310,43 @@ def _drain_state_accum() -> dict[str, Any]:
     counts: list[int] = []
     for name in names:
         e = accum[name]
-        rows.append(torch.stack([e["frob_sum"], e["amax"], e["abs_mean_sum"], e["std_sum"]]))
+        rows.append(torch.stack([
+            e["frob_sum"], e["amax"], e["abs_mean_sum"], e["std_sum"],
+            e["init_frob_sum"], e["delta_frob_sum"],
+        ]))
         counts.append(e["n"])
-    big = torch.stack(rows)  # [n_layers, 4]
+    big = torch.stack(rows)  # [n_layers, 6]
     vals = big.tolist()
     snapshot: dict[str, Any] = {}
     frobs: list[float] = []
     amaxs: list[float] = []
     absmeans: list[float] = []
-    for name, (frob_sum, amax, abs_mean_sum, std_sum), n in zip(names, vals, counts):
+    init_frobs: list[float] = []
+    delta_frobs: list[float] = []
+    for name, (frob_sum, amax, abs_mean_sum, std_sum, init_sum, delta_sum), n in zip(names, vals, counts):
         n_eff = max(1, n)
         snapshot[name] = {
             "frob": frob_sum / n_eff,
             "amax": amax,
             "abs_mean": abs_mean_sum / n_eff,
             "std": std_sum / n_eff,
+            "init_frob": init_sum / n_eff,
+            "delta_frob": delta_sum / n_eff,
         }
         frobs.append(snapshot[name]["frob"])
         amaxs.append(amax)
         absmeans.append(snapshot[name]["abs_mean"])
+        init_frobs.append(snapshot[name]["init_frob"])
+        delta_frobs.append(snapshot[name]["delta_frob"])
     if frobs:
         snapshot["_global"] = {
             "frob_mean_layers": sum(frobs) / len(frobs),
             "frob_max_layers": max(frobs),
             "amax_max_layers": max(amaxs),
             "abs_mean_mean_layers": sum(absmeans) / len(absmeans),
+            "init_frob_mean_layers": sum(init_frobs) / len(init_frobs),
+            "delta_frob_mean_layers": sum(delta_frobs) / len(delta_frobs),
+            "delta_frob_max_layers": max(delta_frobs),
         }
     _STATE["state_accum"].clear()
     return snapshot

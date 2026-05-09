@@ -5,11 +5,9 @@
 # NorMuon (matrix LR 3.6e-4, scalar LR 1.5e-3), WSD, bf16.
 # 1B tokens on ClimbMix, ~244141 samples (~30 min).
 #
-# Variant: gated_delta_net + negative eigenvalues (OLMo Hybrid recipe; Grazzi et al. 2025).
-# Same as GDN baseline but with beta = 2*sigmoid(...) so (I - beta k k^T) admits eigenvalues
-# in (-1, 1), unlocking state tracking.
+# Variant: gated_delta_net (Yang et al. 2025). Reference for the DeltaNet sweep.
 #
-#SBATCH --job-name=transformer-pp-350m-ablation-muon-gdn-neg-carry
+#SBATCH --job-name=transformer-pp-350m-ablation-muon-gdn-carry-v2
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -67,7 +65,7 @@ PP=1
 CP=1
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=transformer-pp-350m-ablation-muon-gdn-neg-carry-$(git rev-parse --short HEAD)
+EXP_NAME=transformer-pp-350m-ablation-muon-gdn-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=deltanet-variants
@@ -103,7 +101,6 @@ NETWORK_SIZE_ARGS=(
 # Hybrid 3:1 (GDN, GDN, GDN, attn) repeated 6x = 24 layers.
 LINEAR_ATTENTION_ARGS=(
     --experimental-attention-variant gated_delta_net
-    --linear-attention-allow-neg-eigval
     --linear-attention-freq 4
     --linear-key-head-dim 64
     --linear-value-head-dim 64

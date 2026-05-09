@@ -290,26 +290,19 @@ class GatedDeltaNet(MegatronModule):
         else:
             self.initial_state_param = None
 
-        # Optional carry-over state across forward passes. Stored as a non-persistent
-        # buffer so it doesn't enter checkpoints. Per-rank carry: no DP all-reduce.
+        # Optional carry-over state across forward passes. Stored as a plain attribute
+        # (not a buffer) so we can lazy-init at first forward with the right batch
+        # dimension without needing micro_batch_size at config time. Per-rank carry:
+        # no DP all-reduce, each rank's microbatches chain through their own slots.
         if self.config.linear_attention_carry_state:
             assert not self.config.linear_attention_learnable_initial_state, (
                 "linear_attention_carry_state and linear_attention_learnable_initial_state "
                 "are mutually exclusive."
             )
-            num_v_heads_local = self.num_value_heads // self.tp_size
-            self.register_buffer(
-                "_carried_state",
-                torch.zeros(
-                    num_v_heads_local,
-                    self.key_head_dim,
-                    self.value_head_dim,
-                    dtype=config.params_dtype,
-                    device=torch.cuda.current_device(),
-                ),
-                persistent=False,
-            )
+            self._carry_enabled = True
+            self._carried_state = None  # lazy-init in forward
         else:
+            self._carry_enabled = False
             self._carried_state = None
 
         # Slot for per-step state stats; populated by forward when state-stats logging is on.
@@ -512,25 +505,37 @@ class GatedDeltaNet(MegatronModule):
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
-        # Initial state: learnable param > carried buffer > None.
+        # Initial state: learnable param > carried full-batch state > None.
         if self.initial_state_param is not None:
             initial_state = (
                 self.initial_state_param.unsqueeze(0)
                 .expand(batch, -1, -1, -1)
                 .contiguous()
             )
-        elif self._carried_state is not None:
-            initial_state = (
-                self._carried_state.unsqueeze(0)
-                .expand(batch, -1, -1, -1)
-                .contiguous()
+        elif self._carry_enabled:
+            # Lazy-init or shape-rebuild if batch size changed.
+            num_v_heads_local = self.num_value_heads // self.tp_size
+            need_init = (
+                self._carried_state is None
+                or self._carried_state.shape[0] != batch
+                or self._carried_state.shape[1] != num_v_heads_local
             )
+            if need_init:
+                self._carried_state = torch.zeros(
+                    batch,
+                    num_v_heads_local,
+                    self.key_head_dim,
+                    self.value_head_dim,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            initial_state = self._carried_state.detach()
         else:
             initial_state = None
 
         # Need the final state if we're carrying it forward or logging state stats.
         log_state_stats = os.environ.get("APERTUS_LOG_STATE_STATS", "0") == "1"
-        need_final_state = (self._carried_state is not None) or log_state_stats
+        need_final_state = self._carry_enabled or log_state_stats
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
@@ -545,23 +550,31 @@ class GatedDeltaNet(MegatronModule):
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
-        # Carry-over: store batch-mean detached state for the next forward.
-        if self._carried_state is not None and last_recurrent_state is not None:
+        # Carry-over: keep full per-batch-element state (no mean reduction).
+        if self._carry_enabled and last_recurrent_state is not None:
             with torch.no_grad():
-                self._carried_state.copy_(
-                    last_recurrent_state.detach().mean(dim=0).to(self._carried_state.dtype)
+                self._carried_state = last_recurrent_state.detach().to(
+                    self._carried_state.dtype
                 )
 
         # State stats: GPU-resident scalars; the logging-patch hook drains them.
         if log_state_stats and last_recurrent_state is not None:
             with torch.no_grad():
                 s = last_recurrent_state.detach().float()
-                self._last_state_stats = {
+                stats = {
                     "frob": s.norm(),
                     "amax": s.abs().amax(),
                     "abs_mean": s.abs().mean(),
                     "std": s.std(),
                 }
+                if initial_state is not None:
+                    init_f = initial_state.detach().float().norm()
+                    stats["init_frob"] = init_f
+                    stats["delta_frob"] = stats["frob"] - init_f
+                else:
+                    stats["init_frob"] = torch.zeros((), device=s.device)
+                    stats["delta_frob"] = stats["frob"].clone()
+                self._last_state_stats = stats
         else:
             self._last_state_stats = None
 

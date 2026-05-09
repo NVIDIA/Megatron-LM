@@ -9,7 +9,7 @@
 # No decay (g forced to 0 so exp(g)=1), per-channel RMSNorm on Q,K after SiLU,
 # no output gate. Reuses the GatedDeltaNet class with config flags.
 #
-#SBATCH --job-name=transformer-pp-350m-ablation-muon-deltanet-perchgate-carry
+#SBATCH --job-name=transformer-pp-350m-ablation-muon-deltanet-carry-v2
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -106,6 +106,7 @@ LINEAR_ATTENTION_ARGS=(
     --experimental-attention-variant delta_net
     --no-linear-attention-use-decay
     --linear-attention-qk-norm rmsnorm
+    --no-linear-attention-use-output-gate
     --linear-attention-freq 4
     --linear-key-head-dim 64
     --linear-value-head-dim 64
