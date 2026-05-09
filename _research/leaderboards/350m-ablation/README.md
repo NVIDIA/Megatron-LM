@@ -42,10 +42,9 @@ reference. Roots have an empty `parent`.
   8e-3 / 1e-2) move final loss only ~0.02 nats and don't recover the gap.
   DyT under the same recipe lands at 2.307 (+0.122). Wired via
   `--normalization Derf` + `APERTUS_DERF_OPTIM=compile` (torch.compile
-  fusion, `_research/derf_optim/option1_compile.py`); pure-PyTorch
-  unfused Derf/DyT runs at the same recipe land at the same loss but
-  ~30% lower TFLOP/s. See `_research/derf_optim/RESULTS.md` for the
-  throughput study (six approaches measured).
+  fusion, `_research/derf_optim/option1_compile.py`) which recovers most
+  of the throughput lost from unfusing TE's `LayerNormColumnParallelLinear`
+  (270 vs 217 TFLOP/s/GPU at this shape).
 - **`aurora-qkn`**: per-head RMSNorm on Q and K (TENorm under
   `--normalization RMSNorm`). WD stays off on the new q/k norm gains
   (default skip-WD-on-shape-1 rule); a paired ablation with
