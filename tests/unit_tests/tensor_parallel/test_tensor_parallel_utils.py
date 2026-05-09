@@ -9,8 +9,9 @@ rank = Utils.rank
 
 def test_split_tensor_along_last_dim():
     input_tensor = torch.rand((3, 4))
-    torch.equal(input_tensor[0:2, 0:2], util.split_tensor_along_last_dim(input_tensor, 2)[0])
-    torch.equal(input_tensor[2:, 2:], util.split_tensor_along_last_dim(input_tensor, 2)[1])
+    chunks = util.split_tensor_along_last_dim(input_tensor, 2)
+    assert torch.equal(chunks[0], input_tensor[:, 0:2])
+    assert torch.equal(chunks[1], input_tensor[:, 2:4])
 
 
 def test_split_tensor_into_1d_equal_chunks():
