@@ -19,6 +19,7 @@ TP=1, bf16). Steady-state TFLOP/s/GPU averaged over iter 50–200 of a
 | Option 3 — hand-rolled CUDA fused matmul + Derf | (timed out) | — | — | 2076308 |
 | Option 4 — explicit Triton norm + cuBLAS (`F.linear`) | 230 | +13 | -80 | 2077391 |
 | Option 5 — Triton norm + TE `general_gemm` (cuBLAS) | 231 | +14 | -79 | 2077708 |
+| Option 6 — hand-tuned CUDA LDG.128 norm + cuBLAS | 226 | +9 | -84 | 2078249 |
 
 Loss curves of all three options match the unfused reference within bf16
 single-rounding noise (numerical correctness gated via
@@ -92,6 +93,27 @@ GEMM, kernel-scheduling overlaps, activation buffer reuse with FP8/SP-aware
 layout). Recovering it requires landing Derf inside TE's actual kernel
 machinery (the Option 3 rebuild path documented in `OPTION_3_4_PLAN.md`),
 not more Python-side optimisation.
+
+### Option 6 — hand-tuned CUDA LDG.128 norm + cuBLAS  (kernel quality is not the lever)
+A from-scratch CUDA C++ extension (JIT-compiled via `cpp_extension.load`,
+no TE rebuild). Each thread block handles one row of `[M, K]`; threads
+cooperatively load `VEC=8` bf16 elements per LDG.128 instruction;
+`gamma * f(alpha*x + s) + beta` computed in registers (fp32 transcendental,
+bf16 store). The same pattern TE's RMSNorm kernel uses.
+
+Result: **226 TFLOP/s** — within noise of Triton (230) and Option 5 (231).
+The compiler-generated Triton elementwise was already near-optimal for
+this kernel; replacing it with hand-tuned CUDA bought nothing.
+
+This rules out the last "easy" lever. The 39 TFLOP/s gap from Option 1
+(271) to TE baseline (310) is **not in the norm kernel** and **not in
+the gemm dispatch**. It must be in TE's specific kernel pipelining
+(workspace reuse, activation buffer caching across the norm/GEMM
+boundary, async stream scheduling, or layout choices that match
+cuBLAS's preferred input format better than what we're producing).
+Recovering that gap requires landing Derf inside TE's actual machinery
+— a TE source rebuild with a Derf specialization in
+`ln_fwd_kernels.cuh` and matching backward.
 
 ### Option 5 — Triton norm + TE's `general_gemm`  (negative result, informative)
 Same as Option 4 but the matmul is dispatched through
