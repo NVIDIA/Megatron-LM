@@ -580,13 +580,14 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     if is_first_or_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
-            # Use whichever data field is available (first stage has tokens, last has labels).
-            # Avoid `tokens or labels`: PyTorch tensors raise on truthiness when they have
-            # more than one element ("Boolean value of Tensor ... is ambiguous").
-            _data_field = batch.get('tokens')
-            if _data_field is None:
-                _data_field = batch.get('labels')
-            total_tokens = torch.tensor(_data_field.size(0), dtype=torch.int32, device=dev)
+            # Under VPP, the last PP stage has labels but no tokens, so derive
+            # total_tokens from cu_seqlens_padded, which is present on every
+            # stage. cu_seqlens_padded keeps the pre-CP packed length; divide
+            # by cp_size to match the already CP-sliced tokens/labels length.
+            cp_world = cp_group.size()
+            total_tokens = (
+                batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world
+            ).reshape(1)
         else:
             total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
         broadcast_tensor(total_tokens, tp_src_rank, tp_group)
