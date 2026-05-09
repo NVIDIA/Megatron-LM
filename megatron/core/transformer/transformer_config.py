@@ -328,6 +328,11 @@ class TransformerConfig(ModelParallelConfig):
     FLA default for GDN/DeltaNet. 'rmsnorm' applies a learnable per-channel RMSNorm (used for
     the Schlag-style DeltaNet variant in this repo)."""
 
+    linear_attention_v_norm: Literal['none', 'l2norm'] = 'none'
+    """If 'l2norm', also project V to unit norm along the last dim before passing to the FLA
+    chunkwise op. Default 'none' (V is the raw SiLU/conv1d output, unbounded). Bounding ||v||
+    bounds the per-token write magnitude beta v k^T."""
+
     linear_attention_use_output_gate: bool = True
     """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
     matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""

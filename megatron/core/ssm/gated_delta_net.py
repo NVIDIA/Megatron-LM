@@ -644,6 +644,10 @@ class GatedDeltaNet(MegatronModule):
             else:
                 query_key = l2norm(query_key)
 
+        # Optional L2norm on V to bound per-token write magnitude.
+        if self.config.linear_attention_v_norm == "l2norm":
+            value = l2norm(value.contiguous())
+
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
