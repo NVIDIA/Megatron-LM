@@ -16,6 +16,7 @@ Steady-state TFLOP/s/GPU averaged over iter 50–200 of a 200-iter run.
 | RMSNorm baseline (TE pipeline) | **310** | +93 | 0 | (Aurora rank-1 leaderboard) |
 | Unfused Derf reference | 217 | 0 | -93 | 2075996 (full 1B-token) |
 | **Option 1 — torch.compile (Derf + linear)** | **271** | **+54** | **-39** | 2076258 |
+| **Option 1 — torch.compile (DyT + linear)** | **268** | **+51** | **-42** | 2078500 |
 
 Loss matches the unfused reference within bf16 single-rounding noise.
 Gated by `_research/derf_optim/test_correctness.py` (forward + d/dx + all
