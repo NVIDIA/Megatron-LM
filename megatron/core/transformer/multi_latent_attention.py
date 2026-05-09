@@ -1054,14 +1054,18 @@ class MLASelfAttention(MultiLatentAttention):
     def _backward_kv_proj(self):
         """Computes weight gradients of KV projection layers"""
         self.linear_kv_up_proj.backward_dw()
-        self.linear_kv_down_proj.backward_dw()
+        if type(self).__name__ == 'FusedMLASelfAttention':
+            self.linear_qkv_down_proj.backward_dw()
+        else:
+            self.linear_kv_down_proj.backward_dw()
 
     def _backward_q_proj(self):
         """Computes weight gradients of Q projection layers"""
         if self.config.q_lora_rank is None:
             self.linear_q_proj.backward_dw()
         else:
-            self.linear_q_down_proj.backward_dw()
+            if not type(self).__name__ == 'FusedMLASelfAttention':
+                self.linear_q_down_proj.backward_dw()
             self.linear_q_up_proj.backward_dw()
 
     def _backward_output_proj(self):
