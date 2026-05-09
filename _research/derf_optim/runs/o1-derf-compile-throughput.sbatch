@@ -111,10 +111,8 @@ MEGATRON_ARGS=(
     --aurora-num-ns-steps 12
     --lr 1e-2
     --min-lr 1e-3
-    --lr-decay-style WSD
-    --lr-warmup-samples 25600
-    --lr-wsd-decay-style minus_sqrt
-    --lr-wsd-decay-samples 48828
+    --lr-decay-style constant
+    --lr-warmup-iters 10
     --seed 42
     --init-method-std 0.02
     --bf16
