@@ -565,6 +565,35 @@ def _emit_top1_accuracy(row: dict[str, Any], iteration: int) -> None:
         pass
 
 
+def _emit_state_stats_wandb(state_stats: dict[str, Any], iteration: int) -> None:
+    """Mirror the per-layer + _global state-stats into wandb (rank-0 only).
+
+    Flattens the nested dict into dot-separated keys under a `state_stats/`
+    prefix; e.g. `state_stats/decoder.layers.0.self_attention/frob` and
+    `state_stats/_global/frob_mean_layers`. With ~18 LA layers x 4 stats plus
+    4 global aggregates we emit ~76 scalars per training step, which wandb
+    handles fine.
+    """
+    if not state_stats:
+        return
+    if int(os.environ.get("RANK", "0")) != 0:
+        return
+    try:
+        import wandb
+        if wandb.run is None:
+            return
+        flat: dict[str, float] = {}
+        for layer_name, stats in state_stats.items():
+            if not isinstance(stats, dict):
+                continue
+            for k, v in stats.items():
+                flat[f"state_stats/{layer_name}/{k}"] = float(v)
+        if flat:
+            wandb.log(flat, step=int(iteration))
+    except Exception:
+        pass
+
+
 def patch_training_log() -> None:
     """Wrap training_log to append one row per call to the JSON writer."""
     from megatron.training import training as mtt
@@ -648,7 +677,9 @@ def patch_training_log() -> None:
             row["act_stats"] = _drain_act_accum()
 
         if _STATE["log_state_stats"]:
-            row["state_stats"] = _drain_state_accum()
+            stats_snapshot = _drain_state_accum()
+            row["state_stats"] = stats_snapshot
+            _emit_state_stats_wandb(stats_snapshot, int(iteration))
 
         if _STATE["log_row_cv"] and _STATE["model"] is not None:
             row["row_cv"] = _row_cv(_STATE["model"])
