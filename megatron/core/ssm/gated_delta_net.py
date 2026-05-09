@@ -55,14 +55,25 @@ except ImportError:
 
 
 class _PerChannelRMSNorm(nn.Module):
-    """Per-head-dim RMSNorm for Q,K in the Schlag-style DeltaNet variant.
-    Applied in float32 for numerical stability, cast back to input dtype.
-    Weight shape [head_dim], replicated across TP/heads (no cross-head reduction)."""
+    """Per-head-dim RMSNorm with learnable scale for Q,K in the Schlag-style
+    DeltaNet variant. Applied in float32 for numerical stability, cast back to
+    input dtype. Weight shape [head_dim], replicated across TP/heads.
+
+    The learnable scale is initialized to ``1/sqrt(head_dim)`` so the output is
+    approximately unit-norm at init. This is required for delta-rule stability:
+    with ``||k|| > 1``, the state update ``(I - beta k k^T) S`` has spectral
+    radius greater than one and the recurrent state diverges to NaN within a
+    handful of steps. Vanilla RMSNorm would init the weight to ones, producing
+    norm ~sqrt(d_k); we deliberately deviate to keep the variant comparable to
+    L2norm-based variants while still exposing a learnable per-channel scale."""
 
     def __init__(self, head_dim: int, eps: float = 1e-6, dtype=torch.float32):
         super().__init__()
+        init = head_dim ** -0.5
         self.weight = nn.Parameter(
-            torch.ones(head_dim, dtype=dtype, device=torch.cuda.current_device())
+            torch.full(
+                (head_dim,), init, dtype=dtype, device=torch.cuda.current_device()
+            )
         )
         self.eps = eps
 
