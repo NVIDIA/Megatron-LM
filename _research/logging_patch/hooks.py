@@ -187,13 +187,22 @@ def _drain_act_accum() -> dict[str, dict[str, float]]:
 
 
 def _per_layer_grad_norms(model: Any) -> dict[str, float]:
+    """Per-parameter gradient L2 norms.
+
+    Megatron's `--use-distributed-optimizer` stores gradients in
+    ``param.main_grad`` (fp32 or bf16 buffer used by the distributed
+    optimizer's reduce-scatter path) rather than ``param.grad``. Without the
+    fallback this dict was silently ``{}`` for every step in any
+    distributed-optimizer run.
+    """
     chunks = model if isinstance(model, list) else [model]
     out: dict[str, float] = {}
     for chunk in chunks:
         for name, p in chunk.named_parameters():
-            if p.grad is None:
+            grad = p.grad if p.grad is not None else getattr(p, "main_grad", None)
+            if grad is None:
                 continue
-            out[name] = float(p.grad.detach().float().norm().item())
+            out[name] = float(grad.detach().float().norm().item())
     return out
 
 
