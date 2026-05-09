@@ -218,8 +218,11 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.
     - A list that defines a custom pattern, e.g.: [1,1,1,1,0,0,0,0], where 1 represents SWA. """
 
-    normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
-    """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
+    normalization: Literal['LayerNorm', 'RMSNorm', 'DyT', 'Derf'] = "LayerNorm"
+    """Which norm to use for normalization layers. `LayerNorm` / `RMSNorm` are the standard
+    reduction-based norms; `DyT` (Dynamic Tanh, Zhu et al. 2025) and `Derf` (Dynamic erf,
+    Chen et al. 2025) are element-wise drop-in replacements (no reduction). DyT/Derf force
+    the TE attention QKV and dense MLP fc1 to unfuse from their layer-norm-linear path."""
 
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""

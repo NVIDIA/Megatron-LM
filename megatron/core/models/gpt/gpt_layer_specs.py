@@ -170,6 +170,29 @@ def get_gpt_layer_with_inference_spec(*args, **kwargs) -> ModuleSpec:
     )
 
 
+class _UnfusedNormBackend:
+    """Delegating wrapper that disables layer-norm/linear fusion.
+
+    Used when `--normalization` is `DyT` or `Derf`: TE's fused norm-linear kernel
+    only knows LayerNorm and RMSNorm, so we route those configs through the
+    unfused TE path (separate `input_layernorm` / `pre_mlp_layernorm` modules
+    plus a plain `TEColumnParallelLinear`). Everything else (attention, row-
+    parallel linear, dot-product attention) still runs through TE.
+    """
+
+    def __init__(self, base):
+        self._base = base
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    def fuse_layernorm_and_linear(self) -> bool:
+        return False
+
+    def column_parallel_layer_norm_linear(self):
+        return None
+
+
 def get_gpt_layer_with_transformer_engine_submodules(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
@@ -183,6 +206,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     mla_down_proj_fusion: bool = False,
+    unfuse_norm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -224,6 +248,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
         backend = TESpecProvider()
+
+    if unfuse_norm:
+        backend = _UnfusedNormBackend(backend)
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
@@ -308,12 +335,23 @@ def get_gpt_layer_with_transformer_engine_submodules(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
+        if unfuse_norm:
+            linear_qkv = backend.column_parallel_linear()
+            input_layernorm = backend.layer_norm(has_residual=True)
+            pre_mlp_layernorm = backend.layer_norm(has_residual=True)
+        else:
+            linear_qkv = backend.column_parallel_layer_norm_linear()
+            input_layernorm = IdentityOp
+            pre_mlp_layernorm = (
+                backend.layer_norm(has_residual=True) if num_experts else IdentityOp
+            )
         return TransformerLayerSubmodules(
+            input_layernorm=input_layernorm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=backend.column_parallel_layer_norm_linear(),
+                    linear_qkv=linear_qkv,
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=(
@@ -325,7 +363,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
+            pre_mlp_layernorm=pre_mlp_layernorm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map={
@@ -557,6 +595,10 @@ def get_gpt_decoder_layer_specs(
     """GPT block spec."""
     if use_transformer_engine:
         layer_norm_impl = TENorm
+        # DyT/Derf are element-wise norms; TE's fused norm-linear kernel only knows
+        # LayerNorm and RMSNorm, so unfuse so `input_layernorm`/`pre_mlp_layernorm`
+        # become real submodules that TENorm dispatches through.
+        unfuse_norm = config.normalization in ("DyT", "Derf")
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -568,6 +610,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            unfuse_norm=unfuse_norm,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -580,6 +623,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            unfuse_norm=unfuse_norm,
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
