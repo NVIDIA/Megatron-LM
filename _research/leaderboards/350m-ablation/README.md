@@ -18,9 +18,10 @@ so results stay reproducible across upstream syncs. Tag list:
 | 1 | NorMuon | 3.6e-4 | **2.224** | **2.061** | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [0l47egjv](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/0l47egjv) | [`baseline-2026-05-08-0b2385c`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-0b2385c) |
 | 2 | Muon (shape_scaling) | 2e-2 | 2.226 | 2.068 | [`03-muon-kj-lr2e-2.sbatch`](runs/03-muon-kj-lr2e-2.sbatch) | [f7uvsbai](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/f7uvsbai) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 3 | NorMuon | 2e-4 | 2.227 | 2.063 | [`02-normuon-lr2e-4.sbatch`](runs/02-normuon-lr2e-4.sbatch) | [heevf919](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 4 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 5 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 6 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 4 | NorMuon (FP8) | 3.6e-4 | 2.229 | 2.065 | [`07-normuon-fp8.sbatch`](runs/07-normuon-fp8.sbatch) | [7j84uy3j](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/7j84uy3j) | [`598cbe616`](https://github.com/ischlag/megatron-lm-research-baseline/tree/598cbe616) |
+| 5 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 6 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 7 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 
 ## Notes on entries
 
@@ -32,6 +33,12 @@ so results stay reproducible across upstream syncs. Tag list:
   final loss 2.219 and 2.224 (within numerical noise). Dropped from table.
 - **Rank 3** is the Keller Jordan recipe: plain Muon, `shape_scaling`
   scale mode, LR 2e-2. Works competitively out of the box on the 350M.
+- **Rank 4** is the FP8 variant of rank 1 — same NorMuon recipe, but
+  with `--fp8-format e4m3 --fp8-recipe blockwise` (DeepSeek-V3 recipe,
+  Hopper-compatible). FP8 matmuls only (params and master weights stay
+  bf16; no `--fp8-param-gather`, no `fp8_param`). Final loss +0.007 vs
+  bf16 leader, within numerical noise. Steady throughput ~313
+  TFLOP/s/GPU.
 - **AdamW ranks** use `--optimizer adam` which in Megatron is decoupled-WD
   AdamW; the naming in the table reflects that.
 - `--overlap-param-gather` is **on** for AdamW rows and **off** for Muon

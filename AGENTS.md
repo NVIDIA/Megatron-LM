@@ -72,6 +72,31 @@ git checkout <sha> && sbatch _research/leaderboards/<size>/runs/NN-*.sbatch
 - **Sync with upstream**: `git fetch upstream && git merge upstream/main`.
   Expect conflicts only in the files listed above.
 
+## Cluster-side worktrees
+
+Local git worktrees buy isolation only if the cluster mirrors them. If
+two branches share the canonical clone at
+`/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline/`, their
+runs trample each other's `_research/packages/`, `cache/`,
+`_research/results/`, etc.
+
+Convention:
+
+- For each local worktree on a non-main branch, create a matching
+  cluster-side **sidecar clone** on that branch:
+  ```
+  cd /iopsstor/scratch/cscs/$USER
+  git clone --branch <branch> https://github.com/ischlag/megatron-lm-research-baseline.git \
+      megatron-lm-research-baseline-<short-name>
+  ```
+- Sbatches in this repo set `REPO_DIR=$WORKDIR` (where `WORKDIR`
+  defaults to `SLURM_SUBMIT_DIR`), so all caches, packages, TB, and
+  wandb outputs land in the sidecar — no shared writes. Only the
+  SBATCH `--output` / `--error` log files still hit the canonical path
+  (the directives can't read shell vars).
+- The canonical clone is reserved for `main` and for runs that don't
+  need branch isolation.
+
 ## When to pause and ask the human
 
 - Adding cluster-wide or repo-wide dependencies.
