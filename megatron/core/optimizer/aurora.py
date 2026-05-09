@@ -165,9 +165,12 @@ class TensorParallelAurora(OrthogonalizedOptimizer):
                 f"Aurora hardcodes the spectral aspect-ratio scale; "
                 f"got scale_mode={scale_mode!r}. Use --muon-scale-mode spectral."
             )
-        if tp_mode != "duplicated":
+        # Match Muon's pattern: 'blockwise' reduces to 'duplicated' at the
+        # orthogonalize call site (each rank polars its full local matrix).
+        # 'distributed' (TP-coordinated polar) is not supported in v1.
+        if tp_mode not in ("duplicated", "blockwise"):
             raise ValueError(
-                f"Aurora v1 supports tp_mode='duplicated' only, got {tp_mode!r}."
+                f"Aurora v1 supports tp_mode in ('duplicated', 'blockwise'), got {tp_mode!r}."
             )
 
         def scaled_orthogonalize_fn(
