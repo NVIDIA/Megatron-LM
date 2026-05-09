@@ -154,7 +154,8 @@ metadata sidecar (`<run>.meta.json`):
 | --- | --- | --- |
 | `train_loss`, `lr`, `grad_norm`, `params_norm`, `tput` | always on | -- |
 | MFU (model FLOPs utilization) | always on | -- |
-| Per-layer activation norms and max | `APERTUS_LOG_ACT_STATS` | on |
+| Per-block FP8-stability activation stats (`amax`, `l2`, `frac_outlier`, `rms`) | `APERTUS_LOG_ACT_STATS` | on |
+| Threshold for the `frac_outlier` stat (E4M3 input range proxy) | `APERTUS_LOG_ACT_THRESHOLD` | `240` |
 | Top-1 next-token accuracy (TP-aware) | `APERTUS_LOG_TOP1_ACC` | on |
 | Per-parameter row-norm CV (Aurora-style neuron utilization proxy) | `APERTUS_LOG_ROW_CV` | on |
 | Per-parameter gradient norms | `APERTUS_LOG_PER_LAYER_GRADS` | off |
