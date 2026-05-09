@@ -521,9 +521,25 @@ class GatedDeltaNet(MegatronModule):
 
         # For DeltaProduct: interleave n Householder slots into the seq dim. After this,
         # the FLA op sees a sequence of length seq_len * n_hh, with each original token
-        # contributing n consecutive entries.
+        # contributing n consecutive entries. The conv-output channel layout is
+        # [n*Q | n*K | n*V]; within each block the n Householders are outer (consecutive).
+        # We split into Q/K/V, reshape each so n becomes the inner seq dim, then re-cat.
         if n_hh > 1:
-            qkv = qkv.reshape(batch, seq_len, n_hh, -1).reshape(batch, seq_len * n_hh, -1)
+            q_part, k_part, v_part = torch.split(
+                qkv,
+                [
+                    n_hh * (self.qk_dim_local_tp // self.cp_size),
+                    n_hh * (self.qk_dim_local_tp // self.cp_size),
+                    n_hh * (self.v_dim_local_tp // self.cp_size),
+                ],
+                dim=-1,
+            )
+            qk_local = self.qk_dim_local_tp // self.cp_size
+            v_local = self.v_dim_local_tp // self.cp_size
+            q_part = q_part.reshape(batch, seq_len, n_hh, qk_local).reshape(batch, seq_len * n_hh, qk_local)
+            k_part = k_part.reshape(batch, seq_len, n_hh, qk_local).reshape(batch, seq_len * n_hh, qk_local)
+            v_part = v_part.reshape(batch, seq_len, n_hh, v_local).reshape(batch, seq_len * n_hh, v_local)
+            qkv = torch.cat([q_part, k_part, v_part], dim=-1)
             fla_seq_len = seq_len * n_hh
         else:
             fla_seq_len = seq_len
