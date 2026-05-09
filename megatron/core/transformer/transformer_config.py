@@ -359,6 +359,12 @@ class TransformerConfig(ModelParallelConfig):
     SiLU(scalar) over the output channels. The scalar form provides a softer, single-knob
     gate that commutes with the linear read (per-head) and uses fewer effective dofs."""
 
+    linear_attention_carry_state: bool = False
+    """If True, carry the recurrent state across forward passes. Each forward pulls the
+    previous step's last_recurrent_state (detached, mean-reduced over batch, broadcast back
+    over the new batch) as initial_state, then writes the new last state into a non-persistent
+    buffer. Per-rank carry (no DP all-reduce). Mutually exclusive with linear_attention_learnable_initial_state."""
+
     ####################
     # initialization
     ####################

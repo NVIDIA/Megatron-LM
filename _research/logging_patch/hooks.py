@@ -40,6 +40,8 @@ _STATE: dict[str, Any] = {
     "log_act_threshold": 240.0,
     "act_accum": {},
     "neuron_accum": {},
+    "state_accum": {},
+    "log_state_stats": False,
     "top1_correct": 0.0,
     "top1_total": 0.0,
 }
@@ -54,6 +56,7 @@ def configure(writer: JsonLogger, cfg: dict[str, Any]) -> None:
     _STATE["log_row_cv"] = cfg.get("log_row_cv", False)
     _STATE["log_neuron_stats"] = cfg.get("log_neuron_stats", False)
     _STATE["log_neuron_interval"] = int(cfg.get("log_neuron_interval", 100))
+    _STATE["log_state_stats"] = cfg.get("log_state_stats", False)
     _STATE["loss_spike_k"] = cfg.get("loss_spike_k", 3.0)
     _STATE["log_act_threshold"] = float(cfg.get("log_act_threshold", 240.0))
 
@@ -232,6 +235,105 @@ def _row_cv(model: Any) -> dict[str, float]:
     return {n: float(v) for n, v in zip(names, vals)}
 
 
+def _register_state_hooks(model: Any) -> None:
+    """Forward hooks on every linear-attn layer that exposes ``_last_state_stats``.
+
+    The GatedDeltaNet (and Schlag-DN config of it) writes a dict of GPU-resident
+    scalar tensors (`frob`, `amax`, `abs_mean`, `std`) on itself in forward when
+    ``APERTUS_LOG_STATE_STATS=1``. After each forward we accumulate (sum + count)
+    so multiple microbatches per training step average correctly. ``amax`` uses
+    ``maximum`` instead of summing.
+    """
+    import torch
+
+    accum: dict[str, dict[str, Any]] = _STATE["state_accum"]
+
+    def make_hook(name: str):
+        def hook(mod, _inp, _out):
+            stats = getattr(mod, "_last_state_stats", None)
+            if not isinstance(stats, dict):
+                return
+            with torch.no_grad():
+                entry = accum.get(name)
+                if entry is None:
+                    accum[name] = {
+                        "frob_sum": stats["frob"].clone(),
+                        "amax": stats["amax"].clone(),
+                        "abs_mean_sum": stats["abs_mean"].clone(),
+                        "std_sum": stats["std"].clone(),
+                        "n": 1,
+                    }
+                else:
+                    entry["frob_sum"].add_(stats["frob"])
+                    entry["amax"] = torch.maximum(entry["amax"], stats["amax"])
+                    entry["abs_mean_sum"].add_(stats["abs_mean"])
+                    entry["std_sum"].add_(stats["std"])
+                    entry["n"] += 1
+        return hook
+
+    chunks = model if isinstance(model, list) else [model]
+    for chunk in chunks:
+        for name, module in chunk.named_modules():
+            # GDN sets _last_state_stats to None at __init__; using hasattr is enough.
+            if hasattr(module, "_last_state_stats"):
+                module.register_forward_hook(make_hook(name))
+
+
+def _drain_state_accum() -> dict[str, Any]:
+    """Aggregate per-layer state stats + a global summary.
+
+    Returns:
+        {
+            "<layer_name>": {"frob": float, "amax": float, "abs_mean": float, "std": float},
+            ...,
+            "_global": {
+                "frob_mean_layers": float,   # mean over layers of per-layer frob
+                "frob_max_layers":  float,   # max over layers
+                "amax_max_layers":  float,
+                "abs_mean_mean_layers": float,
+            },
+        }
+    """
+    import torch
+
+    accum = _STATE["state_accum"]
+    if not accum:
+        return {}
+    names = list(accum.keys())
+    rows = []
+    counts: list[int] = []
+    for name in names:
+        e = accum[name]
+        rows.append(torch.stack([e["frob_sum"], e["amax"], e["abs_mean_sum"], e["std_sum"]]))
+        counts.append(e["n"])
+    big = torch.stack(rows)  # [n_layers, 4]
+    vals = big.tolist()
+    snapshot: dict[str, Any] = {}
+    frobs: list[float] = []
+    amaxs: list[float] = []
+    absmeans: list[float] = []
+    for name, (frob_sum, amax, abs_mean_sum, std_sum), n in zip(names, vals, counts):
+        n_eff = max(1, n)
+        snapshot[name] = {
+            "frob": frob_sum / n_eff,
+            "amax": amax,
+            "abs_mean": abs_mean_sum / n_eff,
+            "std": std_sum / n_eff,
+        }
+        frobs.append(snapshot[name]["frob"])
+        amaxs.append(amax)
+        absmeans.append(snapshot[name]["abs_mean"])
+    if frobs:
+        snapshot["_global"] = {
+            "frob_mean_layers": sum(frobs) / len(frobs),
+            "frob_max_layers": max(frobs),
+            "amax_max_layers": max(amaxs),
+            "abs_mean_mean_layers": sum(absmeans) / len(absmeans),
+        }
+    _STATE["state_accum"].clear()
+    return snapshot
+
+
 def _register_neuron_hooks(model: Any) -> None:
     """Forward pre-hooks on every MLP linear_fc2 to accumulate per-neuron stats.
 
@@ -351,6 +453,8 @@ def patch_setup_model_and_optimizer() -> None:
             _register_act_hooks(model)
         if _STATE["log_neuron_stats"]:
             _register_neuron_hooks(model)
+        if _STATE["log_state_stats"]:
+            _register_state_hooks(model)
         writer = _STATE["writer"]
         if writer is not None:
             writer.set(n_params_total=total, n_params_active=active)
@@ -542,6 +646,9 @@ def patch_training_log() -> None:
 
         if _STATE["log_act_stats"]:
             row["act_stats"] = _drain_act_accum()
+
+        if _STATE["log_state_stats"]:
+            row["state_stats"] = _drain_state_accum()
 
         if _STATE["log_row_cv"] and _STATE["model"] is not None:
             row["row_cv"] = _row_cv(_STATE["model"])

@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -289,6 +290,31 @@ class GatedDeltaNet(MegatronModule):
         else:
             self.initial_state_param = None
 
+        # Optional carry-over state across forward passes. Stored as a non-persistent
+        # buffer so it doesn't enter checkpoints. Per-rank carry: no DP all-reduce.
+        if self.config.linear_attention_carry_state:
+            assert not self.config.linear_attention_learnable_initial_state, (
+                "linear_attention_carry_state and linear_attention_learnable_initial_state "
+                "are mutually exclusive."
+            )
+            num_v_heads_local = self.num_value_heads // self.tp_size
+            self.register_buffer(
+                "_carried_state",
+                torch.zeros(
+                    num_v_heads_local,
+                    self.key_head_dim,
+                    self.value_head_dim,
+                    dtype=config.params_dtype,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+        else:
+            self._carried_state = None
+
+        # Slot for per-step state stats; populated by forward when state-stats logging is on.
+        self._last_state_stats: Optional[dict] = None
+
         # Output layernorm before projection
         self.out_norm = build_module(
             submodules.out_norm,
@@ -486,15 +512,25 @@ class GatedDeltaNet(MegatronModule):
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
-        # Optional learnable initial state: broadcast per-head S0 over batch
+        # Initial state: learnable param > carried buffer > None.
         if self.initial_state_param is not None:
             initial_state = (
                 self.initial_state_param.unsqueeze(0)
                 .expand(batch, -1, -1, -1)
                 .contiguous()
             )
+        elif self._carried_state is not None:
+            initial_state = (
+                self._carried_state.unsqueeze(0)
+                .expand(batch, -1, -1, -1)
+                .contiguous()
+            )
         else:
             initial_state = None
+
+        # Need the final state if we're carrying it forward or logging state stats.
+        log_state_stats = os.environ.get("APERTUS_LOG_STATE_STATS", "0") == "1"
+        need_final_state = (self._carried_state is not None) or log_state_stats
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
@@ -504,10 +540,30 @@ class GatedDeltaNet(MegatronModule):
             g=g,
             beta=beta,
             initial_state=initial_state,
-            output_final_state=False,
+            output_final_state=need_final_state,
             use_qk_l2norm_in_kernel=False,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
+
+        # Carry-over: store batch-mean detached state for the next forward.
+        if self._carried_state is not None and last_recurrent_state is not None:
+            with torch.no_grad():
+                self._carried_state.copy_(
+                    last_recurrent_state.detach().mean(dim=0).to(self._carried_state.dtype)
+                )
+
+        # State stats: GPU-resident scalars; the logging-patch hook drains them.
+        if log_state_stats and last_recurrent_state is not None:
+            with torch.no_grad():
+                s = last_recurrent_state.detach().float()
+                self._last_state_stats = {
+                    "frob": s.norm(),
+                    "amax": s.abs().amax(),
+                    "abs_mean": s.abs().mean(),
+                    "std": s.std(),
+                }
+        else:
+            self._last_state_stats = None
 
         # RMSNorm
         nvtx_range_push(suffix="gated_norm")

@@ -120,6 +120,7 @@ def install() -> None:
         "log_row_cv": os.environ.get("APERTUS_LOG_ROW_CV", "1") != "0",
         "log_neuron_stats": os.environ.get("APERTUS_LOG_NEURON_STATS") == "1",
         "log_neuron_interval": int(os.environ.get("APERTUS_LOG_NEURON_INTERVAL", "100")),
+        "log_state_stats": os.environ.get("APERTUS_LOG_STATE_STATS", "0") == "1",
     })
     hooks.patch_setup_model_and_optimizer()
     hooks.patch_training_log()
