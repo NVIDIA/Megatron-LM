@@ -123,8 +123,9 @@ has a self-contained sbatch (no env-var branching, all hparams pinned)
 plus a W&B link and the git sha it was executed at. Current leaderboards:
 
 - [`350m-ablation`](_research/leaderboards/350m-ablation/README.md) —
-  1B-token optimizer ablations. Top entry: NorMuon @ 3.6e-4, final loss
-  2.225 (beats best AdamW @ 1e-3 by ~0.09 nats).
+  1B-token optimizer ablations. Top entry: Aurora (Tilde) @ 1e-2, final
+  loss 2.200 (beats prior NorMuon @ 3.6e-4 leader by 0.024 nats and best
+  AdamW @ 1e-3 by ~0.12 nats).
 - `350m`, `760m`, `1.3b`, `2.7b` — placeholder dirs; no full runs yet.
 
 ### Launch vs leaderboards
