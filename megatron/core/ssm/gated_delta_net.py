@@ -553,9 +553,16 @@ class GatedDeltaNet(MegatronModule):
         # Carry-over: keep full per-batch-element state (no mean reduction).
         if self._carry_enabled and last_recurrent_state is not None:
             with torch.no_grad():
-                self._carried_state = last_recurrent_state.detach().to(
-                    self._carried_state.dtype
-                )
+                new_state = last_recurrent_state.detach().to(self._carried_state.dtype)
+                cap = self.config.linear_attention_carried_state_max_frob
+                if cap > 0.0:
+                    # Per-batch-element Frobenius cap on the carried state.
+                    flat = new_state.reshape(new_state.shape[0], -1).float()
+                    norms = flat.norm(dim=-1, keepdim=True)  # [batch, 1]
+                    scale = torch.clamp(cap / norms.clamp_min(1e-12), max=1.0)
+                    flat = flat * scale
+                    new_state = flat.reshape_as(new_state).to(new_state.dtype)
+                self._carried_state = new_state
 
         # State stats: GPU-resident scalars; the logging-patch hook drains them.
         if log_state_stats and last_recurrent_state is not None:

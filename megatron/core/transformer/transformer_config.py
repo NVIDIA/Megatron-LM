@@ -333,6 +333,12 @@ class TransformerConfig(ModelParallelConfig):
     chunkwise op. Default 'none' (V is the raw SiLU/conv1d output, unbounded). Bounding ||v||
     bounds the per-token write magnitude beta v k^T."""
 
+    linear_attention_carried_state_max_frob: float = 0.0
+    """Hard cap on ||S||_F of the carried state buffer (linear_attention_carry_state). If the
+    new last-recurrent-state has Frobenius norm above this value, scale it down before storing
+    in the buffer for the next forward. Zero (default) disables the cap. Applied per-rank,
+    per-batch-element on the buffer only; intra-forward state is not capped."""
+
     linear_attention_use_output_gate: bool = True
     """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
     matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""
