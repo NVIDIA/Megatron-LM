@@ -42,6 +42,7 @@ export TORCHINDUCTOR_CACHE_DIR=$REPO_DIR/cache/inductor
 export TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export TMPDIR=$TMP_CACHE_DIR
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 mkdir -p $DATASET_CACHE_DIR $TRITON_CACHE_DIR $TORCHINDUCTOR_CACHE_DIR $TMP_CACHE_DIR $PACKAGE_DIR _research/results/runs _research/results/performance
 
@@ -54,7 +55,7 @@ FFN_HIDDEN=2560
 NUM_HEADS=16
 NUM_KV_HEADS=4
 
-MBS=16
+MBS=8   # reduced from 16 to fit GDN/DeltaNet state + chunkwise intermediates in 95GB GH200
 GBS=128
 SEQ_LEN=4096
 TRAIN_SAMPLES=244141    # 1B tokens / 4096 seq_len
