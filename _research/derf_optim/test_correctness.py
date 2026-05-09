@@ -166,9 +166,30 @@ def test_option3(seq=64, batch=2, hidden=128, output=192, dtype=torch.float32):
     return ok
 
 
+def test_option4(seq=64, batch=2, hidden=128, output=192, dtype=torch.float32):
+    """Option 4: Triton norm-only + F.linear (cuBLAS), TE-style two-kernel pipeline."""
+    print(f"[option4] dtype={dtype} seq={seq} batch={batch} hidden={hidden} output={output}")
+    if not torch.cuda.is_available():
+        print("[option4] SKIP (no CUDA)")
+        return True
+    from _research.derf_optim.option4_te_style import _te_style_derf_linear, _te_style_dyt_linear
+
+    if dtype is torch.bfloat16:
+        rtol, atol = 1e-1, 5e-2
+    else:
+        rtol, atol = 5e-3, 1e-3
+
+    device = "cuda"
+    ok = True
+    ok &= _run_pair(_eager_derf_linear, _te_style_derf_linear, True,  "Derf-te4", seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
+    ok &= _run_pair(_eager_dyt_linear,  _te_style_dyt_linear,  False, "DyT-te4",  seq, batch, hidden, output, dtype, rtol=rtol, atol=atol, device=device)
+    print(f"[option4] {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--option", choices=["1", "2", "3"], default="1")
+    p.add_argument("--option", choices=["1", "2", "3", "4"], default="1")
     p.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
     args = p.parse_args()
 
@@ -179,6 +200,8 @@ def main():
         ok = test_option2(dtype=dtype)
     elif args.option == "3":
         ok = test_option3(dtype=dtype)
+    elif args.option == "4":
+        ok = test_option4(dtype=dtype)
     else:
         raise NotImplementedError(f"option {args.option} test not yet wired")
     sys.exit(0 if ok else 1)
