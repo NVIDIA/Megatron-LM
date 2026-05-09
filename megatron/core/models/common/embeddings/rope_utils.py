@@ -226,14 +226,24 @@ def _apply_rotary_pos_emb_thd(
     device = t.device
 
     token_pos = torch.arange(total_tokens, device=device)
+    # `searchsorted(..., right=True) - 1` returns the index of the sequence each
+    # token belongs to. The `clamp` here guards padding tokens whose
+    # `searchsorted` position can fall outside the valid `[0, num_seqs)` range
+    # (last cu_seqlens entry); they get any wrong-but-harmless freq because
+    # their RoPE output is masked away later by `padding_mask` / `loss_mask`.
     seq_idx = torch.searchsorted(cu_seqlens, token_pos, right=True) - 1
     seq_idx = seq_idx.clamp(min=0, max=cu_seqlens.shape[0] - 2)
 
     seq_start = cu_seqlens[seq_idx]
     local_pos = token_pos - seq_start
 
-    full_seqlen = (cu_seqlens[seq_idx + 1] - seq_start) * cp_size
-    chunk_size = (cu_seqlens[seq_idx + 1] - seq_start) // 2
+    # int64 for the multiplications: `cu_seqlens` are int32 (per TE convention),
+    # but `(seq_len * cp_size)` and downstream arithmetic can overflow int32 at
+    # very long contexts (e.g. >65k tokens × cp_size). Cast once here and the
+    # rest of the computation stays in int64.
+    seq_len_i64 = (cu_seqlens[seq_idx + 1] - seq_start).to(torch.int64)
+    full_seqlen = seq_len_i64 * cp_size
+    chunk_size = seq_len_i64 // 2
 
     if cp_size > 1:
         is_first_half = local_pos < chunk_size
@@ -243,11 +253,19 @@ def _apply_rotary_pos_emb_thd(
             full_seqlen - (cp_rank + 1) * chunk_size + (local_pos - chunk_size),
         )
     else:
-        freq_pos = local_pos
+        freq_pos = local_pos.to(torch.int64)
 
     if freqs.dim() >= 1 and freqs.size(0) > total_tokens:
-        freq_pos = freq_pos + seq_start * cp_size
+        # `freqs` covers all positions across all sequences (used for non-1D
+        # RoPE / VLMs); shift by the per-sequence start offset so each token
+        # samples its absolute position. When `freqs` only spans one max-len
+        # sequence, no shift is needed.
+        freq_pos = freq_pos + seq_start.to(torch.int64) * cp_size
 
+    # Same rationale as the seq_idx clamp above: padded positions can index
+    # past `freqs`; they receive a known wrong-but-harmless freq that gets
+    # masked away. If you suspect a real out-of-range bug, swap clamp for an
+    # assert during development.
     freq_pos = freq_pos.clamp(min=0, max=freqs.shape[0] - 1)
     freqs_packed = freqs[freq_pos]
 

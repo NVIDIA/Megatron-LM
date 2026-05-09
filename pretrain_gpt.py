@@ -198,7 +198,16 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
 
-    return (*batch.values(), packed_seq_params, padding_mask)
+    # Unpack explicitly to avoid relying on dict insertion order.
+    return (
+        batch.get('tokens'),
+        batch.get('labels'),
+        batch.get('loss_mask'),
+        batch.get('attention_mask'),
+        batch.get('position_ids'),
+        packed_seq_params,
+        padding_mask,
+    )
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -294,7 +303,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    tokens, position_ids, attention_mask,
+                    labels=labels, loss_mask=loss_mask,
+                    packed_seq_params=packed_seq_params, padding_mask=padding_mask,
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:

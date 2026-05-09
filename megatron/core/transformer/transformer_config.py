@@ -905,19 +905,13 @@ class TransformerConfig(ModelParallelConfig):
     token budget); setting it too large just allocates a slightly larger cu_seqlens
     buffer."""
 
-    cuda_graph_dynamic_microbatches: bool = field(
-        default=False,
-        metadata={"argparse_meta": {"arg_names": ["--cuda-graph-dynamic-microbatches"]}},
-    )
+    cuda_graph_dynamic_microbatches: bool = False
     """Enable CUDA graph slot reuse so the same captured graphs can be replayed for a dynamic
     number of microbatches. This option is only meaningful for cuda_graph_impl=transformer_engine.
     When enabled, capture builds a bounded number of graph slots and replay maps real
     microbatch_id to slot_id by modulo."""
 
-    cuda_graph_num_microbatch_slots: Optional[int] = field(
-        default=None,
-        metadata={"argparse_meta": {"arg_names": ["--cuda-graph-num-microbatch-slots"]}},
-    )
+    cuda_graph_num_microbatch_slots: Optional[int] = None
     """Number of CUDA graph slots to capture per layer for dynamic microbatch replay.
     If None, an automatic slot count is derived from the PP/VPP schedule topology.
     If set, the provided value must be >= the automatically derived safe minimum."""

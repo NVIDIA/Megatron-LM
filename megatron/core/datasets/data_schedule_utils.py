@@ -23,14 +23,17 @@ def get_cp_slice_for_thd(batch, cp_group):
     if cp_size <= 1:
         return
     cp_rank = cp_group.rank()
-    total_tokens = batch['tokens'].size(0)
     # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
     # cu_seqlens to get the correct result.
     # TODO: Revert this workaround once TE fixes the issue.
     cu_seqlens = batch["cu_seqlens_padded"]
+    # Use cu_seqlens_padded[-1] for total_tokens instead of batch['tokens'].size(0):
+    # under VPP, the last PP stage has labels/loss_mask but no tokens, so
+    # batch['tokens'] is None on that stage. cu_seqlens_padded is always populated.
+    total_tokens = int(cu_seqlens[-1].item())
     index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
     for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
-        if key in batch:
+        if key in batch and batch[key] is not None:
             batch[key] = batch[key].index_select(0, index)
 
 

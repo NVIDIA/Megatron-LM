@@ -997,44 +997,48 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        device = torch.cuda.current_device()
+
+        # Captured forward needs an attention-side static input only when this
+        # layer's attention is actually inside the captured scope.
+        attn_in_graph = not isinstance(self.self_attention, IdentityOp) and (
+            not self.config.cuda_graph_scope
+            or CudaGraphScope.attn in self.config.cuda_graph_scope
+        )
 
         if self._is_thd_cuda_graph():
-            if not isinstance(self.self_attention, IdentityOp) and (
-                not self.config.cuda_graph_scope
-                or CudaGraphScope.attn in self.config.cuda_graph_scope
-            ):
+            if attn_in_graph:
+                # Static cu_seqlens shaped [thd_max_num_seqs + 1]. We seed it as
+                # one full-length sequence (covers the worst case at capture):
+                #   cu_seqlens = [0, max_T, max_T, ..., max_T]
+                # which represents a single packed sequence followed by zero-length
+                # entries. cu_seqlens_q / kv / *_padded all share this layout.
                 max_T = self.config.max_seqlen_per_dp_cp_rank
                 max_num_seqs = self.config.thd_max_num_seqs
-                device = torch.cuda.current_device()
-
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
-                cu_seqlens[0] = 0
-                cu_seqlens[1] = max_T
-                cu_seqlens[2:] = max_T
-
+                cu_seqlens[1:] = max_T
                 static_inputs["cu_seqlens_q"] = cu_seqlens
                 static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
 
+            # padding_mask is consumed by MoE aux-loss / SP scatter even when
+            # attention itself is outside the graph scope, so it's unconditional
+            # for THD CUDA Graph.
             slen_for_mask = self.config.max_seqlen_per_dp_cp_rank
             if self.config.sequence_parallel:
-                slen_for_mask = slen_for_mask // self.config.tensor_model_parallel_size
+                slen_for_mask //= self.config.tensor_model_parallel_size
             static_inputs["padding_mask"] = torch.ones(
-                1, slen_for_mask, dtype=torch.bool, device=torch.cuda.current_device()
+                1, slen_for_mask, dtype=torch.bool, device=device
             )
-        else:
-            if not isinstance(self.self_attention, IdentityOp) and (
-                not self.config.cuda_graph_scope
-                or CudaGraphScope.attn in self.config.cuda_graph_scope
-            ):
-                slen_per_cp = seq_length // self.config.context_parallel_size
-                static_inputs["attention_mask"] = (
-                    ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
-                    .to(torch.cuda.current_device())
-                    .reshape(1, 1, slen_per_cp, seq_length)
-                    .tile(micro_batch_size, 1, 1, 1)
-                )
+        elif attn_in_graph:
+            slen_per_cp = seq_length // self.config.context_parallel_size
+            static_inputs["attention_mask"] = (
+                ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
+                .to(device)
+                .reshape(1, 1, slen_per_cp, seq_length)
+                .tile(micro_batch_size, 1, 1, 1)
+            )
         return static_inputs
 
     def _get_submodules_under_cudagraphs(self):
@@ -1303,8 +1307,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return residual, hidden_states, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
+            # Pull hidden_states explicitly from cuda_graph_output rather than
+            # using `*cuda_graph_output, padding_mask=...`: the latter would
+            # collide if cuda_graph_output ever included a `padding_mask`
+            # positional element.
+            assert len(cuda_graph_output) >= 1, (
+                "expected at least hidden_states in cuda_graph_output"
+            )
+            hidden_states = cuda_graph_output[0]
             output = self._forward_mlp(
-                *cuda_graph_output,
+                hidden_states,
                 padding_mask=kwargs.get("padding_mask", None),
             )
         return output, context

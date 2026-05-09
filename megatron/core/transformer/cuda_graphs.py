@@ -1924,37 +1924,10 @@ class TECudaGraphHelper:
 
             static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
 
-            # For the post_process stage (last PP/VPP chunk with labels), padding_mask
-            # arrives at full CP-local size (max_seqlen_per_dp_cp_rank) because:
-            #   1. labels are present -> actual_T_is_local=True -> no CP re-partition
-            #   2. pre_process=False -> _preprocess does not scatter
-            # Other non-pre_process chunks (intermediate VPP) have no data, so padding_mask
-            # is CP-partitioned to ~max_seqlen/CP ~ max_seqlen/TP (default static size).
-            if (
-                hasattr(layer, "_is_thd_cuda_graph")
-                and layer._is_thd_cuda_graph()
-                and self.config.sequence_parallel
-                and self.config.pipeline_model_parallel_size > 1
-                and not getattr(chunk_of_the_layer, "pre_process", True)
-                and getattr(chunk_of_the_layer, "post_process", False)
-                and "padding_mask" in static_inputs
-            ):
+            if self._needs_full_local_padding_mask(layer, chunk_of_the_layer, static_inputs):
                 local_slen = self.config.max_seqlen_per_dp_cp_rank
                 static_inputs["padding_mask"] = torch.ones(
                     1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
-                )
-
-            if os.getenv("THD_DEBUG_CG_IO", "0") == "1":
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                hs = static_inputs.get("hidden_states", None)
-                pm = static_inputs.get("padding_mask", None)
-                print(
-                    f"[THD_DEBUG_CG_IO][capture] rank={rank} "
-                    f"layer={getattr(layer, 'layer_number', 'na')} "
-                    f"pre_process={getattr(chunk_of_the_layer, 'pre_process', 'na')} "
-                    f"hidden_shape={tuple(hs.shape) if torch.is_tensor(hs) else 'na'} "
-                    f"padding_mask_shape={tuple(pm.shape) if torch.is_tensor(pm) else 'na'}",
-                    flush=True,
                 )
 
             from megatron.core.transformer.identity_op import IdentityOp
@@ -2114,6 +2087,30 @@ class TECudaGraphHelper:
     def _should_use_dynamic_microbatch_slots(self) -> bool:
         """Whether to capture a bounded number of graph slots and reuse them by modulo."""
         return bool(getattr(self.config, "cuda_graph_dynamic_microbatches", False))
+
+    def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
+        """Whether this layer's static padding_mask needs full max_seqlen_per_dp_cp_rank.
+
+        For the post_process chunk (last PP/VPP chunk that holds labels),
+        padding_mask arrives at the full CP-local length because:
+          1. labels are present -> actual_T_is_local=True -> no CP re-partition;
+          2. pre_process=False  -> _preprocess does not scatter under SP.
+        Other non-pre_process chunks (intermediate VPP) have no data, so their
+        captured padding_mask stays at the default scattered size from
+        `get_layer_static_inputs` (~max_seqlen/CP/TP).
+
+        Returns True only for that post_process-with-data case under THD CUDA
+        Graph + SP + PP>1.
+        """
+        return (
+            hasattr(layer, "_is_thd_cuda_graph")
+            and layer._is_thd_cuda_graph()
+            and self.config.sequence_parallel
+            and self.config.pipeline_model_parallel_size > 1
+            and not getattr(chunk, "pre_process", True)
+            and getattr(chunk, "post_process", False)
+            and "padding_mask" in static_inputs
+        )
 
     @staticmethod
     def _get_required_num_microbatch_slots_from_order(order, num_model_chunks):

@@ -792,6 +792,64 @@ class TestTECudaGraphHelper:
         ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
 
 
+class TestRequiredNumMicrobatchSlots:
+    """Pure-Python tests for ``_get_required_num_microbatch_slots_from_order``.
+
+    The method derives the smallest cuda-graph slot count that guarantees no
+    in-flight microbatch's static buffer is reused before its backward
+    completes. ``order`` is a 1F1B / interleaved-1F1B schedule transcript
+    where ``+chunk_id`` denotes a forward and ``-chunk_id`` a backward.
+    Non-integer entries (e.g. ``0.5`` for wgrad sub-steps) are skipped.
+    """
+
+    @staticmethod
+    def _slots(order, num_chunks):
+        return TECudaGraphHelper._get_required_num_microbatch_slots_from_order(
+            order, num_chunks
+        )
+
+    def test_single_chunk_single_microbatch(self):
+        # F0 then B0: one slot is enough.
+        assert self._slots([1, -1], 1) == 1
+
+    def test_single_chunk_pp_pipeline_4_microbatches_pp2(self):
+        # PP=2 1F1B with 4 microbatches: warmup F-F, then F-B-F-B-..., then cooldown B-B.
+        # Max in-flight = 2.
+        order = [1, 1, -1, 1, -1, 1, -1, -1]
+        assert self._slots(order, 1) == 2
+
+    def test_two_chunks_independent(self):
+        # Two model chunks (VPP=2), each running a tiny PP=2-style 1F1B in turn.
+        # Per chunk max in-flight = 2 -> 2 slots.
+        order = [1, 1, -1, -1, 2, 2, -2, -2]
+        assert self._slots(order, 2) == 2
+
+    def test_two_chunks_interleaved(self):
+        # Worst case: forwards stack up across chunks before any backward.
+        # F0 F0 F1 F1 B1 B1 B0 B0 -> per-chunk max in-flight = 2.
+        order = [1, 1, 2, 2, -2, -2, -1, -1]
+        assert self._slots(order, 2) == 2
+
+    def test_skips_non_integer_entries(self):
+        # Float c_ids (e.g. 0.5 for wgrad sub-steps) must be ignored.
+        order = [1, 0.5, -0.5, -1]
+        assert self._slots(order, 1) == 1
+
+    def test_minimum_slot_is_one(self):
+        # Empty / no-op order still returns at least 1 (we always need a slot).
+        assert self._slots([], 1) == 1
+
+    def test_unbalanced_order_asserts(self):
+        # Forward without matching backward -> outstanding != 0 at end -> assert.
+        with pytest.raises(AssertionError):
+            self._slots([1], 1)
+
+    def test_negative_outstanding_asserts(self):
+        # Backward before any forward for a chunk -> outstanding goes negative.
+        with pytest.raises(AssertionError):
+            self._slots([-1], 1)
+
+
 def is_deep_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
 
