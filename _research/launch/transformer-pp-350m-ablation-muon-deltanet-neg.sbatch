@@ -105,7 +105,7 @@ LINEAR_ATTENTION_ARGS=(
     --no-linear-attention-use-decay
     --linear-attention-qk-norm rmsnorm
     --no-linear-attention-use-output-gate
-    --linear-attention-freq "([1]*3+[0]*1)*6"
+    --linear-attention-freq 4
     --linear-key-head-dim 64
     --linear-value-head-dim 64
     --linear-num-key-heads 4

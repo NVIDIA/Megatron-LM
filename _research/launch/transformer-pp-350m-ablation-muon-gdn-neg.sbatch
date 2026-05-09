@@ -102,7 +102,7 @@ NETWORK_SIZE_ARGS=(
 LINEAR_ATTENTION_ARGS=(
     --experimental-attention-variant gated_delta_net
     --linear-attention-allow-neg-eigval
-    --linear-attention-freq "([1]*3+[0]*1)*6"
+    --linear-attention-freq 4
     --linear-key-head-dim 64
     --linear-value-head-dim 64
     --linear-num-key-heads 4
