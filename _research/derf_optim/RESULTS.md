@@ -14,7 +14,8 @@ TP=1, bf16). Steady-state TFLOP/s/GPU averaged over iter 50–200 of a
 | RMSNorm baseline (TE fused norm-linear) | **310** | +93 | 0 | (Aurora rank-1 leaderboard) |
 | Unfused Derf (reference) | 217 | 0 | -93 | 2075996 (full 1B-token) |
 | **Option 1** — torch.compile fused (Derf + nn.Linear) | **271** | **+54** | **-39** | 2076258 |
-| Option 2 — Triton fused (Derf + matmul) | 170 | -47 | -140 | 2076274 |
+| Option 2 — Triton fused (naive 64x64x64, 1 config) | 170 | -47 | -140 | 2076274 |
+| Option 2′ — Triton fused (autotuned, K-major W) | 202 | -15 | -108 | 2076363 |
 | Option 3 — hand-rolled CUDA fused (Derf + matmul) | (timed out) | — | — | 2076308 |
 
 Loss curves of all three options match the unfused reference within bf16
@@ -31,15 +32,24 @@ crucially keeps **cuBLAS for the matmul itself**, so the heavy lifting still
 runs on the well-tuned vendor kernel. Recovers ~58 % of the 93 TFLOP/s lost
 from unfusing.
 
-### Option 2 — Triton fused matmul + Derf prologue  (loses)
+### Option 2 — Triton fused matmul + Derf prologue  (still loses, less by)
 A from-scratch Triton kernel reads `x` once, applies Derf in registers, and
 accumulates the matmul. Backward in PyTorch with post-norm recompute (saves
 only `x`, matching the TE RMSNorm memory profile). Numerically clean.
-Throughput collapses: my hand-rolled Triton matmul (BLOCK_M=BLOCK_N=BLOCK_K=64,
-no Tensor Cores, no warp-specialized scheduling) runs at roughly half cuBLAS
-speed for these shapes. The fusion savings can't compensate. Lesson: a
-Triton norm-linear only wins if the Triton matmul is competitive with cuBLAS,
-which on Hopper requires Tensor Core + careful tiling that is days of work.
+
+**First pass** (single 64×64×64 config, `tl.trans` on W tile): 170 TFLOP/s.
+The trans was likely fighting Triton's TC layout selection; the small
+single-config kernel left occupancy on the table.
+
+**Second pass** (autotuned over 7 Hopper configs spanning 64–256 in M/N,
+32–64 in K, num_stages 2-4, num_warps 4-8; load W in K-major layout to drop
+`tl.trans`): 202 TFLOP/s. Tensor Cores are now in use (`tl.dot` of bf16 →
+fp32 accum), but still ~15 % below cuBLAS-only and ~25 % below Option 1.
+
+The autotuned Triton kernel does fuse, but the fusion saving doesn't pay
+back the matmul gap. Closing that gap on Hopper at these shapes likely
+needs persistent-kernel scheduling, warp-specialised mainloops, and TMA
+loads — Triton 3.x supports these but it's another day or two of work.
 
 ### Option 3 — hand-rolled CUDA fused matmul + prologue  (did not finish)
 `_research/derf_optim/cuda/derf_linear_kernel.cu`. First pass used SMEM-tiled
