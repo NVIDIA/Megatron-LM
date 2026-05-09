@@ -59,10 +59,11 @@ MODEL_ARGS:
   --bf16: true
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
-  --optimizer: dist_muon
+  --optimizer: muon
   --muon-momentum: 0.9
   --muon-extra-scale-factor: 0.2
   --muon-scale-mode: spectral
   --async-save: true
   --use-persistent-ckpt-worker: true
+  --use-distributed-optimizer: true
 TEST_TYPE: ckpt-resume

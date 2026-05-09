@@ -49,6 +49,8 @@ jobs:
 
       - name: Build wheel
         id: build-wheel
+        env:
+          NO_VCS_VERSION: "1"
         run: |
           set -x
 
@@ -70,7 +72,7 @@ jobs:
 
           pushd $BUILD_DIR
             rm LICENSE || true
-            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE bash -c '\
+            docker run --rm -e NO_VCS_VERSION=1 -v $(pwd):/workspace -w /workspace $IMAGE bash -c '\
               for python_version in cp311 cp312 cp313; do \
                 /opt/python/${python_version}-${python_version}/bin/pip install --upgrade "setuptools<80.0.0,>=77.0.0" build; \
               done && \

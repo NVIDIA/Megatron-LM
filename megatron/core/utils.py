@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy
 import torch
@@ -52,13 +52,6 @@ try:
 except ImportError:
     HAVE_PACKAGING = False
 
-try:
-    import nvtx
-
-    HAVE_NVTX = True
-except ImportError:
-    HAVE_NVTX = False
-
 logger = logging.getLogger(__name__)
 
 try:
@@ -81,6 +74,10 @@ _fa_version = None
 _flashinfer_version = None
 _mamba_ssm_version = None
 _causal_conv1d_version = None
+
+
+_Wrapped = TypeVar('_Wrapped', bound=Callable)
+"""A function or class which has been wrapped by a decorator."""
 
 
 @contextmanager
@@ -120,7 +117,7 @@ def experimental_fn(introduced_with_version: str):
     """
     logged_functions = set()
 
-    def validator(func: Callable, max_lifetime: int = 3) -> Callable:
+    def validator(func: _Wrapped, max_lifetime: int = 3) -> _Wrapped:
         """Validates the request to the experimental function.
 
         Args:
@@ -186,7 +183,7 @@ def experimental_cls(introduced_with_version: str):
     """
     logged_classes = set()
 
-    def validator(cls: Callable, max_lifetime: int = 3) -> Callable:
+    def validator(cls: _Wrapped, max_lifetime: int = 3) -> _Wrapped:
         """Validates the request to the experimental function.
 
         Args:
@@ -491,6 +488,12 @@ def is_flashinfer_min_version(version, check_equality=True):
     return flashinver_version > PkgVersion(version)
 
 
+def accepts_parameter(func: Callable, name: str) -> bool:
+    """Check if a callable accepts a parameter with the given name or **kwargs."""
+    params = inspect.signature(func).parameters.values()
+    return any(p.name == name or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
+
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
@@ -501,6 +504,11 @@ def divide(numerator, denominator):
     the division value."""
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
+
+
+def round_up_to_nearest_multiple(value: int, multiple: int) -> int:
+    """Round *value* up to the nearest multiple of *multiple*."""
+    return math.ceil(value / multiple) * multiple
 
 
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
@@ -2116,6 +2124,10 @@ def get_batch_on_this_hybrid_cp_rank(
 
 _nvtx_enabled: bool = False  # Whether NVTX range profiling is enabled
 _nvtx_range_messages: list[str] = []  # Messages associated with active NVTX ranges
+# Permanently pin the string object representing the name of each NVTX range.
+# These string objects may be created during CUDA graph capture.
+# If they are not pinned, the NVTX range names will be garbage-collected and nsys profile crashes.
+_nvtx_range_msg_pool: dict[str, str] = {}
 
 
 def configure_nvtx_profiling(enabled: bool) -> None:
@@ -2156,6 +2168,11 @@ def nvtx_range_push(msg=None, suffix=None) -> None:
         msg = _nvtx_range_get_func_path()
     if suffix is not None:
         msg = f"{msg}.{suffix}"
+
+    # If we have entered this range before, do not use the newly-created "msg" object.
+    # But instead point to the original, first-created, "msg" object.
+    # They may hold identical data, but they are different addresses; matters when CUDA-graphed.
+    msg = _nvtx_range_msg_pool.setdefault(msg, msg)
 
     # Track messages to ensure consistency when popping
     _nvtx_range_messages.append(msg)
@@ -2209,12 +2226,16 @@ def _nvtx_decorator_get_func_path(func):
     return f"{module.__name__}.{caller_func}"
 
 
-def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
+def nvtx_decorator(message: Optional[str] = None) -> Callable[[_Wrapped], _Wrapped]:
     """Decorator to add NVTX range to a function.
+
+    The ``_nvtx_enabled`` flag is checked at **call time** inside
+    ``nvtx_range_push`` / ``nvtx_range_pop``, so the decorator works
+    correctly even when applied before ``configure_nvtx_profiling()``
+    is called (e.g. at module-import time).
 
     Args:
         message (str, optional): Custom message for the NVTX range. If None, uses function path
-        color (str, optional): Color for the NVTX range. Defaults to None
 
     Returns:
         Callable: Decorated function with NVTX profiling if enabled
@@ -2224,17 +2245,23 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
         def my_function():
             pass
 
-        @nvtx_decorator(message="Custom Range", color="blue")
+        @nvtx_decorator(message="Custom Range")
         def another_function():
             pass
     """
 
-    def decorator(func: Callable) -> Callable:
-        if _nvtx_enabled:
-            return nvtx.annotate(
-                message=message or _nvtx_decorator_get_func_path(func), color=color
-            )(func)
-        return func
+    def decorator(func: _Wrapped) -> _Wrapped:
+        msg = message or _nvtx_decorator_get_func_path(func)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            nvtx_range_push(msg)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                nvtx_range_pop(msg)
+
+        return wrapper  # type: ignore[return-value]
 
     return decorator
 
@@ -2372,7 +2399,7 @@ def deprecated(
     removal_version: Optional[str] = None,
     alternative: Optional[str] = None,
     reason: Optional[str] = None,
-) -> Callable:
+) -> Callable[[_Wrapped], _Wrapped]:
     """
     Mark a function as deprecated.
 
@@ -2401,7 +2428,7 @@ def deprecated(
             pass
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: _Wrapped) -> _Wrapped:
         # Add metadata
         func._deprecated = True
         func._deprecated_version = version
@@ -2432,7 +2459,7 @@ def deprecated(
     return decorator
 
 
-def internal_api(func: Callable) -> Callable:
+def internal_api(func: _Wrapped) -> _Wrapped:
     """
     Mark a function or class as internal API (not for external use).
 
@@ -2465,7 +2492,7 @@ def internal_api(func: Callable) -> Callable:
     return func
 
 
-def experimental_api(func: Callable) -> Callable:
+def experimental_api(func: _Wrapped) -> _Wrapped:
     """
     Mark a function or class as experimental API.
 
@@ -2499,8 +2526,8 @@ def experimental_api(func: Callable) -> Callable:
 
 
 def deprecate_args(
-    *deprecated_keys, message="Argument '{name}' has been deprecated and should not be used."
-):
+    *deprecated_keys: str, message="Argument '{name}' has been deprecated and should not be used."
+) -> Callable[[_Wrapped], _Wrapped]:
     """
     Intercepts specific keyword arguments to raise a custom TypeError.
 
@@ -2509,7 +2536,7 @@ def deprecate_args(
         message: Custom error message string. Use {name} as a placeholder.
     """
 
-    def decorator(func):
+    def decorator(func: _Wrapped) -> _Wrapped:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # Check if any deprecated key is present in kwargs

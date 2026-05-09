@@ -12,6 +12,59 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CADENCE = ["pr", "nightly", "mergegroup"]
+ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE) | {"weekly"}
+
+# Maps legacy `scope` values (encoded "when" + "which suite" together) onto the
+# new vocabulary: an L-tier (cost class) plus, where the legacy name implied a
+# trigger, a default cadence. The tier acts purely as a suite/cost label;
+# cadence remains the trigger axis.
+#
+# Only GitHub-side scopes (`mr-github-slim`, `mr-github`) are aliased onto the
+# L-tier names. GitLab-only scopes (`mr`, `mr-slim`, `unit-tests`) are
+# intentionally left as pass-through so GitLab `--scope mr*` / `--scope
+# unit-tests` continue to match recipes verbatim and don't bleed into the
+# GitHub L0 / L1 matrix.
+LEGACY_SCOPE_ALIASES = {
+    # GitHub-only scopes are aliased onto the L-tier vocabulary so the GH CI
+    # workflow can filter on `L0` / `L1`. GitLab-only scopes (`mr`, `mr-slim`)
+    # are intentionally NOT aliased: they pass through to recipe rows verbatim
+    # and remain matchable by GitLab's `--scope mr-slim` / `--scope mr` calls,
+    # without bleeding into the GitHub `L0` / `L1` matrix.
+    "mr-github-slim": ("L0", None),
+    "mr-github": ("L1", None),
+    "nightly": ("L2", ["nightly"]),
+    "weekly": ("L3", ["weekly"]),
+}
+
+
+def _apply_scope_alias(scope_value: str, explicit_cadence: Optional[List[str]]) -> tuple:
+    """Resolve a legacy scope value to (new_scope, cadence).
+
+    If the scope value is in the alias map, returns the new tier name. The
+    alias's cadence is used only when `explicit_cadence` is None — explicit
+    per-product or outer cadence always wins.
+    """
+    if scope_value not in LEGACY_SCOPE_ALIASES:
+        return scope_value, explicit_cadence
+    new_scope, alias_cadence = LEGACY_SCOPE_ALIASES[scope_value]
+    if explicit_cadence is not None or alias_cadence is None:
+        return new_scope, explicit_cadence
+    return new_scope, list(alias_cadence)
+
+
+def _validate_cadence(cadence: List[str], test_case: str) -> None:
+    if not isinstance(cadence, list):
+        raise ValueError(
+            f"cadence for test_case {test_case} must be a list, got {type(cadence).__name__}"
+        )
+    invalid = [c for c in cadence if c not in ALLOWED_CADENCE_VALUES]
+    if invalid:
+        raise ValueError(
+            f"Invalid cadence value(s) {invalid} for test_case {test_case}. "
+            f"Allowed: {sorted(ALLOWED_CADENCE_VALUES)}"
+        )
+
 
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
@@ -47,14 +100,49 @@ def flatten_products(workload_manifest: dotdict) -> dotdict:
             continue
 
         test_case = product["test_case"][0]
+        # Outer-level cadence (next to test_case) acts as a default for every
+        # inner products block under this test_case. Inner cadence wins when
+        # both are present.
+        outer_cadence = product.get("cadence")
+        if outer_cadence is not None:
+            _validate_cadence(outer_cadence, test_case)
+
         for param_dict in product["products"]:
-            # Generate all combinations of parameter values
-            param_combinations = itertools.product(*param_dict.values())
+            # cadence is a list-valued attribute, not a cartesian dimension.
+            # Pull it out of the cartesian product before expansion so a list
+            # like ["pr", "nightly"] doesn't multiply the workload count.
+            inner_cadence = param_dict.get("cadence")
+            if inner_cadence is not None:
+                _validate_cadence(inner_cadence, test_case)
+            cartesian_keys = [k for k in param_dict.keys() if k != "cadence"]
+            cartesian_values = [param_dict[k] for k in cartesian_keys]
+
+            # Resolve effective cadence: inner overrides outer, default loose.
+            # `explicit_cadence` is None when neither inner nor outer set it,
+            # which is the only case where a legacy scope alias may inject a
+            # default cadence (e.g. scope: [nightly] -> cadence: [nightly]).
+            explicit_cadence = inner_cadence if inner_cadence is not None else outer_cadence
+            default_cadence = (
+                list(explicit_cadence) if explicit_cadence is not None else list(DEFAULT_CADENCE)
+            )
+
+            param_combinations = itertools.product(*cartesian_values)
 
             for value_combination in param_combinations:
                 # Map parameter names to their values
-                flattened = dict(zip(param_dict.keys(), value_combination))
+                flattened = dict(zip(cartesian_keys, value_combination))
                 flattened["test_case"] = test_case
+                # Apply legacy scope alias per row so that scope: [mr, nightly]
+                # produces two rows with the right (tier, cadence) each.
+                row_cadence = default_cadence
+                if "scope" in flattened:
+                    new_scope, aliased_cadence = _apply_scope_alias(
+                        flattened["scope"], explicit_cadence
+                    )
+                    flattened["scope"] = new_scope
+                    if aliased_cadence is not None:
+                        row_cadence = list(aliased_cadence)
+                flattened["cadence"] = row_cadence
                 flattened_products.append(flattened)
 
     workload_manifest.products = flattened_products
@@ -130,6 +218,31 @@ def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdi
         return []
 
     return workload_manifests
+
+
+def filter_by_cadence(workload_manifests: List[dotdict], cadence: Optional[str]) -> List[dotdict]:
+    """Returns workloads whose cadence list includes the requested cadence value.
+
+    A cadence of None disables the filter (used for the label-based bypass path).
+    Workloads missing a cadence field default to all triggers (loose default).
+    """
+    if cadence is None:
+        return workload_manifests
+
+    if cadence not in ALLOWED_CADENCE_VALUES:
+        raise ValueError(f"Invalid cadence {cadence!r}. Allowed: {sorted(ALLOWED_CADENCE_VALUES)}")
+
+    filtered = list(
+        workload_manifest
+        for workload_manifest in workload_manifests
+        if cadence in workload_manifest.spec.get("cadence", DEFAULT_CADENCE)
+    )
+
+    if len(filtered) == 0:
+        logger.info("No test_case found for cadence %s!", cadence)
+        return []
+
+    return filtered
 
 
 def filter_by_environment(workload_manifests: List[dotdict], environment: str) -> List[dotdict]:
@@ -227,6 +340,7 @@ def load_workloads(
     test_case: Optional[str] = None,
     container_image: Optional[str] = None,
     record_checkpoints: Optional[str] = None,
+    cadence: Optional[str] = None,
 ) -> List[dotdict]:
     """Return all workloads from disk that match scope and platform."""
     recipes_dir = BASE_PATH / ".." / "recipes"
@@ -241,6 +355,10 @@ def load_workloads(
 
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)
+
+    if workloads and cadence:
+        workloads = filter_by_cadence(workload_manifests=workloads, cadence=cadence)
+
     if workloads and environment:
         workloads = filter_by_environment(workload_manifests=workloads, environment=environment)
 

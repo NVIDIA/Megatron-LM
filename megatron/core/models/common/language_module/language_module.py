@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
 try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
@@ -62,6 +63,20 @@ class LanguageModule(MegatronModule):
         self.embd_group = pg_collection.embd
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
+
+    def _setup_mtp_cuda_graphs(self):
+        """Wrap `compute_mtp_single_step` with a CudaGraphManager.
+
+        Must be called by subclasses after `self.mtp` is created.
+        """
+        if self.config.cuda_graph_impl == "local":
+            self._mtp_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_single_step",
+                need_backward=False,
+                inline_capture=True,
+            )
 
     def _is_in_embd_group(self):
         if self.embd_group is None:
@@ -322,6 +337,55 @@ class LanguageModule(MegatronModule):
         elif self.post_process:
             return self.output_layer.weight
         return None
+
+    @torch.inference_mode()
+    def compute_mtp_single_step(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: Optional[int] = None,
+        eager: bool = False,
+        cache_key=None,
+    ) -> tuple:
+        """Compute a single MTP depth for speculative decoding.
+
+        This is called after speculative token verification to compute MTP
+        predictions conditioned on verified tokens only.
+
+        Args:
+            hidden_states (Tensor): Hidden states at last accepted positions.
+            next_token_ids (Tensor): Correct next token IDs [1, N].
+            position_ids (Tensor): Position IDs for the next tokens [1, N].
+            depth (int, optional): MTP depth index. Only needed when `mtp_use_repeated_layer` is
+                False (each depth uses a distinct layer). Omit for repeated-layer models so that a
+                single CUDA graph can serve all depths.
+            eager, cache_key: The `CudaGraphManager` works by monkey-patching this argument onto the
+                function signature. Explictly including them removes the need for a monkey-patch,
+                and makes it straightforward to call the same method with and without eager mode.
+                These arguments are consumed by `CudaGraphManager`, if it exists.
+
+        Returns:
+            tuple: (new_hidden_states, logits [N, 1, vocab_size]).
+        """
+        # CudaGraphManager consumes these args, if it exists
+        del eager, cache_key
+        layer_idx = 0 if depth is None else depth
+        mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
+            hidden_states=hidden_states,
+            next_token_ids=next_token_ids,
+            position_ids=position_ids,
+            embedding=self.embedding,
+        )
+
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        logits, _ = self.output_layer(mtp_hidden, weight=output_weight, runtime_gather_output=True)
+        logits = self._scale_logits(logits)
+
+        return mtp_hidden, logits
 
     def sharded_state_dict(
         self,
