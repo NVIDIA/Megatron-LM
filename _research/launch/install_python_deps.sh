@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 PKG_DIR=${1:?usage: install_python_deps.sh PKG_DIR}
-MARKER=$PKG_DIR/.deps_installed_v5
+MARKER=$PKG_DIR/.deps_installed_v6
 LOCK=$PKG_DIR/.install.lockdir
 
 mkdir -p "$PKG_DIR"
@@ -24,9 +24,12 @@ fi
 $INSTALL --target="$PKG_DIR" transformers wandb omegaconf
 $INSTALL --no-deps --target="$PKG_DIR" \
     'git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0'
-# flash-linear-attention provides chunk_delta_rule (Schlag DeltaNet),
-# chunk_gated_delta_rule (GDN), and chunk_kda (Kimi Delta Attention).
-# --no-deps to avoid pulling huggingface-hub/transformers conflicts.
-$INSTALL --no-deps --target="$PKG_DIR" 'flash-linear-attention==0.5.0'
+# fla-core is the actual implementation package (the meta-package
+# flash-linear-attention only ships fla/layers/ and fla/models/; the kernels
+# fla/{modules,ops,__init__.py,utils.py} live in fla-core==0.5.0). With
+# --no-deps the meta-package would leave fla broken, so we pin fla-core
+# directly. Provides chunk_delta_rule (Schlag DeltaNet), chunk_gated_delta_rule
+# (GDN), and chunk_kda (Kimi Delta Attention).
+$INSTALL --no-deps --target="$PKG_DIR" 'fla-core==0.5.0'
 
 touch "$MARKER"
