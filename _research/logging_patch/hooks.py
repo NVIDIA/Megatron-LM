@@ -31,11 +31,15 @@ _STATE: dict[str, Any] = {
     "log_act_stats": False,
     "log_loss_spikes": False,
     "log_top1_acc": False,
+    "log_row_cv": False,
+    "log_neuron_stats": False,
+    "log_neuron_interval": 100,
     # |x| > log_act_threshold is counted as an FP8 saturation risk for the
     # frac_outlier stat. Default 240.0 mirrors NVIDIA's E4M3 input dynamic
     # range proxy (E4M3 max = 448, scale headroom kept at ~240).
     "log_act_threshold": 240.0,
     "act_accum": {},
+    "neuron_accum": {},
     "top1_correct": 0.0,
     "top1_total": 0.0,
 }
@@ -47,6 +51,9 @@ def configure(writer: JsonLogger, cfg: dict[str, Any]) -> None:
     _STATE["log_act_stats"] = cfg.get("log_act_stats", False)
     _STATE["log_loss_spikes"] = cfg.get("log_loss_spikes", False)
     _STATE["log_top1_acc"] = cfg.get("log_top1_acc", False)
+    _STATE["log_row_cv"] = cfg.get("log_row_cv", False)
+    _STATE["log_neuron_stats"] = cfg.get("log_neuron_stats", False)
+    _STATE["log_neuron_interval"] = int(cfg.get("log_neuron_interval", 100))
     _STATE["loss_spike_k"] = cfg.get("loss_spike_k", 3.0)
     _STATE["log_act_threshold"] = float(cfg.get("log_act_threshold", 240.0))
 
@@ -186,6 +193,125 @@ def _per_layer_grad_norms(model: Any) -> dict[str, float]:
     return out
 
 
+def _row_cv(model: Any) -> dict[str, float]:
+    """Coefficient-of-variation of row L2 norms for every 2D weight tensor.
+
+    Aurora-style "neuron utilization" proxy: if Muon's polar update has
+    unbalanced row norms, the cumulative effect manifests as widening row-norm
+    spread of W. CV = std / mean over rows; uniform rows -> CV near 0.
+
+    Sharding caveat: under TP/EP, each rank only holds its local shard, so the
+    reported CV is per-shard, not global. Matches the existing rank-local
+    behavior of `per_layer_grad_norm`.
+    """
+    import torch
+
+    chunks = model if isinstance(model, list) else [model]
+    names: list[str] = []
+    cvs: list[torch.Tensor] = []
+    for chunk in chunks:
+        for name, p in chunk.named_parameters():
+            if p.dim() != 2:
+                continue
+            with torch.no_grad():
+                row_norms = p.detach().float().norm(dim=1)
+                if row_norms.numel() < 2:
+                    continue
+                m = row_norms.mean()
+                s = row_norms.std(unbiased=False)
+                cvs.append(s / m.clamp_min(1e-12))
+                names.append(name)
+    if not cvs:
+        return {}
+    big = torch.stack(cvs)
+    vals = big.tolist()
+    return {n: float(v) for n, v in zip(names, vals)}
+
+
+def _register_neuron_hooks(model: Any) -> None:
+    """Forward pre-hooks on every MLP linear_fc2 to accumulate per-neuron stats.
+
+    The input to linear_fc2 is the post-gate-mul activation of shape
+    [s, b, d_ff] (or sequence-parallel shard thereof). Each of the d_ff
+    channels is one MLP "neuron" in the dead-neuron sense; we accumulate the
+    mean of |x| per neuron over training tokens, then summarize as a few
+    percentiles + dead-fraction at drain time.
+    """
+    import torch
+
+    accum: dict[str, dict[str, Any]] = _STATE["neuron_accum"]
+
+    def make_hook(name: str):
+        def hook(_mod, inp):
+            t = inp[0] if isinstance(inp, tuple) else inp
+            if not isinstance(t, torch.Tensor) or t.dim() < 2:
+                return
+            with torch.no_grad():
+                td = t.detach().float()
+                flat = td.reshape(-1, td.shape[-1])
+                mean_abs = flat.abs().mean(dim=0)
+                entry = accum.get(name)
+                if entry is None:
+                    accum[name] = {"mean_abs_sum": mean_abs.clone(), "n": 1}
+                else:
+                    entry["mean_abs_sum"].add_(mean_abs)
+                    entry["n"] += 1
+        return hook
+
+    chunks = model if isinstance(model, list) else [model]
+    for chunk in chunks:
+        for name, module in chunk.named_modules():
+            if name.endswith(".mlp.linear_fc2"):
+                module.register_forward_pre_hook(make_hook(name))
+
+
+def _drain_neuron_accum() -> dict[str, dict[str, float]]:
+    """Summarize per-neuron mean|x| into a compact per-layer record.
+
+    Per layer:
+      - mean: layer-mean of mean|x| across neurons
+      - cv: std / mean of mean|x| across neurons
+      - dead_frac: fraction of neurons with mean|x| < 0.01 * layer_mean
+      - p10, p50, p90: percentiles of mean|x|
+
+    All reductions stay on GPU; one batched .tolist() per drain.
+    """
+    import torch
+
+    accum = _STATE["neuron_accum"]
+    if not accum:
+        return {}
+
+    names = list(accum.keys())
+    rows: list[torch.Tensor] = []
+    for name in names:
+        e = accum[name]
+        mean_abs = e["mean_abs_sum"] / max(e["n"], 1)
+        layer_mean = mean_abs.mean()
+        cv = mean_abs.std(unbiased=False) / layer_mean.clamp_min(1e-12)
+        dead_frac = (mean_abs < 0.01 * layer_mean).to(torch.float32).mean()
+        sorted_vals, _ = mean_abs.sort()
+        n = sorted_vals.numel()
+        p10 = sorted_vals[max(0, int(0.10 * n) - 1)]
+        p50 = sorted_vals[n // 2]
+        p90 = sorted_vals[min(n - 1, int(0.90 * n))]
+        rows.append(torch.stack([layer_mean, cv, dead_frac, p10, p50, p90]))
+    big = torch.stack(rows)  # [n_layers, 6]
+    vals = big.tolist()
+    out: dict[str, dict[str, float]] = {}
+    for name, (lm, cv, df, p10, p50, p90) in zip(names, vals):
+        out[name] = {
+            "mean": lm,
+            "cv": cv,
+            "dead_frac": df,
+            "p10": p10,
+            "p50": p50,
+            "p90": p90,
+        }
+    _STATE["neuron_accum"] = {}
+    return out
+
+
 def _is_spike(loss: float) -> bool:
     history = _STATE["loss_history"]
     history.append(loss)
@@ -216,6 +342,8 @@ def patch_setup_model_and_optimizer() -> None:
         _STATE["n_params_active"] = active
         if _STATE["log_act_stats"]:
             _register_act_hooks(model)
+        if _STATE["log_neuron_stats"]:
+            _register_neuron_hooks(model)
         writer = _STATE["writer"]
         if writer is not None:
             writer.set(n_params_total=total, n_params_active=active)
@@ -407,6 +535,14 @@ def patch_training_log() -> None:
 
         if _STATE["log_act_stats"]:
             row["act_stats"] = _drain_act_accum()
+
+        if _STATE["log_row_cv"] and _STATE["model"] is not None:
+            row["row_cv"] = _row_cv(_STATE["model"])
+
+        if _STATE["log_neuron_stats"]:
+            interval = max(1, _STATE["log_neuron_interval"])
+            if int(iteration) % interval == 0:
+                row["neuron_stats"] = _drain_neuron_accum()
 
         if _STATE["log_loss_spikes"] and "train_loss" in row:
             row["loss_spike"] = _is_spike(row["train_loss"])

@@ -156,7 +156,9 @@ metadata sidecar (`<run>.meta.json`):
 | MFU (model FLOPs utilization) | always on | -- |
 | Per-layer activation norms and max | `APERTUS_LOG_ACT_STATS` | on |
 | Top-1 next-token accuracy (TP-aware) | `APERTUS_LOG_TOP1_ACC` | on |
+| Per-parameter row-norm CV (Aurora-style neuron utilization proxy) | `APERTUS_LOG_ROW_CV` | on |
 | Per-parameter gradient norms | `APERTUS_LOG_PER_LAYER_GRADS` | off |
+| MLP per-neuron pre-activation stats (every N steps via `APERTUS_LOG_NEURON_INTERVAL`) | `APERTUS_LOG_NEURON_STATS` | off |
 | Loss spike detection (rolling z-score) | `APERTUS_LOG_LOSS_SPIKES` | off |
 | Startup phase timeline (sbatch, srun, container, dist init, model build, first iters) | always on | -- |
 

@@ -27,6 +27,9 @@ Because `PYTHONPATH=$WORKDIR` is set in the sbatch scripts, the package is impor
 | `APERTUS_LOG_ACT_THRESHOLD`      | `240`                                | Threshold used by the `frac_outlier` activation stat: mean fraction of \|x\| > T per block. Default mirrors NVIDIA's E4M3 input range proxy (E4M3 max = 448; scale headroom kept at ~240). |
 | `APERTUS_LOG_LOSS_SPIKES`        | unset                                | `1` emits a boolean `loss_spike` per step based on rolling z-score |
 | `APERTUS_LOG_TOP1_ACC`           | `1` (on)                             | `0` disables top-1 next-token accuracy; otherwise emits `top1_accuracy` per log interval and mirrors to wandb |
+| `APERTUS_LOG_ROW_CV`             | `1` (on)                             | `0` disables row-norm CV. Otherwise emits `row_cv` per step: a dict mapping every 2D parameter name to `std/mean` of its row L2 norms (Aurora-style "neuron utilization" proxy; uniform rows -> CV near 0). Per-rank-shard under TP/EP; matches `per_layer_grad_norm` behavior. |
+| `APERTUS_LOG_NEURON_STATS`       | unset                                | `1` registers forward pre-hooks on every `*.mlp.linear_fc2` and emits `neuron_stats` every `APERTUS_LOG_NEURON_INTERVAL` steps. Per layer: `mean`, `cv`, `dead_frac` (rows of mean\|x\| < 1% of layer mean), and percentiles `p10` / `p50` / `p90`. |
+| `APERTUS_LOG_NEURON_INTERVAL`    | `100`                                | Step interval for `neuron_stats` emission. Hook accumulation runs every step; the drain + summarization happens on every Nth `training_log` call. |
 
 ## JSON schema
 
@@ -57,12 +60,14 @@ One file per run: `<log_dir>/<run_name>.json`. Rewritten atomically every log in
     "per_layer_grad_norm": [ {"decoder.layers.0.self_attention...": 0.12, ...}, ... ],
     "act_stats":   [ {"decoder.layers.0.self_attention": {"amax": 128.0, "l2": 42.1, "frac_outlier": 0.0, "rms": 1.3}, ...}, ... ],
     "loss_spike":  [false, false, ...],
-    "top1_accuracy": [0.01, 0.02, ...]
+    "top1_accuracy": [0.01, 0.02, ...],
+    "row_cv":      [ {"decoder.layers.0.mlp.linear_fc1.weight": 0.12, ...}, ... ],
+    "neuron_stats": [ null, ..., {"decoder.layers.0.mlp.linear_fc2": {"mean": 0.42, "cv": 0.31, "dead_frac": 0.005, "p10": 0.21, "p50": 0.40, "p90": 0.62}, ...}, ... ]
   }
 }
 ```
 
-Only `step`, `wall`, and whatever scalars Megatron passed through (`train_loss`, `lr`, `grad_norm`, `params_norm`, `tput`) are always populated. The three per-layer/act/spike columns only appear when their env flag is set. The loader in `_apertus/analyse/load_runs.py` tolerates missing keys.
+Only `step`, `wall`, and whatever scalars Megatron passed through (`train_loss`, `lr`, `grad_norm`, `params_norm`, `tput`) are always populated. The optional per-layer/act/spike/row/neuron columns only appear when their env flag is set; `neuron_stats` rows are sparse (one every `APERTUS_LOG_NEURON_INTERVAL` steps). The loader in `_apertus/analyse/load_runs.py` tolerates missing keys.
 
 ## What the monkey-patch does
 
