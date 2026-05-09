@@ -47,10 +47,12 @@ class DyT(nn.Module):
         self.bias = nn.Parameter(torch.zeros(hidden_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Cast params to x's dtype (bf16 in mixed-precision training) so we keep
+        # activations and saved-for-backward tensors in bf16. Upcasting `x` to
+        # fp32 here would double activation memory at every norm site (12-13 GiB
+        # at our 350M / seq 4096 shape), enough to OOM at the LM-head softmax.
         dtype = x.dtype
-        x_f = x.float()
-        out = self.weight * torch.tanh(self.alpha * x_f) + self.bias
-        return out.to(dtype)
+        return self.weight.to(dtype) * torch.tanh(self.alpha.to(dtype) * x) + self.bias.to(dtype)
 
 
 class Derf(nn.Module):
@@ -79,7 +81,10 @@ class Derf(nn.Module):
         self.bias = nn.Parameter(torch.zeros(hidden_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # See DyT.forward for the dtype rationale.
         dtype = x.dtype
-        x_f = x.float()
-        out = self.weight * torch.erf(self.alpha * x_f + self.s) + self.bias
-        return out.to(dtype)
+        return (
+            self.weight.to(dtype)
+            * torch.erf(self.alpha.to(dtype) * x + self.s.to(dtype))
+            + self.bias.to(dtype)
+        )
