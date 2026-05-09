@@ -337,19 +337,20 @@ def get_gpt_layer_with_transformer_engine_submodules(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
-        if derf_optim == "compile":
-            # Option 1: torch.compile-fused (DyT|Derf + plain F.linear). The
-            # fused module subsumes the input/pre-mlp layernorm into the linear,
-            # mirroring TE's LayerNormColumnParallelLinear shape but in pure
-            # PyTorch so Inductor can fuse the elementwise norm into the matmul
-            # prologue. TP=1 only.
-            from _research.derf_optim.option1_compile import make_qkv_class
+        if derf_optim in ("compile", "triton"):
+            # Option 1 (compile): torch.compile-fused norm+linear.
+            # Option 2 (triton): custom Triton fused kernel + PyTorch backward.
+            # In both cases the norm subsumes into the linear, mirroring TE's
+            # LayerNormColumnParallelLinear shape so we keep the same
+            # input_layernorm=IdentityOp + linear_qkv=<fused> spec layout.
+            if derf_optim == "compile":
+                from _research.derf_optim.option1_compile import make_qkv_class
+            else:
+                from _research.derf_optim.option2_triton import make_qkv_class
             fused_cls = make_qkv_class(derf_norm_kind)
             linear_qkv = fused_cls
             input_layernorm = IdentityOp
             pre_mlp_layernorm = IdentityOp
-            # Replace the dense MLP fc1 with the same fused class so pre_mlp
-            # also fuses. (No-op when num_experts is set.)
             if num_experts is None:
                 mlp = ModuleSpec(
                     module=mlp.module,
