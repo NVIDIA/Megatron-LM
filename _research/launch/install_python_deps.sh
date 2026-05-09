@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 PKG_DIR=${1:?usage: install_python_deps.sh PKG_DIR}
-MARKER=$PKG_DIR/.deps_installed_v6
+MARKER=$PKG_DIR/.deps_installed_v7
 LOCK=$PKG_DIR/.install.lockdir
 
 mkdir -p "$PKG_DIR"
@@ -31,5 +31,10 @@ $INSTALL --no-deps --target="$PKG_DIR" \
 # directly. Provides chunk_delta_rule (Schlag DeltaNet), chunk_gated_delta_rule
 # (GDN), and chunk_kda (Kimi Delta Attention).
 $INSTALL --no-deps --target="$PKG_DIR" 'fla-core==0.5.0'
+# tilelang provides an alternate backend FLA uses on Hopper to dodge a known
+# Triton 3.4+ bug in chunk_bwd_dqkwg that produces incorrect gradients for
+# chunk_gated_delta_rule. Without tilelang the backward raises at iter 1.
+# See fla-org/flash-linear-attention#640.
+$INSTALL --target="$PKG_DIR" 'tilelang'
 
 touch "$MARKER"
