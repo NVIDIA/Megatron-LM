@@ -14,6 +14,7 @@ onelogger.log
 onelogger.err
 .venv
 _research/results/runs/
+_research/packages/
 /test_cases/
 **/dist/
 
