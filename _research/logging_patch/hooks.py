@@ -178,7 +178,11 @@ def _drain_act_accum() -> dict[str, dict[str, float]]:
             "frac_outlier": frac_sum / n_eff,
             "rms": math.sqrt(max(0.0, sqsum_sum / n_eff)),
         }
-    _STATE["act_accum"] = {}
+    # Clear in place: forward hooks captured a reference to this dict at
+    # registration time, so replacing it with `_STATE["act_accum"] = {}` would
+    # orphan the hooks (they'd keep mutating the old dict; subsequent drains
+    # would return empty).
+    _STATE["act_accum"].clear()
     return snapshot
 
 
@@ -308,7 +312,10 @@ def _drain_neuron_accum() -> dict[str, dict[str, float]]:
             "p50": p50,
             "p90": p90,
         }
-    _STATE["neuron_accum"] = {}
+    # Clear in place (see drain_act_accum): forward pre-hooks captured this
+    # dict at registration time; replacing the reference would leak data into
+    # an orphaned dict and cause subsequent drains to return empty.
+    _STATE["neuron_accum"].clear()
     return out
 
 
