@@ -92,6 +92,10 @@ Megatron's own `--seed` is respected. We do not override it.
 
 The writer short-circuits on `RANK != 0` so only rank 0 emits the JSON. Other ranks call through to the original `training_log` unchanged.
 
+## wandb mirroring
+
+After each JSONL row is written, `_mirror_extras_to_wandb` flattens every dict-valued field (`row_cv`, `neuron_stats`, `act_stats`, `per_layer_grad_norm`) and extra scalars (`loss_spike`) into wandb keys structured as `<topkey>/<subkey>` or `<topkey>/<subkey>/<stat>`. Wandb groups these into a single chart panel per top-level key. Fields Megatron's own wandb integration already logs (`train_loss`, `lr`, `grad_norm`, `params_norm`, `tput`) and `top1_accuracy` (mirrored separately) are skipped to avoid duplicate streams. Rank-0 only; missing wandb session is a silent no-op.
+
 ## Notes / known limitations
 
 - `n_params_active` currently equals `n_params_total`. For MoE we'll refine this once we hook up the real 600B config and know how many experts fire per token.
