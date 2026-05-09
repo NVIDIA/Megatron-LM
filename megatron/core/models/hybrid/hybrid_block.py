@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -18,6 +19,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.rmsnorm_residual_fusion import DeferredAdd, wire_rmsnorm_residual_fusion
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -29,7 +31,14 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    log_single_rank,
+    make_viewless_tensor,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -186,6 +195,19 @@ class HybridStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
+        # Enable the cross-layer RMSNorm + residual-add fusion on every
+        # adjacent layer pair that advertises support. See
+        # ``megatron.core.fusions.rmsnorm_residual_fusion`` for the protocol.
+        wired = wire_rmsnorm_residual_fusion(self.layers)
+        if wired:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "[rmsnorm-residual-fusion] wired %d/%d layer boundaries",
+                wired,
+                len(self.layers) - 1,
+            )
+
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
 
@@ -321,11 +343,20 @@ class HybridStack(MegatronModule):
                             packed_seq_params=packed_seq_params,
                         )
 
-                # The attention layer (currently a simplified transformer layer)
-                # outputs a tuple of (hidden_states, context). Context is intended
-                # for cross-attention, and is not needed in our model.
+                # The attention layer (currently a simplified transformer
+                # layer) outputs a tuple of ``(hidden_states, context)``.
+                # Context is for cross-attention and is not needed here.
+                # A ``DeferredAdd`` is not a tuple, so this branch leaves
+                # it untouched for the next layer's fused entry step.
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+
+        # Collapse any residual ``DeferredAdd`` into a plain tensor before
+        # ``final_norm``. In practice the last layer never defers because
+        # ``wire_rmsnorm_residual_fusion`` only pairs emit/absorb on
+        # adjacent layers, but guard anyway.
+        if isinstance(hidden_states, DeferredAdd):
+            hidden_states = hidden_states.residual + hidden_states.delta
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
