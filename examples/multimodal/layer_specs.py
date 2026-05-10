@@ -1,6 +1,9 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+from functools import partial
+
 import torch
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -15,7 +18,6 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
-from megatron.core.extensions.transformer_engine import HAVE_TE
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -170,8 +172,8 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
             mlp_layer=ModuleSpec(
                 module=MLPLayer,
                 submodules=TransformerLayerSubmodules(
-                    mlp=ModuleSpec(
-                        module=MLP,
+                    mlp=partial(
+                        MLP.as_mlp_submodule,
                         submodules=MLPSubmodules(
                             linear_fc1=not_none(TELayerNormColumnParallelLinear),
                             linear_fc2=not_none(TERowParallelLinear),
@@ -184,10 +186,10 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
     )
 
 
-def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
+def get_mlp_module_spec(use_te: bool = True):
     # Dense MLP w/ or w/o TE modules.
-    return ModuleSpec(
-        module=MLP,
+    return partial(
+        MLP.as_mlp_submodule,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
             linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
@@ -195,9 +197,9 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     )
 
 
-def get_norm_mlp_module_spec_te() -> ModuleSpec:
-    return ModuleSpec(
-        module=MLP,
+def get_norm_mlp_module_spec_te():
+    return partial(
+        MLP.as_mlp_submodule,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TELayerNormColumnParallelLinear),
             linear_fc2=not_none(TERowParallelLinear),
