@@ -132,10 +132,14 @@ class TransformerConfig(ModelParallelConfig):
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
-    softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
-    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
-       and learnable offset."""
+    softmax_type: Literal['vanilla', 'off-by-one', 'learnable', 'softpick'] = 'vanilla'
+    """Applies a modified softmax. 'off-by-one' adds an implicit zero-key sink to the
+       denominator (https://www.evanmiller.org/attention-is-off-by-one.html); 'learnable'
+       adds a per-head learnable scalar to the denominator (gpt-oss style sink bias).
+       'softpick' (arXiv 2504.20966) replaces softmax with rectified-softmax
+       ReLU(x)/sum(ReLU(x)), eliminating attention sinks and massive activations.
+       Off-by-one and learnable support both TE FusedAttention and local unfused; softpick
+       requires the local unfused backend (--attention-backend local)."""
 
     num_query_groups: Optional[int] = field(
         default=None, metadata={"argparse_meta": {"default": 1}}
