@@ -14,6 +14,10 @@
 # PyTorch-only fallback path on ARM64 GH200.
 #
 #SBATCH --job-name=transformer-pp-350m-ablation-muon-mamba3
+# DISABLED: Mamba 3 forward NaN's after ~iter 100-500 in our setup (bf16 kernel
+# issue in mamba3_siso_combined). Submit will queue with --hold; release with
+# `scontrol release <jobid>` after the upstream fix lands.
+#SBATCH --hold
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log

@@ -14,6 +14,9 @@
 # PyTorch-only fallback path on ARM64 GH200.
 #
 #SBATCH --job-name=transformer-pp-350m-ablation-muon-mamba3-lr1.5e-4
+# DISABLED: Mamba 3 forward NaN's after ~iter 100-500 in our setup.
+# Lower LR delays NaN (197 vs 120 with default LR) but does not fix.
+#SBATCH --hold
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log

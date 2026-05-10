@@ -14,6 +14,9 @@
 # PyTorch-only fallback path on ARM64 GH200.
 #
 #SBATCH --job-name=transformer-pp-350m-ablation-muon-mamba3-lr1.5e-4-clip0.5
+# DISABLED: clip-grad 0.5 made no difference vs no-clip — Mamba 3 NaN at the
+# same iter (203). Confirms forward (kernel), not gradient, is the NaN source.
+#SBATCH --hold
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log

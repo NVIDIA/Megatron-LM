@@ -14,6 +14,9 @@
 # PyTorch-only fallback path on ARM64 GH200.
 #
 #SBATCH --job-name=transformer-pp-350m-ablation-aurora-mamba3
+# DISABLED: Aurora optimizer NaN'd Mamba 3 at iter 142 — same architecture
+# instability as the NorMuon attempts.
+#SBATCH --hold
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
