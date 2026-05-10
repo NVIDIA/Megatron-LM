@@ -4,9 +4,9 @@ Fast optimizer-ablation track on 350M dense Transformer++ (24L / 1024H /
 2560F / 16h / 4kv GQA), 1B tokens on ClimbMix, GBS=128 (524K tokens/step),
 seq_len=4096, 1 GH200 node, ~30 min/run, WSD schedule.
 
-All entries share architecture, data, schedule, seed (42); only the
-optimizer block differs. W&B project:
-[megatron-lm-research-baseline](https://wandb.ai/ischlag/megatron-lm-research-baseline).
+All entries share data, schedule, seed (42), and active param count
+(~355M); the `change` column carries the diff that produced the entry.
+W&B project: [megatron-lm-research-baseline](https://wandb.ai/ischlag/megatron-lm-research-baseline).
 
 The `commit` column records the git tag (and short SHA) of the
 megatron-lm-research-baseline state at which each row was last executed,
@@ -19,22 +19,46 @@ one builds on; `change` is the one-line delta. `rank` is just current
 ordering and shifts as new entries land, so it is not safe as a
 reference. Roots have an empty `parent`.
 
+Active params (~355M) are constant across rows; for MoE rows the
+`change` column carries the routing recipe and the total-param count
+(active matches the dense baseline by construction: `topk *
+moe_ffn_hidden = ffn_hidden = 2560`).
+
 | rank | entry | parent | change | optimizer | matrix LR | final | min | sbatch | wandb | commit |
 | ---: | --- | --- | --- | --- | ---: | ---: | ---: | --- | --- | --- |
-| 1 | aurora-qkn | aurora-lr1e-2 | add `--qk-layernorm` (RMSNorm on Q, K) | Aurora + QK norm | 1e-2 | **2.185** | **2.025** | [`09-aurora-qkn.sbatch`](runs/09-aurora-qkn.sbatch) | [s5e3c4bm](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/s5e3c4bm) | [`f3816b24e`](https://github.com/ischlag/megatron-lm-research-baseline/tree/f3816b24e) |
-| 2 | aurora-qkn-fp8 | aurora-qkn | add `--fp8-format e4m3 --fp8-recipe blockwise` (DeepSeek-V3) | Aurora + QK norm (FP8) | 1e-2 | 2.188 | 2.027 | [`11-aurora-qkn-fp8.sbatch`](runs/11-aurora-qkn-fp8.sbatch) | [guwuunre](https://wandb.ai/ischlag/lm-research-baseline-dev/runs/guwuunre) | [`6db3a8f8b`](https://github.com/ischlag/megatron-lm-research-baseline/tree/6db3a8f8b) |
-| 3 | aurora-lr1e-2 | normuon-lr3.6e-4 | Aurora polar (Tilde): row-uniform Stiefel; matrix LR rescaled to 1e-2 | Aurora | 1e-2 | 2.200 | 2.038 | [`08-aurora-lr1e-2.sbatch`](runs/08-aurora-lr1e-2.sbatch) | [czxm4be0](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/czxm4be0) | [`c51a272dd`](https://github.com/ischlag/megatron-lm-research-baseline/tree/c51a272dd) |
-| 4 | normuon-lr3.6e-4 | muon-kj-lr2e-2 | adaptive_muon (NorMuon per-row 2nd moment); LR rescaled to 3.6e-4 | NorMuon | 3.6e-4 | 2.224 | 2.061 | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [0l47egjv](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/0l47egjv) | [`baseline-2026-05-08-0b2385c`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-0b2385c) |
-| 5 | muon-kj-lr2e-2 |  | root: plain Muon, Keller Jordan recipe (`shape_scaling`, LR 2e-2) | Muon (shape_scaling) | 2e-2 | 2.226 | 2.068 | [`03-muon-kj-lr2e-2.sbatch`](runs/03-muon-kj-lr2e-2.sbatch) | [f7uvsbai](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/f7uvsbai) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 6 | normuon-lr2e-4 | normuon-lr3.6e-4 | LR 3.6e-4 -> 2e-4 | NorMuon | 2e-4 | 2.227 | 2.063 | [`02-normuon-lr2e-4.sbatch`](runs/02-normuon-lr2e-4.sbatch) | [heevf919](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 7 | normuon-fp8 | normuon-lr3.6e-4 | add `--fp8-format e4m3 --fp8-recipe blockwise` (DeepSeek-V3) | NorMuon (FP8) | 3.6e-4 | 2.229 | 2.065 | [`07-normuon-fp8.sbatch`](runs/07-normuon-fp8.sbatch) | [7j84uy3j](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/7j84uy3j) | [`598cbe616`](https://github.com/ischlag/megatron-lm-research-baseline/tree/598cbe616) |
-| 8 | normuon-lr6e-4 | normuon-lr3.6e-4 | LR 3.6e-4 -> 6e-4 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 9 | adamw-lr1e-3 |  | root: AdamW baseline (decoupled WD), LR 1e-3 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 10 | adamw-lr5e-4 | adamw-lr1e-3 | LR 1e-3 -> 5e-4 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 1 | aurora-qkn-moe-32e-tk3-sh1 | aurora-qkn | replace dense FFN with 32 routed experts top-3 + 1 shared expert (all width 640); active 355M, total ~1.73B (DeepSeek-V3-style fine-grained MoE) | Aurora + QK norm + MoE | 1e-2 | **2.098** | **1.934** | [`12-aurora-qkn-moe-32e-tk3-sh1.sbatch`](runs/12-aurora-qkn-moe-32e-tk3-sh1.sbatch) | [5ttumu3u](https://wandb.ai/ischlag/lm-research-baseline-dev/runs/5ttumu3u) | [`c664f35d2`](https://github.com/ischlag/megatron-lm-research-baseline/tree/c664f35d2) |
+| 2 | aurora-qkn | aurora-lr1e-2 | add `--qk-layernorm` (RMSNorm on Q, K) | Aurora + QK norm | 1e-2 | 2.185 | 2.025 | [`09-aurora-qkn.sbatch`](runs/09-aurora-qkn.sbatch) | [s5e3c4bm](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/s5e3c4bm) | [`f3816b24e`](https://github.com/ischlag/megatron-lm-research-baseline/tree/f3816b24e) |
+| 3 | aurora-qkn-fp8 | aurora-qkn | add `--fp8-format e4m3 --fp8-recipe blockwise` (DeepSeek-V3) | Aurora + QK norm (FP8) | 1e-2 | 2.188 | 2.027 | [`11-aurora-qkn-fp8.sbatch`](runs/11-aurora-qkn-fp8.sbatch) | [guwuunre](https://wandb.ai/ischlag/lm-research-baseline-dev/runs/guwuunre) | [`6db3a8f8b`](https://github.com/ischlag/megatron-lm-research-baseline/tree/6db3a8f8b) |
+| 4 | aurora-lr1e-2 | normuon-lr3.6e-4 | Aurora polar (Tilde): row-uniform Stiefel; matrix LR rescaled to 1e-2 | Aurora | 1e-2 | 2.200 | 2.038 | [`08-aurora-lr1e-2.sbatch`](runs/08-aurora-lr1e-2.sbatch) | [czxm4be0](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/czxm4be0) | [`c51a272dd`](https://github.com/ischlag/megatron-lm-research-baseline/tree/c51a272dd) |
+| 5 | normuon-lr3.6e-4 | muon-kj-lr2e-2 | adaptive_muon (NorMuon per-row 2nd moment); LR rescaled to 3.6e-4 | NorMuon | 3.6e-4 | 2.224 | 2.061 | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [0l47egjv](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/0l47egjv) | [`baseline-2026-05-08-0b2385c`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-0b2385c) |
+| 6 | muon-kj-lr2e-2 |  | root: plain Muon, Keller Jordan recipe (`shape_scaling`, LR 2e-2) | Muon (shape_scaling) | 2e-2 | 2.226 | 2.068 | [`03-muon-kj-lr2e-2.sbatch`](runs/03-muon-kj-lr2e-2.sbatch) | [f7uvsbai](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/f7uvsbai) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 7 | normuon-lr2e-4 | normuon-lr3.6e-4 | LR 3.6e-4 -> 2e-4 | NorMuon | 2e-4 | 2.227 | 2.063 | [`02-normuon-lr2e-4.sbatch`](runs/02-normuon-lr2e-4.sbatch) | [heevf919](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 8 | normuon-fp8 | normuon-lr3.6e-4 | add `--fp8-format e4m3 --fp8-recipe blockwise` (DeepSeek-V3) | NorMuon (FP8) | 3.6e-4 | 2.229 | 2.065 | [`07-normuon-fp8.sbatch`](runs/07-normuon-fp8.sbatch) | [7j84uy3j](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/7j84uy3j) | [`598cbe616`](https://github.com/ischlag/megatron-lm-research-baseline/tree/598cbe616) |
+| 9 | normuon-lr6e-4 | normuon-lr3.6e-4 | LR 3.6e-4 -> 6e-4 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 10 | adamw-lr1e-3 |  | root: AdamW baseline (decoupled WD), LR 1e-3 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 11 | adamw-lr5e-4 | adamw-lr1e-3 | LR 1e-3 -> 5e-4 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | -- | aurora-qkn-derf-rmsqk | aurora-qkn | swap RMSNorm for Derf at block norms (input/pre-MLP/final); keep RMSNorm at QK (`APERTUS_DERF_QK_RMSNORM=1`) | Aurora + QK norm + Derf | 1e-2 | 2.217 | 2.057 | [`10-aurora-qkn-derf-rmsqk.sbatch`](runs/10-aurora-qkn-derf-rmsqk.sbatch) | [94h3m6bs](https://wandb.ai/ischlag/lm-research-baseline-dev/runs/94h3m6bs) | [`dffead810`](https://github.com/ischlag/megatron-lm-research-baseline/tree/dffead810) |
 
 ## Notes on entries
 
+- **`aurora-qkn-moe-32e-tk3-sh1`**: 32 routed experts at width 640 (top-3) plus 1
+  always-on shared expert at width 640. Active params per token are
+  exactly matched to dense aurora-qkn (`(3 + 1) * 3 * 1024 * 640 = 7.86M`
+  per-layer FFN, same as `3 * 1024 * 2560 = 7.86M`). Total is ~1.73B (4.9×
+  dense). Mixtral-style aux loss (`--moe-aux-loss-coeff 1e-2`) and
+  Switch/DeepSeek-style z-loss (`--moe-z-loss-coeff 1e-3`); grouped
+  GEMM, alltoall dispatcher, EP=1 / DP=4 (matches dense parallelism).
+  3D expert weights bypass Aurora's 2D predicate and fall through to
+  AdamW; attention/embeds/output/router still get Aurora. MBS halved
+  16 -> 8 to fit MoE permute/dispatch activations + replicated
+  expert weights (~1 GB/layer at 32E × 640).
+  Steady throughput ~87 TFLOP/s/GPU vs dense ~265 — the small-model MoE
+  penalty (per-token all-to-all dispatch dominates at hidden 1024;
+  vanishes at hidden ≥ 4K). Promoted from a sweep across `num_experts`
+  ∈ {8, 16, 32, 64}, `topk` ∈ {2, 4}, ±1 shared expert; full sweep
+  results in the merging PR. `tk3-sh1 32E` matches `tk2 64E` quality
+  (final 2.098 vs 2.095) at ~3.6× fewer total params and ~2× the
+  throughput.
 - **`aurora-qkn-derf-rmsqk`** (representative entry from a `feat/dyt-derf-norm`
   ablation series): Derf normalisation at block sites, RMSNorm at the per-head
   QK sites. Out-of-the-box Derf+QKN at all sites lands at 2.278 (+0.093 vs
