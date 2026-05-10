@@ -1,25 +1,22 @@
 #!/bin/bash
 #
-# 350M-ablation leaderboard - 32 experts, top-2 (4x total params vs 8E).
-# Active params match dense aurora-qkn (~355M); total ~3.18B.
+# 350M-active MoE ablation - 8 experts, top-2, EP=4 (DP=1).
+#
+# Active params match dense aurora-qkn (~355M); total ~920M.
 #   Per-layer FFN active = topk * 3 * hidden * moe_ffn = 2 * 3 * 1024 * 1280
 #                        = 7.86M  (dense FFN: 3 * 1024 * 2560 = 7.86M)
-#   Per-layer FFN total  = 32 * 3 * 1024 * 1280 = 126M  (16x dense)
+#   Per-layer FFN total  = 8 * 3 * 1024 * 1280 = 31.5M  (4x dense)
 # Optimizer: Aurora on 2D matrices (attention, embeds, output, router);
-# expert weights are 3D under grouped-GEMM, so they fall through to AdamW.
-# Diff vs aurora-qkn-moe-16e: --num-experts 16 -> 32 (2x total params,
-# active stays the same).
-# Final loss: 2.100   Min loss: 1.934
-# W&B: https://wandb.ai/ischlag/lm-research-baseline-dev/runs/06rb5oob
-# Executed at git sha: 15e5a1ef5
+# expert weights are 3D under grouped-GEMM, so they fall through Aurora's
+# `len(shape) != 2` predicate to AdamW. This makes the comparison vs
+# dense aurora-qkn a clean test of "does sparsity buy you anything on this
+# leaderboard" rather than an Aurora-on-experts test.
+# All other arch knobs (RMSNorm, SwiGLU, RoPE, GQA 16h/4kv, qk-layernorm)
+# stay identical to aurora-qkn.
 #
 # Reference: Mixtral 8x7B (Jiang et al., 2024); MoEUT (Csordas et al., 2024).
 #
-# To reproduce bitwise:
-#   git checkout 15e5a1ef5
-#   sbatch _research/leaderboards/350m-ablation/runs/14-aurora-qkn-moe-32e.sbatch
-#
-#SBATCH --job-name=350m-abl-aurora-qkn-moe-32e
+#SBATCH --job-name=350m-abl-aurora-qkn-moe-8e-tk2-ep4
 #SBATCH --time=02:30:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -59,19 +56,17 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-aurora-qkn-moe-32e-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-moe-8e-tk2-ep4-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp-aurora-moe-32e
-export APERTUS_TRACK=350m-ablation-leaderboard
+export APERTUS_FEATURE=transformer-pp-aurora-moe-8e-tk2-ep4
+export APERTUS_TRACK=350m-ablation-aurora-qkn-moe-8e-tk2-ep4
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
-export APERTUS_LOG_ACT_STATS=1
-export APERTUS_LOG_TOP1_ACC=1
+export APERTUS_LOG_ACT_STATS=0
+export APERTUS_LOG_TOP1_ACC=0
 export APERTUS_LOG_ROW_CV=1
-export APERTUS_LOG_NEURON_STATS=1
+export APERTUS_LOG_NEURON_STATS=0
 export APERTUS_LOG_NEURON_INTERVAL=50
-export APERTUS_LOG_PER_LAYER_GRADS=1
-export APERTUS_LOG_LOSS_SPIKES=1
 
 MEGATRON_ARGS=(
     # Architecture: 350M-active Transformer++ MoE (24L, 1024H, 16h, 4kv GQA)
@@ -93,8 +88,8 @@ MEGATRON_ARGS=(
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length 4096
-    # MoE: 32 experts, top-2, expert FFN 1280 (active matches dense, 4x total vs 8E)
-    --num-experts 32
+    # MoE: Mixtral-style 8 experts, top-2, expert FFN 1280 (active matches dense)
+    --num-experts 8
     --moe-router-topk 2
     --moe-ffn-hidden-size 1280
     --moe-router-load-balancing-type aux_loss
@@ -148,13 +143,14 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    # Distributed: TP=1, PP=1, EP=1, DP=4. EP=1 still fits (32 experts
-    # * 31.5M = 1GB/layer, 24L = ~24GB on a 96GB GH200; activations + grads
-    # + optimizer state add ~30-40GB more, comfortably under 96). --overlap-param-gather
+    # Distributed: TP=1, PP=1, EP=4, DP=1. Each rank holds num_experts/EP = 2
+    # experts. Drops DP-sharded optimizer state (DP=1) but slashes per-GPU
+    # bf16 expert weights + grads by 4x. Pays an all-to-all dispatch on every
+    # MoE forward+backward over the EP group. --overlap-param-gather
     # omitted (corrupts Newton-Schulz; same caveat as Muon).
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
-    --expert-model-parallel-size 1
+    --expert-model-parallel-size 4
     --context-parallel-size 1
     --sequence-parallel
     --use-distributed-optimizer

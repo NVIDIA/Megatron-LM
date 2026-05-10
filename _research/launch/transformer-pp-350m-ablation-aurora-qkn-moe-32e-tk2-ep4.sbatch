@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-# 350M-active MoE ablation - 16 experts, top-2 (2x total params vs 8E).
+# 350M-active MoE ablation - 32 experts, top-2, EP=4 (DP=1).
 #
-# Active params match dense aurora-qkn (~355M); total ~1.68B.
+# Active params match dense aurora-qkn (~355M); total ~3.18B.
 #   Per-layer FFN active = topk * 3 * hidden * moe_ffn = 2 * 3 * 1024 * 1280
 #                        = 7.86M  (dense FFN: 3 * 1024 * 2560 = 7.86M)
-#   Per-layer FFN total  = 16 * 3 * 1024 * 1280 = 63M  (8x dense)
+#   Per-layer FFN total  = 32 * 3 * 1024 * 1280 = 126M  (16x dense)
 # Optimizer: Aurora on 2D matrices (attention, embeds, output, router);
 # expert weights are 3D under grouped-GEMM, so they fall through Aurora's
 # `len(shape) != 2` predicate to AdamW. This makes the comparison vs
@@ -16,7 +16,7 @@
 #
 # Reference: Mixtral 8x7B (Jiang et al., 2024); MoEUT (Csordas et al., 2024).
 #
-#SBATCH --job-name=350m-abl-aurora-qkn-moe-16e
+#SBATCH --job-name=350m-abl-aurora-qkn-moe-32e-tk2-ep4
 #SBATCH --time=02:30:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -56,11 +56,11 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-aurora-qkn-moe-16e-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-moe-32e-tk2-ep4-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp-aurora-moe-16e
-export APERTUS_TRACK=350m-ablation-aurora-qkn-moe-16e
+export APERTUS_FEATURE=transformer-pp-aurora-moe-32e-tk2-ep4
+export APERTUS_TRACK=350m-ablation-aurora-qkn-moe-32e-tk2-ep4
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=0
 export APERTUS_LOG_TOP1_ACC=0
@@ -88,8 +88,8 @@ MEGATRON_ARGS=(
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length 4096
-    # MoE: 16 experts, top-2, expert FFN 1280 (active matches dense, 2x total vs 8E)
-    --num-experts 16
+    # MoE: 32 experts, top-2, expert FFN 1280 (active matches dense, 4x total vs 8E)
+    --num-experts 32
     --moe-router-topk 2
     --moe-ffn-hidden-size 1280
     --moe-router-load-balancing-type aux_loss
@@ -143,12 +143,14 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    # Distributed: TP=1, PP=1, EP=1, DP=4. EP=1 still fits (16 experts
-    # * 31.5M = 504MB/layer, 24L = ~12GB on a 96GB GH200). --overlap-param-gather
+    # Distributed: TP=1, PP=1, EP=4, DP=1. Each rank holds num_experts/EP = 8
+    # experts. Slashes per-GPU bf16 expert weights + grads by 4x. Drops DP
+    # sharding of optimizer state but the 1/EP shard already wins overall.
+    # --overlap-param-gather
     # omitted (corrupts Newton-Schulz; same caveat as Muon).
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
-    --expert-model-parallel-size 1
+    --expert-model-parallel-size 4
     --context-parallel-size 1
     --sequence-parallel
     --use-distributed-optimizer

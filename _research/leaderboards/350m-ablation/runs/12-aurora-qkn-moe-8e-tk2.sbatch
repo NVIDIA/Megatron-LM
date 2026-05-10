@@ -1,23 +1,32 @@
 #!/bin/bash
 #
-# 350M-active MoE ablation - 64 experts, top-2 (8x total params vs 8E).
-#
-# Active params match dense aurora-qkn (~355M); total ~6.2B.
+# 350M-ablation leaderboard - rank 1 (new)
+# 350M-active MoE: Mixtral-style 8 experts, top-2.
+# Active params match dense aurora-qkn (~355M); total ~920M.
 #   Per-layer FFN active = topk * 3 * hidden * moe_ffn = 2 * 3 * 1024 * 1280
 #                        = 7.86M  (dense FFN: 3 * 1024 * 2560 = 7.86M)
-#   Per-layer FFN total  = 64 * 3 * 1024 * 1280 = 252M  (32x dense)
+#   Per-layer FFN total  = 8 * 3 * 1024 * 1280 = 31.5M  (4x dense)
 # Optimizer: Aurora on 2D matrices (attention, embeds, output, router);
 # expert weights are 3D under grouped-GEMM, so they fall through Aurora's
-# `len(shape) != 2` predicate to AdamW. This makes the comparison vs
-# dense aurora-qkn a clean test of "does sparsity buy you anything on this
-# leaderboard" rather than an Aurora-on-experts test.
-# All other arch knobs (RMSNorm, SwiGLU, RoPE, GQA 16h/4kv, qk-layernorm)
-# stay identical to aurora-qkn.
+# `len(shape) != 2` predicate to AdamW.
+# Diff vs prior leader (09-aurora-qkn): replace dense FFN with 8-expert
+# top-2 sparse MoE (`--num-experts 8 --moe-router-topk 2 --moe-ffn-hidden-size
+# 1280`); add aux + z losses (1e-2 / 1e-3); MBS 16 -> 8 for MoE activation
+# headroom; SLURM time 1h -> 2.5h, exit-duration 55min -> 140min.
+# All other arch knobs (RMSNorm, SwiGLU, RoPE, GQA 16h/4kv, qk-layernorm,
+# Aurora optimizer, WSD schedule, seed=42) stay identical.
+# Final loss: 2.150   Min loss: 1.978
+# W&B: https://wandb.ai/ischlag/lm-research-baseline-dev/runs/zwm2s2ql
+# Executed at git sha: 15e5a1ef5
 #
 # Reference: Mixtral 8x7B (Jiang et al., 2024); MoEUT (Csordas et al., 2024).
 #
-#SBATCH --job-name=350m-abl-aurora-qkn-moe-64e
-#SBATCH --time=04:30:00
+# To reproduce bitwise:
+#   git checkout 15e5a1ef5
+#   sbatch _research/leaderboards/350m-ablation/runs/12-aurora-qkn-moe-8e.sbatch
+#
+#SBATCH --job-name=350m-abl-aurora-qkn-moe-8e-tk2
+#SBATCH --time=02:30:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --nodes=1
@@ -56,17 +65,19 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-aurora-qkn-moe-64e-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-moe-8e-tk2-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp-aurora-moe-64e
-export APERTUS_TRACK=350m-ablation-aurora-qkn-moe-64e
+export APERTUS_FEATURE=transformer-pp-aurora-moe-8e-tk2
+export APERTUS_TRACK=350m-ablation-leaderboard
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
-export APERTUS_LOG_ACT_STATS=0
-export APERTUS_LOG_TOP1_ACC=0
+export APERTUS_LOG_ACT_STATS=1
+export APERTUS_LOG_TOP1_ACC=1
 export APERTUS_LOG_ROW_CV=1
-export APERTUS_LOG_NEURON_STATS=0
+export APERTUS_LOG_NEURON_STATS=1
 export APERTUS_LOG_NEURON_INTERVAL=50
+export APERTUS_LOG_PER_LAYER_GRADS=1
+export APERTUS_LOG_LOSS_SPIKES=1
 
 MEGATRON_ARGS=(
     # Architecture: 350M-active Transformer++ MoE (24L, 1024H, 16h, 4kv GQA)
@@ -88,8 +99,8 @@ MEGATRON_ARGS=(
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length 4096
-    # MoE: 64 experts, top-2, expert FFN 1280 (active matches dense, 8x total vs 8E)
-    --num-experts 64
+    # MoE: Mixtral-style 8 experts, top-2, expert FFN 1280 (active matches dense)
+    --num-experts 8
     --moe-router-topk 2
     --moe-ffn-hidden-size 1280
     --moe-router-load-balancing-type aux_loss
@@ -98,14 +109,13 @@ MEGATRON_ARGS=(
     --moe-grouped-gemm
     --moe-permute-fusion
     --moe-token-dispatcher-type alltoall
-    # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=4 (DP=4, 8 grad-accum
-    # steps). 64 experts replicate ~12 GB bf16 weights + ~12 GB grads on each
-    # GPU on top of the MoE permute/dispatch activations; MBS=8 OOMs at the
-    # fused CE step (96GB GH200). Halving MBS again here.
-    --micro-batch-size 4
+    # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=8 (DP=4, 4 grad-accum
+    # steps). Dense baseline runs at MBS=16; MoE permuted activations + grouped
+    # GEMM workspace double the per-microbatch activation footprint, so we halve.
+    --micro-batch-size 8
     --global-batch-size 128
     --train-samples 244141
-    --exit-duration-in-mins 250
+    --exit-duration-in-mins 140
     --log-interval 1
     --eval-interval 244141
     --eval-iters 0
@@ -144,10 +154,9 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    # Distributed: TP=1, PP=1, EP=1, DP=4. EP=1 fits tightly (64 experts
-    # * 31.5M = 2GB/layer, 24L = ~48GB on a 96GB GH200 for bf16 weights;
-    # bf16 grads add another 48 GB on the .grad fp16/bf16 reduce path —
-    # may need EP>1 if OOM). --overlap-param-gather
+    # Distributed: TP=1, PP=1, EP=1, DP=4. EP=1 fits comfortably (8 experts
+    # * 31.5M = 252MB/layer, 24L = ~6GB on a 96GB GH200) and matches the
+    # dense baseline's parallelism for a clean comparison. --overlap-param-gather
     # omitted (corrupts Newton-Schulz; same caveat as Muon).
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
