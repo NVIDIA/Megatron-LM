@@ -70,11 +70,11 @@ export APERTUS_LOG_LOSS_SPIKES=1
 
 MEGATRON_ARGS=(
     # Architecture: 350M Transformer++ (24L, 1024H, 2560F, 16h, 4kv GQA)
-    # Local spec (pure PyTorch building blocks) is required by the local
-    # attention backend, which is the only one that can run our softpick path
-    # (TE FlashAttention has no rectified-softmax kernel).
+    # --transformer-impl local takes the get_gpt_layer_local_spec branch in
+    # gpt_builders.py, which builds the layer with the unfused PyTorch
+    # DotProductAttention -- the only backend that knows about softpick.
+    # We don't pass --spec or --attention-backend; defaults are correct.
     --transformer-impl local
-    --spec local
     --main-grads-dtype fp32
     --num-layers 24
     --hidden-size 1024
@@ -91,7 +91,6 @@ MEGATRON_ARGS=(
     --qk-layernorm
     --softmax-type softpick
     --untie-embeddings-and-output-weights
-    --attention-backend local
     --seq-length 4096
     # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=16 (DP=4)
     --micro-batch-size 16
