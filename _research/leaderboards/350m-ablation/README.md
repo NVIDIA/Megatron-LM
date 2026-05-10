@@ -4,8 +4,9 @@ Fast optimizer-ablation track on 350M dense Transformer++ (24L / 1024H /
 2560F / 16h / 4kv GQA), 1B tokens on ClimbMix, GBS=128 (524K tokens/step),
 seq_len=4096, 1 GH200 node, ~30 min/run, WSD schedule.
 
-All entries share architecture, data, schedule, seed (42); only the
-optimizer block differs. W&B project:
+Most entries share architecture, data, schedule, seed (42); the optimizer
+block differs. Architecture variants (linear-attention layers in place of
+softmax attention) are flagged in the variant column. W&B project:
 [megatron-lm-research-baseline](https://wandb.ai/ischlag/megatron-lm-research-baseline).
 
 The `commit` column records the git tag (and short SHA) of the
@@ -23,6 +24,7 @@ so results stay reproducible across upstream syncs. Tag list:
 | 6 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 7 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | 8 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 9 | NorMuon (DN+carry-v2+cap200) | 3.6e-4 | 2.207 | 2.045 | [`09-deltanet-perchgate-carry-v2-cap200.sbatch`](runs/09-deltanet-perchgate-carry-v2-cap200.sbatch) | (dev) | [`91920d23d`](https://github.com/ischlag/megatron-lm-research-baseline/tree/91920d23d) (feat/deltanet-variants) |
 
 ## Notes on entries
 
@@ -53,3 +55,12 @@ so results stay reproducible across upstream syncs. Tag list:
   AdamW; the naming in the table reflects that.
 - `--overlap-param-gather` is **on** for AdamW rows and **off** for Muon /
   Aurora rows (it corrupts Newton-Schulz; see the main README).
+- **Rank 9** is the first architecture variant: hybrid 3:1 (Schlag DeltaNet
+  + softmax attention every 4th layer), per-channel output gate, full
+  per-batch carry-v2 of the recurrent state across batches, and a hard
+  Frobenius cap of 200 on the per-element carried state. NorMuon optimizer
+  to match the canonical recipe. Cap=200 binds late (~step 950) and keeps
+  the carried state norm bounded for length-gen safety without measurably
+  hurting iso-token loss vs the no-cap variant. Runs on
+  `feat/deltanet-variants` branch (DeltaNet flag-gated path); will be
+  re-tagged on main once the branch lands.
