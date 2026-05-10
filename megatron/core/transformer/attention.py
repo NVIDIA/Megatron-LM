@@ -1290,6 +1290,27 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
+        # Exclusive Self-Attention (XSA, arXiv 2603.09078): subtract the component
+        # of each head's output along its own (L2-normalized) value direction.
+        if self.config.exclusive_self_attention:
+            assert (
+                packed_seq_params is None
+            ), "exclusive_self_attention does not support packed sequences"
+            nvtx_range_push(suffix="exclusive_self_attention")
+            np_ = self.num_attention_heads_per_partition
+            hn = self.hidden_size_per_attention_head
+            ng = self.num_query_groups_per_partition
+            n_per_group = np_ // ng
+            # value shape: [sq, b, ng, hn]; broadcast KV heads to query heads.
+            v_bcast = value.repeat_interleave(n_per_group, dim=2)  # [sq, b, np, hn]
+            v_hat = torch.nn.functional.normalize(v_bcast, dim=-1, eps=1e-12)
+            sq, b = core_attn_out.shape[0], core_attn_out.shape[1]
+            out_bhnd = core_attn_out.view(sq, b, np_, hn)
+            proj = (out_bhnd * v_hat).sum(dim=-1, keepdim=True)
+            out_bhnd = out_bhnd - proj * v_hat
+            core_attn_out = out_bhnd.reshape(sq, b, np_ * hn)
+            nvtx_range_pop(suffix="exclusive_self_attention")
+
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
