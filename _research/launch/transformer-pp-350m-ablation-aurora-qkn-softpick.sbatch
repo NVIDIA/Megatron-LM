@@ -93,9 +93,15 @@ MEGATRON_ARGS=(
     --softmax-type softpick
     --untie-embeddings-and-output-weights
     --seq-length 4096
-    # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=16 (DP=4)
-    --micro-batch-size 16
+    # Training: 1B tokens, GBS=128 (524K tokens/step). MBS dropped 16->2
+    # because the local attention backend materializes [b, np, sq, sk] which
+    # TE FlashAttention does not. With MBS=2: per-rank b=2, attention probs
+    # are 2*16*4096*4096*2B = 4 GB per layer instead of 32 GB. Combined with
+    # --recompute-activations this fits on 95 GB GH200. GBS unchanged via
+    # 8x grad-accum per DP rank; loss recipe is identical to MBS=16.
+    --micro-batch-size 2
     --global-batch-size 128
+    --recompute-activations
     --train-samples 244141
     --exit-duration-in-mins 145
     --log-interval 1
