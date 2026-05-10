@@ -23,6 +23,31 @@ the W&B URL, and the final + min training loss.
 To reproduce an entry bitwise: `git checkout <sha>` then
 `sbatch leaderboards/<size>/runs/NN-<name>.sbatch`.
 
+## Promoting a run to a leaderboard
+
+When a run wins (or is otherwise worth tracking), add it as an entry:
+
+1. Copy the executed sbatch into `leaderboards/<size>/runs/`. Pick the
+   next free numeric prefix (`NN-`); the rest of the filename is the
+   stable **slug** for that entry (e.g. `08-aurora-lr1e-2.sbatch` has
+   slug `aurora-lr1e-2`).
+2. Pin every hparam in the file: no env-var branching, no harness
+   dependencies. The header should carry rank, sha, W&B URL, final +
+   min loss.
+3. Add a row to the leaderboard's `README.md` table with these stable
+   columns:
+   - `entry`: the slug from step 1.
+   - `parent`: the slug of the entry this run builds on, or empty if
+     it's a new root.
+   - `change`: a one-line delta vs the parent (e.g. `LR 3.6e-4 -> 6e-4`,
+     `add --qk-layernorm (RMSNorm on Q, K)`, `FP8 e4m3 blockwise
+     (DeepSeek-V3)`). Roots use this column to describe the recipe
+     family.
+4. Reorder the table by `min loss` (or whatever metric matters for
+   that leaderboard) and update the `rank` column. Rank is unstable
+   over time; the slug + parent + change triple is the durable record
+   of lineage.
+
 ## Sizes
 
 | leaderboard | tokens | nodes | purpose |

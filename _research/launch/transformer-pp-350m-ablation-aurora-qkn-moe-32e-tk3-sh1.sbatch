@@ -1,18 +1,24 @@
 #!/bin/bash
 #
-# 350M ablation leaderboard — rank 2
-# Optimizer: NorMuon (adaptive_muon + normuon moment2), matrix LR 2e-4,
-#            scalar LR 1.5e-3, scalar WD 0, spectral scale, Nesterov, mom 0.95.
-# Final loss: 2.227   Min loss: 2.063
-# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919
-# Executed at git sha: 885cdbb0d
+# 350M-active MoE ablation - 32 routed experts top-3 + 1 shared expert,
+# all width 640 (DeepSeek-style, iso-active to dense).
 #
-# To reproduce bitwise:
-#   git checkout 885cdbb0d
-#   sbatch _research/leaderboards/350m-ablation/runs/02-normuon-lr2e-4.sbatch
+# Active params match dense aurora-qkn (~355M); total ~1.73B.
+#   Per-layer FFN active = (topk_routed + 1_shared) * 3 * hidden * 640
+#                        = 4 * 3 * 1024 * 640 = 7.86M  (matches dense)
+#   Per-layer FFN total  = (32 + 1) * 3 * 1024 * 640 = 64.9M  (~32E tk4 + 1 expert)
+# Optimizer: Aurora on 2D matrices (attention, embeds, output, router);
+# expert weights are 3D under grouped-GEMM, so they fall through Aurora's
+# `len(shape) != 2` predicate to AdamW. This makes the comparison vs
+# dense aurora-qkn a clean test of "does sparsity buy you anything on this
+# leaderboard" rather than an Aurora-on-experts test.
+# All other arch knobs (RMSNorm, SwiGLU, RoPE, GQA 16h/4kv, qk-layernorm)
+# stay identical to aurora-qkn.
 #
-#SBATCH --job-name=350m-abl-normuon-lr2e-4
-#SBATCH --time=01:00:00
+# Reference: Mixtral 8x7B (Jiang et al., 2024); MoEUT (Csordas et al., 2024).
+#
+#SBATCH --job-name=350m-abl-aurora-qkn-moe-32e-tk3-sh1
+#SBATCH --time=02:30:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --nodes=1
@@ -27,8 +33,8 @@ set -euo pipefail
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
-REPO_DIR=/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline
-WORKDIR=${SLURM_SUBMIT_DIR:-$REPO_DIR}
+WORKDIR=${SLURM_SUBMIT_DIR:-/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline}
+REPO_DIR=$WORKDIR
 cd $WORKDIR
 
 PACKAGE_DIR=$REPO_DIR/_research/packages
@@ -51,22 +57,20 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-normuon-lr2e-4-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-moe-32e-tk3-sh1-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp
-export APERTUS_TRACK=350m-ablation-leaderboard
+export APERTUS_FEATURE=transformer-pp-aurora-moe-32e-tk3-sh1
+export APERTUS_TRACK=350m-ablation-aurora-qkn-moe-32e-tk3-sh1
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
-export APERTUS_LOG_ACT_STATS=1
-export APERTUS_LOG_TOP1_ACC=1
+export APERTUS_LOG_ACT_STATS=0
+export APERTUS_LOG_TOP1_ACC=0
 export APERTUS_LOG_ROW_CV=1
-export APERTUS_LOG_NEURON_STATS=1
+export APERTUS_LOG_NEURON_STATS=0
 export APERTUS_LOG_NEURON_INTERVAL=50
-export APERTUS_LOG_PER_LAYER_GRADS=1
-export APERTUS_LOG_LOSS_SPIKES=1
 
 MEGATRON_ARGS=(
-    # Architecture: 350M Transformer++ (24L, 1024H, 2560F, 16h, 4kv GQA)
+    # Architecture: 350M-active Transformer++ MoE (24L, 1024H, 16h, 4kv GQA)
     --transformer-impl transformer_engine
     --main-grads-dtype fp32
     --num-layers 24
@@ -81,18 +85,33 @@ MEGATRON_ARGS=(
     --make-vocab-size-divisible-by 128
     --normalization RMSNorm
     --swiglu
+    --qk-layernorm
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length 4096
-    # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=16 (DP=4)
-    --micro-batch-size 16
+    # MoE: 32 experts, top-4, expert FFN 640 (fine-grained, iso-active to dense)
+    --num-experts 32
+    --moe-router-topk 3
+    --moe-ffn-hidden-size 640
+    --moe-shared-expert-intermediate-size 640
+    --moe-router-load-balancing-type aux_loss
+    --moe-aux-loss-coeff 1e-2
+    --moe-z-loss-coeff 1e-3
+    --moe-grouped-gemm
+    --moe-permute-fusion
+    --moe-token-dispatcher-type alltoall
+    --moe-per-layer-logging
+    # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=8 (DP=4, 4 grad-accum
+    # steps). Dense baseline runs at MBS=16; MoE permuted activations + grouped
+    # GEMM workspace double the per-microbatch activation footprint, so we halve.
+    --micro-batch-size 8
     --global-batch-size 128
     --train-samples 244141
-    --exit-duration-in-mins 55
+    --exit-duration-in-mins 140
     --log-interval 1
     --eval-interval 244141
     --eval-iters 0
-    --optimizer adaptive_muon
+    --optimizer aurora
     --dataloader-type single
     --manual-gc
     --manual-gc-interval 50
@@ -106,16 +125,19 @@ MEGATRON_ARGS=(
     --clip-grad 1.0
     --adam-beta1 0.9
     --adam-beta2 0.95
-    # NorMuon recipe
+    # Aurora recipe (applies to 2D matrices; 3D expert weights fall through to AdamW)
     --muon-scale-mode spectral
     --muon-nesterov
     --muon-momentum 0.95
     --muon-scalar-lr 1.5e-3
     --muon-scalar-weight-decay 0.0
-    --adaptive-muon-moment2-method normuon
-    # WSD schedule, 200-step warmup, last 20% decay
-    --lr 2e-4
-    --min-lr 2e-5
+    --polar-precision bf16
+    --aurora-pp-iterations 2
+    --aurora-pp-beta 0.5
+    --aurora-num-ns-steps 12
+    # WSD schedule, 200-step warmup, last 20% decay (same as aurora-qkn)
+    --lr 1e-2
+    --min-lr 1e-3
     --lr-decay-style WSD
     --lr-warmup-samples 25600
     --lr-wsd-decay-style minus_sqrt
@@ -124,10 +146,13 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    # Distributed: TP=1, PP=1, DP=4. --overlap-param-gather intentionally
-    # omitted (corrupts Muon Newton-Schulz, see main README).
+    # Distributed: TP=1, PP=1, EP=1, DP=4. EP=1 still fits (32 experts
+    # * 31.5M = 1GB/layer, 24L = ~24GB on a 96GB GH200; activations + grads
+    # + optimizer state add ~30-40GB more, comfortably under 96). --overlap-param-gather
+    # omitted (corrupts Newton-Schulz; same caveat as Muon).
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
+    --expert-model-parallel-size 1
     --context-parallel-size 1
     --sequence-parallel
     --use-distributed-optimizer

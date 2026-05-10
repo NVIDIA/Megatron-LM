@@ -1,17 +1,23 @@
 #!/bin/bash
 #
-# 350M ablation leaderboard — rank 2
-# Optimizer: NorMuon (adaptive_muon + normuon moment2), matrix LR 2e-4,
-#            scalar LR 1.5e-3, scalar WD 0, spectral scale, Nesterov, mom 0.95.
-# Final loss: 2.227   Min loss: 2.063
-# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919
-# Executed at git sha: 885cdbb0d
+# 350M ablation leaderboard - Aurora + QK-norm + Derf at block sites.
+# Optimizer: Aurora @ 1e-2 (same as 09-aurora-qkn).
+# Norm:      Derf (Chen et al. 2025) at input_layernorm / pre_mlp_layernorm /
+#            final_layernorm. RMSNorm at the per-head QK sites
+#            (APERTUS_DERF_QK_RMSNORM=1) — Derf at QK was tested separately
+#            and lost ~0.06 nats vs RMSNorm at QK.
+# Final loss: 2.217   Min loss: 2.057   (vs leader 2.185 / 2.025)
+# W&B: https://wandb.ai/ischlag/lm-research-baseline-dev/runs/94h3m6bs
+# Executed at git sha: dffead810
+#
+# Reference: https://arxiv.org/abs/2512.10938 (Stronger Normalization-Free
+# Transformers — Derf = gamma * erf(alpha*x + s) + beta).
 #
 # To reproduce bitwise:
-#   git checkout 885cdbb0d
-#   sbatch _research/leaderboards/350m-ablation/runs/02-normuon-lr2e-4.sbatch
+#   git checkout dffead810
+#   sbatch _research/leaderboards/350m-ablation/runs/10-aurora-qkn-derf-rmsqk.sbatch
 #
-#SBATCH --job-name=350m-abl-normuon-lr2e-4
+#SBATCH --job-name=350m-abl-aurora-qkn-derf-rmsqk
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -27,8 +33,10 @@ set -euo pipefail
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
-REPO_DIR=/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline
-WORKDIR=${SLURM_SUBMIT_DIR:-$REPO_DIR}
+# REPO_DIR follows WORKDIR so a cluster-side sidecar clone (one per local
+# worktree) keeps caches, packages, TB, and wandb out of the canonical path.
+WORKDIR=${SLURM_SUBMIT_DIR:-/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline}
+REPO_DIR=$WORKDIR
 cd $WORKDIR
 
 PACKAGE_DIR=$REPO_DIR/_research/packages
@@ -51,10 +59,10 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-normuon-lr2e-4-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-derf-rmsqk-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp
+export APERTUS_FEATURE=transformer-pp-aurora
 export APERTUS_TRACK=350m-ablation-leaderboard
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=1
@@ -64,6 +72,8 @@ export APERTUS_LOG_NEURON_STATS=1
 export APERTUS_LOG_NEURON_INTERVAL=50
 export APERTUS_LOG_PER_LAYER_GRADS=1
 export APERTUS_LOG_LOSS_SPIKES=1
+export APERTUS_DERF_OPTIM=compile
+export APERTUS_DERF_QK_RMSNORM=1  # keep RMSNorm at QK; Derf only at block sites
 
 MEGATRON_ARGS=(
     # Architecture: 350M Transformer++ (24L, 1024H, 2560F, 16h, 4kv GQA)
@@ -79,8 +89,9 @@ MEGATRON_ARGS=(
     --position-embedding-type rope
     --rotary-base 500000
     --make-vocab-size-divisible-by 128
-    --normalization RMSNorm
+    --normalization Derf
     --swiglu
+    --qk-layernorm
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length 4096
@@ -92,7 +103,7 @@ MEGATRON_ARGS=(
     --log-interval 1
     --eval-interval 244141
     --eval-iters 0
-    --optimizer adaptive_muon
+    --optimizer aurora
     --dataloader-type single
     --manual-gc
     --manual-gc-interval 50
@@ -106,16 +117,19 @@ MEGATRON_ARGS=(
     --clip-grad 1.0
     --adam-beta1 0.9
     --adam-beta2 0.95
-    # NorMuon recipe
+    # Aurora recipe
     --muon-scale-mode spectral
     --muon-nesterov
     --muon-momentum 0.95
     --muon-scalar-lr 1.5e-3
     --muon-scalar-weight-decay 0.0
-    --adaptive-muon-moment2-method normuon
+    --polar-precision bf16
+    --aurora-pp-iterations 2
+    --aurora-pp-beta 0.5
+    --aurora-num-ns-steps 12
     # WSD schedule, 200-step warmup, last 20% decay
-    --lr 2e-4
-    --min-lr 2e-5
+    --lr 1e-2
+    --min-lr 1e-3
     --lr-decay-style WSD
     --lr-warmup-samples 25600
     --lr-wsd-decay-style minus_sqrt
@@ -124,8 +138,8 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    # Distributed: TP=1, PP=1, DP=4. --overlap-param-gather intentionally
-    # omitted (corrupts Muon Newton-Schulz, see main README).
+    # Distributed: TP=1, PP=1, DP=4. --overlap-param-gather omitted (corrupts
+    # Newton-Schulz; same caveat as Muon).
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
@@ -166,11 +180,14 @@ ENV_SETUP="export MASTER_ADDR=$MASTER_ADDR; \
     export LOCAL_RANK=\$SLURM_LOCALID; \
     export LOCAL_WORLD_SIZE=$((SLURM_NTASKS/SLURM_NNODES)); \
     export PYTHONPATH=$WORKDIR:$PACKAGE_DIR:$WORKDIR\${PYTHONPATH:+:\$PYTHONPATH}; \
+    export APERTUS_DERF_OPTIM=$APERTUS_DERF_OPTIM; \
+    export APERTUS_DERF_QK_RMSNORM=$APERTUS_DERF_QK_RMSNORM; \
     cd $WORKDIR"
 
 TRAINING_CMD="bash $WORKDIR/_research/launch/install_python_deps.sh $PACKAGE_DIR && python3 $WORKDIR/pretrain_gpt.py $MEGATRON_ARGS_STR"
 
 echo "CMD: $TRAINING_CMD"
+
 export APERTUS_PHASE_PRE_SRUN=$(date +%s.%N)
 srun -lu --mpi=pmix --network=disable_rdzv_get --environment=$WORKDIR/_research/launch/alps3.toml \
     --cpus-per-task $SLURM_CPUS_PER_TASK --wait 120 \

@@ -47,6 +47,13 @@ min loss at time of entry. Bitwise reproduction:
 git checkout <sha> && sbatch _research/leaderboards/<size>/runs/NN-*.sbatch
 ```
 
+The leaderboard table has three lineage columns — `entry` (stable slug =
+sbatch filename without the `NN-` prefix), `parent` (slug of the entry
+this row builds on, empty for roots), and `change` (one-line delta vs
+parent). Fill all three when promoting a run; rank reorders over time
+but slug + parent + change stay durable. Full guidance:
+[`_research/leaderboards/README.md`](_research/leaderboards/README.md).
+
 ## Good practices
 
 - **Flag-gate everything new**, default off. Add the CLI flag in

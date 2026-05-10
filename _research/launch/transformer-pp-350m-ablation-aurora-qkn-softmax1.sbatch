@@ -1,20 +1,20 @@
 #!/bin/bash
 #
-# 350M ablation leaderboard — rank 2
-# Optimizer: NorMuon (adaptive_muon + normuon moment2), matrix LR 2e-4,
-#            scalar LR 1.5e-3, scalar WD 0, spectral scale, Nesterov, mom 0.95.
-# Final loss: 2.227   Min loss: 2.063
-# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919
-# Executed at git sha: 885cdbb0d
+# 350M ablation: aurora-qkn (current rank-1 leader) + softmax1 (off-by-one).
+# Tests the additive effect of softmax1 attention sinks on top of the leader.
 #
-# To reproduce bitwise:
-#   git checkout 885cdbb0d
-#   sbatch _research/leaderboards/350m-ablation/runs/02-normuon-lr2e-4.sbatch
+# Parent: 09-aurora-qkn.sbatch
+# Change: --softmax-type off-by-one (Evan Miller's "Attention Is Off By One":
+#         softmax denominator includes an implicit zero-key sink, so the model
+#         can route attention nowhere when no key matches. Zero parameters.
+#         Mostly aimed at logit-blow-up / FP8 / quantization stability; QK-norm
+#         already addresses overlapping pathology so the marginal effect on
+#         loss may be small. Apertus 125M: min 2.371 (mid-pack, behind qkn-gain).
 #
-#SBATCH --job-name=350m-abl-normuon-lr2e-4
+#SBATCH --job-name=350m-abl-aurora-qkn-softmax1
 #SBATCH --time=01:00:00
-#SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
-#SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
+#SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline-attn-variants/_research/results/runs/%x-%j.log
+#SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline-attn-variants/_research/results/runs/%x-%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
@@ -27,8 +27,8 @@ set -euo pipefail
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
-REPO_DIR=/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline
-WORKDIR=${SLURM_SUBMIT_DIR:-$REPO_DIR}
+WORKDIR=${SLURM_SUBMIT_DIR:-/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline-attn-variants}
+REPO_DIR=$WORKDIR
 cd $WORKDIR
 
 PACKAGE_DIR=$REPO_DIR/_research/packages
@@ -51,10 +51,10 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-normuon-lr2e-4-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-softmax1-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp
+export APERTUS_FEATURE=transformer-pp-aurora
 export APERTUS_TRACK=350m-ablation-leaderboard
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=1
@@ -81,6 +81,8 @@ MEGATRON_ARGS=(
     --make-vocab-size-divisible-by 128
     --normalization RMSNorm
     --swiglu
+    --qk-layernorm
+    --softmax-type off-by-one
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length 4096
@@ -92,7 +94,7 @@ MEGATRON_ARGS=(
     --log-interval 1
     --eval-interval 244141
     --eval-iters 0
-    --optimizer adaptive_muon
+    --optimizer aurora
     --dataloader-type single
     --manual-gc
     --manual-gc-interval 50
@@ -106,16 +108,19 @@ MEGATRON_ARGS=(
     --clip-grad 1.0
     --adam-beta1 0.9
     --adam-beta2 0.95
-    # NorMuon recipe
+    # Aurora recipe
     --muon-scale-mode spectral
     --muon-nesterov
     --muon-momentum 0.95
     --muon-scalar-lr 1.5e-3
     --muon-scalar-weight-decay 0.0
-    --adaptive-muon-moment2-method normuon
+    --polar-precision bf16
+    --aurora-pp-iterations 2
+    --aurora-pp-beta 0.5
+    --aurora-num-ns-steps 12
     # WSD schedule, 200-step warmup, last 20% decay
-    --lr 2e-4
-    --min-lr 2e-5
+    --lr 1e-2
+    --min-lr 1e-3
     --lr-decay-style WSD
     --lr-warmup-samples 25600
     --lr-wsd-decay-style minus_sqrt
@@ -124,8 +129,6 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    # Distributed: TP=1, PP=1, DP=4. --overlap-param-gather intentionally
-    # omitted (corrupts Muon Newton-Schulz, see main README).
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
     --context-parallel-size 1

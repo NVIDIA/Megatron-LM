@@ -627,6 +627,20 @@ class TENorm:
         eps: float = 1e-5,
         has_residual: bool = False,
     ):
+        # DyT / Derf: element-wise norm replacements. They are not TE kernels; we route
+        # them through this dispatch so that `input_layernorm`, `pre_mlp_layernorm`, and
+        # `final_layernorm` (all built via TENorm in the TE spec) all pick up the swap.
+        if config.normalization in ("DyT", "Derf"):
+            from megatron.core.transformer.dynamic_norms import Derf, DyT
+
+            cls_map = {"DyT": DyT, "Derf": Derf}
+            return cast(
+                LayerNormInterface,
+                cls_map[config.normalization](
+                    config=config, hidden_size=hidden_size, eps=eps
+                ),
+            )
+
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "

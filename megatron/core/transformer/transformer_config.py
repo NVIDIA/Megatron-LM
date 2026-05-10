@@ -133,8 +133,8 @@ class TransformerConfig(ModelParallelConfig):
     """Softmax scale for attention scaling."""
 
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
-    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html.
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and
        and learnable offset."""
 
     num_query_groups: Optional[int] = field(
@@ -218,8 +218,11 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.
     - A list that defines a custom pattern, e.g.: [1,1,1,1,0,0,0,0], where 1 represents SWA. """
 
-    normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
-    """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
+    normalization: Literal['LayerNorm', 'RMSNorm', 'DyT', 'Derf'] = "LayerNorm"
+    """Which norm to use for normalization layers. `LayerNorm` / `RMSNorm` are the standard
+    reduction-based norms; `DyT` (Dynamic Tanh, Zhu et al. 2025) and `Derf` (Dynamic erf,
+    Chen et al. 2025) are element-wise drop-in replacements (no reduction). DyT/Derf force
+    the TE attention QKV and dense MLP fc1 to unfuse from their layer-norm-linear path."""
 
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
@@ -242,6 +245,13 @@ class TransformerConfig(ModelParallelConfig):
 
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
+
+    exclusive_self_attention: bool = False
+    """If True, apply Exclusive Self-Attention (XSA, arXiv 2603.09078): after the core
+    attention op, subtract the component of each head's output along its own value
+    direction: out = out - (out . v_hat) * v_hat, where v_hat is L2-normalized along the
+    head dim. Zero parameters. Compatible with GQA (KV values are broadcast across the
+    query heads of each group before projection onto v_hat). Packed sequences not supported."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""

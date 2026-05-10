@@ -1,20 +1,19 @@
 #!/bin/bash
 #
-# 350M ablation leaderboard — rank 2
-# Optimizer: NorMuon (adaptive_muon + normuon moment2), matrix LR 2e-4,
-#            scalar LR 1.5e-3, scalar WD 0, spectral scale, Nesterov, mom 0.95.
-# Final loss: 2.227   Min loss: 2.063
-# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919
-# Executed at git sha: 885cdbb0d
+# 350M ablation: aurora-qkn (current rank-1 leader) + Exclusive Self-Attention.
+# Tests the additive effect of XSA on top of the leader.
 #
-# To reproduce bitwise:
-#   git checkout 885cdbb0d
-#   sbatch _research/leaderboards/350m-ablation/runs/02-normuon-lr2e-4.sbatch
+# Parent: 09-aurora-qkn.sbatch
+# Change: --exclusive-self-attention (XSA, arXiv 2603.09078). Subtracts each
+#         head's output component along its L2-normalized value direction.
+#         Zero parameters. GQA-compatible (V is broadcast across query heads).
+#         Apertus 125M sweep: XSA standalone won by ~0.015 nats min loss but
+#         cost ~13% throughput. Stack-on-leader effect is unknown.
 #
-#SBATCH --job-name=350m-abl-normuon-lr2e-4
+#SBATCH --job-name=350m-abl-aurora-qkn-xsa
 #SBATCH --time=01:00:00
-#SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
-#SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
+#SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline-attn-variants/_research/results/runs/%x-%j.log
+#SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline-attn-variants/_research/results/runs/%x-%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
@@ -27,8 +26,10 @@ set -euo pipefail
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
-REPO_DIR=/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline
-WORKDIR=${SLURM_SUBMIT_DIR:-$REPO_DIR}
+# REPO_DIR follows WORKDIR so a cluster-side sidecar clone (one per local
+# worktree) keeps caches, packages, TB, and wandb out of the canonical path.
+WORKDIR=${SLURM_SUBMIT_DIR:-/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline-attn-variants}
+REPO_DIR=$WORKDIR
 cd $WORKDIR
 
 PACKAGE_DIR=$REPO_DIR/_research/packages
@@ -39,6 +40,10 @@ export PYTHONPATH=$WORKDIR:$PACKAGE_DIR:$WORKDIR${PYTHONPATH:+:$PYTHONPATH}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_CPP_LOG_LEVEL=WARNING
+# XSA materializes [sq, b, np, hn] (4x V via repeat_interleave) per layer,
+# adding ~1 GB activation memory * 24 layers. expandable_segments avoids the
+# allocator fragmentation cliff that OOMs the cross-entropy logits buffer.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TRITON_CACHE_DIR=$REPO_DIR/cache/triton
 export TORCHINDUCTOR_CACHE_DIR=$REPO_DIR/cache/inductor
 export TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0
@@ -51,10 +56,10 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-normuon-lr2e-4-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-xsa-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp
+export APERTUS_FEATURE=transformer-pp-aurora
 export APERTUS_TRACK=350m-ablation-leaderboard
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=1
@@ -81,6 +86,8 @@ MEGATRON_ARGS=(
     --make-vocab-size-divisible-by 128
     --normalization RMSNorm
     --swiglu
+    --qk-layernorm
+    --exclusive-self-attention
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length 4096
@@ -92,7 +99,7 @@ MEGATRON_ARGS=(
     --log-interval 1
     --eval-interval 244141
     --eval-iters 0
-    --optimizer adaptive_muon
+    --optimizer aurora
     --dataloader-type single
     --manual-gc
     --manual-gc-interval 50
@@ -106,16 +113,19 @@ MEGATRON_ARGS=(
     --clip-grad 1.0
     --adam-beta1 0.9
     --adam-beta2 0.95
-    # NorMuon recipe
+    # Aurora recipe
     --muon-scale-mode spectral
     --muon-nesterov
     --muon-momentum 0.95
     --muon-scalar-lr 1.5e-3
     --muon-scalar-weight-decay 0.0
-    --adaptive-muon-moment2-method normuon
+    --polar-precision bf16
+    --aurora-pp-iterations 2
+    --aurora-pp-beta 0.5
+    --aurora-num-ns-steps 12
     # WSD schedule, 200-step warmup, last 20% decay
-    --lr 2e-4
-    --min-lr 2e-5
+    --lr 1e-2
+    --min-lr 1e-3
     --lr-decay-style WSD
     --lr-warmup-samples 25600
     --lr-wsd-decay-style minus_sqrt
@@ -124,8 +134,8 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    # Distributed: TP=1, PP=1, DP=4. --overlap-param-gather intentionally
-    # omitted (corrupts Muon Newton-Schulz, see main README).
+    # Distributed: TP=1, PP=1, DP=4. --overlap-param-gather omitted (corrupts
+    # Newton-Schulz; same caveat as Muon).
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
     --context-parallel-size 1

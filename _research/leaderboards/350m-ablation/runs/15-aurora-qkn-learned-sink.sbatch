@@ -1,17 +1,23 @@
 #!/bin/bash
 #
-# 350M ablation leaderboard — rank 2
-# Optimizer: NorMuon (adaptive_muon + normuon moment2), matrix LR 2e-4,
-#            scalar LR 1.5e-3, scalar WD 0, spectral scale, Nesterov, mom 0.95.
-# Final loss: 2.227   Min loss: 2.063
-# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919
-# Executed at git sha: 885cdbb0d
+# 350M ablation: Aurora + QK-norm + gpt-oss style learned per-head sink bias.
+# Tests whether an explicit per-head learnable scalar in the softmax denominator
+# helps on top of QK-norm. It hurts: -0.015 nats min vs leader. QK-norm appears
+# to already address the same pathology this would target.
+# Architecture diff vs 09-aurora-qkn: adds --softmax-type learnable (built-in
+#            upstream Megatron / TE 2.8+; no code change in this repo).
+# Final loss: 2.201   Min loss: 2.040   (vs leader 09-aurora-qkn: 2.185 / 2.025)
+# Throughput: ~227.6 TFLOP/s/GPU (no measurable change vs leader).
+# W&B: https://wandb.ai/ischlag/lm-research-baseline-dev/runs/9n4abgdu
+# Executed at git sha: 435b3cf2d
+#
+# Reference: gpt-oss attention sink bias (OpenAI, Aug 2025).
 #
 # To reproduce bitwise:
-#   git checkout 885cdbb0d
-#   sbatch _research/leaderboards/350m-ablation/runs/02-normuon-lr2e-4.sbatch
+#   git checkout 435b3cf2d
+#   sbatch _research/leaderboards/350m-ablation/runs/15-aurora-qkn-learned-sink.sbatch
 #
-#SBATCH --job-name=350m-abl-normuon-lr2e-4
+#SBATCH --job-name=350m-abl-aurora-qkn-learned-sink
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -27,8 +33,8 @@ set -euo pipefail
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
-REPO_DIR=/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline
-WORKDIR=${SLURM_SUBMIT_DIR:-$REPO_DIR}
+WORKDIR=${SLURM_SUBMIT_DIR:-/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline}
+REPO_DIR=$WORKDIR
 cd $WORKDIR
 
 PACKAGE_DIR=$REPO_DIR/_research/packages
@@ -51,10 +57,10 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-normuon-lr2e-4-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-learned-sink-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp
+export APERTUS_FEATURE=transformer-pp-aurora
 export APERTUS_TRACK=350m-ablation-leaderboard
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=1
@@ -81,6 +87,8 @@ MEGATRON_ARGS=(
     --make-vocab-size-divisible-by 128
     --normalization RMSNorm
     --swiglu
+    --qk-layernorm
+    --softmax-type learnable
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length 4096
@@ -92,7 +100,7 @@ MEGATRON_ARGS=(
     --log-interval 1
     --eval-interval 244141
     --eval-iters 0
-    --optimizer adaptive_muon
+    --optimizer aurora
     --dataloader-type single
     --manual-gc
     --manual-gc-interval 50
@@ -106,16 +114,19 @@ MEGATRON_ARGS=(
     --clip-grad 1.0
     --adam-beta1 0.9
     --adam-beta2 0.95
-    # NorMuon recipe
+    # Aurora recipe
     --muon-scale-mode spectral
     --muon-nesterov
     --muon-momentum 0.95
     --muon-scalar-lr 1.5e-3
     --muon-scalar-weight-decay 0.0
-    --adaptive-muon-moment2-method normuon
+    --polar-precision bf16
+    --aurora-pp-iterations 2
+    --aurora-pp-beta 0.5
+    --aurora-num-ns-steps 12
     # WSD schedule, 200-step warmup, last 20% decay
-    --lr 2e-4
-    --min-lr 2e-5
+    --lr 1e-2
+    --min-lr 1e-3
     --lr-decay-style WSD
     --lr-warmup-samples 25600
     --lr-wsd-decay-style minus_sqrt
@@ -124,8 +135,6 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    # Distributed: TP=1, PP=1, DP=4. --overlap-param-gather intentionally
-    # omitted (corrupts Muon Newton-Schulz, see main README).
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
     --context-parallel-size 1

@@ -111,6 +111,10 @@ def _get_transformer_layer_spec(use_te, config):
         transformer_layer_spec: The transformer layer specification
     """
     if use_te:
+        # APERTUS_DERF_OPTIM=compile|triton|te_patch swaps the unfused DyT/Derf
+        # path for the matching fused implementation under _research/derf_optim/.
+        import os
+        derf_optim = os.environ.get("APERTUS_DERF_OPTIM") if config.normalization in ("DyT", "Derf") else None
         return get_gpt_layer_with_transformer_engine_spec(
             config.num_moe_experts,
             config.moe_grouped_gemm,
@@ -123,6 +127,9 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            unfuse_norm=config.normalization in ("DyT", "Derf") and derf_optim is None,
+            derf_optim=derf_optim,
+            derf_norm_kind=config.normalization if derf_optim else None,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
