@@ -52,6 +52,20 @@ class BufferIndex:
         chunk_size_factor: int,
         sharding_strategy: str,
     ) -> Tuple[Dict[int, "BufferIndex.ItemIndex"], "BufferIndex.BucketMeta"]:
+        """
+        Compute global buffer layout for a list of parameter shapes.
+
+        Regular parameters (numel >= chunk_size_factor) are placed first.
+        When a regular parameter has a remainder modulo chunk_size_factor,
+        its trailing grid is shared with either another regular parameter
+        or filled with "fragment" parameters.  Leftover fragments are
+        bin-packed into chunk_size_factor-sized grids so that every grid
+        is aligned and can be split evenly across DP ranks.
+
+        Returns:
+            item_index_map:  Maps item_id -> ItemIndex (global position).
+            bucket_meta:     Describes the full padded buffer.
+        """
 
         def _pad(n: int, divisor: int) -> int:
             return int(math.ceil(n / divisor) * divisor)
@@ -66,19 +80,22 @@ class BufferIndex:
                 global_data_index=offset, size=shape.numel(), item_id=item_id, shape=shape
             )
 
-        fragment_items = []
-        regular_items = []
+        # Separate regular and fragment parameters.
+        regular_items: List[Tuple[int, torch.Size]] = []
+        fragment_items: List[Tuple[int, torch.Size]] = []
         for item_id, shape in enumerate(param_shapes):
             if shape.numel() < chunk_size_factor:
                 fragment_items.append((item_id, shape))
             else:
                 regular_items.append((item_id, shape))
 
-        fragment_items = sorted(fragment_items, key=lambda x: -x[1].numel())
+        # Sort fragments largest-first for best gap-filling.
+        fragment_items.sort(key=lambda x: -x[1].numel())
 
         item_index_map: Dict[int, cls.ItemIndex] = {}
         data_index = 0
 
+        # ---- First pass: place regular parameters, fill gaps with fragments ----
         while len(regular_items) > 0:
             item_id, shape = regular_items.pop(0)
             add_item(item_id, shape, data_index, item_index_map)
@@ -92,22 +109,30 @@ class BufferIndex:
             remain = shape.numel() % chunk_size_factor
             space = chunk_size_factor - remain
 
-            found_rhs = False
+            # Try to pair another regular param whose remainder fits.
+            rhs_found_id = None
+            rhs_found_shape = None
             for id_rhs in regular_items[:]:
                 rhs_id, rhs = id_rhs
                 if rhs.numel() % chunk_size_factor == 0:
                     continue
                 rhs_remain = rhs.numel() % chunk_size_factor
                 if remain + rhs_remain <= chunk_size_factor:
-                    found_rhs = True
+                    rhs_found_id, rhs_found_shape = rhs_id, rhs
                     regular_items.remove(id_rhs)
                     break
 
-            if found_rhs:
-                add_item(rhs_id, rhs, data_index - rhs_remain, item_index_map)
+            if rhs_found_id is not None:
+                rhs_remain = rhs_found_shape.numel() % chunk_size_factor
+                # Place the paired param so its LAST ``rhs_remain`` elements
+                # land in the same alignment grid as the current param's remainder.
+                # The bulk of the param extends backward from the grid boundary.
+                add_item(rhs_found_id, rhs_found_shape, data_index - rhs_remain, item_index_map)
                 space -= rhs_remain
-                data_index += rhs.numel() // chunk_size_factor * chunk_size_factor
+                # Advance past the aligned portion of the paired param.
+                data_index += (rhs_found_shape.numel() // chunk_size_factor) * chunk_size_factor
 
+            # Fill remaining space in this grid with fragments.
             for id_frag in fragment_items[:]:
                 frag_id, frag = id_frag
                 if frag.numel() > space:
@@ -117,9 +142,40 @@ class BufferIndex:
                 gap_offset += frag.numel()
                 fragment_items.remove(id_frag)
 
-        for frag_id, frag in fragment_items:
-            add_item(frag_id, frag, data_index, item_index_map)
-            data_index += frag.numel()
+        # ---- helper: bin-pack leftover fragments into chunk_size_factor grids ----
+        def pack_fragments(
+            fragments: List[Tuple[int, torch.Size]], capacity: int
+        ) -> List[List[Tuple[int, torch.Size]]]:
+            """
+            Bin-pack fragments into fixed-capacity slots (grids).
+
+            Each slot has size *capacity* (== chunk_size_factor). Returns a
+            list of slots, each containing one or more (param_id, shape) pairs.
+            """
+            sorted_frags = sorted(fragments, key=lambda p: -p[1].numel())
+            slots: List[List[Tuple[int, torch.Size]]] = []
+            for pid, pshape in sorted_frags:
+                psize = pshape.numel()
+                placed = False
+                for slot in slots:
+                    used = sum(p[1].numel() for p in slot)
+                    if used + psize <= capacity:
+                        slot.append((pid, pshape))
+                        placed = True
+                        break
+                if not placed:
+                    slots.append([(pid, pshape)])
+            return slots
+
+        # ---- Second pass: bin-pack any remaining fragments into aligned grids ----
+        if fragment_items:
+            fragment_slots = pack_fragments(fragment_items, chunk_size_factor)
+            for slot in fragment_slots:
+                offset_within_grid = 0
+                for pid, pshape in slot:
+                    add_item(pid, pshape, data_index + offset_within_grid, item_index_map)
+                    offset_within_grid += pshape.numel()
+                data_index += chunk_size_factor
 
         bucket_meta = cls.BucketMeta(
             global_data_index=0,
@@ -270,6 +326,103 @@ class DataParallelBuffer:
         assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
 
+    def check_no_local_overlap(self, label: str = "") -> bool:
+        """
+        Runtime check: verify no two items' local slices overlap within ``self.data``.
+
+        Returns True if layout is valid (no overlaps, all slices in bounds).
+        Returns False and prints diagnostic info if any overlap or bound violation is found.
+        """
+        if self.data is None:
+            return True
+
+        items = self.buffer_index.item_index_map
+        n_items = len(items)
+        if n_items == 0:
+            return True
+
+        label_prefix = f"[{label}] " if label else ""
+
+        # Collect (local_start, local_end, item_id, global_start, size) for each item
+        slices = []
+        for item_id in range(n_items):
+            local_start, local_end = self.buffer_index._get_item_local_index(item_id)
+            idx = self.buffer_index.item_index_map[item_id]
+            slices.append((local_start, local_end, item_id, idx.global_data_index, idx.size))
+
+        # Sort by local_start
+        slices.sort(key=lambda x: x[0])
+
+        valid = True
+        data_nel = self.data.numel()
+
+        for i in range(len(slices)):
+            s_start, s_end, s_id, g_start, size = slices[i]
+            shape = items[s_id].shape
+
+            # Bounds check: end must not exceed data size
+            if s_end > data_nel:
+                print(
+                    f"{label_prefix}❌ OVERFLOW: item {s_id} shape={list(shape)} "
+                    f"local=[{s_start}, {s_end}) but data.numel()={data_nel} "
+                    f"(global=[{g_start}, {g_start + size}))"
+                )
+                valid = False
+
+            # Overlap check with next item
+            if i + 1 < len(slices):
+                n_start, n_end, n_id, n_gstart, n_size = slices[i + 1]
+                if s_end > n_start:
+                    overlap = s_end - n_start
+                    print(
+                        f"{label_prefix}❌ OVERLAP: item {s_id} shape={list(shape)} "
+                        f"local=[{s_start}, {s_end}) overlaps item {n_id} "
+                        f"local=[{n_start}, {n_end}) by {overlap} elements "
+                        f"(global_{s_id}=[{g_start}, {g_start + size}), "
+                        f"global_{n_id}=[{n_gstart}, {n_gstart + n_size}))"
+                    )
+                    valid = False
+
+        return valid
+
+    def check_no_global_overlap(self, label: str = "") -> bool:
+        """
+        Runtime check: verify no two items' **global** slices overlap.
+
+        This checks the logical layout (should never fail if _build_layout is correct).
+        """
+        items = self.buffer_index.item_index_map
+        n_items = len(items)
+        if n_items == 0:
+            return True
+
+        label_prefix = f"[{label}] " if label else ""
+
+        ranges = []
+        for item_id in range(n_items):
+            idx = items[item_id]
+            ranges.append(
+                (idx.global_data_index, idx.global_data_index + idx.size, item_id, idx.shape)
+            )
+
+        ranges.sort(key=lambda x: x[0])
+
+        valid = True
+        for i in range(len(ranges) - 1):
+            a_start, a_end, a_id, a_shape = ranges[i]
+            b_start, b_end, b_id, b_shape = ranges[i + 1]
+            if a_end > b_start:
+                print(
+                    f"{label_prefix}❌ GLOBAL OVERLAP: item {a_id} shape={list(a_shape)} "
+                    f"[{a_start}, {a_end}) vs item {b_id} shape={list(b_shape)} "
+                    f"[{b_start}, {b_end}) overlap={a_end - b_start}"
+                )
+                valid = False
+
+        if valid:
+            pass  # silent on success
+        return valid
+
     def set_item(self, item_id: int, item_data: torch.Tensor) -> None:
         """Write a parameter tensor into the corresponding region of the buffer."""
         if self.is_distributed:
@@ -360,19 +513,68 @@ class DataParallelBuffer:
         rank's shard, then accumulate into self.data.
         For non-distributed buffers: all-reduce in-place.
         """
+        if self.gradient_scaling_factor in (None, 1.0):
+            op = torch.distributed.ReduceOp.SUM
+        elif self.dtype != torch.bfloat16:
+            op = torch.distributed._make_nccl_premul_sum(self.gradient_scaling_factor)
+        else:
+            full_grad.mul_(self.gradient_scaling_factor)
+            op = torch.distributed.ReduceOp.SUM
+
         if not self.is_distributed:
-            torch.distributed.all_reduce(self.data, group=self.dp_group)
+            if self.gradient_scaling_factor not in (None, 1.0):
+                full_grad.mul_(self.gradient_scaling_factor)
+            torch.distributed.all_reduce(self.data, group=self.dp_group, op=op)
             return
 
         full_grad = self.fetch_unsharded_buffer()
+        if self.gradient_scaling_factor not in (None, 1.0):
+            full_grad.mul_(self.gradient_scaling_factor)  # pre-scale, then SUM-reduce
 
         sm = self.buffer_index.shard_meta
-        grad_shard = full_grad[sm.bucket_data_index : sm.bucket_data_index + sm.size]
+        local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
+        reduced_grad_shard = torch.empty_like(local_grad_shard)
 
         torch.distributed.reduce_scatter_tensor(
-            output=grad_shard, input=full_grad, group=self.dp_group
+            output=reduced_grad_shard, input=full_grad, group=self.dp_group, op=op
         )
 
-        # Accumulate the reduced shard into the persistent local shard buffer. This is needed
-        # to support gradient accumulation across multiple backward passes.
-        self.data[sm.local_data_index : sm.local_data_index + sm.size] += grad_shard
+        # Accumulate the reduced shard into the persistent local shard buffer. The
+        # reduce-scatter output must not alias the full input buffer, otherwise the
+        # collective can clobber its own input and silently corrupt gradients.
+        local_grad_shard += reduced_grad_shard
+
+
+def check_all_fsdp_buffers(module) -> bool:
+    """
+    Scan every FSDPModule in *module* and verify no local slice overlaps
+    in any buffer (model_weight, main_weight, main_grad).
+
+    Call this at any point after FSDP initialization to catch runtime
+    corruption.  Returns True if all buffers are clean.
+    """
+    import torch.distributed as dist
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.fully_shard import (
+        FSDPModule,
+    )
+
+    rank = dist.get_rank() if dist.is_initialized() else -1
+    all_ok = True
+
+    for name, child in module.named_modules():
+        if not isinstance(child, FSDPModule):
+            continue
+        for param_names, param_group in child._named_param_groups:
+            gid = f"mod={name} pg={param_group.param_group_id} rank={rank}"
+            if param_group.model_weight_buffer is not None:
+                ok = param_group.model_weight_buffer.check_no_local_overlap(gid + " wbuf")
+                all_ok = all_ok and ok
+            if param_group.main_weight_buffer is not None:
+                ok = param_group.main_weight_buffer.check_no_local_overlap(gid + " mbuf")
+                all_ok = all_ok and ok
+            if param_group.main_grad_buffer is not None:
+                ok = param_group.main_grad_buffer.check_no_local_overlap(gid + " gbuf")
+                all_ok = all_ok and ok
+
+    return all_ok

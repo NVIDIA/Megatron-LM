@@ -233,9 +233,14 @@ class ParameterGroup:
         # Create gradient DTensor views
         is_grad_shard = is_param_shard
         for p in self.params:
-            if p.requires_grad:
-                gbuf = self.main_grad_buffer
-                grad_data = gbuf.get_item(self.param_idx[p], only_shard=is_grad_shard)
+            gbuf = self.main_grad_buffer
+            grad_data = gbuf.get_item(self.param_idx[p], only_shard=is_grad_shard)
+            # NOTE: Do not remove the grad_data.numel() > 0 check.
+            # Empty local grad shards are semantically no-ops, but materializing
+            # them as DTensor grads can pass zero-numel tensors into fused
+            # multi-tensor optimizers such as TE FusedAdam. That can break
+            # updates for neighboring non-empty shards.
+            if p.requires_grad and grad_data.numel() > 0:
                 self.dist_grads.append(
                     make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
                 )

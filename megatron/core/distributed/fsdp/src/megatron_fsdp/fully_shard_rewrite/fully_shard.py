@@ -48,6 +48,7 @@ def fully_shard(
     # --- Megatron-FSDP specific options ---
     enable_unshard_prefetch: bool = True,
     enable_async_reduce_grad: bool = True,
+    gradient_scaling_factor: Optional[float] = None,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -87,7 +88,9 @@ def fully_shard(
     module.__class__ = new_cls
 
     # Initialize FSDP state and parameter groups
-    module._init_named_param_groups(mesh, ignored_params, mp_policy=mp_policy)
+    module._init_named_param_groups(
+        mesh, ignored_params, mp_policy=mp_policy, gradient_scaling_factor=gradient_scaling_factor
+    )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
         enable_async_reduce_grad=enable_async_reduce_grad,
@@ -122,6 +125,7 @@ class FSDPModule(nn.Module):
         mesh: Optional[DeviceMesh],
         ignored_params: Optional[set],
         mp_policy: Optional["MixedPrecisionPolicy"] = None,
+        gradient_scaling_factor: Optional[float] = None,
     ):
         """
         Initialize parameter groups and build param name mapping.
@@ -143,11 +147,15 @@ class FSDPModule(nn.Module):
                     ignored_modules.add(child_submodule)
 
         # Materialize meta parameters to actual device
-        self._materialize_meta_module(ignored_modules)
+        self._materialize_meta_module(ignored_modules, mesh=mesh)
 
         # Create parameter groups
         fsdp_param_groups = _get_module_fsdp_param_groups(
-            self, mesh, ignored_params=ignored_params, mp_policy=mp_policy
+            self,
+            mesh,
+            ignored_params=ignored_params,
+            mp_policy=mp_policy,
+            gradient_scaling_factor=gradient_scaling_factor,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
 
@@ -193,27 +201,60 @@ class FSDPModule(nn.Module):
                 setattr(param, "_item_id", param_group.param_idx[param])
                 param.get_main_grad = main_grad_getter.__get__(param)
 
-    def _materialize_meta_module(self, ignored_modules: set):
+    def _materialize_meta_module(
+        self, ignored_modules: set, mesh: Optional[DeviceMesh] = None
+    ):
         """
         Materialize meta parameters to actual device and initialize.
 
         This is needed for large models that cannot fit in a single GPU.
         Meta parameters are moved to the current device and reset.
+
+        After materialization, all full (non-DTensor) parameters under this
+        FSDP unit are broadcast from DP rank 0 within *mesh*.  This ensures
+        every DP rank starts with identical parameter values even when the
+        random-number state differs across ranks (e.g., with
+        --data-parallel-random-init or when RNG divergence occurs during
+        meta-device model construction).  The broadcast happens **before**
+        FSDP param groups are built, so each rank subsequently receives the
+        correct shard of the same full parameter.
         """
         materialization_device = torch.cuda.current_device()
-        for m in self.modules():
+        for name, m in self.named_modules():
             if m in ignored_modules:
                 continue
             # Skip modules that don't have meta parameters
             if all(not p.is_meta for p in m.parameters(recurse=False)):
                 continue
 
-            # Move to device and initialize
-            m.to_empty(device=materialization_device, recurse=False)
+            # Materialize only meta tensors in a module, preserving
+            # non-meta tensors that are already initialized on device.
+            m._apply(
+                lambda t: (
+                    torch.empty_like(t, device=materialization_device) if t.is_meta else t
+                ),
+                recurse=False,
+            )
             if hasattr(m, "reset_parameters"):
                 m.reset_parameters()
-            if hasattr(m, "_reset_parameters"):
+            elif hasattr(m, "_reset_parameters"):
                 m._reset_parameters()
+            else:
+                raise ValueError(
+                    f"Module {name} contains meta parameters but does not have a reset_parameters method"
+                )
+
+        if mesh is not None and mesh.size() > 1:
+            dp_group = mesh.get_group()
+            src_rank = torch.distributed.get_global_rank(dp_group, 0)
+            for param_name, param in self.named_parameters():
+                if param.is_meta:
+                    continue
+                if isinstance(param, DTensor):
+                    continue
+                torch.distributed.broadcast(
+                    param.data, src=src_rank, group=dp_group, async_op=False
+                )
 
     def _init_fsdp_state(self, enable_unshard_prefetch, enable_async_reduce_grad):
         """Initialize FSDP state and mark nested FSDP modules as non-root."""
@@ -335,6 +376,21 @@ class FSDPModule(nn.Module):
         ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
         torch.cuda.nvtx.range_pop()
 
+    def _wait_for_previous_async_reduce_grad(self):
+        """Wait for the previous async reduce_grad to complete before reducing gradients for this module."""
+        ctx = self._fsdp_root_context
+        if ctx.enable_async_reduce_grad:
+            backward_order = list(reversed(ctx.forward_order))
+            for i, module in enumerate(backward_order):
+                if i - 2 >= 0:
+                    buckets = ctx.reduce_grad_buckets[id(backward_order[i - 2])]
+                    while len(buckets) > 0:
+                        event, param_group = buckets.pop()
+                        event.wait()
+                        param_group.release_grad_buffer()
+                if module is self:
+                    break
+
     def reduce_grad(self, async_op: bool = False):
         """
         Reduce gradients across data-parallel ranks.
@@ -349,17 +405,7 @@ class FSDPModule(nn.Module):
         stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
         # Handle pending reduce events before this module to ensure memory is freed in a timely manner.
-        if async_op:
-            backward_order = list(reversed(ctx.forward_order))
-            for i, module in enumerate(backward_order):
-                if i - 2 >= 0:
-                    buckets = ctx.reduce_grad_buckets[id(backward_order[i - 2])]
-                    while len(buckets) > 0:
-                        event, param_group = buckets.pop()
-                        event.wait()
-                        param_group.release_grad_buffer()
-                if module is self:
-                    break
+        self._wait_for_previous_async_reduce_grad()
 
         # Perform reduction for this module
         for param_names, param_group in self._named_param_groups:
@@ -376,11 +422,18 @@ class FSDPModule(nn.Module):
             # When gradient_accumulation_fusion is active for FSDP params, the backward
             # kernel writes directly into main_grad (weight.main_grad = get_main_grad() in
             # layers.py) and sets grad_added_to_main_grad=True.  In that case we must NOT
-            # zero main_grad, and there is no .grad to copy.
+            # zero or overwrite main_grad; the dummy .grad tensor (set by layers.py to keep
+            # backprop hooks on the main thread) should simply be discarded.
             for name, param in zip(param_names, param_group.params):
                 main_grad = param.get_main_grad()
-                if param.grad is None:
-                    if not getattr(param, 'grad_added_to_main_grad', False):
+                if getattr(param, 'grad_added_to_main_grad', False):
+                    if param.grad is not None:
+                        del param.grad
+                elif param.grad is None:
+                    if hasattr(param, 'main_grad') and param.main_grad is not None:
+                        if param.main_grad.data_ptr() != main_grad.data_ptr():
+                            main_grad.copy_(param.main_grad.detach())
+                    else:
                         main_grad.zero_()
                 else:
                     main_grad.copy_(param.grad.detach())
@@ -392,9 +445,6 @@ class FSDPModule(nn.Module):
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     param_group.reduce_grad()
-
-                event = stream.record_event()
-                ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
@@ -410,6 +460,10 @@ class FSDPModule(nn.Module):
                         dist_grad = dist_grad.to(dist_param.dtype)
                     setattr(dist_param, "grad", dist_grad)
 
+            if async_op:
+                event = stream.record_event()
+                ctx.reduce_grad_buckets[id(self)].append((event, param_group))
+
             # NaN check after reduction
             if getattr(self, "_enable_nan_checks", False):
                 for name, dist_grad in zip(param_names, param_group.dist_grads):
@@ -423,11 +477,15 @@ class FSDPModule(nn.Module):
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
         """Scale gradients by a factor (e.g., for loss scaling)."""
+        ctx = self._fsdp_root_context
+        torch.cuda.current_stream().wait_stream(ctx.rs_stream)
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
                 for dist_grad in param_group.dist_grads:
+                    if dist_grad is None:
+                        continue
                     dist_grad._local_tensor.mul_(scaling_factor)
 
     def _zero_grad_buffer(self):
@@ -438,28 +496,170 @@ class FSDPModule(nn.Module):
             for param_group in child._fsdp_param_groups:
                 if param_group.main_grad_buffer is not None:
                     param_group.main_grad_buffer.data.zero_()
+                    param_group.release_grad_buffer()
+
+                for dist_param in param_group.dist_params:
+                    if dist_param.grad is not None:
+                        del dist_param.grad
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
-        for _, child in self.named_modules():
+        for name, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
-            for param_group in child._fsdp_param_groups:
+            for param_names, param_group in child._named_param_groups:
                 if param_group.main_weight_buffer is None:
                     continue
                 param_group.model_weight_buffer.data.copy_(param_group.main_weight_buffer.data)
 
-        # Also zero main grads to avoid stale gradients after weight copy
-        self._zero_main_grads()
+    def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
+        """
+        Compute per-parameter L2 norms for params and grads.
 
-    def _zero_main_grads(self):
-        """Zero the main gradient buffer for all parameter groups."""
-        for _, child in self.named_modules():
-            if not isinstance(child, FSDPModule):
+        Returns a dict {param_name: {"param_norm": float, "grad_norm": float}}.
+        The norms are globally reduced across DP ranks.
+        """
+        results = {}
+        dp_group = None
+        for name, child in self.named_modules():
+            if not isinstance(child, FSDPModule) or child is self:
                 continue
-            for param_group in child._fsdp_param_groups:
-                if param_group.main_grad_buffer is not None:
-                    param_group.main_grad_buffer.data.zero_()
+            for param_names, param_group in child._named_param_groups:
+                if dp_group is None and param_group.dp_group is not None:
+                    dp_group = param_group.dp_group
+                for pname, dist_param, dist_grad in zip(
+                    param_names, param_group.dist_params, param_group.dist_grads
+                ):
+                    full_name = f"{name}.{pname}" if name else pname
+                    results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
+                    if dist_param._local_tensor.numel() > 0:
+                        results[full_name]["param_norm"] = (
+                            dist_param._local_tensor.float().norm(p=2).item() ** 2
+                        )
+                    if dist_grad is not None and dist_grad._local_tensor.numel() > 0:
+                        results[full_name]["grad_norm"] = (
+                            dist_grad._local_tensor.float().norm(p=2).item() ** 2
+                        )
+
+        if dp_group is None:
+            for pg in self._fsdp_param_groups:
+                if pg.dp_group is not None:
+                    dp_group = pg.dp_group
+                    break
+
+        if dp_group is not None:
+            for param_name in results:
+                for key in ("param_norm", "grad_norm"):
+                    t = torch.tensor([results[param_name][key]], device="cuda")
+                    torch.distributed.all_reduce(t, group=dp_group)
+                    results[param_name][key] = t.sqrt().item()
+        return results
+
+    def _log_per_param_norms(self, iteration: int, prefix: str = ""):
+        """Log per-parameter param and gradient L2 norms via print (rank 0 only)."""
+        norms = self._compute_per_param_norms()
+        if torch.distributed.get_rank() != 0:
+            return
+        for param_name in sorted(norms.keys()):
+            pn = norms[param_name]["param_norm"]
+            gn = norms[param_name]["grad_norm"]
+            print(
+                f"{prefix} iter={iteration} param={param_name} "
+                f"param_norm={pn:.6f} grad_norm={gn:.6f}"
+            )
+
+    def _log_parameter_groups(self):
+        """Compact log of FSDP parameter groups and their parameters (rewrite path)."""
+
+        def _fmt_dtype(dt: torch.dtype) -> str:
+            short = {
+                torch.float32: "fp32",
+                torch.float16: "fp16",
+                torch.bfloat16: "bf16",
+                torch.int64: "i64",
+                torch.int32: "i32",
+                torch.uint8: "u8",
+            }
+            return short.get(dt, str(dt).removeprefix("torch."))
+
+        def _elem_size(dt: torch.dtype) -> int:
+            return {
+                torch.float32: 4,
+                torch.float16: 2,
+                torch.bfloat16: 2,
+                torch.int64: 8,
+                torch.int32: 4,
+                torch.uint8: 1,
+            }.get(dt, 1)
+
+        def _mb(b: int | float) -> str:
+            return f"{b / 1_000_000:.2f} MB"
+
+        rank = torch.distributed.get_rank()
+        lines = [f"╔══ FSDP Parameter Groups (rank {rank}) ══╗"]
+        group_idx = 0
+        total_model_elems = 0
+        total_comm = 0
+        total_pad = 0
+
+        for name, child in self.named_modules():
+            if not isinstance(child, FSDPModule) or child is self:
+                continue
+            for param_names, param_group in child._named_param_groups:
+                numel = sum(p.numel() for p in param_group.params)
+                total_model_elems += numel
+                dp_sz = torch.distributed.get_world_size(param_group.dp_group)
+                dp_rk = torch.distributed.get_rank(param_group.dp_group)
+
+                # Per-buffer metrics
+                buf_entries = []
+                group_pad = 0
+                group_comm = 0
+                for buf_label, buf in [
+                    ("W", param_group.model_weight_buffer),
+                    ("MW", param_group.main_weight_buffer),
+                    ("G", param_group.main_grad_buffer),
+                ]:
+                    if buf is None:
+                        continue
+                    gsize = buf.buffer_index.bucket_meta.size
+                    esize = _elem_size(buf.dtype)
+                    group_pad += max(0, (gsize - numel)) * esize
+                    group_comm += gsize * esize
+                    dist_flag = "D" if buf.is_distributed else "R"
+                    buf_entries.append(
+                        f"{buf_label}[{_fmt_dtype(buf.dtype)}:{buf.data_size}:{dist_flag}]"
+                    )
+                total_pad += group_pad
+                total_comm += group_comm
+
+                lines.append(
+                    f"╟── {name}  (#{group_idx})  "
+                    f"dp={dp_sz}  strat={param_group.sharding_strategy}  "
+                    f"cf={param_group.chunk_size_factor}"
+                )
+                lines.append(
+                    f"║   {numel:,} elems × {_fmt_dtype(param_group.dtype)}  "
+                    f"comm={_mb(group_comm)}  pad={_mb(group_pad)}  "
+                    f"{'  '.join(buf_entries)}"
+                )
+                for pname, param in zip(param_names, param_group.params):
+                    dist_idx = param_group.param_idx.get(param)
+                    wbuf = param_group.model_weight_buffer
+                    offset_info = ""
+                    if wbuf is not None and dist_idx is not None:
+                        ii = wbuf.buffer_index.item_index_map.get(dist_idx)
+                        if ii is not None:
+                            offset_info = f"  @{ii.global_data_index:,}+{ii.size:,}"
+                    lines.append(f"║     {pname:50s} {str(tuple(param.shape)):24s}{offset_info}")
+                group_idx += 1
+
+        lines.append(
+            f"╚══ SUMMARY: {group_idx} groups  "
+            f"{total_model_elems:,} model elems  "
+            f"comm={_mb(total_comm)}  pad={_mb(total_pad)} ══╝"
+        )
+        print("\n".join(lines))
 
     def _set_nan_check(self, enable_nan_checks: bool):
         """Enable or disable NaN checking."""
@@ -506,6 +706,7 @@ def _get_module_fsdp_param_groups(
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,
     mp_policy: Optional["MixedPrecisionPolicy"] = None,
+    gradient_scaling_factor: Optional[float] = None,
 ) -> List[ParameterGroup]:
     """
     Group module parameters by (device, dtype, requires_grad) and create ParameterGroups.
@@ -535,6 +736,7 @@ def _get_module_fsdp_param_groups(
                 param_group_id=ParamGroupIdx(id(module), i),
                 main_params_dtype=mp_policy.main_params_dtype if mp_policy is not None else None,
                 main_grads_dtype=mp_policy.main_grads_dtype if mp_policy is not None else None,
+                gradient_scaling_factor=gradient_scaling_factor,
             )
         )
 
@@ -696,7 +898,7 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
         ctx = root_module._fsdp_root_context
         stream = ctx.rs_stream
         for module in reversed(ctx.forward_order):
-            if module.post_backward_issued:
+            if getattr(module, "post_backward_issued", False):
                 continue
             module.reshard()
             module.reduce_grad(async_op=ctx.enable_async_reduce_grad)

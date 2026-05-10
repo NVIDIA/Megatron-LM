@@ -3165,6 +3165,14 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
+            if args.log_per_param_norm:
+                model_chunks = model if isinstance(model, list) else [model]
+                for model_chunk in model_chunks:
+                    try:
+                        if hasattr(model_chunk, 'log_per_param_norms'):
+                            model_chunk.log_per_param_norms(iteration, prefix="[PER-PARAM]")
+                    except Exception as e:
+                        print(f"[PER-PARAM] logging failed for {model_chunk}: {e}")
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:

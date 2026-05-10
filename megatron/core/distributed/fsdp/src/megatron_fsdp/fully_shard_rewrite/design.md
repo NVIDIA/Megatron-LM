@@ -372,6 +372,49 @@ modifications for the overlap feature.
 
 ---
 
+## Pitfall: Zero-Numel Gradient Shards and Fused Optimizers
+
+**Problem.** When a parameter is sharded across DP ranks, its local shard on a given rank
+may contain **zero elements** (e.g., a small bias or embedding table on a high-DP-count setup).
+Materializing a `DTensor` gradient for such a shard creates a tensor with `numel() == 0`.
+
+Fused multi-tensor optimizers (e.g., TransformerEngine `FusedAdam`) operate on **all**
+gradients in a parameter group in a single fused kernel launch. Passing a zero-numel
+tensor into these fused ops can silently corrupt the weight updates for **neighboring
+non-empty parameters** in the same group. The optimizer does not crash or raise an error
+— it produces numerically incorrect steps that manifest only as **convergence divergence**,
+making this extremely difficult to attribute and debug.
+
+**Symptoms (hard to diagnose):**
+- Training loss diverges or fails to converge despite correct hyperparameters
+- No NaN or Inf in gradients — the corruption is a numerical perturbation
+- Occurs only at certain DP-world-size / model-size combinations where sharding produces empty local slices
+- Bisecting the codebase is unhelpful because the optimizer runs without error
+
+**Fix in `param_group.py`:**
+```python
+# DO NOT REMOVE THIS CHECK:
+if p.requires_grad and grad_data.numel() > 0:
+    self.dist_grads.append(make_uneven_dtensor(...))
+else:
+    self.dist_grads.append(None)  # zero-numel shard → no DTensor grad
+```
+
+By recording `None` for zero-numel shards instead of a DTensor with an empty local tensor,
+the fused optimizer never receives the empty tensor and cannot corrupt neighboring updates.
+The optimizer already handles `None` grads correctly (parameters without a grad are
+simply skipped during the fused update).
+
+**Additional safeguard in `_scale_gradients`:**
+```python
+for dist_grad in param_group.dist_grads:
+    if dist_grad is None:
+        continue   # skip zero-numel shards
+    dist_grad._local_tensor.mul_(scaling_factor)
+```
+
+---
+
 ## Memory Optimization: Freeing Original Parameter Storage
 
 After `ParameterGroup._init_buffers()` copies parameter data into the internal weight buffers
