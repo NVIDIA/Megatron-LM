@@ -70,7 +70,11 @@ export APERTUS_LOG_LOSS_SPIKES=1
 
 MEGATRON_ARGS=(
     # Architecture: 350M Transformer++ (24L, 1024H, 2560F, 16h, 4kv GQA)
-    --transformer-impl transformer_engine
+    # Local spec (pure PyTorch building blocks) is required by the local
+    # attention backend, which is the only one that can run our softpick path
+    # (TE FlashAttention has no rectified-softmax kernel).
+    --transformer-impl local
+    --spec local
     --main-grads-dtype fp32
     --num-layers 24
     --hidden-size 1024
