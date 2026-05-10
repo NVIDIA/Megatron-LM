@@ -87,6 +87,7 @@ MEGATRON_ARGS=(
     --rotary-base 500000
     --make-vocab-size-divisible-by 128
     --normalization RMSNorm
+    --no-persist-layer-norm
     --swiglu
     --qk-layernorm
     --softmax-type softpick
