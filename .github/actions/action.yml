@@ -79,14 +79,23 @@ runs:
       shell: bash
       run: sudo chown -R $(whoami) /home/runner/
 
-    - name: Setup python and install dependencies
+    - name: Setup python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install uuid-runtime
       shell: bash -x -e -u -o pipefail {0}
       run: |
         for i in 1 2 3; do
-          apt-get update && apt-get install -y python3.12 python3.12-venv uuid-runtime && break
+          apt-get update && apt-get install -y uuid-runtime && break
           echo "apt attempt $i failed, retrying..."
           sleep 10
         done
+
+    - name: Install uv
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
         for i in 1 2 3; do
           curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh && break
           echo "uv install attempt $i failed, retrying..."
