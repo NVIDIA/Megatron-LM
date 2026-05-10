@@ -17,7 +17,7 @@
 # Reference: Mixtral 8x7B (Jiang et al., 2024); MoEUT (Csordas et al., 2024).
 #
 #SBATCH --job-name=350m-abl-aurora-qkn-moe-64e
-#SBATCH --time=02:30:00
+#SBATCH --time=04:30:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --nodes=1
@@ -105,7 +105,7 @@ MEGATRON_ARGS=(
     --micro-batch-size 4
     --global-batch-size 128
     --train-samples 244141
-    --exit-duration-in-mins 140
+    --exit-duration-in-mins 250
     --log-interval 1
     --eval-interval 244141
     --eval-iters 0
