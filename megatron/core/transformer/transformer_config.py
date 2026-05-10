@@ -841,6 +841,11 @@ class TransformerConfig(ModelParallelConfig):
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
     will be dropped. The default is None."""
 
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens
+    exceeding this budget will be dropped. None means no token will be dropped.
+    The default is None."""
+
     moe_pad_expert_input_to_capacity: bool = False
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match
     the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
@@ -891,6 +896,17 @@ class TransformerConfig(ModelParallelConfig):
     """Number of CUDA thread blocks for the unpermute part in HybridEP.
     When permute_fusion_into_hybridep is True, this sets the number
     of SMs for the unpermute part (only 1 block per SM)."""
+
+    moe_hybridep_num_sms_preprocessing: int = 108
+    """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
+
+    moe_mlp_glu_interleave_size: Optional[int] = None
+    """When set, GLU activations in the MoE grouped MLP layer will use a
+    block interleaved format. Instead of interpreting the input tensor
+    as a concatenation of gates and linear units, it will be
+    interpreted as alternating blocks of gates and linear units.
+    This data format is experimental and primarily intended to enable
+    advanced fused kernels."""
 
     ##################
     # Context Parallel

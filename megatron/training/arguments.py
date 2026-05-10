@@ -143,11 +143,6 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
         args = load_yaml(args.yaml_cfg)
 
-        assert (
-            args.yaml_cfg and not args.use_legacy_models
-        ), "Yaml config is not supported with legacy models."
-        args = load_yaml(args.yaml_cfg)
-
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
@@ -3417,6 +3412,16 @@ def _add_training_args(parser):
         action='store_false',
         dest='pin_cpu_params',
         help='Disable pinning of CPU memory for parameters.',
+    )
+    group.add_argument(
+        '--offload-optimizer-states',
+        action='store_true',
+        dest='offload_optimizer_states',
+        help='Offload optimizer states to CPU after each optimizer step and '
+        'reload them before the next optimizer step. '
+        'Only support TE FusedAdam optimizer.'
+        'Note that this still uses pure GPU optimizer instead of '
+        'HybridDeviceOptimizer for --optimizer-cpu-offload.',
     )
     group.add_argument(
         '--dataloader-type',
