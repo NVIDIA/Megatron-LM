@@ -201,25 +201,210 @@ class KimiDeltaAttention(GatedDeltaNet):
             beta = beta * 2.0
         return g, beta
 
-    def forward(self, *args, **kwargs):
-        # KDA's wider alpha slot in the in_proj output requires a different
-        # split layout than GDN. The parent's forward hard-codes the split
-        # sizes for GDN's scalar-alpha layout, so we cannot just inherit it.
-        # TODO: copy the parent forward verbatim and adjust:
-        #   - the torch.split sections to use self.alpha_dim instead of
-        #     self.num_value_heads // self.tp_size for the alpha slot
-        #   - alpha.reshape(batch, seq_len, num_v_heads, key_head_dim)
-        #   - the FLA op call (already bound to chunk_kda via __init__)
-        # The override is mechanical (~80 LOC) but mirrors GDN.forward almost
-        # exactly. Until then KDA is gated off at the first forward pass so it
-        # does not silently fall through to GDN's split layout.
-        raise NotImplementedError(
-            "KimiDeltaAttention.forward is not yet implemented. The class "
-            "scaffolding (in_proj resize, A_log/dt_bias per-channel, "
-            "_compute_g_and_beta vector form, fla.ops.kda binding) is in "
-            "place but the forward override that handles the wider alpha "
-            "slot is still pending."
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        *,
+        inference_params=None,
+        **kwargs,
+    ):
+        """KDA forward. Mirrors GDN.forward, but the alpha slot is wider
+        (num_v_heads * key_head_dim vs num_v_heads). KDA has no DeltaProduct
+        variant, so n_hh is forced to 1 and erase logic is skipped.
+        """
+        import os
+        from megatron.core.ssm.gated_delta_net import (
+            tensor_a2a_cp2hp, tensor_a2a_hp2cp, get_parameter_local_cp,
+            nvtx_range_push, nvtx_range_pop, causal_conv1d,
         )
+        from megatron.core.utils import deprecate_inference_params
+        from fla.modules.l2norm import l2norm
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        seq_len, batch, _ = hidden_states.shape
+        seq_len = seq_len * self.sp_size * self.cp_size
+
+        if inference_context is not None:
+            raise NotImplementedError("KDA does not support inference for now.")
+        if packed_seq_params is not None:
+            raise NotImplementedError("KDA does not support packed sequence for now.")
+        assert self.n_hh == 1, "KDA does not have a DeltaProduct (n_householder>1) variant."
+
+        # Input projection
+        nvtx_range_push(suffix="in_proj")
+        qkvzba, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+
+        num_v_heads_tp = self.num_value_heads // self.tp_size
+
+        # CP All to All: CP to HP. Alpha slot is wider than GDN's:
+        # alpha_dim = num_value_heads * key_head_dim (vs num_value_heads for GDN).
+        qkvzba = tensor_a2a_cp2hp(
+            qkvzba,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.pg_collection.cp,
+            split_sections=[
+                self.qk_dim_local_tp,           # Q
+                self.qk_dim_local_tp,           # K
+                self.v_dim_local_tp,            # V
+                self.v_dim_local_tp,            # gate
+                num_v_heads_tp,                 # beta (per-head scalar, sigmoid'd)
+                self.alpha_dim // self.tp_size, # alpha (per-channel: num_v_heads*key_head_dim)
+            ],
+        )
+
+        # Transpose: s b x --> b s x
+        qkvzba = qkvzba.transpose(0, 1)
+
+        # Split into qkv (Q+K+V), gate, beta, alpha. The alpha slot is wider here.
+        alpha_local = self.alpha_dim // self.tp_size // self.cp_size
+        qkv, gate, beta, alpha = torch.split(
+            qkvzba,
+            [
+                (2 * self.qk_dim_local_tp + self.v_dim_local_tp) // self.cp_size,
+                self.v_dim_local_tp // self.cp_size,
+                num_v_heads_tp // self.cp_size,
+                alpha_local,
+            ],
+            dim=-1,
+        )
+        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+        beta = beta.reshape(batch, seq_len, -1)
+
+        # Convolution on qkv (Q, K, V all per-token for KDA — no DeltaProduct).
+        nvtx_range_push(suffix="conv1d")
+        seq_len = qkv.shape[1]
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp,
+        ]
+        conv1d_weight = get_parameter_local_cp(
+            self.conv1d.weight, dim=0, cp_group=self.pg_collection.cp,
+            split_sections=qkv_channels_split_sections,
+        )
+        conv1d_bias = (
+            get_parameter_local_cp(
+                self.conv1d.bias, dim=0, cp_group=self.pg_collection.cp,
+                split_sections=qkv_channels_split_sections,
+            ) if self.conv_bias else None
+        )
+        if self.config.deterministic_mode:
+            qkv = qkv.transpose(1, 2).contiguous()
+            conv_out = F.conv1d(
+                input=qkv, weight=conv1d_weight, bias=conv1d_bias,
+                stride=self.conv1d.stride, padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp // self.cp_size,
+            )
+            qkv = self.act_fn(conv_out[..., :seq_len])
+            qkv = qkv.transpose(1, 2)
+        else:
+            assert self.activation in ["silu", "swish"]
+            qkv, _ = causal_conv1d(
+                x=qkv, weight=conv1d_weight.squeeze(1), bias=conv1d_bias,
+                activation=self.activation, initial_state=None, output_final_state=False,
+            )
+        nvtx_range_pop(suffix="conv1d")
+
+        # Q/K/V split + reshape + alpha reshape (overridden helper handles the wider alpha).
+        nvtx_range_push(suffix="prepare_qkv_for_kda")
+        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
+            qkv, gate, beta, alpha, batch, seq_len
+        )
+        nvtx_range_pop(suffix="prepare_qkv_for_kda")
+
+        # Compute vector g and sigmoid'd beta (overridden helper).
+        nvtx_range_push(suffix="g_and_beta")
+        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
+        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=self.pg_collection.cp)
+        g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
+        nvtx_range_pop(suffix="g_and_beta")
+
+        # Initial state: learnable param > carried full-batch state > None.
+        if self.initial_state_param is not None:
+            initial_state = self.initial_state_param.unsqueeze(0).expand(batch, -1, -1, -1).contiguous()
+        elif self._carry_enabled:
+            num_v_heads_local = self.num_value_heads // self.tp_size
+            need_init = (
+                self._carried_state is None
+                or self._carried_state.shape[0] != batch
+                or self._carried_state.shape[1] != num_v_heads_local
+            )
+            if need_init:
+                self._carried_state = torch.zeros(
+                    batch, num_v_heads_local, self.key_head_dim, self.value_head_dim,
+                    dtype=hidden_states.dtype, device=hidden_states.device,
+                )
+            initial_state = self._carried_state.detach()
+        else:
+            initial_state = None
+
+        log_state_stats = os.environ.get("APERTUS_LOG_STATE_STATS", "0") == "1"
+        need_final_state = self._carry_enabled or log_state_stats
+
+        # chunk_kda requires initial_state in float32 (asserted inside FLA).
+        initial_state_f32 = initial_state.float() if initial_state is not None else None
+
+        nvtx_range_push(suffix="chunk_kda")
+        core_attn_out, last_recurrent_state = self.gated_delta_rule(
+            query, key, value,
+            g=g, beta=beta,
+            initial_state=initial_state_f32,
+            output_final_state=need_final_state,
+            use_qk_l2norm_in_kernel=False,
+            use_gate_in_kernel=False,
+        )
+        nvtx_range_pop(suffix="chunk_kda")
+
+        # Carry-over (matches GDN; only active if linear_attention_carry_state=True).
+        if self._carry_enabled and last_recurrent_state is not None:
+            with torch.no_grad():
+                new_state = last_recurrent_state.detach().to(self._carried_state.dtype)
+                cap = self.config.linear_attention_carried_state_max_frob
+                if cap > 0.0:
+                    flat = new_state.reshape(new_state.shape[0], -1).float()
+                    norms = flat.norm(dim=-1, keepdim=True)
+                    scale = torch.clamp(cap / norms.clamp_min(1e-12), max=1.0)
+                    flat = flat * scale
+                    new_state = flat.reshape_as(new_state).to(new_state.dtype)
+                self._carried_state = new_state
+
+        if log_state_stats and last_recurrent_state is not None:
+            with torch.no_grad():
+                s = last_recurrent_state.detach().float()
+                stats = {
+                    "frob": s.norm(), "amax": s.abs().amax(),
+                    "abs_mean": s.abs().mean(), "std": s.std(),
+                }
+                if initial_state is not None:
+                    init_f = initial_state.detach().float().norm()
+                    stats["init_frob"] = init_f
+                    stats["delta_frob"] = stats["frob"] - init_f
+                else:
+                    stats["init_frob"] = torch.zeros((), device=s.device)
+                    stats["delta_frob"] = stats["frob"].clone()
+                self._last_state_stats = stats
+        else:
+            self._last_state_stats = None
+
+        # RMSNorm + (optional) output gate
+        nvtx_range_push(suffix="gated_norm")
+        norm_out = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
+        # Transpose back to sbhd, CP a2a HP→CP, output projection.
+        norm_out = norm_out.reshape(batch, seq_len, -1)
+        norm_out = norm_out.transpose(0, 1).contiguous()
+        norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+        return out, out_bias
 
     def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
         """Reshape alpha from a flat [b, s, h*d_k] slice to [b, s, h, d_k].
