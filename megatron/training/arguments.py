@@ -3193,7 +3193,11 @@ def _add_mla_args(parser):
 
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
-    # Linear attention
+    # NOTE: --experimental-attention-variant, --linear-attention-allow-neg-eigval,
+    # --linear-attention-use-decay, --linear-attention-qk-norm, and
+    # --linear-attention-use-output-gate are auto-generated from TransformerConfig
+    # by the ArgumentGroupFactory (see _add_network_size_args). Don't redefine them
+    # here; argparse rejects duplicate option strings.
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'
                             ' SDPA (scaled dot-product attention) layers. Accepts either: '

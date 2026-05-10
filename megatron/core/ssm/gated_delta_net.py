@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -52,6 +53,49 @@ except ImportError:
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
+
+try:
+    from fla.ops.gated_delta_product import chunk_gated_delta_product
+    HAVE_DP = True
+except ImportError:
+    chunk_gated_delta_product = None
+    HAVE_DP = False
+
+
+class _PerChannelRMSNorm(nn.Module):
+    """Per-head-dim RMSNorm with learnable scale for Q,K in the Schlag-style
+    DeltaNet variant. Applied in float32 for numerical stability, cast back to
+    input dtype. Weight shape [head_dim], replicated across TP/heads.
+
+    The learnable scale is initialized to ``1/sqrt(head_dim)`` so the output is
+    approximately unit-norm at init. This is required for delta-rule stability:
+    with ``||k|| > 1``, the state update ``(I - beta k k^T) S`` has spectral
+    radius greater than one and the recurrent state diverges to NaN within a
+    handful of steps. Vanilla RMSNorm would init the weight to ones, producing
+    norm ~sqrt(d_k); we deliberately deviate to keep the variant comparable to
+    L2norm-based variants while still exposing a learnable per-channel scale."""
+
+    def __init__(
+        self,
+        head_dim: int,
+        eps: float = 1e-6,
+        dtype=torch.float32,
+        init_scale: float = 1.0,
+    ):
+        super().__init__()
+        init = init_scale * (head_dim ** -0.5)
+        self.weight = nn.Parameter(
+            torch.full(
+                (head_dim,), init, dtype=dtype, device=torch.cuda.current_device()
+            )
+        )
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [..., head_dim]; reduce on last dim
+        v = x.float()
+        rms = torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (v * rms * self.weight).to(x.dtype)
 
 logger = logging.getLogger(__name__)
 
@@ -136,10 +180,36 @@ class GatedDeltaNet(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
+        # Number of Householder updates per token (DeltaProduct). 1 = standard GDN/DN.
+        self.n_hh = max(1, int(self.config.linear_attention_n_householder))
+        self.n_erase = max(0, int(self.config.linear_attention_n_erase))
+        assert self.n_erase < self.n_hh, (
+            f"linear_attention_n_erase ({self.n_erase}) must be strictly less than "
+            f"linear_attention_n_householder ({self.n_hh})"
+        )
+        if self.n_hh > 1 and not HAVE_DP:
+            raise ImportError(
+                "DeltaProduct requires fla.ops.gated_delta_product.chunk_gated_delta_product. "
+                "Install/upgrade flash-linear-attention (fla-core>=0.5.0)."
+            )
+
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
-        # TODO: for now, output gate is forced for GDN.
-        # We may remove this restriction in the future.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.num_value_heads * 2
+        # FLA's chunk_gated_delta_product convention:
+        #   q: per-token (B, T, H, K)
+        #   k: per-Householder (B, T*n, H, K)
+        #   v: per-Householder (B, T*n, H, V)
+        #   beta: per-Householder (B, T*n, H)
+        #   g (decay): per-token (B, T, H)  ->  alpha is per-token
+        #   gate (z): per-token output gate
+        # For n_hh=1 this collapses to the usual GDN layout (qk*2 + v*2 + num_v_heads*2).
+        self.in_proj_dim = (
+            self.qk_dim                       # Q (per-token)
+            + self.n_hh * self.qk_dim         # K (per-Householder)
+            + self.n_hh * self.v_dim          # V (per-Householder)
+            + self.v_dim                      # gate (z, per-token)
+            + self.n_hh * self.num_value_heads  # beta (per-Householder)
+            + self.num_value_heads            # alpha (per-token for g)
+        )
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
@@ -160,8 +230,9 @@ class GatedDeltaNet(MegatronModule):
             tp_group=self.pg_collection.tp,
         )
 
-        # Conv1d for QKV
-        self.conv_dim = self.qk_dim * 2 + self.v_dim
+        # Conv1d for QKV: Q is per-token (1*qk), K is per-Householder (n*qk),
+        # V is per-Householder (n*v).
+        self.conv_dim = self.qk_dim + self.n_hh * self.qk_dim + self.n_hh * self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
 
         # weight shape: [conv_dim, 1, d_conv]
@@ -205,10 +276,74 @@ class GatedDeltaNet(MegatronModule):
         setattr(self.A_log, "tensor_model_parallel", True)
         setattr(self.A_log, "partition_dim", 0)
 
-        if self.config.deterministic_mode:
+        if self.n_hh > 1:
+            # DeltaProduct kernel; chains n_hh Householder updates per token.
+            self.gated_delta_rule = chunk_gated_delta_product
+        elif self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
+
+        # Optional per-head-dim RMSNorm for Q, K (Schlag-style DeltaNet variant)
+        if self.config.linear_attention_qk_norm == "rmsnorm":
+            self.qk_rmsnorm = _PerChannelRMSNorm(
+                self.key_head_dim,
+                eps=self.config.layernorm_epsilon,
+                init_scale=self.config.linear_attention_qk_norm_init_scale,
+            )
+        else:
+            self.qk_rmsnorm = None
+
+        # Optional learnable beta logit bias (idea: small beta at init slows initial writes).
+        # Per-head, broadcast over batch + seq when added to the projected beta logit.
+        if self.config.linear_attention_beta_bias_init != 0.0:
+            self.beta_bias = nn.Parameter(
+                torch.full(
+                    (self.num_value_heads // self.tp_size,),
+                    float(self.config.linear_attention_beta_bias_init),
+                    dtype=config.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            )
+            setattr(self.beta_bias, "tensor_model_parallel", True)
+            setattr(self.beta_bias, "partition_dim", 0)
+        else:
+            self.beta_bias = None
+
+        # Optional learnable initial state S0 per head (cold-start helper).
+        if self.config.linear_attention_learnable_initial_state:
+            num_v_heads_local = self.num_value_heads // self.tp_size
+            self.initial_state_param = nn.Parameter(
+                torch.zeros(
+                    num_v_heads_local,
+                    self.key_head_dim,
+                    self.value_head_dim,
+                    dtype=config.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            )
+            setattr(self.initial_state_param, "tensor_model_parallel", True)
+            setattr(self.initial_state_param, "partition_dim", 0)
+        else:
+            self.initial_state_param = None
+
+        # Optional carry-over state across forward passes. Stored as a plain attribute
+        # (not a buffer) so we can lazy-init at first forward with the right batch
+        # dimension without needing micro_batch_size at config time. Per-rank carry:
+        # no DP all-reduce, each rank's microbatches chain through their own slots.
+        if self.config.linear_attention_carry_state:
+            assert not self.config.linear_attention_learnable_initial_state, (
+                "linear_attention_carry_state and linear_attention_learnable_initial_state "
+                "are mutually exclusive."
+            )
+            self._carry_enabled = True
+            self._carried_state = None  # lazy-init in forward
+        else:
+            self._carry_enabled = False
+            self._carried_state = None
+
+        # Slot for per-step state stats; populated by forward when state-stats logging is on.
+        self._last_state_stats: Optional[dict] = None
 
         # Output layernorm before projection
         self.out_norm = build_module(
@@ -308,18 +443,20 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
+        n_hh = self.n_hh
+        num_v_heads_tp = self.num_value_heads // self.tp_size
         qkvzba = tensor_a2a_cp2hp(
             qkvzba,
             seq_dim=0,
             head_dim=-1,
             cp_group=self.pg_collection.cp,
             split_sections=[
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-                self.v_dim_local_tp,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
+                self.qk_dim_local_tp,                # Q (per-token)
+                n_hh * self.qk_dim_local_tp,         # K (per-Householder)
+                n_hh * self.v_dim_local_tp,          # V (per-Householder)
+                self.v_dim_local_tp,                 # gate (per-token)
+                n_hh * num_v_heads_tp,               # beta (per-Householder)
+                num_v_heads_tp,                      # alpha (per-token)
             ],
         )
 
@@ -327,28 +464,33 @@ class GatedDeltaNet(MegatronModule):
         # From sbhd to bshd format
         qkvzba = qkvzba.transpose(0, 1)
 
-        # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
+        # Split into qkv (Q + K_n + V_n), gate, beta, alpha. The qkv block goes through
+        # conv1d before being split apart again; gate/beta/alpha go directly to their reshape.
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
+                (self.qk_dim_local_tp + n_hh * self.qk_dim_local_tp + n_hh * self.v_dim_local_tp) // self.cp_size,
                 self.v_dim_local_tp // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
+                n_hh * num_v_heads_tp // self.cp_size,
+                num_v_heads_tp // self.cp_size,
             ],
             dim=-1,
         )
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-        beta = beta.reshape(batch, seq_len, -1)
+        # alpha is per-token; beta is per-Householder (interleaved into seq dim for FLA).
         alpha = alpha.reshape(batch, seq_len, -1)
+        if n_hh > 1:
+            beta = beta.reshape(batch, seq_len, n_hh, -1).reshape(batch, seq_len * n_hh, -1)
+        else:
+            beta = beta.reshape(batch, seq_len, -1)
 
-        # Convolution on qkv
+        # Convolution on qkv (Q is per-token, K and V are per-Householder).
         nvtx_range_push(suffix="conv1d")
         seq_len = qkv.shape[1]
         qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
+            self.qk_dim_local_tp,                # Q
+            n_hh * self.qk_dim_local_tp,         # K_n
+            n_hh * self.v_dim_local_tp,          # V_n
         ]
         conv1d_weight = get_parameter_local_cp(
             self.conv1d.weight,
@@ -391,12 +533,66 @@ class GatedDeltaNet(MegatronModule):
             )
         nvtx_range_pop(suffix="conv1d")
 
-        # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
+        # Prepare QKV tensors. For n_hh=1 we use the existing helper. For n_hh>1
+        # we split Q (per-token), K (per-Householder), V (per-Householder), interleave
+        # K and V into the seq dim, normalize Q and K independently, and GQA-expand.
         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
-        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-            qkv, gate, beta, alpha, batch, seq_len
-        )
+        if n_hh > 1:
+            qk_local = self.qk_dim_local_tp // self.cp_size
+            v_local = self.v_dim_local_tp // self.cp_size
+            q_part, k_part, v_part = torch.split(
+                qkv, [qk_local, n_hh * qk_local, n_hh * v_local], dim=-1,
+            )
+            num_qk_heads_local = self.num_key_heads // self.tp_size // self.cp_size
+            num_v_heads_local = self.num_value_heads // self.tp_size // self.cp_size
+            # Q stays per-token: [b, s, qk_local] -> [b, s, num_qk_heads_local, key_head_dim]
+            query = q_part.reshape(batch, seq_len, num_qk_heads_local, self.key_head_dim).contiguous()
+            # K_n: [b, s, n*qk_local] -> [b, s, n, num_qk_heads_local, d_k] -> [b, s*n, num_qk_heads_local, d_k]
+            key = k_part.reshape(
+                batch, seq_len, n_hh, num_qk_heads_local, self.key_head_dim
+            ).reshape(batch, seq_len * n_hh, num_qk_heads_local, self.key_head_dim).contiguous()
+            # V_n: [b, s, n*v_local] -> [b, s, n, num_v_heads_local, d_v] -> [b, s*n, num_v_heads_local, d_v]
+            value = v_part.reshape(
+                batch, seq_len, n_hh, num_v_heads_local, self.value_head_dim
+            ).reshape(batch, seq_len * n_hh, num_v_heads_local, self.value_head_dim).contiguous()
+            # Q,K norm (independently)
+            if self.use_qk_l2norm:
+                if self.qk_rmsnorm is not None:
+                    query = self.qk_rmsnorm(query)
+                    key = self.qk_rmsnorm(key)
+                else:
+                    query = l2norm(query)
+                    key = l2norm(key)
+            # GQA expansion: query and key heads -> num_v_heads
+            if self.num_value_heads // self.num_key_heads > 1:
+                repeat_factor = self.num_value_heads // self.num_key_heads
+                query = query.repeat_interleave(repeat_factor, dim=2)
+                key = key.repeat_interleave(repeat_factor, dim=2)
+            fla_seq_len = seq_len * n_hh
+        else:
+            query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
+                qkv, gate, beta, alpha, batch, seq_len
+            )
+            fla_seq_len = seq_len
         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
+
+        # Erase positions: zero out v at the last n_erase of each token's n_hh slots so
+        # they contribute only the (I - beta k k^T) factor (no v k^T addition).
+        if n_hh > 1 and self.n_erase > 0:
+            n_erase = self.n_erase
+            n_write = n_hh - n_erase
+            mask_per_token = torch.cat(
+                [
+                    torch.ones(n_write, device=value.device, dtype=value.dtype),
+                    torch.zeros(n_erase, device=value.device, dtype=value.dtype),
+                ]
+            )  # shape [n_hh]
+            # value: [b, seq_len*n_hh, h, d_v]; reshape to apply mask along the n_hh axis.
+            v_shape = value.shape
+            value = (
+                value.reshape(batch, seq_len, n_hh, *v_shape[2:])
+                * mask_per_token.view(1, 1, n_hh, *([1] * (len(v_shape) - 2)))
+            ).reshape(*v_shape).contiguous()
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
@@ -407,18 +603,96 @@ class GatedDeltaNet(MegatronModule):
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
+        # Initial state: learnable param > carried full-batch state > None.
+        if self.initial_state_param is not None:
+            initial_state = (
+                self.initial_state_param.unsqueeze(0)
+                .expand(batch, -1, -1, -1)
+                .contiguous()
+            )
+        elif self._carry_enabled:
+            # Lazy-init or shape-rebuild if batch size changed.
+            num_v_heads_local = self.num_value_heads // self.tp_size
+            need_init = (
+                self._carried_state is None
+                or self._carried_state.shape[0] != batch
+                or self._carried_state.shape[1] != num_v_heads_local
+            )
+            if need_init:
+                self._carried_state = torch.zeros(
+                    batch,
+                    num_v_heads_local,
+                    self.key_head_dim,
+                    self.value_head_dim,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            initial_state = self._carried_state.detach()
+        else:
+            initial_state = None
+
+        # Need the final state if we're carrying it forward or logging state stats.
+        log_state_stats = os.environ.get("APERTUS_LOG_STATE_STATS", "0") == "1"
+        need_final_state = self._carry_enabled or log_state_stats
+
         nvtx_range_push(suffix="gated_delta_rule")
+        fla_extra_kwargs = {"num_householder": n_hh} if n_hh > 1 else {}
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
             query,
             key,
             value,
             g=g,
             beta=beta,
-            initial_state=None,
-            output_final_state=False,
+            initial_state=initial_state,
+            output_final_state=need_final_state,
             use_qk_l2norm_in_kernel=False,
+            **fla_extra_kwargs,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
+        # chunk_gated_delta_product returns one output per ORIGINAL token, but if its
+        # output happens to be n_hh-interleaved (returning [b, s*n, h, d_v]), reduce by
+        # taking every n_hh-th entry. Empirically the kernel returns [b, s, h, d_v].
+        if n_hh > 1 and core_attn_out.shape[1] != seq_len:
+            assert core_attn_out.shape[1] == seq_len * n_hh, (
+                f"unexpected core_attn_out shape {core_attn_out.shape}"
+            )
+            # Take the last Householder slot per token (the one that "reads")
+            core_attn_out = core_attn_out.reshape(batch, seq_len, n_hh, *core_attn_out.shape[2:])[:, :, -1]
+
+        # Carry-over: keep full per-batch-element state (no mean reduction).
+        if self._carry_enabled and last_recurrent_state is not None:
+            with torch.no_grad():
+                new_state = last_recurrent_state.detach().to(self._carried_state.dtype)
+                cap = self.config.linear_attention_carried_state_max_frob
+                if cap > 0.0:
+                    # Per-batch-element Frobenius cap on the carried state.
+                    flat = new_state.reshape(new_state.shape[0], -1).float()
+                    norms = flat.norm(dim=-1, keepdim=True)  # [batch, 1]
+                    scale = torch.clamp(cap / norms.clamp_min(1e-12), max=1.0)
+                    flat = flat * scale
+                    new_state = flat.reshape_as(new_state).to(new_state.dtype)
+                self._carried_state = new_state
+
+        # State stats: GPU-resident scalars; the logging-patch hook drains them.
+        if log_state_stats and last_recurrent_state is not None:
+            with torch.no_grad():
+                s = last_recurrent_state.detach().float()
+                stats = {
+                    "frob": s.norm(),
+                    "amax": s.abs().amax(),
+                    "abs_mean": s.abs().mean(),
+                    "std": s.std(),
+                }
+                if initial_state is not None:
+                    init_f = initial_state.detach().float().norm()
+                    stats["init_frob"] = init_f
+                    stats["delta_frob"] = stats["frob"] - init_f
+                else:
+                    stats["init_frob"] = torch.zeros((), device=s.device)
+                    stats["delta_frob"] = stats["frob"].clone()
+                self._last_state_stats = stats
+        else:
+            self._last_state_stats = None
 
         # RMSNorm
         nvtx_range_push(suffix="gated_norm")
@@ -448,9 +722,16 @@ class GatedDeltaNet(MegatronModule):
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])
         y = self.out_norm(x)
-        # Output gate
-        gate = gate.reshape(-1, gate.shape[-1])
-        y = y * self.act_fn(gate.float())
+        # Output gate (skipped for Schlag-style vanilla DeltaNet)
+        if self.config.linear_attention_use_output_gate:
+            if self.config.linear_attention_output_gate_form == 'scalar':
+                # gate shape [b, s, h, d_v] -> mean over d_v -> [b, s, h, 1].
+                # Flatten to [b*s*h, 1] to match y, then broadcast SiLU(scalar) over d_v.
+                gate_scalar = gate.mean(dim=-1, keepdim=True).reshape(-1, 1).float()
+                y = y * self.act_fn(gate_scalar)
+            else:
+                gate = gate.reshape(-1, gate.shape[-1])
+                y = y * self.act_fn(gate.float())
         y = y.to(x_dtype)
         return y
 
@@ -471,9 +752,17 @@ class GatedDeltaNet(MegatronModule):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Apply L2 norm to query and key
+        # Apply normalization to query and key (l2norm by default; rmsnorm for Schlag variant)
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            query_key = query_key.contiguous()
+            if self.qk_rmsnorm is not None:
+                query_key = self.qk_rmsnorm(query_key)
+            else:
+                query_key = l2norm(query_key)
+
+        # Optional L2norm on V to bound per-token write magnitude.
+        if self.config.linear_attention_v_norm == "l2norm":
+            value = l2norm(value.contiguous())
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
@@ -500,9 +789,26 @@ class GatedDeltaNet(MegatronModule):
         """
         Compute g (decay) and beta (sigmoid) for gated delta rule.
         Fuses exp, softplus, mul, neg, and sigmoid operations.
+        When config.linear_attention_allow_neg_eigval is True, beta is doubled so
+        that (I - beta k k^T) admits eigenvalues in (-1, 1) (OLMo Hybrid recipe).
+        When config.linear_attention_use_decay is False, g is forced to zero so
+        exp(g) == 1, recovering the vanilla Schlag-2021 DeltaNet (no decay). The
+        decay computation still flows so A_log and dt_bias receive zero gradient
+        rather than no gradient (Megatron's DDP asserts every parameter sees a
+        grad each step).
+        Optional ablations (linear_attention_beta_bias_init, _beta_scale) apply a
+        learnable additive bias on the beta logit and a post-sigmoid scale.
         """
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
+        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # fp32
+        if not self.config.linear_attention_use_decay:
+            g = g * 0.0
+        if self.beta_bias is not None:
+            beta = beta + self.beta_bias
         beta = beta.sigmoid()
+        if self.config.linear_attention_allow_neg_eigval:
+            beta = beta * 2.0
+        if self.config.linear_attention_beta_scale != 1.0:
+            beta = beta * self.config.linear_attention_beta_scale
         return g, beta
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):

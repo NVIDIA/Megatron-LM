@@ -273,8 +273,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'delta_net', 'kda']] = None
+    """Type of attention variant to use. Supports gated_delta_net (Yang et al. 2025),
+    dsa (DeepSeek sparse attention), delta_net (Schlag et al. 2021 with chunkwise FLA op),
+    and kda (Kimi Delta Attention, MoonshotAI 2025)."""
 
     ####################
     # DSA
@@ -319,6 +321,85 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    linear_attention_allow_neg_eigval: bool = False
+    """If True, parameterize the delta-rule write strength as `beta = 2 * sigmoid(...)` so
+    `(I - beta k k^T)` admits eigenvalues in (-1, 1), unlocking state tracking
+    (Grazzi et al. 2025; OLMo Hybrid). Applies to gated_delta_net and delta_net variants."""
+
+    linear_attention_use_decay: bool = True
+    """If True (default), the delta-rule layer computes a per-head scalar decay g (gated_delta_net).
+    If False, decay is disabled (g forced to zero so exp(g)=1) for vanilla DeltaNet (Schlag et al.
+    2021). The corresponding alpha/dt_bias/A_log slots in the in-projection are still produced
+    but ignored to keep the projection layout uniform across variants."""
+
+    linear_attention_qk_norm: Literal['l2norm', 'rmsnorm'] = 'l2norm'
+    """Normalization applied to Q, K after the SiLU/conv1d in the delta-rule layer. 'l2norm' is the
+    FLA default for GDN/DeltaNet. 'rmsnorm' applies a learnable per-channel RMSNorm (used for
+    the Schlag-style DeltaNet variant in this repo)."""
+
+    linear_attention_v_norm: Literal['none', 'l2norm'] = 'none'
+    """If 'l2norm', also project V to unit norm along the last dim before passing to the FLA
+    chunkwise op. Default 'none' (V is the raw SiLU/conv1d output, unbounded). Bounding ||v||
+    bounds the per-token write magnitude beta v k^T."""
+
+    linear_attention_carried_state_max_frob: float = 0.0
+    """Hard cap on ||S||_F of the carried state buffer (linear_attention_carry_state). If the
+    new last-recurrent-state has Frobenius norm above this value, scale it down before storing
+    in the buffer for the next forward. Zero (default) disables the cap. Applied per-rank,
+    per-batch-element on the buffer only; intra-forward state is not capped."""
+
+    linear_attention_n_householder: int = 1
+    """Number of Householder-style updates per token (DeltaProduct). 1 (default) recovers
+    standard DeltaNet/GDN. n>1 routes the FLA op to chunk_gated_delta_product, which chains
+    n rank-1 reflections per token. Each token must produce n sets of (q, k, v, beta, alpha);
+    in_proj output dim grows by ~n* for those slots while the output gate stays per-token.
+    Recurrence and projection compute scale ~n*."""
+
+    linear_attention_n_erase: int = 0
+    """Number of pure-erase Householders per token (subset of n_householder). The last
+    n_erase positions of each token's n_householder updates have v forced to zero, so they
+    contribute only the (I - beta k k^T) erasure factor to the chained transform — no v k^T
+    addition. Useful for explicitly removing past info along key directions without writing
+    new info. n_householder must be > n_erase. The erase positions still consume v projection
+    slots in in_proj (those values are wasted)."""
+
+    linear_attention_use_output_gate: bool = True
+    """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
+    matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""
+
+    linear_attention_qk_norm_init_scale: float = 1.0
+    """Multiplier applied to the QK-RMSNorm weight init for the Schlag DeltaNet variant. The
+    base init is 1/sqrt(head_dim) (unit-norm output); values < 1 produce sub-unit-norm Q,K which
+    leaves a stability margin for delta-rule eigenvalues, useful for the neg-eigval variant."""
+
+    linear_attention_beta_scale: float = 1.0
+    """Post-sigmoid multiplier on the delta-rule write strength beta. With allow_neg_eigval the
+    base beta is 2*sigmoid(...); a scale of 0.95 caps beta at 1.9. Without allow_neg_eigval the
+    base is sigmoid(...); a scale of 0.9 caps beta at 0.9."""
+
+    linear_attention_beta_bias_init: float = 0.0
+    """Additive bias on the beta projection logit (pre-sigmoid). A negative value (e.g. -2) makes
+    beta start near 0.12 instead of 0.5, slowing initial writes so the recurrent state forms
+    before strong updates land. Adds a small per-head learnable parameter."""
+
+    linear_attention_learnable_initial_state: bool = False
+    """If True, learn a per-head initial state S0 of shape [num_v_heads_local_tp, key_head_dim,
+    value_head_dim] and pass it as `initial_state` to the FLA chunkwise op. Useful for cold-start:
+    the first few tokens of each sequence read from a learned baseline rather than zero."""
+
+    linear_attention_output_gate_form: Literal['per_channel', 'scalar'] = 'per_channel'
+    """Form of the output gate when use_output_gate=True. 'per_channel' (default, GDN/FLA
+    behavior) applies SiLU(z) per value-channel; gate has shape [b, s, h, d_v]. 'scalar' mean-
+    pools the gate projection over d_v to a single scalar per head per token, then broadcasts
+    SiLU(scalar) over the output channels. The scalar form provides a softer, single-knob
+    gate that commutes with the linear read (per-head) and uses fewer effective dofs."""
+
+    linear_attention_carry_state: bool = False
+    """If True, carry the recurrent state across forward passes. Each forward pulls the
+    previous step's last_recurrent_state (detached, mean-reduced over batch, broadcast back
+    over the new batch) as initial_state, then writes the new last state into a non-persistent
+    buffer. Per-rank carry (no DP all-reduce). Mutually exclusive with linear_attention_learnable_initial_state."""
 
     ####################
     # initialization
@@ -1097,10 +1178,11 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.experimental_attention_variant == "gated_delta_net":
+        if self.experimental_attention_variant in ("gated_delta_net", "delta_net", "kda"):
             assert (
                 self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear gated_delta_net."
+            ), f"linear_attention_freq must be set for linear-attention variants " \
+               f"(got {self.experimental_attention_variant})."
 
             # Check required parameters
             assert (

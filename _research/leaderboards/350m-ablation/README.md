@@ -8,7 +8,9 @@ All entries share data, schedule, seed (42), and **active param count
 (~355M)** per token; the `change` column carries the diff that produced
 the entry. Most rows are dense (active = total = 355M). MoE rows
 add total params via routed experts while keeping active fixed
-(`topk * moe_ffn_hidden = ffn_hidden = 2560`). W&B project:
+(`topk * moe_ffn_hidden = ffn_hidden = 2560`). Linear-attention rows
+swap softmax attention for an SSM/linear-attention variant in 18/24
+layers (3:1 hybrid) and keep the dense FFN. W&B project:
 [megatron-lm-research-baseline](https://wandb.ai/ischlag/megatron-lm-research-baseline).
 
 The `commit` column records the git tag (and short SHA) of the
@@ -32,13 +34,14 @@ reference. Roots have an empty `parent`.
 | 6 | aurora-lr1e-2 | normuon-lr3.6e-4 | Aurora polar (Tilde): row-uniform Stiefel; matrix LR rescaled to 1e-2 | Aurora | 1e-2 | 2.200 | 2.038 | [`08-aurora-lr1e-2.sbatch`](runs/08-aurora-lr1e-2.sbatch) | [czxm4be0](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/czxm4be0) | [`c51a272dd`](https://github.com/ischlag/megatron-lm-research-baseline/tree/c51a272dd) |
 | 7 | aurora-qkn-learned-sink | aurora-qkn | add `--softmax-type learnable` (gpt-oss per-head learned sink bias) | Aurora + QK norm + learned sink | 1e-2 | 2.201 | 2.040 | [`15-aurora-qkn-learned-sink.sbatch`](runs/15-aurora-qkn-learned-sink.sbatch) | [9n4abgdu](https://wandb.ai/ischlag/lm-research-baseline-dev/runs/9n4abgdu) | [`435b3cf2d`](https://github.com/ischlag/megatron-lm-research-baseline/tree/435b3cf2d) |
 | 8 | aurora-qkn-softmax1 | aurora-qkn | add `--softmax-type off-by-one` (Evan Miller softmax1 sink) | Aurora + QK norm + softmax1 | 1e-2 | 2.203 | 2.027 | [`14-aurora-qkn-softmax1.sbatch`](runs/14-aurora-qkn-softmax1.sbatch) | [tz4vr1ng](https://wandb.ai/ischlag/lm-research-baseline-dev/runs/tz4vr1ng) | [`bd77a2f32`](https://github.com/ischlag/megatron-lm-research-baseline/tree/bd77a2f32) |
-| 9 | normuon-lr3.6e-4 | muon-kj-lr2e-2 | adaptive_muon (NorMuon per-row 2nd moment); LR rescaled to 3.6e-4 | NorMuon | 3.6e-4 | 2.224 | 2.061 | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [0l47egjv](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/0l47egjv) | [`baseline-2026-05-08-0b2385c`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-0b2385c) |
-| 10 | muon-kj-lr2e-2 |  | root: plain Muon, Keller Jordan recipe (`shape_scaling`, LR 2e-2) | Muon (shape_scaling) | 2e-2 | 2.226 | 2.068 | [`03-muon-kj-lr2e-2.sbatch`](runs/03-muon-kj-lr2e-2.sbatch) | [f7uvsbai](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/f7uvsbai) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 11 | normuon-lr2e-4 | normuon-lr3.6e-4 | LR 3.6e-4 -> 2e-4 | NorMuon | 2e-4 | 2.227 | 2.063 | [`02-normuon-lr2e-4.sbatch`](runs/02-normuon-lr2e-4.sbatch) | [heevf919](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 12 | normuon-fp8 | normuon-lr3.6e-4 | add `--fp8-format e4m3 --fp8-recipe blockwise` (DeepSeek-V3) | NorMuon (FP8) | 3.6e-4 | 2.229 | 2.065 | [`07-normuon-fp8.sbatch`](runs/07-normuon-fp8.sbatch) | [7j84uy3j](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/7j84uy3j) | [`598cbe616`](https://github.com/ischlag/megatron-lm-research-baseline/tree/598cbe616) |
-| 13 | normuon-lr6e-4 | normuon-lr3.6e-4 | LR 3.6e-4 -> 6e-4 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 14 | adamw-lr1e-3 |  | root: AdamW baseline (decoupled WD), LR 1e-3 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
-| 15 | adamw-lr5e-4 | adamw-lr1e-3 | LR 1e-3 -> 5e-4 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 9 | deltanet-perchgate-carry-v2-cap200 | normuon-lr3.6e-4 | swap 18/24 softmax-attention layers for Schlag DeltaNet (3:1 hybrid) with per-channel output gate, full per-batch carry-v2 of recurrent state, hard Frobenius cap 200 on per-element carried state | NorMuon (DN+carry-v2+cap200) | 3.6e-4 | 2.207 | 2.045 | [`17-deltanet-perchgate-carry-v2-cap200.sbatch`](runs/17-deltanet-perchgate-carry-v2-cap200.sbatch) | (dev) | [`91920d23d`](https://github.com/ischlag/megatron-lm-research-baseline/tree/91920d23d) |
+| 10 | normuon-lr3.6e-4 | muon-kj-lr2e-2 | adaptive_muon (NorMuon per-row 2nd moment); LR rescaled to 3.6e-4 | NorMuon | 3.6e-4 | 2.224 | 2.061 | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [0l47egjv](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/0l47egjv) | [`baseline-2026-05-08-0b2385c`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-0b2385c) |
+| 11 | muon-kj-lr2e-2 |  | root: plain Muon, Keller Jordan recipe (`shape_scaling`, LR 2e-2) | Muon (shape_scaling) | 2e-2 | 2.226 | 2.068 | [`03-muon-kj-lr2e-2.sbatch`](runs/03-muon-kj-lr2e-2.sbatch) | [f7uvsbai](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/f7uvsbai) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 12 | normuon-lr2e-4 | normuon-lr3.6e-4 | LR 3.6e-4 -> 2e-4 | NorMuon | 2e-4 | 2.227 | 2.063 | [`02-normuon-lr2e-4.sbatch`](runs/02-normuon-lr2e-4.sbatch) | [heevf919](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 13 | normuon-fp8 | normuon-lr3.6e-4 | add `--fp8-format e4m3 --fp8-recipe blockwise` (DeepSeek-V3) | NorMuon (FP8) | 3.6e-4 | 2.229 | 2.065 | [`07-normuon-fp8.sbatch`](runs/07-normuon-fp8.sbatch) | [7j84uy3j](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/7j84uy3j) | [`598cbe616`](https://github.com/ischlag/megatron-lm-research-baseline/tree/598cbe616) |
+| 14 | normuon-lr6e-4 | normuon-lr3.6e-4 | LR 3.6e-4 -> 6e-4 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 15 | adamw-lr1e-3 |  | root: AdamW baseline (decoupled WD), LR 1e-3 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
+| 16 | adamw-lr5e-4 | adamw-lr1e-3 | LR 1e-3 -> 5e-4 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) | [`baseline-2026-05-08-a76e5bc`](https://github.com/ischlag/megatron-lm-research-baseline/tree/baseline-2026-05-08-a76e5bc) |
 | -- | aurora-qkn-derf-rmsqk | aurora-qkn | swap RMSNorm for Derf at block norms (input/pre-MLP/final); keep RMSNorm at QK (`APERTUS_DERF_QK_RMSNORM=1`) | Aurora + QK norm + Derf | 1e-2 | 2.217 | 2.057 | [`10-aurora-qkn-derf-rmsqk.sbatch`](runs/10-aurora-qkn-derf-rmsqk.sbatch) | [94h3m6bs](https://wandb.ai/ischlag/lm-research-baseline-dev/runs/94h3m6bs) | [`dffead810`](https://github.com/ischlag/megatron-lm-research-baseline/tree/dffead810) |
 
 ## Notes on entries
@@ -134,3 +137,12 @@ reference. Roots have an empty `parent`.
   decoupled-WD AdamW.
 - `--overlap-param-gather` is on for AdamW rows and off for Muon /
   Aurora rows (it corrupts Newton-Schulz; see the main README).
+- **Rank 9** is the first architecture variant: hybrid 3:1 (Schlag DeltaNet
+  + softmax attention every 4th layer), per-channel output gate, full
+  per-batch carry-v2 of the recurrent state across batches, and a hard
+  Frobenius cap of 200 on the per-element carried state. NorMuon optimizer
+  to match the canonical recipe. Cap=200 binds late (~step 950) and keeps
+  the carried state norm bounded for length-gen safety without measurably
+  hurting iso-token loss vs the no-cap variant. Runs on
+  `feat/deltanet-variants` branch (DeltaNet flag-gated path); will be
+  re-tagged on main once the branch lands.

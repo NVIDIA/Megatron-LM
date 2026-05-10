@@ -412,6 +412,11 @@ class MambaMixer(MegatronModule):
         )
         self.tp_group = pg_collection.tp
 
+        # carry-v2: persist final SSM state across batches (per-rank, no DP all-reduce).
+        # Reuses the same config flag as our DN/GDN carry-v2 for cross-architecture parity.
+        self._carry_enabled = bool(getattr(self.config, "linear_attention_carry_state", False))
+        self._carried_ssm_state = None  # lazy-init on first forward to (batch, nheads_local_tp, headdim, d_state)
+
     def forward(
         self,
         hidden_states,
@@ -457,7 +462,26 @@ class MambaMixer(MegatronModule):
             y = self._ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
-            y = self._ssm_training(zxBCdt, packed_seq_params)
+            # carry-v2: lazy-init buffer + restore as initial_states; save final state after.
+            if self._carry_enabled:
+                if (
+                    self._carried_ssm_state is None
+                    or self._carried_ssm_state.shape[0] != batch
+                ):
+                    self._carried_ssm_state = torch.zeros(
+                        batch, self.nheads_local_tp, self.headdim, self.d_state,
+                        dtype=hidden_states.dtype, device=hidden_states.device,
+                    )
+                # .clone() so autograd's saved_tensors doesn't see the in-place
+                # copy_() we do at the end of _ssm_training (would trigger
+                # "modified by an inplace operation" on the next backward).
+                y = self._ssm_training(
+                    zxBCdt, packed_seq_params,
+                    initial_states=self._carried_ssm_state.detach().clone(),
+                    return_final_state_to=self._carried_ssm_state,
+                )
+            else:
+                y = self._ssm_training(zxBCdt, packed_seq_params)
 
         out, out_bias = self.out_proj(y)
 
@@ -673,7 +697,9 @@ class MambaMixer(MegatronModule):
         return out, out_bias
 
     def _ssm_training(
-        self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+        self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None,
+        initial_states: Optional[torch.Tensor] = None,
+        return_final_state_to: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for training step.
@@ -701,7 +727,8 @@ class MambaMixer(MegatronModule):
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
 
-        y = mamba_split_conv1d_scan_combined(
+        return_final = return_final_state_to is not None
+        y_out = mamba_split_conv1d_scan_combined(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
             self.cp.get_conv1d_bias(),
@@ -718,7 +745,15 @@ class MambaMixer(MegatronModule):
             ngroups=self.cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
+            initial_states=initial_states,
+            return_final_states=return_final,
         )
+        if return_final:
+            y, last_state = y_out
+            with torch.no_grad():
+                return_final_state_to.copy_(last_state.detach())
+        else:
+            y = y_out
 
         y = rearrange(y, "b l d -> l b d").contiguous()
         y = self.cp.post_conv_ssm(y, packed_seq_params)
