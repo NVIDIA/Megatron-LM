@@ -17,7 +17,7 @@
 #
 # Reference: Mixtral 8x7B (Jiang et al., 2024); MoEUT (Csordas et al., 2024).
 #
-#SBATCH --job-name=350m-abl-aurora-qkn-moe-32e-tk3-sh1-smoke-mbs16-rcs
+#SBATCH --job-name=350m-abl-aurora-qkn-moe-32e-tk3-sh1-smoke-mbs16-rcfull
 #SBATCH --time=00:30:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -57,11 +57,11 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-aurora-qkn-moe-32e-tk3-sh1-smoke-mbs16-rcs-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-moe-32e-tk3-sh1-smoke-mbs16-rcfull-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp-aurora-moe-32e-tk3-sh1-smoke-mbs16-rcs
-export APERTUS_TRACK=350m-ablation-aurora-qkn-moe-32e-tk3-sh1-smoke-mbs16-rcs
+export APERTUS_FEATURE=transformer-pp-aurora-moe-32e-tk3-sh1-smoke-mbs16-rcfull
+export APERTUS_TRACK=350m-ablation-aurora-qkn-moe-32e-tk3-sh1-smoke-mbs16-rcfull
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=0
 export APERTUS_LOG_TOP1_ACC=0
@@ -146,7 +146,9 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    --recompute-granularity selective
+    --recompute-granularity full
+    --recompute-method block
+    --recompute-num-layers 24
     # Distributed: TP=1, PP=1, EP=1, DP=4. EP=1 still fits (32 experts
     # * 31.5M = 1GB/layer, 24L = ~24GB on a 96GB GH200; activations + grads
     # + optimizer state add ~30-40GB more, comfortably under 96). --overlap-param-gather
