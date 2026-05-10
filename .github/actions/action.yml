@@ -201,10 +201,10 @@ runs:
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
       run: |
-        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(uuidgen)
+        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
         if [[ "$IS_UNIT_TEST" == "true" ]]; then
-          coverage_report=coverage-unit-test-${{ github.run_id }}-$(uuidgen)
+          coverage_report=coverage-unit-test-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         else
           coverage_report=none
         fi
