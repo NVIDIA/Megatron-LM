@@ -136,9 +136,6 @@ class DotProductAttention(MegatronModule):
             )
             if config.perform_initialization:
                 self.softmax_offset = config.init_method(self.softmax_offset)
-        elif self.config.softmax_type == "softpick":
-            # Rectified-softmax: no offset parameter; mask + ReLU + normalize at forward.
-            self.softmax_offset = None
         else:
             raise ValueError("Softmax type not supported")
 
@@ -210,21 +207,9 @@ class DotProductAttention(MegatronModule):
         # ===========================
 
         # attention scores and attention mask [b, np, sq, sk]
-        if self.config.softmax_type == "softpick":
-            # Softpick (arXiv 2504.20966): rectified-softmax = ReLU(x) / sum(ReLU(x)).
-            # Non-sum-to-one; eliminates attention sinks and massive activations.
-            # Scaling already applied in baddbmm (alpha=self.softmax_scale).
-            if attention_mask is not None:
-                # Set masked positions to -inf so ReLU yields 0 (no contribution to
-                # numerator or denominator).
-                attention_scores = attention_scores.masked_fill(attention_mask, float("-inf"))
-            relu_scores = torch.nn.functional.relu(attention_scores)
-            denom = relu_scores.sum(dim=-1, keepdim=True).clamp(min=1e-9)
-            attention_probs: Tensor = relu_scores / denom
-        else:
-            attention_probs: Tensor = self.scale_mask_softmax(
-                attention_scores, attention_mask, self.softmax_offset
-            )
+        attention_probs: Tensor = self.scale_mask_softmax(
+            attention_scores, attention_mask, self.softmax_offset
+        )
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
 

@@ -1506,10 +1506,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             kv_channels = self.config.kv_channels
 
         if self.config.softmax_type != "vanilla":
-            assert self.config.softmax_type != "softpick", (
-                "softmax_type='softpick' is not supported by Transformer-Engine; "
-                "set --attention-backend local to use the unfused PyTorch path."
-            )
             assert is_te_min_version("2.8.0"), (
                 f"Transformer-Engine v{get_te_version()} must be >= 2.8.0 to support"
                 "`softmax_type`."
