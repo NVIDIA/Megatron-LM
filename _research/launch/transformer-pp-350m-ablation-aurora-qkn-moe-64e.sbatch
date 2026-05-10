@@ -98,10 +98,11 @@ MEGATRON_ARGS=(
     --moe-grouped-gemm
     --moe-permute-fusion
     --moe-token-dispatcher-type alltoall
-    # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=8 (DP=4, 4 grad-accum
-    # steps). Dense baseline runs at MBS=16; MoE permuted activations + grouped
-    # GEMM workspace double the per-microbatch activation footprint, so we halve.
-    --micro-batch-size 8
+    # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=4 (DP=4, 8 grad-accum
+    # steps). 64 experts replicate ~12 GB bf16 weights + ~12 GB grads on each
+    # GPU on top of the MoE permute/dispatch activations; MBS=8 OOMs at the
+    # fused CE step (96GB GH200). Halving MBS again here.
+    --micro-batch-size 4
     --global-batch-size 128
     --train-samples 244141
     --exit-duration-in-mins 140
