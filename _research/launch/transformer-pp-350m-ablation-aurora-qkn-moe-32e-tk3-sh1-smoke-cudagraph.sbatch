@@ -101,7 +101,7 @@ MEGATRON_ARGS=(
     --moe-permute-fusion
     --moe-token-dispatcher-type alltoall
     --cuda-graph-impl transformer_engine
-    --cuda-graph-scope moe
+    --cuda-graph-scope attn moe_router moe_preprocess
     --moe-per-layer-logging
     # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=8 (DP=4, 4 grad-accum
     # steps). Dense baseline runs at MBS=16; MoE permuted activations + grouped
