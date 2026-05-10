@@ -13,7 +13,7 @@
 # Final loss: 2.167   Min loss: 2.009   (vs old leader 2.185 / 2.025)
 # Throughput: ~234.8 TFLOP/s/GPU (in-session baseline ~227); the GQA-aware
 #             rewrite + torch.compile reverses the 9% tax of the naive XSA path.
-# W&B: https://wandb.ai/ischlag/lm-research-baseline-dev/runs/mdmnb7mc
+# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/mdmnb7mc
 # Executed at git sha: 435b3cf2d
 #
 # Reference: https://blog.tilderesearch.com/blog/aurora ; XSA: arXiv 2603.09078
