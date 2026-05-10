@@ -271,13 +271,10 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
-class TestFusedMLARope:
-    @pytest.mark.parametrize("inverse", [False, True])
-    @pytest.mark.parametrize("remove_interleaving", [False, True])
-    def test_inplace_forward_backward(self, input_format, inverse, remove_interleaving):
-        _test_fused_mla_rope_inplace(
-            input_format, inverse=inverse, remove_interleaving=remove_interleaving
-        )
+class TestFusedApplyMLARope:
+    @pytest.mark.flaky_in_dev
+    def test_forward_backward_for_q(self, input_format):
+        _test_fused_apply_mla_rope_for_q(input_format)
 
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):

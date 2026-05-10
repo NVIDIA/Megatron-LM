@@ -61,6 +61,10 @@ inputs:
     description: "Platform to run tests on (e.g. dgx_h100, dgx_gb200)"
     required: false
     default: "dgx_h100"
+  cadence:
+    description: "Trigger cadence for cadence filter (pr|nightly|mergegroup). Empty disables filter."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -75,14 +79,23 @@ runs:
       shell: bash
       run: sudo chown -R $(whoami) /home/runner/
 
-    - name: Setup python and install dependencies
+    - name: Setup python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install uuid-runtime
       shell: bash -x -e -u -o pipefail {0}
       run: |
         for i in 1 2 3; do
-          apt-get update && apt-get install -y python3.12 python3.12-venv uuid-runtime && break
+          apt-get update && apt-get install -y uuid-runtime && break
           echo "apt attempt $i failed, retrying..."
           sleep 10
         done
+
+    - name: Install uv
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
         for i in 1 2 3; do
           curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh && break
           echo "uv install attempt $i failed, retrying..."
@@ -135,6 +148,9 @@ runs:
         )
         if [ "${{ inputs.lightweight }}" == "true" ]; then
           ARGS+=(--enable-lightweight-mode)
+        fi
+        if [ -n "${{ inputs.cadence }}" ]; then
+          ARGS+=(--cadence ${{ inputs.cadence }})
         fi
 
         export PYTHONPATH=$(pwd)
@@ -194,10 +210,10 @@ runs:
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
       run: |
-        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(uuidgen)
+        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
         if [[ "$IS_UNIT_TEST" == "true" ]]; then
-          coverage_report=coverage-unit-test-${{ github.run_id }}-$(uuidgen)
+          coverage_report=coverage-unit-test-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         else
           coverage_report=none
         fi
@@ -254,7 +270,7 @@ runs:
         fi
 
     - name: Upload coverage
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       if: ${{ always() && steps.check.outputs.coverage_report != 'none' }}
       with:
         name: ${{ steps.check.outputs.coverage_report }}
@@ -264,7 +280,7 @@ runs:
         include-hidden-files: true
 
     - name: Upload logs
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       if: always()
       with:
         name: ${{ steps.check.outputs.logs_report }}
