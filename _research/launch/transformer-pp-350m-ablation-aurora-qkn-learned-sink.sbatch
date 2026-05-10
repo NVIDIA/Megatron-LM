@@ -1,35 +1,17 @@
 #!/bin/bash
 #
-# 350M-ablation leaderboard - rank 1 (new)
-# 350M-active MoE: 32 routed experts top-3 + 1 shared expert, all width 640
-# (DeepSeek-V3-style fine-grained, iso-active to dense aurora-qkn).
-# Active params ~355M (matches dense); total ~1.73B.
-#   Per-layer FFN active = (topk_routed + 1_shared) * 3 * hidden * 640
-#                        = 4 * 3 * 1024 * 640 = 7.86M  (matches dense)
-#   Per-layer FFN total  = (32 + 1) * 3 * 1024 * 640 = 64.9M
-# Optimizer: Aurora on 2D matrices (attention, embeds, output, router);
-# expert weights are 3D under grouped-GEMM, so they fall through to AdamW.
-# Diff vs prior leader (09-aurora-qkn): replace dense FFN with
-#   (32 routed * 640 + 1 shared * 640) MoE, topk=3 routed; plus aux + z
-#   losses (1e-2 / 1e-3); MBS 16 -> 8 for MoE activation headroom; SLURM
-#   time 1h -> 2.5h, exit-duration 55min -> 140min.
-# All other arch knobs (RMSNorm, SwiGLU, RoPE, GQA 16h/4kv, qk-layernorm,
-# WSD schedule, Aurora 1e-2, seed=42) stay identical.
-# Final loss: 2.098   Min loss: 1.934
-# W&B: https://wandb.ai/ischlag/lm-research-baseline-dev/runs/5ttumu3u
-# Executed at git sha: c664f35d2
+# 350M ablation: aurora-qkn (current rank-1 leader) + learned per-head sink bias.
+# Tests gpt-oss style attention sink bias (OpenAI, Aug 2025): per-head learnable
+# scalar added to the softmax denominator -- model can "attend to nothing"
+# without burning a sink token.
 #
-# Reference: Mixtral 8x7B (Jiang et al., 2024); DeepSeek-V3 (DeepSeek-AI, 2024);
-# MoEUT (Csordas et al., 2024).
+# Parent: 09-aurora-qkn.sbatch
+# Change: --softmax-type learnable. Existing TE 2.8+ path; no code change.
 #
-# To reproduce bitwise:
-#   git checkout c664f35d2
-#   sbatch _research/leaderboards/350m-ablation/runs/12-aurora-qkn-moe-32e-tk3-sh1.sbatch
-#
-#SBATCH --job-name=350m-abl-aurora-qkn-moe-32e-tk3-sh1
-#SBATCH --time=02:30:00
-#SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
-#SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
+#SBATCH --job-name=350m-abl-aurora-qkn-learned-sink
+#SBATCH --time=01:00:00
+#SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline-attn-variants/_research/results/runs/%x-%j.log
+#SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline-attn-variants/_research/results/runs/%x-%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
@@ -42,7 +24,7 @@ set -euo pipefail
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
-WORKDIR=${SLURM_SUBMIT_DIR:-/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline}
+WORKDIR=${SLURM_SUBMIT_DIR:-/iopsstor/scratch/cscs/$USER/megatron-lm-research-baseline-attn-variants}
 REPO_DIR=$WORKDIR
 cd $WORKDIR
 
@@ -66,10 +48,10 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
-EXP_NAME=350m-abl-aurora-qkn-moe-32e-tk3-sh1-$(git rev-parse --short HEAD)
+EXP_NAME=350m-abl-aurora-qkn-learned-sink-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
-export APERTUS_FEATURE=transformer-pp-aurora-moe-32e-tk3-sh1
+export APERTUS_FEATURE=transformer-pp-aurora
 export APERTUS_TRACK=350m-ablation-leaderboard
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=1
@@ -81,7 +63,7 @@ export APERTUS_LOG_PER_LAYER_GRADS=1
 export APERTUS_LOG_LOSS_SPIKES=1
 
 MEGATRON_ARGS=(
-    # Architecture: 350M-active Transformer++ MoE (24L, 1024H, 16h, 4kv GQA)
+    # Architecture: 350M Transformer++ (24L, 1024H, 2560F, 16h, 4kv GQA)
     --transformer-impl transformer_engine
     --main-grads-dtype fp32
     --num-layers 24
@@ -97,28 +79,15 @@ MEGATRON_ARGS=(
     --normalization RMSNorm
     --swiglu
     --qk-layernorm
+    --softmax-type learnable
     --untie-embeddings-and-output-weights
     --attention-backend auto
     --seq-length 4096
-    # MoE: 32 experts, top-4, expert FFN 640 (fine-grained, iso-active to dense)
-    --num-experts 32
-    --moe-router-topk 3
-    --moe-ffn-hidden-size 640
-    --moe-shared-expert-intermediate-size 640
-    --moe-router-load-balancing-type aux_loss
-    --moe-aux-loss-coeff 1e-2
-    --moe-z-loss-coeff 1e-3
-    --moe-grouped-gemm
-    --moe-permute-fusion
-    --moe-token-dispatcher-type alltoall
-    --moe-per-layer-logging
-    # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=8 (DP=4, 4 grad-accum
-    # steps). Dense baseline runs at MBS=16; MoE permuted activations + grouped
-    # GEMM workspace double the per-microbatch activation footprint, so we halve.
-    --micro-batch-size 8
+    # Training: 1B tokens, GBS=128 (524K tokens/step), MBS=16 (DP=4)
+    --micro-batch-size 16
     --global-batch-size 128
     --train-samples 244141
-    --exit-duration-in-mins 140
+    --exit-duration-in-mins 55
     --log-interval 1
     --eval-interval 244141
     --eval-iters 0
@@ -136,7 +105,7 @@ MEGATRON_ARGS=(
     --clip-grad 1.0
     --adam-beta1 0.9
     --adam-beta2 0.95
-    # Aurora recipe (applies to 2D matrices; 3D expert weights fall through to AdamW)
+    # Aurora recipe
     --muon-scale-mode spectral
     --muon-nesterov
     --muon-momentum 0.95
@@ -146,7 +115,7 @@ MEGATRON_ARGS=(
     --aurora-pp-iterations 2
     --aurora-pp-beta 0.5
     --aurora-num-ns-steps 12
-    # WSD schedule, 200-step warmup, last 20% decay (same as aurora-qkn)
+    # WSD schedule, 200-step warmup, last 20% decay
     --lr 1e-2
     --min-lr 1e-3
     --lr-decay-style WSD
@@ -157,13 +126,8 @@ MEGATRON_ARGS=(
     --seed 42
     --init-method-std 0.02
     --bf16
-    # Distributed: TP=1, PP=1, EP=1, DP=4. EP=1 still fits (32 experts
-    # * 31.5M = 1GB/layer, 24L = ~24GB on a 96GB GH200; activations + grads
-    # + optimizer state add ~30-40GB more, comfortably under 96). --overlap-param-gather
-    # omitted (corrupts Newton-Schulz; same caveat as Muon).
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
-    --expert-model-parallel-size 1
     --context-parallel-size 1
     --sequence-parallel
     --use-distributed-optimizer

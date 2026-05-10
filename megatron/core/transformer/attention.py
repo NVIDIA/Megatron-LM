@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -121,6 +122,30 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+# GQA-aware Exclusive Self-Attention (XSA, arXiv 2603.09078).
+# core_attn_out: [sq, b, ng*n_per_group*hn]; value: [sq, b, ng, hn].
+# v_hat is computed once at GQA size and broadcast across n_per_group query
+# heads of each group (no repeat_interleave materialization). Avoids the ~3 GB
+# extra activation memory and 4x normalize bandwidth of the naive expand-first
+# version.
+def _xsa_subtract_value_component_eager(core_attn_out, value, ng, n_per_group, hn):
+    sq, b = core_attn_out.shape[0], core_attn_out.shape[1]
+    v_hat = torch.nn.functional.normalize(value, dim=-1, eps=1e-12).unsqueeze(-2)
+    out = core_attn_out.view(sq, b, ng, n_per_group, hn)
+    proj = (out * v_hat).sum(dim=-1, keepdim=True)
+    out = out - proj * v_hat
+    return out.reshape(sq, b, ng * n_per_group * hn)
+
+
+# Set XSA_NO_COMPILE=1 to fall back to eager if torch.compile misbehaves.
+if os.environ.get("XSA_NO_COMPILE", "0") != "1":
+    _xsa_subtract_value_component = torch.compile(
+        _xsa_subtract_value_component_eager, dynamic=False, fullgraph=True
+    )
+else:
+    _xsa_subtract_value_component = _xsa_subtract_value_component_eager
 
 
 class LinearQkv(Protocol):
@@ -1289,6 +1314,23 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+
+        # Exclusive Self-Attention (XSA, arXiv 2603.09078): subtract the component
+        # of each head's output along its own (L2-normalized) value direction.
+        # GQA-aware + torch.compile'd helper (see _xsa_subtract_value_component).
+        if self.config.exclusive_self_attention:
+            assert (
+                packed_seq_params is None
+            ), "exclusive_self_attention does not support packed sequences"
+            nvtx_range_push(suffix="exclusive_self_attention")
+            np_ = self.num_attention_heads_per_partition
+            hn = self.hidden_size_per_attention_head
+            ng = self.num_query_groups_per_partition
+            n_per_group = np_ // ng
+            core_attn_out = _xsa_subtract_value_component(
+                core_attn_out, value, ng, n_per_group, hn
+            )
+            nvtx_range_pop(suffix="exclusive_self_attention")
 
         # Output gate
         if gate is not None:
