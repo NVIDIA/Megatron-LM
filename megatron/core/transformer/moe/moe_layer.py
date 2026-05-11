@@ -600,7 +600,7 @@ class MoELayer(BaseMoELayer):
         dispatched_input = self._maybe_record_overload_factor(dispatched_input, tokens_per_expert)
         if (
             hasattr(self, "_inference_token_dispatcher")
-            and self.is_inference_cuda_graphed_iteration
+            and getattr(self, "is_inference_cuda_graphed_iteration", True)
             and not self.training
         ):
             routing_map = self.token_dispatcher.routing_map
