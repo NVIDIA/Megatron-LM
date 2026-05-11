@@ -78,6 +78,58 @@ ddp_model = NonuniformTPDistributedDataParallel(
 
 Set `tp_spares=0` to make the NTP helpers a no-op.
 
+## Rank Placement And Replica Mapping
+
+NTP configuration separates two concepts:
+
+- Global ranks are the process ranks assigned by the launcher.
+- `non_active_ranks_per_dp` values are local TP slot IDs inside a nominal
+  `tp_base` replica. They are not global rank IDs.
+
+For the helper path, `initialize_nonuniform_tp_process_groups()` assumes global
+ranks are laid out as contiguous nominal DP replicas:
+
+```text
+dp_replica_size = tp_base * context_parallel_size
+dp_rank         = global_rank // dp_replica_size
+local_tp_rank   = global_rank % tp_base
+```
+
+With `tp_base=4`, `tp_spares=2`, and
+`non_active_ranks_per_dp={(0, 0, 0): [2, 3]}`, DP replica 0 is interpreted as a
+nominal TP4 replica whose local TP slots 2 and 3 are non-active. The active
+local TP slots are 0 and 1, so that replica runs as TP2.
+
+On systems where physical placement matters, make the launcher rank order match
+the desired replica layout. For example, if one NVL domain has 2 GPUs and
+another NVL domain has 4 GPUs, and the intent is to run those as separate DP
+replicas, use a packed rank layout like:
+
+```text
+global ranks 0,1     -> reduced TP2 replica on the 2-GPU NVL domain
+global ranks 2,3,4,5 -> healthy TP4 replica on the 4-GPU NVL domain
+```
+
+That packed `TP2 + TP4` layout has only 6 physical ranks, so it should be built
+with explicit process groups in the opt-in training script rather than with the
+contiguous nominal-replica helper. The required groups are:
+
+```text
+TP groups: [0, 1], [2, 3, 4, 5]
+DP groups: [0, 2], [1, 3], [4], [5]
+```
+
+Ranks 0 and 1 are the reduced replica's active local TP slots. Ranks 2 and 3
+are the healthy replica's core local TP slots and participate in DP gradient
+sync with ranks 0 and 1. Ranks 4 and 5 are healthy extra local TP slots; NTP
+reshards their gradients through the core ranks, so their DP groups are
+singletons.
+
+Use launcher, hostfile, `CUDA_VISIBLE_DEVICES`, or cluster-specific placement
+controls to ensure these global-rank ranges actually land in the intended NVL
+domains. Pass the resulting `ProcessGroupCollection` to both the model and
+`NonuniformTPDistributedDataParallel`.
+
 ## Gradient Sync Behavior
 
 Healthy full-TP replicas contain extra TP ranks that have no peer in a reduced
