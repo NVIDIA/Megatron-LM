@@ -164,7 +164,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.optimizer import get_param_group_identifier_tuple
 
 from megatron.core.optimizer.qk_clip import clip_qk
 
@@ -813,7 +813,11 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
-            key_fn = lambda pg: [pg[key] for key in param_group_identifier_keys]
+            def key_fn(pg):
+                return tuple(
+                    (value is None, value) for value in get_param_group_identifier_tuple(pg)
+                )
+
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -3432,6 +3436,13 @@ def train(
     return iteration, num_floating_point_operations_so_far
 
 
+def _should_enable_depth_mup_eval(args):
+    return (
+        getattr(args, 'allow_depth_mup_eval', False)
+        and getattr(args, 'scaling_recipe', None) == 'depth_mup'
+    )
+
+
 def evaluate(
     forward_step_func,
     data_iterator,
@@ -3481,9 +3492,7 @@ def evaluate(
     if eval_iters is None:
         eval_iters = args.eval_iters
 
-    depth_mup_eval_enabled = (
-        args.allow_depth_mup_eval and getattr(args, 'scaling_recipe', None) == 'depth_mup'
-    )
+    depth_mup_eval_enabled = _should_enable_depth_mup_eval(args)
     with depth_mup_eval_context(depth_mup_eval_enabled), torch.no_grad():
         iteration = 0
         if verbose:

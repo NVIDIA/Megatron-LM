@@ -80,6 +80,8 @@ def _prepare_parsed_args_for_core_config(args):
 
 
 def _build_minimal_validate_yaml_namespace(**overrides):
+    language_model_overrides = overrides.pop('language_model', None)
+    model_parallel_overrides = overrides.pop('model_parallel', None)
     values = dict(
         data_path=None,
         world_size=1,
@@ -107,15 +109,21 @@ def _build_minimal_validate_yaml_namespace(**overrides):
         decoder_seq_length=None,
         lr=1e-3,
         min_lr=1e-5,
+        weight_decay=0.01,
+        weight_decay_incr_style='constant',
+        start_weight_decay=None,
+        end_weight_decay=None,
         save=None,
         save_interval=None,
         fp16_lm_cross_entropy=False,
         account_for_embedding_in_pipeline_split=False,
         overlap_p2p_comm=False,
+        spec=None,
         model_parallel=SimpleNamespace(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
             context_parallel_size=1,
+            expert_model_parallel_size=1,
             tp_comm_overlap=False,
             sequence_parallel=False,
             fp16=False,
@@ -132,9 +140,22 @@ def _build_minimal_validate_yaml_namespace(**overrides):
             scaling_recipe='none',
             fp32_residual_connection=False,
             moe_grouped_gemm=False,
+            persist_layer_norm=False,
+            distribute_saved_activations=False,
+            recompute_granularity=None,
+            recompute_method=None,
+            num_moe_experts=None,
         ),
     )
     values.update(overrides)
+    if language_model_overrides is not None:
+        values['language_model'] = SimpleNamespace(
+            **{**vars(values['language_model']), **vars(language_model_overrides)}
+        )
+    if model_parallel_overrides is not None:
+        values['model_parallel'] = SimpleNamespace(
+            **{**vars(values['model_parallel']), **vars(model_parallel_overrides)}
+        )
     return SimpleNamespace(**values)
 
 
@@ -665,6 +686,55 @@ class TestMuPConfigValidation:
         ):
             with pytest.raises(RuntimeError, match='yaml-muon-hook'):
                 validate_yaml(args)
+
+    def test_validate_yaml_defaults_depth_mup_eval_flag(self):
+        args = _build_minimal_validate_yaml_namespace(optimizer='adam')
+
+        validated_args = validate_yaml(args)
+
+        assert validated_args.allow_depth_mup_eval is False
+
+    def test_validate_yaml_calls_mup_deprecation_warning(self):
+        args = _build_minimal_validate_yaml_namespace(optimizer='adam')
+
+        with patch.object(
+            yaml_args_module, 'validate_depth_mup_optimizer_support', return_value=None
+        ), patch.object(
+            yaml_args_module, 'validate_muon_scalar_optimizer_support', return_value=None
+        ), patch.object(
+            yaml_args_module,
+            'warn_deprecated_mup_aliases',
+            side_effect=RuntimeError('yaml-mup-warning'),
+        ):
+            with pytest.raises(RuntimeError, match='yaml-mup-warning'):
+                validate_yaml(args)
+
+    def test_validate_yaml_syncs_legacy_mup_alias_fields(self):
+        args = _build_minimal_validate_yaml_namespace(
+            optimizer='adam',
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_base_head_dim=64,
+            mup_width_mult=4.0,
+            language_model=SimpleNamespace(
+                num_layers=12,
+                hidden_size=1024,
+                num_attention_heads=16,
+                ffn_hidden_size=None,
+                activation_func='gelu',
+                kv_channels=None,
+                scaling_recipe=None,
+                fp32_residual_connection=False,
+                moe_grouped_gemm=False,
+            ),
+        )
+
+        validated_args = validate_yaml(args)
+
+        assert validated_args.scaling_recipe == 'mup'
+        assert validated_args.scaling_base_hidden_size == 256
+        assert validated_args.scaling_base_head_dim == 64
+        assert validated_args.mup_width_mult == pytest.approx(4.0)
 
     def test_config_logger_serializes_canonical_depth_mup_surface(self, tmp_path):
         config = TransformerConfig(

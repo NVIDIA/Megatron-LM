@@ -372,7 +372,7 @@ def validate_depth_mup_optimizer_support(args) -> None:
 
 
 def warn_deprecated_mup_aliases(args) -> None:
-    """Warn when users spell MuP through legacy CLI aliases."""
+    """Warn when users spell MuP through legacy aliases."""
     deprecated_aliases = []
     if getattr(args, 'use_mup', False):
         deprecated_aliases.append('--use-mup')
@@ -387,7 +387,7 @@ def warn_deprecated_mup_aliases(args) -> None:
         return
 
     warn_rank_0(
-        "Legacy MuP CLI aliases are deprecated and will be removed in a future release: "
+        "Legacy MuP aliases are deprecated and will be removed in a future release: "
         f"{', '.join(deprecated_aliases)}. Use `--scaling-recipe mup` with "
         "`--scaling-base-hidden-size` and `--scaling-base-head-dim` instead. "
         "`--mup-width-mult` is derived from the resolved scaling context and any "
