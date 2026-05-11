@@ -2997,7 +2997,7 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.hybrid_context_parallel:
+    if args.dynamic_context_parallel:
         train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
