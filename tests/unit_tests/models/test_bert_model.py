@@ -14,7 +14,7 @@ from megatron.core.models.bert.bert_layer_specs import (
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, get_param, set_param
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
@@ -141,14 +141,14 @@ class TestBertModelAttentionDimensions:
     @pytest.mark.internal
     def test_transformer_engine_version_1_10(self, mocker):
         submodules = get_bert_layer_with_transformer_engine_submodules()
-        submodules.self_attention.params['attn_mask_type'] = AttnMaskType.arbitrary
+        set_param(submodules.self_attention, 'attn_mask_type', AttnMaskType.arbitrary)
 
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.10"))
         self.bert_model.transformer_layer_spec = ModuleSpec(
             module=TransformerLayer, submodules=submodules
         )
         attn_mask_dimensions = self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
-        attn_mask_type = submodules.self_attention.params['attn_mask_type']
+        attn_mask_type = get_param(submodules.self_attention, 'attn_mask_type')
         assert (
             attn_mask_type == AttnMaskType.padding
         ), f"Exepcted attn mask type to be padding, but got {attn_mask_type}"
@@ -171,7 +171,7 @@ class TestBertModelAttentionDimensions:
     @pytest.mark.flaky_in_dev
     def test_transformer_engine_version_1_7_to_1_10_rng_error(self, mocker):
         submodules = get_bert_layer_with_transformer_engine_submodules()
-        submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
+        set_param(submodules.self_attention, 'attn_mask_type', AttnMaskType.padding)
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.8"))
         with pytest.raises(Exception) as exc_info:
             self.bert_model = BertModel(
@@ -191,16 +191,16 @@ class TestBertModelAttentionDimensions:
     def test_transformer_engine_version_1_7_to_1_10_unfused_attention(self, mocker):
         self.bert_model.config.attention_backend = AttnBackend.unfused
         submodules = get_bert_layer_with_transformer_engine_submodules()
-        submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
+        set_param(submodules.self_attention, 'attn_mask_type', AttnMaskType.padding)
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.8"))
         self.bert_model.transformer_layer_spec = ModuleSpec(
             module=TransformerLayer, submodules=submodules
         )
         attn_mask_dimensions = self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
-        attn_mask_type = submodules.self_attention.params['attn_mask_type']
+        attn_mask_type = get_param(submodules.self_attention, 'attn_mask_type')
         assert (
             attn_mask_type == AttnMaskType.arbitrary
-        ), f"Exepcted attn mask type to be arbitrary, but got {attn_mask_type}"
+        ), f"Expected attn mask type to be arbitrary, but got {attn_mask_type}"
         assert (
             attn_mask_dimensions == "b1ss"
         ), f"Expected b1ss for attn_mask_dimensions but got {attn_mask_dimensions}"

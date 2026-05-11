@@ -95,9 +95,9 @@ def _get_hybrid_stack_local_spec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=Norm,
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": attn_mask_type},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=attn_mask_type,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=core_attention,

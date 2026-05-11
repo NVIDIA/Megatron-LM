@@ -5,7 +5,13 @@ from typing import Protocol
 
 import pytest
 
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_submodules
+from megatron.core.transformer.spec_utils import (
+    ModuleSpec,
+    build_module,
+    get_param,
+    get_submodules,
+    set_param,
+)
 
 
 def dummy_method(x: int, y: str) -> dict:
@@ -127,3 +133,100 @@ class TestGetSubmodules:
         """Test getting submodules from a use of partial."""
         submodules = BSubmodules(x=OtherChild, y=partial(ExampleA, y='test'))
         assert get_submodules(partial(ExampleB, submodules=submodules, z=123)) == submodules
+
+
+class TestGetParam:
+    """Test that the `get_param` utility works as expected."""
+
+    def test_get_param_missing(self):
+        """Test getting a param from a spec that does not carry one."""
+        with pytest.raises(ValueError):
+            get_param(dummy_method, 'x')
+        with pytest.raises(ValueError):
+            get_param(ExampleA, 'x')
+        with pytest.raises(KeyError):
+            get_param(partial(ExampleA, x=1, y='test'), 'z')
+        with pytest.raises(KeyError):
+            get_param(ModuleSpec(module=ExampleA, params={'x': 1}), 'y')
+
+    def test_get_param_module_spec(self):
+        """Test getting a param from a ModuleSpec."""
+        spec = ModuleSpec(module=ExampleA, params={'x': 1, 'y': 'test'})
+        assert get_param(spec, 'x') == 1
+        assert get_param(spec, 'y') == 'test'
+
+    def test_get_param_partial(self):
+        """Test getting a param from a `partial`."""
+        p = partial(ExampleA, x=1, y='test')
+        assert get_param(p, 'x') == 1
+        assert get_param(p, 'y') == 'test'
+
+    def test_get_param_submodules(self):
+        """Test that `get_param('submodules', ...)` delegates to `get_submodules`."""
+        submodules = BSubmodules(x=OtherChild, y=partial(ExampleA, y='test'))
+        spec = ModuleSpec(module=ExampleB, submodules=submodules, params={'z': 123})
+        assert get_param(spec, 'submodules') is submodules
+
+        p = partial(ExampleB, submodules=submodules, z=123)
+        assert get_param(p, 'submodules') is submodules
+
+        # A spec with no submodules should still raise ValueError via get_submodules.
+        with pytest.raises(ValueError):
+            get_param(dummy_method, 'submodules')
+
+
+class TestSetParam:
+    """Test that the `set_param` utility works as expected."""
+
+    def test_set_param_module_spec(self):
+        """Test setting a param on a ModuleSpec."""
+        spec = ModuleSpec(module=ExampleA, params={'x': 1, 'y': 'old'})
+        set_param(spec, 'y', 'new')
+        assert spec.params == {'x': 1, 'y': 'new'}
+
+        # Also covers inserting a key that wasn't already in `params`.
+        set_param(spec, 'z', 99)
+        assert spec.params == {'x': 1, 'y': 'new', 'z': 99}
+
+        # Round-trip via get_param.
+        assert get_param(spec, 'y') == 'new'
+        assert get_param(spec, 'z') == 99
+
+    def test_set_param_partial(self):
+        """Test setting a param on a `partial`."""
+        p = partial(ExampleA, x=1, y='old')
+        set_param(p, 'y', 'new')
+        assert p.keywords == {'x': 1, 'y': 'new'}
+
+        # Inserting a previously absent keyword.
+        set_param(p, 'extra', 42)
+        assert p.keywords['extra'] == 42
+
+        # Round-trip via get_param.
+        assert get_param(p, 'y') == 'new'
+        assert get_param(p, 'extra') == 42
+
+    def test_set_param_missing(self):
+        """Test setting a param on a spec without a `params`/`keywords` slot."""
+        with pytest.raises(ValueError):
+            set_param(dummy_method, 'x', 1)
+        with pytest.raises(ValueError):
+            set_param(ExampleA, 'x', 1)
+
+    def test_set_param_submodules_rejected(self):
+        """`set_param` must refuse to overwrite `submodules` for any spec type."""
+        submodules = BSubmodules(x=OtherChild, y=partial(ExampleA, y='test'))
+        spec = ModuleSpec(module=ExampleB, submodules=submodules, params={'z': 123})
+        with pytest.raises(ValueError):
+            set_param(spec, 'submodules', BSubmodules(x=OtherChild, y=partial(ExampleA, y='x')))
+        # The original submodules must be untouched.
+        assert spec.submodules is submodules
+
+        p = partial(ExampleB, submodules=submodules, z=123)
+        with pytest.raises(ValueError):
+            set_param(p, 'submodules', BSubmodules(x=OtherChild, y=partial(ExampleA, y='x')))
+        assert p.keywords['submodules'] is submodules
+
+        # Even for unsupported spec types, the submodules guard fires first.
+        with pytest.raises(ValueError):
+            set_param(dummy_method, 'submodules', submodules)

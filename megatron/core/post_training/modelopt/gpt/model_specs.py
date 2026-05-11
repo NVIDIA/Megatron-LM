@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from functools import partial
 
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -92,27 +93,33 @@ def get_gpt_modelopt_spec(
     core_attention = DotProductAttention if local_core_attention else TEDotProductAttention
 
     if config.multi_latent_attention:
-        attn_module = MLASelfAttention
-        attn_submodules = MLASelfAttentionSubmodules(
-            linear_q_proj=ColumnParallelLinear,
-            linear_q_down_proj=Linear,
-            q_layernorm=Norm,
-            linear_q_up_proj=ColumnParallelLinear,
-            linear_kv_down_proj=Linear,
-            kv_layernorm=Norm,
-            linear_kv_up_proj=ColumnParallelLinear,
-            core_attention=core_attention,
-            linear_proj=RowParallelLinear,
+        self_attention = partial(
+            MLASelfAttention,
+            attn_mask_type=attn_mask_type,
+            submodules=MLASelfAttentionSubmodules(
+                linear_q_proj=ColumnParallelLinear,
+                linear_q_down_proj=Linear,
+                q_layernorm=Norm,
+                linear_q_up_proj=ColumnParallelLinear,
+                linear_kv_down_proj=Linear,
+                kv_layernorm=Norm,
+                linear_kv_up_proj=ColumnParallelLinear,
+                core_attention=core_attention,
+                linear_proj=RowParallelLinear,
+            ),
         )
     else:
         norm = L2Norm if qk_l2_norm else Norm if config.qk_layernorm else IdentityOp
-        attn_module = SelfAttention
-        attn_submodules = SelfAttentionSubmodules(
-            linear_qkv=ColumnParallelLinear,
-            core_attention=core_attention,
-            linear_proj=RowParallelLinear,
-            q_layernorm=norm,
-            k_layernorm=norm,
+        self_attention = partial(
+            SelfAttention,
+            attn_mask_type=attn_mask_type,
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=ColumnParallelLinear,
+                core_attention=core_attention,
+                linear_proj=RowParallelLinear,
+                q_layernorm=norm,
+                k_layernorm=norm,
+            ),
         )
 
     dense_mlp_spec = get_mlp_module_spec(use_te=False)
@@ -121,11 +128,7 @@ def get_gpt_modelopt_spec(
         module=transformer_layer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=Norm,
-            self_attention=ModuleSpec(
-                module=attn_module,
-                params={"attn_mask_type": attn_mask_type},
-                submodules=attn_submodules,
-            ),
+            self_attention=self_attention,
             self_attn_bda=get_bias_dropout_add,
             pre_mlp_layernorm=Norm,
             mlp=dense_mlp_spec,

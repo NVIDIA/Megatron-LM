@@ -78,13 +78,15 @@ class GatedDeltaNet(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: GatedDeltaNetSubmodules,
-        layer_number: int = None,
+        layer_number: int | None = None,
         bias: bool = False,
         conv_bias: bool = False,
         conv_init: Optional[float] = None,
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: ProcessGroupCollection | None = None,
+        cp_comm_type: str | None = None,
+        pp_layer_offset: int | None = None,
     ):
         """
         Args:
@@ -259,14 +261,14 @@ class GatedDeltaNet(MegatronModule):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Tensor,
+        attention_mask: Tensor | None,
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[int] = None,
+        sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
-    ):
+    ) -> tuple[Tensor, Tensor]:
         """
         Perform a forward pass through the GDN module.
 
@@ -588,6 +590,10 @@ class GatedDeltaNet(MegatronModule):
             )
 
         return sharded_state_dict
+
+    def set_for_recompute_input_layernorm(self):
+        """Set the input layernorm to be used for recompute."""
+        pass
 
     def backward_dw(self):
         """Execute weight gradient computation for all linear layers."""

@@ -19,7 +19,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.attention import SelfAttentionSubmodules
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
@@ -158,16 +158,10 @@ class LLaVAModel(MegatronModule):
         self.context_parallel_lm = language_transformer_config.context_parallel_size
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
             if not language_model_type.startswith('nemotron5-hybrid'):
-                assert isinstance(
-                    language_transformer_layer_spec.submodules, TransformerLayerSubmodules
-                )
-                assert isinstance(
-                    language_transformer_layer_spec.submodules.self_attention.submodules,
-                    SelfAttentionSubmodules,
-                )
-                attn_submodules = (
-                    language_transformer_layer_spec.submodules.self_attention.submodules
-                )
+                transformer_layer_submodules = get_submodules(language_transformer_layer_spec)
+                assert isinstance(transformer_layer_submodules, TransformerLayerSubmodules)
+                attn_submodules = get_submodules(transformer_layer_submodules.self_attention)
+                assert isinstance(attn_submodules, SelfAttentionSubmodules)
                 assert (
                     attn_submodules.core_attention == TEDotProductAttention and HAVE_TE
                 ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."

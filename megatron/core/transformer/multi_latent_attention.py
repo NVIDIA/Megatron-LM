@@ -1,9 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Union
+from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -39,7 +39,7 @@ from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
-from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -47,6 +47,10 @@ from megatron.core.utils import (
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.inference.contexts import BaseInferenceContext
+    from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -289,21 +293,21 @@ class MultiLatentAttention(Attention):
 
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        key_value_states=None,
-        inference_context=None,
-        rotary_pos_emb=None,
-        rotary_pos_cos=None,
-        rotary_pos_sin=None,
-        rotary_pos_cos_sin=None,
-        attention_bias=None,
-        packed_seq_params=None,
-        position_ids=None,
-        sequence_len_offset=None,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        key_value_states: torch.Tensor | None = None,
+        inference_context: BaseInferenceContext | None = None,
+        rotary_pos_emb: torch.Tensor | None = None,
+        rotary_pos_cos: torch.Tensor | None = None,
+        rotary_pos_sin: torch.Tensor | None = None,
+        rotary_pos_cos_sin: torch.Tensor | None = None,
+        attention_bias: torch.Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        position_ids: torch.Tensor | None = None,
+        sequence_len_offset: torch.Tensor | None = None,
         *,
-        inference_params=None,
-    ):
+        inference_params: BaseInferenceContext | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
         assert attention_bias is None, "Attention bias should not be passed into MLA."
@@ -469,7 +473,7 @@ class MLASelfAttention(MultiLatentAttention):
 
     def __init__(
         self,
-        config: MLATransformerConfig,
+        config: TransformerConfig,
         submodules: MLASelfAttentionSubmodules,
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
@@ -477,6 +481,9 @@ class MLASelfAttention(MultiLatentAttention):
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
     ):
+        assert isinstance(
+            config, MLATransformerConfig
+        ), "MLASelfAttention requires MLATransformerConfig"
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -1206,13 +1213,17 @@ class FusedMLASelfAttention(MLASelfAttention):
 
     def __init__(
         self,
-        config: MLATransformerConfig,
+        config: TransformerConfig,
         submodules: MLASelfAttentionSubmodules,
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        pp_layer_offset: int | None = None,
     ):
+        assert isinstance(
+            config, MLATransformerConfig
+        ), "FusedMLASelfAttention only works with MLATransformerConfig"
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 

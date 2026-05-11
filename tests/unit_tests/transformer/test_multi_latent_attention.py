@@ -27,6 +27,7 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttentionSubmodules,
     MultiLatentAttention,
 )
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.arguments import parse_args
@@ -97,9 +98,9 @@ def make_test_packed_seq_params_with_padding(
 
 
 def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
-    submodules = get_gpt_layer_with_transformer_engine_submodules(
-        multi_latent_attention=True
-    ).self_attention.submodules
+    submodules = get_submodules(
+        get_gpt_layer_with_transformer_engine_submodules(multi_latent_attention=True).self_attention
+    )
     assert isinstance(submodules, MLASelfAttentionSubmodules)
     if linear_qkv_down_proj is not None:
         submodules.linear_q_down_proj = linear_qkv_down_proj
@@ -109,9 +110,11 @@ def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
 
 def get_fused_mla_submodules():
     """Get submodules for FusedMLASelfAttention via the mla_down_proj_fusion spec path."""
-    submodules = get_gpt_layer_with_transformer_engine_submodules(
-        multi_latent_attention=True, mla_down_proj_fusion=True
-    ).self_attention.submodules
+    submodules = get_submodules(
+        get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True, mla_down_proj_fusion=True
+        ).self_attention
+    )
     assert isinstance(submodules, MLASelfAttentionSubmodules)
     assert submodules.linear_qkv_down_proj is not None
     return submodules

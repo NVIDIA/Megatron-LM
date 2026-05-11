@@ -388,28 +388,28 @@ class Attention(MegatronModule, ABC):
 
     def _checkpointed_attention_forward(
         self,
-        query,
-        key,
-        value,
-        attention_mask,
-        rotary_pos_emb=None,
-        attn_mask_type=None,
-        attention_bias=None,
-        packed_seq_params=None,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor | None,
+        rotary_pos_emb: Tensor | None = None,
+        attn_mask_type: AttnMaskType | None = None,
+        attention_bias: Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
     ):
         """Forward method with selective activation checkpointing."""
 
-        def custom_forward(*inputs):
+        def custom_forward(*inputs: torch.Tensor | None):
             query = inputs[0]
             key = inputs[1]
             value = inputs[2]
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
-            attn_mask_type = AttnMaskType(attn_mask_type.item())
+            attn_mask_type = AttnMaskType(not_none(attn_mask_type).item())
             output_ = self._run_core_attention(
-                query,
-                key,
-                value,
+                not_none(query),
+                not_none(key),
+                not_none(value),
                 attention_mask,
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
@@ -419,22 +419,29 @@ class Attention(MegatronModule, ABC):
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
-        attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
+        attn_mask_type_t = torch.tensor([attn_mask_type.value], dtype=torch.int)
         hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
+            custom_forward,
+            False,
+            query,
+            key,
+            value,
+            attention_mask,
+            rotary_pos_emb,
+            attn_mask_type_t,
         )
 
         return hidden_states
 
     def _run_core_attention(
         self,
-        query,
-        key,
-        value,
-        attention_mask,
-        attn_mask_type=None,
-        attention_bias=None,
-        packed_seq_params=None,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor | None,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
         **extra_kwargs,
     ):
         """Run the configured core attention module."""
@@ -490,10 +497,10 @@ class Attention(MegatronModule, ABC):
         key: Tensor,
         value: Tensor,
         rotary_pos_emb: Tensor,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        rotary_pos_cos_sin: Optional[Tensor] = None,
-        sequence_len_offset: Optional[int] = None,
+        rotary_pos_cos: Tensor | None = None,
+        rotary_pos_sin: Tensor | None = None,
+        rotary_pos_cos_sin: Tensor | None = None,
+        sequence_len_offset: Tensor | int | None = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
@@ -512,7 +519,7 @@ class Attention(MegatronModule, ABC):
             rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
             rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
             Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
-            sequence_len_offset (Optional[int]): Sequence length offset used for
+            sequence_len_offset (Optional[Tensor | int]): Sequence length offset used for
                 inference CUDA graphs.
 
         Return:
@@ -683,7 +690,7 @@ class Attention(MegatronModule, ABC):
 
     def flash_decode(
         self,
-        sequence_len_offset: Tensor,
+        sequence_len_offset: int | Tensor | None,
         query_layer: Tensor,
         key_layer: Tensor,
         value_layer: Tensor,
@@ -971,18 +978,18 @@ class Attention(MegatronModule, ABC):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Tensor,
-        key_value_states: Optional[Tensor] = None,
-        inference_context: Optional[BaseInferenceContext] = None,
-        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        rotary_pos_cos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[int] = None,
+        attention_mask: Tensor | None,
+        key_value_states: Tensor | None = None,
+        inference_context: BaseInferenceContext | None = None,
+        rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
+        rotary_pos_cos: Tensor | None = None,
+        rotary_pos_sin: Tensor | None = None,
+        rotary_pos_cos_sin: Tensor | None = None,
+        attention_bias: Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        sequence_len_offset: int | Tensor | None = None,
         *,
-        inference_params: Optional[BaseInferenceContext] = None,
+        inference_params: BaseInferenceContext | None = None,
     ) -> tuple[Tensor, Tensor]:
         """
         Perform a forward pass through the attention module.
@@ -1001,7 +1008,7 @@ class Attention(MegatronModule, ABC):
             Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Optional[Tensor]): Attention bias.
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
-            sequence_len_offset (Optional[int]): Sequence length offset used for
+            sequence_len_offset (Optional[Tensor | int]): Sequence length offset used for
                 inference CUDA graphs.
 
         Return:

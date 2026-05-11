@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from functools import partial
 from typing import Optional
 
 from megatron.core.extensions.transformer_engine import (
@@ -44,9 +45,9 @@ def decoder_model_with_transformer_engine_default_spec(
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
@@ -73,9 +74,9 @@ def decoder_model_with_local_default_spec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=LNImpl,
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,

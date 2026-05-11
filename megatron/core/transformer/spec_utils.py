@@ -140,3 +140,40 @@ def get_submodules(spec: Callable[..., Any]) -> object:
     if hasattr(spec, "submodules"):
         return spec.submodules  # type: ignore
     raise ValueError(f"Could not find `submodules` in the provided spec: {spec!r}")
+
+
+def get_param(spec: Callable[..., Any], param: str) -> object:
+    """Gets the keyword argument `param` from the provided spec.
+
+    Supports `partial` objects, as well as ModuleSpec or any other object with a `params` attr.
+    Raises a ValueError if the provided spec is not supported.
+    """
+    if param == 'submodules':
+        return get_submodules(spec)
+    if isinstance(spec, functools.partial):
+        return spec.keywords[param]
+    if hasattr(spec, "params"):
+        return spec.params[param]  # type: ignore
+    raise ValueError(f"Could not find `{param}` in the provided spec: {spec!r}")
+
+
+def set_param(spec: Callable[..., Any], param: str, value: object):
+    """Sets the keyword argument `param` of the provided spec.
+
+    Avoid using this function when possible.
+
+    Supports `partial` objects, as well as ModuleSpec or any other object with a `params` attr.
+    Raises a ValueError if the provided spec is not supported.
+    """
+    if param == 'submodules':
+        raise ValueError(
+            "Use `get_submodules` and modify the returned submodules object to set submodules"
+            " instead of using `set_param`."
+        )
+    if isinstance(spec, functools.partial):
+        spec.keywords[param] = value
+        return
+    if hasattr(spec, "params"):
+        spec.params[param] = value  # type: ignore
+        return
+    raise ValueError(f"Could not find `{param}` in the provided spec: {spec!r}")

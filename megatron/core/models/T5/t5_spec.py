@@ -59,13 +59,13 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.padding},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.padding,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
+                    linear_proj=not_none(TERowParallelLinear),
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
@@ -89,13 +89,13 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
+                    linear_proj=not_none(TERowParallelLinear),
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
@@ -132,9 +132,9 @@ def encoder_model_with_local_spec() -> ModuleSpec:
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=LNImpl,
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.arbitrary},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.arbitrary,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
@@ -167,9 +167,9 @@ def decoder_model_with_local_spec() -> ModuleSpec:
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=LNImpl,
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,

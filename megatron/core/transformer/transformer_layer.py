@@ -226,6 +226,50 @@ class MlpBuilder(Protocol):
     ) -> MlpInterface: ...
 
 
+class SelfAttentionInterface(Protocol):
+    """Interface for self attention implementations in the transformer layer."""
+
+    def forward(
+        self,
+        input_layernorm_output: torch.Tensor,
+        /,
+        *,
+        attention_mask: torch.Tensor | None,
+        inference_context: BaseInferenceContext | None,
+        rotary_pos_emb: torch.Tensor | None,
+        rotary_pos_cos: torch.Tensor | None,
+        rotary_pos_sin: torch.Tensor | None,
+        rotary_pos_cos_sin: torch.Tensor | None,
+        attention_bias: torch.Tensor | None,
+        packed_seq_params: PackedSeqParams | None,
+        sequence_len_offset: torch.Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        """Forward method for the self_attention layer."""
+        ...
+
+    def set_for_recompute_input_layernorm(self) -> None:
+        """Set the self attention module for input layernorm recomputation."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
+        ...
+
+
+class SelfAttentionBuilder(Protocol):
+    """Interface for building self_attention modules in the transformer layer."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        cp_comm_type: str | None,
+        pg_collection: ProcessGroupCollection,
+        pp_layer_offset: int | None,
+    ) -> SelfAttentionInterface: ...
+
+
 @dataclass
 class TransformerLayerSubmodules:
     """
@@ -255,7 +299,7 @@ class TransformerLayerSubmodules:
     """
 
     input_layernorm: LayerNormBuilder = IdentityOp
-    self_attention: Union[ModuleSpec, type] = IdentityOp
+    self_attention: SelfAttentionBuilder | type[IdentityOp] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
@@ -337,26 +381,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
-        attention_optional_kwargs = {}
+        cp_comm_type: str | None = None
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
             if isinstance(config.cp_comm_type, list):
                 # layer_number is 1-indexed, so we need to subtract 1 to get the correct index
-                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[
-                    self.layer_number - 1
-                ]
+                cp_comm_type = config.cp_comm_type[self.layer_number - 1]
             else:
-                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type
-
-        attention_optional_kwargs["pg_collection"] = pg_collection
-        if pp_layer_offset is not None:
-            attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
+                cp_comm_type = config.cp_comm_type
 
         # [Module 2: SelfAttention]
-        self.self_attention = build_module(
-            submodules.self_attention,
+        self.self_attention = submodules.self_attention(
             config=self.config,
             layer_number=self.layer_number,
-            **attention_optional_kwargs,
+            cp_comm_type=cp_comm_type,
+            pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
         )
 
         # [Module 3: BiasDropoutFusion]
@@ -370,6 +409,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         # [Module 5: CrossAttention]
+        attention_optional_kwargs: dict[str, Any] = {"pg_collection": pg_collection}
+        if cp_comm_type is not None:
+            attention_optional_kwargs["cp_comm_type"] = cp_comm_type
+        if pp_layer_offset is not None:
+            attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
         self.cross_attention = build_module(
             submodules.cross_attention,
             config=self.config,
@@ -428,6 +472,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 if not isinstance(self.input_layernorm, IdentityOp):
                     self.recompute_input_layernorm = True
                     if self.config.fp8 or self.config.fp4:
+                        assert not isinstance(self.self_attention, IdentityOp)
                         self.self_attention.set_for_recompute_input_layernorm()
 
                 def can_recompute_pre_mlp_layernorm_for_cudagraph():
@@ -630,7 +675,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
+        attention_output_with_bias = apply_module(self.self_attention)(
             input_layernorm_output,
             attention_mask=attention_mask,
             inference_context=inference_context,
