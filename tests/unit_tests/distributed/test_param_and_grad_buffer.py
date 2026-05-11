@@ -10,9 +10,38 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import partition_buckets
+from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
+
+
+class TestModelWithExperts(torch.nn.Module):
+    """Model with both dense and expert-parallel parameters.
+
+    Dense layers have the default allreduce=True. Expert layers have
+    allreduce=False on their parameters, which routes them to a separate
+    buffer with a different data-parallel group.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_dense_layers: int,
+        num_expert_layers: int,
+        bias: bool,
+    ):
+        super().__init__()
+        self.dense_layers = torch.nn.ModuleList(
+            [torch.nn.Linear(input_dim, output_dim, bias) for _ in range(num_dense_layers)]
+        )
+        self.expert_layers = torch.nn.ModuleList(
+            [torch.nn.Linear(input_dim, output_dim, bias) for _ in range(num_expert_layers)]
+        )
+        for layer in self.expert_layers:
+            for param in layer.parameters():
+                param.allreduce = False
 
 
 def get_model_and_buffers(
@@ -49,8 +78,18 @@ def get_model_and_buffers(
     # Wrap with DistributedDataParallel, and get underlying buffer.
     # Use dummy TransformerConfig with mostly default values. Avoid divide-by-zero
     # errors for num_attention_heads and num_layers.
+    # Pre-compute parameter layouts for the distributed optimizer.
+    full_param_layout = None
+    if use_distributed_optimizer:
+        all_params = [p for p in model.parameters() if p.requires_grad]
+        full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            all_params, bucket_size, parallel_state.get_data_parallel_world_size(), ddp_config
+        )
     model = DistributedDataParallel(
-        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=model
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        ddp_config=ddp_config,
+        module=model,
+        full_param_layout=full_param_layout,
     )
     assert len(model.buffers) == 1
     param_and_grad_buffer = model.buffers[0]
@@ -669,3 +708,325 @@ class TestFP32LocalGradAccumulation:
                 )
 
         Utils.destroy_model_parallel()
+
+
+class TestNVFP4IndexMaps:
+    """Tests for NVFP4 dual index map (param_index_map and nvfp4_packed_param_index_map).
+
+    These tests mock NVFP4 functions and CUDA so they run on CPU without GPUs.
+    The mocking replaces is_nvfp4tensor (to treat regular bf16 params as NVFP4),
+    get_nvfp4_rowwise_packed_shape (to halve last dim), modify_nvfp4_rowwise_storage
+    (no-op), and torch.cuda.current_device (to allocate on CPU).
+    """
+
+    @staticmethod
+    def _make_buffer(
+        param_shapes,
+        nvfp4_param_indices=None,
+        use_distributed_optimizer=False,
+        bucket_size=None,
+        dp_world_size=1,
+    ):
+        """Create a _ParamAndGradBuffer with some params mocked as NVFP4.
+
+        Args:
+            param_shapes: List of (name, shape) tuples for each parameter.
+            nvfp4_param_indices: Set of indices into param_shapes to treat as NVFP4.
+            use_distributed_optimizer: Whether to use distributed optimizer.
+            bucket_size: Bucket size for splitting.
+            dp_world_size: Simulated data parallel world size.
+
+        Returns:
+            (buffer, params) where params is the ordered list of nn.Parameters.
+        """
+        params = []
+        params_with_names = []
+        param_to_name = {}
+        for name, shape in param_shapes:
+            param = torch.nn.Parameter(torch.randn(shape, dtype=torch.bfloat16))
+            params.append(param)
+            params_with_names.append((param, name))
+            param_to_name[param] = name
+
+        if nvfp4_param_indices is None:
+            nvfp4_param_indices = set()
+        nvfp4_params = {params[i] for i in nvfp4_param_indices}
+        has_nvfp4 = len(nvfp4_params) > 0
+
+        def mock_is_nvfp4(t):
+            return any(t is p for p in nvfp4_params)
+
+        def mock_packed_shape(shape):
+            packed = list(shape)
+            packed[-1] = packed[-1] // 2
+            return torch.Size(packed)
+
+        mock_dp_group = mock.MagicMock()
+        mock_dp_group.size.return_value = dp_world_size
+        mock_pg = mock.MagicMock()
+
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=use_distributed_optimizer,
+            overlap_grad_reduce=False,
+            bucket_size=bucket_size,
+            average_in_collective=False,
+        )
+
+        # Pre-compute layout for distributed optimizer (with padding);
+        # otherwise use default (no padding).
+        param_layout = None
+        if use_distributed_optimizer:
+            param_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                params, bucket_size, dp_world_size, ddp_config, list(range(len(params)))
+            )
+
+        with (
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.is_nvfp4tensor',
+                side_effect=mock_is_nvfp4,
+            ),
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.get_nvfp4_rowwise_packed_shape',
+                side_effect=mock_packed_shape,
+            ),
+            mock.patch('megatron.core.fp4_utils.modify_nvfp4_rowwise_storage'),
+            mock.patch('torch.cuda.current_device', return_value='cpu'),
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.log_on_each_pipeline_stage'
+            ),
+        ):
+            buffer = _ParamAndGradBuffer(
+                ddp_config=ddp_config,
+                param_dtype=torch.uint8 if has_nvfp4 else torch.bfloat16,
+                grad_dtype=torch.bfloat16,
+                params_with_names=params_with_names,
+                data_parallel_group=mock_dp_group,
+                bucket_size=bucket_size,
+                param_to_name=param_to_name,
+                gradient_scaling_factor=1.0,
+                param_indices=list(range(len(params))),
+                nccl_ub=False,
+                pg_collection=mock_pg,
+                param_layout=param_layout,
+            )
+
+        return buffer, params
+
+    def test_exact_index_values_no_padding(self):
+        """Verify exact index map values for a simple case without distributed optimizer."""
+        param_shapes = [('layer0.weight', (100, 100)), ('layer1.weight', (100, 100))]
+        buffer, params = self._make_buffer(param_shapes, nvfp4_param_indices={0, 1})
+
+        # Buffer processes params in reverse order: params[1] first, params[0] second.
+        assert buffer.param_index_map[params[1]] == (0, 10000, 0)
+        assert buffer.param_index_map[params[0]] == (10000, 20000, 0)
+        assert buffer.nvfp4_packed_param_index_map[params[1]] == (0, 5000, 0)
+        assert buffer.nvfp4_packed_param_index_map[params[0]] == (5000, 10000, 0)
+
+        assert buffer.numel == 20000
+        assert buffer.nvfp4_packed_numel == 10000
+
+    def test_non_nvfp4_exact_values_match_original(self):
+        """Non-NVFP4 param_index_map values should be identical to original behavior."""
+        param_shapes = [('layer0.weight', (100, 100)), ('layer1.weight', (100, 100))]
+        buffer, params = self._make_buffer(param_shapes)
+
+        # Without NVFP4 or distributed optimizer, no padding: offsets are contiguous.
+        assert buffer.param_index_map[params[1]] == (0, 10000, 0)
+        assert buffer.param_index_map[params[0]] == (10000, 20000, 0)
+        assert buffer.numel == 20000
+
+    def test_nvfp4_multi_bucket_param_to_index(self):
+        """param_to_index in each bucket should be relative to that bucket's full-numel offset."""
+        param_shapes = [
+            ('layer0.weight', (100, 100)),
+            ('layer1.weight', (100, 100)),
+            ('layer2.weight', (100, 100)),
+            ('layer3.weight', (100, 100)),
+        ]
+        # bucket_size=15000: each param is 10000 full numel, so 2 params per bucket.
+        buffer, params = self._make_buffer(
+            param_shapes, nvfp4_param_indices={0, 1, 2, 3}, bucket_size=15000
+        )
+
+        assert len(buffer.buckets) == 2
+        for bucket in buffer.buckets:
+            for param in bucket.params_list:
+                global_start, global_end, _ = buffer.param_index_map[param]
+                local_start, local_end = bucket.param_to_index[param]
+                assert local_start == global_start - bucket.offset
+                assert local_end == global_end - bucket.offset
+                assert local_end - local_start == param.data.nelement()
+
+    @pytest.mark.parametrize("dp_world_size", [1, 2, 4, 8])
+    def test_nvfp4_with_distributed_optimizer(self, dp_world_size):
+        """With distributed optimizer, both packed and unpacked indices should be padded."""
+        param_shapes = [('layer0.weight', (98, 101)), ('layer1.weight', (98, 101))]
+        buffer, params = self._make_buffer(
+            param_shapes,
+            nvfp4_param_indices={0, 1},
+            use_distributed_optimizer=True,
+            dp_world_size=dp_world_size,
+        )
+
+        # Param starts should be 64-aligned in both maps.
+        for param in params:
+            start, end, _ = buffer.param_index_map[param]
+            assert start % 64 == 0, f"Unpacked start {start} should be 64-aligned"
+            assert end - start == param.data.nelement()
+
+        for param in params:
+            start, end, _ = buffer.nvfp4_packed_param_index_map[param]
+            assert start % 64 == 0, f"Packed start {start} should be 64-aligned"
+            assert end - start == param.data.nelement() // 2
+
+        # Buffer numel should be divisible by dp_world_size.
+        assert buffer.numel % dp_world_size == 0
+        assert buffer.nvfp4_packed_numel % dp_world_size == 0
+
+    def test_nvfp4_mixed_params(self):
+        """Test buffer with a mix of NVFP4 and non-NVFP4 params."""
+        param_shapes = [
+            ('linear.weight', (100, 100)),  # NVFP4.
+            ('layernorm.weight', (100,)),  # Non-NVFP4 (bf16).
+        ]
+        buffer, params = self._make_buffer(param_shapes, nvfp4_param_indices={0})
+
+        # Non-NVFP4 param should have same span in both maps.
+        packed_start, packed_end, _ = buffer.nvfp4_packed_param_index_map[params[1]]
+        unpacked_start, unpacked_end, _ = buffer.param_index_map[params[1]]
+        assert packed_end - packed_start == unpacked_end - unpacked_start == 100
+
+        # NVFP4 param should have half the span in packed map.
+        packed_start, packed_end, _ = buffer.nvfp4_packed_param_index_map[params[0]]
+        unpacked_start, unpacked_end, _ = buffer.param_index_map[params[0]]
+        assert packed_end - packed_start == 5000  # numel // 2.
+        assert unpacked_end - unpacked_start == 10000  # Full numel.
+
+    def test_nvfp4_varied_param_sizes(self):
+        """Test with different param sizes to verify offsets accumulate correctly."""
+        param_shapes = [('small.weight', (10, 20)), ('large.weight', (100, 200))]
+        buffer, params = self._make_buffer(param_shapes, nvfp4_param_indices={0, 1})
+
+        # Reversed order: large (params[1]) processed first, then small (params[0]).
+        large_packed_start = 0
+        large_packed_end = 100 * 200 // 2  # 10000.
+        small_packed_start = large_packed_end
+        small_packed_end = small_packed_start + 10 * 20 // 2  # 10100.
+
+        assert buffer.nvfp4_packed_param_index_map[params[1]] == (
+            large_packed_start,
+            large_packed_end,
+            0,
+        )
+        assert buffer.nvfp4_packed_param_index_map[params[0]] == (
+            small_packed_start,
+            small_packed_end,
+            0,
+        )
+
+        large_unpacked_start = 0
+        large_unpacked_end = 100 * 200  # 20000.
+        small_unpacked_start = large_unpacked_end
+        small_unpacked_end = small_unpacked_start + 10 * 20  # 20200.
+
+        assert buffer.param_index_map[params[1]] == (large_unpacked_start, large_unpacked_end, 0)
+        assert buffer.param_index_map[params[0]] == (small_unpacked_start, small_unpacked_end, 0)
+
+
+@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: bool):
+    """Verify that expert-parallel params (allreduce=False) land in separate buffers
+    with correctly scoped layouts and independent param_index_maps."""
+    Utils.initialize_model_parallel()
+
+    input_dim = 95
+    output_dim = 95
+    num_dense_layers = 3
+    num_expert_layers = 2
+    bucket_size = None  # Single bucket per buffer.
+
+    ddp_config = DistributedDataParallelConfig(
+        grad_reduce_in_fp32=True,
+        use_distributed_optimizer=use_distributed_optimizer,
+        overlap_grad_reduce=True,
+        bucket_size=bucket_size,
+        average_in_collective=False,
+    )
+    model = TestModelWithExperts(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        num_dense_layers=num_dense_layers,
+        num_expert_layers=num_expert_layers,
+        bias=True,
+    ).bfloat16()
+
+    full_param_layout = None
+    if use_distributed_optimizer:
+        all_params = [p for p in model.parameters() if p.requires_grad]
+        full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            all_params, bucket_size, parallel_state.get_data_parallel_world_size(), ddp_config
+        )
+
+    ddp_model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        ddp_config=ddp_config,
+        module=model,
+        full_param_layout=full_param_layout,
+    )
+
+    # Should have exactly one dense buffer and one expert buffer.
+    assert len(ddp_model.buffers) == 1, f"Expected 1 dense buffer, got {len(ddp_model.buffers)}"
+    assert (
+        len(ddp_model.expert_parallel_buffers) == 1
+    ), f"Expected 1 expert buffer, got {len(ddp_model.expert_parallel_buffers)}"
+
+    dense_buffer = ddp_model.buffers[0]
+    expert_buffer = ddp_model.expert_parallel_buffers[0]
+
+    # Collect expected params for each buffer.
+    expected_dense_params = set()
+    expected_expert_params = set()
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if getattr(param, 'allreduce', True):
+            expected_dense_params.add(param)
+        else:
+            expected_expert_params.add(param)
+
+    # Verify each buffer contains exactly the right params.
+    dense_buffer_params = set()
+    for bucket in dense_buffer.buckets:
+        dense_buffer_params.update(bucket.params)
+    assert (
+        dense_buffer_params == expected_dense_params
+    ), "Dense buffer should contain exactly the dense params"
+
+    expert_buffer_params = set()
+    for bucket in expert_buffer.buckets:
+        expert_buffer_params.update(bucket.params)
+    assert (
+        expert_buffer_params == expected_expert_params
+    ), "Expert buffer should contain exactly the expert-parallel params"
+
+    # Verify param_index_maps are scoped to their own buffer (no cross-contamination).
+    assert set(dense_buffer.param_index_map.keys()) == expected_dense_params
+    assert set(expert_buffer.param_index_map.keys()) == expected_expert_params
+
+    # Verify both buffers have indices starting from 0 (independent index spaces).
+    dense_starts = [s for s, _, _ in dense_buffer.param_index_map.values()]
+    expert_starts = [s for s, _, _ in expert_buffer.param_index_map.values()]
+    assert min(dense_starts) == 0, "Dense buffer indices should start at 0"
+    assert min(expert_starts) == 0, "Expert buffer indices should start at 0"
+
+    # Verify DP divisibility for distributed optimizer.
+    if use_distributed_optimizer:
+        dp_world_size = parallel_state.get_data_parallel_world_size()
+        for buffer_name, buffer in [("dense", dense_buffer), ("expert", expert_buffer)]:
+            assert buffer.numel % dp_world_size == 0, (
+                f"{buffer_name} buffer numel ({buffer.numel}) should be "
+                f"divisible by dp_world_size ({dp_world_size})"
+            )
+
+    Utils.destroy_model_parallel()

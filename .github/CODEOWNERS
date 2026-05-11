@@ -7,6 +7,8 @@ megatron/core/models/multimodal/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mul
 megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-mamba
 megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-mamba
 
+megatron/core/models/hybrid/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
+
 megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
 
 megatron/core/tokenizers/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/tokenizers
@@ -30,6 +32,8 @@ megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/transform
 megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech
 
 megatron/core/inference/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference
+
+megatron/inference/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference-interface
 
 megatron/core/parallel_state.py @NVIDIA/core-adlr @NVIDIA/core-nemo
 

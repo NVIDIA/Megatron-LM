@@ -1,22 +1,10 @@
 [
     {
-        "user": "Phlip79",
-        "date": "2026-04-15"
-    },
-    {
-        "user": "asolergi-nv",
-        "date": "2026-04-22"
-    },
-    {
-        "user": "maanug-nv",
-        "date": "2026-04-29"
-    },
-    {
-        "user": "dimapihtar",
+        "user": "janEbert",
         "date": "2026-05-06"
     },
     {
-        "user": "janEbert",
+        "user": "dimapihtar",
         "date": "2026-05-13"
     },
     {
@@ -46,5 +34,17 @@
     {
         "user": "maanug-nv",
         "date": "2026-07-01"
+    },
+    {
+        "user": "wujingyue",
+        "date": "2026-07-08"
+    },
+    {
+        "user": "Connor-XY",
+        "date": "2026-07-15"
+    },
+    {
+        "user": "Phlip79",
+        "date": "2026-07-22"
     }
 ]

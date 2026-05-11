@@ -9,13 +9,13 @@
 
 # Multi-Latent Attention
 
-## Multi-Latent Attention overview
+## Multi-Latent Attention Overview
 
-Multi-Latent Attention ("MLA") is an innovative attention mechanism introduced by Deepseek team that enhances the efficiency of attention computation by leveraging multiple latent spaces. This approach is particularly beneficial for large language models (LLMs), as it reduces the computational burden associated with traditional attention mechanisms. According to Deepseek-V2 technical report, MLA achieves better performance compared to Multi-Head Attention (MHA) and requires smaller KV cache.
+Multi-Latent Attention (MLA) is an attention variant from the DeepSeek team. It uses multiple latent spaces to change how attention is computed. That design often lowers cost for large language models (LLMs) compared with standard attention and can shrink the KV cache. The DeepSeek-V2 technical report compares MLA to Multi-Head Attention (MHA) on quality and cache size.
 
 ## Enabling Multi-Latent Attention
 
-To enable MLA in Megatron-LM, set the following flags in command line:
-- `--multi-latent-attention` to enable MLA in MLP.
-- Set `MLATransformerConfig` to configure MLA.
+To enable MLA in Megatron-LM, set the following on the command line:
 
+- `--multi-latent-attention` to turn on MLA.
+- Use `MLATransformerConfig` for MLA-specific model settings when you build the training configuration.
