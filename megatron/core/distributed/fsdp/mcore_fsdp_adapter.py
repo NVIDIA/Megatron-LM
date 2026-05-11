@@ -53,7 +53,7 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import FSDPModule
     from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.mixed_precision import (
-        build_fully_shard_mixed_precision_policy,
+        FullyShardMixedPrecisionPolicy,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -241,7 +241,19 @@ class FullyShardedDataParallel(_BaseDataParallel):
         edp_mesh = _init_dp_mesh(pg_collection, edp=True)
         dp_mesh = _init_dp_mesh(pg_collection, edp=False)
 
-        fully_shard_mp_policy = build_fully_shard_mixed_precision_policy(ddp_config)
+        fully_shard_mp_policy = FullyShardMixedPrecisionPolicy(
+            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
+            main_grads_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_main_grads_dtype
+            ),
+            grad_comm_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_grad_comm_dtype
+            ),
+        )
         kwargs = {
             "mp_policy": fully_shard_mp_policy,
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,

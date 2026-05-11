@@ -549,11 +549,9 @@ class DataParallelBuffer:
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
-        # Accumulate the reduced shard into the persistent local shard buffer. The
-        # reduce-scatter output must not alias the full input buffer, otherwise the
-        # collective can clobber its own input and silently corrupt gradients.
-        if reduced_grad_shard.dtype != self.dtype:
-            reduced_grad_shard = reduced_grad_shard.to(self.dtype)
+        # Accumulate into the persistent local shard buffer. The reduce-scatter output
+        # must not alias the full input buffer, otherwise the collective can clobber its
+        # own input and silently corrupt gradients.
         local_grad_shard += reduced_grad_shard
 
 

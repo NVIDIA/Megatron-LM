@@ -56,11 +56,7 @@ def fully_shard(
             "Please do not call fully_shard on the same module more than once."
         )
     if mp_policy is None:
-        mp_policy = FullyShardMixedPrecisionPolicy(
-            main_params_dtype=None,
-            main_grads_dtype=None,
-            grad_comm_dtype=None,
-        )
+        mp_policy = FullyShardMixedPrecisionPolicy()
 
     cls = module.__class__
     new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
