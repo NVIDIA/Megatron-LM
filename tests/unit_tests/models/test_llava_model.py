@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -379,16 +380,20 @@ class TestLLaVAModel:
 
         # Try without labels and with inference params.
         inference_context = StaticInferenceContext(5, max_seq_len)
-        logits, _ = self.model.forward(
-            img,
-            input_ids,
-            position_ids,
-            attention_mask,
-            labels=None,
-            loss_mask=None,
-            num_image_tiles=num_image_tiles,
-            inference_context=inference_context,
-        )
+        InferenceMode.set_active()
+        try:
+            logits, _ = self.model.forward(
+                img,
+                input_ids,
+                position_ids,
+                attention_mask,
+                labels=None,
+                loss_mask=None,
+                num_image_tiles=num_image_tiles,
+                inference_context=inference_context,
+            )
+        finally:
+            InferenceMode.unset_active()
         assert logits.shape == torch.Size((5, max_seq_len, 8192))
 
         # Check KV cache got populated correctly.

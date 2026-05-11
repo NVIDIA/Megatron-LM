@@ -15,6 +15,7 @@ from megatron.core.inference.contexts import BaseInferenceContext, StaticInferen
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -164,32 +165,38 @@ class TestHybridModel:
 
         self.model.cuda()
 
-        # load-context/first-output-token, step/generate
-        for offset in (0, prompt_length):
-            if offset == 0:
-                sequence_length = prompt_length
-            else:
-                sequence_length = 1
-            inference_context.sequence_len_offset = offset
+        InferenceMode.set_active()
+        try:
+            # load-context/first-output-token, step/generate
+            for offset in (0, prompt_length):
+                if offset == 0:
+                    sequence_length = prompt_length
+                else:
+                    sequence_length = 1
+                inference_context.sequence_len_offset = offset
 
-            data = list(range(sequence_length))
-            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-            position_ids = (
-                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-            )
-            attention_mask = torch.ones(
-                (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-            ).cuda()
+                data = list(range(sequence_length))
+                input_ids = (
+                    torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+                )
+                position_ids = (
+                    torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+                )
+                attention_mask = torch.ones(
+                    (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+                ).cuda()
 
-            logits = self.model.forward(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-            )
+                logits = self.model.forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                )
 
-            assert logits.shape[0] == micro_batch_size
-            assert logits.shape[1] == sequence_length
+                assert logits.shape[0] == micro_batch_size
+                assert logits.shape[1] == sequence_length
+        finally:
+            InferenceMode.unset_active()
             assert logits.shape[2] == self.model.vocab_size
 
     def test_save_load(self, tmp_path):
@@ -603,27 +610,33 @@ class TestHybridModelWithYarn:
 
         self.model.cuda()
 
-        # load-context/first-output-token, step/generate
-        for offset in (0, prompt_length):
-            sequence_length = prompt_length if offset == 0 else 1
-            inference_context.sequence_len_offset = offset
+        InferenceMode.set_active()
+        try:
+            # load-context/first-output-token, step/generate
+            for offset in (0, prompt_length):
+                sequence_length = prompt_length if offset == 0 else 1
+                inference_context.sequence_len_offset = offset
 
-            data = list(range(sequence_length))
-            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-            position_ids = (
-                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-            )
-            attention_mask = torch.ones(
-                (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-            ).cuda()
+                data = list(range(sequence_length))
+                input_ids = (
+                    torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+                )
+                position_ids = (
+                    torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+                )
+                attention_mask = torch.ones(
+                    (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+                ).cuda()
 
-            logits = self.model.forward(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-            )
+                logits = self.model.forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                )
 
-            assert logits.shape[0] == micro_batch_size
-            assert logits.shape[1] == sequence_length
-            assert logits.shape[2] == self.model.vocab_size
+                assert logits.shape[0] == micro_batch_size
+                assert logits.shape[1] == sequence_length
+                assert logits.shape[2] == self.model.vocab_size
+        finally:
+            InferenceMode.unset_active()

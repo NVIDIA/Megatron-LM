@@ -8,6 +8,7 @@ from packaging.version import Version
 
 from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -34,31 +35,37 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
     )
     prompt_length = model.max_sequence_length - 1
 
-    # load-context/first-output-token, step/generate
-    for offset in (0, prompt_length):
-        if offset == 0:
-            sequence_length = prompt_length
-        else:
-            sequence_length = 1
-        inference_context.sequence_len_offset = offset
+    InferenceMode.set_active()
+    try:
+        # load-context/first-output-token, step/generate
+        for offset in (0, prompt_length):
+            if offset == 0:
+                sequence_length = prompt_length
+            else:
+                sequence_length = 1
+            inference_context.sequence_len_offset = offset
 
-        data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        attention_mask = torch.ones(
-            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+            data = list(range(sequence_length))
+            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+            position_ids = (
+                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+            )
+            attention_mask = torch.ones(
+                (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+            ).cuda()
 
-        logits = model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-        )
+            logits = model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+            )
 
-        assert logits.shape[0] == micro_batch_size
-        assert logits.shape[1] == sequence_length
-        assert logits.shape[2] == model.vocab_size
+            assert logits.shape[0] == micro_batch_size
+            assert logits.shape[1] == sequence_length
+            assert logits.shape[2] == model.vocab_size
+    finally:
+        InferenceMode.unset_active()
 
 
 class TestModelOptGPTModel:

@@ -20,6 +20,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
     VLMTextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -104,7 +105,10 @@ class TestVLMTextGenerationController:
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
         )
 
+        InferenceMode.set_active()
+
     def teardown_method(self, method):
+        InferenceMode.unset_active()
         Utils.destroy_model_parallel()
 
     def test_generate_all_output_tokens_static_batch(self):
