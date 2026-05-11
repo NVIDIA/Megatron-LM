@@ -1,4 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+from functools import partial
+
 from examples.multimodal.layer_scaling import (
     LayerScalingTransformerLayer,
     get_bias_dropout_add_layer_scaling,
@@ -47,10 +49,10 @@ except ImportError:
     LNImpl = WrappedTorchNorm
 
 
-def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
+def get_mlp_module_spec(use_te: bool = True):
     # Dense MLP w/ or w/o TE modules.
-    return ModuleSpec(
-        module=MLP,
+    return partial(
+        MLP.as_mlp_submodule,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
             linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
@@ -58,9 +60,9 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     )
 
 
-def get_norm_mlp_module_spec_te() -> ModuleSpec:
-    return ModuleSpec(
-        module=MLP,
+def get_norm_mlp_module_spec_te():
+    return partial(
+        MLP.as_mlp_submodule,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TELayerNormColumnParallelLinear),
             linear_fc2=not_none(TERowParallelLinear),
