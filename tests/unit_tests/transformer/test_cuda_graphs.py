@@ -12,6 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -35,12 +36,14 @@ from megatron.core.transformer.cuda_graphs import (
     _CudagraphGlobalRecord,
 )
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -328,10 +331,10 @@ class TestLLaVACudaGraph:
         )
 
         # Get layer specs
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-        assert isinstance(language_layer_spec.submodules, TransformerLayerSubmodules)
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        vision_projection_spec = deepcopy(get_submodules(language_layer_submodules.mlp))
+        assert isinstance(vision_projection_spec, MLPSubmodules)
 
         # Set vision model type
         vision_config.vision_model_type = "clip"
@@ -340,7 +343,9 @@ class TestLLaVACudaGraph:
         # Create LLaVA model with both encoder and decoder
         self.llava_model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
@@ -1100,6 +1105,24 @@ class _SimpleModule(MegatronModule):
         return self.linear(x)
 
 
+class _SimpleNonModule:
+    """non-nn.Module base_module for testing the function_name= form of `CudaGraphManager`."""
+
+    def __init__(self, config):
+        self.weight = torch.randn(config.hidden_size, config.hidden_size, device="cuda")
+
+    def my_op(self, x):
+        return x @ self.weight
+
+
+def _make_simple_module(config):
+    return _SimpleModule(config).cuda().eval()
+
+
+def _make_simple_non_module(config):
+    return _SimpleNonModule(config)
+
+
 class TestInlineCaptureManager:
     """Tests for CudaGraphManager with inline_capture, function_name, eager, and cache_key."""
 
@@ -1126,11 +1149,18 @@ class TestInlineCaptureManager:
         CudaGraphManager.global_mempool = None
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize(
+        "make_module",
+        [
+            pytest.param(_make_simple_module, id="nn_module"),
+            pytest.param(_make_simple_non_module, id="plain_class"),
+        ],
+    )
     @torch.inference_mode()
-    def test_inline_capture_matches_eager(self):
+    def test_inline_capture_matches_eager(self, make_module):
         """Inline-captured graph output must match eager execution."""
         config = self._make_config()
-        module = _SimpleModule(config).cuda().eval()
+        module = make_module(config)
 
         # Get eager reference before wrapping
         x = torch.randn(4, config.hidden_size, device="cuda")

@@ -15,6 +15,7 @@ from .utils import (
     _build_layer_module_prefix_map,
     _get_rank_in_group,
     extract_param_metadata,
+    named_refit_tensors,
     select_src_metadata_balanced,
 )
 
@@ -376,7 +377,12 @@ def build_centralized_reshard_plan(
     _rank_list_cache: dict = {}
 
     def _extract_metadata(module, rank_offset):
-        """Extract per-parameter metadata from a module, or [] if module is None."""
+        """Extract per-parameter metadata from a module, or [] if module is None.
+
+        Includes both ``nn.Parameter`` instances and persistent buffers — the
+        latter so that buffers carrying training state (e.g. MoE router
+        ``expert_bias``) travel with the weights during refit.
+        """
         if module is None:
             return []
         pg = getattr(module, "pg_collection", None)
@@ -394,7 +400,7 @@ def build_centralized_reshard_plan(
                 rank_offset=rank_offset,
                 _rank_list_cache=_rank_list_cache,
             )
-            for name, p in module.named_parameters(recurse=True)
+            for name, p in named_refit_tensors(module)
         ]
 
     my_src_metadata = _extract_metadata(src_module, src_rank_offset)

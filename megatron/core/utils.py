@@ -506,6 +506,11 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+def round_up_to_nearest_multiple(value: int, multiple: int) -> int:
+    """Round *value* up to the nearest multiple of *multiple*."""
+    return math.ceil(value / multiple) * multiple
+
+
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
     """Issue a deprecation warning if tp_group is None and return the default tp group."""
     # TODO(zijiey): remove this function later.
@@ -2119,6 +2124,10 @@ def get_batch_on_this_hybrid_cp_rank(
 
 _nvtx_enabled: bool = False  # Whether NVTX range profiling is enabled
 _nvtx_range_messages: list[str] = []  # Messages associated with active NVTX ranges
+# Permanently pin the string object representing the name of each NVTX range.
+# These string objects may be created during CUDA graph capture.
+# If they are not pinned, the NVTX range names will be garbage-collected and nsys profile crashes.
+_nvtx_range_msg_pool: dict[str, str] = {}
 
 
 def configure_nvtx_profiling(enabled: bool) -> None:
@@ -2159,6 +2168,11 @@ def nvtx_range_push(msg=None, suffix=None) -> None:
         msg = _nvtx_range_get_func_path()
     if suffix is not None:
         msg = f"{msg}.{suffix}"
+
+    # If we have entered this range before, do not use the newly-created "msg" object.
+    # But instead point to the original, first-created, "msg" object.
+    # They may hold identical data, but they are different addresses; matters when CUDA-graphed.
+    msg = _nvtx_range_msg_pool.setdefault(msg, msg)
 
     # Track messages to ensure consistency when popping
     _nvtx_range_messages.append(msg)
