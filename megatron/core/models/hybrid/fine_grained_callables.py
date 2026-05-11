@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import nullcontext
+from functools import partial
 from typing import Optional
 
 import torch
@@ -16,6 +17,32 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.models.hybrid.hybrid_layer_allocation import is_layer_group
 from megatron.core.pipeline_parallel.utils import ScheduleNode
 from megatron.core.transformer.transformer_layer import make_viewless_tensor
+
+
+class _SharedExpertBackwardDWWrapper:
+    """Run MoE shared-experts wgrad as part of the ``pre_dispatch_computation`` slot.
+
+    Why: shared-experts forward is part of ``_run_moe_preprocess`` (which runs in the
+    pre_dispatch slot), and TE's delay-wgrad model only ``put``s to the wgrad queue
+    inside the autograd backward (dgrad). So shared-experts' ``backward_dw`` must
+    fire *after* the pre_dispatch slot's autograd backward — registering it in the
+    ``mlp`` slot would call it before that dgrad and trigger
+    ``RuntimeError: Pop empty queue`` from TE.
+    """
+
+    def __init__(self, layer):
+        self.layer = layer
+        self.shared_expert_dw_callable = None
+        if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
+            self.shared_expert_dw_callable = partial(
+                layer.mlp.backward_dw, routed_experts=False, shared_experts=True
+            )
+
+    def backward_dw(self):
+        if self.shared_expert_dw_callable is not None:
+            self.shared_expert_dw_callable()
+        self.layer = None
+        self.shared_expert_dw_callable = None
 
 
 class HybridStackNode(TransformerLayerNode):
@@ -283,18 +310,15 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
             # registering the layer directly is sufficient.
             pre_bwd_dw.append(item_layer)
     if is_moe:
-        # MoELayer.backward_dw default kwargs (routed_experts=True, shared_experts=False) handle
-        # the routed-experts wgrad. The shared-experts wgrad is registered as a sibling callable
-        # under "mlp" so the schedule node iterates both. Skip registering the shared-experts
-        # callable when shared_expert_overlap is enabled — in that case the shared-experts
-        # forward and backward are folded into the dispatcher's overlap handling.
-        mlp_backward_callables = [terminal_layer.mlp]
-        if (
-            terminal_layer.mlp.use_shared_expert
-            and not terminal_layer.mlp.shared_expert_overlap
-        ):
-            mlp_backward_callables.append(terminal_layer.mlp.shared_experts)
-        backward_dw["mlp"] = mlp_backward_callables
+        # MoELayer.backward_dw default kwargs (routed_experts=True, shared_experts=False)
+        # handle the routed-experts wgrad in the mlp slot. The shared-experts wgrad goes
+        # into the pre_dispatch_computation slot so it runs after that slot's autograd
+        # backward (where TE's wgrad_store.put fires); the wrapper is a no-op when
+        # shared_expert_overlap is enabled.
+        shared_expert_dw = _SharedExpertBackwardDWWrapper(terminal_layer)
+        if shared_expert_dw.shared_expert_dw_callable is not None:
+            pre_bwd_dw.append(shared_expert_dw)
+        backward_dw["mlp"] = terminal_layer.mlp
     elif terminal_type == LayerSymbols.MLP:
         backward_dw["mlp"] = terminal_layer.mlp
 
