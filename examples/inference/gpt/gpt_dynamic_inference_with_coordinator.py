@@ -18,6 +18,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
     add_inference_args,
     get_dynamic_inference_engine,
@@ -218,6 +219,7 @@ if __name__ == "__main__":
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
         initialize_megatron()
+        configure_nvtx_profiling(True)
 
         tokenizer = get_tokenizer()
 

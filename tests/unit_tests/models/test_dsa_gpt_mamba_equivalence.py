@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """
-Equivalence tests: GPTModel with DSA vs MambaModel with DSA pattern.
+Equivalence tests: GPTModel with DSA vs HybridModel with DSA pattern.
 
 A small DeepSeek-V3.2 proxy model (4 GPT layers / 8 Mamba layers) is built,
 weights are remapped GPT→Mamba, and logprobs are compared to verify they are
@@ -9,8 +9,8 @@ numerically identical.
 Architecture equivalence
 ------------------------
 GPTModel layer N  (combined attention + MLP in one TransformerLayer)
-  ≡  MambaModel layer 2N  (D, DSA TransformerLayer: input_layernorm + MLASelfAttention)
-   + MambaModel layer 2N+1 (-, MLPLayer: fused-norm MLP)
+  ≡  HybridModel layer 2N  (D, DSA TransformerLayer: input_layernorm + MLASelfAttention)
+   + HybridModel layer 2N+1 (-, MLPLayer: fused-norm MLP)
 
 Run with::
 
@@ -35,10 +35,10 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.rl.rl_utils import selective_log_softmax
@@ -193,15 +193,15 @@ def _build_mamba_model(
     layer_pattern: str,
     pre_process: bool = True,
     post_process: bool = True,
-) -> MambaModel:
-    """Build a MambaModel with the given hybrid layer pattern."""
+) -> HybridModel:
+    """Build a HybridModel with the given hybrid layer pattern."""
     layer_type_list = validate_segment_layers(layer_pattern)
     mamba_config = copy.deepcopy(config)
     mamba_config.num_layers = len(layer_type_list)
     assert mamba_config.num_layers == _NUM_GPT_LAYERS * 2
-    model = MambaModel(
+    model = HybridModel(
         config=mamba_config,
-        mamba_stack_spec=mamba_stack_spec,
+        hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=_VOCAB_SIZE,
         max_sequence_length=_MAX_SEQ_LEN,
         pre_process=pre_process,
@@ -221,14 +221,14 @@ def _build_mamba_model(
 def _remap_gpt_to_mamba_state_dict(
     gpt_sd: Dict[str, torch.Tensor], num_local_gpt_layers: int
 ) -> Dict[str, torch.Tensor]:
-    """Remap a GPTModel state_dict to a MambaModel state_dict.
+    """Remap a GPTModel state_dict to a HybridModel state_dict.
 
     GPTModel layer N (combined attention + MLP) maps to:
-      * MambaModel layer 2N   – DSA attention (input_layernorm + self_attention)
-      * MambaModel layer 2N+1 – MLP           (mlp.*)
+      * HybridModel layer 2N   – DSA attention (input_layernorm + self_attention)
+      * HybridModel layer 2N+1 – MLP           (mlp.*)
 
     Additionally, ``decoder.final_layernorm.*`` (TransformerBlock naming) is
-    remapped to ``decoder.final_norm.*`` (MambaStack naming).
+    remapped to ``decoder.final_norm.*`` (HybridStack naming).
 
     All other keys (embedding, output_layer, rotary_pos_emb, …) are unchanged.
 
@@ -238,7 +238,7 @@ def _remap_gpt_to_mamba_state_dict(
             pipeline stage (i.e. ``len(gpt_model.decoder.layers)``).
 
     Returns:
-        Remapped state dict ready for MambaModel.load_state_dict(strict=True).
+        Remapped state dict ready for HybridModel.load_state_dict(strict=True).
     """
     mamba_sd: Dict[str, torch.Tensor] = {}
     layer_prefix = "decoder.layers."
@@ -380,12 +380,12 @@ _GOLDEN_BASE = Path(__file__).parent.parent.parent / ("functional_tests/test_cas
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)])
 class TestDSAGPTMambaEquivalence:
-    """Verify logprob equivalence between GPTModel+DSA and MambaModel+DSA.
+    """Verify logprob equivalence between GPTModel+DSA and HybridModel+DSA.
 
     For each distributed configuration (TP, PP), the test:
     1. Builds a GPTModel with 4 DSA layers.
-    2. Builds a MambaModel with pattern "D-D-D-D-" (8 layers).
-    3. Remaps and loads GPT weights into MambaModel (strict=True).
+    2. Builds a HybridModel with pattern "D-D-D-D-" (8 layers).
+    3. Remaps and loads GPT weights into HybridModel (strict=True).
     4. Runs the same random tokens through both models.
     5. Asserts logprob tensors are numerically close.
     """
@@ -416,7 +416,7 @@ class TestDSAGPTMambaEquivalence:
         num_local_gpt_layers = len(gpt_model.decoder.layers)
         gpt_sd = gpt_model.state_dict()
 
-        # ---- Build MambaModel ----
+        # ---- Build HybridModel ----
         mamba_model = _build_mamba_model(
             gpt_config, _MAMBA_PATTERN, pre_process=pre_process, post_process=post_process
         )
@@ -481,7 +481,7 @@ class TestDSAGPTMambaEquivalence:
         assert not unexpected, f"Unexpected keys: {unexpected}"
 
     def test_record_and_compare_golden_values(self, tp: int, pp: int) -> None:
-        """Record GPTModel logprobs as golden values, then compare MambaModel against them.
+        """Record GPTModel logprobs as golden values, then compare HybridModel against them.
 
         Golden values are written to the functional test directory so they can be
         committed and used by the CI inference golden-value tests.
@@ -508,7 +508,7 @@ class TestDSAGPTMambaEquivalence:
         gpt_logprobs = _forward_logprobs_pp1(gpt_model, tokens)
         mamba_logprobs = _forward_logprobs_pp1(mamba_model, tokens)
 
-        # Verify MambaModel matches golden values
+        # Verify HybridModel matches golden values
         _compare_against_golden_values(mamba_logprobs, gpt_logprobs, abs_tol=1e-3)
 
 
@@ -520,7 +520,7 @@ class TestDSAGPTMambaEquivalence:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)])
 class TestDSAMoEGPTMambaEquivalence:
-    """Verify logprob equivalence between GPTModel+DSA+MoE and MambaModel+DSA+MoE.
+    """Verify logprob equivalence between GPTModel+DSA+MoE and HybridModel+DSA+MoE.
 
     Architecture: 4 GPT layers with moe_layer_freq=[0,0,1,1] (first 2 dense, last 2 MoE)
     maps to 8 Mamba layers with pattern "D-D-DEDE":
@@ -556,7 +556,7 @@ class TestDSAMoEGPTMambaEquivalence:
         num_local_gpt_layers = len(gpt_model.decoder.layers)
         gpt_sd = gpt_model.state_dict()
 
-        # ---- Build MambaModel with MoE pattern ----
+        # ---- Build HybridModel with MoE pattern ----
         mamba_model = _build_mamba_model(
             gpt_config, _MOE_MAMBA_PATTERN, pre_process=pre_process, post_process=post_process
         )
@@ -618,7 +618,7 @@ class TestDSAMoEGPTMambaEquivalence:
         assert not unexpected, f"Unexpected keys: {unexpected}"
 
     def test_moe_record_and_compare_golden_values(self, tp: int, pp: int) -> None:
-        """Record GPTModel+MoE logprobs as golden values, then compare MambaModel+MoE."""
+        """Record GPTModel+MoE logprobs as golden values, then compare HybridModel+MoE."""
         self._skip_if_insufficient_gpus(tp, pp)
         if tp != 1 or pp != 1:
             pytest.skip("Golden-value recording only runs for tp=1, pp=1")
@@ -640,5 +640,5 @@ class TestDSAMoEGPTMambaEquivalence:
         gpt_logprobs = _forward_logprobs_pp1(gpt_model, tokens)
         mamba_logprobs = _forward_logprobs_pp1(mamba_model, tokens)
 
-        # Verify MambaModel matches golden values
+        # Verify HybridModel matches golden values
         _compare_against_golden_values(mamba_logprobs, gpt_logprobs, abs_tol=1e-3)

@@ -585,8 +585,11 @@ def get_gpt_decoder_layer_specs(
     use_transformer_engine: bool,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    del vp_stage, pp_rank  # accepted for API compatibility with main-side callers
     assert config.experimental_attention_variant is None, (
         "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
         f"but got {config.experimental_attention_variant=}."
@@ -797,15 +800,22 @@ def get_gpt_mtp_block_spec_for_backend(
         mtp_model_layer_spec=transformer_layer_spec, backend=backend
     )
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
-    mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
+    if config.mtp_use_repeated_layer:
+        mtp_layer_specs = [mtp_layer_spec]
+    else:
+        mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
 
-    offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
-    # split the mtp layer specs to only include the layers that are built in this pipeline stage.
-    mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
+    if not config.mtp_use_repeated_layer:
+        offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
+        # Split the MTP layer specs to only include the layers that are built in this
+        # pipeline stage.
+        mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
+        if len(mtp_layer_specs) > 0:
+            assert (
+                len(mtp_layer_specs) == config.mtp_num_layers
+            ), f"All MTP layers must reside in the same pipeline stage"
+
     if len(mtp_layer_specs) > 0:
-        assert (
-            len(mtp_layer_specs) == config.mtp_num_layers
-        ), f"currently all of the mtp layers must stage in the same pipeline stage."
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
     else:
         mtp_block_spec = None

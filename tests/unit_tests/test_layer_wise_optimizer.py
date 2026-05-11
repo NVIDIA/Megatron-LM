@@ -821,6 +821,13 @@ class TestLayerWiseOptimizer:
             optimizer.step()
             model.start_param_sync(force_sync=True)
 
+            # Verify grad_data is zeroed after synchronous param_sync.
+            for bucket_group in model.bucket_groups:
+                for bucket in bucket_group.buckets:
+                    assert torch.all(
+                        bucket.grad_data == 0
+                    ), f"grad_data not zeroed after param sync at iteration {iteration}"
+
             # Sync path: step (includes allgather)
             ref_optimizer.step()
 
@@ -859,6 +866,13 @@ class TestLayerWiseOptimizer:
         model.start_param_sync()  # async dispatch to all bucket groups
         for bucket_group in model.bucket_groups:
             bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
+
+        # Verify grad_data is zeroed after asynchronous param_sync.
+        for bucket_group in model.bucket_groups:
+            for bucket in bucket_group.buckets:
+                assert torch.all(
+                    bucket.grad_data == 0
+                ), "grad_data not zeroed after finish_param_sync"
 
         # Sync path: step (includes allgather)
         ref_optimizer.step()
