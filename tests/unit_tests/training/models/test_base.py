@@ -74,8 +74,7 @@ class TestModelConfigDefaults:
     def test_base_field_defaults(self):
         cfg = DummyModelConfig()
         assert cfg.restore_modelopt_state is False
-        assert cfg.hf_model_id is None
-        assert cfg.generation_config is None
+        assert cfg.extra_checkpoint_metadata is None
         assert cfg.pre_wrap_hooks == []
         assert cfg.post_wrap_hooks == []
 
@@ -141,8 +140,7 @@ class TestModelConfigToDict:
         cfg = DummyModelConfig()
         result = cfg.as_dict()
         assert "restore_modelopt_state" in result
-        assert "hf_model_id" in result
-        assert "generation_config" in result
+        assert "extra_checkpoint_metadata" in result
 
     def test_hook_lists_excluded(self):
         cfg = DummyModelConfig()
