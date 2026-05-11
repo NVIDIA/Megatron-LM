@@ -9,24 +9,27 @@
 
 # Scaling Recipes
 
-Megatron-LM supports named scaling recipes through `--scaling-recipe`.
+Megatron-LM supports named scaling recipes through `--scaling-recipe`. A recipe
+is a resolved contract over model initialization, forward-time scaling, optimizer
+parameter groups, checkpoint compatibility, and validation-time behavior. It is
+not only a command-line alias.
 
 The current named recipes are:
 
 - `none`: standard Megatron parameterization.
 - `mup`: current Megatron width MuP behavior.
-- `depth_mup`: a spectral width-depth μP recipe for dense GPT-style residual
-  Transformer blocks using AdamW-style semantics through `--optimizer adam`
-  with `decoupled_weight_decay=True` when weight decay is nonzero.
+- `depth_mup`: experimental spectral width-depth μP behavior for dense
+  GPT-style residual Transformer blocks using AdamW-style semantics through
+  `--optimizer adam` with `decoupled_weight_decay=True` when weight decay is
+  nonzero.
 
-`depth_mup` remains an experimental narrow-scope recipe rather than a broad
-public depth-transfer claim. Megatron enforces the intended surface and
-explicitly rejects unsupported paths instead of silently inheriting behavior.
+`depth_mup` is intentionally narrow. Megatron enforces the supported surface and
+rejects unsupported paths instead of silently inheriting behavior from standard
+Megatron, width-only MuP, inference, MoE, or non-Adam optimizers.
 
-## Legacy MuP Flags
+## Configuration Surface
 
-`--use-mup` remains a backward-compatible alias for exact `--scaling-recipe
-mup`, but it is deprecated. New configs should use:
+New configs should use the canonical scaling fields:
 
 ```bash
 --scaling-recipe mup \
@@ -34,18 +37,31 @@ mup`, but it is deprecated. New configs should use:
 --scaling-base-head-dim <base-head-dim>
 ```
 
-The legacy aliases `--mup-base-hidden-size`, `--mup-base-head-dim`, and
-`--mup-width-mult` are also deprecated where they overlap with the canonical
-scaling surface. `--mup-width-mult` is derived from the resolved scaling context
-rather than treated as user-owned configuration; if supplied with a non-default
-value, it must match the derived `hidden_size / scaling_base_hidden_size` value.
+`--use-mup` remains a backward-compatible alias for exact
+`--scaling-recipe mup`, but it is deprecated. The legacy aliases
+`--mup-base-hidden-size`, `--mup-base-head-dim`, and `--mup-width-mult` are also
+deprecated where they overlap with the canonical scaling surface.
+
+`--mup-width-mult` is derived state, not user-owned configuration. The effective
+width multiplier is:
+
+```text
+width_mult = hidden_size / scaling_base_hidden_size
+```
+
+If a non-default `--mup-width-mult` is supplied, it must match that derived
+value. This prevents checkpoint metadata, logs, or YAML configs from carrying a
+stale width multiplier that disagrees with the actual model shape.
 
 `depth_mup` is intentionally distinct from `--use-mup`. Code paths that mean
 "MuP-family width behavior" are keyed off the resolved scaling context rather
 than `config.use_mup`.
 
 If legacy MuP flags and canonical scaling flags are both set to conflicting
-values, Megatron raises an error during argument validation.
+values, Megatron raises an error during argument validation. CLI and YAML
+validation use the same legacy-warning and alias-synchronization path so the
+global args namespace has the same canonical scaling fields regardless of input
+format.
 
 The scaling-policy framework is intended to be reusable beyond the current
 recipes. `mup` and `depth_mup` are named presets over a shared resolved scaling
@@ -76,35 +92,58 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 
 ## `depth_mup`
 
-`depth_mup` extends MuP-family width behavior with the spectral width-depth μP
-paper's AdamW-style optimizer table adapted onto Megatron's existing
-`--optimizer adam` path. Because the weight-decay row is derived for decoupled
-AdamW, `depth_mup` requires `decoupled_weight_decay=True` whenever
-`weight_decay` is nonzero. Coupled Adam/L2 is allowed only with
-`weight_decay=0.0`.
+`depth_mup` extends MuP-family width behavior with a v1 Megatron adaptation of
+the spectral width-depth μP AdamW table. It deliberately targets the optimizer
+and residual-block semantics Megatron can implement and validate today.
+
+Because the weight-decay row is derived for decoupled AdamW, `depth_mup`
+requires `decoupled_weight_decay=True` whenever `weight_decay` is nonzero.
+Coupled Adam/L2 is allowed only with `weight_decay=0.0`. Non-Adam optimizers are
+rejected for `depth_mup` rather than partially mapped.
 
 The resolved recipe defaults are:
 
-- residual branch multiplier: `depth_mult^-1`
-- hidden matrix-like Adam/AdamW LR multiplier: `width_mult^-1`
-- hidden matrix-like Adam/AdamW epsilon multiplier: `(width_mult * depth_mult)^-1`
-- hidden bias/vector Adam/AdamW epsilon multiplier: `(width_mult * depth_mult)^-1`
-- embedding/output-class Adam/AdamW epsilon multiplier: `width_mult^-1`
-- hidden matrix-like Adam/AdamW weight-decay multiplier: `width_mult`
-- dense block output-projection init compensation: `depth_mult^+0.5`
+| Mechanism | Default multiplier |
+| --- | --- |
+| Dense self-attention/MLP residual branch output | `depth_mult^-1` |
+| Hidden matrix-like Adam/AdamW LR | `width_mult^-1` |
+| Hidden matrix-like Adam/AdamW epsilon | `(width_mult * depth_mult)^-1` |
+| Hidden vector-like Adam/AdamW epsilon | `(width_mult * depth_mult)^-1` |
+| Embedding/output-class Adam/AdamW epsilon | `width_mult^-1` |
+| Hidden matrix-like AdamW weight decay | `width_mult` |
+| Dense block output-projection initialization | `depth_mult^+0.5` |
 
-Megatron's 1-D parameters are not all hidden biases. Under `depth_mup`, hidden
-linear/attention/MLP biases keep base weight decay as in the AdamW table, while
-normalization scale/bias parameters and otherwise unknown 1-D tensors keep the
-conservative no-weight-decay treatment unless `apply_wd_to_qk_layernorm`
-explicitly opts q/k layernorm into weight decay. The epsilon rule remains
-applied to hidden vector-like parameters.
+### Parameter-Class Policy
 
-The output-projection init compensation is important because Megatron already
-applies layer-count-dependent initialization to residual branch output
-projections. `depth_mup` rebases that initialization to
-`scaling_base_num_layers` so the explicit residual-branch multiplier carries the
-intended depth scaling.
+Megatron classifies parameters by explicit parameterization metadata when it is
+available, with name/shape fallbacks only for backward compatibility. The v1
+`depth_mup` policy is:
+
+| Parameter class | LR policy | Epsilon policy | Weight-decay policy |
+| --- | --- | --- | --- |
+| Embedding/output class | Preserve embedding/output LR policy, including `decoupled_lr` precedence | `width_mult^-1` | Base Megatron policy |
+| Hidden matrix-like weights | `width_mult^-1` | `(width_mult * depth_mult)^-1` | `width_mult` |
+| Hidden linear/attention/MLP biases | Base LR | `(width_mult * depth_mult)^-1` | Base weight decay |
+| Norm scale/bias and unknown 1-D tensors | Base LR | `(width_mult * depth_mult)^-1` as current v1 policy | No weight decay |
+| q/k layernorm vectors with `apply_wd_to_qk_layernorm=True` | Base LR | `(width_mult * depth_mult)^-1` | Base weight decay |
+
+This table is an intentional Megatron adaptation. The spectral AdamW table gives
+base weight decay to hidden biases, but Megatron's 1-D tensors are not all
+hidden biases. Hidden linear/attention/MLP biases therefore keep base weight
+decay, while normalization vectors and otherwise unknown 1-D tensors keep
+Megatron's conservative no-weight-decay behavior unless q/k layernorm is
+explicitly opted in. The hidden-vector epsilon rule is applied to hidden
+vector-like parameters as a v1 policy, not as a claim that all norm-like vectors
+appear in the paper table.
+
+### Initialization and Residual Branches
+
+Megatron already applies layer-count-dependent initialization to residual branch
+output projections. `depth_mup` rebases dense transformer block output
+projection initialization to `scaling_base_num_layers` so the explicit
+residual-branch multiplier carries the intended depth scaling. The dense
+residual hook covers self-attention output projection and dense MLP output
+projection. MoE layers do not inherit this hook.
 
 Example:
 
@@ -141,6 +180,20 @@ unvalidated rules. The rejected surface includes:
 - configured experimental attention variants
 - MoE
 - BERT, T5, and Mamba model families
+
+### Validation and Evaluation
+
+Training mode is the supported runtime for `depth_mup`. Validation loss can be
+enabled explicitly with `--allow-depth-mup-eval`; this switch is for validation
+only and does not make generation/inference a supported `depth_mup` path. YAML
+configs default `allow_depth_mup_eval` to `False` so older YAML files continue
+to validate without adding a new field.
+
+Checkpoint resume and distributed-optimizer preprocessing identify optimizer
+parameter groups through the same tolerant identifier tuple used during
+optimizer load. Optional group fields such as `eps` and per-group `optimizer`
+may be absent in standard Adam/SGD-style groups, so missing fields resolve to
+`None` instead of causing resume-time `KeyError`.
 
 ## Manual Overrides
 
