@@ -130,6 +130,76 @@ controls to ensure these global-rank ranges actually land in the intended NVL
 domains. Pass the resulting `ProcessGroupCollection` to both the model and
 `NonuniformTPDistributedDataParallel`.
 
+## Launcher Rank To GPU Mapping
+
+NTP does not assign global ranks to physical GPUs. It only observes the global
+rank after `torch.distributed.init_process_group()`. The launcher must create
+the desired mapping from global rank to node and GPU.
+
+For `torchrun` with a fixed number of processes per node, global ranks are
+assigned in node-major order:
+
+```text
+global_rank = node_rank * nproc_per_node + local_rank
+gpu         = CUDA_VISIBLE_DEVICES[local_rank]
+```
+
+For example, with `--nnodes=2 --nproc_per_node=3`:
+
+```text
+node 0 local_rank 0 -> global rank 0 -> CUDA_VISIBLE_DEVICES[0]
+node 0 local_rank 1 -> global rank 1 -> CUDA_VISIBLE_DEVICES[1]
+node 0 local_rank 2 -> global rank 2 -> CUDA_VISIBLE_DEVICES[2]
+node 1 local_rank 0 -> global rank 3 -> CUDA_VISIBLE_DEVICES[0]
+node 1 local_rank 1 -> global rank 4 -> CUDA_VISIBLE_DEVICES[1]
+node 1 local_rank 2 -> global rank 5 -> CUDA_VISIBLE_DEVICES[2]
+```
+
+If the desired physical layout is exactly:
+
+```text
+global ranks 0,1     -> 2-GPU NVL domain
+global ranks 2,3,4,5 -> 4-GPU NVL domain
+```
+
+then use a launch that really creates two tasks in the first domain and four
+tasks in the second domain. Plain `torchrun --nnodes=2 --nproc_per_node=N`
+cannot express different process counts per node. Use a Slurm heterogeneous
+launch, one task per rank, or another cluster-specific launcher that lets rank
+0 and rank 1 bind to the 2-GPU domain and rank 2 through rank 5 bind to the
+4-GPU domain.
+
+With direct Slurm rank assignment, the common mapping is:
+
+```text
+global_rank = SLURM_PROCID
+local_rank  = SLURM_LOCALID
+world_size  = SLURM_NTASKS
+```
+
+The training script can validate the placement early with:
+
+```python
+import os
+import socket
+import torch
+import torch.distributed as dist
+
+local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
+torch.cuda.set_device(local_rank)
+dist.init_process_group("nccl")
+print(
+    f"rank={dist.get_rank()} host={socket.gethostname()} "
+    f"local_rank={local_rank} visible={os.environ.get('CUDA_VISIBLE_DEVICES')}",
+    flush=True,
+)
+```
+
+Check this printed table before trusting an NTP run. Cluster topology flags such
+as NVL segment selection can constrain which GPUs are allocated, but the
+launcher rank order still determines which global rank lands on each allocated
+GPU.
+
 ## Gradient Sync Behavior
 
 Healthy full-TP replicas contain extra TP ranks that have no peer in a reduced
