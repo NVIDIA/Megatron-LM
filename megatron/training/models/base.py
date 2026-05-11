@@ -63,9 +63,10 @@ class ModelConfig:
     restore_modelopt_state: bool = False
     """Restore ModelOpt quantization/sparsity state."""
 
-    # === HuggingFace Metadata ===
-    hf_model_id: str | None = None
-    """HuggingFace model identifier."""
+    extra_checkpoint_metadata: dict[str, Any] | None = None
+    """Store for additional model-related metadata to save in the checkpoint. This 
+    may be useful when extending Megatron-Core models, e.g. converting to/from HuggingFace.
+    Must be serializable."""
 
     # === pre-wrap and post-wrap hooks ===
     pre_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(default_factory=list)
