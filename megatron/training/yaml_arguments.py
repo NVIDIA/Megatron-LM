@@ -52,6 +52,8 @@ def validate_yaml(args, defaults={}):
         split_data_path = args.data_path.split()
         if len(split_data_path) != 1:
             args.data_path = split_data_path
+    if not hasattr(args, 'step_batch_size_schedule'):
+        args.step_batch_size_schedule = None
 
     # Tensor model parallel size.
     args.model_parallel.tensor_model_parallel_size = min(
