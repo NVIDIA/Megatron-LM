@@ -203,7 +203,7 @@ class TestConfigContainer_FromYaml:
             TestConfigContainer.from_yaml("non_existent_file.yaml")
 
     @patch("megatron.training.config.container.MultiStorageClientFeature.is_enabled")
-    @patch("megatron.training.config.container.OmegaConf")
+    @patch("omegaconf.OmegaConf")
     @patch("builtins.open", new_callable=mock_open)
     @patch("os.path.exists")
     def test_from_yaml_success(self, mock_exists, mock_file, mock_omegaconf, mock_msc):
@@ -251,7 +251,7 @@ class TestConfigContainer_FromYaml:
 
         with patch("builtins.open", mock_open()):
             with patch("yaml.safe_load", return_value={}):
-                with patch("megatron.training.config.container.OmegaConf") as mock_omegaconf:
+                with patch("omegaconf.OmegaConf") as mock_omegaconf:
                     # Mock OmegaConf methods to return expected values
                     mock_conf = MagicMock()
                     mock_omegaconf.create.return_value = mock_conf
