@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class HybridModelConfig(ModelConfig):
-    """Configuration for a Megatron Core Hybrid (SSM) model.
+    """Configuration for a Megatron Core Hybrid model.
 
     This is purely a configuration object. All model construction
     logic lives in ``HybridModelBuilder``.
@@ -39,7 +39,7 @@ class HybridModelConfig(ModelConfig):
     on the embedded ``transformer`` config are accessible directly on this object
     via ``__getattr__``/``__setattr__`` proxying.
 
-    Supports hybrid SSM/attention architectures via ``hybrid_layer_pattern``
+    Supports hybrid architectures via ``hybrid_layer_pattern``
 
     Note:
         ``vocab_size`` must be set before passing this config to ``HybridModelBuilder``.
