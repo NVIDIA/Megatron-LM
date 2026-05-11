@@ -363,7 +363,7 @@ class DataParallelBuffer:
             # Bounds check: end must not exceed data size
             if s_end > data_nel:
                 print(
-                    f"{label_prefix}❌ OVERFLOW: item {s_id} shape={list(shape)} "
+                    f"{label_prefix}OVERFLOW: item {s_id} shape={list(shape)} "
                     f"local=[{s_start}, {s_end}) but data.numel()={data_nel} "
                     f"(global=[{g_start}, {g_start + size}))"
                 )
@@ -375,7 +375,7 @@ class DataParallelBuffer:
                 if s_end > n_start:
                     overlap = s_end - n_start
                     print(
-                        f"{label_prefix}❌ OVERLAP: item {s_id} shape={list(shape)} "
+                        f"{label_prefix}OVERLAP: item {s_id} shape={list(shape)} "
                         f"local=[{s_start}, {s_end}) overlaps item {n_id} "
                         f"local=[{n_start}, {n_end}) by {overlap} elements "
                         f"(global_{s_id}=[{g_start}, {g_start + size}), "
@@ -413,7 +413,7 @@ class DataParallelBuffer:
             b_start, b_end, b_id, b_shape = ranges[i + 1]
             if a_end > b_start:
                 print(
-                    f"{label_prefix}❌ GLOBAL OVERLAP: item {a_id} shape={list(a_shape)} "
+                    f"{label_prefix}GLOBAL OVERLAP: item {a_id} shape={list(a_shape)} "
                     f"[{a_start}, {a_end}) vs item {b_id} shape={list(b_shape)} "
                     f"[{b_start}, {b_end}) overlap={a_end - b_start}"
                 )
@@ -506,42 +506,54 @@ class DataParallelBuffer:
         return self._unsharded_buffer
 
     @torch.no_grad()
-    def reduce_grad(self):
+    def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
         """Reduce gradients across the data-parallel group.
 
         For distributed buffers: reduce-scatter the full gradient into each
         rank's shard, then accumulate into self.data.
         For non-distributed buffers: all-reduce in-place.
+        If grad_comm_dtype differs from self.dtype, communicate with a temporary
+        casted tensor and cast the reduced result back before accumulation.
         """
+        grad_comm_dtype = grad_comm_dtype or self.dtype
+
         if self.gradient_scaling_factor in (None, 1.0):
             op = torch.distributed.ReduceOp.SUM
-        elif self.dtype != torch.bfloat16:
+            prescale = False
+        elif grad_comm_dtype != torch.bfloat16:
             op = torch.distributed._make_nccl_premul_sum(self.gradient_scaling_factor)
+            prescale = False
         else:
-            full_grad.mul_(self.gradient_scaling_factor)
             op = torch.distributed.ReduceOp.SUM
+            prescale = True
 
         if not self.is_distributed:
-            if self.gradient_scaling_factor not in (None, 1.0):
-                full_grad.mul_(self.gradient_scaling_factor)
-            torch.distributed.all_reduce(self.data, group=self.dp_group, op=op)
+            comm_data = self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
+            if prescale:
+                comm_data.mul_(self.gradient_scaling_factor)
+            torch.distributed.all_reduce(comm_data, group=self.dp_group, op=op)
+            if comm_data is not self.data:
+                self.data.copy_(comm_data.to(self.dtype))
             return
 
         full_grad = self.fetch_unsharded_buffer()
-        if self.gradient_scaling_factor not in (None, 1.0):
-            full_grad.mul_(self.gradient_scaling_factor)  # pre-scale, then SUM-reduce
+        comm_input = full_grad if grad_comm_dtype == self.dtype else full_grad.to(grad_comm_dtype)
+        if prescale:
+            comm_input.mul_(self.gradient_scaling_factor)
 
         sm = self.buffer_index.shard_meta
         local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
-        reduced_grad_shard = torch.empty_like(local_grad_shard)
+        reduced_grad_shard = torch.empty(sm.size, dtype=grad_comm_dtype, device=self.device)
 
         torch.distributed.reduce_scatter_tensor(
-            output=reduced_grad_shard, input=full_grad, group=self.dp_group, op=op
+            output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
         # Accumulate the reduced shard into the persistent local shard buffer. The
         # reduce-scatter output must not alias the full input buffer, otherwise the
         # collective can clobber its own input and silently corrupt gradients.
+        if reduced_grad_shard.dtype != self.dtype:
+            reduced_grad_shard = reduced_grad_shard.to(self.dtype)
         local_grad_shard += reduced_grad_shard
 
 
@@ -555,9 +567,7 @@ def check_all_fsdp_buffers(module) -> bool:
     """
     import torch.distributed as dist
 
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.fully_shard import (
-        FSDPModule,
-    )
+    from .fsdp_module import FSDPModule
 
     rank = dist.get_rank() if dist.is_initialized() else -1
     all_ok = True
