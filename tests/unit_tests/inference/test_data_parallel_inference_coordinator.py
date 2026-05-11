@@ -1097,8 +1097,8 @@ class TestEPAsyncStepProtocol:
         protocol.complete_idle_step()
 
     @pytest.mark.asyncio
-    async def test_async_handoff_publishes_explicit_skip(self):
-        communicator = _RecordingEPCommunicator()
+    async def test_async_handoff_dummy_rank_does_not_veto_real_launch(self):
+        communicator = _RecordingEPCommunicator(sync_results=[(1, 1, 0)])
         protocol = EPAsyncStepProtocol(communicator)
 
         await protocol.establish_work_consensus(1, False)
@@ -1107,6 +1107,32 @@ class TestEPAsyncStepProtocol:
         )
 
         assert decision.step_id == 0
+        assert decision.has_real_work
+        assert decision.launch_async_forward
+        assert not decision.skip_async_forward
+        assert decision.any_launch_request
+        assert not decision.any_skip_request
+        assert communicator.calls[-1] == (
+            "sync",
+            EPAsyncPhase.ASYNC_HANDOFF.value,
+            0,
+            None,
+            (0, 0, 0),
+        )
+        protocol.complete_idle_step()
+
+    @pytest.mark.asyncio
+    async def test_async_handoff_real_rank_publishes_explicit_skip(self):
+        communicator = _RecordingEPCommunicator()
+        protocol = EPAsyncStepProtocol(communicator)
+
+        await protocol.establish_work_consensus(1, False)
+        decision = protocol.decide_async_handoff(
+            has_real_work=True, can_launch_async_handoff=False
+        )
+
+        assert decision.step_id == 0
+        assert decision.has_real_work
         assert not decision.launch_async_forward
         assert decision.skip_async_forward
         assert not decision.any_launch_request
@@ -1116,7 +1142,7 @@ class TestEPAsyncStepProtocol:
             EPAsyncPhase.ASYNC_HANDOFF.value,
             0,
             None,
-            (0, 0, 1),
+            (1, 0, 1),
         )
         protocol.complete_idle_step()
 

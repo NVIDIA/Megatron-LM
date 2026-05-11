@@ -3145,8 +3145,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             (1, 1), device=torch.cuda.current_device(), dtype=torch.long
         )
         controller.set_ep_async_protocol(LaunchingProtocol())
+
+        def unexpected_full_step_eligibility(allow_mtp=False):
+            raise AssertionError("dummy handoff must not run request-local eligibility checks")
+
         monkeypatch.setattr(
-            controller, "_async_scheduling_disabled_reason", lambda allow_mtp=False: None
+            controller,
+            "_async_scheduling_global_disabled_reason",
+            lambda allow_mtp=False: calls.append(("global", allow_mtp)) or None,
+        )
+        monkeypatch.setattr(
+            controller, "_async_scheduling_disabled_reason", unexpected_full_step_eligibility
         )
         monkeypatch.setattr(
             controller,
@@ -3171,6 +3180,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         assert controller._try_launch_dummy_async_handoff()
         assert calls == [
+            ("global", True),
             ("eligible", None),
             ("handoff", False, True),
             ("reset",),
@@ -3588,8 +3598,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 )
 
         controller.set_ep_async_protocol(SkippingProtocol())
+
+        def unexpected_full_step_eligibility(allow_mtp=False):
+            raise AssertionError("dummy handoff must not run request-local eligibility checks")
+
         monkeypatch.setattr(
-            controller, "_async_scheduling_disabled_reason", lambda allow_mtp=False: None
+            controller, "_async_scheduling_global_disabled_reason", lambda allow_mtp=False: None
+        )
+        monkeypatch.setattr(
+            controller, "_async_scheduling_disabled_reason", unexpected_full_step_eligibility
         )
         monkeypatch.setattr(controller, "_record_async_eligibility_result", lambda reason: None)
         monkeypatch.setattr(

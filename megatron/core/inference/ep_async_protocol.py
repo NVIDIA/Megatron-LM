@@ -37,7 +37,7 @@ class EPStepBeginDecision:
 
 @dataclass(frozen=True)
 class EPAsyncHandoffDecision:
-    """EP-wide decision for launching or skipping the async forward handoff."""
+    """EP-wide real-rank decision for launching or skipping the async handoff."""
 
     step_id: int
     has_real_work: bool
@@ -269,17 +269,17 @@ class EPAsyncStepProtocol:
         """Synchronize whether the current EP work step launches an async forward."""
         step_id = self._step_id_for_phase(EPAsyncPhase.ASYNC_HANDOFF)
         local_real = int(has_real_work)
-        local_launch = int(can_launch_async_handoff)
-        local_skip = int(not can_launch_async_handoff)
+        local_launch = int(has_real_work and can_launch_async_handoff)
+        local_real_skip = int(has_real_work and not can_launch_async_handoff)
 
-        any_real, any_launch, any_skip = self._sync_all_reduce_max_at_step(
+        any_real, any_launch, any_real_skip = self._sync_all_reduce_max_at_step(
             EPAsyncPhase.ASYNC_HANDOFF,
             step_id,
             local_real,
             local_launch,
-            local_skip,
+            local_real_skip,
         )
-        launch_async_forward = bool(any_launch and not any_skip)
+        launch_async_forward = bool(any_launch and not any_real_skip)
         if launch_async_forward:
             self._async_handoff_launch_count += 1
         else:
@@ -291,5 +291,5 @@ class EPAsyncStepProtocol:
             launch_async_forward=launch_async_forward,
             skip_async_forward=not launch_async_forward,
             any_launch_request=bool(any_launch),
-            any_skip_request=bool(any_skip),
+            any_skip_request=bool(any_real_skip),
         )

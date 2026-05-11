@@ -1668,7 +1668,7 @@ class TextGenerationController:
     def _try_launch_dummy_async_handoff(self) -> bool:
         """Mirror the real-rank async forward handoff on an EP dummy rank."""
         context = self.inference_wrapped_model.inference_context
-        self._async_disable_reason = self._async_scheduling_disabled_reason(allow_mtp=True)
+        self._async_disable_reason = self._dummy_async_handoff_disabled_reason()
         self._record_async_eligibility_result(self._async_disable_reason)
         handoff_decision = self._decide_ep_async_handoff(
             has_real_work=False,
@@ -2106,9 +2106,10 @@ class TextGenerationController:
 
         return True
 
-    def _async_scheduling_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
-        """Return why async scheduling cannot be used for the current step, or None."""
-        context = self.inference_wrapped_model.inference_context
+    def _async_scheduling_global_disabled_reason(
+        self, *, allow_mtp: bool = False
+    ) -> Optional[str]:
+        """Return non-step-local reasons async scheduling is disabled, or None."""
         if not self._async_scheduling_enabled:
             return "disabled"
         if self._async_step_barrier_reason is not None:
@@ -2128,6 +2129,24 @@ class TextGenerationController:
             return "not enough mtp heads"
         if self._sampling_backend != "torch":
             return "sampling backend is unsupported"
+        return None
+
+    def _dummy_async_handoff_disabled_reason(self) -> Optional[str]:
+        """Return why a dummy EP rank cannot mirror an async handoff, or None.
+
+        Dummy EP ranks often have an empty/reset local context, so request-local
+        checks such as active request count and graph shape belong to real ranks.
+        The dummy rank must still join the handoff decision and mirror any
+        real-rank launch when the shared controller configuration supports it.
+        """
+        return self._async_scheduling_global_disabled_reason(allow_mtp=True)
+
+    def _async_scheduling_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
+        """Return why async scheduling cannot be used for the current step, or None."""
+        context = self.inference_wrapped_model.inference_context
+        disabled_reason = self._async_scheduling_global_disabled_reason(allow_mtp=allow_mtp)
+        if disabled_reason is not None:
+            return disabled_reason
         if not context.is_decode_only():
             return "not decode-only"
         if not context.using_cuda_graph_this_step():
