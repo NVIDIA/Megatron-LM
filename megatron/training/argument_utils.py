@@ -30,7 +30,7 @@ from megatron.training.config import (
     StragglerDetectionConfig,
     RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
 )
-from megatron.training.models.hybrid import HybridModelConfig
+from megatron.training.models import HybridModelConfig, GPTModelConfig
 # TODO: support arg renames
 
 class TypeInferenceError(Exception):
@@ -387,6 +387,16 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
     else:
         return kwargs
 
+
+def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
+    """Create a GPTModelConfig from the appropriate values in the `args` Namespace."""
+    kwargs = {}
+
+    # TODO (@maanug): impl
+    pass
+
+    return GPTModelConfig(**kwargs)
+    
 
 def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
     """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""

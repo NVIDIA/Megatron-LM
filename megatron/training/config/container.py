@@ -27,7 +27,7 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -233,7 +233,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    model: HybridModelConfig  # TODO (@maanug): add support for GPTModelConfig 
+    model: HybridModelConfig | GPTModelConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
