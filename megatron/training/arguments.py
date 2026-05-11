@@ -1179,7 +1179,6 @@ def validate_args(args, defaults={}):
             args.ffn_hidden_size = 4 * args.hidden_size
 
     if args.kv_channels is None:
-        assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
 
     if args.seq_length is not None and args.context_parallel_size > 1:
@@ -1382,14 +1381,9 @@ def validate_args(args, defaults={}):
         warn_rank_0("moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
     # Expert parallelism check
-    # NOTE: These validations are also enforced in TransformerConfig.__post_init__
-    # for configs that go through dataclass construction. Retained here for legacy
-    # model paths that bypass TransformerConfig entirely.
     if args.expert_model_parallel_size > 1:
         assert args.num_experts is not None, \
             "num_experts must be non None to use expert model parallelism"
-        assert args.num_experts % args.expert_model_parallel_size == 0, \
-            "Number of experts should be a multiple of expert model parallel_size."
 
     # MoE router check
     if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:

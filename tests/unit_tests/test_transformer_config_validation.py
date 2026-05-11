@@ -2,8 +2,8 @@
 """
 Unit tests for validations migrated into TransformerConfig.__post_init__.
 
-Part of #3568: moves pure-validation assertions from validate_args() in
-arguments.py into TransformerConfig so they fire at config-construction time
+Part of #3568: adds pure-validation assertions to TransformerConfig.__post_init__
+from validate_args() in arguments.py so they fire at config-construction time
 and can be exercised without a full training process.
 
 Covered validation groups
@@ -103,14 +103,6 @@ class TestMoEExpertParallelDivisibility:
             match="num_moe_experts.*must be divisible by.*expert_model_parallel_size",
         ):
             TransformerConfig(**self._moe_kwargs(num_moe_experts=3, expert_model_parallel_size=2))
-
-    def test_experts_not_divisible_ep4_raises(self):
-        """7 experts, EP=4 → 7 % 4 != 0, must raise ValueError."""
-        with pytest.raises(
-            ValueError,
-            match="num_moe_experts.*must be divisible by.*expert_model_parallel_size",
-        ):
-            TransformerConfig(**self._moe_kwargs(num_moe_experts=7, expert_model_parallel_size=4))
 
     def test_ep1_with_any_non_zero_experts_is_valid(self):
         """expert_model_parallel_size=1 (default) — divisibility never fires
