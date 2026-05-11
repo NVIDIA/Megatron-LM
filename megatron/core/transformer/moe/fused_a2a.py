@@ -200,7 +200,7 @@ class FusedCombine(torch.autograd.Function):
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         ctx.moe_fp8_flow = config.moe_fp8_flow if config is not None else False
-        ctx.fp8_recipe = config.fp8_recipe
+        ctx.fp8_recipe = config.fp8_recipe if config is not None else None
         return combined_x, None
 
     @staticmethod
