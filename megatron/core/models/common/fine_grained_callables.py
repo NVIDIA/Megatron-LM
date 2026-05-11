@@ -29,16 +29,26 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 def build_mtp_layer_callables(layer):
     """Callables for multi-token prediction layer nodes.
 
-    This class contains the callable functions for different types of
-    multi-token prediction layer nodes (attention, MLP, etc.)
+    Wraps the inner ``layer.mtp_model_layer``'s callables with MTP-specific
+    pre-process (chunk and concat embeddings) and post-process (gather across
+    depths) steps. The inner layer is built by ``build_layer_callables`` so
+    that ``mtp_model_layer`` can be a TransformerLayer (today's case) or a
+    HybridStack (when an MTP depth uses the hybrid layout).
     """
 
-    forward_funcs, backward_dw = build_transformer_layer_callables(layer.mtp_model_layer)
-    attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
-    is_moe = isinstance(layer.mtp_model_layer.mlp, MoELayer)
+    forward_funcs, backward_dw, is_moe, num_local_experts = build_layer_callables(
+        layer.mtp_model_layer
+    )
+    (
+        pre_dispatch_forward,
+        dispatch_forward,
+        mlp_forward,
+        combine_forward,
+        _,
+    ) = forward_funcs
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
-    def submodule_mtp_attn_forward(node, hidden_states):
+    def submodule_mtp_pre_dispatch_forward(node, hidden_states):
         # MTP Block Preprocess
         if node.is_first_layer:
             offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
@@ -71,7 +81,7 @@ def build_mtp_layer_callables(layer):
         # fp8 context is added in 1f1b schedule, so we don't need to add it here
         with rng_context:
             hidden_states = layer._concat_embeddings(hidden_states, decoder_input)
-            return attn_forward(node, hidden_states)
+            return pre_dispatch_forward(node, hidden_states)
 
     def submodule_mtp_postprocess_forward(node, hidden_states):
         hidden_states = layer._postprocess(hidden_states)
@@ -93,9 +103,9 @@ def build_mtp_layer_callables(layer):
             return func(*args, **kwargs)
 
     # Build forward and backward callable functions.
-    # pre_dispatch_func already has rng context (rolled into submodule_mtp_attn_forward),
-    # so it does not need to be wrapped.
-    pre_dispatch_func = submodule_mtp_attn_forward
+    # pre_dispatch_func already has rng context (rolled into
+    # submodule_mtp_pre_dispatch_forward), so it does not need to be wrapped.
+    pre_dispatch_func = submodule_mtp_pre_dispatch_forward
     dispatch_func = partial(rng_context_wrapper, dispatch_forward)
     mlp_func = partial(rng_context_wrapper, mlp_forward)
     combine_func = partial(rng_context_wrapper, combine_forward)
@@ -114,24 +124,28 @@ def build_mtp_layer_callables(layer):
     else:
         backward_dw["pre_dispatch_computation"] = [pre_dispatch_bwd, layer.eh_proj]
 
-    return forward_funcs, backward_dw
+    return forward_funcs, backward_dw, is_moe, num_local_experts
 
 
 def build_layer_callables(layer):
-    """
-    Builds the callable functions(forward and dw) for the given layer.
-    For now, 1f1b overlap only support TransformerLayer and MultiTokenPredictionLayer.
+    """Dispatch to the appropriate layer-callable builder.
 
-    Args:
-        layer: The layer to build callables for.
-
-    Returns:
-        forward_funcs: list of callable functions for the layer.
-        backward_dw: dict of weight gradient functions for the layer.
+    Returns ``(forward_funcs, backward_dw, is_moe, num_local_experts)`` so the
+    schedule plan does not need to re-derive ``is_moe`` /
+    ``num_local_experts`` after the call — the build function already knows
+    the layer type. ``num_local_experts`` is ``None`` for dense layers.
     """
-    if isinstance(layer, TransformerLayer):
-        return build_transformer_layer_callables(layer)
-    elif isinstance(layer, MultiTokenPredictionLayer):
+    from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_stack_callables
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+    if isinstance(layer, HybridStack):
+        return build_hybrid_stack_callables(layer)
+    if isinstance(layer, MultiTokenPredictionLayer):
         return build_mtp_layer_callables(layer)
+    if isinstance(layer, TransformerLayer):
+        forward_funcs, backward_dw = build_transformer_layer_callables(layer)
+        is_moe = isinstance(layer.mlp, MoELayer)
+        num_local_experts = layer.mlp.num_local_experts if is_moe else None
+        return forward_funcs, backward_dw, is_moe, num_local_experts
 
     raise ValueError(f"Unsupported layer type: {type(layer)}")

@@ -119,17 +119,15 @@ class TransformerLayerSchedulePlan:
         """
         from megatron.core.models.common.fine_grained_callables import build_layer_callables
         from megatron.core.models.common.utils import TransformerLayerNode
-        from megatron.core.transformer.moe.moe_layer import MoELayer
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
-        # build the forward and backward callables for the transformer/mtp layer
-        fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
+        # The dispatcher returns is_moe / num_local_experts directly since it
+        # already knows the layer type (saves a separate isinstance dance here).
+        fwd_callables, bwd_dw_callable_map, is_moe, num_local_experts = build_layer_callables(
+            self.layer
+        )
 
-        # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
-        transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
-        is_moe = isinstance(transformer_layer.mlp, MoELayer)
-        num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe

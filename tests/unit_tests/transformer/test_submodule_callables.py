@@ -65,7 +65,7 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
 
     output_tensors = []
     # get callables
-    callables, dw = build_layer_callables(model)
+    callables, dw, _is_moe, _num_local_experts = build_layer_callables(model)
     attn, dispatch, moe, combine, post_process = callables
     assert post_process is None
     dummy_model = DummyState()

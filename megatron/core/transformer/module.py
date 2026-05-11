@@ -199,12 +199,22 @@ class GraphableMegatronModule(MegatronModule):
             self.cuda_graph_backward_dw_wrapper = None
 
     def init_backward_dw_wrapper(self):
-        """Initialize the backward_dw_wrapper."""
+        """Initialize ``self.backward_dw_wrapper`` for delayed-wgrad scheduling.
+
+        The wrapper coordinates the per-layer wgrad callables (attention
+        wgrad, optional shared-expert wgrad) with cuda-graph replay scope so
+        captured components are not re-run eagerly. The method is defined on
+        ``GraphableMegatronModule`` so any graphable subclass can opt in;
+        ``_BackwardDWWrapper`` itself currently asserts the underlying layer
+        is a ``TransformerLayer``, so MambaLayer-derived modules implement
+        ``backward_dw`` directly and skip this helper.
+        """
         from megatron.core.models.common.utils import _BackwardDWWrapper
 
         config = getattr(self, 'config', None)
         assert config is not None, (
-            "TransformerLayer must be initialized before calling " "`init_backward_dw_wrapper`."
+            "Module must be fully constructed (config set) before calling "
+            "`init_backward_dw_wrapper`."
         )
         self.backward_dw_wrapper = _BackwardDWWrapper(self)
 
