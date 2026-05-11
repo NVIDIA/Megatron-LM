@@ -2778,35 +2778,27 @@ class ParamAndGradBuffer:
         Zero out the underlying grad_buffer and reset all buckets in preparation
         for the next iteration of training.
 
-        Gradient shards that are not views of Megatron-FSDP sharded gradient buffers
-        will be dereferenced to free memory. Dereferencing is not compatible with
-        CUDA graphability, because we need to preserve this reference to sharded
-        gradients generated during CUDA graph replay (`setattr` in `update_main_grads`
-        is not executed during replay). Because decoupled gradients are never casted
-        and remain a view of the sharded gradient buffer, using a precision-aware
-        optimizer (i.e. `megatron_fsdp_use_decoupled_grad=True`) is CUDA-graphable.
+        Gradient shards are dereferenced to free memory. However, dereferencing is
+        not compatible with (FWD-BWD / full-iteration) CUDA graph-ability, because
+        we need to preserve this reference to the sharded gradient generated during
+        CUDA graph replay (`setattr` in `update_main_grads` not executed during
+        CUDA graph replay, as it is not a CUDA kernel).
+
+        If the gradient is decoupled (precision-aware) or is equivalent to the
+        distributed optimizer parameter precision, the gradient shard is a view of
+        the Megatron-FSDP sharded gradient buffer. If not, then not dereferencing
+        this gradient shard will increase memory utilization as this gradient is a
+        persistent casted-copy of the accumulated gradient.
         """
-        for name, param in self.optimizer_named_parameters:
-            if (
-                hasattr(param, "grad")
-                and isinstance(param.grad, DTensor)
-                and param.grad._local_tensor._base is None
-            ):
-                # NOTE: Only when param.dtype != group.main_grad_buffer.dtype.
+        if not self.ddp_config.megatron_fsdp_cuda_graph_mode:
+            # Dereference the sharded gradient to reclaim memory
+            # unless a full-iteration CUDA graph is utilized.
+            for name, param in self.optimizer_named_parameters:
                 param.grad = None
-            if (
-                hasattr(param, "decoupled_grad")
-                and isinstance(param.decoupled_grad, DTensor)
-                and param.decoupled_grad._local_tensor._base is None
-            ):
-                # NOTE: Decoupled gradients should always be a view of Megatron-FSDP buffers.
-                param.decoupled_grad = None
-            if (
-                name in self.dist_main_grad
-                and self.dist_main_grad[name]._local_tensor._base is None
-            ):
-                # NOTE: Either param.grad or param.decoupled_grad.
-                self.dist_main_grad[name]._local_tensor = None
+                if hasattr(param, "decoupled_grad"):
+                    param.decoupled_grad = None
+                if name in self.dist_main_grad:
+                    self.dist_main_grad[name]._local_tensor = None
 
         # Zero the Megatron-FSDP sharded gradient buffer. If param.grad or param.decoupled_grad
         # is a view of this buffer, they will be zero'd as well.
