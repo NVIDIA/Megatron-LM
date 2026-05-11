@@ -1315,6 +1315,7 @@ def wrap_model_chunks_with_ddp(
     ddp_config,
     *,
     use_layer_wise_distributed_optimizer=False,
+    use_layer_wise_param_layout=True,
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -1325,10 +1326,12 @@ def wrap_model_chunks_with_ddp(
     Centralises the DDP-wrapping wiring shared between :func:`get_model` and
     unit tests.
 
-    For ``use_layer_wise_distributed_optimizer=True``: forces
-    ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed for
-    reduce-scatter), and computes per-chunk shard-aligned layouts via
-    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`.
+    For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
+    forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
+    for reduce-scatter), and computes per-chunk shard-aligned layouts via
+    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
+    ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
+    to its legacy ``allgather_params`` sync path.
 
     For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
     computes per-chunk byte-level layouts via
@@ -1344,8 +1347,11 @@ def wrap_model_chunks_with_ddp(
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
         config: :class:`TransformerConfig`.
         ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
-            ``use_layer_wise_distributed_optimizer=True``.
+            ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+            controls whether to compute and supply a shard-aligned param layout
+            to DDP. ``False`` keeps LayerWise on its legacy sync path.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. Forwarded to
@@ -1367,10 +1373,10 @@ def wrap_model_chunks_with_ddp(
     # Compute per-chunk layouts (DDP only).
     per_chunk_layouts = [None] * n
     if DP is DDP:
-        if use_layer_wise_distributed_optimizer:
+        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
             ddp_config.use_distributed_optimizer = True
             compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-        elif ddp_config.use_distributed_optimizer:
+        elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
         else:
             compute_layout = None
@@ -1608,6 +1614,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 use_layer_wise_distributed_optimizer=getattr(
                     args, 'use_layer_wise_distributed_optimizer', False
                 ),
+                use_layer_wise_param_layout=False,
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
