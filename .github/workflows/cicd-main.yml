@@ -133,7 +133,7 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
 
   configure:
     runs-on: ubuntu-latest
@@ -174,21 +174,21 @@ jobs:
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
 
           if [ "$IS_MERGE_GROUP" == "true" ]; then
-            SCOPE=mr-github; N_REPEAT=1; LIGHTWEIGHT=false
+            SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=false
           elif [ "$HAS_RUN_TESTS" == "true" ]; then
-            SCOPE=mr-github; N_REPEAT=1; LIGHTWEIGHT=true
+            SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=true
           elif [ "$HAS_RUN_FUNCTIONAL" == "true" ]; then
-            SCOPE=mr-github; N_REPEAT=5; LIGHTWEIGHT=false
+            SCOPE=L1; N_REPEAT=5; LIGHTWEIGHT=false
           elif [ "$IS_CI_WORKLOAD" == "true" ] || [ "$EVENT_NAME" == "workflow_dispatch" ]; then
             # Scheduled / dispatch / release have no PR labels; default to the
-            # full functional scope so cadence (set below) is the discriminator.
-            # `workflow_dispatch` is forced into this branch because upstream
-            # pre-flight reports is_ci_workload=false when dispatched from a
-            # `pull-request/*` branch, which would otherwise drop us into the
-            # slim scope.
-            SCOPE=mr-github; N_REPEAT=5; LIGHTWEIGHT=false
+            # full functional tier (L1) so cadence (set below) is the
+            # discriminator. `workflow_dispatch` is forced into this branch
+            # because upstream pre-flight reports is_ci_workload=false when
+            # dispatched from a `pull-request/*` branch, which would otherwise
+            # drop us into the slim tier.
+            SCOPE=L1; N_REPEAT=5; LIGHTWEIGHT=false
           else
-            SCOPE=mr-github-slim; N_REPEAT=5; LIGHTWEIGHT=false
+            SCOPE=L0; N_REPEAT=5; LIGHTWEIGHT=false
           fi
 
           if [ "$HAS_MBRIDGE" == "true" || $IS_MERGE_GROUP == "true" ]; then
@@ -233,7 +233,7 @@ jobs:
           _RT=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" == "true" ]                                        && echo "**→**" || echo "" )
           _RF=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" == "true" ]  && echo "**→**" || echo "" )
           _CI=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" != "true" ] && [ "$IS_CI_WORKLOAD" == "true" ] && echo "**→**" || echo "" )
-          _DF=$( [ "$SCOPE" == "mr-github-slim" ]                                                                          && echo "**→**" || echo "" )
+          _DF=$( [ "$SCOPE" == "L0" ]                                                                                      && echo "**→**" || echo "" )
           _LTS=$( [ "$HAS_LTS" == "true" ]                                                                                 && echo "**→**" || echo "" )
           _DEV=$( [ "$HAS_LTS" != "true" ]                                                                                 && echo "**→**" || echo "" )
           _CMG=$( [ "$CADENCE" == "mergegroup" ] && echo "**→**" || echo "" )
@@ -260,11 +260,11 @@ jobs:
 
           | | Trigger | \`scope\` | \`n_repeat\` | \`lightweight\` |
           |---|---|---|---|---|
-          | $_MG | Merge group | \`mr-github\` | \`1\` | \`false\` |
-          | $_RT | Label: _Run tests_ | \`mr-github\` | \`1\` | \`true\` |
-          | $_RF | Label: _Run functional tests_ | \`mr-github\` | \`5\` | \`false\` |
-          | $_CI | Schedule / dispatch (CI workload) | \`mr-github\` | \`5\` | \`false\` |
-          | $_DF | _(default)_ | \`mr-github-slim\` | \`5\` | \`false\` |
+          | $_MG | Merge group | \`L1\` | \`1\` | \`false\` |
+          | $_RT | Label: _Run tests_ | \`L1\` | \`1\` | \`true\` |
+          | $_RF | Label: _Run functional tests_ | \`L1\` | \`5\` | \`false\` |
+          | $_CI | Schedule / dispatch (CI workload) | \`L1\` | \`5\` | \`false\` |
+          | $_DF | _(default)_ | \`L0\` | \`5\` | \`false\` |
 
           **Cadence** _(filter bypassed when \`Run tests\` or \`Run functional tests\` label is set)_
 
@@ -307,7 +307,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           version: 0.7.2
 
@@ -588,10 +588,10 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4.0.0
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.1.0
         with:
           file: ./docker/Dockerfile.ci.dev
           push: true

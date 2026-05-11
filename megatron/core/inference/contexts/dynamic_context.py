@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -600,18 +600,30 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
-        # CUDA graph config list.
+        # are we using the inference_optimized nccl ep dispatcher for MoEs?
         self._nccl_ep_dispatcher = (
             get_pg_size(self.expert_model_parallel_group) > 1
-            and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
+            and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
-        # We disable non-decode cuda graphs for the nccl dispatcher.
-        # The NCCL dispatcher uses allgathers. Thus there is a need to
-        # run the same sized cuda-graph on every EP rank. This is difficult to
-        # generalize for non-decode steps.
+
+        # are we using the training a2a dispatcher for MoEs?
+        # Note that this is not optimal for speed.
+        self._training_ep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and model_config.transformer_impl == "transformer_engine"
+        )
+
+        # We only allow non-decode cuda graphs for the nvls dispatcher
+        force_disable_non_decode_cuda_graphs = (
+            self._nccl_ep_dispatcher or self._training_ep_dispatcher
+        )
+
         self.use_cuda_graphs_for_non_decode_steps = (
-            inference_config.use_cuda_graphs_for_non_decode_steps and not self._nccl_ep_dispatcher
+            inference_config.use_cuda_graphs_for_non_decode_steps
+            and not (force_disable_non_decode_cuda_graphs)
         )
+
+        # CUDA graph config list.
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
@@ -641,10 +653,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     hidden_size=moe_hidden_size,
                     ep_group=self.expert_model_parallel_group,
                 )
-
-        self.smallest_non_decode_cuda_graph_size = min(
-            inference_config.cuda_graph_mixed_prefill_count, self.max_requests
-        )
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1173,6 +1181,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+
+        # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
+        # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
+        # we fix the underlying storage so views are reusable across steps. The number of entries
+        # is bounded by the graph sizes plus eager-mode token counts, which are rounded up to
+        # multiples of TOKEN_ROUNDER and capped at max_tokens / TOKEN_ROUNDER distinct values.
+        self._input_position_views: Dict[int, Tuple[Tensor, Tensor]] = {}
 
         # Bind the shared MHA GPU views to both graph and non-graph metadata;
         # only one is active per step, so sharing storage is safe.
@@ -2026,13 +2041,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
-            smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
             strict=self.is_hybrid_model,
-            decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
-            num_speculative_tokens=self.num_speculative_tokens,
+            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
             ep_zmq_communicator=self._ep_zmq_communicator,
-            match_ep_token_counts=self._nccl_ep_dispatcher,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
@@ -2427,10 +2439,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert num_tokens >= self.padded_batch_dimensions.decode_req_count * (
             self.num_speculative_tokens + 1
         )
-        return (
-            self.gpu_view.token_to_input_ids[:num_tokens].unsqueeze(0),
-            self.gpu_view.token_to_pos_ids[:num_tokens].unsqueeze(0),
-        )
+        cached = self._input_position_views.get(num_tokens)
+        if cached is not None:
+            return cached
+        input_ids = self.gpu_view.token_to_input_ids[:num_tokens].unsqueeze(0)
+        pos_ids = self.gpu_view.token_to_pos_ids[:num_tokens].unsqueeze(0)
+        cached = (input_ids, pos_ids)
+        self._input_position_views[num_tokens] = cached
+        return cached
 
     def speculative_required_logit_indices(self) -> Tensor:
         """Token-level indices needed for speculative decode verification.
