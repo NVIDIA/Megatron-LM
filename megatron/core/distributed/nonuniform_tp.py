@@ -90,6 +90,7 @@ class _NTPAllToAllHandle:
         self.output_copies = output_copies
 
     def wait(self):
+        """Wait for the collective and copy temporary outputs into their target views."""
         self.handle.wait()
         for dst, src in self.output_copies:
             dst.copy_(src)
@@ -918,10 +919,7 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
             )
         else:
             param_layout = _compute_default_per_buffer_param_layout(
-                params,
-                bucket_size,
-                ddp_config,
-                data_parallel_group.size(),
+                params, bucket_size, ddp_config, data_parallel_group.size()
             )
         self._ntp_side_grad_index_map = param_layout.side_grad_index_map
 
@@ -1295,9 +1293,10 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
                 'disable_bucketing': disable_bucketing,
                 'pg_collection': pg_collection,
             }
-            if 'full_param_layout' in inspect.signature(
-                DistributedDataParallel.__init__
-            ).parameters:
+            if (
+                'full_param_layout'
+                in inspect.signature(DistributedDataParallel.__init__).parameters
+            ):
                 parent_kwargs['full_param_layout'] = full_param_layout
             elif full_param_layout is not None:
                 logger.warning(
