@@ -50,6 +50,7 @@ from megatron.training.arguments import (
     validate_args,
     validate_depth_mup_optimizer_support,
     validate_muon_scalar_optimizer_support,
+    warn_deprecated_mup_aliases,
 )
 from megatron.training.checkpointing import check_checkpoint_args, load_args_from_checkpoint
 from megatron.training.yaml_arguments import (
@@ -421,14 +422,66 @@ class TestMuPConfigValidation:
                 '--use-mup',
                 '--mup-base-hidden-size', '256',
                 '--mup-base-head-dim', '64',
-                '--mup-width-mult', '3.0',
+                '--mup-width-mult', '4.0',
             ]
         )
         legacy_args = _prepare_parsed_args_for_core_config(legacy_args)
         legacy_config = core_transformer_config_from_args(legacy_args)
-        assert legacy_args.mup_width_mult == pytest.approx(3.0)
+        assert legacy_args.mup_width_mult == pytest.approx(4.0)
         assert legacy_config.use_mup is True
         assert legacy_config.mup_width_mult == pytest.approx(4.0)
+
+    def test_legacy_mup_width_mult_must_match_derived_width_mult(self):
+        with pytest.raises(ValueError, match='must match the derived'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                use_mup=True,
+                mup_base_hidden_size=256,
+                mup_width_mult=3.0,
+            )
+
+    def test_legacy_mup_width_mult_requires_active_scaling_recipe(self):
+        with pytest.raises(ValueError, match='Scaling overrides require'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                mup_width_mult=3.0,
+            )
+
+    def test_legacy_mup_aliases_emit_deprecation_warning(self):
+        args = SimpleNamespace(
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_base_head_dim=64,
+            mup_width_mult=3.0,
+        )
+
+        with patch.object(training_args_module, 'warn_rank_0') as warn:
+            warn_deprecated_mup_aliases(args)
+
+        warn.assert_called_once()
+        message = warn.call_args.args[0]
+        assert '--use-mup' in message
+        assert '--mup-base-hidden-size' in message
+        assert '--mup-base-head-dim' in message
+        assert '--mup-width-mult' in message
+        assert '--scaling-recipe mup' in message
+
+    def test_canonical_mup_recipe_does_not_emit_legacy_deprecation_warning(self):
+        args = SimpleNamespace(
+            use_mup=False,
+            mup_base_hidden_size=None,
+            mup_base_head_dim=None,
+            mup_width_mult=1.0,
+        )
+
+        with patch.object(training_args_module, 'warn_rank_0') as warn:
+            warn_deprecated_mup_aliases(args)
+
+        warn.assert_not_called()
 
     def test_validate_args_calls_depth_mup_hook(self):
         parser = ArgumentParser(allow_abbrev=False)

@@ -25,7 +25,20 @@ rejects unsupported paths instead of silently inheriting behavior.
 
 ## Legacy MuP Flags
 
-`--use-mup` remains a backward-compatible alias for exact `--scaling-recipe mup`.
+`--use-mup` remains a backward-compatible alias for exact `--scaling-recipe
+mup`, but it is deprecated. New configs should use:
+
+```bash
+--scaling-recipe mup \
+--scaling-base-hidden-size <base-hidden-size> \
+--scaling-base-head-dim <base-head-dim>
+```
+
+The legacy aliases `--mup-base-hidden-size`, `--mup-base-head-dim`, and
+`--mup-width-mult` are also deprecated where they overlap with the canonical
+scaling surface. `--mup-width-mult` is derived from the resolved scaling context
+rather than treated as user-owned configuration; if supplied with a non-default
+value, it must match the derived `hidden_size / scaling_base_hidden_size` value.
 
 `depth_mup` is intentionally distinct from `--use-mup`. Code paths that mean
 "MuP-family width behavior" are keyed off the resolved scaling context rather

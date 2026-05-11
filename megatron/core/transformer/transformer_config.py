@@ -407,13 +407,14 @@ class TransformerConfig(ModelParallelConfig):
 
     use_mup: bool = False
     """
-    Backward-compatible alias for `scaling_recipe="mup"`.
+    Deprecated backward-compatible alias for `scaling_recipe="mup"`. New code
+    should use the resolved scaling context instead of reading this field.
     """
 
     mup_width_mult: float = 1.0
     """
-    Width multiplier for MuP scaling, computed as hidden_size / mup_base_hidden_size.
-    This value is automatically computed in __post_init__ when use_mup is enabled.
+    Deprecated compatibility field. The effective width multiplier is derived as
+    hidden_size / scaling_base_hidden_size in the resolved scaling context.
     """
 
     mup_base_hidden_size: Optional[int] = None
@@ -450,7 +451,7 @@ class TransformerConfig(ModelParallelConfig):
     """
     Power for attention scaling: softmax_scale = 1 / (kv_channels ** mup_attn_scale_power).
     0.5 = standard attention (1/sqrt(d_head)), 1.0 = MuP attention (1/d_head).
-    Default: 1.0 (MuP scaling when use_mup is True). Set to 0.5 for standard scaling.
+    Default: 1.0 for MuP-family recipes. Set to 0.5 for standard scaling.
     """
 
     ####################

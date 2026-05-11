@@ -353,6 +353,30 @@ def validate_depth_mup_optimizer_support(args) -> None:
             "and input/output-bias rules and is intentionally out of scope for v1."
         )
 
+def warn_deprecated_mup_aliases(args) -> None:
+    """Warn when users spell MuP through legacy CLI aliases."""
+    deprecated_aliases = []
+    if getattr(args, 'use_mup', False):
+        deprecated_aliases.append('--use-mup')
+    if getattr(args, 'mup_base_hidden_size', None) is not None:
+        deprecated_aliases.append('--mup-base-hidden-size')
+    if getattr(args, 'mup_base_head_dim', None) is not None:
+        deprecated_aliases.append('--mup-base-head-dim')
+    if getattr(args, 'mup_width_mult', 1.0) != 1.0:
+        deprecated_aliases.append('--mup-width-mult')
+
+    if not deprecated_aliases:
+        return
+
+    warn_rank_0(
+        "Legacy MuP CLI aliases are deprecated and will be removed in a future release: "
+        f"{', '.join(deprecated_aliases)}. Use `--scaling-recipe mup` with "
+        "`--scaling-base-hidden-size` and `--scaling-base-head-dim` instead. "
+        "`--mup-width-mult` is derived from the resolved scaling context and any "
+        "non-default supplied value must match the derived value."
+    )
+
+
 
 def validate_muon_scalar_optimizer_support(args) -> None:
     """Keep YAML and CLI validation aligned for Muon scalar optimizer selection."""
@@ -1711,6 +1735,7 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
     from megatron.core.parameterization import build_resolved_scaling_context, sync_legacy_mup_fields
+    warn_deprecated_mup_aliases(args)
 
     sync_legacy_mup_fields(args, build_resolved_scaling_context(args))
 
@@ -2246,17 +2271,17 @@ def _add_scaling_args(parser):
                        'runtime context. This does not enable general inference support.')
 
     group.add_argument('--use-mup', action='store_true',
-                       help='Backward-compatible alias for `--scaling-recipe mup`.')
+                       help='Deprecated backward-compatible alias for `--scaling-recipe mup`.')
     group.add_argument('--mup-width-mult', type=float, default=1.0,
-                       help='Backward-compatible compatibility field. Preserved for existing CLI/YAML surfaces.')
+                       help='Deprecated compatibility field; derived from the resolved scaling context.')
     group.add_argument('--mup-base-hidden-size', type=int, default=None,
-                       help='Backward-compatible alias for `--scaling-base-hidden-size`.')
+                       help='Deprecated backward-compatible alias for `--scaling-base-hidden-size`.')
     group.add_argument('--mup-embedding-mult', type=float, default=1.0,
                        help='MuP embedding output multiplier. Preserved for compatibility.')
     group.add_argument('--mup-output-mult', type=float, default=1.0,
                        help='MuP output/logit multiplier. Preserved for compatibility.')
     group.add_argument('--mup-base-head-dim', type=float, default=None,
-                       help='Backward-compatible alias for `--scaling-base-head-dim`.')
+                       help='Deprecated backward-compatible alias for `--scaling-base-head-dim`.')
     group.add_argument('--mup-attn-scale-power', type=float, default=1.0,
                        help='MuP attention scaling power. Preserved for compatibility.')
     return parser

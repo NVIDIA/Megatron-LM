@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
@@ -21,6 +22,7 @@ class ScalingUserConfig:
     hidden_lr_depth_power: Optional[float] = None
     block_out_proj_init_depth_power: Optional[float] = None
     use_mup_alias: bool = False
+    mup_width_mult: float = 1.0
     mup_base_hidden_size: Optional[int] = None
     mup_embedding_mult: float = 1.0
     mup_output_mult: float = 1.0
@@ -115,6 +117,8 @@ def _non_default_scaling_fields(
             candidates['mup_output_mult'] = user_config.mup_output_mult
         if user_config.mup_attn_scale_power != 1.0:
             candidates['mup_attn_scale_power'] = user_config.mup_attn_scale_power
+        if user_config.mup_width_mult != 1.0:
+            candidates['mup_width_mult'] = user_config.mup_width_mult
     return [name for name, value in candidates.items() if value is not None]
 
 
@@ -145,6 +149,7 @@ def build_scaling_user_config(config: Any) -> ScalingUserConfig:
             config, 'scaling_block_out_proj_init_depth_power', None
         ),
         use_mup_alias=bool(getattr(config, 'use_mup', False)),
+        mup_width_mult=getattr(config, 'mup_width_mult', 1.0),
         mup_base_hidden_size=getattr(config, 'mup_base_hidden_size', None),
         mup_embedding_mult=getattr(config, 'mup_embedding_mult', 1.0),
         mup_output_mult=getattr(config, 'mup_output_mult', 1.0),
@@ -198,6 +203,15 @@ def canonicalize_scaling_user_config(user_config: ScalingUserConfig, config: Any
         base_hidden_size = config.hidden_size
     if base_hidden_size <= 0:
         raise AssertionError('--scaling-base-hidden-size must be positive.')
+    width_mult = config.hidden_size / base_hidden_size
+    if user_config.mup_width_mult != 1.0 and not math.isclose(
+        user_config.mup_width_mult, width_mult, rel_tol=1e-12, abs_tol=1e-12
+    ):
+        raise ValueError(
+            "--mup-width-mult is deprecated as an input and must match the derived "
+            f"hidden_size / scaling_base_hidden_size value ({width_mult}). "
+            f"Got --mup-width-mult={user_config.mup_width_mult}."
+        )
 
     base_num_layers = user_config.base_num_layers
     if base_num_layers is None:
