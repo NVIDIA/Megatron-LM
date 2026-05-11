@@ -445,8 +445,8 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_unpermute = None
 
         num_tokens, hidden_dim = x.shape[-2:]
+        _validate_hybrid_ep_ib_tx_depth(num_tokens, group)
         if _hybrid_ep_buffer is None:
-            _validate_hybrid_ep_ib_tx_depth(num_tokens, group)
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
@@ -459,8 +459,6 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_unpermute,
                 fp8_dispatch,
             )
-        else:
-            _validate_hybrid_ep_ib_tx_depth(num_tokens, group)
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
