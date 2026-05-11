@@ -67,9 +67,6 @@ class ModelConfig:
     hf_model_id: str | None = None
     """HuggingFace model identifier."""
 
-    generation_config: Any | None = None
-    """HuggingFace GenerationConfig."""
-
     # === pre-wrap and post-wrap hooks ===
     pre_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(default_factory=list)
     """List of functions that are executed before the model is wrapped with DDP/FSDP.
