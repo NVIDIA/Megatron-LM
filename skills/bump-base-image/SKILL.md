@@ -6,7 +6,7 @@ when_to_use: User wants to upgrade the PyTorch container (e.g. "bump base image 
 
 # Bump the PyTorch base image
 
-End-to-end workflow for moving Megatron-LM's CI to a newer `nvcr.io/nvidia/pytorch:<YY.MM>-py3` container. The most common failure mode is forgetting that **GitHub CI and GitLab CI have separate pins** ([#4611](https://github.com/NVIDIA/Megatron-LM/pull/4611) bumped only the former and [#4688](https://github.com/NVIDIA/Megatron-LM/pull/4688) had to follow up). Always update both in the same PR.
+End-to-end workflow for moving Megatron-LM's CI to a newer `nvcr.io/nvidia/pytorch:<YY.MM>-py3` container. The most common failure mode is forgetting that **GitHub CI and GitLab CI have separate pins** — a bump that only touches the former lands green, then breaks GitLab CI on `main` and forces an immediate follow-up PR. Always update both in the same PR.
 
 ## Inputs to gather from the user
 
@@ -81,20 +81,20 @@ Hand off to the `update-golden-values` skill with:
 - `--pipeline-id <WORKFLOW_RUN_ID>` from the failing CI run
 - `--only-failing` (refresh just the trajectories that drifted)
 
-PR #4611 refreshed **78 golden-value files** across `dev_dgx_h100` and `dev_dgx_gb200` for GPT / MoE / MIMO / hybrid suites in a single pass via this exact flow. The KL summary the skill produces is the recommended PR description blurb — reviewers expect to see it.
+PR #4611 refreshed **78 golden-value files** across `dev_dgx_h100` and `dev_dgx_gb200` for GPT / MoE / MIMO / hybrid suites in a single pass via this exact flow. The per-metric relative-difference summary the skill produces is the recommended PR description blurb — reviewers expect to see it.
 
 ### Step 6 — Real regressions: mark broken, don't block the bump
 
 A small number of tests will genuinely break (hangs, OOM, real numerical regressions). Don't gate the base-image bump on fixing them — that conflates two changes. Instead:
 
-1. **File a GitHub issue** describing the failure mode (link the failing run). Examples from #4611: [#4654](https://github.com/NVIDIA/Megatron-LM/issues/4654), [#4657](https://github.com/NVIDIA/Megatron-LM/issues/4657).
+1. **File a GitHub issue** describing the failure mode and linking the failing CI run.
 2. **Flip the test's scope to the `-broken` variant** in the recipe YAML under `tests/test_utils/recipes/<arch>/`, with an inline comment that references the issue. Pattern:
 
    ```yaml
    - test_case: [hybrid_dynamic_inference_tp1_ep8_nanov3_chunked_prefill]
      products:
        - environment: [dev]
-         # Broken: hangs on repeat iter 3, exceeds 1h job limit — see issue #4657.
+         # Broken: hangs on repeat iter 3, exceeds 1h job limit — see issue #<N>.
          scope: [mr-broken, mr-github-broken]      # was: [mr, mr-github]
          platforms: [dgx_h100]
    ```
@@ -138,13 +138,13 @@ All three lines should show `nvcr.io/nvidia/pytorch:<YY.MM>-py3`. If they don't,
 
 - **GitHub vs GitLab pins are independent.** `docker/.ngc_version.dev` only drives GitHub CI's local container build via `Dockerfile.ci.dev`. GitLab CI has its own hardcoded `BASE_IMAGE:` matrix in `.gitlab/stages/01.build.yml`. PR #4688 existed solely because #4611 forgot the second one — don't repeat this.
 - **Don't bump LTS along with dev.** The `IMAGE_TYPE: lts` rows and `docker/.ngc_version.lts` are stability-pinned for the `container::lts` label path. Bump them in a dedicated PR with its own LTS validation.
-- **Don't fix golden-value drift by hand.** Use `tests/test_utils/python_scripts/download_golden_values.py` via the `update-golden-values` skill. Hand-editing the JSONs invites diff noise and KL regressions on subsequent bumps.
+- **Don't fix golden-value drift by hand.** Use `tests/test_utils/python_scripts/download_golden_values.py` via the `update-golden-values` skill. Hand-editing the JSONs invites diff noise and relative-difference regressions on subsequent bumps.
 - **`mr-broken` is a real scope, not a comment marker.** It keeps the recipe wired into the matrix (so it stays discoverable and runnable on demand) without gating merges. Don't delete the test case from the recipe.
 - **`/ok to test` is per-commit.** A new force-push or fixup commit needs a fresh `/ok to test <sha>` comment to re-trigger NVIDIA-runner CI on a fork PR.
 - **Don't merge until the GitLab pin matches.** Use the Step 7 grep before requesting review.
 
 ## Related skills
 
-- [update-golden-values](../update-golden-values/SKILL.md) — call this as soon as the first post-bump CI run finishes and you have a workflow run ID with failing golden checks. Produces the KL summary you paste into the PR description.
+- [update-golden-values](../update-golden-values/SKILL.md) — call this as soon as the first post-bump CI run finishes and you have a workflow run ID with failing golden checks. Produces the per-metric relative-difference summary you paste into the PR description.
 - [build-and-dependency](../build-and-dependency/SKILL.md) — for verifying the new image builds locally before opening the PR (`docker build --target main --build-arg FROM_IMAGE_NAME=$(cat docker/.ngc_version.dev) ...`).
 - [cicd](../cicd/SKILL.md) — for the PR scope-label semantics (`Run functional tests`, `complexity::*`) and the `copy-pr-bot` flow.
