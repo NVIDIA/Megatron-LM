@@ -432,7 +432,22 @@ def _get_deepep_v2_num_sms(
     num_experts: int,
     num_topk: int,
 ) -> int:
-    """Get or calculate the analytical SM count for the current DeepEP V2 layout."""
+    """Get or calculate the SM count for the current DeepEP V2 layout.
+
+    Defaults to ``buffer.get_theoretical_num_sms(num_experts, num_topk)`` which
+    optimises the dispatch kernel's *standalone* throughput. On a chip with
+    competing concurrent kernels (attention, Mamba, expert FFN) this can
+    over-allocate SMs to dispatch and starve compute. Override with the
+    ``MCORE_DEEPEP_V2_NUM_SMS`` env var to fix the count for tuning sweeps;
+    typical good values on B200 are 8-24 (vs the auto-default of ~30 at
+    EP=64, num_topk=22). Each new value triggers a JIT recompile, so pin
+    ``EP_JIT_CACHE_DIR`` if sweeping.
+    """
+    import os as _os
+    _override = _os.environ.get("MCORE_DEEPEP_V2_NUM_SMS")
+    if _override is not None:
+        return int(_override)
+
     global _deepep_v2_num_sms
     global _deepep_v2_num_sms_group
     global _deepep_v2_num_sms_num_experts
