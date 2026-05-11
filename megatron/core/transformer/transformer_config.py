@@ -24,12 +24,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
-from ..utils import (
-    get_te_version,
-    init_method_normal,
-    is_te_min_version,
-    is_torch_min_version,
-)
+from ..utils import get_te_version, init_method_normal, is_te_min_version, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -1883,8 +1878,7 @@ class TransformerConfig(ModelParallelConfig):
                 UserWarning,
             )
         self.softmax_scale = model_scaling_policy.resolve_attention_softmax_scale(
-            softmax_scale=self.softmax_scale,
-            kv_channels=self.kv_channels,
+            softmax_scale=self.softmax_scale, kv_channels=self.kv_channels
         )
 
         # Set the embedding init method.
@@ -1915,10 +1909,12 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.output_layer_init_method is None:
-            self.output_layer_init_method = model_scaling_policy.build_default_output_layer_init_method(
-                init_method_std=self.init_method_std,
-                num_layers=self.num_layers,
-                is_hybrid_model=self.is_hybrid_model,
+            self.output_layer_init_method = (
+                model_scaling_policy.build_default_output_layer_init_method(
+                    init_method_std=self.init_method_std,
+                    num_layers=self.num_layers,
+                    is_hybrid_model=self.is_hybrid_model,
+                )
             )
 
         if self.num_moe_experts is not None and self.add_bias_linear:

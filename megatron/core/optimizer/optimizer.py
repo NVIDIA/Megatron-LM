@@ -434,7 +434,8 @@ class MegatronOptimizer(ABC):
         current_groups: List[Dict], state_dict_groups: List[Dict]
     ) -> List[Dict]:
         """Filter and reorder state_dict parameter groups to match current optimizer groups.
-        Keys used for matching align with the scheduler/optimizer fields emitted by _get_param_groups.
+        Keys used for matching align with the scheduler/optimizer fields emitted by
+        _get_param_groups.
 
         Args:
             current_groups (List[Dict]): Parameter groups from the current optimizer instance.
@@ -453,8 +454,7 @@ class MegatronOptimizer(ABC):
         # and their order is determined at runtime, not from the checkpoint.
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
         loaded_groups_map = {
-            get_param_group_identifier_tuple(group): group
-            for group in state_dict_groups
+            get_param_group_identifier_tuple(group): group for group in state_dict_groups
         }
 
         final_groups = []

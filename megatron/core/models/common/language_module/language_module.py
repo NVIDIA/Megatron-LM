@@ -15,7 +15,6 @@ from megatron.core.parameterization import (
     build_resolved_model_policy,
     set_parameterization_metadata,
 )
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
 try:

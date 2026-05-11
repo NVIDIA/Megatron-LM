@@ -2,8 +2,8 @@
 
 import inspect
 import os
-from types import SimpleNamespace
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,17 +19,17 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_mlp_module_spec,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.parameterization import (
     ROLE_EMBEDDING,
     ROLE_OUTPUT,
     ROLE_SHARED_EMBEDDING_OUTPUT,
     build_resolved_model_policy,
 )
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
-    get_mlp_module_spec,
-)
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
@@ -186,17 +186,21 @@ class TestGPTModel:
             embedding=embedding,
             model_scaling_policy=build_resolved_model_policy(config),
         )
-        dummy.shared_embedding_or_output_weight = lambda: LanguageModule.shared_embedding_or_output_weight(
-            dummy
+        dummy.shared_embedding_or_output_weight = (
+            lambda: LanguageModule.shared_embedding_or_output_weight(dummy)
         )
 
-        with patch(
-            'megatron.core.models.common.language_module.language_module.is_pp_first_stage',
-            return_value=False,
-        ), patch(
-            'megatron.core.models.common.language_module.language_module.is_vp_first_stage',
-            return_value=False,
-        ), patch('torch.distributed.is_initialized', return_value=False):
+        with (
+            patch(
+                'megatron.core.models.common.language_module.language_module.is_pp_first_stage',
+                return_value=False,
+            ),
+            patch(
+                'megatron.core.models.common.language_module.language_module.is_vp_first_stage',
+                return_value=False,
+            ),
+            patch('torch.distributed.is_initialized', return_value=False),
+        ):
             LanguageModule.setup_embeddings_and_output_layer(dummy)
 
         assert weight.is_embedding_or_output_parameter is True

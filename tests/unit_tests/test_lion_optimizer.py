@@ -22,8 +22,8 @@ from megatron.core.optimizer import (
 )
 from megatron.core.optimizer.emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
-    _default_betas_for_eopt,
     _default_adam_based_eopt_config_to_kwargs,
+    _default_betas_for_eopt,
     _muon_default_param_overrides,
 )
 from megatron.core.optimizer.optimizer import FP32Optimizer
@@ -93,7 +93,7 @@ class TestLionOptimizerConfig:
 
         overrides = entry.config_to_param_overrides(config)
         assert len(overrides) == 1
-        (_, override), = overrides.items()
+        ((_, override),) = overrides.items()
         assert override["optimizer"] == "lion"
 
     def test_muon_scalar_optimizer_routes_lion_groups_to_lion_entry(self):
@@ -133,21 +133,25 @@ class TestLionOptimizerConfig:
             config_to_kwargs=None,
         )
 
-        with patch("torch.distributed.get_world_size", return_value=1), patch(
-            "torch.distributed.all_gather_object",
-            lambda output_list, obj: output_list.__setitem__(0, obj),
-        ), patch.object(
-            opt_module, "HAVE_EMERGING_OPTIMIZERS", True
-        ), patch.dict(
-            opt_module._EMERGING_OPTIMIZERS,
-            {"muon": fake_muon_entry, "lion": fake_lion_entry},
-            clear=False,
-        ), patch.object(
-            opt_module, "_create_emerging_optimizer", side_effect=fake_create
-        ), patch.object(
-            opt_module, "FP32Optimizer", side_effect=lambda optimizer, *_args, **_kwargs: optimizer
-        ), patch.object(
-            opt_module, "ChainedOptimizer", side_effect=lambda optimizers: optimizers
+        with (
+            patch("torch.distributed.get_world_size", return_value=1),
+            patch(
+                "torch.distributed.all_gather_object",
+                lambda output_list, obj: output_list.__setitem__(0, obj),
+            ),
+            patch.object(opt_module, "HAVE_EMERGING_OPTIMIZERS", True),
+            patch.dict(
+                opt_module._EMERGING_OPTIMIZERS,
+                {"muon": fake_muon_entry, "lion": fake_lion_entry},
+                clear=False,
+            ),
+            patch.object(opt_module, "_create_emerging_optimizer", side_effect=fake_create),
+            patch.object(
+                opt_module,
+                "FP32Optimizer",
+                side_effect=lambda optimizer, *_args, **_kwargs: optimizer,
+            ),
+            patch.object(opt_module, "ChainedOptimizer", side_effect=lambda optimizers: optimizers),
         ):
             results = opt_module._get_megatron_emerging_optimizer(
                 config=config,

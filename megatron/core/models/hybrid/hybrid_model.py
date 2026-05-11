@@ -12,8 +12,8 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.parameterization import SCALING_RECIPE_DEPTH_MUP
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parameterization import SCALING_RECIPE_DEPTH_MUP
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -531,7 +531,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config=self.config,
                     cp_group=self.pg_collection.cp,
                     packed_seq_params=packed_seq_params,
-                    scale_logits_fn=self._scale_logits if self.model_scaling_policy.enabled else None,
+                    scale_logits_fn=(
+                        self._scale_logits if self.model_scaling_policy.enabled else None
+                    ),
                 )
         sequence_parallel_override = False
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:

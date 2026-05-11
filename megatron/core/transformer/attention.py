@@ -14,7 +14,6 @@ from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
@@ -28,6 +27,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -362,9 +362,7 @@ class Attention(MegatronModule, ABC):
                 num_layers=self.config.num_layers,
                 is_hybrid_model=self.config.is_hybrid_model,
                 output_layer_init_method_is_user_provided=getattr(
-                    self.config,
-                    '_parameterization_output_layer_init_method_user_provided',
-                    False,
+                    self.config, '_parameterization_output_layer_init_method_user_provided', False
                 ),
                 apply_depth_hook=self.attention_type != "cross",
             )

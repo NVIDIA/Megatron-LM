@@ -109,9 +109,7 @@ class TestT5Model:
     def test_forward_uses_scale_logits(self, mocker):
         output_mult = 3.0
         t5_model = self._build_t5_model(
-            use_mup=True,
-            mup_base_hidden_size=384,
-            mup_output_mult=output_mult,
+            use_mup=True, mup_base_hidden_size=384, mup_output_mult=output_mult
         )
         bs = 2
         seq_len = t5_model.max_sequence_length
@@ -127,11 +125,7 @@ class TestT5Model:
         decoder_mask = torch.zeros((bs, seq_len), dtype=bool).cuda()
         encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask = (
             T5MaskedWordPieceDataset.config_attention_mask(
-                encoder_input_ids,
-                decoder_input_ids,
-                encoder_mask,
-                decoder_mask,
-                use_local=False,
+                encoder_input_ids, decoder_input_ids, encoder_mask, decoder_mask, use_local=False
             )
         )
         captured = {}
@@ -166,9 +160,7 @@ class TestT5Model:
     def test_loss_path_uses_scaled_logits(self, mocker):
         output_mult = 3.0
         t5_model = self._build_t5_model(
-            use_mup=True,
-            mup_base_hidden_size=384,
-            mup_output_mult=output_mult,
+            use_mup=True, mup_base_hidden_size=384, mup_output_mult=output_mult
         )
         bs = 2
         seq_len = t5_model.max_sequence_length
@@ -185,11 +177,7 @@ class TestT5Model:
         lm_labels = torch.zeros((bs, seq_len), dtype=torch.int64).cuda()
         encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask = (
             T5MaskedWordPieceDataset.config_attention_mask(
-                encoder_input_ids,
-                decoder_input_ids,
-                encoder_mask,
-                decoder_mask,
-                use_local=False,
+                encoder_input_ids, decoder_input_ids, encoder_mask, decoder_mask, use_local=False
             )
         )
         captured = {}

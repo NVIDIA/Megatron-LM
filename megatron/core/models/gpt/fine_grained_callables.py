@@ -43,7 +43,9 @@ def weak_method(method):
     return wrapped_func
 
 
-def _apply_mlp_bda_with_scaling(layer: TransformerLayer, output: torch.Tensor, residual: torch.Tensor):
+def _apply_mlp_bda_with_scaling(
+    layer: TransformerLayer, output: torch.Tensor, residual: torch.Tensor
+):
     mlp_output_with_bias = layer._scale_dense_residual_branch_output(
         (output, None),
         branch_name="mlp",

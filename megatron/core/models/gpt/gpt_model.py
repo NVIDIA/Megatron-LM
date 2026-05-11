@@ -646,7 +646,9 @@ class GPTModel(LanguageModule):
                     config=self.config,
                     cp_group=self.pg_collection.cp,
                     packed_seq_params=packed_seq_params,
-                    scale_logits_fn=self._scale_logits if self.model_scaling_policy.enabled else None,
+                    scale_logits_fn=(
+                        self._scale_logits if self.model_scaling_policy.enabled else None
+                    ),
                 )
         sequence_parallel_override = False
 

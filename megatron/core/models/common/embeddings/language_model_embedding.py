@@ -5,8 +5,8 @@ from typing import Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core import tensor_parallel
+from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, nvtx_decorator

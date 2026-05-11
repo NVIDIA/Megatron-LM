@@ -212,9 +212,7 @@ class MLP(MegatronModule):
                 num_layers=self.config.num_layers,
                 is_hybrid_model=self.config.is_hybrid_model,
                 output_layer_init_method_is_user_provided=getattr(
-                    self.config,
-                    '_parameterization_output_layer_init_method_user_provided',
-                    False,
+                    self.config, '_parameterization_output_layer_init_method_user_provided', False
                 ),
                 apply_depth_hook=not is_expert,
             )

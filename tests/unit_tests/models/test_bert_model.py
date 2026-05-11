@@ -102,9 +102,7 @@ class TestBertModel:
     def test_forward_uses_scale_logits(self, mocker):
         output_mult = 3.0
         bert_model = self._build_bert_model(
-            use_mup=True,
-            mup_base_hidden_size=6,
-            mup_output_mult=output_mult,
+            use_mup=True, mup_base_hidden_size=6, mup_output_mult=output_mult
         )
         sequence_length = bert_model.max_sequence_length
         micro_batch_size = 2
@@ -133,9 +131,7 @@ class TestBertModel:
     def test_loss_path_uses_scaled_logits(self, mocker):
         output_mult = 3.0
         bert_model = self._build_bert_model(
-            use_mup=True,
-            mup_base_hidden_size=6,
-            mup_output_mult=output_mult,
+            use_mup=True, mup_base_hidden_size=6, mup_output_mult=output_mult
         )
         sequence_length = bert_model.max_sequence_length
         micro_batch_size = 2

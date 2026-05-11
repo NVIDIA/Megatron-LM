@@ -78,7 +78,7 @@ def test_preprocess_common_state_dict_tolerates_missing_optional_param_group_key
                 "param_groups": [
                     {**base_group, "params": ["missing_optional"]},
                     {**base_group, "eps": 1e-8, "params": ["with_eps"]},
-                ],
+                ]
             },
             "param_state": {},
         },

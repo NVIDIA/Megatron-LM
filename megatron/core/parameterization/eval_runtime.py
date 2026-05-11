@@ -4,7 +4,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Iterator
 
-
 _DEPTH_MUP_EVAL_DEPTH: ContextVar[int] = ContextVar('depth_mup_eval_depth', default=0)
 
 

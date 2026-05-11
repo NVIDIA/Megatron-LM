@@ -9,9 +9,9 @@ These tests verify that MuP is correctly implemented in Megatron-LM:
 4. LR override computation
 """
 
-import logging
 import dataclasses
 import json
+import logging
 import math
 from argparse import ArgumentParser
 from types import SimpleNamespace
@@ -20,19 +20,19 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import megatron.core.optimizer as optimizer_module
 import megatron.training.arguments as training_args_module
 import megatron.training.yaml_arguments as yaml_args_module
-import megatron.core.optimizer as optimizer_module
+from megatron.core.config_logger import log_config_to_disk
+from megatron.core.models.gpt.fine_grained_callables import _apply_mlp_bda_with_scaling
 from megatron.core.optimizer import (
     _get_megatron_optimizer_based_on_param_groups,
     get_mup_config_overrides,
     get_scaling_config_overrides,
     get_standard_config_overrides,
 )
-from megatron.core.config_logger import log_config_to_disk
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
-from megatron.core.models.gpt.fine_grained_callables import _apply_mlp_bda_with_scaling
 from megatron.core.parameterization import (
     build_resolved_model_policy,
     build_resolved_scaling_context,
@@ -53,10 +53,8 @@ from megatron.training.arguments import (
     warn_deprecated_mup_aliases,
 )
 from megatron.training.checkpointing import check_checkpoint_args, load_args_from_checkpoint
-from megatron.training.yaml_arguments import (
-    core_config_from_args as core_config_from_yaml_args,
-    validate_yaml,
-)
+from megatron.training.yaml_arguments import core_config_from_args as core_config_from_yaml_args
+from megatron.training.yaml_arguments import validate_yaml
 
 
 def _build_transformer_namespace(**overrides):
@@ -284,7 +282,9 @@ class TestMuPConfigValidation:
             )
 
     def test_scaling_overrides_require_recipe(self):
-        with pytest.raises(ValueError, match="Scaling overrides require a non-'none' scaling recipe"):
+        with pytest.raises(
+            ValueError, match="Scaling overrides require a non-'none' scaling recipe"
+        ):
             TransformerConfig(
                 hidden_size=512,
                 num_layers=12,
@@ -293,12 +293,11 @@ class TestMuPConfigValidation:
             )
 
     def test_legacy_mup_knobs_require_mup_recipe(self):
-        with pytest.raises(ValueError, match="Scaling overrides require a non-'none' scaling recipe"):
+        with pytest.raises(
+            ValueError, match="Scaling overrides require a non-'none' scaling recipe"
+        ):
             TransformerConfig(
-                hidden_size=512,
-                num_layers=12,
-                num_attention_heads=8,
-                mup_base_hidden_size=256,
+                hidden_size=512, num_layers=12, num_attention_heads=8, mup_base_hidden_size=256
             )
 
     def test_scaling_base_head_dim_must_be_positive(self):
@@ -400,13 +399,19 @@ class TestMuPConfigValidation:
 
         canonical_args = parser.parse_args(
             [
-                '--num-layers', '12',
-                '--hidden-size', '1024',
-                '--num-attention-heads', '16',
+                '--num-layers',
+                '12',
+                '--hidden-size',
+                '1024',
+                '--num-attention-heads',
+                '16',
                 '--no-rope-fusion',
-                '--scaling-recipe', 'mup',
-                '--scaling-base-hidden-size', '256',
-                '--scaling-base-head-dim', '64',
+                '--scaling-recipe',
+                'mup',
+                '--scaling-base-hidden-size',
+                '256',
+                '--scaling-base-head-dim',
+                '64',
             ]
         )
         canonical_args = _prepare_parsed_args_for_core_config(canonical_args)
@@ -416,15 +421,23 @@ class TestMuPConfigValidation:
 
         depth_args = parser.parse_args(
             [
-                '--num-layers', '12',
-                '--hidden-size', '1024',
-                '--num-attention-heads', '16',
+                '--num-layers',
+                '12',
+                '--hidden-size',
+                '1024',
+                '--num-attention-heads',
+                '16',
                 '--no-rope-fusion',
-                '--scaling-recipe', 'depth_mup',
-                '--optimizer', 'adam',
-                '--scaling-base-hidden-size', '256',
-                '--scaling-base-num-layers', '6',
-                '--scaling-base-head-dim', '64',
+                '--scaling-recipe',
+                'depth_mup',
+                '--optimizer',
+                'adam',
+                '--scaling-base-hidden-size',
+                '256',
+                '--scaling-base-num-layers',
+                '6',
+                '--scaling-base-head-dim',
+                '64',
             ]
         )
         depth_args = _prepare_parsed_args_for_core_config(depth_args)
@@ -436,14 +449,20 @@ class TestMuPConfigValidation:
 
         legacy_args = parser.parse_args(
             [
-                '--num-layers', '12',
-                '--hidden-size', '1024',
-                '--num-attention-heads', '16',
+                '--num-layers',
+                '12',
+                '--hidden-size',
+                '1024',
+                '--num-attention-heads',
+                '16',
                 '--no-rope-fusion',
                 '--use-mup',
-                '--mup-base-hidden-size', '256',
-                '--mup-base-head-dim', '64',
-                '--mup-width-mult', '4.0',
+                '--mup-base-hidden-size',
+                '256',
+                '--mup-base-head-dim',
+                '64',
+                '--mup-width-mult',
+                '4.0',
             ]
         )
         legacy_args = _prepare_parsed_args_for_core_config(legacy_args)
@@ -466,18 +485,12 @@ class TestMuPConfigValidation:
     def test_legacy_mup_width_mult_requires_active_scaling_recipe(self):
         with pytest.raises(ValueError, match='Scaling overrides require'):
             TransformerConfig(
-                hidden_size=1024,
-                num_layers=12,
-                num_attention_heads=16,
-                mup_width_mult=3.0,
+                hidden_size=1024, num_layers=12, num_attention_heads=16, mup_width_mult=3.0
             )
 
     def test_legacy_mup_aliases_emit_deprecation_warning(self):
         args = SimpleNamespace(
-            use_mup=True,
-            mup_base_hidden_size=256,
-            mup_base_head_dim=64,
-            mup_width_mult=3.0,
+            use_mup=True, mup_base_hidden_size=256, mup_base_head_dim=64, mup_width_mult=3.0
         )
 
         with patch.object(training_args_module, 'warn_rank_0') as warn:
@@ -493,10 +506,7 @@ class TestMuPConfigValidation:
 
     def test_canonical_mup_recipe_does_not_emit_legacy_deprecation_warning(self):
         args = SimpleNamespace(
-            use_mup=False,
-            mup_base_hidden_size=None,
-            mup_base_head_dim=None,
-            mup_width_mult=1.0,
+            use_mup=False, mup_base_hidden_size=None, mup_base_head_dim=None, mup_width_mult=1.0
         )
 
         with patch.object(training_args_module, 'warn_rank_0') as warn:
@@ -509,26 +519,37 @@ class TestMuPConfigValidation:
         parser = add_megatron_arguments(parser)
         args = parser.parse_args(
             [
-                '--num-layers', '12',
-                '--hidden-size', '1024',
-                '--num-attention-heads', '16',
-                '--seq-length', '128',
-                '--micro-batch-size', '1',
-                '--max-position-embeddings', '128',
+                '--num-layers',
+                '12',
+                '--hidden-size',
+                '1024',
+                '--num-attention-heads',
+                '16',
+                '--seq-length',
+                '128',
+                '--micro-batch-size',
+                '1',
+                '--max-position-embeddings',
+                '128',
                 '--no-rope-fusion',
-                '--optimizer', 'adam',
-                '--scaling-recipe', 'depth_mup',
+                '--optimizer',
+                'adam',
+                '--scaling-recipe',
+                'depth_mup',
             ]
         )
         args.world_size = 1
         args.rank = 0
 
-        with patch.object(
-            training_args_module,
-            'validate_depth_mup_optimizer_support',
-            side_effect=RuntimeError('depth-hook'),
-        ), patch.object(
-            training_args_module, 'validate_muon_scalar_optimizer_support', return_value=None
+        with (
+            patch.object(
+                training_args_module,
+                'validate_depth_mup_optimizer_support',
+                side_effect=RuntimeError('depth-hook'),
+            ),
+            patch.object(
+                training_args_module, 'validate_muon_scalar_optimizer_support', return_value=None
+            ),
         ):
             with pytest.raises(RuntimeError, match='depth-hook'):
                 validate_args(args)
@@ -538,36 +559,43 @@ class TestMuPConfigValidation:
         parser = add_megatron_arguments(parser)
         args = parser.parse_args(
             [
-                '--num-layers', '12',
-                '--hidden-size', '1024',
-                '--num-attention-heads', '16',
-                '--seq-length', '128',
-                '--micro-batch-size', '1',
-                '--max-position-embeddings', '128',
+                '--num-layers',
+                '12',
+                '--hidden-size',
+                '1024',
+                '--num-attention-heads',
+                '16',
+                '--seq-length',
+                '128',
+                '--micro-batch-size',
+                '1',
+                '--max-position-embeddings',
+                '128',
                 '--no-rope-fusion',
-                '--optimizer', 'muon',
-                '--muon-scalar-optimizer', 'lion',
+                '--optimizer',
+                'muon',
+                '--muon-scalar-optimizer',
+                'lion',
             ]
         )
         args.world_size = 1
         args.rank = 0
 
-        with patch.object(
-            training_args_module, 'validate_depth_mup_optimizer_support', return_value=None
-        ), patch.object(
-            training_args_module,
-            'validate_muon_scalar_optimizer_support',
-            side_effect=RuntimeError('muon-hook'),
+        with (
+            patch.object(
+                training_args_module, 'validate_depth_mup_optimizer_support', return_value=None
+            ),
+            patch.object(
+                training_args_module,
+                'validate_muon_scalar_optimizer_support',
+                side_effect=RuntimeError('muon-hook'),
+            ),
         ):
             with pytest.raises(RuntimeError, match='muon-hook'):
                 validate_args(args)
 
     def test_yaml_namespace_without_scaling_fields_still_builds_transformer_config(self):
-        args = _build_transformer_namespace(
-            hidden_size=1024,
-            num_layers=12,
-            num_attention_heads=16,
-        )
+        args = _build_transformer_namespace(hidden_size=1024, num_layers=12, num_attention_heads=16)
         for field_name in (
             'scaling_recipe',
             'scaling_base_hidden_size',
@@ -633,8 +661,7 @@ class TestMuPConfigValidation:
 
     def test_muon_scalar_optimizer_gate_rejects_invalid_nested_yaml_namespace(self):
         args = SimpleNamespace(
-            muon_scalar_optimizer='soap',
-            language_model=SimpleNamespace(scaling_recipe='none'),
+            muon_scalar_optimizer='soap', language_model=SimpleNamespace(scaling_recipe='none')
         )
 
         with pytest.raises(ValueError, match="muon_scalar_optimizer must be one of"):
@@ -661,28 +688,33 @@ class TestMuPConfigValidation:
             ),
         )
 
-        with patch.object(
-            yaml_args_module,
-            'validate_depth_mup_optimizer_support',
-            side_effect=RuntimeError('yaml-depth-hook'),
-        ), patch.object(
-            yaml_args_module, 'validate_muon_scalar_optimizer_support', return_value=None
+        with (
+            patch.object(
+                yaml_args_module,
+                'validate_depth_mup_optimizer_support',
+                side_effect=RuntimeError('yaml-depth-hook'),
+            ),
+            patch.object(
+                yaml_args_module, 'validate_muon_scalar_optimizer_support', return_value=None
+            ),
         ):
             with pytest.raises(RuntimeError, match='yaml-depth-hook'):
                 validate_yaml(args)
 
     def test_validate_yaml_calls_muon_scalar_optimizer_hook(self):
         args = _build_minimal_validate_yaml_namespace(
-            optimizer='adam',
-            muon_scalar_optimizer='lion',
+            optimizer='adam', muon_scalar_optimizer='lion'
         )
 
-        with patch.object(
-            yaml_args_module, 'validate_depth_mup_optimizer_support', return_value=None
-        ), patch.object(
-            yaml_args_module,
-            'validate_muon_scalar_optimizer_support',
-            side_effect=RuntimeError('yaml-muon-hook'),
+        with (
+            patch.object(
+                yaml_args_module, 'validate_depth_mup_optimizer_support', return_value=None
+            ),
+            patch.object(
+                yaml_args_module,
+                'validate_muon_scalar_optimizer_support',
+                side_effect=RuntimeError('yaml-muon-hook'),
+            ),
         ):
             with pytest.raises(RuntimeError, match='yaml-muon-hook'):
                 validate_yaml(args)
@@ -697,14 +729,18 @@ class TestMuPConfigValidation:
     def test_validate_yaml_calls_mup_deprecation_warning(self):
         args = _build_minimal_validate_yaml_namespace(optimizer='adam')
 
-        with patch.object(
-            yaml_args_module, 'validate_depth_mup_optimizer_support', return_value=None
-        ), patch.object(
-            yaml_args_module, 'validate_muon_scalar_optimizer_support', return_value=None
-        ), patch.object(
-            yaml_args_module,
-            'warn_deprecated_mup_aliases',
-            side_effect=RuntimeError('yaml-mup-warning'),
+        with (
+            patch.object(
+                yaml_args_module, 'validate_depth_mup_optimizer_support', return_value=None
+            ),
+            patch.object(
+                yaml_args_module, 'validate_muon_scalar_optimizer_support', return_value=None
+            ),
+            patch.object(
+                yaml_args_module,
+                'warn_deprecated_mup_aliases',
+                side_effect=RuntimeError('yaml-mup-warning'),
+            ),
         ):
             with pytest.raises(RuntimeError, match='yaml-mup-warning'):
                 validate_yaml(args)
@@ -1121,7 +1157,7 @@ class TestMuPModelPolicy:
         expected_std = (
             config.init_method_std
             / (math.sqrt(2 * config.num_layers) * math.sqrt(config.mup_width_mult))
-            * (policy.context.depth_mult ** config.scaling_block_out_proj_init_depth_power)
+            * (policy.context.depth_mult**config.scaling_block_out_proj_init_depth_power)
         )
         actual_std = weights.std().item()
         assert abs(actual_std - expected_std) < expected_std * 0.05
@@ -1227,9 +1263,7 @@ class TestMuPModelPolicy:
         output = torch.ones(4, 8)
         bias = torch.ones(8)
         scaled_output, scaled_bias = layer._scale_dense_residual_branch_output(
-            (output, bias),
-            branch_name='self attention',
-            using_fused_tp_inference_kernel=False,
+            (output, bias), branch_name='self attention', using_fused_tp_inference_kernel=False
         )
         expected_mult = (
             config.num_layers / config.scaling_base_num_layers
@@ -1239,9 +1273,7 @@ class TestMuPModelPolicy:
 
         with pytest.raises(NotImplementedError, match='Residual-branch scaling'):
             layer._scale_dense_residual_branch_output(
-                (output, bias),
-                branch_name='self attention',
-                using_fused_tp_inference_kernel=True,
+                (output, bias), branch_name='self attention', using_fused_tp_inference_kernel=True
             )
 
     def test_depth_mup_rejects_inference_even_at_base_depth(self):
@@ -1283,9 +1315,7 @@ class TestMuPModelPolicy:
 
         with depth_mup_eval_context(True):
             scaled_output, scaled_bias = layer._scale_dense_residual_branch_output(
-                (output, bias),
-                branch_name='self attention',
-                using_fused_tp_inference_kernel=False,
+                (output, bias), branch_name='self attention', using_fused_tp_inference_kernel=False
             )
 
         assert torch.equal(scaled_output, output / expected_mult)
@@ -1388,12 +1418,7 @@ class TestMuPModelPolicy:
         )
 
         with pytest.raises(NotImplementedError, match='MambaModel is out of scope for v1'):
-            MambaModel(
-                config=config,
-                mamba_stack_spec=None,
-                vocab_size=128,
-                max_sequence_length=16,
-            )
+            MambaModel(config=config, mamba_stack_spec=None, vocab_size=128, max_sequence_length=16)
 
     def test_overlap_helper_routes_through_residual_branch_scaler(self):
         class DummyCtx:
@@ -1930,9 +1955,9 @@ class TestMuPLRScaling:
         )
 
         expected_lr_mult = 1.0 / scaling_policy.context.width_mult
-        expected_eps_mult = (
-            1.0 / scaling_policy.context.width_mult
-        ) * (1.0 / scaling_policy.context.depth_mult)
+        expected_eps_mult = (1.0 / scaling_policy.context.width_mult) * (
+            1.0 / scaling_policy.context.depth_mult
+        )
         assert scaling_policy.hidden_eps_depth_power == pytest.approx(-1.0)
         assert hidden_override['max_lr'] == pytest.approx(optimizer_config.lr * expected_lr_mult)
         assert hidden_override['min_lr'] == pytest.approx(
@@ -1997,8 +2022,12 @@ class TestMuPLRScaling:
             scaling_base_num_layers=12,
         )
 
-        assert build_resolved_model_policy(base_depth_config).residual_branch_multiplier == pytest.approx(1.0)
-        assert build_resolved_model_policy(double_depth_config).residual_branch_multiplier == pytest.approx(0.5)
+        assert build_resolved_model_policy(
+            base_depth_config
+        ).residual_branch_multiplier == pytest.approx(1.0)
+        assert build_resolved_model_policy(
+            double_depth_config
+        ).residual_branch_multiplier == pytest.approx(0.5)
 
     def test_depth_mup_hidden_depth_factor_excludes_embedding_class_eps(self):
         config = TransformerConfig(
@@ -2033,9 +2062,12 @@ class TestMuPLRScaling:
         bias_param = torch.nn.Parameter(torch.zeros(10))
         norm_scale_param = torch.nn.Parameter(torch.zeros(10))
         unknown_vector_param = torch.nn.Parameter(torch.zeros(10))
-        assert _combined_override_for_param(
-            standard_overrides, bias_param, 'decoder.layers.0.mlp.linear_fc1.bias'
-        ) == {}
+        assert (
+            _combined_override_for_param(
+                standard_overrides, bias_param, 'decoder.layers.0.mlp.linear_fc1.bias'
+            )
+            == {}
+        )
         assert _combined_override_for_param(
             standard_overrides, norm_scale_param, 'decoder.layers.0.input_layernorm.weight'
         ) == {'wd_mult': 0.0}
@@ -2062,9 +2094,14 @@ class TestMuPLRScaling:
 
         q_norm_param = torch.nn.Parameter(torch.zeros(10))
         ordinary_norm_param = torch.nn.Parameter(torch.zeros(10))
-        assert _combined_override_for_param(
-            standard_overrides, q_norm_param, 'decoder.layers.0.self_attention.q_layernorm.weight'
-        ) == {}
+        assert (
+            _combined_override_for_param(
+                standard_overrides,
+                q_norm_param,
+                'decoder.layers.0.self_attention.q_layernorm.weight',
+            )
+            == {}
+        )
         assert _combined_override_for_param(
             standard_overrides, ordinary_norm_param, 'decoder.layers.0.input_layernorm.weight'
         ) == {'wd_mult': 0.0}
@@ -2113,9 +2150,7 @@ class TestMuPLRScaling:
         with pytest.raises(ValueError, match='requires decoupled_weight_decay=True'):
             validate_depth_mup_optimizer_support(args)
 
-    def test_depth_mup_cli_validation_treats_missing_decoupled_weight_decay_as_default_adamw(
-        self,
-    ):
+    def test_depth_mup_cli_validation_treats_missing_decoupled_weight_decay_as_default_adamw(self):
         args = SimpleNamespace(scaling_recipe='depth_mup', optimizer='adam', weight_decay=0.1)
 
         validate_depth_mup_optimizer_support(args)
@@ -2249,10 +2284,7 @@ class TestMuPOptimizerTypeHandling:
     def test_adam_with_decoupled_weight_decay_uses_standard_optimizer_path(self):
         param = torch.nn.Parameter(torch.ones(1))
         optimizer_config = OptimizerConfig(
-            optimizer='adam',
-            lr=1e-3,
-            weight_decay=0.1,
-            decoupled_weight_decay=True,
+            optimizer='adam', lr=1e-3, weight_decay=0.1, decoupled_weight_decay=True
         )
 
         raw_optimizer, _ = _get_megatron_optimizer_based_on_param_groups(

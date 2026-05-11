@@ -158,7 +158,9 @@ def build_scaling_user_config(config: Any) -> ScalingUserConfig:
     )
 
 
-def canonicalize_scaling_user_config(user_config: ScalingUserConfig, config: Any) -> CanonicalScalingSpec:
+def canonicalize_scaling_user_config(
+    user_config: ScalingUserConfig, config: Any
+) -> CanonicalScalingSpec:
     recipe = user_config.recipe
     if recipe is None:
         recipe = SCALING_RECIPE_MUP if user_config.use_mup_alias else SCALING_RECIPE_NONE
@@ -185,12 +187,13 @@ def canonicalize_scaling_user_config(user_config: ScalingUserConfig, config: Any
     )
 
     if recipe == SCALING_RECIPE_NONE:
-        non_default_fields = _non_default_scaling_fields(user_config, include_legacy_mup_fields=True)
+        non_default_fields = _non_default_scaling_fields(
+            user_config, include_legacy_mup_fields=True
+        )
         if non_default_fields:
             raise ValueError(
                 "Scaling overrides require a non-'none' scaling recipe (for example `mup` or "
-                "`depth_mup`). Non-default fields: "
-                + ", ".join(non_default_fields)
+                "`depth_mup`). Non-default fields: " + ", ".join(non_default_fields)
             )
         references = ScalingReferences(
             current_hidden_size=config.hidden_size,
@@ -255,7 +258,9 @@ def canonicalize_scaling_user_config(user_config: ScalingUserConfig, config: Any
 
 def resolve_scaling_context(canonical_spec: CanonicalScalingSpec) -> ResolvedScalingContext:
     if canonical_spec.recipe == SCALING_RECIPE_NONE:
-        return ResolvedScalingContext(recipe=SCALING_RECIPE_NONE, references=canonical_spec.references)
+        return ResolvedScalingContext(
+            recipe=SCALING_RECIPE_NONE, references=canonical_spec.references
+        )
 
     refs = canonical_spec.references
     assert refs.base_hidden_size is not None

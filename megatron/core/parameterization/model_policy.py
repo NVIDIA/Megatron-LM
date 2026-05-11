@@ -10,7 +10,11 @@ from typing import Iterable, Optional
 import torch
 from torch import Tensor
 
-from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal, scaled_init_method_normal
+from megatron.core.utils import (
+    init_method_normal,
+    mup_scaled_init_method_normal,
+    scaled_init_method_normal,
+)
 
 from .spec import ResolvedScalingContext, build_resolved_scaling_context
 
@@ -58,16 +62,9 @@ class ResolvedModelPolicy:
         multiplier = 2.0 if not is_hybrid_model else 1.0
         if self.uses_width_mup:
             return mup_scaled_init_method_normal(
-                init_method_std,
-                num_layers,
-                self.context.width_mult,
-                multiplier=multiplier,
+                init_method_std, num_layers, self.context.width_mult, multiplier=multiplier
             )
-        return scaled_init_method_normal(
-            init_method_std,
-            num_layers,
-            multiplier=multiplier,
-        )
+        return scaled_init_method_normal(init_method_std, num_layers, multiplier=multiplier)
 
     def dense_block_output_init_method(
         self,

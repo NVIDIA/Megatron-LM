@@ -221,12 +221,7 @@ def test_param_group_identifier_tuple_distinguishes_lr_schedule_and_eps():
         'max_lr': 1e-3,
         'min_lr': 1e-5,
     }
-    scaled_group = {
-        **default_group,
-        'max_lr': 2.5e-4,
-        'min_lr': 2.5e-6,
-        'eps': 2.5e-9,
-    }
+    scaled_group = {**default_group, 'max_lr': 2.5e-4, 'min_lr': 2.5e-6, 'eps': 2.5e-9}
     assert get_param_group_identifier_tuple(default_group) != get_param_group_identifier_tuple(
         scaled_group
     )
@@ -254,10 +249,7 @@ def test_filter_and_reorder_param_groups_keeps_distinct_lr_schedule_groups():
             'min_lr': 1e-5,
         },
     ]
-    state_dict_groups = [
-        dict(current_groups[0]),
-        dict(current_groups[1]),
-    ]
+    state_dict_groups = [dict(current_groups[0]), dict(current_groups[1])]
 
     filtered_groups = MegatronOptimizer._filter_and_reorder_param_groups(
         current_groups, state_dict_groups

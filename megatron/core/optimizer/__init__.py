@@ -125,9 +125,7 @@ def get_standard_config_overrides(
         depth_mup_vector_wd_skip = ParamWithNamePredicate(
             name="depth_mup_norm_and_unknown_vector_wd_skip",
             fn=lambda param, name: should_skip_depth_mup_vector_weight_decay(
-                param,
-                name,
-                apply_wd_to_qk_layernorm=config.apply_wd_to_qk_layernorm,
+                param, name, apply_wd_to_qk_layernorm=config.apply_wd_to_qk_layernorm
             ),
         )
         config_overrides[ParamKey(with_name_predicate=depth_mup_vector_wd_skip)] = (
@@ -185,8 +183,10 @@ def get_scaling_config_overrides(
 
     Scaling optimizer rules (as implemented here):
     - ``mup``:
-      - Adam/AdamW hidden (matrix-like) lr = base_lr / width_mult * depth_mult^hidden_lr_depth_power
-      - Adam/AdamW hidden (matrix-like) eps = base_eps / width_mult * depth_mult^hidden_eps_depth_power
+      - Adam/AdamW hidden (matrix-like) lr =
+        base_lr / width_mult * depth_mult^hidden_lr_depth_power
+      - Adam/AdamW hidden (matrix-like) eps =
+        base_eps / width_mult * depth_mult^hidden_eps_depth_power
       - vector-like params keep base lr and eps
       - SGD vector-like lr = base_lr * width_mult
       - SGD hidden (matrix-like) lr = base_lr * depth_mult^hidden_lr_depth_power
