@@ -3975,6 +3975,14 @@ def _add_tokenizer_args(parser):
         '--tokenizer-model', type=str, default=None, help='Sentencepiece tokenizer model.'
     )
     group.add_argument(
+        '--null-tokenizer-vocab-includes-eod',
+        action='store_true',
+        default=False,
+        help='Treat --vocab-size as the total vocab including eod. '
+        'When set, NullTokenizer eod_id=N-1 (instead of default N). '
+        'For compatibility with Megatron-Bridge convention.',
+    )
+    group.add_argument(
         '--tokenizer-metadata',
         type=str,
         default=None,
