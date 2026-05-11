@@ -244,6 +244,11 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    rotary_base_per_layer: Optional[List[float]] = None
+    """Per-layer RoPE theta values. Length must equal num_layers. When set, each
+    SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
+    the shared model-level rotary_pos_emb is not created."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -930,12 +935,11 @@ class TransformerConfig(ModelParallelConfig):
     CUDA graph (1 CUDA graph for whole iteration excluding optimizer) is enabled. --cuda-graph-scope
     determines the scope of graph capture."""
 
-    cuda_graph_use_single_mempool: bool = False
-    """[For `local` implementation only] When set to true, cudagraphs will be captured inside a
-    single mempool, in which all cudagraphs may only be used once per step. If false, cudagraphs may
-    be reused across microbatches. Enabling may reduce cudagraph memory overheads due to memory
-    fragmentation, however may greatly increase the number of cudagraphs created when the number of
-    microbatches is high."""
+    cuda_graph_use_single_mempool: bool = True
+    """For cuda_graph_impl "local" with cuda_graph_scope "full_iteration" only.
+
+    When True, full-iteration graph replay (training and evaluation) and optimizer graph
+    capture/replay share the same CUDA graph memory pool."""
 
     cuda_graph_retain_backward_graph: bool = False
     """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
@@ -1162,6 +1166,14 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_offload_fraction: float = 1.0
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
+
+    fine_grained_offloading_max_inflight_offloads: Optional[int] = None
+    """Per fine-grained offloading group name, max number of inflight offloads for that name not
+    yet joined on the main stream (wait_event on D2H). The same cap applies to every name (e.g.,
+    ``moe_act`` and ``qkv_linear`` each have their own pending queue). 0 = wait after every
+    offload for that name. 1 = at most one not-yet-waited offload per name, etc. None = do not
+    insert these joins. This feature is particularly useful when using with full-iteration CUDA
+    graphs"""
 
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward"""
@@ -1788,6 +1800,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
+            if self.fine_grained_offloading_max_inflight_offloads is not None:
+                assert (
+                    self.fine_grained_offloading_max_inflight_offloads >= 0
+                ), "fine_grained_offloading_max_inflight_offloads must be non-negative when set."
         if self.moe_paged_stash:
             assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
             assert self.moe_expert_rank_capacity_factor is not None, (
@@ -2452,7 +2468,8 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.fine_grained_activation_offloading:
                 assert self.cuda_graph_impl == "transformer_engine" or (
-                    self.cuda_graph_impl == "local" and self.cuda_graph_scope == "full_iteration"
+                    self.cuda_graph_impl == "local"
+                    and self.cuda_graph_scope == [CudaGraphScope.full_iteration]
                 ), (
                     "fine-grained activation offloading is only supported with "
                     "transformer_engine CUDA graph implementation or local CUDA graph "
@@ -2465,6 +2482,11 @@ class TransformerConfig(ModelParallelConfig):
                     "cuda_graph_warmup_steps must be greater than 0 when enabling "
                     "fine-grained activation offloading."
                 )
+                if CudaGraphScope.full_iteration in self.cuda_graph_scope:
+                    assert self.fine_grained_offloading_max_inflight_offloads is not None, (
+                        "fine_grained_offloading_max_inflight_offloads must be set when using "
+                        "fine-grained activation offloading with full-iteration CUDA graphs "
+                    )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
@@ -2615,6 +2637,12 @@ class TransformerConfig(ModelParallelConfig):
             assert is_te_min_version("2.3.0") or get_te_version() == PkgVersion(
                 "2.3.0.dev0+39c0e70"
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
+
+        if self.rotary_base_per_layer is not None:
+            assert len(self.rotary_base_per_layer) == self.num_layers, (
+                f"rotary_base_per_layer length ({len(self.rotary_base_per_layer)}) "
+                f"must equal num_layers ({self.num_layers})"
+            )
 
         if self.no_rope_freq:
             assert not self.flash_decode, "flash_decode cannot be used with no_rope."
