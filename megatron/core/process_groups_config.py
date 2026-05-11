@@ -249,10 +249,14 @@ class ProcessGroupCollection:
             ),
         }
 
-        assert all(
-            pg in pg_to_func for pg in required_pgs
-        ), f"Initialization function for process group not defined for all \
-        ProcessGroupCollection fields"
+        # Validate that initialization functions exist for all requested groups
+        missing_funcs = [pg for pg in required_pgs if pg not in pg_to_func]
+        if missing_funcs:
+            raise ValueError(
+                f"Initialization function not defined for process groups: {missing_funcs}. "
+                f"Available process groups are: {sorted(pg_to_func.keys())}. "
+                f"This typically indicates a mismatch between requested and supported groups."
+            )
 
         # Build initialization dict by calling appropriate parallel_state get_foo_group
         init_dict = {pg: pg_to_func[pg]() for pg in required_pgs}
