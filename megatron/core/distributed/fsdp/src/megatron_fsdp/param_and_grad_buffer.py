@@ -3921,15 +3921,28 @@ class AllGatherPipeline:
             while len(self.param_gather_event_map) > 0:
                 (bucket_id, bwd) = next(iter(self.param_gather_event_map))
                 self.wait_bucket_ready(bucket_id, bwd)
+        # Per the release_bucket contract, buckets that do not belong to any FSDP unit
+        # module (fsdp_unit_id is None) must remain persistently allocated — their
+        # parameters may be read across module boundaries (e.g. by fused kernels that
+        # bypass nn.Module.forward), so there is no safe point at which to free their
+        # gather scratch. Explicitly clear can_be_released for those buckets so a stray
+        # lazy-release marking from any future path cannot trigger recycle on them.
         for bucket_id in range(self.num_buckets):
+            is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
             for bwd in [False, True]:
-                self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = True
+                self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = is_unit_bucket
         self.recycle_unused_buckets()
 
-        assert all([status is BucketStatus.EMPTY for status in self.bucket_status.values()]), (
-            f"There are still working buckets, it is not safe to reset. "
-            f"bucket_status: {self.bucket_status}."
-        )
+        for bucket_id in range(self.num_buckets):
+            if self.buffer.parameter_groups[bucket_id].fsdp_unit_id is None:
+                continue
+            for bwd in [False, True]:
+                bucket_key = self.get_bucket_key(bucket_id, bwd)
+                status = self.bucket_status[bucket_key]
+                assert status is BucketStatus.EMPTY, (
+                    f"Bucket {bucket_key} is in status {status} after reset, "
+                    f"expected EMPTY. Full bucket_status: {self.bucket_status}."
+                )
         assert all(
             [not can_be_released for can_be_released in self.bucket_can_be_released.values()]
         ), (
