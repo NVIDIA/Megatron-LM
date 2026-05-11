@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 import warnings
 from functools import partial
+
+_TP_INVARIANT_MODE = os.environ.get("NVTE_TP_INVARIANT_MODE", "0") == "1"
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
@@ -526,7 +528,18 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 total_input = all_gather_buffer
             else:
                 total_input = input
-        grad_input = grad_output.matmul(weight)
+        tp_size = tp_group.size()
+        _tp_inv = _TP_INVARIANT_MODE and tp_size > 1
+
+        if _tp_inv:
+            full_w = [torch.empty_like(weight) for _ in range(tp_size)]
+            torch.distributed.all_gather(full_w, weight.contiguous(), group=tp_group)
+            full_go = [torch.empty_like(grad_output) for _ in range(tp_size)]
+            torch.distributed.all_gather(full_go, grad_output.contiguous(), group=tp_group)
+            grad_input = torch.cat(full_go, dim=-1).matmul(torch.cat(full_w, dim=0))
+            del full_w, full_go
+        else:
+            grad_input = grad_output.matmul(weight)
 
         if ctx.sequence_parallel and wgrad_compute:
             # pylint: disable=possibly-used-before-assignment
@@ -537,13 +550,20 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 grad_output, total_input
             )
 
-        if ctx.allreduce_dgrad:
+        if _tp_inv:
+            if ctx.sequence_parallel:
+                tp_rank = torch.distributed.get_rank(group=tp_group)
+                seq_chunk = grad_input.size(0) // tp_size
+                sub_grad_input = grad_input[tp_rank * seq_chunk : (tp_rank + 1) * seq_chunk].contiguous()
+                handle = None
+            else:
+                handle = None
+        elif ctx.allreduce_dgrad:
             # Asynchronous all-reduce
             handle = torch.distributed.all_reduce(grad_input, group=tp_group, async_op=True)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
-
-        if ctx.sequence_parallel:
+        elif ctx.sequence_parallel:
             assert not ctx.allreduce_dgrad
             dim_size = list(input.size())
             sub_grad_input = torch.empty(
@@ -555,6 +575,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             )
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # reduce scatter is scheduled before the weight gradient computation
+        else:
+            handle = None
 
         if ctx.gradient_accumulation_fusion:
             if wgrad_compute:
@@ -629,13 +651,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         if ctx.sequence_parallel:
-            handle.wait()
+            if handle is not None:
+                handle.wait()
             # Need to return None's as gradient has to flow for all the input arguments
             # provided during forward
             return (sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None)
 
         if ctx.allreduce_dgrad:
-            handle.wait()
+            if handle is not None:
+                handle.wait()
 
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 

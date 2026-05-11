@@ -2703,9 +2703,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.batch_invariant_mode:
-            assert (
-                self.attention_backend == AttnBackend.flash
-            ), "Batch invariant mode only supports FlashAttention"
+            assert self.attention_backend in (
+                AttnBackend.flash, AttnBackend.auto, AttnBackend.unfused,
+            ), "Batch invariant mode only supports FlashAttention, auto, or unfused"
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.

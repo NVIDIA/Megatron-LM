@@ -7,6 +7,7 @@ import contextlib
 import importlib
 import importlib.util
 import logging
+import os
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict, List, Optional
@@ -494,20 +495,48 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
 
 
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
-    """Batch-invariant replacement for `aten::mean.dim` over one or more dimensions."""
+    """Batch-invariant replacement for `aten::mean.dim` over one or more dimensions.
+
+    Determinism across SM architectures:
+    - Full reduction (dim=[]): two-stage Triton via `mean_dim`. Stage 1 reduces
+      M=4096 chunks in parallel; stage 2 reduces the M partial means serially.
+      Both stages use fixed launch shape → cross-SM deterministic.
+    - Single-dim: `mean_dim` (Triton, fixed reduction order).
+    - Multi-dim partial: TODO — currently uses non-deterministic torch.sum.
+    """
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
+    if not dim:
+        # Full reduction: two-stage parallel deterministic via Triton mean_dim.
+        flat = input.reshape(-1)
+        n = flat.numel()
+        M = 4096  # fixed parallelism, SM-independent
+        if n % M == 0:
+            chunk = n // M
+            partials = mean_dim(flat.reshape(M, chunk), 1, keepdim=False)
+            return mean_dim(partials.reshape(1, M, 1), 1, keepdim=False).reshape(())
+        # Fallback: single-block (slow but deterministic).
+        return mean_dim(flat, 0, keepdim=False)
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
-    else:
-        assert input.dtype in {
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        }, "only float types supported for now"
-        n_elems = 1
-        for d in dim:
-            n_elems *= input.shape[d]
-        return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
+    # TODO: multi-dim partial reduction is non-deterministic across SMs.
+    # Use Triton (e.g., permute+reshape+mean_dim) to close this gap.
+    assert input.dtype in {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    }, "only float types supported for now"
+    n_elems = 1
+    for d in dim:
+        n_elems *= input.shape[d]
+    return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
+
+
+# TODO: BIK does not patch aten::sum, aten::var, aten::std, aten::norm.
+# These reductions go through native PyTorch CUDA kernels and are not
+# cross-SM deterministic — meaning E2E loss reductions (e.g., Megatron's
+# `torch.sum(losses*mask) / mask.sum()`) will diverge slightly across
+# SM_90/SM_100 even with BIK on. Add Triton fixed-order kernels to close
+# this gap.
 
 
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])
@@ -525,6 +554,7 @@ _TE_RMSNORM_ORIG_FWD = None
 _MEG_TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
+_TE_RMSNORM_BWD_ORIG = None
 
 
 def _import_module_if_available(name: str):
@@ -575,6 +605,69 @@ def _te_patch_for_batch_invariant():
     if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
         _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
         meg_te.general_gemm = _te_general_gemm_patched
+
+    # Patch tex.rmsnorm_bwd for TP-invariant dgamma in fused layers.
+    # Standalone RMSNorm is handled by BatchInvariantRMSNormFn.backward (no
+    # call to tex.rmsnorm_bwd), so there is no double-patching concern.
+    global _TE_RMSNORM_BWD_ORIG
+    import transformer_engine_torch as _tex
+
+    if _TE_RMSNORM_BWD_ORIG is None and hasattr(_tex, "rmsnorm_bwd"):
+        _TE_RMSNORM_BWD_ORIG = _tex.rmsnorm_bwd
+
+        def _te_rmsnorm_bwd_tp_invariant(dy, x, rsigma, gamma, sm_margin, zero_centered_gamma):
+            """Wrapper around tex.rmsnorm_bwd that recomputes dgamma in
+            Python FP32 with consistent accumulation order across all TP
+            degrees (including TP=1).
+
+            dx is left to the original CUDA kernel — its per-token BF16
+            computation is already TP-invariant (same result for each token
+            regardless of batch size).  Only dgamma needs fixing because
+            it's a reduction over tokens whose count differs under SP.
+            """
+            d_norm_x = dy.clone()
+            dx, dgamma_cuda = _TE_RMSNORM_BWD_ORIG(
+                dy, x, rsigma, gamma, sm_margin, zero_centered_gamma,
+            )
+
+            if os.environ.get("NVTE_TP_INVARIANT_MODE", "0") != "1":
+                return dx, dgamma_cuda
+            if not torch.distributed.is_initialized():
+                return dx, dgamma_cuda
+
+            from megatron.core.parallel_state import (
+                get_tensor_model_parallel_group,
+                get_tensor_model_parallel_world_size,
+                get_tensor_model_parallel_rank,
+            )
+
+            tp_size = get_tensor_model_parallel_world_size()
+
+            # Recompute dgamma in Python FP32 for consistent accumulation.
+            rsigma_f = rsigma.float()
+            if rsigma_f.ndim < d_norm_x.ndim:
+                rsigma_f = rsigma_f.unsqueeze(-1)
+            per_token = d_norm_x.float() * x.float() * rsigma_f
+            red_dims = tuple(range(0, per_token.ndim - 1))
+
+            if tp_size > 1:
+                tp_group = get_tensor_model_parallel_group()
+                gather_dim = 0 if per_token.ndim == 2 else per_token.ndim - 2
+                chunks = [torch.empty_like(per_token) for _ in range(tp_size)]
+                torch.distributed.all_gather(
+                    chunks, per_token.contiguous(), group=tp_group,
+                )
+                per_token = torch.cat(chunks, dim=gather_dim)
+
+            dgamma_python = per_token.sum(dim=red_dims).to(gamma.dtype)
+
+            if tp_size > 1:
+                if get_tensor_model_parallel_rank() != 0:
+                    dgamma_python.zero_()
+
+            return dx, dgamma_python
+
+        _tex.rmsnorm_bwd = _te_rmsnorm_bwd_tp_invariant
 
     # Patch RMSNorm.forward once (class may be on te or te.pytorch)
     rms_cls = getattr(te, "RMSNorm", None)
@@ -838,6 +931,11 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         raise RuntimeError("TE general_gemm original not captured; patching order issue")
 
     A, B, out_dtype, layout, out, bias, grad = _extract_te_gemm_args(args, kwargs)
+
+    # Fall back to original for empty tensors (e.g., MoE experts with 0 tokens)
+    if A is not None and B is not None and (A.numel() == 0 or B.numel() == 0):
+        return _TE_GENERAL_GEMM_ORIG(*args, **kwargs)
+
     extra_output = kwargs.get("extra_output", None)
     ub = kwargs.get("ub", None)
     ub_type = kwargs.get("ub_type", None)
@@ -914,6 +1012,13 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
 
         Computes gradients w.r.t. input and weight while matching TE's fp32
         accumulation and reduction behavior for numerical stability.
+
+        When NVTE_TP_INVARIANT_MODE=1, dgamma is computed in Python FP32
+        with consistent accumulation order across all TP degrees.  For
+        TP>1, per-token contributions are all-gathered before summation
+        and the result is kept on rank 0 only (others zeroed) so that the
+        subsequent all-reduce in finalize_model_grads recovers the correct
+        total without FP32 precision loss from divide-then-sum.
         """
         x, weight, rsigma = ctx.saved_tensors
         w_eff = (weight + 1.0) if ctx.zero_centered_gamma else weight
@@ -926,7 +1031,36 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         D = x.shape[-1]
 
         red_dims = tuple(range(0, go_fp32.ndim - 1))
-        g_w = (go_fp32 * x_fp32 * r).sum(dim=red_dims).to(weight.dtype)
+        per_token = go_fp32 * x_fp32 * r
+
+        _tp_invariant = os.environ.get("NVTE_TP_INVARIANT_MODE", "0") == "1"
+        if _tp_invariant and torch.distributed.is_initialized():
+            from megatron.core.parallel_state import (
+                get_tensor_model_parallel_group,
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            tp_size = get_tensor_model_parallel_world_size()
+            if tp_size > 1:
+                tp_group = get_tensor_model_parallel_group()
+                # 2D [seq/TP, H]: SP-sharded RMSNorm → gather along seq (dim 0)
+                # 3D+ [seq, heads/TP, H]: TP-sharded qk_layernorm → gather along
+                #   the penultimate dim (heads)
+                gather_dim = 0 if per_token.ndim == 2 else per_token.ndim - 2
+                chunks = [torch.empty_like(per_token) for _ in range(tp_size)]
+                torch.distributed.all_gather(
+                    chunks, per_token.contiguous(), group=tp_group,
+                )
+                per_token = torch.cat(chunks, dim=gather_dim)
+                del chunks
+
+            g_w = per_token.sum(dim=red_dims).to(weight.dtype)
+
+            if tp_size > 1 and get_tensor_model_parallel_rank() != 0:
+                g_w.zero_()
+        else:
+            g_w = per_token.sum(dim=red_dims).to(weight.dtype)
+        del per_token
 
         s = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
         dx = go_fp32 * (w_fp32 * r) - (w_fp32 * r3) * (s * x_fp32) / D
