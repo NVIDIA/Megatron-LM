@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 from functools import partial
-from typing import List, Dict
+from typing import Dict, List
 
 # Add megatron to the path.
 sys.path.append(
@@ -21,24 +21,25 @@ from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
-from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
-from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.inference.text_generation.api import generate_and_post_process
-from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
-from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
-    VLMTextGenerationController,
-)
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
-from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, is_last_rank
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
+    VLMTextGenerationController,
+)
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.inference.text_generation.api import generate_and_post_process
+from megatron.inference.text_generation.forward_step import ForwardStep
+from megatron.training import get_args, get_model, get_tokenizer, is_last_rank, print_rank_0
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
@@ -119,7 +120,7 @@ def get_evaluation_dataloader(
     num_frames,
     num_workers,
     vision_model_type,
-    split="validation"
+    split="validation",
 ):
     """Build evaluation dataset."""
     dataset = get_evaluation_dataset(
@@ -136,7 +137,7 @@ def get_evaluation_dataloader(
         partition_id,
         num_frames,
         vision_model_type,
-        split=split
+        split=split,
     )
 
     dp_rank = parallel_state.get_data_parallel_rank()
@@ -172,7 +173,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.num_frames,
         args.num_workers,
         args.vision_model_type,
-        config.split
+        config.split,
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(
@@ -218,21 +219,29 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         conv = get_conversation(config.task, question, metadata)
 
         if not args.use_mcore_inference:
-            forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
+            forward_step = partial(
+                VLMForwardStep,
+                num_img_embeddings_per_tile,
+                imgs,
+                num_tiles,
+                args.decoder_seq_length,
+            )
 
-        inference_context = StaticInferenceContext(max_batch_size=1, max_sequence_length=args.inference_max_seq_length)
+        inference_context = StaticInferenceContext(
+            max_batch_size=1, max_sequence_length=args.inference_max_seq_length
+        )
         if is_first_rank():
 
             if args.use_mcore_inference:
                 inference_request = VLMInferenceRequest(
-                   request_id=inference_engine.get_new_request_id(),
-                   prompt=conv,
-                   prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
-                   sampling_params=sampling_params,
-                   num_img_embeddings_per_tile=num_img_embeddings_per_tile,
-                   imgs=imgs,
-                   num_tiles=num_tiles,
-                   decoder_seq_length=args.decoder_seq_length,
+                    request_id=inference_engine.get_new_request_id(),
+                    prompt=conv,
+                    prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
+                    sampling_params=sampling_params,
+                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                    imgs=imgs,
+                    num_tiles=num_tiles,
+                    decoder_seq_length=args.decoder_seq_length,
                 )
                 results: List[InferenceRequest] = inference_engine.generate(
                     inference_requests=[inference_request]
@@ -244,7 +253,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 ]
             else:
                 resp_sentences, _, _, _ = generate_and_post_process(
-                    model, inference_context,
+                    model,
+                    inference_context,
                     forward_step=forward_step,
                     prompts=[conv],
                     tokens_to_generate=config.out_seq_length,
@@ -255,7 +265,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     random_seed=args.seed,
                     detokenize_segments=False,
                     data_parallel=True,
-            )
+                )
 
             for generation in resp_sentences:
                 if isinstance(sample_id, torch.Tensor):
@@ -342,21 +352,23 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         else:
             if args.use_mcore_inference:
                 inference_request = VLMInferenceRequest(
-                   request_id=inference_engine.get_new_request_id(),
-                   prompt=conv,
-                   prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
-                   sampling_params=sampling_params,
-                   num_img_embeddings_per_tile=num_img_embeddings_per_tile,
-                   imgs=imgs,
-                   num_tiles=num_tiles,
-                   decoder_seq_length=args.decoder_seq_length,
+                    request_id=inference_engine.get_new_request_id(),
+                    prompt=conv,
+                    prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
+                    sampling_params=sampling_params,
+                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                    imgs=imgs,
+                    num_tiles=num_tiles,
+                    decoder_seq_length=args.decoder_seq_length,
                 )
-                inference_engine.generate(
-                    inference_requests=[inference_request]
-                )
+                inference_engine.generate(inference_requests=[inference_request])
             else:
                 generate_and_post_process(
-                    model, inference_context, forward_step=forward_step, detokenize_segments=False, data_parallel=True
+                    model,
+                    inference_context,
+                    forward_step=forward_step,
+                    detokenize_segments=False,
+                    data_parallel=True,
                 )
 
             idx += 1
@@ -454,6 +466,7 @@ def generate_and_write_samples(model, config, print_output=True):
     if is_first_rank():
         output_file.close()
 
+
 class VLMForwardStep(ForwardStep):
     """Inference forward step for a multimodal model."""
 
@@ -501,14 +514,19 @@ class VLMForwardStep(ForwardStep):
             if self._recv_only_vision_embeds:
                 recv_buffer_seq_length = self._num_img_embeddings
             else:
-                recv_buffer_seq_length = min(self._num_img_embeddings + num_tokens - num_image_tokens, self.decoder_seq_length)
+                recv_buffer_seq_length = min(
+                    self._num_img_embeddings + num_tokens - num_image_tokens,
+                    self.decoder_seq_length,
+                )
         elif self._recv_only_vision_embeds:
             # If this stage only receives vision embeddings and there are no image tokens we won't run the encoder and therefore shouldn't try to recv.
             recv_buffer_seq_length = 0
 
         # If the pipeline stage only has a vision encoder, then it only needs to run when there are image tokens
         if not (self._encoder_only and num_image_tokens == 0):
-            output = super().__call__(tokens, position_ids, attention_mask, recv_buffer_seq_length=recv_buffer_seq_length)
+            output = super().__call__(
+                tokens, position_ids, attention_mask, recv_buffer_seq_length=recv_buffer_seq_length
+            )
         else:
             output = None
         if isinstance(output, tuple):
@@ -521,13 +539,16 @@ class VLMForwardStep(ForwardStep):
         # update the sequence length offset by the number of image tokens.
         if num_tokens > 1 and num_image_tokens > 0:
             if "image_tokens_count" not in self.inference_context.key_value_memory_dict:
-                self.inference_context.key_value_memory_dict["image_tokens_count"] = self._num_img_embeddings
+                self.inference_context.key_value_memory_dict["image_tokens_count"] = (
+                    self._num_img_embeddings
+                )
 
             if self._num_img_embeddings + num_tokens - num_image_tokens > self.decoder_seq_length:
                 self.inference_context.sequence_len_offset += self.decoder_seq_length - num_tokens
             else:
                 self.inference_context.sequence_len_offset += (
-                    self.inference_context.key_value_memory_dict["image_tokens_count"] - num_image_tokens
+                    self.inference_context.key_value_memory_dict["image_tokens_count"]
+                    - num_image_tokens
                 )
 
         return logits
@@ -598,7 +619,10 @@ def get_conversation(task, question, metadata=None):
         ]
     elif task == "MathVista":
         conversation = [
-            {"role": "system", "content": "You are math expert. Use your math knowledge to calculate the answer."},
+            {
+                "role": "system",
+                "content": "You are math expert. Use your math knowledge to calculate the answer.",
+            },
             {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
     elif task == "RealworldQA":
@@ -612,13 +636,17 @@ def get_conversation(task, question, metadata=None):
             {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
     elif task == "MotionBench":
-        extra_instruction = "Respond with only the letter choice (A, B, C, or D) of the correct option.\n"
+        extra_instruction = (
+            "Respond with only the letter choice (A, B, C, or D) of the correct option.\n"
+        )
         conversation = [
             {"role": "system", "content": "Answer the questions."},
             {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}\n{extra_instruction}"},
         ]
     elif task == "PhysGameBench":
-        extra_instruction = "Respond with only the letter choice (A, B, C, or D) of the correct option.\n"
+        extra_instruction = (
+            "Respond with only the letter choice (A, B, C, or D) of the correct option.\n"
+        )
         conversation = [
             {"role": "system", "content": "Answer the questions."},
             {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}\n{extra_instruction}"},
@@ -626,7 +654,10 @@ def get_conversation(task, question, metadata=None):
     elif task == "MVBench":
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word or phrase."},
+            {
+                "role": "user",
+                "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word or phrase.",
+            },
         ]
     elif task in ["PerceptionTest"]:
         conversation = [
@@ -640,7 +671,6 @@ def get_conversation(task, question, metadata=None):
         ]
     else:
         raise NotImplementedError(f"No prompting support for task {task}")
-
 
     return conversation
 
@@ -693,64 +723,87 @@ def run_eval(config, iteration=None):
 
     if config.task == "TextVQA":
         from evaluation.evaluate_textvqa import textvqa_eval
+
         avg_acc = textvqa_eval(config.output_path)
 
         score = {"TextVQA accuracy": avg_acc}
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} at iteration={iteration} TextVQA accuracy: {score}\n")
+            f.write(
+                f"{config.task} {config.dataset} at iteration={iteration} TextVQA accuracy: {score}\n"
+            )
 
     elif config.task == "OCRBench":
         from evaluation.evaluate_ocrbench import ocrbench_eval
+
         log, avg_acc = ocrbench_eval(config.output_path)
 
         score = {"OCRBench accuracy": avg_acc}
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} at iteration={iteration} OCRBench accuracy: {score}\n")
+            f.write(
+                f"{config.task} {config.dataset} at iteration={iteration} OCRBench accuracy: {score}\n"
+            )
             f.write(f"{log}\n")
 
     elif config.task == "MathVista":
         from evaluation.evaluate_mathvista import mathvista_eval
+
         avg_acc = mathvista_eval(config.output_path)
 
         score = {"MathVista accuracy": avg_acc}
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} at iteration={iteration} MathVista accuracy: {score}\n")
+            f.write(
+                f"{config.task} {config.dataset} at iteration={iteration} MathVista accuracy: {score}\n"
+            )
 
     elif config.task == "ChartQA":
         from evaluation.evaluate_chartqa import chartqa_eval
+
         avg_acc = chartqa_eval(config.output_path)
 
         score = {"ChartQA accuracy": avg_acc}
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} at iteration={iteration} ChartQA accuracy: {score}\n")
+            f.write(
+                f"{config.task} {config.dataset} at iteration={iteration} ChartQA accuracy: {score}\n"
+            )
 
     elif config.task == "SPDocVQA":
         from evaluation.evaluate_spdocvqa import spdocvqa_eval
+
         avg_acc = spdocvqa_eval(config.output_path)
 
         score = {"SPDocVQA accuracy": avg_acc}
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} at iteration={iteration} SPDocVQA accuracy: {score}\n")
+            f.write(
+                f"{config.task} {config.dataset} at iteration={iteration} SPDocVQA accuracy: {score}\n"
+            )
 
     elif config.task == "RealworldQA":
         from evaluation.evaluate_realworldqa import realworldqa_eval
+
         avg_acc = realworldqa_eval(config.output_path)
 
         score = {"RealworldQA accuracy": avg_acc}
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} at iteration={iteration} RealworldQA accuracy: {score}\n")
+            f.write(
+                f"{config.task} {config.dataset} at iteration={iteration} RealworldQA accuracy: {score}\n"
+            )
 
     elif config.task == "AI2D":
         from evaluation.evaluate_ai2d import ai2d_eval
+
         avg_acc = ai2d_eval(config.output_path)
 
         score = {f"AI2D {config.dataset} accuracy": avg_acc}
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} at iteration={iteration} AI2D accuracy: {score}\n")
+            f.write(
+                f"{config.task} {config.dataset} at iteration={iteration} AI2D accuracy: {score}\n"
+            )
 
     elif config.task == "MMMU":
         from evaluation.evaluate_mmmu import convert_to_mmmu_format
+
         from examples.multimodal.evaluation.mmmu_utils import mmmu_main_eval
+
         result_file = convert_to_mmmu_format(config.output_path)
         result = json.load(open(result_file))
         mmmu_results = mmmu_main_eval(result, {"answer_dict": config.gt_path})
@@ -765,13 +818,17 @@ def run_eval(config, iteration=None):
         score = {"MMMU val accuracy": mmmu_results['Overall']['acc']}
     elif config.task == 'captioning':
         from evaluation.evaluate_coco import coco_captioning_eval
+
         cider_score = coco_captioning_eval(config.output_path, config.gt_path)
         score = {f"{config.task} {config.dataset} CIDEr": cider_score}
 
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} CIDEr scores at iteration={iteration}: {cider_score}\n")
+            f.write(
+                f"{config.task} {config.dataset} CIDEr scores at iteration={iteration}: {cider_score}\n"
+            )
     elif config.task == 'MotionBench':
         from evaluation.evaluate_video_motionbench import motionbench_eval
+
         avg_acc = motionbench_eval(config.output_path)
 
         score = {f"MotionBench accuracy": avg_acc}
@@ -779,18 +836,24 @@ def run_eval(config, iteration=None):
             f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {score}\n")
     elif config.task == 'PhysGameBench':
         from evaluation.evaluate_video_phys_game_bench import phys_game_bench_eval
+
         avg_acc_dict = phys_game_bench_eval(config.output_path)
 
         score = {f"PhysGame Total accuracy": avg_acc_dict['Physgame-Total-Acc']}
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n")
+            f.write(
+                f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n"
+            )
     elif config.task == "MVBench":
         from evaluation.evaluate_video_mvbench import mvbench_eval
+
         avg_acc_dict = mvbench_eval(config.output_path)
 
         score = {f"MVBench accuracy": avg_acc_dict['total-acc']}
         with open(config.output_path + "-scores.txt", "a") as f:
-            f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n")
+            f.write(
+                f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n"
+            )
     elif config.task == "inference":
         score = {"Inference accuracy:": None}
         pass
@@ -801,7 +864,9 @@ def run_eval(config, iteration=None):
     return score
 
 
-def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None, print_output=True):
+def run_evaluation_loop(
+    model, configs, output_dir_override=None, iteration=None, print_output=True
+):
     """
     Common evaluation loop used by both online evaluation during training and standalone evaluation.
 
@@ -842,16 +907,24 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
-    initialize_megatron(extra_args_provider=add_text_generation_args)
+    parse_and_validate_args(extra_args_provider=add_text_generation_args)
+    initialize_megatron()
 
     args = get_args()
 
     def wrapped_model_provider(pre_process, post_process, add_encoder=True, add_decoder=True):
-        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder,
-                              parallel_output=False)
+        return model_provider(
+            pre_process,
+            post_process,
+            add_encoder=add_encoder,
+            add_decoder=add_decoder,
+            parallel_output=False,
+        )
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
+    model = get_model(
+        wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False
+    )
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)

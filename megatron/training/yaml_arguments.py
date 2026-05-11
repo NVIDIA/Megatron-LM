@@ -131,6 +131,11 @@ def validate_yaml(args, defaults={}):
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    is_global_batch_size_explicitly_specified = getattr(
+        args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
+        raise ValueError('Cannot specify both --step-batch-size-schedule and --global-batch-size')
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         if args.rank == 0:
@@ -228,9 +233,6 @@ def validate_yaml(args, defaults={}):
         assert args.train_samples is None, 'expected iteration-based training'
         assert args.lr_decay_samples is None, 'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, 'expected iteration-based learning rate warmup'
-        assert (
-            args.rampup_batch_size is None
-        ), 'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert (
                 args.lr_warmup_iters == 0
@@ -497,4 +499,7 @@ def load_yaml(yaml_path):
         )
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
+        config_namespace._is_global_batch_size_explicitly_specified = (
+            getattr(config_namespace, "global_batch_size", None) is not None
+        )
         return config_namespace

@@ -182,8 +182,6 @@ class ScheduleNode:
         self.free_input = free_input
         self.inputs = None
         self.outputs = None
-        self.delay_grads_release = False
-        self.manual_release_grads = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -263,12 +261,6 @@ class ScheduleNode:
             for g in output_grad:
                 if g is not None:
                     g.record_stream(self.stream)
-                    # Manually trigger the memory release of dgrad tensor
-                    # to avoid delayed garbage collection. If
-                    # delay_grads_release is True, dgrad is last used in
-                    # wgrad compute and skip the release here.
-                    if self.manual_release_grads and not self.delay_grads_release:
-                        g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
         self._release_state()
@@ -341,14 +333,18 @@ _COMP_STREAM = None
 _COMM_STREAM = None
 
 
-def set_streams(comm_stream=None):
+def set_streams(comm_stream=None, high_priority=False):
     """Set the stream for communication operations."""
     global _COMM_STREAM
 
     # Set communication stream
     if _COMM_STREAM is None:
         if comm_stream is None:
-            comm_stream = torch.cuda.Stream(device="cuda")
+            if high_priority:
+                _, high = torch.cuda.Stream.priority_range()
+                comm_stream = torch.cuda.Stream(device="cuda", priority=high)
+            else:
+                comm_stream = torch.cuda.Stream(device="cuda")
         _COMM_STREAM = comm_stream
 
 

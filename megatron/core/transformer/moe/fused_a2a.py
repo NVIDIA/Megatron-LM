@@ -287,6 +287,7 @@ def init_hybrid_ep_buffer(
     num_blocks_permute: Optional[int] = None,
     num_blocks_unpermute: Optional[int] = None,
     fp8_dispatch: bool = False,
+    num_sms_preprocessing_api: Optional[int] = None,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -315,6 +316,8 @@ def init_hybrid_ep_buffer(
             Number of blocks used by the unpermute part.
         fp8_dispatch (bool):
             Whether to use FP8 communication during the dispatch phase.
+        num_sms_preprocessing_api (Optional[int]):
+            Number of SMs used by the preprocessing (metadata scan) kernel.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
@@ -327,6 +330,8 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_permute'] = num_blocks_permute
     if num_blocks_unpermute is not None:
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
+    if num_sms_preprocessing_api is not None:
+        kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -365,6 +370,7 @@ class HybridEPDispatch(torch.autograd.Function):
         fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -399,6 +405,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute,
                 num_blocks_unpermute,
                 fp8_dispatch,
+                num_sms_preprocessing_api,
             )
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
@@ -450,6 +457,7 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -518,6 +526,7 @@ if HAVE_HYBRIDEP:
         fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -549,6 +558,8 @@ if HAVE_HYBRIDEP:
             pad_multiple (int):
                 Alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
+            num_sms_preprocessing_api (int):
+                Number of SMs used by the preprocessing (metadata scan) kernel.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -563,6 +574,7 @@ if HAVE_HYBRIDEP:
             fused,
             num_permuted_tokens,
             pad_multiple,
+            num_sms_preprocessing_api,
         )
 
     @internal_api
