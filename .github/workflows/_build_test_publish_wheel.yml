@@ -18,7 +18,7 @@ on:
         default: true
     secrets:
       TWINE_PASSWORD:
-        required: true
+        required: false
 
 jobs:
   build-and-test-wheels:
@@ -144,7 +144,8 @@ jobs:
   publish-wheels:
     needs: [build-and-test-wheels]
     runs-on: ubuntu-latest
-    if: inputs.no-publish == false
+    environment:
+      name: ${{ inputs.no-publish && 'public' || 'main' }}
     strategy:
       fail-fast: false
       matrix:
@@ -171,6 +172,7 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
           TWINE_REPOSITORY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'pypi' || 'testpypi' }}
           PLATFORM: ${{ matrix.PLATFORM }}
+          DRY_RUN: ${{ inputs.no-publish }}
         run: |
 
           # Delete sdist for arm64 since we already upload it with amd64.
@@ -180,9 +182,15 @@ jobs:
 
           ls -al dist/
           pip install twine
-          twine upload \
-            --verbose \
-            -r $TWINE_REPOSITORY \
-            -u $TWINE_USERNAME \
-            -p $TWINE_PASSWORD \
-            dist/*
+
+          if [[ "$DRY_RUN" == "false" ]]; then
+            [[ -z "$TWINE_PASSWORD" ]] && { echo "::error::TWINE_PASSWORD unset"; exit 1; }
+            twine upload \
+              --verbose \
+              -r $TWINE_REPOSITORY \
+              -u $TWINE_USERNAME \
+              -p $TWINE_PASSWORD \
+              dist/*
+          else
+            echo "[dry-run] would execute: twine upload --verbose -r $TWINE_REPOSITORY -u <user> -p <pass> dist/*"
+          fi
