@@ -361,8 +361,8 @@ class TransformerConfig(ModelParallelConfig):
     """
     Canonical scaling recipe. `mup` preserves the current Megatron MuP semantics,
     `depth_mup` is the spectral width-depth μP recipe for dense GPT-style
-    residual Transformer blocks using `optimizer='adam'`; AdamW semantics
-    remain controlled by `decoupled_weight_decay`,
+    residual Transformer blocks using `optimizer='adam'` with AdamW-style
+    semantics via `decoupled_weight_decay` when weight decay is nonzero,
     `none` keeps the standard parameterization, and `None` means unspecified so
     legacy alias resolution can decide the recipe.
     """

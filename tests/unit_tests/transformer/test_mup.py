@@ -1821,7 +1821,7 @@ class TestMuPLRScaling:
         assert 'min_lr' not in bias_override
         assert 'eps' not in bias_override
 
-    def test_depth_mup_applies_spectral_adam_role_specific_overrides(self):
+    def test_depth_mup_adamw_matches_paper_table_5_role_specific_overrides(self):
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, weight_decay=0.1)
         model_config = TransformerConfig(
             hidden_size=1024,
@@ -1964,6 +1964,57 @@ class TestMuPLRScaling:
         assert _combined_override_for_param(
             standard_overrides, bias_param, 'decoder.layers.0.mlp.linear_fc1.bias'
         ) == {}
+
+    def test_depth_mup_rejects_coupled_adam_nonzero_weight_decay(self):
+        optimizer_config = OptimizerConfig(
+            lr=1e-3, min_lr=1e-5, weight_decay=0.1, decoupled_weight_decay=False
+        )
+        model_config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=16,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=4,
+        )
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adam')
+
+        with pytest.raises(ValueError, match='requires decoupled_weight_decay=True'):
+            get_scaling_config_overrides(optimizer_config, scaling_policy)
+
+    def test_depth_mup_allows_coupled_adam_when_weight_decay_is_zero(self):
+        optimizer_config = OptimizerConfig(
+            lr=1e-3, min_lr=1e-5, weight_decay=0.0, decoupled_weight_decay=False
+        )
+        model_config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=16,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=4,
+        )
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adam')
+
+        assert get_scaling_config_overrides(optimizer_config, scaling_policy)
+
+    def test_depth_mup_cli_validation_rejects_coupled_adam_nonzero_weight_decay(self):
+        args = SimpleNamespace(
+            scaling_recipe='depth_mup',
+            optimizer='adam',
+            weight_decay=0.1,
+            decoupled_weight_decay=False,
+        )
+
+        with pytest.raises(ValueError, match='requires decoupled_weight_decay=True'):
+            validate_depth_mup_optimizer_support(args)
+
+    def test_depth_mup_cli_validation_treats_missing_decoupled_weight_decay_as_default_adamw(
+        self,
+    ):
+        args = SimpleNamespace(scaling_recipe='depth_mup', optimizer='adam', weight_decay=0.1)
+
+        validate_depth_mup_optimizer_support(args)
 
     def test_depth_mup_with_decoupled_lr_preserves_embedding_output_lr_and_scales_eps(self):
         optimizer_config = OptimizerConfig(

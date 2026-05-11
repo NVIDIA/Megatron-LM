@@ -341,17 +341,35 @@ def _resolve_validation_attr(args, attr_name):
 
 def validate_depth_mup_optimizer_support(args) -> None:
     """Enforce the public optimizer support surface for depth_mup."""
-    if _resolve_validation_attr(args, 'scaling_recipe') == 'depth_mup' and _resolve_validation_attr(
-        args, 'optimizer'
-    ) not in (
-        'adam',
-    ):
+    if _resolve_validation_attr(args, 'scaling_recipe') != 'depth_mup':
+        return
+
+    if _resolve_validation_attr(args, 'optimizer') not in ('adam',):
         raise ValueError(
             "scaling_recipe='depth_mup' currently supports optimizer='adam' only. "
             "AdamW semantics should continue to use decoupled_weight_decay. "
             "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
             "and input/output-bias rules and is intentionally out of scope for v1."
         )
+
+    weight_decay = _resolve_validation_attr(args, 'weight_decay')
+    decoupled_weight_decay = _resolve_validation_attr(args, 'decoupled_weight_decay')
+    if decoupled_weight_decay is None:
+        # CLI argparse does not expose this field directly; the optimizer config
+        # default is AdamW semantics.
+        decoupled_weight_decay = True
+    if (
+        weight_decay is not None
+        and weight_decay != 0.0
+        and decoupled_weight_decay is not True
+    ):
+        raise ValueError(
+            "scaling_recipe='depth_mup' with nonzero weight_decay requires "
+            "decoupled_weight_decay=True because the width-depth weight-decay scaling "
+            "is derived for AdamW. Use weight_decay=0.0 for coupled Adam, or enable "
+            "decoupled_weight_decay."
+        )
+
 
 def warn_deprecated_mup_aliases(args) -> None:
     """Warn when users spell MuP through legacy CLI aliases."""
@@ -375,7 +393,6 @@ def warn_deprecated_mup_aliases(args) -> None:
         "`--mup-width-mult` is derived from the resolved scaling context and any "
         "non-default supplied value must match the derived value."
     )
-
 
 
 def validate_muon_scalar_optimizer_support(args) -> None:
@@ -1735,8 +1752,8 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
     from megatron.core.parameterization import build_resolved_scaling_context, sync_legacy_mup_fields
-    warn_deprecated_mup_aliases(args)
 
+    warn_deprecated_mup_aliases(args)
     sync_legacy_mup_fields(args, build_resolved_scaling_context(args))
 
     # Print arguments.
@@ -2252,8 +2269,8 @@ def _add_scaling_args(parser):
                        choices=['none', 'mup', 'depth_mup'],
                        help='Canonical scaling recipe. `mup` preserves current Megatron MuP; '
                        '`depth_mup` is the spectral width-depth μP recipe for dense GPT-style '
-                       'residual Transformer blocks using `--optimizer adam`; AdamW semantics '
-                       'remain controlled by `decoupled_weight_decay`.')
+                       'residual Transformer blocks using `--optimizer adam` with AdamW-style '
+                       'semantics via `decoupled_weight_decay` when weight decay is nonzero.')
     group.add_argument('--scaling-base-hidden-size', type=int, default=None,
                        help='Reference hidden size for width-based scaling recipes.')
     group.add_argument('--scaling-base-num-layers', type=int, default=None,

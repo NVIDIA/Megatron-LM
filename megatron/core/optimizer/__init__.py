@@ -196,6 +196,19 @@ def get_scaling_config_overrides(
     """
     if not scaling_policy.enabled:
         return {}
+    if (
+        scaling_policy.context.is_depth_mup
+        and scaling_policy.is_adam_optimizer
+        and config.weight_decay != 0.0
+        and not config.decoupled_weight_decay
+    ):
+        raise ValueError(
+            "scaling_recipe='depth_mup' with nonzero weight_decay requires "
+            "decoupled_weight_decay=True because the width-depth weight-decay scaling "
+            "is derived for AdamW. Use weight_decay=0.0 for coupled Adam, or enable "
+            "decoupled_weight_decay."
+        )
+
 
     decoupled_lr_enabled = config.decoupled_lr is not None
     if decoupled_lr_enabled:
