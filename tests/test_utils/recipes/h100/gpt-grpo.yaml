@@ -57,17 +57,17 @@ products:
   - test_case: [gpt_grpo_basic_function]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
   - test_case: [gpt_grpo_tp4_pp1_dp2_8b_throughput]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken]
         platforms: [dgx_h100]
   - test_case: [gpt_grpo_tp4_pp1_dp2_8b_cudagraphs_throughput]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken]
         platforms: [dgx_h100]
   - test_case: [gpt_grpo_tp4_pp1_dp2_8b_throughput_github]
     products:
