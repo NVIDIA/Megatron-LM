@@ -129,6 +129,8 @@ NON_DETERMINSTIC_RESULTS=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.NON_DETERMINSTIC_RESULTS // "0"')
 SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.SKIP_PYTEST')
+BENCHMARK_TEST=$(cat $TRAINING_PARAMS_PATH |
+    /usr/local/bin/yq '.ENV_VARS.BENCHMARK_TEST // "0"')
 
 export RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
 
@@ -261,7 +263,7 @@ for i in $(seq 1 $N_REPEAT); do
 
         # Read test values from Tensorboard for non-inference tests.
         # Inference tests will load from JSON instead.
-        if [[ "$MODE" == "pretraining" ]]; then
+        if [[ "$MODE" == "pretraining" && "${BENCHMARK_TEST:-0}" != 1 ]]; then
             uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                 --logs-dir $TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
@@ -297,6 +299,11 @@ for i in $(seq 1 $N_REPEAT); do
             if [[ "$TEST_TYPE" == "checkpoint-consistency" ]]; then
                 echo "Running checkpoint consistency check"
                 uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/test_optimizer_grads_match.py "${ITER_CHECKPOINT_DIRS[@]}"
+            elif [[ "${BENCHMARK_TEST:-0}" == 1 ]]; then
+                uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_benchmark_pipeline.py \
+                    --golden-values-path $GOLDEN_VALUES_PATH \
+                    --logs-dir ${OUTPUT_PATH}/logs \
+                    --model-config-path ${TRAINING_PARAMS_PATH}
             else
                 uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
                     --golden-values-path $GOLDEN_VALUES_PATH \

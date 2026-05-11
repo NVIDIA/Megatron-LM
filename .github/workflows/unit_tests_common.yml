@@ -106,6 +106,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
+          PLATFORM='${{ inputs.platform }}'
           
           if [ -f /opt/conda/etc/profile.d/conda.sh ]; then
             source /opt/conda/etc/profile.d/conda.sh
@@ -119,10 +120,17 @@ jobs:
 
           # Install dependence package
           pip install torch boto3 mock pytest-mock coverage pytest-asyncio anyio wandb openai httpx --no-cache-dir
+          if [ "$PLATFORM" = "metax" ]; then
+            pip install fastapi uvicorn --no-cache-dir
+          fi
 
           # Install nvidia-resiliency-ext from source
-          git clone --branch v0.6.0-main https://github.com/NVIDIA/nvidia-resiliency-ext.git /tmp/nvidia-resiliency-ext
-          pip install -e /tmp/nvidia-resiliency-ext --no-cache-dir
+          if [ "$PLATFORM" != "metax" ]; then
+            git clone --branch v0.6.0-main https://github.com/NVIDIA/nvidia-resiliency-ext.git /tmp/nvidia-resiliency-ext
+            pip install -e /tmp/nvidia-resiliency-ext --no-cache-dir
+          else
+            echo "Skipping nvidia-resiliency-ext on Metax because it requires NVIDIA CUPTI."
+          fi
 
           # Install emerging-optimizers from source
           pip install git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0 --no-cache-dir
@@ -185,12 +193,16 @@ jobs:
           # Coverage setup
           COVERAGE_DIR="$GITHUB_WORKSPACE/coverage-report"
           RUNNER_CMD="-m pytest"
+          MARKER_OPTS=()
+          if [ "$PLATFORM" = "cuda" ]; then
+            MARKER_OPTS=(-m "not flaky_in_dev")
+          fi
           mkdir -p "$COVERAGE_DIR"
           printf '[run]\nparallel = true\nsource = %s\ndata_file = %s/.coverage\n' \
             "$GITHUB_WORKSPACE" "$COVERAGE_DIR" > "$COVERAGE_DIR/.coveragerc"
           RUNNER_CMD="-m coverage run --rcfile=$COVERAGE_DIR/.coveragerc -m pytest"
           
-          torchrun --nproc_per_node=$NUM_GPUS $RUNNER_CMD -v $FINAL_TEST_PATH $IGNORE_OPTS -p no:randomly
+          torchrun --nproc_per_node=$NUM_GPUS $RUNNER_CMD -v $FINAL_TEST_PATH $IGNORE_OPTS "${MARKER_OPTS[@]}" -p no:randomly
           exit_code=$?
 
           # Combine coverage fragments and generate JSON report

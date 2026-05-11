@@ -86,6 +86,7 @@ jobs:
           if [ -n "$CONDA_PYTHON" ] && [ "$CONDA_PYTHON" != "/usr/bin/python3" ]; then
             ln -sf "$CONDA_PYTHON" /usr/local/bin/python3
           fi
+
           echo "PATH=$PATH" >> $GITHUB_ENV
           echo "Python: $(which python) ($(python --version 2>&1))"
           python -c "import torch; print('Torch:', torch.__version__)"

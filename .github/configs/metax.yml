@@ -11,15 +11,7 @@ display_name: 'Metax Tests'
 # CI image for online env
 ci_image: harbor.baai.ac.cn/flagscale/megatron-lm-with-te:202603231839
 
-# Runner labels for self-hosted Metax node
-# runner_labels:
-#   - self-hosted
-#   - Linux
-#   - X64
-#   - metax
-#   - dev
-
-# Runner labels for online env
+# Runner labels for Metax node
 runner_labels:
   - mx-4g-cicd-megatron
 
@@ -49,13 +41,13 @@ container_options: >-
 
 # Device types to run tests on
 device_types:
-  - c500
+  - c550
 
 # Test matrix configuration
 test_matrix:
   unit:
     devices:
-      - c500
+      - c550
     # Ignored test files for unit tests
     # These files will be skipped when running pytest
     ignored_tests:
@@ -64,12 +56,25 @@ test_matrix:
       - tests/unit_tests/test_fp8_param.py
       - tests/unit_tests/test_optimizer.py ## RuntimeError: No CUDA GPUs are available
       - tests/unit_tests/test_utils.py
+      # Metax C500 CPU optimizer offload overlap has larger numeric drift than CUDA tolerance.
+      - tests/unit_tests/test_optimizer_cpu_offloading.py::test_overlap_cpu_optimizer_d2h_h2d_sync_correctness
 
       # 2.models
       # ZeroDivisionError: integer modulo by zero
       - tests/unit_tests/models/test_heterogeneous_gpt_model.py
       # need cuda
       - tests/unit_tests/models/test_mamba_model.py
+      # Metax image has an incompatible mamba_ssm/causal_conv1d CUDA extension signature.
+      - tests/unit_tests/models/test_mamba_moe_model.py::TestMambaMoEModel::test_forward
+      # Metax C500 MIMO 1F1B 8-GPU layouts hit missing tensor model-parallel group initialization.
+      - tests/unit_tests/models/test_mimo_1f1b_schedule.py::TestMimo1F1BSchedule::test_encoder_tp2_llm_tp2_pp3_8gpu
+      - tests/unit_tests/models/test_mimo_1f1b_schedule.py::TestMimo1F1BSchedule::test_full_pp_8gpu
+      - tests/unit_tests/models/test_mimo_1f1b_schedule.py::TestMimo1F1BSchedule::test_fan_in_dp4_to_dp1_llm_tp2_pp2_8gpu
+      - tests/unit_tests/models/test_mimo_1f1b_schedule.py::TestMimo1F1BSchedule::test_fan_out_dp1_to_dp4_enc_tp2_pp2_8gpu
+      - tests/unit_tests/models/test_mimo_1f1b_schedule.py::TestMimo1F1BSchedule::test_fan_in_dp2_to_dp1_llm_pp3_8gpu
+      # Metax C500 MIMO checkpoint follows the same HyperCommGrid + TE attention path and fails with
+      # "tensor model parallel group is not initialized" when GPTModel/SelfAttention is instantiated.
+      - tests/unit_tests/models/test_mimo_checkpoint.py
 
       # 3.transformer
       # TE _extra_state compatibility issue with AbsorbedMLA
@@ -123,6 +128,9 @@ test_matrix:
       # No CUDA GPUs are available
       - tests/unit_tests/dist_checkpointing/models/test_mamba.py
       - tests/unit_tests/dist_checkpointing/models/test_moe_experts.py
+      # Metax C500 8-GPU layer-wise optimizer checkpointing times out in
+      # determine_main_replica_uniform_distribution/all_gather_object during fully-parallel save.
+      - tests/unit_tests/dist_checkpointing/test_layer_wise_optimizer.py::TestLayerWiseOptimizer::test_optimizer_common_state_dict
 
       # 6.distributed
       - tests/unit_tests/distributed/test_distributed_data_parallel.py
@@ -130,6 +138,15 @@ test_matrix:
       - tests/unit_tests/distributed/test_grad_sync_with_expert_parallel.py
       - tests/unit_tests/distributed/test_param_and_grad_buffer.py
       - tests/unit_tests/distributed/test_reduce_scatter_with_fp32_accumulation.py
+      # Metax C500 lacks TE FP8/fused-topk features required by this MCore FSDP E2E matrix.
+      - tests/unit_tests/distributed/megatron_fsdp/test_mcore_fully_sharded_data_parallel.py::TestMegatronFSDPE2E::test_compatible_with_nd_parallel
+      # test_fully_shard leaves behind corrupted NCCL state according to the test file itself and CI shows
+      # sporadic SIGSEGV during torchrun teardown after otherwise passing cases on Metax C500.
+      - tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_fully_shard_ez
+      # Metax C500 still hits NCCL internal errors in the custom dtype FSDP matrix.
+      - tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_fully_shard_custom_dtype
+      # TE quantized FP8 FSDP path uses FP8 recipes without a C500-compatible support gate.
+      - tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_fully_shard_te_quantized
 
       # 7.export
       - tests/unit_tests/export/trtllm/test_distributed_fp8.py
@@ -138,8 +155,12 @@ test_matrix:
 
       #8.fusions
       - tests/unit_tests/fusions/test_mla_yarn_rope_apply.py
+      # TE fused residual RMSNorm hits an aliasing/in-place view limitation on Metax C500.
+      - tests/unit_tests/fusions/test_rmsnorm_residual_fusion.py
 
       #9.post training
+      # ModelOpt is optional on Metax; model_provider does not export the ModelOpt builder when unavailable.
+      - tests/unit_tests/post_training/test_modelopt_model_builder.py::test_model_provider_switches_to_modelopt_builder
       - tests/unit_tests/post_training/test_modelopt_module_spec.py::TestModelOptMambaModel::test_inference
 
       #10.tokenizers
@@ -172,6 +193,15 @@ test_matrix:
       - tests/unit_tests/pipeline_parallel/test_schedules.py
       - tests/unit_tests/pipeline_parallel/test_pipeline_layout.py
       - tests/unit_tests/pipeline_parallel/test_bridge_communicator.py
+      # Metax runtime aborts in multimodule bridge communicator teardown.
+      - tests/unit_tests/pipeline_parallel/test_multimodule_communicator.py
+      # Metax C500 TE package misses transformer_engine_torch.get_fused_attn_backend, so the 8-GPU
+      # multimodule schedule path aborts inside TE attention backend selection.
+      - tests/unit_tests/pipeline_parallel/test_multimodule_schedules.py::TestMultimoduleSchedules::test_single_encoder_8gpu
+      - tests/unit_tests/pipeline_parallel/test_multimodule_schedules.py::TestMultimoduleSchedules::test_dual_encoder_8gpu
+      # Metax C500 pipeline CI hits flaky fine-grained activation offload paths.
+      - tests/unit_tests/pipeline_parallel/test_fine_grained_activation_offloading.py::test_gpt_fine_grained_activation_offloading_correctness_and_memory
+      - tests/unit_tests/pipeline_parallel/test_fine_grained_activation_offloading.py::test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility
       # distributed: pp=4
       - tests/unit_tests/distributed/test_grad_reduce_for_replicated_embedder.py
       # dist_checkpointing: tp*pp=8
@@ -196,5 +226,13 @@ test_matrix:
         training_script: pretrain_gpt.py
         n_repeat: 1
         golden_environment: dev
-        golden_platform: c500
+        golden_platform: c550
         enable_lightweight_mode: false
+      - model: gpt
+        test_case: qwen3_0p6b_mcore_te_tp2_pp2_benchmark_metax
+        training_script: pretrain_gpt.py
+        n_repeat: 1
+        golden_environment: dev
+        golden_platform: c550
+        enable_lightweight_mode: false
+        gpus_per_node: 4

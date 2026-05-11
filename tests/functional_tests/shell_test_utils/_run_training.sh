@@ -57,6 +57,25 @@ while IFS= read -r ARGUMENT; do
     echo "$KEY=$VALUE"
 done <<<"$ENV_VARS"
 
+if ! command -v python3-config &>/dev/null; then
+    PYTHON_BIN=$(command -v python || command -v python3)
+    PYTHON_BIN_DIR=$(dirname "$PYTHON_BIN")
+    mkdir -p "$PYTHON_BIN_DIR"
+    cat >"$PYTHON_BIN_DIR/python3-config" <<PYCONFIGEOF
+#!$PYTHON_BIN
+import sys
+import sysconfig
+
+if "--extension-suffix" in sys.argv:
+    print(sysconfig.get_config_var("EXT_SUFFIX") or "")
+else:
+    raise SystemExit("python3-config shim only supports --extension-suffix")
+PYCONFIGEOF
+    chmod +x "$PYTHON_BIN_DIR/python3-config"
+    export PATH="$PYTHON_BIN_DIR:$PATH"
+fi
+python3-config --extension-suffix
+
 # Run before script
 BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.BEFORE_SCRIPT')
 if [[ "$BEFORE_SCRIPT" != null ]]; then

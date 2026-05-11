@@ -25,6 +25,7 @@ def pytest_addoption(parser):
     )
     parser.addoption("--test-values-path", action="store", help="Path to tensorboard records")
     parser.addoption("--tensorboard-path", action="store", help="Path to tensorboard records")
+    parser.addoption("--logs-dir", action="store", help="Path to torchrun output logs")
     parser.addoption("--model-config-path", action="store", help="Path to model_config.yaml")
 
 
@@ -97,6 +98,12 @@ def test_values_path(request):
 def tensorboard_path(request):
     """Simple fixture returning path to tensorboard logs."""
     return request.config.getoption("--tensorboard-path")
+
+
+@pytest.fixture
+def logs_dir(request):
+    """Simple fixture returning path to torchrun output logs."""
+    return request.config.getoption("--logs-dir")
 
 
 @pytest.fixture
