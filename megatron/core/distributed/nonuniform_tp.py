@@ -1320,6 +1320,14 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
         else:
             _call_parent_init()
 
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
+        """Ensure all first-batch reductions are launched before post-sync reshards."""
+        if self.ntp_config.tp_spares > 0 and self.ddp_config.overlap_grad_reduce:
+            for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+                if bucket_group.is_first_batch and bucket_group.grad_reduce_handle is None:
+                    bucket_group.start_grad_sync(force_all_reduce=force_all_reduce)
+        return super().finish_grad_sync(force_all_reduce=force_all_reduce)
+
     def _wrap_bucket_groups_for_ntp(self):
         """Replace DDP bucket groups with NTP-aware groups and rebuild param lookup."""
 
