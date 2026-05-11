@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing
 import sys
@@ -40,6 +41,16 @@ class InferenceMode:
     def unset_active(cls) -> None:
         """Mark the inference engine as inactive. Idempotent."""
         cls._is_active = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def active(cls):
+        """Context manager: set the flag for the duration of the `with` block."""
+        cls.set_active()
+        try:
+            yield
+        finally:
+            cls.unset_active()
 
 
 def device_memory_summary() -> str:

@@ -35,8 +35,7 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
     )
     prompt_length = model.max_sequence_length - 1
 
-    InferenceMode.set_active()
-    try:
+    with InferenceMode.active():
         # load-context/first-output-token, step/generate
         for offset in (0, prompt_length):
             if offset == 0:
@@ -64,8 +63,6 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
             assert logits.shape[0] == micro_batch_size
             assert logits.shape[1] == sequence_length
             assert logits.shape[2] == model.vocab_size
-    finally:
-        InferenceMode.unset_active()
 
 
 class TestModelOptGPTModel:

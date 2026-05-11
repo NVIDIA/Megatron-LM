@@ -92,8 +92,7 @@ class TestMambaMixer:
             max_batch_size=max(micro_batch_sizes), max_sequence_length=sequence_length
         )
 
-        InferenceMode.set_active()
-        try:
+        with InferenceMode.active():
             for micro_batch_size in micro_batch_sizes:
                 inference_context.max_seqlen = inference_context.max_sequence_length
                 inference_context.seqlen_offset = inference_context.sequence_len_offset
@@ -107,8 +106,6 @@ class TestMambaMixer:
                 assert output.shape[1] == micro_batch_size
                 assert output.shape[2] == mixer.config.hidden_size
                 assert output.dtype == torch.float32
-        finally:
-            InferenceMode.unset_active()
 
 
 class TestMambaMixerErrorChecks:

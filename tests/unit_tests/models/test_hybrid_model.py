@@ -165,8 +165,7 @@ class TestHybridModel:
 
         self.model.cuda()
 
-        InferenceMode.set_active()
-        try:
+        with InferenceMode.active():
             # load-context/first-output-token, step/generate
             for offset in (0, prompt_length):
                 if offset == 0:
@@ -195,8 +194,6 @@ class TestHybridModel:
 
                 assert logits.shape[0] == micro_batch_size
                 assert logits.shape[1] == sequence_length
-        finally:
-            InferenceMode.unset_active()
             assert logits.shape[2] == self.model.vocab_size
 
     def test_save_load(self, tmp_path):
@@ -610,8 +607,7 @@ class TestHybridModelWithYarn:
 
         self.model.cuda()
 
-        InferenceMode.set_active()
-        try:
+        with InferenceMode.active():
             # load-context/first-output-token, step/generate
             for offset in (0, prompt_length):
                 sequence_length = prompt_length if offset == 0 else 1
@@ -638,5 +634,3 @@ class TestHybridModelWithYarn:
                 assert logits.shape[0] == micro_batch_size
                 assert logits.shape[1] == sequence_length
                 assert logits.shape[2] == self.model.vocab_size
-        finally:
-            InferenceMode.unset_active()

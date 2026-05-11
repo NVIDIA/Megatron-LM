@@ -100,8 +100,7 @@ class TestParallelTransformerLayer:
                 max_batch_size=micro_batch_size, max_sequence_length=sequence_length
             )
             outputs = {}
-            InferenceMode.set_active()
-            try:
+            with InferenceMode.active():
                 for mlp_chunks_for_prefill in [1, 4]:
                     transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
                     hidden_states, context = parallel_transformer_layer(
@@ -113,8 +112,6 @@ class TestParallelTransformerLayer:
                     assert hidden_states.shape[1] == micro_batch_size
                     assert hidden_states.shape[2] == hidden_size
                     outputs[mlp_chunks_for_prefill] = (hidden_states, context)
-            finally:
-                InferenceMode.unset_active()
 
             assert torch.equal(outputs[1][0], outputs[4][0])
 
