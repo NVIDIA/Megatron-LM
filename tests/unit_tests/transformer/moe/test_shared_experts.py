@@ -8,7 +8,8 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -33,13 +34,16 @@ class TestSharedExperts:
         )
 
     def get_moe_layer(self, **kargs) -> MoELayer:
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=self.config.num_moe_experts, moe_grouped_gemm=False
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(
+                num_experts=self.config.num_moe_experts, moe_grouped_gemm=False
+            ).mlp
         )
+        assert isinstance(submodules, MoESubmodules)
         new_config = dataclasses.replace(self.config, **kargs)
         if get_tensor_model_parallel_world_size() > 1:
             new_config.sequence_parallel = True
-        moe_layer = MoELayer(new_config, submodules.mlp.submodules)
+        moe_layer = MoELayer(new_config, submodules)
         moe_layer.cuda()
         return moe_layer
 
