@@ -22,6 +22,7 @@ from megatron.training.config import (
     DistributedInitConfig, 
     PretrainConfigContainer, 
     SchedulerConfig, 
+    TokenizerConfig,
     TrainingConfig, 
     ValidationConfig, 
     RNGConfig, 
@@ -470,6 +471,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         logger=_default_config_from_args(LoggerConfig, args),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=ProfilingConfig(**prof_kwargs),
+        tokenizer=_default_config_from_args(TokenizerConfig, args),
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
