@@ -32,38 +32,79 @@ class ProcessGroupCollection:
 
     Args:
         # Model Parallelism Groups
-        tp: Tensor parallel process group
-        pp: Pipeline parallel process group
-        mp: Model parallel group (tensor + pipeline)
+        tp: Tensor parallel process group (splits tensors across ranks)
+        pp: Pipeline parallel process group (splits layers across ranks)
+        mp: Model parallel group (tensor + pipeline combined)
         embd: Embedding process group
         pos_embd: Position embedding process group
-        cp: Context parallel process group
-        tp_cp: Tensor and context parallel group
+        cp: Context parallel process group (splits sequences across ranks)
+        tp_cp: Tensor and context parallel group (TP + CP combined)
         hcp: Hierarchical context parallel groups
-        ep: Expert model parallel group
+        ep: Expert model parallel group (for MoE models)
         expt_tp: Expert tensor parallel group
         tp_ep: Tensor and expert parallel group
         tp_ep_pp: Tensor, expert, and pipeline parallel group
 
         # Data Parallelism Groups
-        dp: Data parallel process group
-        dp_cp: Data and context parallel group
+        dp: Data parallel process group (standard data parallelism)
+        dp_cp: Data and context parallel group (DP + CP combined)
         expt_dp: Expert data parallel group
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
         inter_dist_opt: Inter distributed optimizer instance group
 
-    Example:
-        # Create instance and set needed process groups
-        pgs = ProcessGroupCollection()
-        pgs.tp = tp_group
-        pgs.pp = pp_group
-        pgs.dp = dp_group
+    Examples:
+        1. Simple Data Parallelism Setup::
 
-        # Pass to model components
-        model = TransformerModel(..., pg_collection=pgs)
-        ddp_model = DistributedDataParallel(..., pg_collection=pgs)
-        finalize_model_grads(..., pg_collection=pgs)
+            from megatron.core.distributed import DistributedDataParallel
+            from megatron.core.model_parallel_config import ModelParallelConfig
+
+            # Create empty collection 
+            pgs = ProcessGroupCollection()
+            # Groups will be initialized by DDP
+            
+            config = ModelParallelConfig(
+                tensor_model_parallel_size=1,  # No TP
+                pipeline_model_parallel_size=1,  # No PP
+            )
+            
+            model = YourTransformerModel(...)
+            ddp_model = DistributedDataParallel(config, ddp_config, model, pg_collection=pgs)
+
+        2. 2D Tensor Parallel + Data Parallel::
+
+            config = ModelParallelConfig(
+                tensor_model_parallel_size=4,  # 4-way TP
+                pipeline_model_parallel_size=1,  # No PP
+            )
+            # Ranks are split into groups of 4 for TP, remainder is DP
+            # For 8 GPUs: ranks 0-3 in one TP group, 4-7 in another TP group
+            # Each TP group has its own data parallelism
+
+        3. 3D Parallelism (Tensor + Pipeline + Data)::
+
+            config = ModelParallelConfig(
+                tensor_model_parallel_size=4,   # 4-way TP
+                pipeline_model_parallel_size=2,  # 2-way PP
+            )
+            # For 16 GPUs: (16 / 4 / 2) = 2-way DP
+            # Total: 4 TP × 2 PP × 2 DP = 16 ranks
+
+        4. Using pre-computed Process Groups from parallel_state::
+
+            pgs = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'pp', 'dp']  # Only initialize these
+            )
+            
+            model = YourTransformerModel(..., pg_collection=pgs)
+            ddp_model = DistributedDataParallel(..., pg_collection=pgs)
+
+    Notes:
+        - Each rank appears in exactly one tensor parallel, one pipeline parallel, and
+          one data parallel group
+        - Process groups are created based on the configuration during initialization
+        - When pg_collection=None is passed to DDP, it automatically creates groups
+          using parallel_state helpers
     """
 
     # Model Parallelism Process Groups
