@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope, LayerType
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import experimental_api
 
@@ -200,7 +200,7 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu."""
+    is quick_gelu or weighted SwiGLU (MoE only)."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -244,6 +244,11 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    rotary_base_per_layer: Optional[List[float]] = None
+    """Per-layer RoPE theta values. Length must equal num_layers. When set, each
+    SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
+    the shared model-level rotary_pos_emb is not created."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -264,8 +269,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
+        None
+    )
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
     ####################
     # DSA
@@ -285,6 +292,22 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    ####################
+    # DeepSeek-v4 hybrid attention
+    ####################
+    csa_window_size: int = 128
+    """Sliding window size for compressed sparse attention."""
+
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in compressed sparse attention."""
+
+    csa_dense_mode: bool = False
+    """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
+    disabled."""
 
     ####################
     # linear attention
@@ -742,6 +765,15 @@ class TransformerConfig(ModelParallelConfig):
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
 
+    moe_n_hash_layers: int = 0
+    """Number of leading transformer layers that use hash-based MoE routing.
+    Layers with layer_number <= moe_n_hash_layers use a pre-computed tid2eid
+    lookup table for expert selection instead of learned top-k routing."""
+
+    actual_vocab_size: Optional[int] = None
+    """Padded actual vocabulary size. Required when moe_n_hash_layers > 0 for the
+    tid2eid lookup buffer in hash-based MoE routing."""
+
     dense_grouped_gemm: bool = False
     """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
     ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
@@ -903,12 +935,11 @@ class TransformerConfig(ModelParallelConfig):
     CUDA graph (1 CUDA graph for whole iteration excluding optimizer) is enabled. --cuda-graph-scope
     determines the scope of graph capture."""
 
-    cuda_graph_use_single_mempool: bool = False
-    """[For `local` implementation only] When set to true, cudagraphs will be captured inside a
-    single mempool, in which all cudagraphs may only be used once per step. If false, cudagraphs may
-    be reused across microbatches. Enabling may reduce cudagraph memory overheads due to memory
-    fragmentation, however may greatly increase the number of cudagraphs created when the number of
-    microbatches is high."""
+    cuda_graph_use_single_mempool: bool = True
+    """For cuda_graph_impl "local" with cuda_graph_scope "full_iteration" only.
+
+    When True, full-iteration graph replay (training and evaluation) and optimizer graph
+    capture/replay share the same CUDA graph memory pool."""
 
     cuda_graph_retain_backward_graph: bool = False
     """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
@@ -1136,6 +1167,14 @@ class TransformerConfig(ModelParallelConfig):
     activation_offload_fraction: float = 1.0
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
 
+    fine_grained_offloading_max_inflight_offloads: Optional[int] = None
+    """Per fine-grained offloading group name, max number of inflight offloads for that name not
+    yet joined on the main stream (wait_event on D2H). The same cap applies to every name (e.g.,
+    ``moe_act`` and ``qkv_linear`` each have their own pending queue). 0 = wait after every
+    offload for that name. 1 = at most one not-yet-waited offload per name, etc. None = do not
+    insert these joins. This feature is particularly useful when using with full-iteration CUDA
+    graphs"""
+
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward"""
 
@@ -1254,6 +1293,22 @@ class TransformerConfig(ModelParallelConfig):
             )
         elif self.experimental_attention_variant == "dsa":
             pass
+        elif self.experimental_attention_variant == "dsv4_hybrid":
+            assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
+            assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
+            mtp_layers = self.mtp_num_layers or 0
+            expected_len = self.num_layers + mtp_layers
+            assert len(self.csa_compress_ratios) == expected_len, (
+                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must equal "
+                f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
+            )
+            assert all(
+                ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
+            ), "csa_compress_ratios must be 0, 4, or 128"
+            assert (
+                self.tensor_model_parallel_size == 1
+            ), "DSv4 Hybrid Attention only supports TP size 1."
+            assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1745,6 +1800,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
+            if self.fine_grained_offloading_max_inflight_offloads is not None:
+                assert (
+                    self.fine_grained_offloading_max_inflight_offloads >= 0
+                ), "fine_grained_offloading_max_inflight_offloads must be non-negative when set."
         if self.moe_paged_stash:
             assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
             assert self.moe_expert_rank_capacity_factor is not None, (
@@ -2000,6 +2059,24 @@ class TransformerConfig(ModelParallelConfig):
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
 
+        if self.activation_func_clamp_value is not None:
+            # swiglu
+            if self.activation_func == F.silu and self.gated_linear_unit:
+                if self.num_moe_experts is None:
+                    raise ValueError(
+                        "activation_func_clamp_value for SwiGLU is only supported with MoE."
+                    )
+                if self.use_te_activation_func:
+                    raise ValueError(
+                        "use_te_activation_func must be False "
+                        "when activation_func_clamp_value is not None for SwiGLU"
+                    )
+                if self.use_transformer_engine_op_fuser:
+                    raise ValueError(
+                        "use_transformer_engine_op_fuser must be False "
+                        "when activation_func_clamp_value is not None for SwiGLU"
+                    )
+
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
                 warnings.warn(
@@ -2127,6 +2204,38 @@ class TransformerConfig(ModelParallelConfig):
                 "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
                 "score functions. Please set --moe-router-score-function to 'sigmoid' or "
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
+            )
+
+        if self.moe_n_hash_layers > 0:
+            assert (
+                self.actual_vocab_size is not None
+            ), "actual_vocab_size must be set when moe_n_hash_layers > 0."
+            if self.pipeline_model_parallel_size > 1:
+                assert self.pipeline_model_parallel_layout is not None, (
+                    "pipeline_model_parallel_layout must be set when using hash MoE "
+                    "layers with pipeline parallelism (PP > 1)."
+                )
+                # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
+                # All hash MoE layers must be in the same virtual pipeline stage.
+                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
+                    f"Currently, All hash MoE layers must be in the same virtual pipeline stage "
+                    f"as the embedding. The embedding stage has "
+                    f"{n_decoders_with_embedding} decoder layers, but "
+                    f"moe_n_hash_layers={self.moe_n_hash_layers}."
+                )
+            assert (
+                not self.overlap_moe_expert_parallel_comm
+            ), "overlap_moe_expert_parallel_comm does not support moe_n_hash_layers > 0 for now."
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"Hash MoE layer initialized with placeholder round-robin tid2eid. "
+                f"For real training, you MUST either (a) load tid2eid from a "
+                f"pre-trained DSv4 checkpoint, or (b) provide a frequency-aware "
+                f"initialization (e.g., Sinkhorn-balanced over token frequency). "
+                f"Round-robin will cause severe expert imbalance.",
             )
 
         if self.num_moe_experts and self.fp8:
@@ -2359,7 +2468,8 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.fine_grained_activation_offloading:
                 assert self.cuda_graph_impl == "transformer_engine" or (
-                    self.cuda_graph_impl == "local" and self.cuda_graph_scope == "full_iteration"
+                    self.cuda_graph_impl == "local"
+                    and self.cuda_graph_scope == [CudaGraphScope.full_iteration]
                 ), (
                     "fine-grained activation offloading is only supported with "
                     "transformer_engine CUDA graph implementation or local CUDA graph "
@@ -2372,6 +2482,11 @@ class TransformerConfig(ModelParallelConfig):
                     "cuda_graph_warmup_steps must be greater than 0 when enabling "
                     "fine-grained activation offloading."
                 )
+                if CudaGraphScope.full_iteration in self.cuda_graph_scope:
+                    assert self.fine_grained_offloading_max_inflight_offloads is not None, (
+                        "fine_grained_offloading_max_inflight_offloads must be set when using "
+                        "fine-grained activation offloading with full-iteration CUDA graphs "
+                    )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
@@ -2523,6 +2638,12 @@ class TransformerConfig(ModelParallelConfig):
                 "2.3.0.dev0+39c0e70"
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
 
+        if self.rotary_base_per_layer is not None:
+            assert len(self.rotary_base_per_layer) == self.num_layers, (
+                f"rotary_base_per_layer length ({len(self.rotary_base_per_layer)}) "
+                f"must equal num_layers ({self.num_layers})"
+            )
+
         if self.no_rope_freq:
             assert not self.flash_decode, "flash_decode cannot be used with no_rope."
             if isinstance(self.no_rope_freq, int):
@@ -2637,10 +2758,12 @@ class MLATransformerConfig(TransformerConfig):
     """Rank of Query tensor's low rank representation."""
 
     kv_lora_rank: int = 512
-    """Rank of Key and Value tensors' low rank representation."""
+    """Rank of Key and Value tensors' low rank representation.
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_head_dim: int = 128
-    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim"""
+    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_pos_emb_head_dim: int = 64
     """Dimension of the position embedding in the QK projection."""
@@ -2678,6 +2801,12 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
+    o_groups: int = 8
+    """Number of groups for grouped low-rank output projection (wo_a)."""
+
+    o_lora_rank: int = 1024
+    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
+
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
@@ -2695,6 +2824,21 @@ class MLATransformerConfig(TransformerConfig):
 
         if self.attention_output_gate:
             raise NotImplementedError("Output gate is not supported for MLA yet.")
+
+        # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            assert (
+                not self.mla_down_proj_fusion
+            ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
+                f"v_head_dim and qk_pos_emb_head_dim",
+            )
+            derived = self.v_head_dim - self.qk_pos_emb_head_dim
+            self.qk_head_dim = derived
+            self.kv_lora_rank = derived
 
         if self.cache_mla_latents:
             assert (

@@ -136,11 +136,14 @@ class MoEModelTestContainer:
         quantization_context = get_fp8_context(self.config, layer_number, is_init=True)
         with quantization_context:
             moe_layer = (
-                MoELayer(self.config, transformer_layer_spec.submodules.mlp.submodules)
+                MoELayer(
+                    self.config,
+                    transformer_layer_spec.submodules.mlp.submodules,
+                    layer_number=layer_number,
+                )
                 .cuda()
                 .to(dtype=self.test_dtype)
             )
-            moe_layer.set_layer_number(layer_number)
             return moe_layer
 
     def zero_grad(self):

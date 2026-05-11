@@ -6,6 +6,8 @@ import logging
 
 import torch
 
+from megatron.core.full_cuda_graph import get_graph_pool, get_shared_capture_stream
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,9 +18,10 @@ class OptimizerCudaGraphWrapper:
     cuda_graph = None
     result = None  # result of the optimizer.step() function
 
-    def __init__(self, optimizer_step_func, cuda_graph_warmup_steps=1):
+    def __init__(self, optimizer_step_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
         self.optimizer_step_func = optimizer_step_func
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
+        self.use_single_mempool = use_single_mempool
 
     def __call__(self, *args, **kwargs):
         assert len(args) == 0, 'optimizer.step() does not accept positional args'
@@ -31,8 +34,12 @@ class OptimizerCudaGraphWrapper:
             assert OptimizerCudaGraphWrapper.cuda_graph is None
             OptimizerCudaGraphWrapper.cuda_graph = torch.cuda.CUDAGraph()
             torch.cuda.synchronize()
-            capture_stream = torch.cuda.Stream()
-            with torch.cuda.graph(OptimizerCudaGraphWrapper.cuda_graph, stream=capture_stream):
+            capture_stream = get_shared_capture_stream()
+            with torch.cuda.graph(
+                OptimizerCudaGraphWrapper.cuda_graph,
+                stream=capture_stream,
+                pool=get_graph_pool(self.use_single_mempool),
+            ):
                 OptimizerCudaGraphWrapper.result = self.optimizer_step_func()
             torch.cuda.synchronize()
             torch.distributed.barrier()
