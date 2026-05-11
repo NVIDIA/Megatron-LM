@@ -208,6 +208,16 @@ class _ParamAndGradBucketGroup:
                 not self.ddp_config.reduce_scatter_with_fp32_accumulation
             ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
 
+        reduction_collective = (
+            "reduce-scatter" if self.ddp_config.use_distributed_optimizer else "all-reduce"
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Using {reduction_collective} for gradient reductions because "
+            f"{self.ddp_config.use_distributed_optimizer=}",
+        )
+
         global dist_reduce_scatter_func
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
             dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
