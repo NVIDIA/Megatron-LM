@@ -213,6 +213,17 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    megatron_fsdp_cuda_graph_mode: bool = False
+    """If set to True, Megatron-FSDP will practice CUDA graph-safe operations, such as
+    not dereferencing `param.grad` after the optimizer step to preserve references for
+    CUDA graph replay. Can affect memory utilization in some cases, such as when the
+    gradient shard is not a view of the Megatron-FSDP sharded gradient buffer, so
+    FusedAdam(use_decoupled_grad=True) + megatron_fsdp_use_decoupled_grad=True or
+    setting megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype is
+    recommended to avoid casting the gradient to the parameter precision and creating
+    a casted-copy of the gradient shard that cannot be dereferenced due to replay.
+    """
+
     def __post_init__(self):
         import os
 

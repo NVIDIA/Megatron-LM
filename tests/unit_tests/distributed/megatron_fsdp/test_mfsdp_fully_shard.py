@@ -766,6 +766,8 @@ class TestMegatronFsdpFullyShard:
             mixed_precision_policy=MixedPrecisionPolicy(
                 main_params_dtype=torch.float32, main_grads_dtype=torch.float32
             ),
+            # Run Megatron-FSDP in CUDA graph-safe mode.
+            cuda_graph_mode=True,
         )
 
         # FusedAdam is REQUIRED for full-iteration CUDA graphs!
