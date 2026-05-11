@@ -597,7 +597,12 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and not self.training:
+        dispatched_input = self._maybe_record_overload_factor(dispatched_input, tokens_per_expert)
+        if (
+            hasattr(self, "_inference_token_dispatcher")
+            and self.is_inference_cuda_graphed_iteration
+            and not self.training
+        ):
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map

@@ -2072,7 +2072,7 @@ class MoETransformerLayer(TransformerLayer):
             obj, name = self._resolve_token_dispatcher_attr(attr_name)
             setattr(obj, name, attr)
 
-    def _forward_mlp_router(self, hidden_states, padding_mask=None):
+    def _forward_mlp_router(self, hidden_states, padding_mask=None, input_ids=None):
         """
         Executes the router phase of the MoE block.
 

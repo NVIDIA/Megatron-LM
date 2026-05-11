@@ -533,14 +533,7 @@ class _ParamAndGradBucketGroup:
                     # (a view into grad_data) would start from the result of the
                     # latest parameter all-gather instead of zero.
                     bucket.grad_data.zero_()
-            else:
-                fp8_params = []
-                for bucket in self.buckets:
-                    for param in bucket.params:
-                        if is_float8tensor(param):
-                            fp8_params.append(param)
-                if len(fp8_params) > 0:
-                    post_all_gather_processing(fp8_params)
+            self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """

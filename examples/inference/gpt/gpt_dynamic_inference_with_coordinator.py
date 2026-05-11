@@ -25,6 +25,7 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
 
 # pylint: disable=line-too-long
 
