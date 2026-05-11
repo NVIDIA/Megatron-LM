@@ -16,6 +16,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from ..uneven_dtensor import make_uneven_dtensor
 from .allocator import TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
+from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .utils import ParamGroupIdx
 
 
@@ -41,10 +42,9 @@ class ParameterGroup:
         params: List[torch.nn.Parameter],
         param_group_id: ParamGroupIdx,
         *,
+        mp_policy: FullyShardMixedPrecisionPolicy,
         mesh: Optional[DeviceMesh] = None,
         sharding_strategy: str = "optim_grads_params",
-        main_params_dtype: Optional[torch.dtype] = None,
-        main_grads_dtype: Optional[torch.dtype] = None,
         gradient_scaling_factor: Optional[float] = None,
         allocator: Optional[TemporaryBucketAllocator] = None,
     ):
@@ -75,8 +75,7 @@ class ParameterGroup:
         else:
             self.chunk_size_factor = 1
 
-        self.main_params_dtype = main_params_dtype
-        self.main_grads_dtype = main_grads_dtype
+        self.mp_policy = mp_policy
         self.gradient_scaling_factor = gradient_scaling_factor
         self.allocator = allocator
 
@@ -114,7 +113,7 @@ class ParameterGroup:
 
         Buffer creation logic:
         - model_weight_buffer: always created unless "no_shard"
-        - main_weight_buffer: created if main_params_dtype specified
+        - main_weight_buffer: created if mp_policy.main_params_dtype is specified
         - main_grad_buffer: created if requires_grad
         """
         s = self.sharding_strategy
@@ -131,11 +130,11 @@ class ParameterGroup:
             self.model_weight_buffer = wbuf
 
         # Create main weight buffer for mixed precision
-        if self.main_params_dtype is not None:
-            mbuf = self._create_buffer(self.main_params_dtype, shard_main_weights)
+        if self.mp_policy.main_params_dtype is not None:
+            mbuf = self._create_buffer(self.mp_policy.main_params_dtype, shard_main_weights)
             mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
-                mbuf.set_item(i, p.detach().to(self.main_params_dtype))
+                mbuf.set_item(i, p.detach().to(self.mp_policy.main_params_dtype))
             self.main_weight_buffer = mbuf
 
         # Free the original full parameter tensors now that their data has been
@@ -147,13 +146,10 @@ class ParameterGroup:
 
         # Create gradient buffer
         if self.requires_grad:
-            if self.main_grads_dtype is not None:
-                gbuf_dtype = self.main_grads_dtype
-            elif self.main_params_dtype is not None:
-                gbuf_dtype = self.main_params_dtype
-            else:
-                gbuf_dtype = self.dtype
-            gbuf = self._create_buffer(gbuf_dtype, shard_grads)
+            main_grads_dtype = self.dtype
+            if self.mp_policy.main_grads_dtype is not None:
+                main_grads_dtype = self.mp_policy.main_grads_dtype
+            gbuf = self._create_buffer(main_grads_dtype, shard_grads)
             gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
             self.main_grad_buffer = gbuf
 
@@ -180,7 +176,7 @@ class ParameterGroup:
         For distributed buffers: reduce-scatter the full gradient
         For non-distributed buffers: all-reduce in-place
         """
-        self.main_grad_buffer.reduce_grad()
+        self.main_grad_buffer.reduce_grad(grad_comm_dtype=self.mp_policy.grad_comm_dtype)
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
