@@ -135,10 +135,7 @@ def _get_cp_positions_from_layout(
 
 
 def _build_packed_allgather_cp_local_positions(
-    cu_seqlens: torch.Tensor,
-    cp_size: int,
-    cp_rank: int,
-    device: torch.device,
+    cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, device: torch.device
 ) -> torch.Tensor:
     """Build local packed-token positions for one CP rank under zigzag THD sharding.
 
@@ -470,12 +467,12 @@ def _normalize_query_valid_rows(
             return query_valid_rows.expand(b, sq)
         if query_valid_rows.shape != (b, sq):
             raise ValueError(
-                f"query_valid_rows shape mismatch: expected {(b, sq)}, got {tuple(query_valid_rows.shape)}"
+                f"query_valid_rows shape mismatch: expected {
+                    (b, sq)
+                    }, got {tuple(query_valid_rows.shape)}"
             )
         return query_valid_rows
-    raise ValueError(
-        f"query_valid_rows should be 1D or 2D tensor, got {query_valid_rows.ndim}D."
-    )
+    raise ValueError(f"query_valid_rows should be 1D or 2D tensor, got {query_valid_rows.ndim}D.")
 
 
 def _extract_query_valid_rows_from_packed_seq_params(
@@ -713,9 +710,7 @@ def _fused_qk_topk_lighting(
                 use_relu=use_relu,
             )
             topk_indices, _ = _sanitize_fused_topk_outputs(
-                topk_indices=topk_indices,
-                starts=starts[start:end],
-                ends=ends[start:end],
+                topk_indices=topk_indices, starts=starts[start:end], ends=ends[start:end]
             )
             if topk_out is None:
                 topk_out = torch.empty(
@@ -1012,7 +1007,9 @@ def _fused_qk_topk_lighting_with_streaming_sparse_kl(
         return None
     if nk != 1 and nk != np:
         return None
-    query_valid_rows = _normalize_query_valid_rows(query_valid_rows, b=b, sq=sq, device=query.device)
+    query_valid_rows = _normalize_query_valid_rows(
+        query_valid_rows, b=b, sq=sq, device=query.device
+    )
 
     starts = starts.contiguous()
     ends = ends.contiguous()
@@ -2054,7 +2051,9 @@ def bwd_fused_indexer_loss_naive(
     valid_row_count = (
         query_valid_rows.sum().to(dtype=torch.float32, device=attention_scores_normalized.device)
         if query_valid_rows is not None
-        else torch.tensor(float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device)
+        else torch.tensor(
+            float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device
+        )
     ).clamp_min(1.0)
     grad_kl_per_row = grad_kl_div / valid_row_count  # scalar value for each real row
 
@@ -2438,10 +2437,7 @@ class DSAIndexer(MegatronModule):
             else self.config.layernorm_epsilon
         )
         self.k_norm = build_module(
-            submodules.k_norm,
-            config=k_norm_config,
-            hidden_size=self.index_head_dim,
-            eps=k_norm_eps,
+            submodules.k_norm, config=k_norm_config, hidden_size=self.index_head_dim, eps=k_norm_eps
         )
 
         self.linear_weights_proj = build_module(
@@ -2483,10 +2479,7 @@ class DSAIndexer(MegatronModule):
             cu_seqlens=cu_seqlens,
             mscale=mscale,
             cp_group=self.pg_collection.cp,
-            # # GLM5 uses interleaved RoPE for the DSA indexer, while DeepSeek-V3.2
-            # # keeps the legacy non-interleaved path. Make this behavior
-            # # model-configurable instead of hard-coding a single variant.
-            # mla_rotary_interleaved=self.config.dsa_indexer_rope_interleaved,
+            mla_rotary_interleaved=self.config.dsa_indexer_rope_interleaved,
         )
         if squeezed_batch_dim:
             x_pe = x_pe.unsqueeze(1)
@@ -2596,8 +2589,7 @@ class DSAIndexer(MegatronModule):
 
         # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
         index_scores, topk_indices = fused_qk_topk_naive(
-            q, k, weights, self.index_topk, mask,
-            use_relu=self.config.dsa_indexer_scoring_relu,
+            q, k, weights, self.index_topk, mask, use_relu=self.config.dsa_indexer_scoring_relu
         )
 
         return index_scores, topk_indices
@@ -2945,7 +2937,9 @@ class DSAttention(MegatronModule):
                     if value.size(0) != packed_kv_reorder_idx.numel():
                         raise RuntimeError(
                             "Packed DSA gathered value length mismatch: "
-                            f"value_seqlen={value.size(0)}, expected={packed_kv_reorder_idx.numel()}"
+                            f"value_seqlen={
+                                value.size(0)
+                            }, expected={packed_kv_reorder_idx.numel()}"
                         )
                     value = value.index_select(0, packed_kv_reorder_idx)
 
