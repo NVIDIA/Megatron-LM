@@ -234,14 +234,42 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             bucket_numel_unpadded += param_numel
 
             for shard_id in range(1, dp_size):
+                # Prefer an exact-numel peer; this gives the cleanest layout
+                # (no inner-shard padding).
                 matched_param = _next_with_size(param_numel)
                 if matched_param is not None:
                     assigned_param_ids.add(id(matched_param))
                     shard_assignments[shard_id].append((matched_param, param_numel))
                     bucket_numel_unpadded += param_numel
-                else:
-                    shard_assignments[shard_id].append((None, param_numel))
-                    size_match_padding_numel += param_numel
+                    continue
+
+                # No exact peer. Greedily pack as many smaller params from the
+                # queue as fit within this shard slot (sized to ``param_numel``).
+                # Cuts overhead from unique-large seeds (e.g. an embedding)
+                # that would otherwise force ``(dp_size - 1) * param_numel`` of
+                # empty padding.
+                useful_in_slot = 0
+                slot_cursor = 0
+                while True:
+                    candidate_param = _next_unassigned()
+                    if candidate_param is None:
+                        break
+                    candidate_numel = candidate_param.data.nelement()
+                    candidate_start = pad_param_start(slot_cursor)
+                    if candidate_start + candidate_numel > param_numel:
+                        break
+                    assigned_param_ids.add(id(candidate_param))
+                    shard_assignments[shard_id].append((candidate_param, candidate_numel))
+                    bucket_numel_unpadded += candidate_numel
+                    slot_cursor = candidate_start + candidate_numel
+                    useful_in_slot += candidate_numel
+
+                # Pad the remainder of the slot up to ``param_numel``.
+                padding_start = pad_param_start(slot_cursor)
+                padding_size = param_numel - padding_start
+                if padding_size > 0:
+                    shard_assignments[shard_id].append((None, padding_size))
+                size_match_padding_numel += param_numel - useful_in_slot
 
             shard_cursor = pad_param_start(shard_cursor) + param_numel
 

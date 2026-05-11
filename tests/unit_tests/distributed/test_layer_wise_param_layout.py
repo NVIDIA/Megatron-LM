@@ -184,6 +184,45 @@ class TestSizeMatchingLayout:
         # They should share a bucket (matched in one round).
         assert len(big_param_bucket_ids) == 1
 
+    # -- fallback packing for unique-large seeds --
+
+    def test_unique_large_seed_packs_smaller_params(self):
+        """A unique-large seed's empty shard slots should absorb smaller params.
+
+        Pool order is the *reverse* of input/forward order, so the
+        ``unique_large_param`` is placed last in the input list to make it the
+        first seed (top of pool). Without the packing fallback, the unique
+        seed would emit a bucket with ``dp_size - 1`` shards of pure padding
+        and the trailing smaller params would form their own bucket. With the
+        fallback, the smaller params land in the large param's bucket,
+        eliminating the second bucket entirely.
+        """
+        dp_size = 4
+        unique_large_param = _make_param((1024,))
+        filler_params = [_make_param((128,)) for _ in range(3)]
+        cfg = _make_ddp_config()
+
+        layout = _LWO._compute_per_buffer_param_layout(
+            filler_params + [unique_large_param], None, dp_size, cfg
+        )
+
+        # Invariant still holds: each param lies entirely within one shard.
+        for param in [unique_large_param] + filler_params:
+            _assert_param_within_shard(layout, param, dp_size)
+
+        # All four params share a single bucket (no second bucket for the
+        # filler params).
+        assert len(layout.bucket_indices) == 1
+        _, _, large_bucket_id = layout.param_index_map[unique_large_param]
+        for filler_param in filler_params:
+            _, _, filler_bucket_id = layout.param_index_map[filler_param]
+            assert filler_bucket_id == large_bucket_id
+
+        # Filler params land in shard slots other than the unique-large's.
+        large_shard = _get_shard_for_param(layout, unique_large_param, dp_size)
+        for filler_param in filler_params:
+            assert _get_shard_for_param(layout, filler_param, dp_size) != large_shard
+
     # -- shared_embedding isolation --
 
     def test_shared_embedding_isolated(self):
