@@ -79,14 +79,23 @@ runs:
       shell: bash
       run: sudo chown -R $(whoami) /home/runner/
 
-    - name: Setup python and install dependencies
+    - name: Setup python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install uuid-runtime
       shell: bash -x -e -u -o pipefail {0}
       run: |
         for i in 1 2 3; do
-          apt-get update && apt-get install -y python3.12 python3.12-venv uuid-runtime && break
+          apt-get update && apt-get install -y uuid-runtime && break
           echo "apt attempt $i failed, retrying..."
           sleep 10
         done
+
+    - name: Install uv
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
         for i in 1 2 3; do
           curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh && break
           echo "uv install attempt $i failed, retrying..."
@@ -200,18 +209,24 @@ runs:
       if: always()
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
+        MAIN_CONCLUSION: ${{ steps.run-main-script.conclusion }}
+        MAIN_EXIT_CODE: ${{ steps.run-main-script.outputs.exit_code }}
       run: |
-        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(uuidgen)
+        logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
         if [[ "$IS_UNIT_TEST" == "true" ]]; then
-          coverage_report=coverage-unit-test-${{ github.run_id }}-$(uuidgen)
+          coverage_report=coverage-unit-test-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         else
           coverage_report=none
         fi
         echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
 
-        EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
-        IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
+        EXIT_CODE="${MAIN_EXIT_CODE:-${MAIN_CONCLUSION}}"
+        if [[ "$MAIN_CONCLUSION" == "success" ]]; then
+          IS_SUCCESS=true
+        else
+          IS_SUCCESS=false
+        fi
 
         if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is-optional }}" == "true" ]]; then
           echo "::warning::Test failed but is marked optional — treating as success."
