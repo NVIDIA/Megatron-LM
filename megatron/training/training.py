@@ -69,6 +69,7 @@ try:
 except ImportError:
     has_rl_utils = False
 
+
 # Canonical list of RL timer names to include in timers_to_log.
 # When the profiling branch is merged, this will be imported from rl_profiling
 # as RL_LOGGABLE_TIMER_NAMES instead of being defined here.
@@ -126,12 +127,6 @@ try:
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
-
-try:
-    from nvidia_resiliency_ext.inprocess import CallWrapper
-except ImportError:
-    CallWrapper = type(None)
-
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -194,6 +189,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
+from megatron.training.config import FaultInjectorConfig
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
@@ -843,7 +839,7 @@ def pretrain(
     get_position_embedding_ranks=None,
     non_loss_data_func=None,
     store=None,
-    inprocess_call_wrapper: Optional[CallWrapper] = None,
+    inprocess_call_wrapper: Optional[Any] = None,
 ):
     """Main training program.
 
@@ -915,9 +911,7 @@ def pretrain(
     timers = get_timers()
 
     if args.fine_grained_activation_offloading:
-        from megatron.core.pipeline_parallel.utils import (
-            set_ideal_affinity_for_current_gpu
-        )
+        from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
 
@@ -1007,8 +1001,8 @@ def pretrain(
                 LocalCheckpointManager,
             )
             from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                parse_group_sequence,
                 GroupWrapper,
+                parse_group_sequence,
             )
             from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
                 CliqueReplicationStrategy,
@@ -1336,6 +1330,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import has_modelopt_state
+
         # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
         # set a flag to use our model provider if so.
         if args.load is not None and has_modelopt_state(args.load):
@@ -2217,8 +2212,9 @@ def training_log(
         if is_hybrid_model(args):
             from operator import itemgetter
 
-            from megatron.core.models.hybrid.hybrid_layer_allocation import (
-                Symbols, get_hybrid_layer_counts,
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+                Symbols,
+                get_hybrid_layer_counts,
             )
             layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
         else:
@@ -2513,6 +2509,22 @@ def save_checkpoint_and_time(
     timers('interval-time', log_level=0).start(barrier=True)
 
 
+def _run_gpu_sniff_test(tag):
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.training.gpu_sniff_test import run_gpu_sniff_test
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['ep', 'dp', 'tp'],
+    )
+    print_datetime(f'running GPU sniff test ({tag})')
+    timers = get_timers()
+    timers('gpu-sniff-test', log_level=0).start(barrier=True)
+    run_gpu_sniff_test(tag, pg_collection=pg_collection)
+    timers('gpu-sniff-test').stop(barrier=True)
+    timers.log(['gpu-sniff-test'])
+    print_datetime(f'finished GPU sniff test ({tag})')
+
+
 def post_training_step_callbacks(
     model,
     optimizer,
@@ -2573,6 +2585,13 @@ def post_training_step_callbacks(
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
             if nsys_nvtx_context is not None:
                 nsys_nvtx_context.__exit__(None, None, None)
+
+    # GPU sniff test.
+    if (
+        args.gpu_sniff_test_interval is not None
+        and iteration % args.gpu_sniff_test_interval == 0
+    ):
+        _run_gpu_sniff_test(f'iteration {iteration:7d}')
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -2711,6 +2730,28 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+    fault_injector_kwargs = {}
+    for f in dataclasses.fields(FaultInjectorConfig):
+        if hasattr(args, f.name):
+            fault_injector_kwargs[f.name] = getattr(args, f.name)
+    fault_injector_config = FaultInjectorConfig(**fault_injector_kwargs)
+
+    _maybe_raise_workload_exception = None
+    if (
+        fault_injector_config.fault_injector_ranks is not None
+        or fault_injector_config.fault_injector_num_ranks is not None
+    ):
+        from megatron.core.fault_injector import (
+            maybe_raise_workload_exception as _maybe_raise_workload_exception,
+        )
+        from megatron.core.fault_injector import (
+            setup_fault_injection,
+            should_setup_fault_injection_at_iteration,
+            should_setup_fault_injection_at_start,
+        )
+
+        if should_setup_fault_injection_at_start(fault_injector_config):
+            setup_fault_injection(fault_injector_config)
 
     if args.perform_rl_step:
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
@@ -2763,8 +2804,9 @@ def train(
         print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
         from megatron.core.num_microbatches_calculator import (
             destroy_num_microbatches_calculator,
-            init_num_microbatches_calculator
+            init_num_microbatches_calculator,
         )
+
         # First destroy the existing calculator
         destroy_num_microbatches_calculator()
         # Then initialize with the correct perform_rl_step=True context
@@ -2787,8 +2829,9 @@ def train(
 
     if args.run_workload_inspector_server:
         try:
-            from workload_inspector.utils.webserver import run_server
             import threading
+
+            from workload_inspector.utils.webserver import run_server
 
             threading.Thread(
                 target=run_server, daemon=True, args=(torch.distributed.get_rank(),)
@@ -2859,6 +2902,11 @@ def train(
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
+
+    # GPU sniff test at start of training.
+    if args.gpu_sniff_test_interval is not None:
+        _run_gpu_sniff_test('before training')
+
     report_memory_flag = True
     pre_hook_enabled = False
     should_exit = False
@@ -3119,6 +3167,15 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+            if _maybe_raise_workload_exception is not None and iteration != start_iteration:
+                _maybe_raise_workload_exception()
+            # Fault delay timing can start at the end of iteration N. Self-firing faults
+            # (signals, GIL, GPU) may then manifest in iteration N or N+1 depending on the
+            # configured delay; workload-exception faults manifest on a later poll.
+            if _maybe_raise_workload_exception is not None and should_setup_fault_injection_at_iteration(
+                fault_injector_config, iteration
+            ):
+                setup_fault_injection(fault_injector_config)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3572,10 +3629,20 @@ def evaluate_and_print_results(
     else:
         eval_iters = args.eval_iters
 
+    if args.validation_set_names:
+        assert args.multiple_validation_sets, \
+            "--validation-set-names requires --multiple-validation-sets"
+        assert len(args.validation_set_names) == len(data_iterators), \
+            f"Number of --validation-set-names ({len(args.validation_set_names)}) must match " \
+            f"the number of validation datasets ({len(data_iterators)})"
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
-            suffix = f"-{index}"
+            if args.validation_set_names:
+                suffix = f"-{args.validation_set_names[index]}"
+            else:
+                suffix = f"-{index}"
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
             forward_step_func,
             iterator,
