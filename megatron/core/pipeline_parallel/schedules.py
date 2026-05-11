@@ -708,6 +708,13 @@ def forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                    # Release the autograd graph head before the next forward_step.
+                    # Without this, the previous microbatch's output_tensor stays
+                    # live until the next iteration rebinds the variable, deferring
+                    # autograd-node teardown onto the next forward's dispatch path
+                    # and triggering PyTorch's "AccumulateGrad node's stream does
+                    # not match" warning. See issue #4124.
+                    del output_tensor
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
@@ -730,6 +737,7 @@ def forward_backward_no_pipelining(
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+            del output_tensor
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
