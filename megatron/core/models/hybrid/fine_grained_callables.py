@@ -24,13 +24,14 @@ class HybridStackNode(TransformerLayerNode):
     Subclassed from ``TransformerLayerNode`` so the runtime backbone (forward /
     backward / backward_dw plumbing, detach bookkeeping, output-grad release)
     is shared. The hybrid path keeps a separate node class so its free-input
-    policy can diverge from the GPT defaults — for example, the ``attn`` slot
-    here covers the whole pre-dispatch loop (mamba + attention + …) rather than
-    a single attention block, and group-level decisions about whether the input
-    is needed in backward may differ from ``should_free_input`` in
-    ``gpt/fine_grained_callables.py``. Keep this override thin until a hybrid
-    counter-example forces it to diverge; the explicit subclass exists so the
-    divergence can be made surgically without touching the GPT class.
+    policy can diverge from the GPT defaults — for example, the
+    ``pre_dispatch_computation`` slot here covers the whole pre-dispatch loop
+    (mamba + attention + …) rather than a single attention block, and
+    group-level decisions about whether the input is needed in backward may
+    differ from ``should_free_input`` in ``gpt/fine_grained_callables.py``.
+    Keep this override thin until a hybrid counter-example forces it to
+    diverge; the explicit subclass exists so the divergence can be made
+    surgically without touching the GPT class.
     """
 
     @staticmethod

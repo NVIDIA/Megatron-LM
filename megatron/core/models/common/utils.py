@@ -46,11 +46,12 @@ def weak_method(method):
 def should_free_input(name, is_moe, config, num_local_experts):
     """Whether the schedule node named ``name`` can free its input after forward.
 
-    The schedule decomposes a transformer layer into ``attn``, ``moe_dispatch``,
-    ``mlp``, and ``moe_combine`` nodes; the inputs to some of those nodes are
-    not needed in backward and can be released early to lower peak activation
-    memory. Dense layers and the ``attn`` node always need their input retained
-    (the attention residual flows through the post-MLP BDA).
+    The schedule decomposes a transformer layer into ``pre_dispatch_computation``,
+    ``moe_dispatch``, ``mlp``, and ``moe_combine`` nodes; the inputs to some of
+    those nodes are not needed in backward and can be released early to lower
+    peak activation memory. Dense layers and the ``pre_dispatch_computation``
+    node always need their input retained (the attention residual flows through
+    the post-MLP BDA).
 
     Args:
         name: Schedule node name.
@@ -61,7 +62,8 @@ def should_free_input(name, is_moe, config, num_local_experts):
     Returns:
         True iff the named node may free its input after forward.
     """
-    # For dense layers [attn, fake, mlp, fake], the input is needed during backward pass
+    # For dense layers [pre_dispatch_computation, fake, mlp, fake], the input is needed
+    # during backward pass
     if not is_moe:
         return False
     enable_deepep = (
@@ -208,8 +210,8 @@ class PostProcessNode(ScheduleNode):
 class TransformerLayerNode(ScheduleNode):
     """Schedule node for one slot of a fine-grained transformer layer plan.
 
-    Each transformer layer is decomposed into ``attn``, ``moe_dispatch``,
-    ``mlp``, and ``moe_combine`` slots; this class is the scheduler-side
+    Each transformer layer is decomposed into ``pre_dispatch_computation``,
+    ``moe_dispatch``, ``mlp``, and ``moe_combine`` slots; this class is the scheduler-side
     handle for one slot. It owns the slot's stream / event, the per-slot
     ``free_input`` policy, and the optional delayed weight-gradient hook.
     Subclasses override ``_resolve_free_input`` to specialize the policy
@@ -321,7 +323,7 @@ class TransformerLayerNode(ScheduleNode):
 
 
 class _BackwardDWWrapper:
-    """Backward weight-gradient wrapper for the ``attn`` slot of a transformer layer.
+    """Backward weight-gradient wrapper for the ``pre_dispatch_computation`` slot of a transformer layer.
 
     Runs the layer's ``self_attention.backward_dw`` plus, on MoE layers, the
     shared-expert ``backward_dw``; coordinates with the cuda-graph wgrad

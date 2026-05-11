@@ -23,12 +23,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
     MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
 
-    The five callables are:
-    1. Attention (computation)
-    2. Post-Attention (computation)
-    3. MoE Dispatch (communication)
-    4. MLP / MoE Experts (computation)
-    5. MoE Combine (communication)
+    The five callables align with the schedule plan's slot order:
+    1. pre_dispatch_computation (computation):
+       attention -> pre-MLP layernorm -> router -> dispatch preprocess.
+       For dense layers this is just the attention pass.
+    2. moe_dispatch (communication): MoE dispatch All-to-All.
+    3. mlp / moe_experts (computation): dense MLP or routed-experts compute.
+    4. moe_combine (communication): MoE combine All-to-All + post-MLP residual.
+    5. mtp_post_process (computation): always ``None`` here; only the MTP
+       wrapper in ``common/fine_grained_callables.py`` fills this slot.
 
     By assigning these functions to different CUDA streams (e.g., a compute stream
     and a communication stream), the scheduler can overlap their execution, preventing
@@ -40,8 +43,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     Returns:
         A tuple containing:
-        - forward_funcs: List of callable functions for the layer
-        - backward_dw: Dict of weight gradient functions for the layer
+        - forward_funcs: List of 5 callables, one per slot in the schedule plan
+          (pre_dispatch_computation, moe_dispatch, mlp, moe_combine,
+          mtp_post_process=None).
+        - backward_dw: Dict mapping slot name to the delayed-wgrad callable
+          (keys: "pre_dispatch_computation", "mlp").
     """
 
     is_moe = isinstance(layer.mlp, MoELayer)
@@ -54,9 +60,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         and layer.config.moe_flex_dispatcher_backend == "hybridep"
     )
 
-    def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+    def submodule_pre_dispatch_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
-        Performs same attnention forward logic as GPT Model and forward pass for
+        Performs the same attention forward logic as GPTModel and the forward pass for
         computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
         """
@@ -154,7 +160,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep or enable_hybridep:
             # update token_probs to be the detached version, prevents
-            # backward graph from connecting to attn submodule
+            # backward graph from connecting to pre_dispatch_computation submodule
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
@@ -249,7 +255,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         raise NotImplementedError("This callable is not implemented for Dense layer.")
 
     # Build forward and backward callable functions
-    pre_dispatch_func = submodule_attn_forward
+    pre_dispatch_func = submodule_pre_dispatch_forward
     dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented

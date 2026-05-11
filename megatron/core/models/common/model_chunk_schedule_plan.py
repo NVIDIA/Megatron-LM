@@ -115,7 +115,8 @@ class TransformerLayerSchedulePlan:
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
-            attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
+            pre_dispatch_computation, moe_dispatch, mlp, moe_combine,
+            and mtp_post_process.
         """
         from megatron.core.models.common.fine_grained_callables import build_layer_callables
         from megatron.core.models.common.utils import TransformerLayerNode
@@ -195,12 +196,12 @@ class TransformerLayerSchedulePlan:
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
         This function interleaves forward and backward operations, overlapping the communications
-        (dispatch or combine) of one with the computations (att or mlp) of the other
+        (dispatch or combine) of one with the computations (pre_dispatch or mlp) of the other
         to maximize parallelism and efficiency.
 
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
-        comm_stream: combine_bwd | dispatch_fwd->dispatch_bwd  | combine_fwd
-        comp_stream: attn_fwd    | mlp_bwd->mlp_bwd_dw->mlp_fwd| attn_bwd
+        comm_stream: combine_bwd       | dispatch_fwd->dispatch_bwd  | combine_fwd
+        comp_stream: pre_dispatch_fwd  | mlp_bwd->mlp_bwd_dw->mlp_fwd| pre_dispatch_bwd
         For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
         and mtp_post_process_bwd is executed before the combine_bwd in the comp_stream.
 
@@ -544,13 +545,13 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         if f_schedule_plan is not None and post_forward is not None:
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
-            # so the p2p comm could be overlapped with the attn backward
+            # so the p2p comm could be overlapped with the pre_dispatch backward
             with torch.cuda.stream(get_comm_stream()):
                 f_schedule_plan.wait_current_stream()
                 post_forward(f_input, f_schedule_plan.vp_stage)
 
         # post_backward()/send_backward_recv_backward() is running in the computation stream,
-        # so the p2p comm could be overlapped with the wgrad of attn backward
+        # so the p2p comm could be overlapped with the wgrad of pre_dispatch backward
         if b_schedule_plan is not None and post_backward is not None:
             b_schedule_plan.wait_current_stream()
             post_backward(b_grad, b_schedule_plan.vp_stage)
