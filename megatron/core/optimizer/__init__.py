@@ -63,6 +63,7 @@ from megatron.core.parameterization import (
     is_hidden_vector_parameter,
     is_muon_managed_matrix_parameter,
     is_vector_like_parameter,
+    should_skip_depth_mup_vector_weight_decay,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
@@ -106,8 +107,9 @@ def get_standard_config_overrides(
     Args:
         config (OptimizerConfig): optimizer configuration object.
         scaling_policy (Optional[ResolvedTrainingPolicy]): optional resolved scaling policy.
-            ``depth_mup`` uses the paper-backed Adam/AdamW weight-decay table and therefore
-            disables Megatron's default 1D/bias weight-decay skip.
+            ``depth_mup`` uses the paper-backed AdamW weight-decay table and therefore
+            splits hidden biases from norm/unknown vector-like parameters instead of
+            applying Megatron's default all-1D/bias weight-decay skip.
 
     Returns:
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
@@ -116,10 +118,22 @@ def get_standard_config_overrides(
     # First, figure out how we are going to do wd skipping. The two main approaches are:
     #  1. The classic megatron approach of skipping all len 1 and bias parameters.
     #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
-    disable_default_vector_like_wd_skip = bool(
+    use_depth_mup_adamw_table = bool(
         scaling_policy and scaling_policy.context.is_depth_mup and scaling_policy.is_adam_optimizer
     )
-    if not disable_default_vector_like_wd_skip:
+    if use_depth_mup_adamw_table:
+        depth_mup_vector_wd_skip = ParamWithNamePredicate(
+            name="depth_mup_norm_and_unknown_vector_wd_skip",
+            fn=lambda param, name: should_skip_depth_mup_vector_weight_decay(
+                param,
+                name,
+                apply_wd_to_qk_layernorm=config.apply_wd_to_qk_layernorm,
+            ),
+        )
+        config_overrides[ParamKey(with_name_predicate=depth_mup_vector_wd_skip)] = (
+            ParamGroupOverride(wd_mult=0.0)
+        )
+    else:
         if config.apply_wd_to_qk_layernorm:
             shape_1_not_qkln_param = ParamWithNamePredicate(
                 name="s1_not_qkln",
@@ -196,6 +210,7 @@ def get_scaling_config_overrides(
     """
     if not scaling_policy.enabled:
         return {}
+
     if (
         scaling_policy.context.is_depth_mup
         and scaling_policy.is_adam_optimizer
@@ -208,7 +223,6 @@ def get_scaling_config_overrides(
             "is derived for AdamW. Use weight_decay=0.0 for coupled Adam, or enable "
             "decoupled_weight_decay."
         )
-
 
     decoupled_lr_enabled = config.decoupled_lr is not None
     if decoupled_lr_enabled:

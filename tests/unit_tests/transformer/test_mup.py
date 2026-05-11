@@ -1945,7 +1945,7 @@ class TestMuPLRScaling:
         assert policy.hidden_vector_eps_multiplier == pytest.approx(0.5)
         assert policy.embedding_class_eps_multiplier == pytest.approx(1.0)
 
-    def test_depth_mup_disables_default_vector_like_weight_decay_skip(self):
+    def test_depth_mup_weight_decay_treats_hidden_bias_and_norm_vectors_explicitly(self):
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, weight_decay=0.1)
         model_config = TransformerConfig(
             hidden_size=1024,
@@ -1961,9 +1961,43 @@ class TestMuPLRScaling:
         )
 
         bias_param = torch.nn.Parameter(torch.zeros(10))
+        norm_scale_param = torch.nn.Parameter(torch.zeros(10))
+        unknown_vector_param = torch.nn.Parameter(torch.zeros(10))
         assert _combined_override_for_param(
             standard_overrides, bias_param, 'decoder.layers.0.mlp.linear_fc1.bias'
         ) == {}
+        assert _combined_override_for_param(
+            standard_overrides, norm_scale_param, 'decoder.layers.0.input_layernorm.weight'
+        ) == {'wd_mult': 0.0}
+        assert _combined_override_for_param(
+            standard_overrides, unknown_vector_param, 'decoder.layers.0.some_scalar'
+        ) == {'wd_mult': 0.0}
+
+    def test_depth_mup_respects_apply_wd_to_qk_layernorm_for_qk_norm_vectors(self):
+        optimizer_config = OptimizerConfig(
+            lr=1e-3, min_lr=1e-5, weight_decay=0.1, apply_wd_to_qk_layernorm=True
+        )
+        model_config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=16,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=4,
+        )
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adam')
+        standard_overrides = get_standard_config_overrides(
+            optimizer_config, scaling_policy=scaling_policy
+        )
+
+        q_norm_param = torch.nn.Parameter(torch.zeros(10))
+        ordinary_norm_param = torch.nn.Parameter(torch.zeros(10))
+        assert _combined_override_for_param(
+            standard_overrides, q_norm_param, 'decoder.layers.0.self_attention.q_layernorm.weight'
+        ) == {}
+        assert _combined_override_for_param(
+            standard_overrides, ordinary_norm_param, 'decoder.layers.0.input_layernorm.weight'
+        ) == {'wd_mult': 0.0}
 
     def test_depth_mup_rejects_coupled_adam_nonzero_weight_decay(self):
         optimizer_config = OptimizerConfig(

@@ -88,10 +88,17 @@ The resolved recipe defaults are:
 - residual branch multiplier: `depth_mult^-1`
 - hidden matrix-like Adam/AdamW LR multiplier: `width_mult^-1`
 - hidden matrix-like Adam/AdamW epsilon multiplier: `(width_mult * depth_mult)^-1`
-- hidden vector Adam/AdamW epsilon multiplier: `(width_mult * depth_mult)^-1`
+- hidden bias/vector Adam/AdamW epsilon multiplier: `(width_mult * depth_mult)^-1`
 - embedding/output-class Adam/AdamW epsilon multiplier: `width_mult^-1`
 - hidden matrix-like Adam/AdamW weight-decay multiplier: `width_mult`
 - dense block output-projection init compensation: `depth_mult^+0.5`
+
+Megatron's 1-D parameters are not all hidden biases. Under `depth_mup`, hidden
+linear/attention/MLP biases keep base weight decay as in the AdamW table, while
+normalization scale/bias parameters and otherwise unknown 1-D tensors keep the
+conservative no-weight-decay treatment unless `apply_wd_to_qk_layernorm`
+explicitly opts q/k layernorm into weight decay. The epsilon rule remains
+applied to hidden vector-like parameters.
 
 The output-projection init compensation is important because Megatron already
 applies layer-count-dependent initialization to residual branch output
