@@ -75,6 +75,16 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_round_robin_zmq]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   # - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq]
   #   products:
   #     - environment: [dev]
