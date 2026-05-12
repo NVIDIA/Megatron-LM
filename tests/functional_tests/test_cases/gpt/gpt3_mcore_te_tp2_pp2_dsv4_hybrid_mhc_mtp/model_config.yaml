@@ -39,6 +39,7 @@ MODEL_ARGS:
   --micro-batch-size: 4
   --global-batch-size: 32
   --seq-length: 1024
+  --position-embedding-type: rope
   --max-position-embeddings: 1024
   --train-iters: 50
   --timing-log-level: 0
