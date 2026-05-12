@@ -23,8 +23,9 @@ from megatron.core.inference.text_generation_controllers.vlm_text_generation_con
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
@@ -71,7 +72,8 @@ class TestVLMTextGenerationController:
         vision_layer_spec = ModuleSpec(
             module=TransformerLayer, submodules=copy.deepcopy(language_layer_submodules)
         )
-        vision_projection_spec = copy.deepcopy(language_layer_submodules.mlp.submodules)
+        vision_projection_spec = copy.deepcopy(get_submodules(language_layer_submodules.mlp))
+        assert isinstance(vision_projection_spec, MLPSubmodules)
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
