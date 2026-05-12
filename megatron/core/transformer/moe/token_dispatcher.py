@@ -50,6 +50,139 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 logger = logging.getLogger(__name__)
 
 
+class _ChunkedAllToAllAndUnpermute(torch.autograd.Function):
+    """Fuse EP return all-to-all with final unpermute using bounded column chunks."""
+
+    _MAX_CHUNK_BYTES = 8 * 1024 * 1024
+
+    @staticmethod
+    def _as_int_tuple(values: object) -> Tuple[int, ...]:
+        if torch.is_tensor(values):
+            return tuple(int(x) for x in values.detach().cpu().tolist())
+        if hasattr(values, "tolist"):
+            return tuple(int(x) for x in values.tolist())
+        return tuple(int(x) for x in values)
+
+    @staticmethod
+    def _max_rows(group, local_rows: int, device: torch.device) -> int:
+        if group.size() == 1:
+            return int(local_rows)
+        rows = torch.tensor([int(local_rows)], device=device, dtype=torch.long)
+        torch.distributed.all_reduce(rows, op=torch.distributed.ReduceOp.MAX, group=group)
+        return int(rows.item())
+
+    @staticmethod
+    def _chunks(hidden: int, row_count: int, element_size: int) -> Tuple[Tuple[int, int], ...]:
+        row_bytes = max(1, int(row_count) * int(element_size))
+        width = max(1, _ChunkedAllToAllAndUnpermute._MAX_CHUNK_BYTES // row_bytes)
+        if width >= hidden:
+            return ((0, hidden),)
+        return tuple((start, min(width, hidden - start)) for start in range(0, hidden, width))
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        output_split_sizes,
+        input_split_sizes,
+        group,
+        sorted_indices: torch.Tensor,
+        restore_shape: torch.Size,
+    ) -> torch.Tensor:
+        """Run return EP all-to-all and unpermute in bounded hidden-size chunks."""
+        if hidden_states.dim() != 2:
+            raise RuntimeError(
+                f"chunked token combine expects [tokens, hidden], got {tuple(hidden_states.shape)}"
+            )
+
+        output_split_sizes = _ChunkedAllToAllAndUnpermute._as_int_tuple(output_split_sizes)
+        input_split_sizes = _ChunkedAllToAllAndUnpermute._as_int_tuple(input_split_sizes)
+        world_size = group.size()
+        if len(output_split_sizes) != world_size or len(input_split_sizes) != world_size:
+            raise RuntimeError(
+                f"split sizes must have {world_size} entries, got "
+                f"output={len(output_split_sizes)} input={len(input_split_sizes)}"
+            )
+
+        input_rows = int(hidden_states.size(0))
+        hidden = int(hidden_states.size(1))
+        output_rows = int(sum(output_split_sizes))
+        if input_rows != int(sum(input_split_sizes)):
+            raise RuntimeError(
+                f"input rows {input_rows} do not match input splits {sum(input_split_sizes)}"
+            )
+        if sorted_indices.numel() != output_rows:
+            raise RuntimeError(
+                f"sorted_indices rows {sorted_indices.numel()} do not match "
+                f"output rows {output_rows}"
+            )
+        if len(restore_shape) != 2 or int(restore_shape[-1]) != hidden:
+            raise RuntimeError(
+                f"restore_shape {tuple(restore_shape)} is incompatible with hidden {hidden}"
+            )
+
+        output_tokens = torch.zeros(
+            restore_shape, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        sorted_indices = sorted_indices.to(device=hidden_states.device, non_blocking=True)
+
+        max_rows = _ChunkedAllToAllAndUnpermute._max_rows(
+            group, max(input_rows, output_rows), hidden_states.device
+        )
+        chunks = _ChunkedAllToAllAndUnpermute._chunks(
+            hidden, max_rows, hidden_states.element_size()
+        )
+
+        for start, width in chunks:
+            send = hidden_states.narrow(1, start, width).contiguous()
+            recv = hidden_states.new_empty((output_rows, width))
+            torch.distributed.all_to_all_single(
+                recv,
+                send,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+            )
+            output_tokens.narrow(1, start, width).index_add_(0, sorted_indices, recv)
+            del send, recv
+
+        ctx.group = group
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+        ctx.restore_shape = torch.Size(restore_shape)
+        ctx.input_rows = input_rows
+        ctx.hidden = hidden
+        ctx.chunks = chunks
+        ctx.save_for_backward(sorted_indices)
+        return output_tokens
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> Tuple[torch.Tensor, None, None, None, None, None]:
+        """Backpropagate through the fused unpermute and return all-to-all."""
+        (sorted_indices,) = ctx.saved_tensors
+        grad_output = grad_output.reshape(ctx.restore_shape)
+        sorted_indices = sorted_indices.to(device=grad_output.device, non_blocking=True)
+        grad_input = grad_output.new_empty((ctx.input_rows, ctx.hidden))
+
+        for start, width in ctx.chunks:
+            grad_slice = grad_output.narrow(1, start, width)
+            send = grad_slice.index_select(0, sorted_indices).contiguous()
+            recv = grad_output.new_empty((ctx.input_rows, width))
+            torch.distributed.all_to_all_single(
+                recv,
+                send,
+                output_split_sizes=ctx.input_split_sizes,
+                input_split_sizes=ctx.output_split_sizes,
+                group=ctx.group,
+            )
+            grad_input.narrow(1, start, width).copy_(recv)
+            del send, recv
+
+        return grad_input, None, None, None, None, None
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -831,6 +964,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
+
+        if self._can_chunk_ep_combine_unpermute():
+            return self._chunk_ep_combine_unpermute(hidden_states)
+
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
         permutated_local_input_tokens = all_to_all(
@@ -845,6 +982,26 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
         return permutated_local_input_tokens
 
+    def _can_chunk_ep_combine_unpermute(self) -> bool:
+        return (
+            self.ep_size > 1
+            and self.input_splits is not None
+            and self.output_splits is not None
+            and not self.drop_and_pad
+            and not self.config.moe_permute_fusion
+            and self.shared_experts is None
+        )
+
+    def _chunk_ep_combine_unpermute(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return _ChunkedAllToAllAndUnpermute.apply(
+            hidden_states,
+            self.input_splits,
+            self.output_splits,
+            self.ep_group,
+            self.reversed_local_input_permutation_mapping,
+            self.hidden_shape_before_permute,
+        ).view(self.hidden_shape)
+
     def combine_postprocess(self, permutated_local_input_tokens):
         """Finalizes token reconstruction with un-permutation and reshaping.
 
@@ -858,6 +1015,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
+        if self._can_chunk_ep_combine_unpermute():
+            return permutated_local_input_tokens
 
         # Unpermutation 1: AlltoAll output to output
         output = unpermute(

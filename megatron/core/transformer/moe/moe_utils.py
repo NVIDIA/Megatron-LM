@@ -534,6 +534,72 @@ def unpermute(
     return output_tokens.to(dtype=input_dtype)
 
 
+class _SortChunksByIdxs(torch.autograd.Function):
+    """Chunk reorder that does not retain the source tensor storage for backward."""
+
+    @staticmethod
+    def forward(
+        ctx, input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor
+    ) -> torch.Tensor:
+        """Reorder input chunks according to sorted_idxs."""
+        split_size_list = [int(size) for size in split_sizes.tolist()]
+        sorted_idx_list = [int(idx) for idx in sorted_idxs.tolist()]
+        if len(set(sorted_idx_list)) != len(sorted_idx_list):
+            raise ValueError("sort_chunks_by_idxs requires a permutation, got duplicate indices")
+        if sorted_idx_list and (
+            min(sorted_idx_list) < 0 or max(sorted_idx_list) >= len(split_size_list)
+        ):
+            raise ValueError("sort_chunks_by_idxs index out of range for split_sizes")
+
+        total_rows = sum(split_size_list)
+        if input.size(0) != total_rows:
+            raise ValueError(
+                f"sort_chunks_by_idxs split sizes cover {total_rows} rows, "
+                f"but input has {input.size(0)} rows"
+            )
+        selected_rows = sum(split_size_list[idx] for idx in sorted_idx_list)
+        if selected_rows != total_rows:
+            raise ValueError("sort_chunks_by_idxs sorted indices must cover every input chunk")
+
+        input_offsets = []
+        offset = 0
+        for size in split_size_list:
+            input_offsets.append(offset)
+            offset += size
+
+        output = input.new_empty((total_rows, *input.shape[1:]))
+        output_offset = 0
+        for idx in sorted_idx_list:
+            size = split_size_list[idx]
+            if size:
+                output.narrow(0, output_offset, size).copy_(
+                    input.narrow(0, input_offsets[idx], size)
+                )
+            output_offset += size
+
+        ctx.split_size_list = split_size_list
+        ctx.sorted_idx_list = sorted_idx_list
+        ctx.input_offsets = input_offsets
+        ctx.input_shape = tuple(input.shape)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], None, None]:
+        """Scatter gradients back to the original chunk order."""
+        if grad_output is None:
+            return None, None, None
+        grad_input = grad_output.new_empty(ctx.input_shape)
+        output_offset = 0
+        for idx in ctx.sorted_idx_list:
+            size = ctx.split_size_list[idx]
+            if size:
+                grad_input.narrow(0, ctx.input_offsets[idx], size).copy_(
+                    grad_output.narrow(0, output_offset, size)
+                )
+            output_offset += size
+        return grad_input, None, None
+
+
 def sort_chunks_by_idxs(
     input: torch.Tensor,
     split_sizes: torch.Tensor,
@@ -569,11 +635,9 @@ def sort_chunks_by_idxs(
             )
         return fused_sort_chunks_by_index_with_probs(input, probs, split_sizes, sorted_idxs)
 
-    input = torch.split(input, split_sizes.tolist(), dim=0)
-    output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
+    output = _SortChunksByIdxs.apply(input, split_sizes, sorted_idxs)
     if probs is not None:
-        probs = torch.split(probs, split_sizes.tolist(), dim=0)
-        permuted_probs = torch.cat([probs[i] for i in sorted_idxs.tolist()], dim=0)
+        permuted_probs = _SortChunksByIdxs.apply(probs, split_sizes, sorted_idxs)
     else:
         permuted_probs = None
     return output, permuted_probs
