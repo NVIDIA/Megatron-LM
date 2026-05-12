@@ -390,6 +390,7 @@ class TestLLaVAModel:
                 loss_mask=None,
                 num_image_tiles=num_image_tiles,
                 inference_context=inference_context,
+                runtime_gather_output=True,
             )
         assert logits.shape == torch.Size((5, max_seq_len, 8192))
 

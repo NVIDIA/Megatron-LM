@@ -58,6 +58,7 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
+                runtime_gather_output=True,
             )
 
             assert logits.shape[0] == micro_batch_size
