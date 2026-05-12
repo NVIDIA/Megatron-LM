@@ -142,7 +142,6 @@ class NVSHMEMCopyService(CopyService):
                             )
                         dst.copy_(src, non_blocking=True)
 
-            torch.cuda.current_stream().wait_stream(self._local_copy_stream)
             self._local_send_ops.clear()
             self._local_recv_ops.clear()
 
@@ -151,8 +150,13 @@ class NVSHMEMCopyService(CopyService):
         #  - schedule() uses dist.all_gather_object()
         #  - run() uses nvshmem.core.barrier_all()
         # Critical for non-collocated refit where some ranks may have no work.
+        # Local copies on `_local_copy_stream` run concurrently with this remote
+        # NVSHMEM pipeline because the join below happens after `run()`.
         logger.info("NVSHMEMCopyService: building NVSHMEM schedule and executing")
         self._remote.schedule()
         self._remote.run()
         self._remote.clear_requests()
+
+        # Join local-copy stream after remote pipeline so they overlapped.
+        torch.cuda.current_stream().wait_stream(self._local_copy_stream)
         logger.info("NVSHMEMCopyService: NVSHMEM transfers complete")

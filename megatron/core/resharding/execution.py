@@ -85,8 +85,28 @@ def execute_reshard_plan(
     dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
 
     # Dequantized BF16 views of MXFP8 source params are reused across multiple
-    # send ops for the same param.
+    # send ops for the same param.  Issue all dequants on a side stream and
+    # record per-param events so each send op only waits on its own dequant
+    # (later dequants can overlap with earlier sends' slicing on default stream).
     sendable_cache: dict[str, torch.Tensor] = {}
+    sendable_events: dict[str, torch.cuda.Event] = {}
+
+    mxfp8_param_names: set[str] = set()
+    for op in plan.send_ops:
+        if transform is not None and transform.should_transform(op.param_name):
+            continue
+        src_param = src_params.get(op.param_name)
+        if src_param is not None and is_mxfp8tensor(src_param):
+            mxfp8_param_names.add(op.param_name)
+
+    if mxfp8_param_names:
+        prefetch_stream = torch.cuda.Stream()
+        with torch.cuda.stream(prefetch_stream):
+            for param_name in mxfp8_param_names:
+                sendable_cache[param_name] = _ensure_sendable(src_params[param_name])
+                ev = torch.cuda.Event()
+                ev.record()
+                sendable_events[param_name] = ev
 
     def get_sendable(param_name: str, param: torch.nn.Parameter) -> torch.Tensor:
         if param_name not in sendable_cache:
@@ -102,6 +122,9 @@ def execute_reshard_plan(
             for t in tensors:
                 service.submit_send(t.contiguous(), op.peer_rank, task_id=op.task_id)
         else:
+            ev = sendable_events.get(op.param_name)
+            if ev is not None:
+                torch.cuda.current_stream().wait_event(ev)
             sendable = get_sendable(op.param_name, src_param)
             src_view = sendable[op.my_slice]
             if not src_view.is_contiguous():
@@ -109,6 +132,7 @@ def execute_reshard_plan(
             service.submit_send(src_view, op.peer_rank, task_id=op.task_id)
 
     sendable_cache.clear()
+    sendable_events.clear()
 
     writebacks: list[_Writeback] = []
     # Maps id(dst_param) -> (dst_param, full_bf16, slices) for MXFP8 dests that
@@ -187,6 +211,7 @@ def execute_reshard_plan(
                 wb.dst_param.data[wb.dst_slice].copy_(wb.recv_buffer)
     writebacks.clear()
 
+    had_mxfp8_staging = bool(pending_quantized)
     for _param_id, (dst_param, full_bf16, _slices) in pending_quantized.items():
         with torch.no_grad():
             dst_param.quantize_(full_bf16)
@@ -197,8 +222,10 @@ def execute_reshard_plan(
     # that read params immediately race against the writes.
     torch.cuda.synchronize()
 
-    # Release transient BF16 staging/accumulation buffers back to the CUDA
-    # driver.  Significant for MXFP8 destinations (full model BF16 footprint).
-    torch.cuda.empty_cache()
+    # MXFP8 destinations allocate a full-model-sized BF16 staging buffer that
+    # can dwarf the rest of the working set.  Reclaim it back to the driver
+    # when present; skip the (expensive) empty_cache walk otherwise.
+    if had_mxfp8_staging:
+        torch.cuda.empty_cache()
 
     logger.info("Reshard complete")
