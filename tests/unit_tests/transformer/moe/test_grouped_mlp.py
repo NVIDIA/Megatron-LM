@@ -925,13 +925,25 @@ class TestTEGroupedMLP:
         hidden_states = torch.rand(
             (seq_len, batch_size, self.hidden_size), dtype=torch.bfloat16, device="cuda"
         )
-        optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
+        # MoE blocks with small-init weights produce near-zero output in bf16,
+        # so a `||output||^2`-style loss starts at zero and never moves the
+        # weights. Drive the output toward a fixed non-zero target so the
+        # gradient is non-trivial even when the initial output is tiny.
+        with torch.no_grad():
+            init_output, _ = layer(hidden_states)
+        target = torch.full_like(init_output, 0.5, dtype=torch.float32)
+        # Adam (not SGD) because bf16 weights quantize SGD updates of tiny
+        # gradients down to zero. Adam's per-parameter adaptive step keeps
+        # the update large enough to move bf16 weights regardless of grad
+        # magnitude — without it, even a working fused path produces only
+        # ~1e-6 loss movement per step, which is below trustable noise.
+        optimizer = torch.optim.Adam(layer.parameters(), lr=0.05)
 
         losses = []
-        for _ in range(8):
+        for _ in range(16):
             optimizer.zero_grad(set_to_none=True)
             output, _ = layer(hidden_states)
-            loss = output.float().pow(2).mean()
+            loss = (output.float() - target).pow(2).mean()
             loss.backward()
             optimizer.step()
             losses.append(loss.detach().item())
@@ -939,7 +951,10 @@ class TestTEGroupedMLP:
         assert all(
             l == l and l != float("inf") for l in losses
         ), f"Fused-path produced non-finite loss: {losses}"
-        assert losses[-1] < losses[0], (
-            f"Fused-path training did not reduce loss: "
+        # Require a meaningful relative drop. If the fused path silently no-ops
+        # weight updates (the historical wgrad-hook bug PR #4311 fixed) the
+        # loss is constant and this fires.
+        assert losses[-1] < losses[0] * 0.5, (
+            f"Fused-path training did not reduce loss enough: "
             f"initial={losses[0]:.6f}, final={losses[-1]:.6f}, full={losses}"
         )
