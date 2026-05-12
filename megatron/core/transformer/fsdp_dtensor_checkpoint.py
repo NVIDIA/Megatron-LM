@@ -31,6 +31,7 @@ try:
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        split_dtensor,
         uneven_dtensor_to_full_tensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
@@ -471,12 +472,23 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
     def split_gdn_fused(data, dist_param, split_sizes, split_dim):
         """Split a fused GDN projection DTensor into per-component DTensors."""
+        total_split = sum(split_sizes)
+        if isinstance(data, DTensor) and data.shape[split_dim] == total_split:
+            # GDN tensors are already TP-local here.
+            return list(
+                split_dtensor(
+                    data,
+                    split_sizes,
+                    dim=split_dim,
+                    update_uneven_dtensor_chunk_meta=True,
+                )
+            )
+
         fsdp_slice = dist_param.megatron_fsdp_slice
         dist_index = dist_param.megatron_fsdp_dist_index
         tp_mesh = dist_index.get_submesh([dist_index.tp_dim], is_expert_parallel=False)
 
         data_size = data.numel() // tp_mesh.mesh.numel()
-        total_split = sum(split_sizes)
         elems_per_unit = data_size // total_split
 
         local_tensor = data.to_local() if isinstance(data, DTensor) else data
