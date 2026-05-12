@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = ["setuptools<80.0.0", "pybind11", "packaging>=24.2"]
+requires = ["setuptools>=80", "pybind11", "packaging>=24.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -75,6 +75,7 @@ training = [
     "wandb",
     "transformers",
     "accelerate",
+    "omegaconf",
 ]
 
 ### 'mlm' group is deprecated. please use 'training' instead ###
@@ -85,10 +86,11 @@ mlm = [
     "wandb",
     "transformers",
     "accelerate",
+    "omegaconf",
 ]
 
 dev = [
-    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]>=0.43; sys_platform != 'darwin'",
     "nvidia-resiliency-ext",
     "tqdm",
     "einops~=0.8",
@@ -161,7 +163,7 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 build = [
-    "setuptools<80.0.0,>=77.0.0",
+    "setuptools>=80",
     "packaging>=24.2",
     "hatchling",
     "pybind11",
