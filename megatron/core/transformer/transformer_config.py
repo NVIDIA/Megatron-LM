@@ -843,6 +843,15 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    moe_chunked_ep_combine: bool = False
+    """Enable the memory-saving chunked expert-parallel combine path for the unfused all-to-all
+    token dispatcher. This is opt-in because it replaces one all-to-all with multiple collectives
+    and may reduce throughput. The path is disabled when CUDA graphs are configured or active."""
+
+    moe_chunked_ep_combine_max_chunk_bytes: int = 8 * 1024 * 1024
+    """Target maximum bytes for each send or receive buffer used by chunked expert-parallel
+    combine. A chunk always contains at least one hidden-dimension column."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -1501,6 +1510,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
+
+        if self.moe_chunked_ep_combine_max_chunk_bytes <= 0:
+            raise ValueError("moe_chunked_ep_combine_max_chunk_bytes must be greater than zero.")
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size

@@ -17,6 +17,7 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
     ensure_nccl_ep_bootstrapped,
@@ -53,6 +54,173 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 """
 
 logger = logging.getLogger(__name__)
+
+
+def _get_ep_combine_max_rows(tokens_per_expert: torch.Tensor, ep_size: int) -> torch.Tensor:
+    """Get a rank-common row bound from the gathered EP routing matrix.
+
+    ``tokens_per_expert`` has shape ``[source_ep, num_experts]``. Collapsing local
+    experts produces the complete source-to-destination split matrix, which is
+    available on every rank before the per-rank routing metadata is sliced.
+    """
+    if tokens_per_expert.dim() != 2 or tokens_per_expert.size(0) != ep_size:
+        raise RuntimeError(
+            "EP routing counts must have shape [ep_size, num_experts], got "
+            f"{tuple(tokens_per_expert.shape)} for ep_size={ep_size}"
+        )
+    if tokens_per_expert.size(1) % ep_size != 0:
+        raise RuntimeError(
+            f"num_experts={tokens_per_expert.size(1)} must be divisible by ep_size={ep_size}"
+        )
+
+    split_matrix = tokens_per_expert.reshape(ep_size, ep_size, -1).sum(dim=-1)
+    max_input_rows = split_matrix.sum(dim=0).max()
+    max_output_rows = split_matrix.sum(dim=1).max()
+    return torch.maximum(max_input_rows, max_output_rows)
+
+
+class _ChunkedAllToAllAndUnpermute(torch.autograd.Function):
+    """Fuse EP return all-to-all with final unpermute using bounded column chunks."""
+
+    @staticmethod
+    def _as_int_tuple(values: object) -> Tuple[int, ...]:
+        if torch.is_tensor(values):
+            return tuple(int(x) for x in values.detach().cpu().tolist())
+        if hasattr(values, "tolist"):
+            return tuple(int(x) for x in values.tolist())
+        return tuple(int(x) for x in values)
+
+    @staticmethod
+    def _as_int(value: object, name: str) -> int:
+        if torch.is_tensor(value):
+            if value.is_cuda:
+                raise RuntimeError(f"{name} must be copied to CPU before chunked combine")
+            return int(value)
+        if hasattr(value, "tolist"):
+            return int(value.tolist())
+        return int(value)
+
+    @staticmethod
+    def _chunks(
+        hidden: int, row_count: int, element_size: int, max_chunk_bytes: int
+    ) -> Tuple[Tuple[int, int], ...]:
+        if max_chunk_bytes <= 0:
+            raise RuntimeError(f"max_chunk_bytes must be positive, got {max_chunk_bytes}")
+        row_bytes = max(1, int(row_count) * int(element_size))
+        width = max(1, max_chunk_bytes // row_bytes)
+        if width >= hidden:
+            return ((0, hidden),)
+        return tuple((start, min(width, hidden - start)) for start in range(0, hidden, width))
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        output_split_sizes,
+        input_split_sizes,
+        group,
+        sorted_indices: torch.Tensor,
+        restore_shape: torch.Size,
+        max_rows,
+        max_chunk_bytes: int,
+    ) -> torch.Tensor:
+        """Run return EP all-to-all and unpermute in bounded hidden-size chunks."""
+        if hidden_states.dim() != 2:
+            raise RuntimeError(
+                f"chunked token combine expects [tokens, hidden], got {tuple(hidden_states.shape)}"
+            )
+
+        output_split_sizes = _ChunkedAllToAllAndUnpermute._as_int_tuple(output_split_sizes)
+        input_split_sizes = _ChunkedAllToAllAndUnpermute._as_int_tuple(input_split_sizes)
+        world_size = group.size()
+        if len(output_split_sizes) != world_size or len(input_split_sizes) != world_size:
+            raise RuntimeError(
+                f"split sizes must have {world_size} entries, got "
+                f"output={len(output_split_sizes)} input={len(input_split_sizes)}"
+            )
+
+        input_rows = int(hidden_states.size(0))
+        hidden = int(hidden_states.size(1))
+        output_rows = int(sum(output_split_sizes))
+        if input_rows != int(sum(input_split_sizes)):
+            raise RuntimeError(
+                f"input rows {input_rows} do not match input splits {sum(input_split_sizes)}"
+            )
+        if sorted_indices.numel() != output_rows:
+            raise RuntimeError(
+                f"sorted_indices rows {sorted_indices.numel()} do not match "
+                f"output rows {output_rows}"
+            )
+        if len(restore_shape) != 2 or int(restore_shape[-1]) != hidden:
+            raise RuntimeError(
+                f"restore_shape {tuple(restore_shape)} is incompatible with hidden {hidden}"
+            )
+
+        max_rows = _ChunkedAllToAllAndUnpermute._as_int(max_rows, "max_rows")
+        max_chunk_bytes = _ChunkedAllToAllAndUnpermute._as_int(max_chunk_bytes, "max_chunk_bytes")
+        if max_rows < max(input_rows, output_rows):
+            raise RuntimeError(
+                f"max_rows {max_rows} does not bound local input/output rows "
+                f"({input_rows}, {output_rows})"
+            )
+
+        output_tokens = torch.zeros(
+            restore_shape, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        sorted_indices = sorted_indices.to(device=hidden_states.device, non_blocking=True)
+
+        chunks = _ChunkedAllToAllAndUnpermute._chunks(
+            hidden, max_rows, hidden_states.element_size(), max_chunk_bytes
+        )
+
+        for start, width in chunks:
+            send = hidden_states.narrow(1, start, width).contiguous()
+            recv = hidden_states.new_empty((output_rows, width))
+            torch.distributed.all_to_all_single(
+                recv,
+                send,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+            )
+            output_tokens.narrow(1, start, width).index_add_(0, sorted_indices, recv)
+            del send, recv
+
+        ctx.group = group
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+        ctx.restore_shape = torch.Size(restore_shape)
+        ctx.input_rows = input_rows
+        ctx.hidden = hidden
+        ctx.chunks = chunks
+        ctx.save_for_backward(sorted_indices)
+        return output_tokens
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> Tuple[torch.Tensor, None, None, None, None, None, None, None]:
+        """Backpropagate through the fused unpermute and return all-to-all."""
+        (sorted_indices,) = ctx.saved_tensors
+        grad_output = grad_output.reshape(ctx.restore_shape)
+        sorted_indices = sorted_indices.to(device=grad_output.device, non_blocking=True)
+        grad_input = grad_output.new_empty((ctx.input_rows, ctx.hidden))
+
+        for start, width in ctx.chunks:
+            grad_slice = grad_output.narrow(1, start, width)
+            send = grad_slice.index_select(0, sorted_indices).contiguous()
+            recv = grad_output.new_empty((ctx.input_rows, width))
+            torch.distributed.all_to_all_single(
+                recv,
+                send,
+                output_split_sizes=ctx.input_split_sizes,
+                input_split_sizes=ctx.output_split_sizes,
+                group=ctx.group,
+            )
+            grad_input.narrow(1, start, width).copy_(recv)
+            del send, recv
+
+        return grad_input, None, None, None, None, None, None, None
 
 
 class MoETokenDispatcher:
@@ -412,6 +580,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # [tp_size]. Represents the number of tokens received by the current rank from
         # other TP ranks.
         self.output_splits_tp = None
+        # Rank-common maximum row count for chunked EP combine. When enabled, this is copied
+        # to CPU alongside the existing split metadata without adding another synchronization.
+        self._chunked_ep_combine_max_rows = None
         self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else "cpu"
         input_chunk_idxs = torch.arange(
             self.num_experts * self.tp_size, device=self.permute_idx_device
@@ -495,6 +666,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tensor with the number of tokens for each local expert.
         """
+        self._chunked_ep_combine_max_rows = None
+
         if self.drop_and_pad:
             # Drop and pad the input to capacity.
             num_tokens = routing_map.size(0) * self.config.moe_router_topk
@@ -555,6 +728,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 .reshape(self.ep_size, self.tp_size, self.num_experts)
                 .transpose(0, 1)
             )
+            if (
+                self.config.moe_chunked_ep_combine
+                and self.config.cuda_graph_impl == "none"
+                and not is_graph_capturing()
+                and self.ep_size > 1
+            ):
+                self._chunked_ep_combine_max_rows = _get_ep_combine_max_rows(
+                    num_global_tokens_per_expert[self.tp_rank], self.ep_size
+                )
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
@@ -839,6 +1021,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
+
+        if self._can_chunk_ep_combine_unpermute():
+            return self._chunk_ep_combine_unpermute(hidden_states)
+
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
         permutated_local_input_tokens = all_to_all(
@@ -853,6 +1039,32 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
         return permutated_local_input_tokens
 
+    def _can_chunk_ep_combine_unpermute(self) -> bool:
+        return (
+            self.config.moe_chunked_ep_combine
+            and self.config.cuda_graph_impl == "none"
+            and not is_graph_capturing()
+            and self._chunked_ep_combine_max_rows is not None
+            and self.ep_size > 1
+            and self.input_splits is not None
+            and self.output_splits is not None
+            and not self.drop_and_pad
+            and not self.config.moe_permute_fusion
+            and self.shared_experts is None
+        )
+
+    def _chunk_ep_combine_unpermute(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return _ChunkedAllToAllAndUnpermute.apply(
+            hidden_states,
+            self.input_splits,
+            self.output_splits,
+            self.ep_group,
+            self.reversed_local_input_permutation_mapping,
+            self.hidden_shape_before_permute,
+            self._chunked_ep_combine_max_rows,
+            self.config.moe_chunked_ep_combine_max_chunk_bytes,
+        ).view(self.hidden_shape)
+
     def combine_postprocess(self, permutated_local_input_tokens):
         """Finalizes token reconstruction with un-permutation and reshaping.
 
@@ -866,6 +1078,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
+        if self._can_chunk_ep_combine_unpermute():
+            return permutated_local_input_tokens
 
         # Unpermutation 1: AlltoAll output to output
         output = unpermute(
@@ -923,6 +1137,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     self.output_splits_tp = maybe_move_tensor_to_cpu(
                         self.output_splits_tp, as_numpy=True, record_stream=on_side_stream
                     )
+                    if self._chunked_ep_combine_max_rows is not None:
+                        self._chunked_ep_combine_max_rows = maybe_move_tensor_to_cpu(
+                            self._chunked_ep_combine_max_rows, record_stream=on_side_stream
+                        )
                     self.num_out_tokens = maybe_move_tensor_to_cpu(
                         self.num_out_tokens, record_stream=on_side_stream
                     )

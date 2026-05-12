@@ -4,11 +4,16 @@ import pytest
 import torch
 
 from megatron.core import config
+from megatron.core.transformer.moe import token_dispatcher as token_dispatcher_module
+from megatron.core.transformer.moe.token_dispatcher import _get_ep_combine_max_rows
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import (
     MoEModelTestContainer,
     permute_fusion_params,
+    token_permutation,
 )
 
 
@@ -16,6 +21,31 @@ def test_placeholder():
     """This is here because otherwise there's no other test in this module (all disabled)
     and pytest would fail."""
     pass
+
+
+def test_get_ep_combine_max_rows_uses_full_split_matrix():
+    """The common bound must include the most-loaded source and destination ranks."""
+    destination_skew = torch.tensor([[4, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], [2, 0, 0, 0]])
+    source_skew = torch.tensor([[2, 2, 2, 2], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
+
+    assert int(_get_ep_combine_max_rows(destination_skew, ep_size=4)) == 14
+    assert int(_get_ep_combine_max_rows(source_skew, ep_size=4)) == 8
+
+
+def test_chunked_ep_combine_config_defaults_and_validation():
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+    assert not config.moe_chunked_ep_combine
+    assert config.moe_chunked_ep_combine_max_chunk_bytes == 8 * 1024 * 1024
+
+    with pytest.raises(
+        ValueError, match="moe_chunked_ep_combine_max_chunk_bytes must be greater than zero"
+    ):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            moe_chunked_ep_combine_max_chunk_bytes=0,
+        )
 
 
 class TestAlltoAllDispatcher:
@@ -52,6 +82,94 @@ class TestAlltoAllDispatcher:
             moe_permute_fusion=permute_fusion,
         )
         container.dispatcher_dropless_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (2, 4)])
+    def test_chunked_combine_unpermute_matches_reference(self, tp_size, ep_size, monkeypatch):
+        """Compare chunked EP combine/unpermute to the existing unfused reference path."""
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_permute_fusion=False,
+            moe_chunked_ep_combine=True,
+            moe_chunked_ep_combine_max_chunk_bytes=1,
+            hidden_size=16,
+        )
+        moe_layer = container.moe_layer
+        token_dispatcher = moe_layer.token_dispatcher
+        hidden_states = torch.randn(
+            (16, 4, moe_layer.config.hidden_size), dtype=container.test_dtype, device="cuda"
+        )
+        probs, routing_map = apply_module(moe_layer.router)(hidden_states)
+        # Route every source rank to the first two experts. This heavily skews one or two
+        # destinations and leaves the remaining expert ranks empty.
+        routing_map = torch.zeros_like(routing_map)
+        routing_map[:, : moe_layer.router.topk] = True
+        probs = routing_map.to(dtype=probs.dtype) / moe_layer.router.topk
+
+        permuted_tokens, _, permuted_probs = token_permutation(
+            token_dispatcher, hidden_states, probs, routing_map
+        )
+        routed_output = permuted_tokens * permuted_probs.unsqueeze(-1)
+        combine_input = token_dispatcher.combine_preprocess(
+            routed_output.to(dtype=container.test_dtype)
+        )
+        max_rows = token_dispatcher._chunked_ep_combine_max_rows
+        assert torch.is_tensor(max_rows) and not max_rows.is_cuda
+        assignments_to_busiest_rank = min(moe_layer.router.topk, container.num_local_experts)
+        assert (
+            int(max_rows)
+            == hidden_states.shape[0]
+            * hidden_states.shape[1]
+            * token_dispatcher.ep_size
+            * assignments_to_busiest_rank
+        )
+
+        ref_input = combine_input.detach().clone().requires_grad_(True)
+        chunk_input = combine_input.detach().clone().requires_grad_(True)
+
+        monkeypatch.setattr(token_dispatcher.config, "moe_chunked_ep_combine", False)
+        assert not token_dispatcher._can_chunk_ep_combine_unpermute()
+        ref_output = token_dispatcher.combine_postprocess(token_dispatcher.token_combine(ref_input))
+
+        monkeypatch.setattr(token_dispatcher.config, "moe_chunked_ep_combine", True)
+        assert token_dispatcher._can_chunk_ep_combine_unpermute()
+        monkeypatch.setattr(token_dispatcher_module, "is_graph_capturing", lambda: True)
+        assert not token_dispatcher._can_chunk_ep_combine_unpermute()
+        monkeypatch.setattr(token_dispatcher_module, "is_graph_capturing", lambda: False)
+        assert token_dispatcher._can_chunk_ep_combine_unpermute()
+
+        def fail_on_all_reduce(*args, **kwargs):
+            raise AssertionError("chunked combine must not issue an all-reduce")
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fail_on_all_reduce)
+        all_to_all_single = torch.distributed.all_to_all_single
+        all_to_all_calls = 0
+
+        def count_all_to_all_calls(*args, **kwargs):
+            nonlocal all_to_all_calls
+            all_to_all_calls += 1
+            return all_to_all_single(*args, **kwargs)
+
+        monkeypatch.setattr(torch.distributed, "all_to_all_single", count_all_to_all_calls)
+        chunk_output = token_dispatcher.combine_postprocess(
+            token_dispatcher.token_combine(chunk_input)
+        )
+        assert all_to_all_calls == moe_layer.config.hidden_size
+
+        torch.testing.assert_close(chunk_output, ref_output)
+
+        grad_output = torch.randn_like(ref_output)
+        torch.autograd.backward(ref_output, grad_output)
+        torch.autograd.backward(chunk_output, grad_output)
+        torch.testing.assert_close(chunk_input.grad, ref_input.grad)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

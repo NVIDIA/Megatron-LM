@@ -91,6 +91,10 @@ class MoEModelTestContainer:
             use_cpu_initialization=kwargs.get("use_cpu_initialization", True),
             sequence_parallel=tp_size > 1,
             add_bias_linear=kwargs.get("add_bias_linear", False),
+            moe_chunked_ep_combine=kwargs.get("moe_chunked_ep_combine", False),
+            moe_chunked_ep_combine_max_chunk_bytes=kwargs.get(
+                "moe_chunked_ep_combine_max_chunk_bytes", 8 * 1024 * 1024
+            ),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
