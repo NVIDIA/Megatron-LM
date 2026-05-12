@@ -394,7 +394,8 @@ class TestLLaVAModel:
                 inference_context=inference_context,
                 runtime_gather_output=True,
             )
-        assert logits.shape == torch.Size((5, max_seq_len, 8192))
+        # StaticInferenceContext always sets materialize_only_last_token_logits=True.
+        assert logits.shape == torch.Size((5, 1, 8192))
 
         # Check KV cache got populated correctly.
         kv_dict = inference_context.key_value_memory_dict

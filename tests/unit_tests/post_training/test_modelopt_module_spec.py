@@ -62,7 +62,8 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
             )
 
             assert logits.shape[0] == micro_batch_size
-            assert logits.shape[1] == sequence_length
+            # StaticInferenceContext always sets materialize_only_last_token_logits=True.
+            assert logits.shape[1] == 1
             assert logits.shape[2] == model.vocab_size
 
 

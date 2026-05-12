@@ -194,7 +194,8 @@ class TestHybridModel:
                 )
 
                 assert logits.shape[0] == micro_batch_size
-                assert logits.shape[1] == sequence_length
+                # StaticInferenceContext always sets materialize_only_last_token_logits=True.
+                assert logits.shape[1] == 1
             assert logits.shape[2] == self.model.vocab_size
 
     def test_save_load(self, tmp_path):
@@ -509,13 +510,14 @@ class TestHybridWithDynamicInference:
         input_ids, position_ids = inference_context.current_input_and_position_ids()
 
         # Run the forward pass with inference parameters.
-        logits = self.model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=None,
-            inference_context=inference_context,
-            runtime_gather_output=True,
-        )
+        with InferenceMode.active():
+            logits = self.model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                inference_context=inference_context,
+                runtime_gather_output=True,
+            )
 
         # Verify the output shape.
         assert logits.shape[0] == 1
@@ -634,5 +636,6 @@ class TestHybridModelWithYarn:
                 )
 
                 assert logits.shape[0] == micro_batch_size
-                assert logits.shape[1] == sequence_length
+                # StaticInferenceContext always sets materialize_only_last_token_logits=True.
+                assert logits.shape[1] == 1
                 assert logits.shape[2] == self.model.vocab_size
