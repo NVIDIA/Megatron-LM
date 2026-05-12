@@ -14,6 +14,7 @@ Guides for Megatron Core training features.
 ```{toctree}
 :maxdepth: 2
 
+cuda_graph
 fine_grained_activation_offloading
 moe
 context_parallel
