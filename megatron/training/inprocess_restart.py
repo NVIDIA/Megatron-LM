@@ -1,15 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import importlib
 import os
 import socket
-from datetime import timedelta
-
-try:
-    import nvidia_resiliency_ext.inprocess as inprocess
-except ImportError:
-    inprocess = None
-
 import warnings
+from datetime import timedelta
 
 import torch
 
@@ -20,6 +15,13 @@ from megatron.training.async_utils import reset_persistent_async_worker
 from . import arguments
 
 
+def _get_inprocess_module():
+    try:
+        return importlib.import_module("nvidia_resiliency_ext.inprocess")
+    except ImportError:
+        return None
+
+
 def destroy_state():
     from . import training
 
@@ -28,6 +30,7 @@ def destroy_state():
 
 
 def inprocess_restart(train, args):
+    inprocess = _get_inprocess_module()
     if inprocess is None:
         warnings.warn('In-process restart is not available')
         return train

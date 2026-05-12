@@ -610,6 +610,104 @@ class TestMultiTokenPrediction:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("cp", [1, 2])
+    def test_roll_tensor_with_packed_sequences_odd_seqlen(self, cp):
+        """Test roll_tensor with ODD packed seqlens.
+
+        For CP=1: per-sequence rolling on contiguous packed tensor — odd seqlens are fine
+                  with cu_seqlens_q alone (no padding required).
+        For CP=2: each per-sequence padded length must be a multiple of 2*cp_size, so odd
+                  seqlens require padding. The local THD-CP layout is determined by
+                  cu_seqlens_q_padded; the roll function must use the padded boundaries to
+                  index local chunks correctly. Without the padded boundaries, real tokens
+                  leak across sequence boundaries.
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group() if cp > 1 else None
+        cp_rank = torch.distributed.get_rank(group=cp_group) if cp_group is not None else 0
+
+        if cp == 1:
+            # Two odd-length sequences: [3, 5]. Total = 8.
+            tensor = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.float32).cuda()
+            cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32).cuda()
+
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=5,
+                max_seqlen_kv=5,
+                qkv_format='thd',
+            )
+
+            rolled, sum_val = roll_tensor(
+                tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+
+            # seq1 [1,2,3] -> [2,3,0]; seq2 [4,5,6,7,8] -> [5,6,7,8,0]
+            expected = torch.tensor([2, 3, 0, 5, 6, 7, 8, 0], dtype=torch.float32).cuda()
+            assert torch.equal(rolled, expected), f"Expected {expected}, got {rolled}"
+        else:
+            # Two ODD sequences padded up to multiples of 2*cp_size = 4:
+            #   seq1: real=[1..7] (len 7), padded with 0 -> [1,2,3,4,5,6,7,0] (len 8)
+            #   seq2: real=[11..21] (len 11), padded with 0 ->
+            #         [11,12,13,14,15,16,17,18,19,20,21,0] (len 12)
+            # Zigzag (4 chunks per padded seq, rank r owns chunks (r, 3-r)):
+            #   seq1 chunks: [1,2], [3,4], [5,6], [7,0]
+            #     rank 0 -> [1,2, 7,0];  rank 1 -> [3,4, 5,6]
+            #   seq2 chunks: [11,12,13], [14,15,16], [17,18,19], [20,21,0]
+            #     rank 0 -> [11,12,13, 20,21,0]; rank 1 -> [14,15,16, 17,18,19]
+            # Expected after roll(-1) within unpadded region (last real -> 0; pad stays 0):
+            #   seq1 rolled real: [2,3,4,5,6,7,0]; padded last -> 0
+            #   seq2 rolled real: [12,13,14,15,16,17,18,19,20,21,0]; padded last -> 0
+            # Re-zigzag the rolled+padded seqs:
+            #   seq1: [2,3], [4,5], [6,7], [0,0]
+            #     rank 0 -> [2,3, 0,0];  rank 1 -> [4,5, 6,7]
+            #   seq2: [12,13,14], [15,16,17], [18,19,20], [21,0,0]
+            #     rank 0 -> [12,13,14, 21,0,0]; rank 1 -> [15,16,17, 18,19,20]
+            if cp_rank == 0:
+                tensor = torch.tensor(
+                    [1, 2, 7, 0, 11, 12, 13, 20, 21, 0], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [2, 3, 0, 0, 12, 13, 14, 21, 0, 0], dtype=torch.float32
+                ).cuda()
+            else:
+                tensor = torch.tensor(
+                    [3, 4, 5, 6, 14, 15, 16, 17, 18, 19], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [4, 5, 6, 7, 15, 16, 17, 18, 19, 20], dtype=torch.float32
+                ).cuda()
+
+            # Unpadded cu_seqlens_q = [0, 7, 18]; padded = [0, 8, 20].
+            cu_seqlens = torch.tensor([0, 7, 18], dtype=torch.int32).cuda()
+            cu_seqlens_padded = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                cu_seqlens_kv_padded=cu_seqlens_padded,
+                max_seqlen_q=11,
+                max_seqlen_kv=11,
+                qkv_format='thd',
+            )
+
+            rolled, sum_val = roll_tensor(
+                tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+
+            assert (
+                rolled.shape == expected.shape
+            ), f"Shape mismatch: expected {expected.shape}, got {rolled.shape}"
+            assert torch.equal(
+                rolled, expected
+            ), f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n{rolled - expected}"
+
+            assert sum_val.numel() == 1, "Sum should be a scalar"
+
+        Utils.destroy_model_parallel()
+
 
 class TestMTPLossLoggingHelper:
     def setup_method(self, method):
