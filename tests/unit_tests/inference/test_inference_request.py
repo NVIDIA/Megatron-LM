@@ -164,9 +164,7 @@ class TestInferenceRequest:
         """_post_deserialize converts ('tensor', list) wrappers to torch.Tensors after msgpack."""
         import msgpack
 
-        req = InferenceRequest(
-            request_id=20, prompt="x", generated_tokens=torch.tensor([7, 8, 9])
-        )
+        req = InferenceRequest(request_id=20, prompt="x", generated_tokens=torch.tensor([7, 8, 9]))
         # msgpack converts the ('tensor', [...]) tuple into a list, which is what
         # _post_deserialize matches against.
         data = msgpack.unpackb(msgpack.packb(req.serialize()), raw=False)
@@ -203,9 +201,7 @@ class TestInferenceRequest:
 
     def test_serialize_tensor_field_wraps_in_tuple(self):
         """Tensor fields are stored as ('tensor', list) sentinels."""
-        req = InferenceRequest(
-            request_id=12, prompt="x", generated_tokens=torch.tensor([1, 2, 3])
-        )
+        req = InferenceRequest(request_id=12, prompt="x", generated_tokens=torch.tensor([1, 2, 3]))
         data = req.serialize()
         assert data["generated_tokens"][0] == "tensor"
         assert data["generated_tokens"][1] == [1, 2, 3]
@@ -265,9 +261,7 @@ class TestDynamicInferenceEvent:
     def test_str_format_for_generated_token(self):
         """__str__ formats GENERATED_TOKEN events with token id."""
         ev = DynamicInferenceEvent(
-            timestamp=1.0,
-            type=DynamicInferenceEventType.GENERATED_TOKEN,
-            payload={"token_id": 11},
+            timestamp=1.0, type=DynamicInferenceEventType.GENERATED_TOKEN, payload={"token_id": 11}
         )
         assert "token=11" in str(ev)
         assert "GENERATED_TOKEN" in str(ev)
@@ -283,9 +277,7 @@ class TestDynamicInferenceEvent:
     def test_str_format_for_other_payload_uses_type_name(self):
         """__str__ shows payload type name for non-token, non-None payloads."""
         ev = DynamicInferenceEvent(
-            timestamp=3.0,
-            type=DynamicInferenceEventType.ERROR_TRANSIENT,
-            payload=ValueError("x"),
+            timestamp=3.0, type=DynamicInferenceEventType.ERROR_TRANSIENT, payload=ValueError("x")
         )
         s = str(ev)
         assert "ValueError" in s

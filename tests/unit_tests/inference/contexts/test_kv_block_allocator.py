@@ -203,9 +203,7 @@ class TestKVBlockAllocatorWithPrefixCaching:
     def test_register_kv_block_hashes_records_mappings(self):
         """register_kv_block_hashes populates block_hashes and the kv_hash_to_block_id dict."""
         ctx = _make_context()
-        a = KVBlockAllocator(
-            ctx, total_count=8, paused_count=2, enable_prefix_caching=True
-        )
+        a = KVBlockAllocator(ctx, total_count=8, paused_count=2, enable_prefix_caching=True)
         a.register_kv_block_hashes(block_ids=[1, 3], block_hashes=[111, 333])
         assert a.block_hashes[1].item() == 111
         assert a.block_hashes[3].item() == 333
@@ -215,9 +213,7 @@ class TestKVBlockAllocatorWithPrefixCaching:
     def test_register_kv_block_hashes_empty_is_noop(self):
         """register_kv_block_hashes with empty inputs does nothing."""
         ctx = _make_context()
-        a = KVBlockAllocator(
-            ctx, total_count=8, paused_count=2, enable_prefix_caching=True
-        )
+        a = KVBlockAllocator(ctx, total_count=8, paused_count=2, enable_prefix_caching=True)
         a.register_kv_block_hashes(block_ids=[], block_hashes=[])
         assert a.kv_hash_to_block_id == {}
 
@@ -242,13 +238,9 @@ class TestKVBlockAllocatorWithPrefixCaching:
         request_to_kv[1] = torch.tensor([2, 3, -1, -1], dtype=torch.int32)
         request_to_kv[2] = torch.tensor([3, 4, 5, -1], dtype=torch.int32)
         ctx = _make_context(
-            paused_request_count=1,
-            total_request_count=3,
-            request_to_kv_block_ids=request_to_kv,
+            paused_request_count=1, total_request_count=3, request_to_kv_block_ids=request_to_kv
         )
-        a = KVBlockAllocator(
-            ctx, total_count=10, paused_count=2, enable_prefix_caching=True
-        )
+        a = KVBlockAllocator(ctx, total_count=10, paused_count=2, enable_prefix_caching=True)
         # Unique active block ids = {2, 3, 4, 5} = 4 entries.
         assert a.get_active_used() == 4
 
@@ -257,12 +249,7 @@ class TestKVBlockAllocatorWithPrefixCaching:
         request_to_kv = -torch.ones((8, 4), dtype=torch.int32)
         request_to_kv[0] = torch.tensor([1, 2, -1, -1], dtype=torch.int32)
         request_to_kv[1] = torch.tensor([1, 3, -1, -1], dtype=torch.int32)
-        ctx = _make_context(
-            paused_request_count=2,
-            request_to_kv_block_ids=request_to_kv,
-        )
-        a = KVBlockAllocator(
-            ctx, total_count=10, paused_count=3, enable_prefix_caching=True
-        )
+        ctx = _make_context(paused_request_count=2, request_to_kv_block_ids=request_to_kv)
+        a = KVBlockAllocator(ctx, total_count=10, paused_count=3, enable_prefix_caching=True)
         # Unique paused block ids = {1, 2, 3} = 3 entries.
         assert a.get_paused_used() == 3

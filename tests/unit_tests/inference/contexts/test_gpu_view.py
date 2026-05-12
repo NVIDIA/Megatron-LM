@@ -75,11 +75,7 @@ class TestContextGPUView:
         """When max_mamba_chunks > 0, all mamba views are non-None tensor views with correct shapes."""
         device = torch.device("cuda")
         v = ContextGPUView(
-            max_requests=4,
-            max_tokens=16,
-            max_kv_blocks=8,
-            device=device,
-            max_mamba_chunks=3,
+            max_requests=4, max_tokens=16, max_kv_blocks=8, device=device, max_mamba_chunks=3
         )
         # All shapes per the layout note in the source.
         assert v.mamba_batch_indices_decode.shape == (4,)

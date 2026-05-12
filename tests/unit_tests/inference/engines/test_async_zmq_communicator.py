@@ -152,10 +152,7 @@ class TestAsyncZMQCommunicator:
         """sync_all_reduce_max leader path collects and broadcasts the element-wise max."""
         comm = _make_comm(rank=0, world_size=3)
         # Two followers send two rows.
-        comm.gather_sock.recv.side_effect = [
-            struct.pack("!2i", 4, 8),
-            struct.pack("!2i", 5, 7),
-        ]
+        comm.gather_sock.recv.side_effect = [struct.pack("!2i", 4, 8), struct.pack("!2i", 5, 7)]
         result = comm.sync_all_reduce_max(3, 6)
         assert result == (5, 8)
         # Broadcast was called with the element-wise max.

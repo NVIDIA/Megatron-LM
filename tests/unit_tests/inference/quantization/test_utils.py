@@ -32,17 +32,22 @@ class TestShouldQuantizeParam:
     def test_te_mxfp8_tensor_is_quantized(self):
         """A TEMXFP8Tensor instance returns True (when HAVE_TE)."""
         # Force HAVE_TE=True and TEMXFP8Tensor=our fake.
-        with patch.object(qutils, "HAVE_TE", True), patch.object(
-            qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True
+        with (
+            patch.object(qutils, "HAVE_TE", True),
+            patch.object(qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True),
         ):
-            te_param = _FakeTEMXFP8Tensor(torch.zeros(2, 2, device="cuda" if torch.cuda.is_available() else "cpu"))
+            te_param = _FakeTEMXFP8Tensor(
+                torch.zeros(2, 2, device="cuda" if torch.cuda.is_available() else "cpu")
+            )
             # Tag .is_cuda for the CPU fallback.
             te_param.is_cuda = True
             assert qutils._should_quantize_param(te_param) is True
 
     def test_mxfp8_tensor_is_quantized(self):
         """A direct MXFP8Tensor instance is recognized."""
-        t = MXFP8Tensor(data=torch.zeros(4, 32, dtype=torch.uint8), scale=torch.zeros(16, dtype=torch.uint8))
+        t = MXFP8Tensor(
+            data=torch.zeros(4, 32, dtype=torch.uint8), scale=torch.zeros(16, dtype=torch.uint8)
+        )
         # Mark fake .is_cuda (function checks before isinstance).
         t.is_cuda = True
         assert qutils._should_quantize_param(t) is True
@@ -62,8 +67,9 @@ class TestShouldQuantizeParam:
         wrapped = MagicMock()
         wrapped.is_cuda = True
         wrapped.data = torch.zeros(4, 32)  # not MXFP8Tensor
-        with patch.object(qutils, "HAVE_TE", True), patch.object(
-            qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True
+        with (
+            patch.object(qutils, "HAVE_TE", True),
+            patch.object(qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True),
         ):
             # `wrapped` is a MagicMock, not a TEMXFP8Tensor / MXFP8Tensor / wrapper of either.
             assert qutils._should_quantize_param(wrapped) is False
@@ -75,8 +81,9 @@ class TestToBf16:
         """A TEMXFP8Tensor goes through .dequantize()."""
         bf16 = torch.zeros(4, 4)
         te = _FakeTEMXFP8Tensor(bf16)
-        with patch.object(qutils, "HAVE_TE", True), patch.object(
-            qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True
+        with (
+            patch.object(qutils, "HAVE_TE", True),
+            patch.object(qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True),
         ):
             out = qutils._to_bf16(te)
         assert out is bf16
@@ -87,8 +94,9 @@ class TestToBf16:
         te = _FakeTEMXFP8Tensor(bf16)
         wrapper = MagicMock()
         wrapper.data = te
-        with patch.object(qutils, "HAVE_TE", True), patch.object(
-            qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True
+        with (
+            patch.object(qutils, "HAVE_TE", True),
+            patch.object(qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True),
         ):
             out = qutils._to_bf16(wrapper)
         assert out is bf16
@@ -112,8 +120,9 @@ class TestCollectMxfp8ParamMetadata:
     def test_records_shape_dtype_device_for_plain_params(self):
         """For plain (non-TE) params, metadata records (shape, dtype, device) directly."""
         model = torch.nn.Linear(4, 8, bias=False)
-        with patch.object(qutils, "_should_quantize_param", return_value=True), patch.object(
-            qutils, "HAVE_TE", False
+        with (
+            patch.object(qutils, "_should_quantize_param", return_value=True),
+            patch.object(qutils, "HAVE_TE", False),
         ):
             md = qutils.collect_mxfp8_param_metadata(model)
         assert "weight" in md
@@ -132,9 +141,11 @@ class TestCollectMxfp8ParamMetadata:
         # _parameters['weight'] in-place. A MagicMock that exposes .dequantize() is enough.
         model._parameters["weight"] = te_param  # type: ignore[assignment]
 
-        with patch.object(qutils, "HAVE_TE", True), patch.object(
-            qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True
-        ), patch.object(qutils, "_should_quantize_param", return_value=True):
+        with (
+            patch.object(qutils, "HAVE_TE", True),
+            patch.object(qutils, "TEMXFP8Tensor", _FakeTEMXFP8Tensor, create=True),
+            patch.object(qutils, "_should_quantize_param", return_value=True),
+        ):
             md = qutils.collect_mxfp8_param_metadata(model)
 
         assert md["weight"][0] == bf16_dq.shape

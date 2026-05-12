@@ -25,9 +25,7 @@ def _make_client(deserialize: bool = False):
     fake_socket = MagicMock(name="zmq_socket")
     fake_context = MagicMock(name="zmq_context")
     fake_context.socket.return_value = fake_socket
-    with patch(
-        "megatron.core.inference.inference_client.zmq.Context", return_value=fake_context
-    ):
+    with patch("megatron.core.inference.inference_client.zmq.Context", return_value=fake_context):
         client = InferenceClient("tcp://127.0.0.1:5555", deserialize=deserialize)
     return client, fake_context, fake_socket
 
@@ -133,9 +131,7 @@ class TestInferenceClient:
     def test_connect_handshake_raises_on_unexpected_reply(self):
         """A non-CONNECT_ACK reply during handshake raises AssertionError."""
         client, _, fake_socket = _make_client()
-        fake_socket.recv.return_value = msgpack.packb(
-            [Headers.STOP.value], use_bin_type=True
-        )
+        fake_socket.recv.return_value = msgpack.packb([Headers.STOP.value], use_bin_type=True)
         with pytest.raises(AssertionError):
             client._connect_with_inference_coordinator()
 
@@ -241,9 +237,7 @@ class TestInferenceClient:
             future.cancel()  # already done
             client.completion_futures[0] = future
             client.request_submission_times[0] = 0.0
-            reply_payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, 0, {}], use_bin_type=True
-            )
+            reply_payload = msgpack.packb([Headers.ENGINE_REPLY.value, 0, {}], use_bin_type=True)
             # Use an iterator-like callable so subsequent calls keep returning
             # zmq.Again() rather than exhausting and raising StopIteration.
             calls = [reply_payload]
