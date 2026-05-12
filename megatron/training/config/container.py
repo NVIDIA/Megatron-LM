@@ -7,7 +7,6 @@ from dataclasses import is_dataclass
 from typing import Any, Type, TypeVar
 
 import yaml
-from omegaconf import OmegaConf
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import MultiStorageClientFeature
@@ -99,6 +98,8 @@ class ConfigContainerBase:
         Returns:
             A new instance of this class initialized with the YAML file values
         """
+        from omegaconf import OmegaConf
+
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
             yaml_path_exists = msc.os.path.exists(yaml_path)

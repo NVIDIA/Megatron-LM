@@ -6,7 +6,7 @@ from functools import partial
 
 import torch
 
-from megatron.core import mpu, parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.enums import ModelType
@@ -22,7 +22,7 @@ from megatron.core.models.vision.vit_layer_specs import (
     get_vit_layer_with_transformer_engine_spec,
 )
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.spec_utils import get_submodules, import_module
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
@@ -182,7 +182,9 @@ def model_provider(
     vision_transformer_config.pipeline_model_parallel_size = 1
     vision_projection_config.pipeline_model_parallel_size = 1
 
-    vision_projection_modules = deepcopy(language_transformer_layer_spec.submodules.mlp.submodules)
+    vision_projection_modules = deepcopy(
+        get_submodules(language_transformer_layer_spec.submodules.mlp)
+    )
 
     language_max_sequence_length = args.decoder_seq_length
     if args.context_parallel_size > 1:
