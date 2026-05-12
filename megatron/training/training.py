@@ -1117,7 +1117,7 @@ def pretrain(
         append_to_progress_log(args.save, "Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    set_jit_fusion_options(cfg_container.model.transformer, cfg_container.train.micro_batch_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
 

@@ -10,6 +10,7 @@ from datetime import timedelta
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
@@ -22,6 +23,7 @@ from megatron.core.rerun_state_machine import (
     RerunMode,
     initialize_rerun_state_machine,
 )
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
@@ -412,8 +414,18 @@ def write_args_to_tensorboard():
             writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)
 
 
-def set_jit_fusion_options():
-    """Set PyTorch JIT layer fusion options."""
+def set_jit_fusion_options(
+    model_config: TransformerConfig, micro_batch_size: int
+) -> None:
+    """Set PyTorch JIT layer fusion options and warmup JIT functions.
+
+    Configures the JIT fuser (nvFuser or legacy) based on the PyTorch version
+    and warms up common fused kernels like bias_gelu and bias_dropout_add.
+
+    Args:
+        model_config: Transformer Config
+        micro_batch_size: The micro batch size used for warmup tensor shapes.
+    """
     # flags required to enable jit fusion kernels
     if is_torch_min_version("2.2.0a0"):
         pass  # we're using torch.compile for jit fusion
@@ -433,28 +445,29 @@ def set_jit_fusion_options():
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
 
-    _warmup_jit_function()
+    _warmup_jit_function(model_config, micro_batch_size)
 
 
-def _warmup_jit_function():
+def _warmup_jit_function(model_config: TransformerConfig, micro_batch_size: int) -> None:
     """Compilie JIT functions before the main training steps"""
-    args = get_args()
-    if args.bf16:
+    if model_config.bf16:
         dtype = torch.bfloat16
-    elif args.fp16:
+    elif model_config.fp16:
         dtype = torch.float16
     else:
         dtype = torch.float32
 
     # Warmup fused bias+gelu
     bias = torch.rand(
-        args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
+        model_config.ffn_hidden_size // model_config.tensor_model_parallel_size,
+        dtype=dtype,
+        device="cuda",
     )
     input = torch.rand(
         (
-            args.seq_length // args.context_parallel_size,
-            args.micro_batch_size,
-            args.ffn_hidden_size // args.tensor_model_parallel_size,
+            model_config.seq_length // model_config.context_parallel_size,
+            micro_batch_size,
+            model_config.ffn_hidden_size // model_config.tensor_model_parallel_size,
         ),
         dtype=dtype,
         device="cuda",
@@ -464,28 +477,36 @@ def _warmup_jit_function():
     for bias_grad, input_grad in zip([True, True], [False, True]):
         bias.requires_grad, input.requires_grad = bias_grad, input_grad
         for _ in range(5):
-            if args.swiglu:
+            if model_config.activation_func == F.silu:
                 output = bias_swiglu(input, bias)
             else:
                 output = bias_gelu(bias, input)
     del bias, input, output
 
     # Warmup fused bias+dropout+add
-    if args.sequence_parallel:
-        seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
+    if model_config.sequence_parallel:
+        seq_length = model_config.seq_length // model_config.tensor_model_parallel_size
     else:
-        seq_length = args.seq_length
+        seq_length = model_config.seq_length
     input = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (
+            seq_length // model_config.context_parallel_size,
+            micro_batch_size,
+            model_config.hidden_size,
+        ),
         dtype=dtype,
         device="cuda",
     )
     residual = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (
+            seq_length // model_config.context_parallel_size,
+            micro_batch_size,
+            model_config.hidden_size,
+        ),
         dtype=dtype,
         device="cuda",
     )
-    bias = torch.rand((args.hidden_size), dtype=dtype, device="cuda").expand_as(residual)
+    bias = torch.rand((model_config.hidden_size), dtype=dtype, device="cuda").expand_as(residual)
     dropout_rate = 0.1
     # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
