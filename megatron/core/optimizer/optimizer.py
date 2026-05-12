@@ -1284,12 +1284,55 @@ class ChainedOptimizer(MegatronOptimizer):
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
         success = True
-        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
-            success &= optimizer.step_with_ready_grads()
-            if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
-                assert success
-                assert len(optimizer.model_chunks) == 1
-                optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+        # With MXFP8 grad-buffer reuse and non-overlap param gather, each DistOpt stages
+        # its own updated main-param shards into its param buffers during step. However,
+        # param sync is a DDP model-chunk operation: model_chunk.start_param_sync() gathers
+        # both dense and expert bucket groups, copies gathered values into model weights,
+        # and zeros the shared MXFP8 param/grad buffers. For MoE, dense and expert DistOpts
+        # may share the same model chunk, so defer param sync until all chained optimizers
+        # have staged their params, then sync each model chunk once.
+        defer_param_sync = (
+            self.config.reuse_grad_buf_for_mxfp8_param_ag
+            and not self.config.overlap_param_gather
+        )
+        deferred_model_chunks = []
+        deferred_model_chunk_ids = set()
+
+        if defer_param_sync:
+            from .distrib_optimizer import DistributedOptimizer
+
+            for optimizer in self.chained_optimizers:
+                if isinstance(optimizer, DistributedOptimizer):
+                    optimizer._defer_param_sync = True
+                    for model_chunk in optimizer.model_chunks:
+                        model_chunk_id = id(model_chunk)
+                        if model_chunk_id not in deferred_model_chunk_ids:
+                            deferred_model_chunk_ids.add(model_chunk_id)
+                            deferred_model_chunks.append(model_chunk)
+
+        try:
+            for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                success &= optimizer.step_with_ready_grads()
+                if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
+                    assert success
+                    assert len(optimizer.model_chunks) == 1
+                    optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+        finally:
+            if defer_param_sync:
+                for optimizer in self.chained_optimizers:
+                    if hasattr(optimizer, '_defer_param_sync'):
+                        optimizer._defer_param_sync = False
+
+        if defer_param_sync and success:
+            timers = self.config.timers
+            if timers is not None:
+                timers('params-all-gather', log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+            for model_chunk in deferred_model_chunks:
+                model_chunk.start_param_sync()
+            if timers is not None:
+                timers('params-all-gather').stop()
 
         return success
 
