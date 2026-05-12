@@ -238,6 +238,20 @@ def _generate_varlen_mask_params(cu_seqlens: torch.Tensor) -> Tuple[torch.Tensor
     return starts, ends
 
 
+def _generate_varlen_mask_params_for_positions(
+    cu_seqlens: torch.Tensor, query_positions: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate packed causal bounds only for the requested query positions."""
+    assert cu_seqlens.ndim == 1 and cu_seqlens.numel() >= 2, "invalid cu_seqlens"
+    assert query_positions.dtype in (torch.int32, torch.int64), "query_positions must be integer"
+    cu_seqlens = cu_seqlens.to(device=query_positions.device, dtype=torch.int64)
+    query_positions = query_positions.to(dtype=torch.int64)
+    seq_indices = torch.searchsorted(cu_seqlens[1:], query_positions, right=True)
+    starts = cu_seqlens[seq_indices]
+    ends = query_positions + 1
+    return starts, ends
+
+
 def _build_valid_mask_from_starts_ends(
     starts: torch.Tensor, ends: torch.Tensor, key_positions: torch.Tensor
 ) -> torch.Tensor:
@@ -540,7 +554,6 @@ def _build_dsattention_forward_mask(
         if packed_thd:
             cu_seqlens_q, _ = _get_packed_qk_cu_seqlens(packed_seq_params)
             cu_seqlens_q = cu_seqlens_q.to(device=device, dtype=torch.int64)
-            starts, ends = _generate_varlen_mask_params(cu_seqlens_q)
             if cp_size > 1:
                 if packed_query_positions is not None:
                     query_idx = packed_query_positions.to(device=device, dtype=torch.int64)
@@ -558,8 +571,9 @@ def _build_dsattention_forward_mask(
             else:
                 query_idx = torch.arange(sq, dtype=torch.int64, device=device)
                 key_idx = torch.arange(skv, dtype=torch.int64, device=device)
-            varlen_starts = starts.index_select(0, query_idx)
-            varlen_ends = ends.index_select(0, query_idx)
+            varlen_starts, varlen_ends = _generate_varlen_mask_params_for_positions(
+                cu_seqlens_q, query_idx
+            )
             return None, (varlen_starts, varlen_ends, key_idx)
 
         if cp_size > 1:

@@ -393,6 +393,18 @@ def bwd(
     return sparse_mla_bwd_kernel
 
 
+def sparse_mla_delta(o, do):
+    """Compute Delta = sum(O * dO) per sequence row and head."""
+    o = o.unsqueeze(0)
+    do = do.unsqueeze(0)
+    assert o.is_contiguous()
+    assert do.is_contiguous()
+    assert o.shape == do.shape
+    _, _, H, D = o.shape
+    preprocess_kernel = _get_preprocess_kernel(H, D)
+    return preprocess_kernel(o, do).squeeze(0)
+
+
 def sparse_mla_bwd(
     q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None
 ):
@@ -402,7 +414,8 @@ def sparse_mla_bwd(
 
     q = q.unsqueeze(0)
     kv = kv.unsqueeze(0)
-    o = o.unsqueeze(0)
+    if o is not None:
+        o = o.unsqueeze(0)
     do = do.unsqueeze(0)
     indices = indices.unsqueeze(0)
     lse = lse.unsqueeze(0)
@@ -437,9 +450,10 @@ def sparse_mla_bwd(
         q_padded[:, :S].copy_(q)
         q = q_padded
 
-        o_padded = torch.zeros((B, seq_bucketed, H, D), dtype=o.dtype, device=o.device)
-        o_padded[:, :S].copy_(o)
-        o = o_padded
+        if o is not None:
+            o_padded = torch.zeros((B, seq_bucketed, H, D), dtype=o.dtype, device=o.device)
+            o_padded[:, :S].copy_(o)
+            o = o_padded
 
         do_padded = torch.zeros((B, seq_bucketed, H, D), dtype=do.dtype, device=do.device)
         do_padded[:, :S].copy_(do)
@@ -480,6 +494,8 @@ def sparse_mla_bwd(
     postprocess_kernel = _get_postprocess_kernel(D, D_tail, kv_group)
 
     if delta is None:
+        if o is None:
+            raise ValueError("sparse_mla_bwd requires either output tensor o or precomputed delta")
         delta = preprocess_kernel(o, do)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
