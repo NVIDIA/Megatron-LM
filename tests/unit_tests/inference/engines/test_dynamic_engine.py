@@ -1683,6 +1683,55 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
 
     @pytest.mark.internal
+    @torch.inference_mode()
+    def test_mamba_match_is_chunk_local_when_chunked_prefill_limits_kv_match(self):
+        """Mamba restore depth is bounded to KV blocks assigned for the current chunk."""
+        block_size = 256
+        block_hashes = [111, 222]
+        req = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.arange(512, dtype=torch.int64, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+            precomputed_block_hashes=block_hashes,
+        )
+
+        # This simulates the old scheduler-side full-prompt Mamba match. The
+        # context must ignore it and record the chunk-local executable count.
+        req._mamba_num_matched_blocks = 2
+
+        ctx = DynamicInferenceContext.__new__(DynamicInferenceContext)
+        ctx.block_size_tokens = block_size
+        ctx.enable_prefix_caching = True
+        ctx.is_hybrid_model = True
+        ctx.kv_block_allocator = types.SimpleNamespace(
+            kv_hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
+        )
+        ctx.mamba_slot_allocator = types.SimpleNamespace(
+            hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
+        )
+
+        (
+            matched_block_ids,
+            num_blocks_from_pool,
+            already_allocated_blocks,
+            overall_required_blocks,
+            prefix_skip_tokens,
+            effective_prefill_chunk_length,
+        ) = DynamicInferenceContext._compute_prefix_match(
+            ctx, req, prefill_chunk_length=211, record_mamba_match=True
+        )
+
+        assert matched_block_ids == [7]
+        assert num_blocks_from_pool == 0
+        assert already_allocated_blocks == 0
+        assert overall_required_blocks == 1
+        assert req._mamba_num_matched_blocks == 1
+        assert prefix_skip_tokens == 0
+        assert effective_prefill_chunk_length == 211
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
