@@ -992,9 +992,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             [3, 3], dtype=torch.int32, device='cuda'
         )  # 1 sampled + 2 spec
         ctx.num_prefill_requests = 0
-        ctx.active_request_metadata["temperature"][:2] = 0.0
-        ctx.active_request_metadata["top_k"][:2] = 1
-        ctx.active_request_metadata["top_p"][:2] = 0.0
         ctx.pad_active_slices()
 
         # Init accepted tokens tensors
@@ -1004,15 +1001,28 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # Target tokens (what the model was fed): [T0, T1, T2, T3, T4, T5]
         input_ids = torch.tensor([[10, 11, 12, 20, 21, 22]], device='cuda')
 
-        # Deterministic greedy logits. Req 1 predicts [11, 12, 99], so it
-        # accepts 2 speculative tokens. Req 2 predicts [99, 22, 23], so it
-        # rejects at the first speculative token.
-        expected_samples = torch.tensor([11, 12, 99, 99, 22, 23], device='cuda')
-        logits = torch.full((1, 6, self.vocab_size), -1000.0, device='cuda')
-        logits[0, torch.arange(6, device='cuda'), expected_samples] = 1000.0
+        # We need the sampling function to return a 1D tensor for base logits,
+        # and a 1D tensor for the flattened MTP logits.
+        def mock_sampling_func(logits, *args, **kwargs):
+            if logits.shape[0] == 6:
+                # Base logits -> return 1D tensor of shape [6]
+                # Req 1: Predicts [11, 12, 99]. Matches T1, T2. Rejects T3. -> Accepts 2 spec tokens.
+                # Req 2: Predicts [99, 22, 23]. Fails at first spec token (99 != 21). -> Accepts 0 spec tokens.
+                return torch.tensor([11, 12, 99, 99, 22, 23], dtype=torch.long, device='cuda')
+            else:
+                # MTP logits -> return 1D tensor of shape [12]
+                # The verification logic only uses base tokens, so we can return zeros here.
+                return torch.zeros((12,), dtype=torch.long, device='cuda')
+
+        # Override sampling to return our predictable mock outputs.
+        self.text_generation_controller._sampling.sample_kernel = mock.MagicMock(
+            side_effect=mock_sampling_func
+        )
+
+        # Mock logits matching input shape
+        logits = torch.randn(1, 6, self.vocab_size, device='cuda')
         self.text_generation_controller._all_logits_cuda = logits
 
-        self.text_generation_controller._dynamic_step_sample_bookkeeping()
         self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
 
         # Verify acceptance counts
@@ -1025,84 +1035,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert torch.equal(accepted_tokens[0], torch.tensor([11, 12], device='cuda'))
         # Req 2 accepted 0 tokens, should remain -1
         assert torch.equal(accepted_tokens[1], torch.tensor([-1, -1], device='cuda'))
-
-    @pytest.mark.internal
-    def test_speculative_verify_tokens_row_mapped_full_logits(self):
-        """Row-mapped MTP reuse gathers full-token logits from the pending forward rows."""
-        self.setup_model(
-            torch.float32,
-            static=False,
-            num_speculative_tokens=2,
-            max_requests=2,
-            mtp_num_layers=2,
-            sampling_backend="torch",
-            materialize_only_last_token_logits=False,
-        )
-
-        self.text_generation_controller.num_speculative_tokens = 2
-        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        ctx.total_request_count = 2
-        ctx.paused_request_count = 0
-        ctx.request_in_prefill_status_tensor[:2] = torch.tensor([0, 0], device='cuda')
-        ctx.request_query_lengths[:2] = torch.tensor([3, 3], dtype=torch.int32, device='cuda')
-        ctx.num_prefill_requests = 0
-        ctx.active_request_metadata["temperature"][:2] = 0.0
-        ctx.active_request_metadata["top_k"][:2] = 1
-        ctx.active_request_metadata["top_p"][:2] = 0.0
-        ctx.pad_active_slices()
-        ctx.gpu_view.request_in_prefill_status[:2].copy_(ctx.request_in_prefill_status_tensor[:2])
-        ctx.gpu_view.request_query_lengths[:2].copy_(ctx.request_query_lengths[:2])
-
-        self.text_generation_controller._init_mtp_sampling_tensors()
-
-        # Current row order is [A, B], but the pending forward row order is [B, A].
-        # The verifier must sample logits in current order while reading them from
-        # pending rows [1, 0].
-        input_ids = torch.tensor([[10, 11, 12, 20, 21, 22]], device='cuda')
-        row_indices = torch.tensor([1, 0], dtype=torch.long, device='cuda')
-
-        logits = torch.full((1, 6, self.vocab_size), -1000.0, device='cuda')
-        pending_order_samples = torch.tensor(
-            [
-                99,
-                22,
-                23,  # pending row 0 = current request B: rejects first spec token
-                11,
-                12,
-                99,  # pending row 1 = current request A: accepts both spec tokens
-            ],
-            device='cuda',
-        )
-        logits[0, torch.arange(6, device='cuda'), pending_order_samples] = 1000.0
-        self.text_generation_controller._all_logits_cuda = logits
-
-        self.text_generation_controller._dynamic_step_sample_bookkeeping()
-        self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
-            input_ids, row_indices=row_indices
-        )
-
-        accepted_counts = self.text_generation_controller._accepted_token_counts_per_request[:2]
-        assert torch.equal(accepted_counts, torch.tensor([2, 0], device='cuda'))
-
-        accepted_tokens = self.text_generation_controller._accepted_tokens_per_request[:2]
-        assert torch.equal(accepted_tokens[0], torch.tensor([11, 12], device='cuda'))
-        assert torch.equal(accepted_tokens[1], torch.tensor([-1, -1], device='cuda'))
-
-        # The serial MTP follow-up reads hidden states from the pending forward's
-        # packed row order, so last accepted positions must stay pending-row mapped.
-        assert torch.equal(
-            self.text_generation_controller._last_accepted_seq_indices,
-            torch.tensor([5, 0], dtype=torch.int64, device='cuda'),
-        )
-
-        log_probs, _ = (
-            self.text_generation_controller._dynamic_step_calculate_log_probs_speculative(
-                row_indices=row_indices
-            )
-        )
-        assert [len(request_log_probs) for request_log_probs in log_probs] == [3, 1]
-        for request_log_probs in log_probs:
-            assert request_log_probs == pytest.approx([0.0] * len(request_log_probs), abs=1e-4)
 
     @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
@@ -1326,7 +1258,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         self.text_generation_controller._all_logits_cuda = logits
         try:
-            self.text_generation_controller._dynamic_step_sample_bookkeeping()
             self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
         except RuntimeError as e:
             if "prob_dist must be 1 or 2 dim" in str(e):

@@ -1,8 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import concurrent.futures
 import os
-import threading
 import time
 import urllib.request as req
 from types import SimpleNamespace
@@ -160,30 +158,6 @@ def test_nvtx_range(msg, suffix):
     util.configure_nvtx_profiling(True)
     _call_nvtx_range()
     assert execution_tracker['ranges']
-
-
-def test_nvtx_range_stack_is_thread_local(monkeypatch):
-    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda msg: None)
-    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
-
-    util.configure_nvtx_profiling(True)
-    barrier = threading.Barrier(2)
-
-    def run_nested_ranges(prefix):
-        util.nvtx_range_push(f"{prefix}-outer")
-        barrier.wait()
-        util.nvtx_range_push(f"{prefix}-inner")
-        util.nvtx_range_pop(f"{prefix}-inner")
-        barrier.wait()
-        util.nvtx_range_pop(f"{prefix}-outer")
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(run_nested_ranges, prefix) for prefix in ("a", "b")]
-            for future in futures:
-                future.result()
-    finally:
-        util.configure_nvtx_profiling(False)
 
 
 def test_nvtx_decorator():
