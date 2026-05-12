@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 from packaging import version
 from pytest import approx
 from transformer_engine.pytorch.fp8 import check_fp8_support
@@ -111,6 +112,121 @@ class TestGPTModel:
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.gpt_model.vocab_size
+
+    @pytest.mark.internal
+    def test_output_processor_forward(self):
+        config: TransformerConfig = self.gpt_model.config
+        sequence_length = self.gpt_model.max_sequence_length
+        micro_batch_size = 2
+
+        self.gpt_model.cuda()
+        self.gpt_model.eval()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = (input_ids + 1) % self.gpt_model.vocab_size
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        context = {"selected_token_positions": torch.tensor([0, 2], device="cuda")}
+        seen = {}
+
+        def output_processor(**kwargs):
+            seen.update(kwargs)
+            logits, _ = kwargs["output_layer"](
+                kwargs["hidden_states"],
+                weight=kwargs["output_weight"],
+                runtime_gather_output=kwargs["runtime_gather_output"],
+            )
+            logits = kwargs["scale_logits"](logits).transpose(0, 1).contiguous().float()
+            token_logprobs = F.log_softmax(logits, dim=-1).gather(
+                dim=-1, index=kwargs["labels"].unsqueeze(-1)
+            )
+            token_logprobs = token_logprobs.squeeze(-1)
+            return token_logprobs.index_select(1, kwargs["context"]["selected_token_positions"])
+
+        with torch.no_grad():
+            logits = self.gpt_model.forward(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+            ).float()
+            expected = F.log_softmax(logits, dim=-1).gather(dim=-1, index=labels.unsqueeze(-1))
+            expected = expected.squeeze(-1).index_select(1, context["selected_token_positions"])
+
+            output = self.gpt_model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                output_processor=output_processor,
+                output_processor_context=context,
+            )
+
+        assert torch.allclose(output, expected)
+        assert seen["context"] is context
+        assert seen["output_layer"] is self.gpt_model.output_layer
+        assert seen["output_weight"] is None
+        assert seen["labels"] is labels
+        assert seen["runtime_gather_output"] is None
+        assert seen["config"] is config
+        assert seen["compute_language_model_loss"].__self__ is self.gpt_model
+        assert seen["scale_logits"].__self__ is self.gpt_model
+
+    @pytest.mark.internal
+    def test_build_schedule_plan_threads_output_processor(self):
+        sequence_length = self.gpt_model.max_sequence_length
+        micro_batch_size = 2
+
+        self.gpt_model.cuda()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        context = {"loss_mask": torch.ones_like(labels)}
+
+        seen = {}
+
+        def output_processor(**kwargs):
+            seen.update(kwargs)
+            return kwargs["hidden_states"].sum()
+
+        schedule_plan = self.gpt_model.build_schedule_plan(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            output_processor=output_processor,
+            output_processor_context=context,
+        )
+
+        assert schedule_plan.state.output_processor is output_processor
+        assert schedule_plan.state.output_processor_context is context
+
+        schedule_plan.state.decoder_input = None
+        schedule_plan.state.rotary_pos_emb = None
+        schedule_plan.state.rotary_pos_cos = None
+        schedule_plan.state.rotary_pos_sin = None
+        schedule_plan.state.sequence_len_offset = None
+
+        hidden_states = torch.randn(
+            sequence_length,
+            micro_batch_size,
+            self.gpt_model.config.hidden_size,
+            device="cuda",
+            requires_grad=True,
+        )
+        output = schedule_plan.post_process.forward(hidden_states)
+
+        assert output.item() == pytest.approx(hidden_states.sum().item())
+        assert seen["context"] is context
+        assert seen["labels"] is labels
+        assert seen["output_layer"] is self.gpt_model.output_layer
 
 
 def test_get_mlp_module_spec_interface():
