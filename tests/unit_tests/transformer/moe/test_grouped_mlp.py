@@ -883,9 +883,7 @@ class TestTEGroupedMLP:
         import inspect
 
         if "single_grouped_weight" not in inspect.signature(GroupedLinear.__init__).parameters:
-            pytest.skip(
-                "Installed TE op fuser GroupedLinear lacks `single_grouped_weight` kwarg"
-            )
+            pytest.skip("Installed TE op fuser GroupedLinear lacks `single_grouped_weight` kwarg")
 
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
