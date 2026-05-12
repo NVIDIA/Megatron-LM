@@ -163,9 +163,7 @@ class TestMatchGraphConfigWithEP:
         )
 
         assert result == BD(token_count=16, prefill_req_count=0, decode_req_count=8)
-        assert protocol.calls == [
-            (EPAsyncPhase.GRAPH_SHAPE, (8, 0, 0, 8)),
-        ]
+        assert protocol.calls == [(EPAsyncPhase.GRAPH_SHAPE, (8, 0, 0, 8))]
 
     # ------------------------------------------------------------------ #
     # 1. All ranks same decode batch → consistent match

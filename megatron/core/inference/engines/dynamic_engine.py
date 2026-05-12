@@ -6,7 +6,6 @@ import logging
 import math
 import multiprocessing
 import socket
-import struct
 import time
 import warnings
 from collections import deque
@@ -223,6 +222,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
+        self.disable_ep_consensus = inference_config.disable_ep_consensus
+        self.ep_consensus_interval = inference_config.ep_consensus_interval
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -398,6 +399,12 @@ class DynamicInferenceEngine(AbstractEngine):
             # Forward pass -> logits.
             with torch.inference_mode():
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+                if controller._sampling_backend == "flashinfer":
+                    if controller.num_speculative_tokens > 0:
+                        controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                    else:
+                        controller._dynamic_step_sample_logits()
 
                 # MTP CUDA graph warmup for this batch dimension.
                 if mtp_warmup_enabled:
@@ -584,20 +591,16 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
-            mp_len_sock = self.zmq_context.socket(zmq.PUB)
-            mp_len_sock.bind_to_random_port(f"tcp://{local_ip}")
-            mp_len_addr = mp_len_sock.getsockopt_string(zmq.LAST_ENDPOINT)
         else:
             mp_req_addr = None
-            mp_len_addr = None
 
         # Broadcast addresses to respective ranks.
         bcast = [dp_addr]
         torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
-        bcast = [mp_req_addr, mp_len_addr]
+        bcast = [mp_req_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
-        [mp_req_addr, mp_len_addr] = bcast
+        [mp_req_addr] = bcast
 
         identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
@@ -614,27 +617,16 @@ class DynamicInferenceEngine(AbstractEngine):
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
             self.model_parallel_publisher_socket = mp_req_sock
-
-            # 3. Create another publisher socket to broadcast the number of messages to receive.
-            self.model_parallel_num_msgs_publisher_socket = mp_len_sock
             self.zmq_sockets += [
                 self.socket_for_receiving_requests,
-                self.model_parallel_num_msgs_publisher_socket,
                 self.model_parallel_publisher_socket,
             ]
-        # All MP ranks subscribe to the two publisher sockets
+        # All MP ranks subscribe to the publisher socket
         self.model_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
         self.model_parallel_subscriber_socket.connect(mp_req_addr)
         self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.model_parallel_num_msgs_subscriber_socket.connect(mp_len_addr)
-        self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-
-        self.zmq_sockets += [
-            self.model_parallel_subscriber_socket,
-            self.model_parallel_num_msgs_subscriber_socket,
-        ]
+        self.zmq_sockets += [self.model_parallel_subscriber_socket]
 
         torch.distributed.barrier(mp_group)
 
@@ -642,13 +634,13 @@ class DynamicInferenceEngine(AbstractEngine):
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
         self.ep_async_step_protocol = EPAsyncStepProtocol()
+        self._ep_consensus_loop_counter = 0
+        self._last_ep_consensus: tuple[int, bool] = (0, False)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
-            self.ep_async_step_protocol = EPAsyncStepProtocol(
-                self.expert_parallel_zmq_communicator
-            )
+            self.ep_async_step_protocol = EPAsyncStepProtocol(self.expert_parallel_zmq_communicator)
             if hasattr(self.context, "set_ep_async_protocol"):
                 self.context.set_ep_async_protocol(self.ep_async_step_protocol)
             if hasattr(self.controller, "set_ep_async_protocol"):
@@ -863,8 +855,20 @@ class DynamicInferenceEngine(AbstractEngine):
         request = request_entry.record[-1]
 
         if self.rank == 0:
+            errors = [
+                e.payload
+                for e in request.events
+                if e.type
+                in (
+                    DynamicInferenceEventType.ERROR_NONTRANSIENT,
+                    DynamicInferenceEventType.ERROR_TRANSIENT,
+                )
+            ]
+            errors_str = (
+                "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else "unknown error"
+            )
             warnings.warn(
-                f"Request {request_id} failed to be added to the engine due to errors. "
+                f"Request {request_id} failed to be added to the engine ({errors_str}). "
                 f"Prompt Tokens: {len(request.prompt_tokens)} "
                 f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
                 f"Max sequence length: {self.context.max_sequence_length} "
@@ -1212,8 +1216,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     # so gate the update to keep the metric a truthful sparse
                     # sample instead of polluting it with zeros.
                     if step_time > 0:
-                        if request.tpot is None:
-                            request.tpot = []
                         per_token_step_time = step_time / len(tokens)
                         request.tpot.extend([per_token_step_time] * len(tokens))
 
@@ -2008,6 +2010,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.prefix_cache_blocks_matched = 0
 
         # Log KV cache utilization stats to W&B
+        nvtx_range_push("wandb_logging")
         if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
@@ -2047,13 +2050,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.metrics_writer.log(metrics, commit=True)
             else:
                 raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
+        nvtx_range_pop("wandb_logging")
 
         # Print context state.
+        nvtx_range_push("console_logging")
         if (
             self.logging_step_interval > 0
             and self.context.step_count % self.logging_step_interval == 0
         ):
+            nvtx_range_push("cuda_memory_stats")
             mem = torch.cuda.memory_stats()
+            nvtx_range_pop("cuda_memory_stats")
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "
@@ -2132,6 +2139,8 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.context.enable_prefix_caching:
                 self._prefix_cache_hits = 0
                 self._prefix_cache_blocks_matched = 0
+
+        nvtx_range_pop("console_logging")
 
         return {
             "active_request_ids": active_request_ids,
@@ -2263,28 +2272,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
-            messages_to_dequeue = len(all_messages)
-            # First publish the number of messages to dequeue.
-            # This is important because we want all tensor parallel ranks
-            # to dequeue the same number of messages.
-            self.model_parallel_num_msgs_publisher_socket.send(
-                struct.pack('!i', messages_to_dequeue)
+            self.model_parallel_publisher_socket.send_multipart(
+                [bytes([Headers.TP_BROADCAST.value])] + all_messages
             )
-            # Now publish the actual messages to all model parallel ranks
-            if messages_to_dequeue > 0:
-                self.model_parallel_publisher_socket.send_multipart(all_messages)
         else:
-            # First, receive the number of messages to dequeue from mp-rank 0
-            messages_to_dequeue = struct.unpack(
-                '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
-            )[0]
-            # Now, dequeue the same number of messages from the subscriber socket.
-            # Note that these receives are blocking, because the messages
-            # are guaranteed to be available after the tp-rank 0 has sent them.
-            if messages_to_dequeue > 0:
-                all_messages = self.model_parallel_subscriber_socket.recv_multipart()
-            else:
-                all_messages = []
+            frames = self.model_parallel_subscriber_socket.recv_multipart()
+            all_messages = frames[1:]
 
         nvtx_range_pop("drain_zmq_socket")
 
@@ -2465,15 +2458,11 @@ class DynamicInferenceEngine(AbstractEngine):
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
             # We have tried that and it blocks the event loop in megatron-rl.
             consensus = await self.ep_async_step_protocol.establish_work_consensus(
-                local_work,
-                signal_consensus,
-                async_op=(not self.use_synchronous_zmq_collectives),
+                local_work, signal_consensus, async_op=(not self.use_synchronous_zmq_collectives)
             )
         else:
             consensus = await self.ep_async_step_protocol.establish_work_consensus(
-                local_work,
-                signal_consensus,
-                async_op=(not self.use_synchronous_zmq_collectives),
+                local_work, signal_consensus, async_op=(not self.use_synchronous_zmq_collectives)
             )
 
         nvtx_range_pop("_ep_establish_consensus")
@@ -2547,9 +2536,50 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    global_work, all_pausing = await self._ep_establish_consensus(
-                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
-                    )
+                    if self.disable_ep_consensus:
+                        # Skip the EP consensus all-reduce; act on local state only.
+                        # NOTE: even with no consensus we must still participate in EP
+                        # collectives (NCCL all-to-all, etc.) every iteration. A peer with
+                        # real work will block at its all-to-all kernel waiting for this
+                        # rank, so when there is no local work we run dummy_forward()
+                        # rather than sleeping. Sleeping here would deadlock EP > 1.
+                        if self.state == EngineState.PAUSING:
+                            await self._world_barrier()
+                            self.state = EngineState.PAUSED
+                            self._state_events[EngineState.PAUSED].set()
+                        elif local_pending > 0:
+                            await self.async_step()
+                        else:
+                            self.step_start_event.record()
+                            nvtx_range_push("EP-dummy-forward")
+                            self.controller.dummy_forward()
+                            self.step_end_event.record()
+                            self.step_end_event.synchronize()
+                            nvtx_range_pop("EP-dummy-forward")
+                            self.context.step_count += 1
+                            self.context.prefix_cache_lru_clock += 1
+                            # The consensus path yields via _ep_establish_consensus;
+                            # without it we must still let other coroutines (signal
+                            # delivery, request scheduling) run between steps.
+                            await asyncio.sleep(0)
+                        continue
+                    global_work_from_last_consensus, _ = self._last_ep_consensus
+                    if (
+                        global_work_from_last_consensus == 0
+                        or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
+                    ):
+                        # selectively enter ep_establish_consensus if
+                        # 1. there is no global work -> engine is idle. At any step in the future
+                        #    one of the ranks can receive work. So we should be eagerly checking for that
+                        # 2. it has been 20 steps since we last established consensus, and that consensus
+                        #    had some work.
+                        # In the worst case, this delays pausing by 20 steps which is around
+                        # 200-400 milliseconds.
+                        self._last_ep_consensus = await self._ep_establish_consensus(
+                            local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                        )
+                    global_work, all_pausing = self._last_ep_consensus
+                    self._ep_consensus_loop_counter += 1
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
@@ -2573,6 +2603,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.state = EngineState.RUNNING
                     self._state_events[EngineState.PAUSED].clear()
                     self._state_events[EngineState.RUNNING].set()
+                    # The cache from the PAUSING phase still has all_pausing=True;
+                    # without this reset the next RUNNING iteration would skip
+                    # consensus, read the stale flag, and immediately re-pause.
+                    self._last_ep_consensus = (0, False)
 
                 elif self.state == EngineState.SUSPENDING:
                     await self._world_barrier()

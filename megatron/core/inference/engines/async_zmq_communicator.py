@@ -141,7 +141,8 @@ class AsyncZMQCommunicator:
             )
         if step_id != expected_step_id:
             raise ZMQCollectiveError(
-                f"ZMQ collective step mismatch for {phase}: expected {expected_step_id}, got {step_id}"
+                f"ZMQ collective step mismatch for {phase}: "
+                f"expected {expected_step_id}, got {step_id}"
             )
         if value_count != expected_count:
             raise ZMQCollectiveError(
@@ -204,11 +205,7 @@ class AsyncZMQCommunicator:
         self._send_result_to_peers(self._pack_error_message(str(error)))
 
     async def all_reduce_max(
-        self,
-        *local_vals: int,
-        async_op=True,
-        phase: str | None = None,
-        step_id: int | None = None,
+        self, *local_vals: int, async_op=True, phase: str | None = None, step_id: int | None = None
     ) -> int | tuple[int, ...]:
         """Element-wise all-reduce max of one or more integers.
 
@@ -238,10 +235,7 @@ class AsyncZMQCommunicator:
                         msg = self.gather_sock.recv()
                     rows.append(
                         self._unpack_collective_values_message(
-                            msg,
-                            expected_phase=phase,
-                            expected_step_id=step_id,
-                            expected_count=n,
+                            msg, expected_phase=phase, expected_step_id=step_id, expected_count=n
                         )
                     )
                 except zmq.Again:
@@ -269,10 +263,7 @@ class AsyncZMQCommunicator:
                     else:
                         msg = self.result_recv_sock.recv()
                     result = self._unpack_collective_values_message(
-                        msg,
-                        expected_phase=phase,
-                        expected_step_id=step_id,
-                        expected_count=n,
+                        msg, expected_phase=phase, expected_step_id=step_id, expected_count=n
                     )
                     if not async_op:
                         await asyncio.sleep(
@@ -317,10 +308,7 @@ class AsyncZMQCommunicator:
                     msg = self.gather_sock.recv()
                     rows.append(
                         self._unpack_collective_values_message(
-                            msg,
-                            expected_phase=phase,
-                            expected_step_id=step_id,
-                            expected_count=n,
+                            msg, expected_phase=phase, expected_step_id=step_id, expected_count=n
                         )
                     )
             except Exception as error:
@@ -333,10 +321,7 @@ class AsyncZMQCommunicator:
             self.gather_sock.send(payload)
             msg = self.result_recv_sock.recv()
             result = self._unpack_collective_values_message(
-                msg,
-                expected_phase=phase,
-                expected_step_id=step_id,
-                expected_count=n,
+                msg, expected_phase=phase, expected_step_id=step_id, expected_count=n
             )
             return result[0] if n == 1 else result
 

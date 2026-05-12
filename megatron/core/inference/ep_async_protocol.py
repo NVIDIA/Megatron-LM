@@ -93,9 +93,7 @@ class EPAsyncStepProtocol:
 
     def _begin_ep_step(self) -> int:
         if self._active_ep_step_id is not None:
-            raise RuntimeError(
-                f"EP protocol step {self._active_ep_step_id} is still active"
-            )
+            raise RuntimeError(f"EP protocol step {self._active_ep_step_id} is still active")
         step_id = self._next_ep_step_id
         self._next_ep_step_id += 1
         self._active_ep_step_id = step_id
@@ -110,11 +108,7 @@ class EPAsyncStepProtocol:
         return self._next_step_id(phase)
 
     async def _all_reduce_max_at_step(
-        self,
-        phase: EPAsyncPhase,
-        step_id: int,
-        *local_vals: int,
-        async_op: bool = True,
+        self, phase: EPAsyncPhase, step_id: int, *local_vals: int, async_op: bool = True
     ) -> int | tuple[int, ...]:
         if not self.enabled:
             return local_vals[0] if len(local_vals) == 1 else local_vals
@@ -146,13 +140,9 @@ class EPAsyncStepProtocol:
         if len(local_vals) == 0:
             raise ValueError("EP async protocol all_reduce_max requires at least one value")
         step_id = self._step_id_for_phase(phase)
-        return await self._all_reduce_max_at_step(
-            phase, step_id, *local_vals, async_op=async_op
-        )
+        return await self._all_reduce_max_at_step(phase, step_id, *local_vals, async_op=async_op)
 
-    def sync_all_reduce_max(
-        self, phase: EPAsyncPhase, *local_vals: int
-    ) -> int | tuple[int, ...]:
+    def sync_all_reduce_max(self, phase: EPAsyncPhase, *local_vals: int) -> int | tuple[int, ...]:
         """Run a tagged EP MAX collective for a synchronous call site."""
         if len(local_vals) == 0:
             raise ValueError("EP async protocol sync_all_reduce_max requires at least one value")
@@ -166,18 +156,12 @@ class EPAsyncStepProtocol:
         consensus_val = -1 if signal_consensus else 0
         step_id = self._begin_ep_step()
         global_work, global_consensus = await self._all_reduce_max_at_step(
-            EPAsyncPhase.WORK_CONSENSUS,
-            step_id,
-            local_work,
-            consensus_val,
-            async_op=async_op,
+            EPAsyncPhase.WORK_CONSENSUS, step_id, local_work, consensus_val, async_op=async_op
         )
         self._work_consensus_count += 1
 
         return EPWorkConsensus(
-            step_id=step_id,
-            global_work=global_work,
-            all_pausing=(global_consensus == -1),
+            step_id=step_id, global_work=global_work, all_pausing=(global_consensus == -1)
         )
 
     async def complete_work_step(self, *, async_op: bool = True) -> None:
@@ -273,11 +257,7 @@ class EPAsyncStepProtocol:
         local_real_skip = int(has_real_work and not can_launch_async_handoff)
 
         any_real, any_launch, any_real_skip = self._sync_all_reduce_max_at_step(
-            EPAsyncPhase.ASYNC_HANDOFF,
-            step_id,
-            local_real,
-            local_launch,
-            local_real_skip,
+            EPAsyncPhase.ASYNC_HANDOFF, step_id, local_real, local_launch, local_real_skip
         )
         launch_async_forward = bool(any_launch and not any_real_skip)
         if launch_async_forward:
