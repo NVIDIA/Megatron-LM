@@ -1150,20 +1150,29 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
+            # TE checkpoint only treats positional tensor arguments as checkpoint inputs.
+            # Keep the differentiable MTP activations positional so recompute backward
+            # preserves gradients through the MTP projection and transformer layer.
+            def custom_forward(hidden_states, decoder_input):
+                return self._proj_and_transformer_layer(
+                    hidden_states=hidden_states,
+                    decoder_input=decoder_input,
+                    attention_mask=attention_mask,
+                    context=context,
+                    context_mask=context_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    attention_bias=attention_bias,
+                    inference_params=inference_params,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                )
+
             hidden_states = self._checkpointed_forward(
-                self._proj_and_transformer_layer,
-                hidden_states=hidden_states,
-                decoder_input=decoder_input,
-                attention_mask=attention_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
+                custom_forward,
+                hidden_states,
+                decoder_input,
             )
         else:
             hidden_states = self._proj_and_transformer_layer(
