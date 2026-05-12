@@ -1598,6 +1598,19 @@ if _CUTILE_AVAILABLE:
             if tile_m <= M and M % tile_m == 0:
                 yield tile_m
 
+    def _default_reduce_compute_h_tile_m(M: int) -> int:
+        """Pick a reduce tile size with enough blocks to cover the GPU."""
+        try:
+            num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+        except Exception:
+            num_sms = 128
+
+        valid = [tm for tm in _reduce_compute_h_autotune_configs(M)]
+        for tm in valid:
+            if math.ceil(M / tm) >= num_sms:
+                return tm
+        return valid[-1] if valid else 1
+
     _reduce_compute_h_best_cfg: dict = {}
 
     def _cutile_reduce_compute_h(
@@ -1612,7 +1625,7 @@ if _CUTILE_AVAILABLE:
         N: int,
         K: int,
         eps: float,
-        tile_m: int,
+        _proj_tile_m: int,
         tile_n: int,
         split_k: int,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -1636,7 +1649,8 @@ if _CUTILE_AVAILABLE:
         r_out = torch.empty(M, 1, dtype=proj_acc.dtype, device=dev)
         proj_out = torch.empty(M, N, dtype=proj_acc.dtype, device=dev)
 
-        cache_key = (M, N, K, n, tile_m, split_k)
+        default_tm = _default_reduce_compute_h_tile_m(M)
+        cache_key = (M, N, K, n, split_k)
         cached = _reduce_compute_h_best_cfg.get(cache_key)
 
         def _make_args(tm):
@@ -1649,7 +1663,7 @@ if _CUTILE_AVAILABLE:
             )
 
         if cached is not None or not _CUTILE_EXPERIMENTAL_AVAILABLE:
-            tm = cached if cached is not None else tile_m
+            tm = cached if cached is not None else default_tm
             ct.launch(stream, (math.ceil(M / tm),), _ct_reduce_compute_h_kernel, _make_args(tm))
         else:
             from types import SimpleNamespace
@@ -1657,7 +1671,6 @@ if _CUTILE_AVAILABLE:
             configs = [
                 SimpleNamespace(TILE_M=tm)
                 for tm in _reduce_compute_h_autotune_configs(M)
-                if tm == tile_m
             ]
             tuned = ct_experimental.autotune_launch(
                 stream,
