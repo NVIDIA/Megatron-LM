@@ -1028,7 +1028,7 @@ class TestMHCMTPIntegration:
             tensor_model_parallel_size=tp,
             sequence_parallel=True if tp > 1 else False,
         )
-        spec = get_gpt_layer_local_spec(enable_hyper_connection=True)
+        spec = get_gpt_layer_local_spec(enable_hyper_connections=True)
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=config, spec=spec, use_transformer_engine=False
         )
@@ -1052,7 +1052,7 @@ class TestMHCMTPIntegration:
         """With mHC+MTP the block returns (contracted, multistream); without MTP just a tensor."""
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(_SEED)
-        spec = get_gpt_layer_local_spec(enable_hyper_connection=True)
+        spec = get_gpt_layer_local_spec(enable_hyper_connections=True)
 
         seq_len, batch_size, h, n = 16, 2, 64, 4
 
@@ -1157,7 +1157,7 @@ class TestMHCMTPIntegration:
                 a.num_experts,
                 a.moe_grouped_gemm,
                 a.qk_layernorm,
-                enable_hyper_connection=config.enable_hyper_connections,
+                enable_hyper_connections=config.enable_hyper_connections,
             )
             mtp_spec = get_gpt_mtp_block_spec(
                 config=config, spec=layer_spec, use_transformer_engine=True
