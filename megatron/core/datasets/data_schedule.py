@@ -5,9 +5,11 @@ from typing import Any, List, Optional
 import torch
 
 from megatron.core import parallel_state
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 
@@ -211,14 +213,16 @@ class HybridCPDataLoaderWrapper:
         def _pack_sample_by_key(key: str) -> torch.Tensor:
             flattened_tensors = []
             for gid in send_ids_sorted:
+                # FlagScale Begin
                 t = batch[gid2local_id[gid]][key].to(
                     cur_platform.current_device(), non_blocking=True
                 )
+                # FlagScale End
                 flattened_tensors.append(t)
             return (
                 torch.cat(flattened_tensors, dim=0)
                 if flattened_tensors
-                else torch.empty(0, device=cur_platform.current_device(), dtype=batch[0][key].dtype)
+                else torch.empty(0, device=cur_platform.current_device(), dtype=batch[0][key].dtype)  # FlagScale Add
             )
 
         def _unpack_sample_by_key(key: str, recv_tensor: torch.Tensor):
@@ -231,7 +235,7 @@ class HybridCPDataLoaderWrapper:
         for key in data_keys:
             send_tensor = _pack_sample_by_key(key)
             recv_tensor = torch.empty(
-                sum(recv_lens_split), device=cur_platform.current_device(), dtype=send_tensor.dtype
+                sum(recv_lens_split), device=cur_platform.current_device(), dtype=send_tensor.dtype  # FlagScale Add
             )
             torch.distributed.all_to_all_single(
                 output=recv_tensor,

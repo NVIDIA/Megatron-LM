@@ -116,6 +116,7 @@ class TransformerConfig(ModelParallelConfig):
     """If set, the loss layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
 
+    # FlagScale Begin
     use_dualpipev: bool = False
     """Enable DualPipeV pipeline scheduling for MoE models."""
 
@@ -124,6 +125,7 @@ class TransformerConfig(ModelParallelConfig):
 
     te_fl_prefer: Optional[str] = "vendor"
     """TE-FL backend preference: 'flagos', 'vendor', or 'reference'."""
+    # FlagScale End
 
     hidden_size: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Transformer hidden size."""
@@ -232,8 +234,10 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    # FlagScale Begin
     qk_layernorm_hidden_dim: bool = False
     """Whether to layer normalize q and k on hidden dimension rather than head dimension."""
+    # FlagScale End
 
     qk_l2_norm: bool = False
     """Whether to apply llama 4-style qk L2 norm."""
@@ -489,6 +493,7 @@ class TransformerConfig(ModelParallelConfig):
     the number of transformer layers to recompute within each pipeline stage.  Must be None for
     'selective' activation checkpointing."""
 
+    # FlagScale Begin
     recompute_granularity_per_stage_micro_batch: Optional[List] = None
     """Fine-grained recompute granularity control per pipeline stage and micro-batch."""
 
@@ -497,6 +502,7 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_num_layers_per_stage_micro_batch: Optional[List] = None
     """Fine-grained recompute num_layers control per pipeline stage and micro-batch."""
+    # FlagScale End
 
     distribute_saved_activations: Optional[bool] = False
     """If True, distribute recomputed activations across the model parallel group."""
@@ -1032,6 +1038,7 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    # FlagScale Begin
     # FlagScale PEFT/LoRA configuration
     peft_type: Optional[str] = None
     """PEFT type (e.g., 'lora'). None means no PEFT."""
@@ -1056,6 +1063,7 @@ class TransformerConfig(ModelParallelConfig):
 
     lora_out_init_method: str = "zero"
     """Initialization method for LoRA B matrix."""
+    # FlagScale End
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

@@ -48,9 +48,11 @@ except ImportError:
 
 _results_queue = None
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 @_disable_gc()
@@ -249,7 +251,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 del tensor
             result.append((file_name, storage_key, (bytes_data, tensor_list)))
         if non_blocking:
-            cur_platform.synchronize()
+            cur_platform.synchronize()  # FlagScale Add
         return result
 
     @staticmethod

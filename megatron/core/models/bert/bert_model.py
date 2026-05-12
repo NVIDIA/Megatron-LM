@@ -28,9 +28,11 @@ from megatron.core.transformer.utils import get_linear_layer
 from megatron.core.utils import deprecate_inference_params, is_te_min_version
 
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 class BertModel(LanguageModule):
@@ -369,7 +371,7 @@ class BertModel(LanguageModule):
             output = torch.zeros(
                 size=(embeddings.shape[0], embeddings.shape[2]),
                 dtype=torch.float32,
-                device=cur_platform.current_device(),
+                device=cur_platform.current_device(),  # FlagScale Add
             )
             for i, (embedding, mask) in enumerate(zip(embeddings, masks)):
                 output[i, :] = torch.mean(embedding[1 : mask - 1], dim=0)

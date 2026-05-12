@@ -296,9 +296,11 @@ def _get_should_context_be_quantized_params(
         )
 
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -310,7 +312,7 @@ def _get_extra_te_kwargs(config: TransformerConfig):
         elif config.init_model_with_meta_device:
             extra_transformer_engine_kwargs["device"] = "meta"
         else:
-            extra_transformer_engine_kwargs["device"] = cur_platform.current_device()
+            extra_transformer_engine_kwargs["device"] = cur_platform.current_device()  # FlagScale Add
     return extra_transformer_engine_kwargs
 
 
@@ -1031,7 +1033,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             sequence_parallel=self.config.sequence_parallel,
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
             tp_group=tp_group if torch.distributed.is_initialized() else None,
-            tp_size=get_tensor_model_parallel_world_size(),
+            tp_size=get_tensor_model_parallel_world_size(),  # FlagScale Add
             get_rng_state_tracker=(
                 get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
             ),
@@ -1362,7 +1364,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     via set_tensor_parallel_group() and set_context_parallel_group().
     """
 
-    cp_stream: cur_platform.Stream = None
+    cp_stream: cur_platform.Stream = None  # FlagScale Add
 
     def __init__(
         self,
@@ -1446,7 +1448,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "1.0.0"
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
             if getattr(TEDotProductAttention, "cp_stream") is None:
-                TEDotProductAttention.cp_stream = cur_platform.Stream()
+                TEDotProductAttention.cp_stream = cur_platform.Stream()  # FlagScale Add
             extra_kwargs["cp_group"] = pg_collection.cp
             extra_kwargs["cp_global_ranks"] = torch.distributed.get_process_group_ranks(
                 pg_collection.cp
@@ -1541,7 +1543,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ),
             attn_mask_type=attn_mask_type.name,
             sequence_parallel=self.config.sequence_parallel,
-            tp_size=get_tensor_model_parallel_world_size(),
+            tp_size=get_tensor_model_parallel_world_size(),  # FlagScale Add
             get_rng_state_tracker=(
                 get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
             ),
@@ -1916,7 +1918,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         def _encode_extra_state(self, state):
             # TE 2.0 changed the format of extra_state to be a byte tensor
             if is_te_min_version("2.0.0"):
-                cur_platform.synchronize()
+                cur_platform.synchronize()  # FlagScale Add
                 state_serialized = bytearray(pickle.dumps(state))
                 state_serialized = torch.frombuffer(state_serialized, dtype=torch.uint8)
             else:
@@ -1932,9 +1934,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return pickle.loads(state.detach().cpu().numpy().tobytes())
             elif isinstance(state, io.BytesIO):
                 state.seek(0)
+                # FlagScale Begin
                 return torch.load(
                     state, map_location=cur_platform.device_name(), weights_only=False
                 )
+                # FlagScale End
             else:
                 raise RuntimeError("Unsupported checkpoint format.")
 

@@ -1185,7 +1185,7 @@ def maybe_move_tensor_to_cpu(
         if as_numpy:
             cpu_tensor = cpu_tensor.numpy()
         if record_stream:
-            tensor.record_stream(cur_platform.current_stream())
+            tensor.record_stream(cur_platform.current_stream())  # FlagScale Add
         tensor = cpu_tensor
     return tensor
 

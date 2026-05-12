@@ -433,7 +433,7 @@ class Attention(MegatronModule, ABC):
             self.num_query_groups_per_partition,
             dim,
             dtype=dtype,
-            device=cur_platform.current_device(),
+            device=cur_platform.current_device(),  # FlagScale Add
         )
 
     def _get_pp_layer_offset_for_inference(self):

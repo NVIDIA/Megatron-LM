@@ -398,6 +398,7 @@ class ModelParallelConfig:
        the user adds a level 1 timer that is not called by all ranks.
     """
 
+    # FlagScale Begin
     ###################
     # Heterogeneous Training
     ###################
@@ -406,6 +407,7 @@ class ModelParallelConfig:
 
     hetero_pipeline_layer_split: list = None
     """A list of lists, each sublist contains numbers of layers to be processed in the corresponding pipeline stages for one device type."""
+    # FlagScale End
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

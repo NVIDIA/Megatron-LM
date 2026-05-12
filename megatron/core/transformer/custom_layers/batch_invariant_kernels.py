@@ -28,9 +28,11 @@ except ImportError:
     tl = MagicMock()
     HAVE_TRITON = False
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 __all__ = [
     "set_batch_invariant_mode",
@@ -110,7 +112,7 @@ def matmul_kernel_persistent(
     offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):  # FlagScale Add
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
@@ -166,7 +168,7 @@ def get_compute_units():
     # Use match/case for device-specific logic (Python 3.10+)
     match device_type:
         case "cuda":
-            device_properties = cur_platform.get_device_properties(0)
+            device_properties = cur_platform.get_device_properties(0)  # FlagScale Add
             NUM_SMS = device_properties.multi_processor_count
         case "xpu":
             device_properties = torch.xpu.get_device_properties(0)

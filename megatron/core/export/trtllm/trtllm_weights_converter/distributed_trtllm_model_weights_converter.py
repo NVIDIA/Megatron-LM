@@ -19,9 +19,11 @@ try:
 except ImportError:
     HAVE_TQDM = False
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 def str_dtype_to_torch(dtype: DataType):
@@ -223,7 +225,7 @@ class DistributedTRTLLMModelWeightsConverter:
             dim_size = list(val.size())
             dim_size[0] = vocab_size_padded
             gathered_val = torch.zeros(
-                dim_size, dtype=val.dtype, device=cur_platform.current_device()
+                dim_size, dtype=val.dtype, device=cur_platform.current_device()  # FlagScale Add
             )
             gathered_val[vocab_start_index:vocab_end_index] = val
             torch.distributed.all_reduce(gathered_val, group=self.tp_group)

@@ -338,11 +338,13 @@ class TransformerLayerNode(ScheduleNode):
             return
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
+        # FlagScale Begin
         with cur_platform.stream(self.stream):
             cur_platform.range_push(f"{self.name} wgrad")
+        # FlagScale End
             for module in self.bwd_dw_callables:
                 module.backward_dw()
-            cur_platform.range_pop()
+            cur_platform.range_pop()  # FlagScale Add
 
         # the output grad memory is last used in wgrad compute, should be safe to release.
         assert self.delay_grads_release, "output grad memory should be valid before wgrad."
@@ -618,9 +620,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         )
 
         # Need to record tensors created on comp stream to comm stream
-        node.layer_state.residual.record_stream(cur_platform.current_stream())
+        node.layer_state.residual.record_stream(cur_platform.current_stream())  # FlagScale Add
         if shared_expert_output is not None:
-            shared_expert_output.record_stream(cur_platform.current_stream())
+            shared_expert_output.record_stream(cur_platform.current_stream())  # FlagScale Add
 
         # release tensor reference after use
         node.layer_state.residual = None

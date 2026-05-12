@@ -166,7 +166,7 @@ def contains_submesh(
 
 
 def _get_cuda_rng_state(
-    device: Union[int, str, torch.device] = cur_platform.device_name(), clone: bool = False, graph_safe: bool = False
+    device: Union[int, str, torch.device] = cur_platform.device_name(), clone: bool = False, graph_safe: bool = False  # FlagScale Add
 ) -> torch.Tensor:
     """Return the random number generator state of the specified GPU.
 
@@ -179,18 +179,18 @@ def _get_cuda_rng_state(
 
     # if not using cuda graphs, just use the builtin pytorch function
     if not graph_safe:
-        return cur_platform.random().get_rng_state(device=device)
+        return cur_platform.random().get_rng_state(device=device)  # FlagScale Add
 
     _lazy_init()
     if isinstance(device, str):
         device = torch.device(device)
     elif isinstance(device, int):
-        device = torch.device(cur_platform.current_device_name())
+        device = torch.device(cur_platform.current_device_name())  # FlagScale Add
     idx = device.index
     if idx is None:
-        idx = cur_platform.current_device()
+        idx = cur_platform.current_device()  # FlagScale Add
 
-    default_generator = cur_platform.default_generator(idx)
+    default_generator = cur_platform.default_generator(idx)  # FlagScale Add
     if clone:
         return default_generator.clone_state()
     return default_generator.graphsafe_get_state()
@@ -217,17 +217,19 @@ def _set_cuda_rng_state(new_state: torch.Tensor, device: int = -1, graph_safe: b
     else:
         # newer PyTorch
         if device == -1:
-            device = torch.device(cur_platform.device_name())
+            device = torch.device(cur_platform.device_name())  # FlagScale Add
         elif isinstance(device, str):
             device = torch.device(device)
         elif isinstance(device, int):
-            device = torch.device(cur_platform.device(int))
+            device = torch.device(cur_platform.device(int))  # FlagScale Add
 
         def cb():
             idx = device.index
             if idx is None:
+                # FlagScale Begin
                 idx = cur_platform.current_device()
             default_generator = cur_platform.default_generator(idx)
+                # FlagScale End
 
             # if graph capturing, set the rng state in a cudagraphable way
             if graph_safe:
@@ -365,10 +367,12 @@ def initialize_rng_tracker(
                     self.states_[name] = new_state
                 else:
                     # Get the current rng state.
-                    orig_rng_state = cur_platform.get_rng_state()
+                    orig_rng_state = cur_platform.get_rng_state()  # FlagScale Add
                     # Set the new state and store it.
+                    # FlagScale Begin
                     cur_platform.manual_seed(seed)
                     self.states_[name] = cur_platform.get_rng_state()
+                    # FlagScale End
                     # Reset rng state to what it was.
                     _set_cuda_rng_state(orig_rng_state)
 
@@ -770,7 +774,7 @@ class GlobalMemoryBuffer:
                 self.buffer[(name, dtype)] = torch.empty(
                     required_len,
                     dtype=dtype,
-                    device=cur_platform.current_device(),
+                    device=cur_platform.current_device(),  # FlagScale Add
                     requires_grad=False,
                 )
 

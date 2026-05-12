@@ -197,13 +197,13 @@ class MegatronFSDP(torch.nn.Module):
         super().__init__()
         # If device is not specified, use the current device.
         self.device = (
-            device if device is not None else torch.device(cur_platform.current_device_name())
+            device if device is not None else torch.device(cur_platform.current_device_name())  # FlagScale Add
         )
-        if self.device != torch.device(cur_platform.current_device_name()):
+        if self.device != torch.device(cur_platform.current_device_name()):  # FlagScale Add
             logger.warning(
                 f"[Rank {torch.distributed.get_rank()}] Megatron-FSDP is "
                 f"using device {self.device} instead of the current device "
-                f"{torch.device(cur_platform.current_device_name())}, "
+                f"{torch.device(cur_platform.current_device_name())}, "  # FlagScale Add
                 "which may cause process-to-device mapping issues or "
                 "cross-device Tensor operation errors. If necessary, "
                 "send all Tensors in the module to the Megatron-FSDP "
@@ -373,8 +373,10 @@ class MegatronFSDP(torch.nn.Module):
         self.raw_param = dict(self.module.named_parameters())
 
         # Initialize a gradient buffer and accumulation stream for the GradReducePipeline.
+        # FlagScale Begin
         self.side_stream_for_buffer_copy_and_grad_accum = cur_platform.Stream()
         self.side_stream_for_param_gather = cur_platform.Stream()
+        # FlagScale End
 
         # Initialize the reduce-scatter pipeline.
         self.grad_reduce_pipeline = GradReducePipeline(

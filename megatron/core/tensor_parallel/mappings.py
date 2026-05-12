@@ -18,9 +18,11 @@ except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 def _reduce(input_, group):
@@ -92,7 +94,7 @@ def _gather_along_last_dim(input_, group):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=cur_platform.current_device())
+    output = torch.empty(dim_size, dtype=input_.dtype, device=cur_platform.current_device())  # FlagScale Add
     dist_all_gather_func(output, input_.contiguous(), group=group)
     tensor_list = output.chunk(world_size, dim=0)
     output = torch.cat(tensor_list, dim=-1).contiguous()
@@ -142,14 +144,14 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_b
         if use_global_buffer:
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
-            output = torch.empty(dim_size, dtype=input_.dtype, device=cur_platform.current_device())
+            output = torch.empty(dim_size, dtype=input_.dtype, device=cur_platform.current_device())  # FlagScale Add
         dist_all_gather_func(output, input_.contiguous(), group=group)
     else:
         dim_size[0] = sum(output_split_sizes)
         if use_global_buffer:
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
-            output = torch.empty(dim_size, dtype=input_.dtype, device=cur_platform.current_device())
+            output = torch.empty(dim_size, dtype=input_.dtype, device=cur_platform.current_device())  # FlagScale Add
         output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
         torch.distributed.all_gather(output_tensor_list, input_, group=group)
 
@@ -182,7 +184,7 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
         if use_global_buffer:
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
-            output = torch.empty(dim_size, dtype=input_.dtype, device=cur_platform.current_device())
+            output = torch.empty(dim_size, dtype=input_.dtype, device=cur_platform.current_device())  # FlagScale Add
         dist_reduce_scatter_func(output, input_.contiguous(), group=group)
     else:
         rank = group.rank()
@@ -443,7 +445,7 @@ class _AllToAll(torch.autograd.Function):
             output = input.new_empty(
                 size=[sum(output_split_sizes)] + list(input.size()[1:]),
                 dtype=input.dtype,
-                device=cur_platform.current_device(),
+                device=cur_platform.current_device(),  # FlagScale Add
             )
         torch.distributed.all_to_all_single(
             output,

@@ -59,7 +59,7 @@ cur_platform = get_platform()
 ########## FlagScale End ##########
 
 
-@overridable
+@overridable  # FlagScale Add
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
@@ -200,7 +200,7 @@ def clip_grad_by_total_norm_fp32(
         )
 
 
-@overridable
+@overridable  # FlagScale Add
 def count_zeros_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     grad_stats_parallel_group: torch.distributed.ProcessGroup,

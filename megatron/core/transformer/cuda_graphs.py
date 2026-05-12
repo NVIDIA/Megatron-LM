@@ -377,7 +377,7 @@ class _CudagraphGlobalRecord:
 
         progress_bar = enumerate(cls.cudagraph_record)
         time_start = time.time()
-        mem_stats_start = cur_platform.memory_stats()
+        mem_stats_start = cur_platform.memory_stats()  # FlagScale Add
 
         if torch.distributed.get_rank() == 0:
             if HAVE_TQDM:
@@ -398,7 +398,7 @@ class _CudagraphGlobalRecord:
                 )
 
         gc.collect()
-        cur_platform.empty_cache()
+        cur_platform.empty_cache()  # FlagScale Add
 
         _set_capture_start()
         if has_te_modules:
@@ -415,7 +415,7 @@ class _CudagraphGlobalRecord:
 
         for g_idx, g in progress_bar:
             if torch.distributed.get_rank() == 0:
-                mem_stats = cur_platform.memory_stats()
+                mem_stats = cur_platform.memory_stats()  # FlagScale Add
                 progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
                     format_mem_bytes(mem_stats["allocated_bytes.all.current"]),
                     format_mem_bytes(mem_stats["reserved_bytes.all.current"]),
@@ -435,7 +435,7 @@ class _CudagraphGlobalRecord:
 
         # Memory usage.
         time_end = time.time()
-        mem_stats_end = cur_platform.memory_stats()
+        mem_stats_end = cur_platform.memory_stats()  # FlagScale Add
         capture_stats = {
             "time": time_end - time_start,
             "allocated_bytes": (
@@ -519,7 +519,7 @@ def delete_cuda_graphs():
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
-    cur_platform.empty_cache()
+    cur_platform.empty_cache()  # FlagScale Add
 
     CudaGraphManager.global_mempool = None
 
@@ -940,11 +940,11 @@ class _CudaGraphRunner(torch.nn.Module):
             _set_warmup_end()
 
             with self.get_quantization_context():
-                cur_platform.synchronize()
+                cur_platform.synchronize()  # FlagScale Add
                 # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
                 # before capture begins, to avoid inference-tensor state issues during capture.
                 with torch.inference_mode(mode=False):
-                    for device_idx in range(cur_platform.device_count()):
+                    for device_idx in range(cur_platform.device_count()):  # FlagScale Add
                         default_gen = torch.cuda.default_generators[device_idx]
                         self.fwd_graph.register_generator_state(
                             _ensure_generator_state_is_cudagraph_safe(default_gen)
@@ -1464,7 +1464,7 @@ class CudaGraphManager(torch.nn.Module):
             CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
             # Cudagraph stream capture requires no operations on the default stream prior to the
             # capture, so change to a side stream.
-            cur_platform.set_stream(cur_platform.Stream())
+            cur_platform.set_stream(cur_platform.Stream())  # FlagScale Add
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -2237,9 +2237,9 @@ class TECudaGraphHelper:
         """
         assert not self._capture_finished, "CUDA Graph capture has already been finished."
 
-        cur_platform.synchronize()
+        cur_platform.synchronize()  # FlagScale Add
         gc.collect()
-        cur_platform.empty_cache()
+        cur_platform.empty_cache()  # FlagScale Add
         if FREEZE_GC:
             gc.freeze()
 
@@ -2273,12 +2273,12 @@ class TECudaGraphHelper:
         )
         _set_capture_end()
 
-        cur_platform.synchronize()
+        cur_platform.synchronize()  # FlagScale Add
         self._reset_after_capture()
         if FREEZE_GC:
             gc.unfreeze()
         gc.collect()
-        cur_platform.empty_cache()
+        cur_platform.empty_cache()  # FlagScale Add
 
         self._capture_finished = True
 

@@ -44,9 +44,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 class LinearFc1Interface(Protocol):
@@ -442,7 +444,7 @@ def apply_swiglu_sharded_factory(
                 )
                 merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
                 gc.collect()
-                cur_platform.empty_cache()
+                cur_platform.empty_cache()  # FlagScale Add
                 return merged_sub_state_dict
 
     return ShardedTensorFactory(

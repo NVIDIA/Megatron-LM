@@ -17,13 +17,15 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.plugin.platform import get_platform
+from megatron.plugin.platform import get_platform  # FlagScale Add
 
+# FlagScale Begin
 cur_platform = get_platform()
 
 _FLOAT_TYPES = (torch.FloatTensor, cur_platform.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, cur_platform.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, cur_platform.BFloat16Tensor)
+# FlagScale End
 
 
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
@@ -253,7 +255,7 @@ class GraphableMegatronModule(MegatronModule):
             (slen_per_cptp, micro_batch_size, self.config.hidden_size),
             dtype=torch.bfloat16,
             requires_grad=True,
-            device=cur_platform.current_device(),
+            device=cur_platform.current_device(),  # FlagScale Add
         )
         return static_inputs
 

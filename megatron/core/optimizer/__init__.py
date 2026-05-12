@@ -314,7 +314,7 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel, is_engram_parallel) to params.
+    # Map (pg_overrides, is_expert_parallel, is_engram_parallel) to params.  # FlagScale Add
     params_map = {}
 
     if config_overrides is None:
@@ -346,15 +346,17 @@ def _get_param_groups(
                 param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            # FlagScale Begin
             is_engram_parallel = getattr(
                 param, 'is_engram_embedding', False
             )  # FlagScale add is_engram_parallel
+            # FlagScale End
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel, is_engram_parallel)
+            key = (param_override_tuple, is_expert_parallel, is_engram_parallel)  # FlagScale Add
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -373,7 +375,7 @@ def _get_param_groups(
     param_groups = []
     # Sort keys, None first.
     for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
-        param_override_tuple, is_expert_parallel, is_engram_parallel = key
+        param_override_tuple, is_expert_parallel, is_engram_parallel = key  # FlagScale Add
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -406,8 +408,10 @@ def _get_param_groups(
         param_group = {
             'params': params,
             'is_expert_parallel': is_expert_parallel,
+            # FlagScale Begin
             'is_engram_parallel': is_engram_parallel,  # FlagScale add is_engram_parallel
             'is_vision_model_param': False,  # FlagScale add is_vision_model_param
+            # FlagScale End
             'default_config': uses_default_lr_schedule,
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
@@ -765,9 +769,11 @@ def get_megatron_optimizer(
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
+    # FlagScale Begin
     engram_dp_group = process_groups_dict['engram_dp_group']
     engram_mp_group = process_groups_dict['engram_mp_group']
     engram_dp_group_gloo = process_groups_dict['engram_dp_group_gloo']
+    # FlagScale End
 
     model_parallel_rank = get_pg_rank(mp_group)
 
@@ -826,7 +832,7 @@ def get_megatron_optimizer(
             model_chunk_offset=model_chunk_offset,
             config=config,
             config_overrides=config_overrides,
-            filter_fn=lambda g: not g['is_expert_parallel'] and not g['is_engram_parallel'],
+            filter_fn=lambda g: not g['is_expert_parallel'] and not g['is_engram_parallel'],  # FlagScale Add
             buffer_name='buffers',
         )
         for model_chunk in dense_model_chunks:
@@ -863,7 +869,7 @@ def get_megatron_optimizer(
         model_chunk_offset=0,
         config=config,
         config_overrides=config_overrides,
-        filter_fn=lambda g: g['is_expert_parallel'] and not g['is_engram_parallel'],
+        filter_fn=lambda g: g['is_expert_parallel'] and not g['is_engram_parallel'],  # FlagScale Add
         buffer_name='expert_parallel_buffers',
     )
     if dump_param_to_param_group_map is not None:
@@ -895,6 +901,7 @@ def get_megatron_optimizer(
             )
         )
 
+    # FlagScale Begin
     # Engram parallel param groups and buffers
     engram_param_groups, engram_buffers = _get_param_groups_and_buffers(
         model_chunks,
@@ -936,6 +943,7 @@ def get_megatron_optimizer(
                 pg_collection=pg_collection,
             )
         )
+    # FlagScale End
 
     if dump_param_to_param_group_map is not None:
         torch.distributed.checkpoint.save(

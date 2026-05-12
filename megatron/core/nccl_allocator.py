@@ -21,9 +21,11 @@ logger = logging.getLogger(__name__)
 
 _allocator = None
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 def _build_nccl_allocator():
@@ -127,20 +129,22 @@ def create_nccl_mem_pool(symmetric=None):  # symmetric: bool | None = None -> to
 
     assert _allocator is not None, "NCCL allocator is not initialized"
     if not symmetric:
-        _pool = cur_platform.MemPool(_allocator)
+        _pool = cur_platform.MemPool(_allocator)  # FlagScale Add
     else:
-        if 'symmetric' in get_func_args(cur_platform.MemPool):
+        if 'symmetric' in get_func_args(cur_platform.MemPool):  # FlagScale Add
             # The PyTorch version >= 2.9.0a0 and before PyTorch PR #161238,
             # The symmetric knob should passed to the MemPool constructor.
             # Since PyTorch PR #161238 symmetric knob is now in registration function.
+            # FlagScale Begin
             _pool = cur_platform.MemPool(_allocator, symmetric=symmetric)
         elif 'symm_mem' in get_func_args(cur_platform.MemPool):
+            # FlagScale End
             # This path handles argument name divergence between
             # nvidia pytorch and the official pytorch.
-            _pool = cur_platform.MemPool(_allocator, symm_mem=symmetric)
+            _pool = cur_platform.MemPool(_allocator, symm_mem=symmetric)  # FlagScale Add
         else:
             # This path handles the case where the symmetric knob is in the registration function.
-            _pool = cur_platform.MemPool(_allocator)
+            _pool = cur_platform.MemPool(_allocator)  # FlagScale Add
     return _pool
 
 
@@ -169,7 +173,7 @@ def register_mem_pool(pool, group, symmetric=True):
     Register a memory pool to a group.
     symmetric: bool, this is for future use.
     """
-    backend = group._get_backend(torch.device("cuda", cur_platform.current_device()))
+    backend = group._get_backend(torch.device("cuda", cur_platform.current_device()))  # FlagScale Add
     if symmetric:
         try:
             backend.register_mem_pool(pool, symm=symmetric)
@@ -190,7 +194,7 @@ def deregister_mem_pool(pool, group):
     """
     Deregister a memory pool from a group.
     """
-    backend = group._get_backend(torch.device("cuda", cur_platform.current_device()))
+    backend = group._get_backend(torch.device("cuda", cur_platform.current_device()))  # FlagScale Add
     if pool.snapshot():
         backend.deregister_mem_pool(pool)
 
@@ -210,9 +214,9 @@ class nccl_mem:
 
         if enabled:
             if device is None:
-                self.device = torch.device(cur_platform.current_device_name())
+                self.device = torch.device(cur_platform.current_device_name())  # FlagScale Add
             elif isinstance(device, int):
-                self.device = torch.device(cur_platform.device(device))
+                self.device = torch.device(cur_platform.device(device))  # FlagScale Add
             elif isinstance(device, str):
                 assert "cuda" in device, "only cuda devices are supported"
                 self.device = torch.device(device)
@@ -222,7 +226,7 @@ class nccl_mem:
             else:
                 self.group = group
 
-            self.mem_context = cur_platform.use_mem_pool(self.pool)
+            self.mem_context = cur_platform.use_mem_pool(self.pool)  # FlagScale Add
         else:
             self.mem_context = nullcontext()
 
@@ -307,10 +311,10 @@ class MultiGroupMemPoolAllocator:
     ):  # pool: torch.cuda.MemPool, groups: List[torch.distributed.ProcessGroup]
         self.pool = pool
         self.groups = groups
-        self.mem_context = cur_platform.use_mem_pool(self.pool)
+        self.mem_context = cur_platform.use_mem_pool(self.pool)  # FlagScale Add
         self.symmetric = symmetric
 
-        assert isinstance(self.pool, cur_platform.MemPool), "pool must be a cur_platform.MemPool"
+        assert isinstance(self.pool, cur_platform.MemPool), "pool must be a cur_platform.MemPool"  # FlagScale Add
         assert isinstance(self.groups, list), "groups must be a list"
         assert all(
             isinstance(group, torch.distributed.ProcessGroup) for group in self.groups
@@ -321,7 +325,7 @@ class MultiGroupMemPoolAllocator:
         # If the pool is not empty, deregister the pool from all the groups.
         if self.pool.snapshot():
             for group in self.groups:
-                backend = group._get_backend(torch.device(cur_platform.current_device_name()))
+                backend = group._get_backend(torch.device(cur_platform.current_device_name()))  # FlagScale Add
                 try:
                     # Since the registration is done in mempool granularity, we need to deregister
                     # the tensors in the mempool and re-register the mempool including
@@ -338,7 +342,7 @@ class MultiGroupMemPoolAllocator:
 
     def __exit__(self, *args):
         for group in self.groups:
-            backend = group._get_backend(torch.device(cur_platform.current_device_name()))
+            backend = group._get_backend(torch.device(cur_platform.current_device_name()))  # FlagScale Add
             try:
                 # Prefer attempting symmetric registration first; fall back if unsupported.
                 if self.symmetric:

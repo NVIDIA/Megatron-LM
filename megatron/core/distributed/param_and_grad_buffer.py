@@ -585,12 +585,12 @@ class _ParamAndGradBucketGroup:
         ):
             # Assign a communication stream if we have multiple DistOpt instances and we
             # need to overlap communication.
-            stream_context = cur_platform.stream(self.communication_stream)
+            stream_context = cur_platform.stream(self.communication_stream)  # FlagScale Add
 
             # The RS/AR communication stream needs to wait for the current stream
             # to complete its gradient computation before launching the next
             # gradient reduction collective.
-            self.communication_stream.wait_stream(cur_platform.current_stream())
+            self.communication_stream.wait_stream(cur_platform.current_stream())  # FlagScale Add
         else:
             stream_context = nullcontext()
 
@@ -698,7 +698,7 @@ class _ParamAndGradBucketGroup:
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
-            cur_platform.current_stream().wait_stream(self.communication_stream)
+            cur_platform.current_stream().wait_stream(self.communication_stream)  # FlagScale Add
             self._copy_back_extra_main_grads()
             return
         assert self.grad_reduce_handle is not None, (
@@ -1042,7 +1042,7 @@ class _ParamAndGradBuffer:
                 self.shared_buffer = torch.zeros(
                     self.numel,
                     dtype=self.grad_dtype,
-                    device=cur_platform.current_device(),
+                    device=cur_platform.current_device(),  # FlagScale Add
                     requires_grad=False,
                 )
                 # For FP32 weight grads, only half of the buffer is used to store params in bf16.
@@ -1059,7 +1059,7 @@ class _ParamAndGradBuffer:
                     self.param_data = torch.zeros(
                         self.numel,
                         dtype=self.param_dtype,
-                        device=cur_platform.current_device(),
+                        device=cur_platform.current_device(),  # FlagScale Add
                         requires_grad=False,
                     )
                 # For NVFP4, grad buffer uses full size (grad_numel),
@@ -1067,7 +1067,7 @@ class _ParamAndGradBuffer:
                 self.grad_data = torch.zeros(
                     self.grad_numel,
                     dtype=self.grad_dtype,
-                    device=cur_platform.current_device(),
+                    device=cur_platform.current_device(),  # FlagScale Add
                     requires_grad=False,
                 )
 

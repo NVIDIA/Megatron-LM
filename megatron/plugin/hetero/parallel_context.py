@@ -992,6 +992,12 @@ class ParallelContext:
             assert group is not None, 'model parallel group is not initialized'
         return group
 
+    def get_model_parallel_src_rank(self):
+        """Calculate the global rank corresponding to the first local rank
+        in the model parallel group."""
+        ranks = self.get_global_group_ranks("tp-pp", is_expert=False, check_initialized=True)
+        return ranks[0]
+
     def get_tensor_model_parallel_group(self, check_initialized=True):
         """Get the tensor model parallel group the caller rank belongs to."""
         current_process_mesh = self._process_meshes[self._current_process_mesh_index]

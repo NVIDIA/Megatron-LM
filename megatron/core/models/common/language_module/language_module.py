@@ -70,7 +70,7 @@ class LanguageModule(MegatronModule):
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
 
-    @overridable
+    @overridable  # FlagScale Add
     def _is_in_embd_group(self):
         if self.embd_group is None:
             return False
@@ -179,7 +179,7 @@ class LanguageModule(MegatronModule):
         loss = loss.transpose(0, 1).contiguous()
         return loss
 
-    @overridable
+    @overridable  # FlagScale Add
     def setup_embeddings_and_output_layer(self) -> None:
         """Sets up embedding layer in first stage and output layer in last stage.
 
@@ -280,7 +280,7 @@ class LanguageModule(MegatronModule):
         if torch.distributed.is_initialized():
             if self._is_in_embd_group() and not self.config.init_model_with_meta_device:
                 weight = self.shared_embedding_or_output_weight()
-                weight.data = weight.data.to(cur_platform.device())
+                weight.data = weight.data.to(cur_platform.device())  # FlagScale Add
                 torch.distributed.all_reduce(weight.data, group=self.embd_group)
 
         elif not getattr(LanguageModule, "embedding_warning_printed", False):

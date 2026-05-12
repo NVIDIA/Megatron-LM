@@ -99,9 +99,9 @@ class Router(ABC, MegatronModule):
         """
         if self.weight.device.type == 'cpu':
             # move weights to GPU
-            self.weight.data = self.weight.data.to(device=cur_platform.current_device())
+            self.weight.data = self.weight.data.to(device=cur_platform.current_device())  # FlagScale Add
         if self.bias is not None and self.bias.device.type == 'cpu':
-            self.bias.data = self.bias.data.to(device=cur_platform.current_device())
+            self.bias.data = self.bias.data.to(device=cur_platform.current_device())  # FlagScale Add
 
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
@@ -182,7 +182,7 @@ class TopKRouter(Router):
                 torch.zeros(
                     self.config.num_moe_experts,
                     dtype=torch.float32,
-                    device=cur_platform.current_device(),
+                    device=cur_platform.current_device(),  # FlagScale Add
                 ),
                 persistent=False,
             )
@@ -191,7 +191,7 @@ class TopKRouter(Router):
                 torch.zeros(
                     self.config.num_moe_experts,
                     dtype=torch.float32,
-                    device=cur_platform.current_device(),
+                    device=cur_platform.current_device(),  # FlagScale Add
                 ),
             )
         else:
@@ -205,13 +205,13 @@ class TopKRouter(Router):
                 torch.zeros(
                     self.config.num_moe_experts,
                     dtype=torch.float32,
-                    device=cur_platform.current_device(),
+                    device=cur_platform.current_device(),  # FlagScale Add
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 'ga_steps',
-                torch.tensor(0, dtype=torch.float32, device=cur_platform.current_device()),
+                torch.tensor(0, dtype=torch.float32, device=cur_platform.current_device()),  # FlagScale Add
                 persistent=False,
             )
         else:

@@ -123,7 +123,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.bucket_size = self.ddp_config.bucket_size
         if disable_bucketing:
             self.bucket_size = None
-        self.device = device if device else torch.device(cur_platform.current_device_name())
+        self.device = device if device else torch.device(cur_platform.current_device_name())  # FlagScale Add
 
         if fsdp_unit_modules is not None:
             self.fsdp_unit_modules = fsdp_unit_modules
@@ -499,7 +499,7 @@ def _get_rng_state_dict():
         'random_rng_state': random.getstate(),
         'np_rng_state': np.random.get_state(),
         'torch_rng_state': torch.get_rng_state(),
-        'cuda_rng_state': cur_platform.get_rng_state(),
+        'cuda_rng_state': cur_platform.get_rng_state(),  # FlagScale Add
         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states(),
     }
     return rng_state_dict
@@ -509,5 +509,5 @@ def _load_rng_state_dict(rng_state_dict):
     random.setstate(rng_state_dict['random_rng_state'])
     np.random.set_state(rng_state_dict['np_rng_state'])
     torch.set_rng_state(rng_state_dict['torch_rng_state'])
-    cur_platform.set_rng_state(rng_state_dict['cuda_rng_state'])
+    cur_platform.set_rng_state(rng_state_dict['cuda_rng_state'])  # FlagScale Add
     tensor_parallel.get_cuda_rng_tracker().set_states(rng_state_dict['rng_tracker_states'])

@@ -185,7 +185,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
         empty_tensor = torch.empty(
             tensor_send_list[i].shape,
             dtype=tensor_send_list[i].dtype,
-            device=cur_platform.current_device(),
+            device=cur_platform.current_device(),  # FlagScale Add
         )
         tensor_recv_list.append(empty_tensor)
 
@@ -362,7 +362,7 @@ class MTPLossLoggingHelper:
 
         tracker = MTPLossLoggingHelper.tracker
         if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=cur_platform.current_device())
+            tracker["values"] = torch.zeros(num_layers, device=cur_platform.current_device())  # FlagScale Add
         tracker["values"][layer_number] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group

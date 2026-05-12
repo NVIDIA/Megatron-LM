@@ -21,9 +21,11 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
 )
 from megatron.core.utils import divide
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 class DotProductAttention(MegatronModule):
@@ -123,7 +125,7 @@ class DotProductAttention(MegatronModule):
         elif self.config.softmax_type == "off-by-one":
             self.softmax_offset = torch.zeros(
                 self.num_attention_heads_per_partition,
-                device=cur_platform.current_device(),
+                device=cur_platform.current_device(),  # FlagScale Add
                 dtype=self.config.params_dtype,
             )
         elif self.config.softmax_type == "learnable":
@@ -132,7 +134,7 @@ class DotProductAttention(MegatronModule):
                 torch.nn.Parameter(
                     torch.empty(
                         self.num_attention_heads_per_partition,
-                        device=cur_platform.current_device(),
+                        device=cur_platform.current_device(),  # FlagScale Add
                         dtype=self.config.params_dtype,
                     )
                 ),

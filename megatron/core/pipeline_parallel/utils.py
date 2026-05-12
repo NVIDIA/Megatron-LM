@@ -150,8 +150,10 @@ class ScheduleNode:
     def __init__(
         self,
         forward_func: Callable,
+        # FlagScale Begin
         stream: cur_platform.Stream,
         event: cur_platform.Event,
+        # FlagScale End
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
@@ -297,13 +299,13 @@ class ScheduleNode:
         """
         self.event.wait(self.stream)
         if name:
-            cur_platform.range_push(name)
+            cur_platform.range_push(name)  # FlagScale Add
         try:
-            with cur_platform.stream(self.stream):
+            with cur_platform.stream(self.stream):  # FlagScale Add
                 yield
         finally:
             if name:
-                cur_platform.range_pop()
+                cur_platform.range_pop()  # FlagScale Add
             self.event.record(self.stream)
 
     def _release_state(self):
@@ -347,13 +349,13 @@ def set_streams(comm_stream=None):
     # Set communication stream
     if _COMM_STREAM is None:
         if comm_stream is None:
-            comm_stream = cur_platform.Stream(device=cur_platform.device_name())
+            comm_stream = cur_platform.Stream(device=cur_platform.device_name())  # FlagScale Add
         _COMM_STREAM = comm_stream
 
 
 def get_comp_stream():
     """Get the stream for computation"""
-    return cur_platform.current_stream()
+    return cur_platform.current_stream()  # FlagScale Add
 
 
 def get_comm_stream():

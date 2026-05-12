@@ -15,9 +15,11 @@ from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
 )
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 if TYPE_CHECKING:
     from megatron.core.transformer import TransformerConfig
@@ -35,12 +37,12 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
 
 def get_default_causal_mask(sq: int) -> torch.Tensor:
     """Return the causal upper triangular mask for softmax input."""
-    return torch.triu(torch.ones(sq, sq, device=cur_platform.device_name()), diagonal=1).bool()
+    return torch.triu(torch.ones(sq, sq, device=cur_platform.device_name()), diagonal=1).bool()  # FlagScale Add
 
 
 def get_sliding_window_causal_mask(sq, skv, window_size):
     """Create the equivalent attention mask for SWA in [sq, skv] shape"""
-    m = torch.ones(sq, skv, dtype=torch.bool, device=cur_platform.device_name())
+    m = torch.ones(sq, skv, dtype=torch.bool, device=cur_platform.device_name())  # FlagScale Add
     mu = torch.triu(m, diagonal=skv - sq - window_size[0])
     ml = torch.tril(mu, diagonal=skv - sq + window_size[1])
     ml = ~ml

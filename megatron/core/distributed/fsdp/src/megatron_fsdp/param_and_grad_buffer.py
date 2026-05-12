@@ -211,7 +211,7 @@ class MultiGroupUBRAllocator:
 
     def __enter__(self):
         for group in self.groups[1:]:
-            backend = group._get_backend(torch.device("cuda", cur_platform.current_device()))
+            backend = group._get_backend(torch.device("cuda", cur_platform.current_device()))  # FlagScale Add
             try:
                 # Since the registration is done in mempool granularity, we need to deregister
                 # the tensors in the mempool and re-register the mempool including the newly created
@@ -224,7 +224,7 @@ class MultiGroupUBRAllocator:
     def __exit__(self, *args):
         self.mem_allocator.__exit__(*args)
         for group in self.groups[1:]:
-            backend = group._get_backend(torch.device("cuda", cur_platform.current_device()))
+            backend = group._get_backend(torch.device("cuda", cur_platform.current_device()))  # FlagScale Add
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -802,7 +802,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             ):
                 # Requires synchronization for new buffer allocation
                 self.allocation_tracker[(buffer_name, dtype)] = size
-                cur_platform.synchronize()
+                cur_platform.synchronize()  # FlagScale Add
         return Bucket(
             data=get_global_memory_buffer().get_tensor(
                 [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
@@ -1849,9 +1849,9 @@ class ParamAndGradBuffer:
         self.already_registered = True
 
         global NCCL_MEMORY_POOL
-        cur_platform.synchronize()
+        cur_platform.synchronize()  # FlagScale Add
         torch.distributed.barrier(async_op=False)
-        cur_platform.synchronize()
+        cur_platform.synchronize()  # FlagScale Add
 
         for group in self.ubr_groups:
             log_single_rank(
@@ -2492,7 +2492,7 @@ class ParamAndGradBuffer:
                             # CUDA device.
                             if check_gpu_memory(threshold=0.5):
                                 gc.collect()
-                                cur_platform.empty_cache()
+                                cur_platform.empty_cache()  # FlagScale Add
 
                             m.to_empty(device=self.device, recurse=False)
                             if (
@@ -2706,7 +2706,7 @@ class ParamAndGradBuffer:
 
         # Clean up deallocated memory.
         gc.collect()
-        cur_platform.empty_cache()
+        cur_platform.empty_cache()  # FlagScale Add
 
     def _reset_parameters(self, old_params, new_params):
         assert len(old_params) == len(new_params)
@@ -3386,7 +3386,7 @@ class GradReducePipeline:
     def __init__(
         self,
         param_and_grad_buffer: ParamAndGradBuffer,
-        rs_stream: Optional[cur_platform.Stream] = None,
+        rs_stream: Optional[cur_platform.Stream] = None,  # FlagScale Add
         check_nans: bool = False,
     ) -> None:
         self.buffer = param_and_grad_buffer
@@ -3409,7 +3409,7 @@ class GradReducePipeline:
         if dist_index.use_hybrid_fsdp:
             # If there are multiple FSDP groups, we need to reduce gradients across groups.
             self.outer_fsdp_group_grad_reduce = True
-            self.outer_fsdp_group_grad_reduce_stream = cur_platform.Stream()
+            self.outer_fsdp_group_grad_reduce_stream = cur_platform.Stream()  # FlagScale Add
         else:
             self.outer_fsdp_group_grad_reduce = False
 
@@ -3593,15 +3593,15 @@ class GradReducePipeline:
         if ddp_config.fsdp_double_buffer:
             self._enforce_double_buffer_limit(bucket_group)
 
-        current_stream = cur_platform.current_stream()
+        current_stream = cur_platform.current_stream()  # FlagScale Add
         reduce_scatter_stream = (
-            self.rs_stream if self.rs_stream is not None else cur_platform.current_stream()
+            self.rs_stream if self.rs_stream is not None else cur_platform.current_stream()  # FlagScale Add
         )
         reduce_scatter_stream.wait_stream(current_stream)
 
         # DP-Shard Gradient Reduction
         dp_group = self.get_fsdp_buffer(bucket_group[0]).data_parallel_group
-        with cur_platform.stream(reduce_scatter_stream):
+        with cur_platform.stream(reduce_scatter_stream):  # FlagScale Add
             with _coalescing_manager(dp_group):
                 # List of gradient accumulation closure tasks.
                 # (grad_buffer, reduced_grad)
@@ -3695,7 +3695,7 @@ class GradReducePipeline:
             # Wait on the DP-Shard reduction before further reduction.
             self.outer_fsdp_group_grad_reduce_stream.wait_stream(reduce_scatter_stream)
             outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group()
-            with cur_platform.stream(self.outer_fsdp_group_grad_reduce_stream):
+            with cur_platform.stream(self.outer_fsdp_group_grad_reduce_stream):  # FlagScale Add
                 with _coalescing_manager(outer_fsdp_group):
                     # List of gradient accumulation closure tasks.
                     # (grad_buffer, reduced_grad)
@@ -3842,7 +3842,7 @@ class AllGatherPipeline:
     def __init__(
         self,
         param_and_grad_buffer: ParamAndGradBuffer,
-        ag_stream: Optional[cur_platform.Stream] = None,
+        ag_stream: Optional[cur_platform.Stream] = None,  # FlagScale Add
     ) -> None:
         self.buffer = param_and_grad_buffer
         self.ag_stream = ag_stream
@@ -3881,7 +3881,7 @@ class AllGatherPipeline:
         ):
             # If there are multiple FSDP groups and full sharding, we need to
             # all-gather parameters across groups.
-            self.outer_fsdp_group_param_gather_stream = cur_platform.Stream()
+            self.outer_fsdp_group_param_gather_stream = cur_platform.Stream()  # FlagScale Add
 
     def get_bucket_key(self, bucket_id, bwd):
         """Get the key for the bucket."""
@@ -4062,11 +4062,13 @@ class AllGatherPipeline:
         # Coalesce all-gather operations for all buckets in the same data-parallel-group
         for _, buckets in bucket_group_to_buckets.items():
             all_gather_stream = (
-                self.ag_stream if self.ag_stream is not None else cur_platform.current_stream()
+                self.ag_stream if self.ag_stream is not None else cur_platform.current_stream()  # FlagScale Add
             )
             if outer_fsdp_group_param_gather:
+                # FlagScale Begin
                 self.outer_fsdp_group_param_gather_stream.wait_stream(cur_platform.current_stream())
                 with cur_platform.stream(self.outer_fsdp_group_param_gather_stream):
+                # FlagScale End
                     is_expert_parallel = parameter_groups[buckets[0]].is_expert_param
                     outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
                         is_expert_parallel=is_expert_parallel
@@ -4087,9 +4089,9 @@ class AllGatherPipeline:
                 all_gather_stream.wait_stream(self.outer_fsdp_group_param_gather_stream)
 
             # Coalesce the asynchronous NCCL operations in this context.
-            all_gather_stream.wait_stream(cur_platform.current_stream())
+            all_gather_stream.wait_stream(cur_platform.current_stream())  # FlagScale Add
             dp_group = self.get_fsdp_buffer(buckets[0]).data_parallel_group
-            with cur_platform.stream(all_gather_stream):
+            with cur_platform.stream(all_gather_stream):  # FlagScale Add
                 with _coalescing_manager(
                     dp_group, async_ops=async_param_gather
                 ) as coalescing_event:
@@ -4303,12 +4305,14 @@ def check_gpu_memory(threshold=0.9):
     Returns:
         bool: True if the GPU memory is over the threshold.
     """
-    if not cur_platform.is_available():
+    if not cur_platform.is_available():  # FlagScale Add
         return False
+    # FlagScale Begin
     device = cur_platform.current_device()
     allocated = cur_platform.memory_allocated(device)
     reserved = cur_platform.memory_reserved(device)
     total = cur_platform.get_device_properties(device).total_memory
+    # FlagScale End
 
     allocated_ratio = allocated / total
     reserved_ratio = reserved / total

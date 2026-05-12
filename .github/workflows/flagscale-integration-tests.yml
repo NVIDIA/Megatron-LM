@@ -99,4 +99,28 @@ jobs:
           RUN_ID="${{ steps.get_run_id.outputs.run_id }}"
 
           echo "Monitoring FlagScale workflow run: ${RUN_ID}"
-          gh run watch ${RUN_ID} --repo "${FLAGSCALE_REPO}" --exit-status
+
+          POLL_INTERVAL=60
+          MAX_ATTEMPTS=120  # 120 * 60s = 2 hours max
+
+          for i in $(seq 1 ${MAX_ATTEMPTS}); do
+            STATUS=$(gh run view ${RUN_ID} --repo "${FLAGSCALE_REPO}" --json status,conclusion --jq '.status')
+            CONCLUSION=$(gh run view ${RUN_ID} --repo "${FLAGSCALE_REPO}" --json status,conclusion --jq '.conclusion')
+
+            echo "[$(date -u '+%H:%M:%S')] Attempt ${i}/${MAX_ATTEMPTS}: status=${STATUS}, conclusion=${CONCLUSION}"
+
+            if [ "${STATUS}" = "completed" ]; then
+              if [ "${CONCLUSION}" = "success" ]; then
+                echo "Workflow completed successfully!"
+                exit 0
+              else
+                echo "Workflow failed with conclusion: ${CONCLUSION}"
+                exit 1
+              fi
+            fi
+
+            sleep ${POLL_INTERVAL}
+          done
+
+          echo "Timed out waiting for workflow to complete"
+          exit 1

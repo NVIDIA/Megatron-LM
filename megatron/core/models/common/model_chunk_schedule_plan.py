@@ -318,7 +318,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
-        self._event = cur_platform.Event()
+        self._event = cur_platform.Event()  # FlagScale Add
         self.pre_process = None
         self.post_process = None
         self.vp_stage = model.vp_stage
@@ -364,7 +364,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             return
         num_layers = len(module.layers)
         for layer_idx in range(num_layers):
-            layer = module.layers[layer_idx]
+            layer = module.layers[layer_idx]  # FlagScale Add
             extra_args = {
                 "is_first_layer": layer_idx == 0,
                 "is_last_layer": layer_idx == num_layers - 1,
@@ -377,7 +377,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 ]
             ########## FlagScale End ##########
             layer_plan = TransformerLayerSchedulePlan(
-                layer,
+                layer,  # FlagScale Add
                 self.event,
                 self.state,
                 comp_stream,
@@ -393,12 +393,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
     def record_current_stream(self):
         """Records the current CUDA stream in the event."""
-        stream = cur_platform.current_stream()
+        stream = cur_platform.current_stream()  # FlagScale Add
         self.event.record(stream)
 
     def wait_current_stream(self):
         """Waits for the event to complete on the current CUDA stream."""
-        stream = cur_platform.current_stream()
+        stream = cur_platform.current_stream()  # FlagScale Add
         self.event.wait(stream)
 
     def get_layer(self, i):
@@ -493,7 +493,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         for i in range(overlapped_layers):
             f_layer = f_schedule_plan.get_layer(i)
             b_layer = b_schedule_plan.pop_layer()
-            cur_platform.range_push(f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b")
+            cur_platform.range_push(f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b")  # FlagScale Add
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
@@ -503,30 +503,30 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
-            cur_platform.range_pop()
+            cur_platform.range_pop()  # FlagScale Add
 
         # backward pass for the remaining layers
         for i in range(overlapped_layers, b_num_layers):
             b_layer = b_schedule_plan.pop_layer()
-            cur_platform.range_push(f"layer_{b_schedule_plan.num_layers()}b")
+            cur_platform.range_push(f"layer_{b_schedule_plan.num_layers()}b")  # FlagScale Add
             _, b_grad = TransformerLayerSchedulePlan.run(
                 None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
-            cur_platform.range_pop()
+            cur_platform.range_pop()  # FlagScale Add
 
         # forward pass for the remaining layers
         for i in range(overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
-            cur_platform.range_push(f"layer_{i}f")
+            cur_platform.range_push(f"layer_{i}f")  # FlagScale Add
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
-            cur_platform.range_pop()
+            cur_platform.range_pop()  # FlagScale Add
 
         if f_schedule_plan is not None and post_forward is not None:
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
             # so the p2p comm could be overlapped with the attn backward
-            with cur_platform.stream(get_comm_stream()):
+            with cur_platform.stream(get_comm_stream()):  # FlagScale Add
                 f_schedule_plan.wait_current_stream()
                 post_forward(f_input, f_schedule_plan.vp_stage)
 

@@ -27,9 +27,11 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_sharded_tensor_for_checkpoint,
 )
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
@@ -119,7 +121,7 @@ class SharedExpertMLP(MLP):
             self.gate_score = None
 
             if self.stream is None:
-                self.stream = cur_platform.Stream()
+                self.stream = cur_platform.Stream()  # FlagScale Add
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
@@ -158,8 +160,10 @@ class SharedExpertMLP(MLP):
         """
         assert self.config.moe_shared_expert_overlap
         assert self.cached_output is None
+        # FlagScale Begin
         self.stream.wait_stream(cur_platform.current_stream())
         with cur_platform.stream(self.stream):
+        # FlagScale End
             if self.use_shared_expert_gate:
                 logits = torch.nn.functional.linear(input, self.gate_weight)
                 self.gate_score = torch.nn.functional.sigmoid(logits)
@@ -181,7 +185,7 @@ class SharedExpertMLP(MLP):
         assert self.cached_fc1_input is not None
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
-        with cur_platform.stream(self.stream):
+        with cur_platform.stream(self.stream):  # FlagScale Add
             # [s, b, 4 * h/p]
             intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
                 self.cached_fc1_input
@@ -234,7 +238,7 @@ class SharedExpertMLP(MLP):
         assert self.cached_fc2_input is not None
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
-        with cur_platform.stream(self.stream):
+        with cur_platform.stream(self.stream):  # FlagScale Add
             # [s, b, h]
             self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
             self.cached_fc2_input = None
@@ -247,7 +251,7 @@ class SharedExpertMLP(MLP):
         """
         assert self.config.moe_shared_expert_overlap
         assert self.cached_fc2_output is not None
-        with cur_platform.stream(self.stream):
+        with cur_platform.stream(self.stream):  # FlagScale Add
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
                     self.cached_fc2_output
@@ -267,7 +271,7 @@ class SharedExpertMLP(MLP):
         """
         assert self.config.moe_shared_expert_overlap
         assert self.cached_output is not None
-        with cur_platform.stream(self.stream):
+        with cur_platform.stream(self.stream):  # FlagScale Add
             if self.use_shared_expert_gate:
                 assert self.gate_score is not None
                 output = self.cached_output * self.gate_score
@@ -275,7 +279,7 @@ class SharedExpertMLP(MLP):
             else:
                 output = self.cached_output
             self.cached_output = None
-        cur_platform.current_stream().wait_stream(self.stream)
+        cur_platform.current_stream().wait_stream(self.stream)  # FlagScale Add
         return output
 
 

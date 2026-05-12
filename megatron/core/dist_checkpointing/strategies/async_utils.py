@@ -25,9 +25,11 @@ from ..utils import debug_time
 
 logger = logging.getLogger(__name__)
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 def _set_process_qos(cpu_priority: int, io_priority: Optional[int]) -> None:
@@ -225,7 +227,7 @@ class AsyncCaller(ABC):
             bool: True if all ranks are done, False if at least one rank is still active.
 
         """
-        ten = torch.tensor([is_alive], dtype=torch.int, device=cur_platform.current_device())
+        ten = torch.tensor([is_alive], dtype=torch.int, device=cur_platform.current_device())  # FlagScale Add
         torch.distributed.all_reduce(ten)
         return ten[0] == 0
 
@@ -274,7 +276,7 @@ class TemporalAsyncCaller(AsyncCaller):
 
         rank = torch.distributed.get_rank()
         start_sync = time()
-        cur_platform.synchronize()
+        cur_platform.synchronize()  # FlagScale Add
         end_sync = time()
         logger.debug(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
 
@@ -566,7 +568,7 @@ class PersistentAsyncCaller(AsyncCaller):
         # in this new process are on the right device, and device 0 on the node does not
         # take on undue memory burden from other devices on node (default behavior without
         # this line).
-        cur_platform.set_device(rank % cur_platform.device_count())
+        cur_platform.set_device(rank % cur_platform.device_count())  # FlagScale Add
 
         # Set QoS to deprioritize checkpoint writing vs training
         # This prevents checkpoint I/O from interfering with data loader
@@ -699,9 +701,11 @@ class AsyncCallsQueue:
                 call_idx, _, async_request = self.async_calls.popleft()
                 for finalize_fn in async_request.finalize_fns:
                     finalize_fn()
+                # FlagScale Begin
                 ten = torch.tensor(
                     [call_idx], dtype=torch.int, device=cur_platform.current_device()
                 )
+                # FlagScale End
                 torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
                 assert ten.item() == call_idx, "Unmatched async calls. "
                 "That probably means not all ranks are participating in async finalization"

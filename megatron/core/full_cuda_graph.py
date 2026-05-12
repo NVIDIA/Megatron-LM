@@ -66,7 +66,7 @@ class StaticBufferLoader:
     static_buffers: dict = {'training': [], 'validation': []}
 
     def __init__(self):
-        self.stream = cur_platform.Stream()
+        self.stream = cur_platform.Stream()  # FlagScale Add
 
     def __call__(self, inputs, stage, microbatch):
         assert stage in ['training', 'validation']
@@ -76,8 +76,10 @@ class StaticBufferLoader:
 
         assert isinstance(inputs, dict)
         if microbatch == len(StaticBufferLoader.static_buffers[stage]):
+            # FlagScale Begin
             self.stream.wait_stream(cur_platform.current_stream())
             with cur_platform.stream(self.stream):
+            # FlagScale End
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
 
@@ -90,12 +92,14 @@ class StaticBufferLoader:
                     else:
                         StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
+            # FlagScale Begin
             self.stream.wait_stream(cur_platform.current_stream())
             with cur_platform.stream(self.stream):
+            # FlagScale End
                 clone_tensors_in_struct(
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
-        cur_platform.current_stream().wait_stream(self.stream)
+        cur_platform.current_stream().wait_stream(self.stream)  # FlagScale Add
         return StaticBufferLoader.static_buffers[stage][microbatch]
 
 
@@ -175,8 +179,10 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
             for _, state in get_all_rng_states().items():
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
+            # FlagScale Begin
             cur_platform.synchronize()
             capture_stream = cur_platform.Stream()
+            # FlagScale End
             with torch.cuda.graph(
                 FullCudaGraphWrapper.cuda_graph[training_str],
                 stream=capture_stream,
@@ -185,7 +191,7 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )
-            cur_platform.synchronize()
+            cur_platform.synchronize()  # FlagScale Add
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
 

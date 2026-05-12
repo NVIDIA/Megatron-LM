@@ -20,9 +20,11 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -77,7 +79,7 @@ class DSAIndexerLossLoggingHelper:
 
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=cur_platform.current_device())
+            tracker["values"] = torch.zeros(num_layers, device=cur_platform.current_device())  # FlagScale Add
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group

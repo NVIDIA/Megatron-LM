@@ -69,10 +69,12 @@ logger = logging.getLogger(__name__)
 
 
 def get_num_layers_to_build(
+    # FlagScale Begin
     config: TransformerConfig,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
     is_dualpipev_first_chunk: Optional[bool] = False,
+    # FlagScale End
 ) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.

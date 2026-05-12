@@ -22,7 +22,7 @@ def compile_helpers():
     import os
     import subprocess
 
-    src_dir = os.path.abspath(os.path.dirname(__file__))
+    src_dir = os.path.abspath(os.path.dirname(__file__))  # FlagScale Add
 
     # FlagScale Begin
     # Skip compilation if the shared library already exists (e.g. pip-installed package
@@ -35,7 +35,7 @@ def compile_helpers():
         return
     # FlagScale End
 
-    command = ["make", "-C", src_dir]
+    command = ["make", "-C", src_dir]  # FlagScale Add
     if subprocess.run(command).returncode != 0:
         import sys
 

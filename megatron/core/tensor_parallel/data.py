@@ -1,6 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from gettext import ngettext
+from gettext import ngettext  # FlagScale Add
 
 import torch
 
@@ -8,9 +8,11 @@ from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 _MAX_DATA_DIM = 5
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 def _check_data_types(keys, data, target_dtype):
@@ -40,7 +42,7 @@ def _build_key_size_numel_dictionaries(keys, data, tp_group=None):
             offset += max_dim
 
     # Move to GPU and broadcast.
-    sizes_cuda = torch.tensor(sizes, dtype=torch.long, device=cur_platform.device_name())
+    sizes_cuda = torch.tensor(sizes, dtype=torch.long, device=cur_platform.device_name())  # FlagScale Add
     group_ranks = torch.distributed.get_process_group_ranks(group=tp_group)
     torch.distributed.broadcast(sizes_cuda, group_ranks[0], group=tp_group)
 
@@ -87,14 +89,18 @@ def broadcast_data(keys, data, datatype, tp_group=None):
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
+        # FlagScale Begin
         flatten_data = torch.cat(
             [data[key].to(cur_platform.current_device()).contiguous().view(-1) for key in keys],
             dim=0,
         )
+        # FlagScale End
     else:
+        # FlagScale Begin
         flatten_data = torch.empty(
             total_numel, device=cur_platform.current_device(), dtype=datatype
         )
+        # FlagScale End
 
     # Broadcast
     group_ranks = torch.distributed.get_process_group_ranks(group=tp_group)

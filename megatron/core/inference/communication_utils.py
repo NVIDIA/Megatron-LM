@@ -6,8 +6,10 @@ from torch.distributed import ProcessGroup
 
 from megatron.core import parallel_state
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 cur_platform = get_platform()
+# FlagScale End
 
 def is_pipeline_first_stage(pp_group: ProcessGroup):
     """Check if the current process is the first stage of the pipeline"""
@@ -75,7 +77,7 @@ def broadcast_from_last_pipeline_stage(
         assert dtype == tensor.dtype, f"Expected tensor of type {dtype} but got {tensor.dtype}"
         _is_cuda_contiguous(tensor)
     else:
-        tensor = torch.empty(size, dtype=dtype, device=cur_platform.current_device())
+        tensor = torch.empty(size, dtype=dtype, device=cur_platform.current_device())  # FlagScale Add
 
     # Broadcast the tensor
     torch.distributed.broadcast(tensor, src=last_rank, group=pp_group)
@@ -110,7 +112,7 @@ def recv_from_prev_pipeline_rank_(
     for req in reqs:
         req.wait()
     # To protect against race condition when using batch_isend_irecv().
-    cur_platform.synchronize()
+    cur_platform.synchronize()  # FlagScale Add
 
 
 def send_to_next_pipeline_rank(
@@ -141,7 +143,7 @@ def send_to_next_pipeline_rank(
     for req in reqs:
         req.wait()
     # To protect against race condition when using batch_isend_irecv().
-    cur_platform.synchronize()
+    cur_platform.synchronize()  # FlagScale Add
 
 
 def broadcast_tensor(size, dtype, tensor=None, rank=0, data_parallel=False):
@@ -157,7 +159,7 @@ def broadcast_tensor(size, dtype, tensor=None, rank=0, data_parallel=False):
     if torch.distributed.get_rank() == rank:
         _is_cuda_contiguous(tensor)
     else:
-        tensor = torch.empty(size, dtype=dtype, device=cur_platform.current_device())
+        tensor = torch.empty(size, dtype=dtype, device=cur_platform.current_device())  # FlagScale Add
 
     group = None
     if data_parallel:
@@ -179,12 +181,12 @@ def broadcast_list(size, dtype, list_values=None, rank=0, data_parallel=False):
 
     if data_parallel:
         if parallel_state.get_model_parallel_src_rank() == torch.distributed.get_rank():
-            tensor = torch.tensor(list_values, dtype=dtype, device=cur_platform.current_device())
+            tensor = torch.tensor(list_values, dtype=dtype, device=cur_platform.current_device())  # FlagScale Add
 
         rank = parallel_state.get_model_parallel_src_rank()
     else:
         if torch.distributed.get_rank() == rank:
-            tensor = torch.tensor(list_values, dtype=dtype, device=cur_platform.current_device())
+            tensor = torch.tensor(list_values, dtype=dtype, device=cur_platform.current_device())  # FlagScale Add
 
     return broadcast_tensor(size, dtype, tensor=tensor, rank=rank, data_parallel=data_parallel)
 

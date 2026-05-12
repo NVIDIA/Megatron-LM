@@ -21,9 +21,11 @@ try:
 except:
     NORM_IMPL = torch.nn.LayerNorm
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 # Note: This is under development and is missing features like position embedding interpolation.
@@ -125,7 +127,7 @@ class CLIPViTModel(VisionModule):
             padding=padding,
         )
 
-        self.position_ids = torch.arange(self.seq_length).expand(1, -1).to(cur_platform.device())
+        self.position_ids = torch.arange(self.seq_length).expand(1, -1).to(cur_platform.device())  # FlagScale Add
 
         self.position_embeddings = torch.nn.Embedding(
             self.seq_length, self.visual_hidden_size, dtype=transformer_config.params_dtype

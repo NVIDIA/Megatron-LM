@@ -19,7 +19,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_pp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.plugin.decorators import overridable
+from megatron.plugin.decorators import overridable  # FlagScale Add
 
 from .. import parallel_state
 from ..transformer.moe.moe_utils import get_updated_expert_bias
@@ -209,7 +209,7 @@ def _allreduce_word_embedding_grads(
     )
 
 
-@overridable
+@overridable  # FlagScale Add
 def _allreduce_embedding_grad(
     model: List[torch.nn.Module],
     embd_group: torch.distributed.ProcessGroup,

@@ -34,9 +34,11 @@ try:
 except ImportError:
     apply_rotary_emb_flash = None
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 __all__ = [
     'apply_rotary_pos_emb',
@@ -62,9 +64,11 @@ def get_pos_emb_on_this_cp_rank(
         raise ValueError("cp_group must be provided to get positional embedding per CP rank")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
+    # FlagScale Begin
     cp_idx = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True).to(
         device=cur_platform.device(), non_blocking=True
     )
+    # FlagScale End
     pos_emb = pos_emb.view(
         *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
     )

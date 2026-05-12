@@ -71,7 +71,7 @@ except (ImportError, ModuleNotFoundError):
     HAVE_NVRX = False
 
 try:
-    if not cur_platform.is_available():
+    if not cur_platform.is_available():  # FlagScale Add
         raise ImportError
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 

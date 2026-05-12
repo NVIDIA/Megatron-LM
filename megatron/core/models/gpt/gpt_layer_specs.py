@@ -553,7 +553,7 @@ def get_gpt_decoder_layer_specs(
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
-    is_dualpipev_first_chunk: Optional[bool] = False,
+    is_dualpipev_first_chunk: Optional[bool] = False,  # FlagScale Add
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -662,7 +662,7 @@ def get_gpt_decoder_block_spec(
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
-    is_dualpipev_first_chunk: Optional[bool] = False,
+    is_dualpipev_first_chunk: Optional[bool] = False,  # FlagScale Add
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     layer_specs = get_gpt_decoder_layer_specs(
@@ -670,6 +670,7 @@ def get_gpt_decoder_block_spec(
     )
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
+    # FlagScale Begin
     ######### FlagScale Modify ########
     num_layers_to_build = get_num_layers_to_build(
         config,
@@ -677,6 +678,7 @@ def get_gpt_decoder_block_spec(
         pp_rank=pp_rank,
         is_dualpipev_first_chunk=is_dualpipev_first_chunk,
     )
+    # FlagScale End
 
     if config.pipeline_model_parallel_layout is not None:
         layout = config.pipeline_model_parallel_layout
@@ -688,6 +690,7 @@ def get_gpt_decoder_block_spec(
             )
         ]
     else:
+        # FlagScale Begin
         ######### FlagScale Modify ########
         offset = get_transformer_layer_offset(
             config,
@@ -695,6 +698,7 @@ def get_gpt_decoder_block_spec(
             pp_rank=pp_rank,
             is_dualpipev_first_chunk=is_dualpipev_first_chunk,
         )
+        # FlagScale End
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     if use_transformer_engine:

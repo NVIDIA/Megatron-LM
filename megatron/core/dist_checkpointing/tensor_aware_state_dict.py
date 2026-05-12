@@ -43,9 +43,11 @@ except ImportError:
     TensorAwareStateDict = types.new_class("TensorAwareStateDict", ())
     HAVE_NVRX = False
 
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 
 @dataclass
@@ -305,7 +307,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
                         parallelization_group,
                         exchange_algo,
                     )
-                    cur_platform.synchronize()
+                    cur_platform.synchronize()  # FlagScale Add
         loaded_objects = {}
         for sh_base in nested_values(self.sharded_state_dict):
             if not isinstance(sh_base, ShardedTensor):

@@ -339,7 +339,7 @@ def get_te_version():
     global _te_version
     if _te_version is None:
         if HAVE_TE:
-            _te_version = PkgVersion(parse_te_version_str(get_te_version_str()))
+            _te_version = PkgVersion(parse_te_version_str(get_te_version_str()))  # FlagScale Add
         else:
             _te_version = PkgVersion("0.0.0")
     return _te_version
@@ -671,7 +671,7 @@ class GlobalMemoryBuffer:
                 self.buffer[(name, dtype)] = torch.empty(
                     required_len,
                     dtype=dtype,
-                    device=cur_platform.current_device(),
+                    device=cur_platform.current_device(),  # FlagScale Add
                     requires_grad=False,
                 )
 
@@ -1398,10 +1398,12 @@ class StragglerDetector:
         self.bdata: bool = False
         self.dev: Union[torch.device, int, None] = None
         self.evt_q: Union[queue.LifoQueue, None] = None
+        # FlagScale Begin
         self.start_gemm_ev: List[cur_platform.Event] = []
         self.stop_gemm_ev: List[cur_platform.Event] = []
         self.start_data_ev: List[cur_platform.Event] = []
         self.stop_data_ev: List[cur_platform.Event] = []
+        # FlagScale End
         self.start_gemm_tm: List[int] = []
         self.stop_gemm_tm: List[int] = []
         self.start_data_tm: List[int] = []
@@ -1451,7 +1453,7 @@ class StragglerDetector:
         self.stop = self.null_method
         self._off = True
         # No CUDA, No Support
-        if cur_platform.is_available():
+        if cur_platform.is_available():  # FlagScale Add
             self._off = not enabled
             self.world = world
             self.rank = rank
@@ -1471,12 +1473,12 @@ class StragglerDetector:
             self.stop_data_tm = []
             backend = torch.distributed.get_backend()
             if backend == "nccl":
-                self.dev = cur_platform.current_device()
+                self.dev = cur_platform.current_device()  # FlagScale Add
             else:
                 self.dev = torch.device("cpu")
             # cache some events
             for _ in range(prefill):
-                self.evt_q.put(cur_platform.Event(enable_timing=True))
+                self.evt_q.put(cur_platform.Event(enable_timing=True))  # FlagScale Add
             if self.rank == 0:
                 # Start the controller
                 self._controller()
@@ -1521,8 +1523,10 @@ class StragglerDetector:
             sev = self.evt_q.get()  # no try-catch
             eev = self.evt_q.get()  # no try-catch
         else:
+            # FlagScale Begin
             sev = cur_platform.Event(enable_timing=True)
             eev = cur_platform.Event(enable_timing=True)
+            # FlagScale End
         # First check if this start is for data
         if self.bdata:
             self.start_data_ev.append(sev)
@@ -1593,11 +1597,13 @@ class StragglerDetector:
         elif ls_bs != ls_be:
             logger.warning(f"get_batch Start/Stop out of sync {ls_bs}/{ls_be}")
         else:
+            # FlagScale Begin
             temp = cur_platform.temperature()
             power = cur_platform.power_draw()
             util = cur_platform.utilization()
             clock = cur_platform.clock_rate()
             cur_platform.synchronize()
+            # FlagScale End
             # Process Events
             for i in range(ls_ev):
                 e_ev = self.start_gemm_ev[i].elapsed_time(self.stop_gemm_ev[i])
@@ -2187,7 +2193,7 @@ def nvtx_range_push(msg=None, suffix=None) -> None:
     _nvtx_range_messages.append(msg)
 
     # Push NVTX range
-    cur_platform.range_push(msg)
+    cur_platform.range_push(msg)  # FlagScale Add
 
 
 def nvtx_range_pop(msg=None, suffix=None) -> None:
@@ -2216,7 +2222,7 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
         )
 
     # Pop NVTX range
-    cur_platform.range_pop()
+    cur_platform.range_pop()  # FlagScale Add
 
 
 @lru_cache(maxsize=None)

@@ -425,7 +425,7 @@ class GPTModel(LanguageModule):
             sequence_len_offset = torch.tensor(
                 [inference_context.sequence_len_offset] * current_batch_size,
                 dtype=torch.int32,
-                device=cur_platform.current_device(),
+                device=cur_platform.current_device(),  # FlagScale Add
             )
         else:
             sequence_len_offset = None

@@ -7,18 +7,22 @@ import torch
 from packaging import version
 
 from megatron.core.utils import null_decorator
+# FlagScale Begin
 from megatron.plugin.platform import get_platform
 
 cur_platform = get_platform()
+# FlagScale End
 
 try:
     import triton
     import triton.language as tl
 
+    # FlagScale Begin
     if (
         version.parse(triton.__version__) < version.parse("3.4.0")
         and not cur_platform.is_available()
     ):
+    # FlagScale End
         HAVE_TRITON = False
     else:
         HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
@@ -209,19 +213,25 @@ class IndicesToMultihot(torch.autograd.Function):
         ), "indices and probs_indices must have the same shape"
         topk = indices.shape[1]
         multihot_indices = torch.empty(
+            # FlagScale Begin
             (num_of_tokens, num_of_local_experts),
             dtype=torch.bool,
             device=cur_platform.device_name(),
+            # FlagScale End
         )
         probs_in_multihot = torch.empty(
+            # FlagScale Begin
             (num_of_tokens, num_of_local_experts),
             dtype=probs_indices.dtype,
             device=cur_platform.device_name(),
+            # FlagScale End
         )
         position_map = torch.empty(
+            # FlagScale Begin
             (num_of_tokens, num_of_local_experts),
             dtype=torch.int32,
             device=cur_platform.device_name(),
+            # FlagScale End
         )
         # Compute the next power of 2 for the topk and num_of_local_experts
         topk_next_power_of_2 = 2 ** int(math.ceil(math.log2(topk)))
@@ -268,9 +278,11 @@ class IndicesToMultihot(torch.autograd.Function):
 
         # Initialize the gradient of the indices and probs_indices
         grad_probs_indices = torch.empty(
+            # FlagScale Begin
             (num_of_tokens, topk),
             dtype=grad_probs_in_multihot.dtype,
             device=cur_platform.device_name(),
+            # FlagScale End
         )
         # Compute the next power of 2 for the topk and num_of_local_experts
         topk_next_power_of_2 = 2 ** int(math.ceil(math.log2(topk)))
