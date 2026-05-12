@@ -145,6 +145,7 @@ class DSv4HybridAttention(Attention):
         core_attn_extra_kwargs = {
             "rotary_pos_emb": self.rotary_pos_emb,
             "compress_ratio": compress_ratio,
+            "is_mtp_layer": is_mtp_layer,
         }
         self.core_attention = build_module(
             submodules.core_attention,
