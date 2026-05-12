@@ -37,6 +37,7 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,

@@ -8,7 +8,11 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
+from megatron.core.transformer.moe.moe_utils import (
+    get_default_pg_collection,
+    get_updated_expert_bias,
+    router_gating_linear,
+)
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig

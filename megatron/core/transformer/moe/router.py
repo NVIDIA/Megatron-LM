@@ -176,29 +176,23 @@ class TopKRouter(Router):
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
 
-        if self.config.moe_n_hash_layers > 0:
-            assert layer_number is not None, "layer_number is required for the hash-based router."
+        # Hash-router buffers depend on layer_number, which may be set after
+        # construction via set_layer_number(). Initialize lazily in that case.
         self.is_hash_layer = (
             not self.is_mtp_layer
             and self.config.moe_n_hash_layers > 0
+            and layer_number is not None
             and layer_number <= self.config.moe_n_hash_layers
         )
         if self.is_hash_layer:
-            # DSv4-Pro ships a pre-trained tid2eid table in its inference checkpoint;
-            # no public initialization recipe is documented. Round-robin is used here
-            # only as a placeholder so the layer is runnable from scratch.
-            vocab_size = self.config.actual_vocab_size
-            num_experts = self.config.num_moe_experts
-            ids = torch.arange(vocab_size, device=torch.cuda.current_device())
-            tid2eid = torch.stack([(ids + k) % num_experts for k in range(self.topk)], dim=1).to(
-                torch.int32
-            )
-            self.register_buffer('tid2eid', tid2eid)
+            self._init_hash_layer_buffers()
         else:
             self.tid2eid = None
 
-        self.enable_expert_bias = (
-            self.config.moe_router_enable_expert_bias and not self.is_hash_layer
+        self.enable_expert_bias = self.config.moe_router_enable_expert_bias and not (
+            self.config.moe_n_hash_layers > 0
+            and not self.is_mtp_layer
+            and (layer_number is None or layer_number <= self.config.moe_n_hash_layers)
         )
         if self.enable_expert_bias:
             self.register_buffer(
@@ -245,6 +239,35 @@ class TopKRouter(Router):
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
+
+    def _init_hash_layer_buffers(self):
+        """Register the hash-router lookup table once `layer_number` is known."""
+        # DSv4-Pro ships a pre-trained tid2eid table in its inference checkpoint;
+        # no public initialization recipe is documented. Round-robin is used here
+        # only as a placeholder so the layer is runnable from scratch.
+        vocab_size = self.config.actual_vocab_size
+        num_experts = self.config.num_moe_experts
+        ids = torch.arange(vocab_size, device=torch.cuda.current_device())
+        tid2eid = torch.stack([(ids + k) % num_experts for k in range(self.topk)], dim=1).to(
+            torch.int32
+        )
+        # Drop any placeholder attribute set by __init__ so register_buffer can claim the name.
+        if hasattr(self, 'tid2eid') and 'tid2eid' not in self._buffers:
+            del self.tid2eid
+        self.register_buffer('tid2eid', tid2eid)
+
+    def set_layer_number(self, layer_number: int):
+        """Set the layer number for the router, initializing hash buffers if needed."""
+        super().set_layer_number(layer_number)
+        if (
+            not self.is_hash_layer
+            and not self.is_mtp_layer
+            and self.config.moe_n_hash_layers > 0
+            and layer_number is not None
+            and layer_number <= self.config.moe_n_hash_layers
+        ):
+            self.is_hash_layer = True
+            self._init_hash_layer_buffers()
 
     def _maintain_float32_expert_bias(self):
         """

@@ -279,6 +279,7 @@ class TransformerLayerSubmodules:
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_mlp_layernorm: LayerNormBuilder = IdentityOp
+    mlp_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     mlp: MlpBuilder | type[IdentityOp] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
@@ -834,7 +835,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
+                    functools.partial(
+                        apply_module(self.mlp), padding_mask=padding_mask, **moe_kwargs
+                    ),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -866,7 +869,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask
+                pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
             )
 
         nvtx_range_pop(suffix="mlp")
