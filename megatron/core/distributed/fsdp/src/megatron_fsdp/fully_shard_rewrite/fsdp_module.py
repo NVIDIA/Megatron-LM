@@ -1,6 +1,7 @@
 """FSDPModule implementation for the Megatron-FSDP fully_shard rewrite path."""
 
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -143,7 +144,7 @@ class FSDPModule(nn.Module):
                     ignored_modules.add(child_submodule)
 
         # Materialize meta parameters to actual device
-        self._materialize_meta_module(ignored_modules, mesh=mesh)
+        self._materialize_meta_module(ignored_modules, mesh=mesh, mp_policy=mp_policy)
 
         # Create parameter groups
         fsdp_param_groups = _get_module_fsdp_param_groups(
@@ -198,7 +199,10 @@ class FSDPModule(nn.Module):
                 param.get_main_grad = main_grad_getter.__get__(param)
 
     def _materialize_meta_module(
-        self, ignored_modules: set, mesh: Optional[DeviceMesh] = None
+        self,
+        ignored_modules: set,
+        mesh: Optional[DeviceMesh] = None,
+        mp_policy: Optional[FullyShardMixedPrecisionPolicy] = None,
     ):
         """
         Materialize meta parameters to actual device and initialize.
@@ -220,14 +224,16 @@ class FSDPModule(nn.Module):
                 lambda t: torch.empty_like(t, device=materialization_device) if t.is_meta else t,
                 recurse=False,
             )
-            if hasattr(m, "reset_parameters"):
-                m.reset_parameters()
-            elif hasattr(m, "_reset_parameters"):
-                m._reset_parameters()
-            else:
-                raise ValueError(
-                    f"Module {name} contains meta parameters but cannot reset them"
-                )
+            init_context = mp_policy.model_init_context() if mp_policy is not None else nullcontext()
+            with init_context:
+                if hasattr(m, "reset_parameters"):
+                    m.reset_parameters()
+                elif hasattr(m, "_reset_parameters"):
+                    m._reset_parameters()
+                else:
+                    raise ValueError(
+                        f"Module {name} contains meta parameters but cannot reset them"
+                    )
 
         if mesh is not None and mesh.size() > 1:
             dp_group = mesh.get_group()
@@ -417,10 +423,19 @@ class FSDPModule(nn.Module):
             for name, param, dist_param, dist_grad in zip(
                 param_names, param_group.params, param_group.dist_params, param_group.dist_grads
             ):
-                if param.requires_grad and dist_grad is not None:
-                    with torch.cuda.stream(stream):
-                        dist_grad = dist_grad.to(dist_param.dtype)
+                if not param.requires_grad:
+                    continue
+                if param_group.mp_policy.use_decoupled_grad:
+                    setattr(dist_param, "decoupled_grad", dist_grad)
+                    if dist_param.grad is not None:
+                        del dist_param.grad
+                else:
+                    if dist_grad is not None:
+                        with torch.cuda.stream(stream):
+                            dist_grad = dist_grad.to(dist_param.dtype)
                     setattr(dist_param, "grad", dist_grad)
+                    if hasattr(dist_param, "decoupled_grad"):
+                        dist_param.decoupled_grad = None
 
             if async_op:
                 event = stream.record_event()
@@ -462,6 +477,8 @@ class FSDPModule(nn.Module):
                 for dist_param in param_group.dist_params:
                     if dist_param.grad is not None:
                         del dist_param.grad
+                    if hasattr(dist_param, "decoupled_grad"):
+                        dist_param.decoupled_grad = None
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
@@ -469,9 +486,7 @@ class FSDPModule(nn.Module):
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                if param_group.main_weight_buffer is None:
-                    continue
-                param_group.model_weight_buffer.data.copy_(param_group.main_weight_buffer.data)
+                param_group.copy_main_weights_to_model_weights()
 
     def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
         """
@@ -663,8 +678,10 @@ def _get_module_fsdp_param_groups(
         if ignored_params is not None and param in ignored_params:
             continue
 
-        # Group by (device, dtype, requires_grad)
-        param_attrs = (param.device, param.dtype, param.requires_grad)
+        # The policy owns dtype-sensitive grouping, including FP8/MXFP8 tensors
+        # whose logical dtype may differ from their communication payload.
+        param_dtype = mp_policy.group_key_dtype(param)
+        param_attrs = (param.device, param_dtype, param.requires_grad)
         if param_attrs not in param_groups:
             param_groups[param_attrs] = []
         param_groups[param_attrs].append(param)

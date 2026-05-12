@@ -162,22 +162,60 @@ class TestMegatronFSDPE2E:
                     use_fully_shard_api=True,
                 ),
                 id="optim_grads_params_double_buffer",
-            )
+            ),
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    fp8_recipe="mxfp8",
+                    main_grads_dtype="fp32",
+                    main_params_dtype="fp32",
+                    exp_avg_dtype="bf16",
+                    exp_avg_sq_dtype="bf16",
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
+                    use_fully_shard_api=True,
+                    use_precision_aware_optimizer=True,
+                ),
+                id="optim_grads_params_mxfp8_param_gather_pao",
+            ),
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
         if spec_configs.get("fp8_recipe") == "mxfp8" and (
-            torch.cuda.get_device_capability()[0] < 10 or not HAVE_TE_MXFP8TENSOR
+            not torch.cuda.is_available()
+            or torch.cuda.get_device_capability()[0] < 10
+            or not HAVE_TE_MXFP8TENSOR
         ):
             pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
 
-        nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
-        if nd_topology_str not in ref_cache:
-            distopt_spec_configs = copy.deepcopy(spec_configs)
-            distopt_spec_configs["fp8_param_gather"] = False
-            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                use_distributed_optimizer=True, **distopt_spec_configs
-            )
+        reference_kind = "fsdp_v1" if spec_configs.get("fp8_param_gather") else "distopt"
+        ref_cache_key = (
+            reference_kind,
+            tuple(sorted(nd_topology.items())),
+            tuple(sorted((key, repr(value)) for key, value in spec_configs.items())),
+        )
+        if ref_cache_key not in ref_cache:
+            reference_spec_configs = copy.deepcopy(spec_configs)
+            if reference_kind == "fsdp_v1":
+                reference_spec_configs["use_fully_shard_api"] = False
+                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
+                    use_megatron_fsdp=True,
+                    init_model_with_meta_device=True,
+                    ckpt_format="fsdp_dtensor",
+                    gradient_accumulation_fusion=False,
+                    **reference_spec_configs,
+                )
+            else:
+                reference_spec_configs["fp8_param_gather"] = False
+                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
+                    use_distributed_optimizer=True, **reference_spec_configs
+                )
 
         outputs = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
@@ -186,7 +224,7 @@ class TestMegatronFSDPE2E:
             gradient_accumulation_fusion=False,
             **spec_configs,
         )
-        reference_outputs = ref_cache[nd_topology_str]
+        reference_outputs = ref_cache[ref_cache_key]
 
         if torch.distributed.get_rank() == 0:
             for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):

@@ -1,4 +1,5 @@
 import dataclasses
+from typing import Tuple, Union
 
 import torch
 
@@ -11,7 +12,7 @@ class Bucket:
 
 
 class TemporaryBucketAllocator:
-    """Manages temporary flat buffers keyed by param_group_id.
+    """Manages temporary flat buffers keyed by parameter group and buffer role.
 
     Used by DataParallelBuffer for unshard (all-gather) and gradient
     reduction (reduce-scatter) operations.
@@ -21,18 +22,20 @@ class TemporaryBucketAllocator:
         self.buckets = {}
 
     def allocate(
-        self, param_group_id: ParamGroupIdx, size: int, dtype: torch.dtype, device: torch.device
+        self,
+        key: Union[ParamGroupIdx, Tuple[ParamGroupIdx, str]],
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
     ) -> Bucket:
-        if param_group_id not in self.buckets:
-            self.buckets[param_group_id] = Bucket(
-                data=torch.empty(size, dtype=dtype, device=device)
-            )
-        return self.buckets[param_group_id]
+        if key not in self.buckets:
+            self.buckets[key] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
+        return self.buckets[key]
 
-    def free(self, param_group_id: ParamGroupIdx) -> None:
-        if param_group_id in self.buckets:
-            _free_storage(self.buckets[param_group_id].data)
-            del self.buckets[param_group_id]
+    def free(self, key: Union[ParamGroupIdx, Tuple[ParamGroupIdx, str]]) -> None:
+        if key in self.buckets:
+            _free_storage(self.buckets[key].data)
+            del self.buckets[key]
 
 
 def _free_storage(tensor: torch.Tensor):
