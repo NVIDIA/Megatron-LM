@@ -1320,6 +1320,14 @@ class TextGenerationController:
         # need to re-pad here.
         required_logit_indices = context.speculative_required_logit_indices()
         pending_forward_logit_indices = required_logit_indices
+        if row_indices is not None:
+            stride = self.num_speculative_tokens + 1
+            pending_forward_logit_indices = (
+                row_indices.to(required_logit_indices.dtype).unsqueeze(1) * stride
+                + torch.arange(
+                    stride, device=row_indices.device, dtype=required_logit_indices.dtype
+                ).unsqueeze(0)
+            ).reshape(-1)
 
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.
@@ -1327,25 +1335,17 @@ class TextGenerationController:
             sample_logits = required_logits
             sample_gather_indices = None
             if row_indices is not None:
-                stride = self.num_speculative_tokens + 1
                 required_logits = (
                     required_logits.view(-1, stride, self.vocab_size)
                     .index_select(0, row_indices)
                     .reshape(-1, self.vocab_size)
                 )
-                pending_forward_logit_indices = (
-                    row_indices.to(required_logit_indices.dtype).unsqueeze(1) * stride
-                    + torch.arange(
-                        stride, device=row_indices.device, dtype=required_logit_indices.dtype
-                    ).unsqueeze(0)
-                ).reshape(-1)
                 sample_logits = required_logits
         else:
-            assert row_indices is None, "row-mapped MTP async reuse requires last-token logits"
             sample_logits = logits.squeeze(0)
-            sample_gather_indices = required_logit_indices
+            sample_gather_indices = pending_forward_logit_indices
             required_logits = logits.squeeze(0)[
-                required_logit_indices, :
+                pending_forward_logit_indices, :
             ]  # Shape [num_required, vocab_size]
         nvtx_range_pop("mtp-spec-decoding/verify/logit-indices")
 
@@ -2406,14 +2406,13 @@ class TextGenerationController:
         logits = self._all_logits_cuda
         logits_squeezed = logits.squeeze(0).float()
         if row_indices is not None:
-            assert only_last, "row-mapped MTP async reuse requires last-token logits"
             stride = self.num_speculative_tokens + 1
             logits_squeezed = (
                 logits_squeezed.view(-1, stride, self.vocab_size)
                 .index_select(0, row_indices)
                 .reshape(-1, self.vocab_size)
             )
-        if only_last:
+        if only_last or row_indices is not None:
             log_probs_tensor = F.log_softmax(logits_squeezed, dim=-1)
         else:
             log_probs_tensor = F.log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
