@@ -1,6 +1,4 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
-from functools import partial
-
 import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -172,8 +170,8 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
             mlp_layer=ModuleSpec(
                 module=MLPLayer,
                 submodules=TransformerLayerSubmodules(
-                    mlp=partial(
-                        MLP.as_mlp_submodule,
+                    mlp=ModuleSpec(
+                        module=MLP,
                         submodules=MLPSubmodules(
                             linear_fc1=not_none(TELayerNormColumnParallelLinear),
                             linear_fc2=not_none(TERowParallelLinear),
@@ -186,10 +184,10 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
     )
 
 
-def get_mlp_module_spec(use_te: bool = True):
+def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.
-    return partial(
-        MLP.as_mlp_submodule,
+    return ModuleSpec(
+        module=MLP,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
             linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
@@ -197,9 +195,9 @@ def get_mlp_module_spec(use_te: bool = True):
     )
 
 
-def get_norm_mlp_module_spec_te():
-    return partial(
-        MLP.as_mlp_submodule,
+def get_norm_mlp_module_spec_te() -> ModuleSpec:
+    return ModuleSpec(
+        module=MLP,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TELayerNormColumnParallelLinear),
             linear_fc2=not_none(TERowParallelLinear),

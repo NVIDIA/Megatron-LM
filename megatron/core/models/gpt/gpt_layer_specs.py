@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import warnings
-from functools import partial
 from typing import Optional, Union
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -37,12 +36,12 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
-    MlpBuilder,
+    HyperConnectionTransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
-from megatron.core.typed_torch import copy_signature, not_none
+from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
@@ -514,7 +513,7 @@ def get_mlp_module_spec(
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     use_te_op_fuser: Optional[bool] = False,
-) -> MlpBuilder:
+) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
     if fp8 is not None:
         warnings.warn(
@@ -545,7 +544,8 @@ def get_mlp_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
-) -> MlpBuilder:
+    dense_grouped_gemm: bool = False,
+) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
 
     linear_fc2 = backend.row_parallel_linear()
@@ -553,14 +553,19 @@ def get_mlp_module_spec_for_backend(
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        module = not_none(TEFusedMLP).as_mlp_submodule if use_te_op_fuser else MLP.as_mlp_submodule
+        if dense_grouped_gemm and use_te_op_fuser:
+            module = TEFusedDenseMLP
+        elif use_te_op_fuser:
+            module = TEFusedMLP
+        else:
+            module = MLP
         if backend.fuse_layernorm_and_linear():
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
         else:
             linear_fc1 = backend.column_parallel_linear()
-        return partial(
-            module,
+        return ModuleSpec(
+            module=module,
             submodules=MLPSubmodules(
                 linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
             ),

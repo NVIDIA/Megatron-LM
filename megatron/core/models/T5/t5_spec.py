@@ -1,6 +1,4 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from functools import partial
-
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -71,8 +69,8 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            mlp=partial(
-                MLP.as_mlp_submodule,
+            mlp=ModuleSpec(
+                module=MLP,
                 submodules=MLPSubmodules(
                     linear_fc1=not_none(TELayerNormColumnParallelLinear),
                     linear_fc2=not_none(TERowParallelLinear),
@@ -113,8 +111,8 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 ),
             ),
             cross_attn_bda=get_bias_dropout_add,
-            mlp=partial(
-                MLP.as_mlp_submodule,
+            mlp=ModuleSpec(
+                module=MLP,
                 submodules=MLPSubmodules(
                     linear_fc1=not_none(TELayerNormColumnParallelLinear),
                     linear_fc2=not_none(TERowParallelLinear),
@@ -145,8 +143,8 @@ def encoder_model_with_local_spec() -> ModuleSpec:
             ),
             self_attn_bda=get_bias_dropout_add,
             pre_mlp_layernorm=LNImpl,
-            mlp=partial(
-                MLP.as_mlp_submodule,
+            mlp=ModuleSpec(
+                module=MLP,
                 submodules=MLPSubmodules(
                     linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
                 ),
@@ -192,8 +190,8 @@ def decoder_model_with_local_spec() -> ModuleSpec:
             ),
             cross_attn_bda=get_bias_dropout_add,
             pre_mlp_layernorm=LNImpl,
-            mlp=partial(
-                MLP.as_mlp_submodule,
+            mlp=ModuleSpec(
+                module=MLP,
                 submodules=MLPSubmodules(
                     linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
                 ),

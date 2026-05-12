@@ -1,5 +1,4 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
-from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -171,8 +170,8 @@ hybrid_stack_spec = ModuleSpec(
         mlp_layer=ModuleSpec(
             module=MLPLayer,
             submodules=TransformerLayerSubmodules(
-                mlp=partial(
-                    MLP.as_mlp_submodule,
+                mlp=ModuleSpec(
+                    module=MLP,
                     submodules=MLPSubmodules(
                         linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
                     ),
@@ -266,8 +265,8 @@ hybrid_inference_stack_spec = ModuleSpec(
         mlp_layer=ModuleSpec(
             module=MLPLayer,
             submodules=TransformerLayerSubmodules(
-                mlp=partial(
-                    MLP.as_mlp_submodule,
+                mlp=ModuleSpec(
+                    module=MLP,
                     submodules=MLPSubmodules(
                         linear_fc1=InferenceLayerNormColumnParallelLinear,
                         linear_fc2=InferenceRowParallelLinear,

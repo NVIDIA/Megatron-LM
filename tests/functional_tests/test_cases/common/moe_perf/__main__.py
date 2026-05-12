@@ -20,9 +20,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import RandomSTE
-from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.training.initialize import _set_random_seed
@@ -87,12 +86,10 @@ def _build_transformer_config(case: MoEPerformanceCase) -> TransformerConfig:
 
 
 # NOTE: Only TE backend is covered in this test.
-def _resolve_moe_submodules(case: MoEPerformanceCase) -> MoESubmodules:
-    return get_submodules(
-        get_gpt_layer_with_transformer_engine_submodules(
-            num_experts=case.model.num_experts, moe_grouped_gemm=True
-        ).mlp
-    )
+def _resolve_moe_submodules(case: MoEPerformanceCase):
+    return get_gpt_layer_with_transformer_engine_submodules(
+        num_experts=case.model.num_experts, moe_grouped_gemm=True
+    ).mlp.submodules
 
 
 def _load_baselines() -> Dict[str, Dict[str, float]]:

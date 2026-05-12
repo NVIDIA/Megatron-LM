@@ -9,8 +9,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.spec_utils import get_submodules
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -45,13 +44,10 @@ class TestMoELayerInit:
             moe_ffn_hidden_size=128,
             add_bias_linear=False,
         )
-        submodules = get_submodules(
-            get_gpt_layer_with_transformer_engine_submodules(
-                num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
-            ).mlp
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
-        assert isinstance(submodules, MoESubmodules)
-        moe_layer = MoELayer(self.transformer_config, submodules)
+        moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules)
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
@@ -74,13 +70,10 @@ class TestMoELayerInit:
             moe_grouped_gemm=grouped_gemm,
             add_bias_linear=False,
         )
-        submodules = get_submodules(
-            get_gpt_layer_local_submodules(
-                num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
-            ).mlp
+        transformer_layer_submodules = get_gpt_layer_local_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
-        assert isinstance(submodules, MoESubmodules)
-        moe_layer = MoELayer(self.transformer_config, submodules)
+        moe_layer = MoELayer(self.transformer_config, transformer_layer_submodules.mlp.submodules)
         Utils.destroy_model_parallel()
 
     @pytest.mark.skip(
@@ -112,18 +105,15 @@ class TestMoELayerInit:
             bf16=True,
             params_dtype=torch.bfloat16,
         )
-        submodules = get_submodules(
-            get_gpt_layer_with_transformer_engine_submodules(
-                num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
-            ).mlp
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
-        assert isinstance(submodules, MoESubmodules)
 
         # Fake initialization as NeMo does
         Utils.fake_initialize_model_parallel(
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
         )
-        moe_layer = MoELayer(transformer_config, submodules).cuda()
+        moe_layer = MoELayer(transformer_config, submodules.mlp.submodules).cuda()
 
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
@@ -239,12 +229,11 @@ class TestMoELayerFP16:
             params_dtype=torch.float16,
         )
 
-        submodules = get_submodules(
-            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        assert isinstance(submodules, MoESubmodules)
 
-        moe_layer = MoELayer(transformer_config, submodules).cuda()
+        moe_layer = MoELayer(transformer_config, submodules.mlp.submodules).cuda()
 
         hidden_states = torch.randn(
             sequence_length,
@@ -343,20 +332,15 @@ class TestMoELayerRecompute:
 
         # Use TE spec for fp8, local spec otherwise
         if fp8:
-            submodules = get_submodules(
-                get_gpt_layer_with_transformer_engine_submodules(
-                    num_experts=num_moe_experts, moe_grouped_gemm=False
-                ).mlp
+            transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
+                num_experts=num_moe_experts, moe_grouped_gemm=False
             )
         else:
-            submodules = get_submodules(
-                get_gpt_layer_local_submodules(
-                    num_experts=num_moe_experts, moe_grouped_gemm=False
-                ).mlp
+            transformer_layer_submodules = get_gpt_layer_local_submodules(
+                num_experts=num_moe_experts, moe_grouped_gemm=False
             )
-        assert isinstance(submodules, MoESubmodules)
 
-        moe_layer = MoELayer(transformer_config, submodules).cuda()
+        moe_layer = MoELayer(transformer_config, transformer_layer_submodules.mlp.submodules).cuda()
 
         hidden_states = torch.randn(
             sequence_length,

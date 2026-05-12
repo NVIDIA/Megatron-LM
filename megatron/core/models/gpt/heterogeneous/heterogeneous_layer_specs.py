@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from functools import partial
 from typing import Optional
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -129,19 +128,17 @@ def _get_heterogenous_attention_spec(
 
 def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):
     if mlp_config.no_op:
-        return IdentityOp
+        mlp = ModuleSpec(module=IdentityOp)
     elif mlp_config.replace_with_linear:
-        return partial(
-            (
-                not_none(TELayerNormColumnParallelLinearGathered)
-                if use_te
-                else ColumnParallelLinearGathered
+        mlp = ModuleSpec(
+            module=(
+                TELayerNormColumnParallelLinearGathered if use_te else ColumnParallelLinearGathered
             ),
-            tp_comm_buffer_name="linear_mlp",
+            params={"tp_comm_buffer_name": "linear_mlp"},
         )
     else:
-        return partial(
-            MLP.as_mlp_submodule,
+        mlp = ModuleSpec(
+            module=MLP,
             submodules=MLPSubmodules(
                 linear_fc1=(
                     not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
@@ -149,6 +146,7 @@ def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):
                 linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
             ),
         )
+    return mlp
 
 
 def _get_sharded_state_dict_keys_map(block_config: TransformerBlockConfig, use_te: bool):
