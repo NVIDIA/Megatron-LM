@@ -16,7 +16,8 @@ from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
@@ -54,7 +55,8 @@ class TestLLaVAModel:
         vision_layer_spec = ModuleSpec(
             module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
         )
-        vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
+        vision_projection_spec = deepcopy(get_submodules(language_layer_submodules.mlp))
+        assert isinstance(vision_projection_spec, MLPSubmodules)
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
@@ -494,7 +496,7 @@ def setup_and_teardown_llava_model(request):
     vision_layer_spec = ModuleSpec(
         module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
     )
-    vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
+    vision_projection_spec = deepcopy(get_submodules(language_layer_submodules.mlp))
 
     language_config.language_model_type = "dummy"
     vision_model_type = request.param
@@ -604,7 +606,7 @@ class TestLLaVAModelTokenParallel:
         vision_layer_spec = ModuleSpec(
             module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
         )
-        vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
+        vision_projection_spec = deepcopy(get_submodules(language_layer_submodules.mlp))
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
