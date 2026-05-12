@@ -65,11 +65,14 @@ fi
 # squashfs containers are read-only per-srun. Detects TE version and picks
 # the matching subdir under patches/; fails fast if unsupported.
 SETUP_CMD="\
-P=${MEGATRON_PATH}/examples/tp-numerics/patches && \
-TE_VERSION=\$(python3 -c 'import transformer_engine as te; print(te.__version__.split(\"+\")[0])') && \
-PATCH_SRC=\$P/v\${TE_VERSION}/transformer_engine/pytorch && \
-if [ ! -d \$PATCH_SRC ]; then echo \"ERROR: no TP-invariant patches for TE \$TE_VERSION (have: \$(ls \$P | grep ^v | tr '\n' ' '))\"; exit 1; fi && \
-cp -r \$PATCH_SRC/* /opt/venv/lib/python3.12/site-packages/transformer_engine/pytorch/"
+TE_DST=\$(python3 -c 'import transformer_engine.pytorch as p; print(p.__path__[0])') && \
+if ! grep -q NVTE_TP_INVARIANT_MODE \$TE_DST/module/linear.py; then \
+    P=${MEGATRON_PATH}/examples/tp-numerics/patches && \
+    TE_VERSION=\$(python3 -c 'import transformer_engine as te; print(te.__version__.split(\"+\")[0])') && \
+    PATCH_SRC=\$P/v\${TE_VERSION}/transformer_engine/pytorch && \
+    if [ ! -d \$PATCH_SRC ]; then echo \"ERROR: no TP-invariant patches for TE \$TE_VERSION (have: \$(ls \$P | grep ^v | tr '\n' ' '))\"; exit 1; fi && \
+    cp -r \$PATCH_SRC/* \$TE_DST/; \
+fi"
 
 # ---------------------------------------------------------------------------
 # Training command
