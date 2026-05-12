@@ -8,6 +8,7 @@ from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -20,7 +21,7 @@ class TestMultimodalProjector:
         transformer_config = TransformerConfig(
             num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
         )
-        mlp_layer_spec = get_mlp_module_spec().keywords['submodules']
+        mlp_layer_spec = get_submodules(get_mlp_module_spec())
 
         affine_layer_spec = MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=None)
         self.mlp = MultimodalProjector(

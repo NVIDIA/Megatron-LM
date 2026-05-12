@@ -691,10 +691,12 @@ class TestHashRouting:
     def test_moe_layer_hash_routing_integration(self):
         """End-to-end MoELayer forward/backward with hash routing; raises without input_ids."""
         config = _hash_routing_config(moe_n_hash_layers=1)
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=config.num_moe_experts, moe_grouped_gemm=False
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(
+                num_experts=config.num_moe_experts, moe_grouped_gemm=False
+            ).mlp
         )
-        moe_layer = MoELayer(config, submodules.mlp.submodules, layer_number=1).cuda()
+        moe_layer = MoELayer(config, submodules, layer_number=1).cuda()
 
         hidden_states = torch.randn(8, 2, 16, device="cuda", requires_grad=True)
         input_ids = torch.randint(0, 128, (2, 8), device="cuda")

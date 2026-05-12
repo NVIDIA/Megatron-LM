@@ -406,30 +406,50 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
         # [Module 8: MLP block]
+        additional_mlp_kwargs = {}
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TEFusedMLP
+        from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
         # We can change MLP to accept pg_collection but it makes the logic implicit
         # The conditional below is to make the logic explicit
-        # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
-        if isinstance(submodules.mlp, ModuleSpec) and submodules.mlp.module in (MLP, TEFusedMLP):
-            submodules.mlp = functools.partial(
-                submodules.mlp.module.as_mlp_submodule,
-                submodules=submodules.mlp.submodules,
-                **submodules.mlp.params,
+        # `MlpBuilder` Protocol callables (functools.partial, plain functions) encapsulate
+        # the submodules/params and accept config/pg_collection/is_mtp_layer directly. For
+        # ModuleSpec entries we still dispatch through build_module with type-specific kwargs.
+        if isinstance(submodules.mlp, functools.partial) or (
+            not isinstance(submodules.mlp, (ModuleSpec, type)) and callable(submodules.mlp)
+        ):
+            self.mlp = submodules.mlp(
+                config=self.config, pg_collection=pg_collection, is_mtp_layer=self.is_mtp_layer
             )
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                f"Rewrapping ModuleSpec with module {type(submodules.mlp)} to forward kwargs. "
-                "Consider migrating the `mlp` submodule spec to a direct call of the "
-                "`as_mlp_submodule` classmethod instead.",
-            )
-        self.mlp = submodules.mlp(
-            config=self.config, pg_collection=pg_collection, is_mtp_layer=self.is_mtp_layer
-        )
+        else:
+            if isinstance(submodules.mlp, ModuleSpec):
+                if submodules.mlp.module in (MoELayer, TEGroupedMLP, SequentialMLP):
+                    additional_mlp_kwargs["pg_collection"] = pg_collection
+                    if submodules.mlp.module == MoELayer:
+                        # Pass is_mtp_layer flag to MoELayer to distinguish MTP MoE layers.
+                        additional_mlp_kwargs["is_mtp_layer"] = self.is_mtp_layer
+                        # Pass layer number to MoELayer for router configuration.
+                        additional_mlp_kwargs["layer_number"] = self.layer_number
+                elif submodules.mlp.module == MLP:
+                    assert hasattr(
+                        pg_collection, 'tp'
+                    ), 'TP process group is required for MLP in TransformerLayer'
+                    additional_mlp_kwargs["tp_group"] = pg_collection.tp
+                elif TEFusedMLP is not None and submodules.mlp.module == TEFusedMLP:
+                    assert hasattr(
+                        pg_collection, 'tp'
+                    ), 'TP process group is required for TEFusedMLP in TransformerLayer'
+                    additional_mlp_kwargs["tp_group"] = pg_collection.tp
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        f"Unknown MLP type: {type(submodules.mlp)}. Using default kwargs.",
+                    )
+            self.mlp = build_module(submodules.mlp, config=self.config, **additional_mlp_kwargs)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 

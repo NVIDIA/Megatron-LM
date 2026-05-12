@@ -38,7 +38,6 @@ from megatron.core.transformer.transformer_block import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
-    MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
@@ -285,18 +284,14 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         moe_layer_pattern = [0] * config.num_layers
 
     if 1 in moe_layer_pattern:
-        moe_layer_spec, fuse_layernorm_pre_moe = _get_moe_module_spec(
-            config=config, backend=backend
-        )
+        moe_layer_spec = _get_moe_module_spec(config=config, backend=backend)
     else:
-        moe_layer_spec, fuse_layernorm_pre_moe = None, False
+        moe_layer_spec = None
 
     if 0 in moe_layer_pattern:
-        dense_mlp_layer_spec, fuse_layernorm_pre_dense = _get_dense_mlp_module_spec(
-            config=config, backend=backend
-        )
+        dense_mlp_layer_spec = _get_dense_mlp_module_spec(config=config, backend=backend)
     else:
-        dense_mlp_layer_spec, fuse_layernorm_pre_dense = None, False
+        dense_mlp_layer_spec = None
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
@@ -312,11 +307,6 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
             else standard_attention_spec
         )
         mlp = moe_layer_spec if moe_layer_pattern[layer_number] == 1 else dense_mlp_layer_spec
-        fuse_pre_mlp_layernorm = (
-            fuse_layernorm_pre_moe
-            if moe_layer_pattern[layer_number] == 1
-            else fuse_layernorm_pre_dense
-        )
         input_layernorm = (
             IdentityOp
             if attention.metainfo["fuse_input_layernorm"]
@@ -324,7 +314,7 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         )
         pre_mlp_layernorm = (
             IdentityOp
-            if fuse_pre_mlp_layernorm
+            if mlp.metainfo["fuse_pre_mlp_layernorm"]
             else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         )
 
@@ -535,50 +525,41 @@ def _get_self_attention_module_spec(
 
 def _get_dense_mlp_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
-) -> tuple[MlpBuilder, bool]:
+) -> ModuleSpec:
     """Get dense MLP module spec.
     For hybrid models that mix dense MLP and experimental attention architectures.
 
-    Warning: This function may be deprecated in the future.
-
-    Returns:
-        A tuple of (MLP module spec, whether to fuse pre-MLP layernorm)
-    """
+    Warning: This function may be deprecated in the future."""
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
     from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec_for_backend
 
-    return (
-        get_mlp_module_spec_for_backend(backend=backend, num_experts=None),
-        backend.fuse_layernorm_and_linear(),
-    )
+    mlp_spec = get_mlp_module_spec_for_backend(backend=backend, num_experts=None)
+    mlp_spec.metainfo["fuse_pre_mlp_layernorm"] = backend.fuse_layernorm_and_linear()
+
+    return mlp_spec
 
 
 def _get_moe_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
-) -> tuple[MlpBuilder, bool]:
+) -> ModuleSpec:
     """Get MoE module spec.
     For hybrid models that mix MoE and experimental attention architectures.
 
-    Warning: This function may be deprecated in the future.
-
-    Returns:
-        A tuple of (MoE module spec, whether to fuse pre-MoE layernorm)
-    """
+    Warning: This function may be deprecated in the future."""
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
     from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 
-    return (
-        get_moe_module_spec_for_backend(
-            backend=backend,
-            num_experts=config.num_moe_experts,
-            moe_grouped_gemm=config.moe_grouped_gemm,
-            use_te_activation_func=config.use_te_activation_func,
-        ),
-        False,
+    moe_spec = get_moe_module_spec_for_backend(
+        backend=backend,
+        num_experts=config.num_moe_experts,
+        moe_grouped_gemm=config.moe_grouped_gemm,
+        use_te_activation_func=config.use_te_activation_func,
     )
+    moe_spec.metainfo["fuse_pre_mlp_layernorm"] = False
+    return moe_spec
