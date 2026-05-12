@@ -323,10 +323,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if pg_collection is not None:
             self.expert_model_parallel_group = pg_collection.ep
+            self.expert_tensor_and_model_parallel_group = pg_collection.tp_ep
         elif parallel_state.get_expert_model_parallel_world_size() > 1:
             self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+            self.expert_tensor_and_model_parallel_group = parallel_state.get_expert_tensor_and_model_parallel_group()
         else:
             self.expert_model_parallel_group = None
+            self.expert_tensor_and_model_parallel_group = None  
+
 
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
@@ -602,14 +606,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # are we using the inference_optimized nccl ep dispatcher for MoEs?
         self._nccl_ep_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
         # are we using the training a2a dispatcher for MoEs?
         # Note that this is not optimal for speed.
         self._training_ep_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
             and model_config.transformer_impl == "transformer_engine"
         )
 
@@ -640,7 +644,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
-        if get_pg_size(self.expert_model_parallel_group) > 1:
+        if get_pg_size(self.expert_tensor_and_model_parallel_group) > 1:
             if self._nccl_ep_dispatcher:
                 NCCLAllGatherDispatcher.allocate_buffers()
             else:
@@ -651,7 +655,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     // tp_size,
                     topk=model_config.moe_router_topk,
                     hidden_size=moe_hidden_size,
-                    ep_group=self.expert_model_parallel_group,
+                    tp_ep_group=self.expert_tensor_and_model_parallel_group,
                 )
 
         # Deal with chunked prefill
@@ -2038,6 +2042,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
+        #todo: fix this for nccl dispatcher.
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
