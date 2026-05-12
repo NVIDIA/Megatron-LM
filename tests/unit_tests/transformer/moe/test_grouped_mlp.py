@@ -564,6 +564,60 @@ def test_backward_dw_falls_back_to_wrappers_when_delay_wgrad_off():
     assert module.linear_fc2.backward_dw_calls == 1
 
 
+@pytest.mark.parametrize(
+    ("dispatcher_type", "flex_backend", "expected"),
+    [
+        ("flex", "hybridep", False),  # the silent-fallback case we're guarding
+        ("flex", "deepep", True),
+        ("alltoall", None, True),
+    ],
+)
+def test_is_fused_impl_supported_rejects_hybridep_dispatcher(
+    monkeypatch, dispatcher_type, flex_backend, expected
+):
+    """Megatron must not hand off to TE's fused op-fuser path under the HybridEP
+    dispatcher: TE silently falls back to basic-op and the differing size
+    contract crashes downstream. Other dispatchers are unaffected."""
+
+    class FakeGroupedLinear(torch.nn.Module):
+        pass
+
+    fake_ops_mod = SimpleNamespace(
+        GroupedLinear=FakeGroupedLinear, ScaledSwiGLU=object, ScaledClampedQGeGLU=object
+    )
+    fake_pytorch_mod = SimpleNamespace(GroupedLinear=FakeGroupedLinear, ops=fake_ops_mod)
+    fake_te = SimpleNamespace(pytorch=fake_pytorch_mod)
+
+    # Bypass TE-installation checks so we reach the HybridEP guard
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda *_a, **_kw: True)
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    # `_is_fused_impl_supported` does `from transformer_engine.pytorch.ops import ...`
+    # which we satisfy via sys.modules.
+    import sys
+
+    monkeypatch.setitem(sys.modules, "transformer_engine", fake_te)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", fake_pytorch_mod)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.ops", fake_ops_mod)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_token_dispatcher_type=dispatcher_type,
+        moe_flex_dispatcher_backend=flex_backend,
+        moe_apply_probs_on_input=False,
+        gated_linear_unit=True,
+    )
+    module.tp_group = SimpleNamespace(size=lambda: 1)
+    module.offload_expert_fc1 = False
+    module.offload_moe_act = False
+    module.linear_fc1 = FakeGroupedLinear()
+    module.linear_fc2 = FakeGroupedLinear()
+    module.activation_func = F.silu
+
+    assert module._is_fused_impl_supported() is expected
+
+
 @pytest.mark.skipif(
     not is_te_min_version("1.9.0.dev0"),
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
@@ -805,3 +859,87 @@ class TestTEGroupedMLP:
                 assert getattr(ops[2], f"weight{idx}") is getattr(
                     experts.linear_fc2, f"weight{idx}"
                 )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_gpu_fused_path_loss_decreases(self):
+        """End-to-end signal that the fused TE op-fuser path actually trains.
+
+        Builds a small grouped-MLP MoE layer with `use_transformer_engine_op_fuser=True`,
+        runs a few SGD steps minimizing `||output||^2`, and asserts the loss decreases
+        and stays finite. This catches regressions where the fused path silently no-ops
+        weight updates (the wgrad-hook plumbing fixed in PR #4311) or where the cached
+        `_fused_ops` view stops aliasing the underlying GroupedLinear weights — failure
+        modes that pass our mock-based unit tests but break real training.
+
+        HybridEP is intentionally not exercised here: `_is_fused_impl_supported()` does
+        not currently gate on HybridEP, and TE's internal fusion pass can silently fall
+        back to the basic-op path under HybridEP, which is tracked separately.
+        """
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        import inspect
+
+        if "single_grouped_weight" not in inspect.signature(GroupedLinear.__init__).parameters:
+            pytest.skip(
+                "Installed TE op fuser GroupedLinear lacks `single_grouped_weight` kwarg"
+            )
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        layer = MoELayer(tf_config, submodules)
+        layer = Float16Module(layer.config, layer).module
+        layer.cuda()
+        assert isinstance(layer.experts, TEGroupedMLP)
+        assert layer.experts._with_fused_impl
+
+        seq_len = 32
+        batch_size = 2
+        torch.manual_seed(7)
+        hidden_states = torch.rand(
+            (seq_len, batch_size, self.hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+        optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
+
+        losses = []
+        for _ in range(8):
+            optimizer.zero_grad(set_to_none=True)
+            output, _ = layer(hidden_states)
+            loss = output.float().pow(2).mean()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.detach().item())
+
+        assert all(
+            l == l and l != float("inf") for l in losses
+        ), f"Fused-path produced non-finite loss: {losses}"
+        assert losses[-1] < losses[0], (
+            f"Fused-path training did not reduce loss: "
+            f"initial={losses[0]:.6f}, final={losses[-1]:.6f}, full={losses}"
+        )
