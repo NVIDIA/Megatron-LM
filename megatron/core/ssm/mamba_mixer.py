@@ -973,21 +973,24 @@ class MambaMixer(MegatronModule):
             tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
 
             # Write intermediate states to pre-allocated output buffers
-            # All tensor ops, no Python loops, fully CUDA graph compatible
+            # All tensor ops, no Python loops, fully CUDA graph compatible.
+            # The destination buffers are sized to the global max_intermediate_count
+            # but we only fill the per-graph-bucket prefix; readers consult
+            # per_request_intermediate_counts to know the real count.
             if intermediate_chunk_indices is not None and intermediate_ssm_out is not None:
-                intermediate_ssm_out.copy_(intermediate_ssm_states)
+                n = intermediate_ssm_states.shape[0]
+                intermediate_ssm_out[:n].copy_(intermediate_ssm_states)
 
                 # Vectorized conv state extraction
-                # intermediate_abs_positions: [max_intermediate_count]
                 # conv_gather_offsets: [d_conv] = [-d_conv, ..., -1]
                 gather_positions = (
                     intermediate_abs_positions.unsqueeze(1).long()
                     + conv_gather_offsets.unsqueeze(0).long()
-                )  # [max_intermediate_count, d_conv]
+                )  # [n, d_conv]
                 intermediate_conv = xBC_pre_conv[0, gather_positions, :]
-                # [max_intermediate_count, d_conv, conv_dim]
-                intermediate_conv_out.copy_(intermediate_conv.transpose(1, 2))
-                # [max_intermediate_count, conv_dim, d_conv]
+                # [n, d_conv, conv_dim]
+                intermediate_conv_out[:n].copy_(intermediate_conv.transpose(1, 2))
+                # [n, conv_dim, d_conv]
         else:
             # Non-dynamic-batching path (static batching)
             initial_ssm_state = None

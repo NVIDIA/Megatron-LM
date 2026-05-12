@@ -348,7 +348,10 @@ class MambaMetadata:
             # This converts per-request token offsets to chunk indices and
             # absolute positions, padded to fixed size for CUDA graph compat.
             self._update_intermediate_metadata(
-                intermediate_offsets_gpu, intermediate_counts_gpu, real_prefill_count
+                intermediate_offsets_gpu,
+                intermediate_counts_gpu,
+                real_prefill_count,
+                padded_prefill_count,
             )
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
@@ -363,6 +366,7 @@ class MambaMetadata:
         intermediate_offsets_gpu: Optional[torch.Tensor],
         intermediate_counts_gpu: Optional[torch.Tensor],
         real_prefill_count: int,
+        padded_prefill_count: int,
         cu_seqlens_gpu: Optional[torch.Tensor] = None,
     ) -> None:
         """Precompute intermediate extraction metadata for CUDA graph compatibility.
@@ -383,7 +387,7 @@ class MambaMetadata:
                 shared ``ContextGPUView.mamba_cu_seqlens`` view.
         """
         chunk_size = self.mamba_chunk_size
-        max_count = self.max_intermediate_count
+        max_count = padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
         if cu_seqlens_gpu is None:
             cu_seqlens_gpu = self._cu_seqlens_buffer
 
@@ -677,6 +681,7 @@ class MambaMetadata:
                 d["intermediate_offsets_gpu"],
                 d["intermediate_counts_gpu"],
                 real_prefill_count,
+                padded_prefill_count,
                 cu_seqlens_gpu=v.mamba_cu_seqlens,
             )
 
