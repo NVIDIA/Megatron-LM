@@ -58,14 +58,57 @@ class AttnBackend(enum.Enum):
     auto = 5
 
 
-class CudaGraphScope(enum.Enum):
-    """Cuda Graph Scope - defines which parts of the model to capture."""
+class CudaGraphModule(enum.Enum):
+    """Named capture regions for per-layer CUDA graphs.
 
-    full_iteration = 1  # Captures the entire training iteration
-    attn = 2  # Captures attention layers
-    mlp = 3  # Captures MLP layers (dense layers only)
-    moe = 4  # Captures MoE layers (drop-and-pad MoE layers only)
-    moe_router = 5  # Captures MoE router part
-    moe_preprocess = 6  # Captures MoE preprocessing part (requires moe_router)
-    mamba = 7  # Captures Mamba layers
-    full_iteration_inference = 8  # Captures the entire inference iteration
+    Whole-layer capture is represented outside this enum by an empty scope. Current per-layer
+    implementations that consume these values are `local` and `transformer_engine`.
+    """
+
+    attn = 1  # Captures attention layers
+    mlp = 2  # Captures MLP layers (dense layers only)
+    moe = 3  # Captures MoE layers (drop-and-pad MoE layers only)
+    moe_router = 4  # Captures MoE router part
+    moe_preprocess = 5  # Captures MoE preprocessing part (requires moe_router)
+    mamba = 6  # Captures Mamba layers
+
+
+# Deprecated: use CudaGraphModule instead. Retained only for checkpoint backward compat.
+class CudaGraphScope(enum.Enum):
+    """Deprecated predecessor of CudaGraphModule.
+
+    Preserved as a standalone class (not an alias) so that pre-refactor checkpoints that
+    stored CudaGraphScope enum instances can be deserialized correctly. The original ordinals
+    differ from CudaGraphModule (full_iteration=1, attn=2, …), so a simple alias would
+    silently reconstruct enum members with the wrong identity.
+
+    Do NOT use in new code. Migration guide:
+    - full_iteration → cuda_graph_impl="full_iteration"
+    - full_iteration_inference → inference_cuda_graph_scope=InferenceCudaGraphScope.block
+    - all other members → equivalent CudaGraphModule member
+    """
+
+    full_iteration = 1
+    attn = 2
+    mlp = 3
+    moe = 4
+    moe_router = 5
+    moe_preprocess = 6
+    mamba = 7
+    full_iteration_inference = 8
+
+
+class InferenceCudaGraphScope(enum.Enum):
+    """Inference CUDA graph scope.
+
+    This controls the ownership boundary for inference CUDA graphs:
+    - none: inference runs without CUDA graphs.
+    - layer: graphs are owned at the module/layer boundary. This name
+      does not by itself imply any finer-grained replay contract within the layer.
+    - block: graphs are owned by the enclosing block rather than
+      individual modules.
+    """
+
+    none = 1
+    layer = 2
+    block = 3
