@@ -27,7 +27,6 @@ MODEL_ARGS:
   --enable-hyper-connections: true
   --num-residual-streams: 4
   --mhc-sinkhorn-iterations: 20
-  --use-fused-mhc: true
   --mtp-num-layers: 1
   --mtp-loss-scaling-factor: 0.1
   --pipeline-model-parallel-layout: "Et|t|t|tmL"
@@ -62,7 +61,7 @@ MODEL_ARGS:
   --eval-interval: 1000
   --eval-iters: 10
   --transformer-impl: transformer_engine
-  --tensor-model-parallel-size: 2
+  --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 2
   --sequence-parallel: true
   --untie-embeddings-and-output-weights: true
