@@ -774,12 +774,13 @@ class TestTEGroupedMLP:
             use_transformer_engine_op_fuser=True,
         )
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        layer = MoELayer(
-            tf_config,
+        submodules = get_submodules(
             get_gpt_layer_with_transformer_engine_submodules(
                 self.num_experts, moe_grouped_gemm=True
-            ).mlp.submodules,
+            ).mlp
         )
+        assert isinstance(submodules, MoESubmodules)
+        layer = MoELayer(tf_config, submodules)
         layer = Float16Module(layer.config, layer).module
         layer.cuda()
         experts = layer.experts
