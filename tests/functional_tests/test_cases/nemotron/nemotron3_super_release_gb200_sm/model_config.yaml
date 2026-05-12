@@ -3,7 +3,7 @@ ENV_VARS:
   NVTE_BWD_LAYERNORM_SM_MARGIN: 16
   TORCHINDUCTOR_WORKER_START: fork
   QUANTIZATION_TYPE_DEBUG: 1
-  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 64
   USE_MNNVL: 1
 TEST_TYPE: "release"
@@ -25,24 +25,24 @@ MODEL_ARGS:
 
   # Training args
   --micro-batch-size: 1
-  --global-batch-size: 3072
+  --global-batch-size: 512
   --train-samples: 12207031
   --cross-entropy-loss-fusion: true
   --cross-entropy-fusion-impl: native
   --attention-backend: flash
   --enable-cuda-graph: true
-  --cuda-graph-scope: mamba attn moe_router
+  --cuda-graph-scope: "[mamba attn]"
   --te-rng-tracker: true
   --manual-gc: true
   --manual-gc-interval: 10
   --no-create-attention-mask-in-dataloader: true
   --num-workers: 1
-  --exit-interval: 51000
+  --exit-interval: 4768
   --override-opt_param-scheduler: true
 
   # Network size args
   --use-mcore-models: true
-  --spec: megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
   --is-hybrid-model: true
   --mamba-num-heads: 128
   --num-layers: 88
@@ -87,10 +87,8 @@ MODEL_ARGS:
   --moe-permute-fusion: true
   --moe-latent-size: 1024
   --moe-shared-expert-intermediate-size: 5376
-  --moe-shared-expert-compute-before-router: true
 
   # MTP args
-  --mtp-spec: megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
   --mtp-num-layers: 2
   --mtp-hybrid-override-pattern: \"*E\"
   --calculate-per-token-loss: true
@@ -98,10 +96,7 @@ MODEL_ARGS:
 
   # Mixed precision / quantization args
   --bf16: true
-  --keep-mtp-spec-in-bf16: true
-  --keep-mamba-stack-attention-linear-in-bf16: true
-  --keep-mamba-out-proj-in-mxfp8: true
-  --keep-moe-latent-projections-in-bf16: true
+  --te-precision-config-file: /mnt/artifacts/model/nemotron3_super_release_gb200/te_quant.cfg
   --first-last-layers-bf16: true
   --num-layers-at-start-in-bf16: 0
   --num-layers-at-end-in-bf16: 14
@@ -134,15 +129,15 @@ MODEL_ARGS:
   --ckpt-assume-constant-structure: true
   --async-save: true
   --use-persistent-ckpt-worker: true
-  --save-interval: 1000
-  --save-retain-interval: 5000
+  --save-interval: 100
+  --save-retain-interval: 2000
 
   # Validation args
-  --eval-interval: 1000
+  --eval-interval: 100
   --eval-iters: 14
 
   # Logging args
-  --log-interval: 100
+  --log-interval: 10
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-timers-to-tensorboard: true
@@ -150,10 +145,10 @@ MODEL_ARGS:
   --log-throughput: true
   --log-progress: true
   --log-energy: true
-  --log-memory-interval: 500
+  --log-memory-interval: 50
   --logging-level: 20
   --timing-log-option: minmax
-  --check-weight-hash-across-dp-replicas-interval: 20000
+  --check-weight-hash-across-dp-replicas-interval: 2000
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
   --wandb-entity: adlr
