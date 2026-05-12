@@ -789,24 +789,13 @@ def get_gpt_mtp_block_spec_for_backend(
 
     transformer_layer_spec.submodules = copy.copy(transformer_layer_spec.submodules)
 
-    # MTP does not support hyper connections yet; strip HC modules and
-    # downgrade the layer class to plain TransformerLayer.
-    transformer_layer_spec.submodules.self_attention_hyper_connection = IdentityOp
-    transformer_layer_spec.submodules.cross_attention_hyper_connection = IdentityOp
-    transformer_layer_spec.submodules.mlp_hyper_connection = IdentityOp
-    if transformer_layer_spec.module is HyperConnectionTransformerLayer:
-        transformer_layer_spec.module = TransformerLayer
-    # Defensive postcondition: a future spec extension that adds another HC
-    # field would silently slip past the explicit assignments above. Verify
-    # the final submodules object contains no remaining HC references so MTP
-    # never accidentally builds an HC-enabled layer.
-    assert transformer_layer_spec.submodules.self_attention_hyper_connection is IdentityOp
-    assert transformer_layer_spec.submodules.cross_attention_hyper_connection is IdentityOp
-    assert transformer_layer_spec.submodules.mlp_hyper_connection is IdentityOp
-    assert transformer_layer_spec.module is not HyperConnectionTransformerLayer
-
+    # MTP supports mHC natively via per-stream e_proj/h_proj projections and
+    # the learned per-depth output contraction. Pass the flag through so the
+    # MTP layer spec is built with the appropriate per-stream submodules.
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
-        mtp_model_layer_spec=transformer_layer_spec, backend=backend
+        mtp_model_layer_spec=transformer_layer_spec,
+        backend=backend,
+        enable_hyper_connections=config.enable_hyper_connections,
     )
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
     mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers

@@ -117,7 +117,10 @@ moe_inference = get_inference_optimized_moe_spec()
 
 
 # MTP block spec - provides norms and projection only.
-# Inner layers are built by MultiTokenPredictionLayer using nested HybridStack
+# Inner layers are built by MultiTokenPredictionLayer using nested HybridStack.
+# Both ``eh_proj`` (used when mHC is disabled) and ``e_proj``/``h_proj`` (used
+# when mHC is enabled) are listed; MultiTokenPredictionLayer picks the right
+# pair at construction time based on ``config.enable_hyper_connections``.
 _hybrid_mtp_block_spec = ModuleSpec(
     module=MultiTokenPredictionBlock,
     submodules=MultiTokenPredictionBlockSubmodules(
@@ -128,6 +131,8 @@ _hybrid_mtp_block_spec = ModuleSpec(
                     enorm=TENorm,
                     hnorm=TENorm,
                     eh_proj=TEColumnParallelLinear,
+                    e_proj=TEColumnParallelLinear,
+                    h_proj=TEColumnParallelLinear,
                     mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                     layer_norm=TENorm,
                 ),
@@ -363,6 +368,8 @@ hybrid_inference_stack_spec = ModuleSpec(
                             enorm=TENorm,
                             hnorm=TENorm,
                             eh_proj=InferenceColumnParallelLinear,
+                            e_proj=InferenceColumnParallelLinear,
+                            h_proj=InferenceColumnParallelLinear,
                             mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                             layer_norm=TENorm,
                         ),

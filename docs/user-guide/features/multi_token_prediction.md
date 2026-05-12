@@ -53,6 +53,17 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 - For models with MTP layers, the final LayerNorm sits in the stage that contains the last decoder layer, not in the post-process stage. That can change gradient norm reduction slightly in deterministic mode when LayerNorm would otherwise live in another stage. For bitwise alignment, disable gradient norm clipping.
 - MTP loss is computed in the post-processing stage.
 
+## Combining MTP with Manifold-Constrained Hyper-Connections (mHC)
+
+MTP is compatible with manifold-constrained Hyper-Connections (`--enable-hyper-connections`) in both `GPTModel` and `HybridModel`. The combination follows the DeepSeek-V4 reference design:
+
+- The main decoder block keeps the n-stream residual flow all the way through its final layer. Instead of averaging streams at the model boundary, a *learned* output contraction (sigmoid-gated weighted sum over streams) projects from `[s, b, n*h]` down to `[s, b, h]`. The contraction is parameterized by three learnable tensors (`hc_head_fn`, `hc_head_base`, `hc_head_scale`) that live on the block containing the final LayerNorm.
+- The block returns both the contracted hidden state (for the shared LM head) and the pre-contraction multi-stream tensor (for the MTP input). MTP depths consume the multi-stream tensor so each depth can also operate per-stream.
+- MTP depths replace the concatenated `eh_proj` with two per-stream projections (`e_proj` and `h_proj`): the embedding is mixed in via `e_proj` and broadcast across streams, while `h_proj` operates per-stream on the hidden states. The per-depth output uses its own learned contraction before the shared LM head.
+- The contraction is identical in form to the one used at the main-block boundary, so each MTP depth carries its own `hc_head_fn`, `hc_head_base`, and `hc_head_scale` learnable parameters.
+
+Enable the combination by setting both `--mtp-num-layers` and `--enable-hyper-connections` (plus `--num-residual-streams`) in the training arguments. No further flags are required. The original mutual-exclusion validation has been removed.
+
 ## Unsupported Combinations
 
-Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP.
+Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP. The `extract_layer_indices` feature-extraction path is not supported when mHC and MTP are enabled together.
