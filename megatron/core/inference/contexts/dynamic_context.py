@@ -336,7 +336,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # the engine via set_ep_zmq_communicator() when available. When set,
         # match_graph_config() uses this to perform the MAX reduction on the
         # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
-        self._ep_zmq_communicator = None
+        self._tp_ep_zmq_communicator = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
@@ -1694,7 +1694,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         return key
 
-    def set_ep_zmq_communicator(self, communicator) -> None:
+    def set_tp_ep_zmq_communicator(self, communicator) -> None:
         """Attach an EP-group ZMQ communicator for CPU-side sync collectives.
 
         When set, match_graph_config() uses this communicator's
@@ -1706,7 +1706,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             communicator: AsyncZMQCommunicator over the EP process group.
         """
-        self._ep_zmq_communicator = communicator
+        self._tp_ep_zmq_communicator = communicator
 
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
@@ -2049,7 +2049,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
-            ep_zmq_communicator=self._ep_zmq_communicator,
+            ep_zmq_communicator=self._tp_ep_zmq_communicator,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
