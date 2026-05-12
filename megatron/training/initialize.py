@@ -17,6 +17,7 @@ from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_trai
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 from megatron.core.parallel_state import create_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
@@ -27,7 +28,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
-from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
+from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version, get_pg_rank
 from megatron.training import (
     get_adlr_autoresume,
     get_args,
@@ -382,27 +383,42 @@ def _init_autoresume():
 
 def _set_random_seed(
     seed_: int,
+    pg_collection: ProcessGroupCollection,
     data_parallel_random_init: bool = False,
     te_rng_tracker: bool = False,
     inference_rng_tracker: bool = False,
     use_cudagraphable_rng: bool = False,
 ):
-    """Set random seed for reproducability."""
-    if seed_ is not None and seed_ > 0:
-        # Ensure that different pipeline MP stages get different seeds.
-        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
-        # Ensure different data parallel ranks get different seeds
-        if data_parallel_random_init:
-            seed = seed + (10 * mpu.get_data_parallel_rank())
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.device_count() > 0:
-            tensor_parallel.model_parallel_cuda_manual_seed(
-                seed, te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng
-            )
-    else:
-        raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
+    """Set random seed for reproducibility."""
+    assert seed_ is not None and seed_ > 0, f"Seed ({seed_}) should be a positive integer."
+
+    current_rank = torch.distributed.get_rank()
+
+    # Ensure that different pipeline MP stages get different seeds.
+    pp_rank = torch.distributed.get_group_rank(pg_collection.pp, current_rank)
+    seed = seed_ + (100 * pp_rank)
+    # Ensure different data parallel ranks get different seeds
+    if data_parallel_random_init:
+        dp_rank = torch.distributed.get_group_rank(pg_collection.dp, current_rank)
+        seed = seed + (10 * dp_rank)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.device_count() > 0:
+        # Derive TP/EP/ETP ranks from provided process groups using helper utils
+        tp_rank = get_pg_rank(pg_collection.tp)
+        ep_rank = get_pg_rank(pg_collection.ep)
+        etp_rank = get_pg_rank(pg_collection.expt_tp)
+
+        tensor_parallel.model_parallel_cuda_manual_seed(
+            seed,
+            te_rng_tracker,
+            inference_rng_tracker,
+            use_cudagraphable_rng,
+            tp_rank=tp_rank,
+            ep_rank=ep_rank,
+            etp_rank=etp_rank,
+        )
 
 
 def write_args_to_tensorboard():
