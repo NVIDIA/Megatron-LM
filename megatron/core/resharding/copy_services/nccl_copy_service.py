@@ -2,33 +2,14 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 
-from .base import CopyService
+from .base import CopyService, RecvOp, SendOp, match_local_ops_by_task_id
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SendOp:
-    """Simple container describing a single send operation."""
-
-    task_id: int | None
-    tensor: torch.Tensor
-    dest_rank: int
-
-
-@dataclass
-class RecvOp:
-    """Simple container describing a single receive operation."""
-
-    task_id: int | None
-    tensor: torch.Tensor
-    src_rank: int
 
 
 class NCCLCopyService(CopyService):
@@ -38,10 +19,7 @@ class NCCLCopyService(CopyService):
     """
 
     def __init__(self, group=None):
-        self.group = group
-        # Use group.rank()/size() to support cross-cluster ProcessGroups
-        self.rank = group.rank() if group is not None else dist.get_rank()
-        self.world_size = group.size() if group is not None else dist.get_world_size()
+        super().__init__(group=group)
         self.send_ops: List[SendOp] = []
         self.recv_ops: List[RecvOp] = []
         # Dedicated stream for local (same-rank) copies to avoid unnecessary
@@ -72,35 +50,12 @@ class NCCLCopyService(CopyService):
         remote_recvs = [op for op in self.recv_ops if op.src_rank != self.rank]
 
         if local_sends or local_recvs:
-            local_sends_by_id = {op.task_id: op for op in local_sends}
-            if None in local_sends_by_id:
-                raise RuntimeError(
-                    "NCCLCopyService: local (same-rank) transfer requires a task_id "
-                    "to match sends with recvs"
-                )
-            local_recvs_by_id = {op.task_id: op for op in local_recvs}
-            if None in local_recvs_by_id:
-                raise RuntimeError(
-                    "NCCLCopyService: local (same-rank) transfer requires a task_id "
-                    "to match sends with recvs"
-                )
-            if len(local_sends_by_id) != len(local_sends) or len(local_recvs_by_id) != len(
-                local_recvs
-            ):
-                raise RuntimeError(
-                    f"NCCLCopyService: unmatched local ops on rank {self.rank}: "
-                    f"{len(local_sends)} local sends vs {len(local_recvs)} local recvs"
-                )
-            for task_id, recv_op in local_recvs_by_id.items():
-                send_op = local_sends_by_id.get(task_id)
-                if send_op is None:
-                    raise RuntimeError(
-                        f"NCCLCopyService: missing local send for task_id={task_id} "
-                        f"on rank {self.rank}"
-                    )
-                with torch.no_grad():
-                    with torch.cuda.stream(self._copy_stream):
-                        recv_op.tensor.copy_(send_op.tensor)
+            pairs = match_local_ops_by_task_id(
+                local_sends, local_recvs, "NCCLCopyService", self.rank
+            )
+            with torch.no_grad(), torch.cuda.stream(self._copy_stream):
+                for send_op, recv_op in pairs:
+                    recv_op.tensor.copy_(send_op.tensor)
 
         p2p_ops = []
         for op in remote_sends:
@@ -113,7 +68,6 @@ class NCCLCopyService(CopyService):
             for req in reqs:
                 req.wait()
 
-        # Make sure the copy stream is finished
         torch.cuda.current_stream().wait_stream(self._copy_stream)
 
         if self.rank == 0:

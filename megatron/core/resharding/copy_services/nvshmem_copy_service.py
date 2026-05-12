@@ -24,20 +24,23 @@ class NVSHMEMCopyService(CopyService):
     def __init__(self, group=None):
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before NVSHMEMCopyService()")
+        super().__init__(group=group)
 
-        self._group = group
-        self.rank = group.rank() if group is not None else dist.get_rank()
         self._remote = RemoteCopyService(group=group)
-        # Lazily initialized on first use to avoid side effects at import time
         self._initialized = False
 
-        # NOTE: keep the original typed tensors here (not uint8 views) so local copies
-        # preserve shape/strides semantics and avoid byte-offset pitfalls.
+        # Keep original typed tensors (not uint8 views) so local copies preserve
+        # shape/strides semantics and avoid byte-offset pitfalls.
         self._local_send_ops: Dict[int, torch.Tensor] = {}
         self._local_recv_ops: Dict[int, torch.Tensor] = {}
         self._local_copy_stream = torch.cuda.Stream()
 
         logger.info("NVSHMEMCopyService constructed")
+
+    def close(self) -> None:
+        if self._initialized:
+            self._remote.finalize()
+            self._initialized = False
 
     def _ensure_initialized(self):
         if not self._initialized:
@@ -50,14 +53,13 @@ class NVSHMEMCopyService(CopyService):
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int, task_id: Optional[int] = None):
         if task_id is None:
             raise RuntimeError(
-                "NVSHMEMCopyService requires a task_id for every transfer; " "got task_id=None"
+                "NVSHMEMCopyService requires a task_id for every transfer; got task_id=None"
             )
         self._ensure_initialized()
 
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
 
-        # Local transfers: keep them out of RemoteCopyService entirely.
         if dest_rank == self.rank:
             self._local_send_ops[task_id] = src_tensor
             return
@@ -80,14 +82,13 @@ class NVSHMEMCopyService(CopyService):
     def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int, task_id: Optional[int] = None):
         if task_id is None:
             raise RuntimeError(
-                "NVSHMEMCopyService requires a task_id for every transfer; " "got task_id=None"
+                "NVSHMEMCopyService requires a task_id for every transfer; got task_id=None"
             )
         self._ensure_initialized()
 
         if not dest_tensor.is_contiguous():
             dest_tensor = dest_tensor.contiguous()
 
-        # Local transfers: keep them out of RemoteCopyService entirely.
         if src_rank == self.rank:
             self._local_recv_ops[task_id] = dest_tensor
             return
@@ -117,7 +118,7 @@ class NVSHMEMCopyService(CopyService):
         """
         self._ensure_initialized()
 
-        # 1) Run same-rank copies (match by task_id), like NCCL backend.
+        # Local copies match by task_id (the NVSHMEM RemoteCopyService never sees them).
         if self._local_send_ops or self._local_recv_ops:
             missing_sends = set(self._local_recv_ops.keys()) - set(self._local_send_ops.keys())
             missing_recvs = set(self._local_send_ops.keys()) - set(self._local_recv_ops.keys())
@@ -145,12 +146,11 @@ class NVSHMEMCopyService(CopyService):
             self._local_send_ops.clear()
             self._local_recv_ops.clear()
 
-        # 2) Execute remote schedule (if any remote sends/recvs were registered).
-        # NOTE: ALL ranks must call schedule() and run() because they contain collective
-        # operations that require all ranks to participate:
-        #  - schedule() has dist.all_gather_object() (torch distributed collective)
-        #  - run() has nvshmem.core.barrier_all() (nvshmem collective)
-        # This is critical for non-collocated refit where some ranks may have no work.
+        # ALL ranks must call schedule() and run() because they contain collectives
+        # that require all ranks to participate:
+        #  - schedule() uses dist.all_gather_object()
+        #  - run() uses nvshmem.core.barrier_all()
+        # Critical for non-collocated refit where some ranks may have no work.
         logger.info("NVSHMEMCopyService: building NVSHMEM schedule and executing")
         self._remote.schedule()
         self._remote.run()

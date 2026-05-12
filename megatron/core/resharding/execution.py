@@ -2,25 +2,57 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 
+from megatron.core.fp8_utils import is_mxfp8tensor
+
 from .copy_services.base import CopyService
 from .transforms import ReshardTransform, _ensure_sendable
-from .utils import ReshardPlan, named_refit_tensors
+from .utils import ReshardPlan, get_refit_tensor_dict
 
 logger = logging.getLogger(__name__)
 
 
-def _is_mxfp8_tensor(param):
-    """Check if param is a TE MXFP8Tensor (fp8_param=true)."""
-    return (
-        hasattr(param, 'quantize_')
-        and hasattr(param, 'dequantize')
-        and hasattr(param, '_rowwise_data')
-    )
+@dataclass
+class _Writeback:
+    """Tagged-union for what to do with a received tensor after service.run().
+
+    Exactly one of the three kinds applies; the other fields are unused for
+    that kind.  ``direct`` means the data landed in its final destination
+    during recv and there's nothing to copy.  ``copy`` copies a staging
+    ``recv_buffer`` into a slice of ``dst_param`` (deferring to MXFP8
+    accumulation when the dest is quantized).  ``transform`` hands the
+    received buffers to a ``ReshardTransform.finalize_recv`` call.
+    """
+
+    kind: str  # 'direct' | 'copy' | 'transform'
+    recv_buffer: Optional[torch.Tensor] = None
+    dst_param: Optional[torch.Tensor] = None
+    dst_slice: Optional[tuple] = None
+    param_name: Optional[str] = None
+    recv_bufs: Optional[list[torch.Tensor]] = None
+
+
+def _get_mxfp8_accumulator(
+    pending: dict[int, tuple], dst_param: torch.Tensor
+) -> tuple[torch.Tensor, list]:
+    """Get or lazily allocate the BF16 accumulation buffer for an MXFP8 dest param.
+
+    All slices for the same dst_param land in this buffer; ``quantize_`` is
+    called once after all slices have been written.  Allocates empty (not
+    dequantized) because every slice will be overwritten.
+    """
+    param_id = id(dst_param)
+    entry = pending.get(param_id)
+    if entry is None:
+        full_bf16 = torch.empty(dst_param.shape, dtype=torch.bfloat16, device=dst_param.device)
+        entry = (dst_param, full_bf16, [])
+        pending[param_id] = entry
+    return entry[1], entry[2]
 
 
 def execute_reshard_plan(
@@ -47,57 +79,40 @@ def execute_reshard_plan(
     transform's prepare_send / prepare_recv / finalize_recv methods instead
     of the default slice-and-copy logic.
     """
+    # Refit tensors (parameters + persistent buffers) are cached on each module
+    # so the named_modules() walk happens once per model, not per refit.
+    src_params = get_refit_tensor_dict(src_module) if src_module is not None else {}
+    dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
 
-    # Extract parameters and persistent buffers from models if present.
-    # Persistent buffers carry training state (e.g. MoE router expert_bias)
-    # and must be refit alongside parameters.
-    src_params = {}
-    dst_params = {}
-    if src_module is not None:
-        src_params = {name: p for name, p in named_refit_tensors(src_module)}
-    if dst_module is not None:
-        dst_params = {name: p for name, p in named_refit_tensors(dst_module)}
+    # Dequantized BF16 views of MXFP8 source params are reused across multiple
+    # send ops for the same param.
+    sendable_cache: dict[str, torch.Tensor] = {}
 
-    # Cache dequantized BF16 views of MXFP8 source params so that multiple
-    # send ops for the same param reuse one dequant instead of repeating it.
-    _sendable_cache: dict[str, torch.Tensor] = {}
+    def get_sendable(param_name: str, param: torch.nn.Parameter) -> torch.Tensor:
+        if param_name not in sendable_cache:
+            sendable_cache[param_name] = _ensure_sendable(param)
+        return sendable_cache[param_name]
 
-    def _get_sendable(param_name: str, param: torch.nn.Parameter) -> torch.Tensor:
-        if param_name not in _sendable_cache:
-            _sendable_cache[param_name] = _ensure_sendable(param)
-        return _sendable_cache[param_name]
-
-    # Submit sends (only if we have source model)
     for op in plan.send_ops:
+        src_param = src_params.get(op.param_name)
+        if src_param is None:
+            continue
         if transform is not None and transform.should_transform(op.param_name):
-            src_param = src_params.get(op.param_name)
-            if src_param is not None:
-                tensors = transform.prepare_send(op.param_name, op.my_slice, src_param)
-                for t in tensors:
-                    service.submit_send(t.contiguous(), op.peer_rank, task_id=op.task_id)
+            tensors = transform.prepare_send(op.param_name, op.my_slice, src_param)
+            for t in tensors:
+                service.submit_send(t.contiguous(), op.peer_rank, task_id=op.task_id)
         else:
-            src_param = src_params.get(op.param_name)
-            if src_param is not None:
-                sendable = _get_sendable(op.param_name, src_param)
-                src_view = sendable[op.my_slice]
-                # Only copy if the slice is non-contiguous.
-                if not src_view.is_contiguous():
-                    src_view = src_view.contiguous()
-                service.submit_send(src_view, op.peer_rank, task_id=op.task_id)
+            sendable = get_sendable(op.param_name, src_param)
+            src_view = sendable[op.my_slice]
+            if not src_view.is_contiguous():
+                src_view = src_view.contiguous()
+            service.submit_send(src_view, op.peer_rank, task_id=op.task_id)
 
-    # Free the dequant cache — slices have been submitted and the service
-    # holds its own references to the contiguous buffers it needs.
-    _sendable_cache.clear()
+    sendable_cache.clear()
 
-    # Submit recvs (only if we have destination model)
-    # Writebacks: each entry is one of:
-    #   ('direct',)                                       — recv'd in-place, no writeback
-    #   ('default', recv_buffer, dst_param, dst_slice)    — copy recv_buffer → dst_param
-    #   ('transform', param_name, dst_slice, [recv_bufs]) — transform.finalize_recv
-    recv_writebacks: list = []
-
-    # Pre-allocate BF16 accumulation buffers for TE MXFP8 destination params so
-    # we can recv directly into views instead of allocating per-slice buffers.
+    writebacks: list[_Writeback] = []
+    # Maps id(dst_param) -> (dst_param, full_bf16, slices) for MXFP8 dests that
+    # need deferred quantize_() after all slices are written.
     pending_quantized: dict[int, tuple[torch.nn.Parameter, torch.Tensor, list]] = {}
 
     for op in plan.recv_ops:
@@ -105,107 +120,85 @@ def execute_reshard_plan(
             recv_bufs = transform.prepare_recv(op.param_name, op.my_slice)
             for buf in recv_bufs:
                 service.submit_recv(buf, op.peer_rank, task_id=op.task_id)
-            recv_writebacks.append(('transform', op.param_name, op.my_slice, recv_bufs))
-        else:
-            dst_param = dst_params.get(op.param_name)
-            if dst_param is not None:
-                # Try to recv directly into the destination parameter slice to
-                # avoid allocating a separate buffer + a writeback copy.  This
-                # is safe when the slice view is already contiguous AND the
-                # parameter is a plain tensor (not quantized — quantized params
-                # need deferred accumulation).
-                dst_slice_view = dst_param.data[op.my_slice]
-                if dst_slice_view.is_contiguous() and not _is_mxfp8_tensor(dst_param):
-                    # Recv directly into destination — no writeback needed.
-                    service.submit_recv(dst_slice_view, op.peer_rank, task_id=op.task_id)
-                    recv_writebacks.append(('direct',))
-                elif _is_mxfp8_tensor(dst_param):
-                    # TE MXFP8: recv directly into pre-allocated accumulation
-                    # buffer to avoid per-slice BF16 allocations.
-                    param_id = id(dst_param)
-                    if param_id not in pending_quantized:
-                        full_bf16 = torch.empty(
-                            dst_param.shape, dtype=torch.bfloat16, device=dst_param.device
-                        )
-                        pending_quantized[param_id] = (dst_param, full_bf16, [])
-                    accum_view = pending_quantized[param_id][1][op.my_slice]
-                    if accum_view.is_contiguous():
-                        service.submit_recv(accum_view, op.peer_rank, task_id=op.task_id)
-                        recv_writebacks.append(('direct',))
-                    else:
-                        recv_buffer = torch.empty_like(dst_slice_view.contiguous())
-                        service.submit_recv(recv_buffer, op.peer_rank, task_id=op.task_id)
-                        recv_writebacks.append(('default', recv_buffer, dst_param, op.my_slice))
-                else:
-                    recv_buffer = torch.empty_like(dst_slice_view.contiguous())
-                    service.submit_recv(recv_buffer, op.peer_rank, task_id=op.task_id)
-                    recv_writebacks.append(('default', recv_buffer, dst_param, op.my_slice))
+            writebacks.append(
+                _Writeback(
+                    kind='transform',
+                    param_name=op.param_name,
+                    dst_slice=op.my_slice,
+                    recv_bufs=recv_bufs,
+                )
+            )
+            continue
 
-    # Execute
+        dst_param = dst_params.get(op.param_name)
+        if dst_param is None:
+            continue
+
+        dst_slice_view = dst_param.data[op.my_slice]
+        dst_is_mxfp8 = is_mxfp8tensor(dst_param)
+
+        if not dst_is_mxfp8 and dst_slice_view.is_contiguous():
+            # Plain tensor: recv straight into the destination slice.
+            service.submit_recv(dst_slice_view, op.peer_rank, task_id=op.task_id)
+            writebacks.append(_Writeback(kind='direct'))
+            continue
+
+        if dst_is_mxfp8:
+            full_bf16, _slices = _get_mxfp8_accumulator(pending_quantized, dst_param)
+            accum_view = full_bf16[op.my_slice]
+            if accum_view.is_contiguous():
+                # Recv straight into the BF16 accumulator slice.
+                service.submit_recv(accum_view, op.peer_rank, task_id=op.task_id)
+                writebacks.append(_Writeback(kind='direct'))
+                continue
+
+        # Fallback: stage into a temporary BF16 buffer.
+        recv_buffer = torch.empty_like(dst_slice_view.contiguous())
+        service.submit_recv(recv_buffer, op.peer_rank, task_id=op.task_id)
+        writebacks.append(
+            _Writeback(
+                kind='copy', recv_buffer=recv_buffer, dst_param=dst_param, dst_slice=op.my_slice
+            )
+        )
+
     logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
     service.run()
     torch.cuda.synchronize()
     dist.barrier(group=group)
 
-    # Write back received buffers into their destination parameter slices.
-    #
-    # For quantized destination params (fp8_param=true on receiver),
-    # accumulate ALL BF16 slices per-param before calling quantize_() once.
-    # This avoids corrupting MXFP8 per-block scales from partial-slice updates.
-    #
-    # Since refit overwrites every slice of each param, we allocate a fresh
-    # BF16 buffer (torch.empty) instead of dequantizing the existing MXFP8
-    # weights — this avoids a full-model-sized dequantize+clone.
-    #
-    # pending_quantized was pre-populated during recv submission so that
-    # contiguous MXFP8 slices recv'd directly into the accumulation buffer.
-    # Non-contiguous fallback slices are copied into it here.
-    for i in range(len(recv_writebacks)):
-        wb = recv_writebacks[i]
-        recv_writebacks[i] = None  # Eagerly drop reference to free recv buffers
+    # Writebacks: ``direct`` already landed in place; ``transform`` hands off to
+    # the transform; ``copy`` copies the staging buffer into the destination
+    # slice (deferring MXFP8 accumulation to one quantize_() per param).
+    for i in range(len(writebacks)):
+        wb = writebacks[i]
+        writebacks[i] = None  # Drop reference eagerly so recv buffers can free.
         with torch.no_grad():
-            if wb[0] == 'direct':
-                # Already written in-place during recv — nothing to do.
-                pass
-            elif wb[0] == 'transform':
-                _, param_name, dst_slice, recv_bufs = wb
-                transform.finalize_recv(param_name, dst_slice, recv_bufs)
+            if wb.kind == 'direct':
+                continue
+            if wb.kind == 'transform':
+                transform.finalize_recv(wb.param_name, wb.dst_slice, wb.recv_bufs)
+                continue
+            # 'copy'
+            if is_mxfp8tensor(wb.dst_param):
+                full_bf16, slices = _get_mxfp8_accumulator(pending_quantized, wb.dst_param)
+                slices.append((wb.dst_slice, wb.recv_buffer))
+                full_bf16[wb.dst_slice].copy_(wb.recv_buffer)
             else:
-                _, recv_buffer, dst_param, dst_slice = wb
-                if _is_mxfp8_tensor(dst_param):
-                    # Non-contiguous fallback: copy into pre-allocated accum buffer.
-                    param_id = id(dst_param)
-                    if param_id not in pending_quantized:
-                        # Allocate empty BF16 buffer — no need to dequantize
-                        # existing weights since all slices will be overwritten.
-                        full_bf16 = torch.empty(
-                            dst_param.shape, dtype=torch.bfloat16, device=dst_param.device
-                        )
-                        pending_quantized[param_id] = (dst_param, full_bf16, [])
-                    pending_quantized[param_id][2].append((dst_slice, recv_buffer))
-                    pending_quantized[param_id][1][dst_slice].copy_(recv_buffer)
-                else:
-                    dst_param.data[dst_slice].copy_(recv_buffer)
-    # Free writeback list — recv_buffers are no longer needed after copy.
-    recv_writebacks.clear()
+                wb.dst_param.data[wb.dst_slice].copy_(wb.recv_buffer)
+    writebacks.clear()
 
-    # Finalize deferred quantized param updates
-    for param_id, (dst_param, full_bf16, slices) in pending_quantized.items():
+    for _param_id, (dst_param, full_bf16, _slices) in pending_quantized.items():
         with torch.no_grad():
             dst_param.quantize_(full_bf16)
-    # Free the BF16 accumulation buffers eagerly.
     pending_quantized.clear()
 
-    # Ensure all writeback copies are visible to subsequent CUDA ops (e.g. CUDA
-    # graph warmup).  The synchronize() above fires *before* the writeback loop,
-    # so without this second sync the .copy_() kernels are still async when
-    # execute_reshard_plan returns — creating a race with callers that immediately
-    # inspect or capture (via CUDA graphs) the destination parameters.
+    # Second sync: the writeback loop's .copy_() kernels are still async when
+    # execute_reshard_plan returns; without this CUDA-graph capture or callers
+    # that read params immediately race against the writes.
     torch.cuda.synchronize()
 
-    # Release transient BF16 recv/accumulation buffers back to the CUDA driver.
-    # Without this the caching allocator retains the peak allocation, which can
-    # be significant for MXFP8 destinations (full model weight size in BF16).
+    # Release transient BF16 staging/accumulation buffers back to the CUDA
+    # driver.  Significant for MXFP8 destinations (full model BF16 footprint).
     torch.cuda.empty_cache()
 
     logger.info("Reshard complete")
