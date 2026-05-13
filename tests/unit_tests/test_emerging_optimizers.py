@@ -153,6 +153,30 @@ class TestMuonOptimizerMultiRank:
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
 
+    def create_ddp_model_for_layerwise(self, model, use_param_layout=False):
+        """Wrap model in DDP for layer-wise distributed optimizer tests.
+
+        Args:
+            model: Model to wrap.
+            use_param_layout: If True, supply DDP a precomputed shard-aligned
+                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
+                + ``start_param_sync``). If False (default), build DDP without a layout
+                so ``LayerWiseDistributedOptimizer`` syncs via the legacy
+                flatten / ``all_gather_v`` / unflatten ``allgather_params()`` codepath.
+        """
+        if use_param_layout:
+            from megatron.training.training import wrap_model_chunks_with_ddp
+
+            ddp_config = DistributedDataParallelConfig()
+            wrapped = wrap_model_chunks_with_ddp(
+                [model],
+                TransformerConfig(num_attention_heads=1, num_layers=1),
+                ddp_config,
+                use_layer_wise_distributed_optimizer=True,
+            )
+            return wrapped[0]
+        return self.create_ddp_model(model)
+
     def test_get_megatron_optimizer_smoke(self):
         """Smoke test for get_megatron_optimizer function."""
         model = Net().bfloat16().cuda()
@@ -258,7 +282,7 @@ class TestMuonOptimizerMultiRank:
         """Test get_megatron_optimizer with layer-wise distributed optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
-        model = self.create_ddp_model(model)
+        model = self.create_ddp_model_for_layerwise(model)
 
         optimizer_config = OptimizerConfig(
             optimizer='muon',
@@ -302,7 +326,7 @@ class TestMuonOptimizerMultiRank:
         """Test get_megatron_muon_optimizer with backward compatible layer-wise distributed optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
-        model = self.create_ddp_model(model)
+        model = self.create_ddp_model_for_layerwise(model)
 
         optimizer_config = OptimizerConfig(
             optimizer='muon',
