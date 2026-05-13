@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import math
 from types import SimpleNamespace
 
@@ -39,10 +41,7 @@ def _make_args(**overrides):
 
 
 def test_weight_and_optimizer_memory_accounts_for_expert_parallelism():
-    args = _make_args(
-        pipeline_model_parallel_size=2,
-        world_size=64,
-    )
+    args = _make_args(pipeline_model_parallel_size=2, world_size=64)
 
     # Most-loaded stage has 1 / PP of the transformer block plus the embedding table.
     # Regular TP-sharded params: (dense attention/MLP + MoE attention/shared-expert) / PP
@@ -55,10 +54,9 @@ def test_weight_and_optimizer_memory_accounts_for_expert_parallelism():
 
     # DP = 64 // 2(TP) // 2(PP) = 16
     # EDP = 64 // 4(ETP) // 2(EP) // 2(PP) = 4
-    expected_memory = (
-        (tp_sharded_params_on_rank + replicated_params_on_rank) * (6 + 12 / 16)
-        + expert_sharded_params_on_rank * (6 + 12 / 4)
-    )
+    expected_memory = (tp_sharded_params_on_rank + replicated_params_on_rank) * (
+        6 + 12 / 16
+    ) + expert_sharded_params_on_rank * (6 + 12 / 4)
 
     assert math.isclose(compute_weight_and_optimizer_memory(args), expected_memory)
 
@@ -84,10 +82,7 @@ def test_weight_and_optimizer_memory_decreases_with_tensor_parallelism():
 def test_weight_and_optimizer_memory_decreases_with_expert_parallelism():
     memories = [
         compute_weight_and_optimizer_memory(
-            _make_args(
-                expert_model_parallel_size=ep_size,
-                expert_tensor_parallel_size=etp_size,
-            )
+            _make_args(expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size)
         )
         for ep_size, etp_size in ((1, 1), (2, 1), (2, 2), (4, 2))
     ]
