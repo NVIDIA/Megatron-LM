@@ -4,6 +4,7 @@ import os
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -48,11 +49,20 @@ def _router_expert_bias_config():
     )
 
 
-def _router_bias_pg_collection(include_tp_dp_cp=True):
-    required_pgs = ['tp', 'pp', 'embd', 'pos_embd', 'dp_cp']
-    if include_tp_dp_cp:
-        required_pgs.append('tp_dp_cp')
-    return ProcessGroupCollection.use_mpu_process_groups(required_pgs)
+_NO_TP_DP_CP = object()
+
+
+def _router_bias_pg_collection(tp_dp_cp=_NO_TP_DP_CP):
+    kwargs = {
+        'tp': dist.group.WORLD,
+        'pp': dist.group.WORLD,
+        'embd': None,
+        'pos_embd': None,
+        'dp_cp': dist.group.WORLD,
+    }
+    if tp_dp_cp is not _NO_TP_DP_CP:
+        kwargs['tp_dp_cp'] = tp_dp_cp
+    return ProcessGroupCollection(**kwargs)
 
 
 class TestFinalizeModelGradsMoEExpertBias:
@@ -61,21 +71,28 @@ class TestFinalizeModelGradsMoEExpertBias:
         os.environ.pop('NVTE_FLASH_ATTN', None)
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
         Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(tensor_model_parallel_size=min(2, Utils.world_size))
+        Utils.initialize_distributed()
+        parallel_state.destroy_model_parallel()
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_finalize_model_grads_updates_router_expert_bias_with_custom_group(self):
+        assert not parallel_state.model_parallel_is_initialized()
+
         config = _router_expert_bias_config()
         device = torch.device("cuda", torch.cuda.current_device())
-        local_tokens = torch.tensor([float(torch.distributed.get_rank() + 1), 0.0], device=device)
+        local_tokens = torch.tensor(
+            [0.0, 2.0] if dist.get_rank() == 0 else [0.0, 0.0], device=device
+        )
         model = _RouterExpertBiasModel(config, local_tokens)
 
-        finalize_model_grads([model], pg_collection=_router_bias_pg_collection())
+        finalize_model_grads(
+            [model], pg_collection=_router_bias_pg_collection(tp_dp_cp=dist.group.WORLD)
+        )
 
-        expected_bias = torch.tensor([-0.25, 0.25], device=device)
+        expected_bias = torch.tensor([0.25, -0.25], device=device)
         torch.testing.assert_close(model.router.expert_bias, expected_bias)
         torch.testing.assert_close(
             model.router.local_tokens_per_expert, torch.zeros_like(local_tokens)
@@ -84,11 +101,12 @@ class TestFinalizeModelGradsMoEExpertBias:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_finalize_model_grads_requires_custom_group_before_grad_sync(self):
+        assert not parallel_state.model_parallel_is_initialized()
         config = _router_expert_bias_config()
         device = torch.device("cuda", torch.cuda.current_device())
         pg_collections = [
-            _router_bias_pg_collection(include_tp_dp_cp=False),
             _router_bias_pg_collection(),
+            _router_bias_pg_collection(tp_dp_cp=dist.group.WORLD),
         ]
         pg_collections[1].tp_dp_cp = None
 
