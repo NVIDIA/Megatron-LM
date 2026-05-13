@@ -79,7 +79,14 @@ def match_local_ops_by_task_id(
             f"{backend_name}: local (same-rank) transfer requires a task_id "
             "to match sends with recvs"
         )
-    if len(sends_by_id) != len(local_sends) or len(recvs_by_id) != len(local_recvs):
+    # Count mismatch catches both imbalanced send/recv lists (which would
+    # otherwise silently drop the longer side) and duplicate task_ids (which
+    # collapse to fewer dict entries than list entries).
+    if (
+        len(local_sends) != len(local_recvs)
+        or len(sends_by_id) != len(local_sends)
+        or len(recvs_by_id) != len(local_recvs)
+    ):
         raise RuntimeError(
             f"{backend_name}: unmatched local ops on rank {rank}: "
             f"{len(local_sends)} local sends vs {len(local_recvs)} local recvs"

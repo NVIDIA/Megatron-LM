@@ -515,8 +515,15 @@ def _round_robin_dp(src_meta_list: list[ParameterMetadata], dst_rank: int) -> Pa
     if len(grouped_by_dp) == 1:
         return src_meta_list[0]
 
+    # Round-robin selection across source DP groups based on destination global rank.
+    # This ensures even distribution: if we have 4 src DP groups and 128 dst ranks,
+    # each src DP group will be selected by 32 dst ranks (128 / 4 = 32).
     sorted_dp_groups = sorted(grouped_by_dp.keys())
     chosen_group = sorted_dp_groups[dst_rank % len(sorted_dp_groups)]
+    # Within the chosen DP group, distribute across available metadata entries
+    # to balance load across all TP groups in the DP replica.
+    # Example: With 4 TP groups in a DP group, dst_ranks will cycle through all 4
+    # instead of always using the first one, better distributing transfer load.
     group_metadata = grouped_by_dp[chosen_group]
     within_group_idx = (dst_rank // len(sorted_dp_groups)) % len(group_metadata)
     return group_metadata[within_group_idx]

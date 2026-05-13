@@ -218,9 +218,7 @@ def _plan_tp(
     dst_world = len(d.dst_dim_ranks)
     dst_local_rank = _get_rank_in_group(my_global_rank, d.dst_dim_ranks)
 
-    blocks = _tp_block_layout(
-        param_name, src_metadata, dst_metadata, d, src_shape, dst_shape
-    )
+    blocks = _tp_block_layout(param_name, src_metadata, dst_metadata, d, src_shape, dst_shape)
 
     ops: list[tuple[int, tuple[slice, ...], tuple[slice, ...]]] = []
     for src_off, dst_off, full_len, src_stride, dst_stride, label in blocks:
