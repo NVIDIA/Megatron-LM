@@ -1024,9 +1024,7 @@ class TestFsdpNonUnitBucketPreservation:
                 h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
                 return self.mamba_layer(hidden_states=h)
 
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["tp", "cp"]
-        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
 
         # bucket_size=4096 forces conv1d.weight into a separate non-unit bucket
@@ -1047,7 +1045,8 @@ class TestFsdpNonUnitBucketPreservation:
 
         # Guard against future bucketing changes silently masking the bug.
         non_unit_buckets = [
-            pg for pg in fsdp_model.param_and_grad_buffer.parameter_groups
+            pg
+            for pg in fsdp_model.param_and_grad_buffer.parameter_groups
             if pg.fsdp_unit_id is None
         ]
         assert len(non_unit_buckets) >= 2, (
