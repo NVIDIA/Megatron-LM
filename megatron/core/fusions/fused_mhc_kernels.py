@@ -71,16 +71,12 @@ if _TRITON_AVAILABLE:
     # Sinkhorn-Knopp
     # ============================================================================
 
-
     @triton.autotune(
-        configs=[triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)],
-        key=["HC", "NUM_ITERS"],
+        configs=[triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)], key=["HC", "NUM_ITERS"]
     )
     @triton.jit
     def _triton_sinkhorn_fwd_kernel(
-        inp_ptr, out_ptr, M_init_ptr,
-        N_batch, eps,
-        HC: tl.constexpr, NUM_ITERS: tl.constexpr,
+        inp_ptr, out_ptr, M_init_ptr, N_batch, eps, HC: tl.constexpr, NUM_ITERS: tl.constexpr
     ):
         """Grid: (N_batch,). Each program handles one [HC, HC] matrix."""
         pid = tl.program_id(0)
@@ -105,17 +101,21 @@ if _TRITON_AVAILABLE:
 
         tl.store(out_ptr + mat_ptrs, M.to(out_ptr.dtype.element_ty))
 
-
     @triton.autotune(
-        configs=[triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)],
-        key=["HC", "NUM_ITERS"],
+        configs=[triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)], key=["HC", "NUM_ITERS"]
     )
     @triton.jit
     def _triton_sinkhorn_bwd_kernel(
-        grad_out_ptr, M_init_ptr, grad_inp_ptr,
-        ws_M_ptr, ws_rs_ptr, ws_cs_ptr,
-        N_batch, eps,
-        HC: tl.constexpr, NUM_ITERS: tl.constexpr,
+        grad_out_ptr,
+        M_init_ptr,
+        grad_inp_ptr,
+        ws_M_ptr,
+        ws_rs_ptr,
+        ws_cs_ptr,
+        N_batch,
+        eps,
+        HC: tl.constexpr,
+        NUM_ITERS: tl.constexpr,
     ):
         """Grid: (N_batch,). Each program handles one [HC, HC] backward."""
         pid = tl.program_id(0)
@@ -156,8 +156,11 @@ if _TRITON_AVAILABLE:
             col_corr = tl.sum(grad * M, axis=0)
             grad = grad - col_corr[None, :]
             M = tl.load(
-                ws_M_ptr + M_ws_base + (2 * t + 1) * HC * HC
-                + offs_r[:, None] * HC + offs_c[None, :]
+                ws_M_ptr
+                + M_ws_base
+                + (2 * t + 1) * HC * HC
+                + offs_r[:, None] * HC
+                + offs_c[None, :]
             ).to(tl.float32)
 
             row_s = tl.load(ws_rs_ptr + (v_ws_base + t) * HC + offs_r).to(tl.float32)
@@ -165,14 +168,12 @@ if _TRITON_AVAILABLE:
             row_corr = tl.sum(grad * M, axis=1)
             grad = grad - row_corr[:, None]
             M = tl.load(
-                ws_M_ptr + M_ws_base + (2 * t) * HC * HC
-                + offs_r[:, None] * HC + offs_c[None, :]
+                ws_M_ptr + M_ws_base + (2 * t) * HC * HC + offs_r[:, None] * HC + offs_c[None, :]
             ).to(tl.float32)
 
         M_init = tl.load(M_init_ptr + mat_ptrs).to(tl.float32)
         grad = grad * M_init
         tl.store(grad_inp_ptr + mat_ptrs, grad.to(grad_inp_ptr.dtype.element_ty))
-
 
     def _triton_sinkhorn_fwd(
         input_logits: Tensor, num_iterations: int, eps: float = 1e-8
@@ -184,11 +185,8 @@ if _TRITON_AVAILABLE:
         out = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         M_init = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         inp = input_logits.contiguous().view(N_batch, hc, hc)
-        _triton_sinkhorn_fwd_kernel[(N_batch,)](
-            inp, out, M_init, N_batch, eps, hc, num_iterations,
-        )
+        _triton_sinkhorn_fwd_kernel[(N_batch,)](inp, out, M_init, N_batch, eps, hc, num_iterations)
         return out.view(original_shape), M_init.view(original_shape)
-
 
     def _triton_sinkhorn_bwd(
         grad_output: Tensor, M_init: Tensor, num_iterations: int, eps: float = 1e-8
@@ -204,12 +202,13 @@ if _TRITON_AVAILABLE:
         ws_rs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
         ws_cs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
         _triton_sinkhorn_bwd_kernel[(N_batch,)](
-            go, mi, grad_input, ws_M, ws_rs, ws_cs, N_batch, eps, hc, num_iterations,
+            go, mi, grad_input, ws_M, ws_rs, ws_cs, N_batch, eps, hc, num_iterations
         )
         return grad_input.view(original_shape)
 
-
     class TritonFusedSinkhorn(torch.autograd.Function):
+        """Autograd wrapper for Triton fused Sinkhorn."""
+
         @staticmethod
         def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
             out, M_init = _triton_sinkhorn_fwd(input_logits, num_iterations, eps)
@@ -224,17 +223,15 @@ if _TRITON_AVAILABLE:
             grad_input = _triton_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
             return grad_input, None, None
 
-
     def triton_fused_sinkhorn(
         input_logits: Tensor, num_iterations: int, eps: float = 1e-6
     ) -> Tensor:
+        """Apply Triton fused Sinkhorn with autograd support."""
         return TritonFusedSinkhorn.apply(input_logits, num_iterations, eps)
-
 
     # ============================================================================
     # H_aggregate forward
     # ============================================================================
-
 
     @triton.autotune(
         configs=[
@@ -247,10 +244,17 @@ if _TRITON_AVAILABLE:
     )
     @triton.jit
     def _triton_h_agg_fwd_kernel(
-        x_ptr, h_ptr, out_ptr,
-        sb, C: tl.constexpr, N: tl.constexpr,
-        stride_x_s, stride_x_n, stride_x_c,
-        BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
+        x_ptr,
+        h_ptr,
+        out_ptr,
+        sb,
+        C: tl.constexpr,
+        N: tl.constexpr,
+        stride_x_s,
+        stride_x_n,
+        stride_x_c,
+        BLOCK_C: tl.constexpr,
+        BLOCK_S: tl.constexpr,
     ):
         """out[s, c] = sum_i x[s, i, c] * h[s, i]."""
         pid_s = tl.program_id(0)
@@ -276,7 +280,6 @@ if _TRITON_AVAILABLE:
             mask=mask_2d,
         )
 
-
     def _triton_h_aggregate_fwd(x: Tensor, h_pre: Tensor) -> Tensor:
         s, b, n, C = x.shape
         sb = s * b
@@ -286,16 +289,13 @@ if _TRITON_AVAILABLE:
 
         grid = lambda META: (triton.cdiv(sb, META["BLOCK_S"]), triton.cdiv(C, META["BLOCK_C"]))
         _triton_h_agg_fwd_kernel[grid](
-            x_flat, h_flat, out, sb, C, n,
-            x_flat.stride(0), x_flat.stride(1), x_flat.stride(2),
+            x_flat, h_flat, out, sb, C, n, x_flat.stride(0), x_flat.stride(1), x_flat.stride(2)
         )
         return out.view(s, b, C)
-
 
     # ============================================================================
     # H_post BDA
     # ============================================================================
-
 
     @triton.autotune(
         configs=[
@@ -308,13 +308,27 @@ if _TRITON_AVAILABLE:
     )
     @triton.jit
     def _triton_hpb_fwd_kernel(
-        hr_ptr, orig_ptr, hp_ptr, x_ptr, bias_ptr, out_ptr,
-        sb, C: tl.constexpr, N: tl.constexpr,
-        stride_hr_s, stride_hr_i, stride_hr_j,
-        stride_orig_s, stride_orig_n, stride_orig_c,
-        stride_out_s, stride_out_n, stride_out_c,
+        hr_ptr,
+        orig_ptr,
+        hp_ptr,
+        x_ptr,
+        bias_ptr,
+        out_ptr,
+        sb,
+        C: tl.constexpr,
+        N: tl.constexpr,
+        stride_hr_s,
+        stride_hr_i,
+        stride_hr_j,
+        stride_orig_s,
+        stride_orig_n,
+        stride_orig_c,
+        stride_out_s,
+        stride_out_n,
+        stride_out_c,
         HAS_BIAS: tl.constexpr,
-        BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        BLOCK_S: tl.constexpr,
     ):
         """out = hr @ orig + hp * (x + bias)."""
         pid_s = tl.program_id(0)
@@ -325,11 +339,9 @@ if _TRITON_AVAILABLE:
         mask_c = offs_c < C
         mask_2d = mask_s[:, None] & mask_c[None, :]
 
-        x_tile = tl.load(
-            x_ptr + offs_s[:, None] * C + offs_c[None, :],
-            mask=mask_2d,
-            other=0.0,
-        ).to(tl.float32)
+        x_tile = tl.load(x_ptr + offs_s[:, None] * C + offs_c[None, :], mask=mask_2d, other=0.0).to(
+            tl.float32
+        )
         if HAS_BIAS:
             bias_tile = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
             x_tile += bias_tile[None, :]
@@ -360,13 +372,8 @@ if _TRITON_AVAILABLE:
                 mask=mask_2d,
             )
 
-
     def _triton_h_post_bda_fwd(
-        h_res: Tensor,
-        original_residual: Tensor,
-        h_post: Tensor,
-        x: Tensor,
-        bias: Optional[Tensor],
+        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
@@ -379,15 +386,27 @@ if _TRITON_AVAILABLE:
 
         grid = lambda META: (triton.cdiv(sb, META["BLOCK_S"]), triton.cdiv(C, META["BLOCK_C"]))
         _triton_hpb_fwd_kernel[grid](
-            hr_flat, orig_flat, hp_flat, x_flat, bias if bias is not None else x_flat, out,
-            sb, C, n,
-            hr_flat.stride(0), hr_flat.stride(1), hr_flat.stride(2),
-            orig_flat.stride(0), orig_flat.stride(1), orig_flat.stride(2),
-            out.stride(0), out.stride(1), out.stride(2),
+            hr_flat,
+            orig_flat,
+            hp_flat,
+            x_flat,
+            bias if bias is not None else x_flat,
+            out,
+            sb,
+            C,
+            n,
+            hr_flat.stride(0),
+            hr_flat.stride(1),
+            hr_flat.stride(2),
+            orig_flat.stride(0),
+            orig_flat.stride(1),
+            orig_flat.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
             HAS_BIAS=(bias is not None),
         )
         return out.view(s, b, n, C)
-
 
     @triton.autotune(
         configs=[
@@ -400,12 +419,25 @@ if _TRITON_AVAILABLE:
     )
     @triton.jit
     def _triton_hpb_bwd_g_x_orig_kernel(
-        go_ptr, hr_ptr, hp_ptr, g_orig_ptr, g_x_ptr,
-        sb, C: tl.constexpr, N: tl.constexpr,
-        stride_go_s, stride_go_n, stride_go_c,
-        stride_hr_s, stride_hr_i, stride_hr_j,
-        stride_orig_s, stride_orig_n, stride_orig_c,
-        BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
+        go_ptr,
+        hr_ptr,
+        hp_ptr,
+        g_orig_ptr,
+        g_x_ptr,
+        sb,
+        C: tl.constexpr,
+        N: tl.constexpr,
+        stride_go_s,
+        stride_go_n,
+        stride_go_c,
+        stride_hr_s,
+        stride_hr_i,
+        stride_hr_j,
+        stride_orig_s,
+        stride_orig_n,
+        stride_orig_c,
+        BLOCK_C: tl.constexpr,
+        BLOCK_S: tl.constexpr,
     ):
         """g_x = hp @ go, g_orig = hr.T @ go."""
         pid_s = tl.program_id(0)
@@ -420,7 +452,8 @@ if _TRITON_AVAILABLE:
         for j in tl.static_range(N):
             go_j = tl.load(
                 go_ptr + offs_s[:, None] * stride_go_s + j * stride_go_n + offs_c[None, :],
-                mask=mask_2d, other=0.0,
+                mask=mask_2d,
+                other=0.0,
             ).to(tl.float32)
             hp_j = tl.load(hp_ptr + offs_s * N + j, mask=mask_s, other=0.0).to(tl.float32)
             g_x_acc += hp_j[:, None] * go_j
@@ -435,11 +468,13 @@ if _TRITON_AVAILABLE:
             for j in tl.static_range(N):
                 go_j = tl.load(
                     go_ptr + offs_s[:, None] * stride_go_s + j * stride_go_n + offs_c[None, :],
-                    mask=mask_2d, other=0.0,
+                    mask=mask_2d,
+                    other=0.0,
                 ).to(tl.float32)
                 hr_ji = tl.load(
                     hr_ptr + offs_s * stride_hr_s + j * stride_hr_i + i * stride_hr_j,
-                    mask=mask_s, other=0.0,
+                    mask=mask_s,
+                    other=0.0,
                 ).to(tl.float32)
                 g_orig_i += hr_ji[:, None] * go_j
             tl.store(
@@ -447,7 +482,6 @@ if _TRITON_AVAILABLE:
                 g_orig_i.to(g_orig_ptr.dtype.element_ty),
                 mask=mask_2d,
             )
-
 
     @triton.autotune(
         configs=[
@@ -460,14 +494,27 @@ if _TRITON_AVAILABLE:
     )
     @triton.jit
     def _triton_hpb_bwd_g_hp_hr_kernel(
-        go_ptr, orig_ptr, x_ptr, bias_ptr,
-        g_hr_ptr, g_hp_ptr,
-        sb, C: tl.constexpr, N: tl.constexpr,
-        stride_go_s, stride_go_n, stride_go_c,
-        stride_orig_s, stride_orig_n, stride_orig_c,
-        stride_hr_s, stride_hr_i, stride_hr_j,
+        go_ptr,
+        orig_ptr,
+        x_ptr,
+        bias_ptr,
+        g_hr_ptr,
+        g_hp_ptr,
+        sb,
+        C: tl.constexpr,
+        N: tl.constexpr,
+        stride_go_s,
+        stride_go_n,
+        stride_go_c,
+        stride_orig_s,
+        stride_orig_n,
+        stride_orig_c,
+        stride_hr_s,
+        stride_hr_i,
+        stride_hr_j,
         HAS_BIAS: tl.constexpr,
-        BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        BLOCK_S: tl.constexpr,
     ):
         """g_hp = sum_c go*(x+bias), g_hr = go @ orig.T."""
         pid_s = tl.program_id(0)
@@ -483,9 +530,7 @@ if _TRITON_AVAILABLE:
             mask_2d = mask_s[:, None] & mask_c[None, :]
 
             x_tile = tl.load(
-                x_ptr + offs_s[:, None] * C + offs_c[None, :],
-                mask=mask_2d,
-                other=0.0,
+                x_ptr + offs_s[:, None] * C + offs_c[None, :], mask=mask_2d, other=0.0
             ).to(tl.float32)
             if HAS_BIAS:
                 bias_tile = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
@@ -537,7 +582,6 @@ if _TRITON_AVAILABLE:
                     mask=mask_s,
                 )
 
-
     def _triton_h_post_bda_bwd(
         grad_output: Tensor,
         h_res: Tensor,
@@ -563,19 +607,45 @@ if _TRITON_AVAILABLE:
 
         grid_a = lambda META: (triton.cdiv(sb, META["BLOCK_S"]), triton.cdiv(C, META["BLOCK_C"]))
         _triton_hpb_bwd_g_x_orig_kernel[grid_a](
-            go_flat, hr_flat, hp_flat, g_res, g_x, sb, C, n,
-            go_flat.stride(0), go_flat.stride(1), go_flat.stride(2),
-            hr_flat.stride(0), hr_flat.stride(1), hr_flat.stride(2),
-            g_res.stride(0), g_res.stride(1), g_res.stride(2),
+            go_flat,
+            hr_flat,
+            hp_flat,
+            g_res,
+            g_x,
+            sb,
+            C,
+            n,
+            go_flat.stride(0),
+            go_flat.stride(1),
+            go_flat.stride(2),
+            hr_flat.stride(0),
+            hr_flat.stride(1),
+            hr_flat.stride(2),
+            g_res.stride(0),
+            g_res.stride(1),
+            g_res.stride(2),
         )
 
         grid_b = lambda META: (triton.cdiv(sb, META["BLOCK_S"]),)
         _triton_hpb_bwd_g_hp_hr_kernel[grid_b](
-            go_flat, orig_flat, x_flat, bias if bias is not None else x_flat,
-            g_hr, g_hp, sb, C, n,
-            go_flat.stride(0), go_flat.stride(1), go_flat.stride(2),
-            orig_flat.stride(0), orig_flat.stride(1), orig_flat.stride(2),
-            g_hr.stride(0), g_hr.stride(1), g_hr.stride(2),
+            go_flat,
+            orig_flat,
+            x_flat,
+            bias if bias is not None else x_flat,
+            g_hr,
+            g_hp,
+            sb,
+            C,
+            n,
+            go_flat.stride(0),
+            go_flat.stride(1),
+            go_flat.stride(2),
+            orig_flat.stride(0),
+            orig_flat.stride(1),
+            orig_flat.stride(2),
+            g_hr.stride(0),
+            g_hr.stride(1),
+            g_hr.stride(2),
             HAS_BIAS=(bias is not None),
         )
 
@@ -700,16 +770,13 @@ if _CUTILE_AVAILABLE:
             from types import SimpleNamespace
 
             configs = [
-                SimpleNamespace(TILE_SIZE=ts)
-                for ts in _sinkhorn_autotune_tile_sizes(N_batch)
+                SimpleNamespace(TILE_SIZE=ts) for ts in _sinkhorn_autotune_tile_sizes(N_batch)
             ]
             tuned = ct_experimental.autotune_launch(
                 stream,
                 grid_fn=lambda cfg: (math.ceil(N_batch / cfg.TILE_SIZE), 1, 1),
                 kernel=_ct_sinkhorn_fwd_kernel,
-                args_fn=lambda cfg: (
-                    inp, out, M_init, eps, hc, num_iterations, cfg.TILE_SIZE,
-                ),
+                args_fn=lambda cfg: (inp, out, M_init, eps, hc, num_iterations, cfg.TILE_SIZE),
                 search_space=configs,
             )
             best_ts = tuned.tuned_config.TILE_SIZE
@@ -739,7 +806,9 @@ if _CUTILE_AVAILABLE:
         cached = _sinkhorn_bwd_best_cfg.get(cache_key)
 
         def _alloc_and_launch(ts):
-            ws_M = torch.empty(N_batch * 2 * num_iterations, hc, hc, dtype=torch.float32, device=dev)
+            ws_M = torch.empty(
+                N_batch * 2 * num_iterations, hc, hc, dtype=torch.float32, device=dev
+            )
             ws_rs = torch.empty(N_batch * num_iterations, hc, 1, dtype=torch.float32, device=dev)
             ws_cs = torch.empty(N_batch * num_iterations, 1, hc, dtype=torch.float32, device=dev)
             ct.launch(
@@ -756,11 +825,12 @@ if _CUTILE_AVAILABLE:
             from types import SimpleNamespace
 
             configs = [
-                SimpleNamespace(TILE_SIZE=ts)
-                for ts in _sinkhorn_autotune_tile_sizes(N_batch)
+                SimpleNamespace(TILE_SIZE=ts) for ts in _sinkhorn_autotune_tile_sizes(N_batch)
             ]
             # Allocate workspace for largest tile size (all configs share same workspace shape).
-            ws_M = torch.empty(N_batch * 2 * num_iterations, hc, hc, dtype=torch.float32, device=dev)
+            ws_M = torch.empty(
+                N_batch * 2 * num_iterations, hc, hc, dtype=torch.float32, device=dev
+            )
             ws_rs = torch.empty(N_batch * num_iterations, hc, 1, dtype=torch.float32, device=dev)
             ws_cs = torch.empty(N_batch * num_iterations, 1, hc, dtype=torch.float32, device=dev)
             tuned = ct_experimental.autotune_launch(
@@ -768,7 +838,15 @@ if _CUTILE_AVAILABLE:
                 grid_fn=lambda cfg: (math.ceil(N_batch / cfg.TILE_SIZE), 1, 1),
                 kernel=_ct_sinkhorn_bwd_kernel,
                 args_fn=lambda cfg: (
-                    go, mi, grad_input, ws_M, ws_rs, ws_cs, eps, hc, num_iterations,
+                    go,
+                    mi,
+                    grad_input,
+                    ws_M,
+                    ws_rs,
+                    ws_cs,
+                    eps,
+                    hc,
+                    num_iterations,
                     cfg.TILE_SIZE,
                 ),
                 search_space=configs,
@@ -839,8 +917,9 @@ if _CUTILE_AVAILABLE:
             tm, tc = cached
         else:
             tm, tc = math.gcd(sb, 4), math.gcd(C, 1024)
-        ct.launch(stream, (math.ceil(sb / tm),), _ct_h_agg_fwd_kernel,
-                  (x_flat, h_flat, out, n, tm, tc))
+        ct.launch(
+            stream, (math.ceil(sb / tm),), _ct_h_agg_fwd_kernel, (x_flat, h_flat, out, n, tm, tc)
+        )
 
         return out.view(s, b, C)
 
@@ -864,8 +943,12 @@ if _CUTILE_AVAILABLE:
             tm, tc = cached
         else:
             tm, tc = math.gcd(sb, 4), math.gcd(C, 1024)
-        ct.launch(stream, (math.ceil(sb / tm),), _ct_h_agg_bwd_kernel,
-                  (go_flat, x_flat, h_flat, gx, gh, n, tm, tc))
+        ct.launch(
+            stream,
+            (math.ceil(sb / tm),),
+            _ct_h_agg_bwd_kernel,
+            (go_flat, x_flat, h_flat, gx, gh, n, tm, tc),
+        )
 
         return gx.view(s, b, n, C), gh.view(s, b, n)
 
@@ -922,9 +1005,7 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_hpb_bwd_g_x_orig_kernel(
-        go, hr, hp,
-        g_orig, g_x,
-        N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt,
+        go, hr, hp, g_orig, g_x, N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt
     ):
         """Compute g_x = hp @ go and g_orig = hr.T @ go.
 
@@ -948,16 +1029,15 @@ if _CUTILE_AVAILABLE:
             hr_row_j = ct.extract(hr_tile, (0, j, 0), shape=(TILE_SIZE, 1, N))
             g_orig_tile = g_orig_tile + ct.reshape(hr_row_j, (TILE_SIZE, N, 1)) * go_j
         ct.store(
-            g_x, index=(pid, ct_idx),
+            g_x,
+            index=(pid, ct_idx),
             tile=ct.reshape(g_x_tile, (TILE_SIZE, TILE_C)).astype(g_x.dtype),
         )
         ct.store(g_orig, index=(pid, 0, ct_idx), tile=g_orig_tile.astype(g_orig.dtype))
 
     @ct.kernel
     def _ct_hpb_bwd_g_hp_hr_kernel(
-        go, orig, x,
-        g_hr, g_hp,
-        N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt,
+        go, orig, x, g_hr, g_hp, N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt
     ):
         """Compute g_hp = sum(go * x) and g_hr = go @ orig.T (no bias).
 
@@ -968,7 +1048,9 @@ if _CUTILE_AVAILABLE:
         acc_g_hp = ct.full((TILE_SIZE, N, 1), 0, dtype=ct.float32)
         acc_g_hr = ct.full((TILE_SIZE, N, N), 0, dtype=ct.float32)
         for ct_idx in range(num_c_tiles):
-            x_tile = ct.load(x, index=(pid, ct_idx), shape=(TILE_SIZE, TILE_C), padding_mode=PAD_ZERO)
+            x_tile = ct.load(
+                x, index=(pid, ct_idx), shape=(TILE_SIZE, TILE_C), padding_mode=PAD_ZERO
+            )
             x_exp = ct.expand_dims(x_tile, axis=1)  # [TS, 1, TC]
             go_tile = ct.load(
                 go, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
@@ -980,17 +1062,12 @@ if _CUTILE_AVAILABLE:
             acc_g_hr = acc_g_hr + ct.sum(
                 ct.expand_dims(go_tile, axis=2) * ct.expand_dims(orig_tile, axis=1), axis=3
             )
-        ct.store(
-            g_hp, index=(pid, 0),
-            tile=ct.reshape(acc_g_hp, (TILE_SIZE, N)).astype(g_hp.dtype),
-        )
+        ct.store(g_hp, index=(pid, 0), tile=ct.reshape(acc_g_hp, (TILE_SIZE, N)).astype(g_hp.dtype))
         ct.store(g_hr, index=(pid, 0, 0), tile=acc_g_hr.astype(g_hr.dtype))
 
     @ct.kernel
     def _ct_hpb_bwd_g_hp_hr_bias_kernel(
-        go, orig, x, bias,
-        g_hr, g_hp,
-        N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt,
+        go, orig, x, bias, g_hr, g_hp, N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt
     ):
         """Compute g_hp = sum(go * (x+bias)) and g_hr = go @ orig.T (with bias).
 
@@ -1001,7 +1078,9 @@ if _CUTILE_AVAILABLE:
         acc_g_hp = ct.full((TILE_SIZE, N, 1), 0, dtype=ct.float32)
         acc_g_hr = ct.full((TILE_SIZE, N, N), 0, dtype=ct.float32)
         for ct_idx in range(num_c_tiles):
-            x_tile = ct.load(x, index=(pid, ct_idx), shape=(TILE_SIZE, TILE_C), padding_mode=PAD_ZERO)
+            x_tile = ct.load(
+                x, index=(pid, ct_idx), shape=(TILE_SIZE, TILE_C), padding_mode=PAD_ZERO
+            )
             bias_tile = ct.load(bias, index=(ct_idx,), shape=(TILE_C,), padding_mode=PAD_ZERO)
             xb_exp = ct.expand_dims(x_tile + bias_tile, axis=1)  # [TS, 1, TC]
             go_tile = ct.load(
@@ -1014,10 +1093,7 @@ if _CUTILE_AVAILABLE:
             acc_g_hr = acc_g_hr + ct.sum(
                 ct.expand_dims(go_tile, axis=2) * ct.expand_dims(orig_tile, axis=1), axis=3
             )
-        ct.store(
-            g_hp, index=(pid, 0),
-            tile=ct.reshape(acc_g_hp, (TILE_SIZE, N)).astype(g_hp.dtype),
-        )
+        ct.store(g_hp, index=(pid, 0), tile=ct.reshape(acc_g_hp, (TILE_SIZE, N)).astype(g_hp.dtype))
         ct.store(g_hr, index=(pid, 0, 0), tile=acc_g_hr.astype(g_hr.dtype))
 
     # -- H_post BDA autotune configs & caches --------------------------------
@@ -1093,7 +1169,8 @@ if _CUTILE_AVAILABLE:
             else:
                 ts, tc = 1, math.gcd(C, 1024)
             ct.launch(
-                stream, (math.ceil(sb / ts), math.ceil(C / tc)),
+                stream,
+                (math.ceil(sb / ts), math.ceil(C / tc)),
                 _ct_hpb_bwd_g_x_orig_kernel,
                 (go_flat, hr_flat, hp_flat, g_res, g_x, n, tc, ts),
             )
@@ -1106,14 +1183,22 @@ if _CUTILE_AVAILABLE:
                 grid_fn=lambda cfg: (math.ceil(sb / cfg.TILE_SIZE), math.ceil(C / cfg.TILE_C)),
                 kernel=_ct_hpb_bwd_g_x_orig_kernel,
                 args_fn=lambda cfg: (
-                    go_flat, hr_flat, hp_flat, g_res, g_x, n, cfg.TILE_C, cfg.TILE_SIZE,
+                    go_flat,
+                    hr_flat,
+                    hp_flat,
+                    g_res,
+                    g_x,
+                    n,
+                    cfg.TILE_C,
+                    cfg.TILE_SIZE,
                 ),
                 search_space=configs,
             )
             best = tuned.tuned_config
             _hpb_bwd_g_x_orig_best_cfg[cache_key_a] = (best.TILE_SIZE, best.TILE_C)
             ct.launch(
-                stream, (math.ceil(sb / best.TILE_SIZE), math.ceil(C / best.TILE_C)),
+                stream,
+                (math.ceil(sb / best.TILE_SIZE), math.ceil(C / best.TILE_C)),
                 _ct_hpb_bwd_g_x_orig_kernel,
                 (go_flat, hr_flat, hp_flat, g_res, g_x, n, best.TILE_C, best.TILE_SIZE),
             )
@@ -1121,7 +1206,9 @@ if _CUTILE_AVAILABLE:
         # --- Kernel B: g_hp, g_hr (1D grid, loops C-tiles) ---
         cache_key_b = ('hpb_bwd_g_hp_hr', sb, n, C, bias is not None)
         cached_b = _hpb_bwd_g_hp_hr_best_cfg.get(cache_key_b)
-        hp_hr_kernel = _ct_hpb_bwd_g_hp_hr_bias_kernel if bias is not None else _ct_hpb_bwd_g_hp_hr_kernel
+        hp_hr_kernel = (
+            _ct_hpb_bwd_g_hp_hr_bias_kernel if bias is not None else _ct_hpb_bwd_g_hp_hr_kernel
+        )
 
         if cached_b is not None or not _CUTILE_EXPERIMENTAL_AVAILABLE:
             if cached_b is not None:
@@ -1195,7 +1282,8 @@ if _CUTILE_AVAILABLE:
         SPLIT_K: ConstInt,
     ):
         '''
-        Grid: (num_tiles_m, num_tiles_k).  Fused matmul + norm + r: proj, norm, r in one pass over K.
+        Grid: (num_tiles_m, num_tiles_k).
+        Fused matmul + norm + r: proj, norm, r in one pass over K.
         '''
         tile_m_id = ct.bid(0)
         split_k_id = ct.bid(1)
@@ -1272,19 +1360,16 @@ if _CUTILE_AVAILABLE:
         for split_idx in ct.static_iter(range(SPLIT_K)):
             bid_m_k = bid_m + split_idx * num_bid_m
             pre_tile = ct.load(
-                Y_acc, index=(bid_m_k, 0), shape=(TILE_SIZE_M, n),
-                padding_mode=PAD_ZERO,
+                Y_acc, index=(bid_m_k, 0), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
             )
             post_tile = ct.load(
-                Y_acc, index=(bid_m_k, 1), shape=(TILE_SIZE_M, n),
-                padding_mode=PAD_ZERO,
+                Y_acc, index=(bid_m_k, 1), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
             )
             pre_accum = pre_accum + ct.astype(pre_tile, ct.float32)
             post_accum = post_accum + ct.astype(post_tile, ct.float32)
 
             r_tile = ct.load(
-                R_acc, index=(bid_m_k, 0), shape=(TILE_SIZE_M, 1),
-                padding_mode=PAD_ZERO,
+                R_acc, index=(bid_m_k, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO
             )
             r_accum = r_accum + ct.astype(r_tile, ct.float32)
 
@@ -1303,12 +1388,8 @@ if _CUTILE_AVAILABLE:
 
         # 3. Apply compute_h directly into split outputs.
         inv_r_eps = 1.0 / (r_val + eps)
-        bias_pre = ct.load(
-            Bias, index=(0, 0), shape=(1, n), padding_mode=PAD_ZERO,
-        )
-        bias_post = ct.load(
-            Bias, index=(0, 1), shape=(1, n), padding_mode=PAD_ZERO,
-        )
+        bias_pre = ct.load(Bias, index=(0, 0), shape=(1, n), padding_mode=PAD_ZERO)
+        bias_post = ct.load(Bias, index=(0, 1), shape=(1, n), padding_mode=PAD_ZERO)
         bias_pre = ct.astype(bias_pre, ct.float32)
         bias_post = ct.astype(bias_post, ct.float32)
 
@@ -1325,14 +1406,14 @@ if _CUTILE_AVAILABLE:
             for split_idx in ct.static_iter(range(SPLIT_K)):
                 bid_m_k = bid_m + split_idx * num_bid_m
                 res_tile = ct.load(
-                    Y_acc, index=(bid_m_k, 2 + res_chunk), shape=(TILE_SIZE_M, n),
+                    Y_acc,
+                    index=(bid_m_k, 2 + res_chunk),
+                    shape=(TILE_SIZE_M, n),
                     padding_mode=PAD_ZERO,
                 )
                 res_accum = res_accum + ct.astype(res_tile, ct.float32)
 
-            bias_res = ct.load(
-                Bias, index=(0, 2 + res_chunk), shape=(1, n), padding_mode=PAD_ZERO,
-            )
+            bias_res = ct.load(Bias, index=(0, 2 + res_chunk), shape=(1, n), padding_mode=PAD_ZERO)
             bias_res = ct.astype(bias_res, ct.float32)
             h_res = res_accum * alpha_res * inv_r_eps + bias_res
             ct.store(PROJ_OUT, index=(bid_m, 2 + res_chunk), tile=res_accum.astype(PROJ_OUT.dtype))
@@ -1563,14 +1644,28 @@ if _CUTILE_AVAILABLE:
                     grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M), cfg.SPLIT_K),
                     kernel=_ct_proj_rms_fwd_kernel,
                     args_fn=lambda cfg: (
-                        x, weight, proj, norm, r, M, N, K, eps,
-                        cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.SPLIT_K,
+                        x,
+                        weight,
+                        proj,
+                        norm,
+                        r,
+                        M,
+                        N,
+                        K,
+                        eps,
+                        cfg.TILE_M,
+                        cfg.TILE_N,
+                        cfg.TILE_K,
+                        cfg.SPLIT_K,
                     ),
                     search_space=configs,
                 )
                 best = tuned.tuned_config
                 _proj_rms_fwd_best_cfg[cache_key] = (
-                    best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K
+                    best.TILE_M,
+                    best.TILE_N,
+                    best.TILE_K,
+                    best.SPLIT_K,
                 )
                 proj = torch.empty(best.SPLIT_K * M, N, dtype=x.dtype, device=dev)
                 norm = torch.empty(best.SPLIT_K * M, 1, dtype=x.dtype, device=dev)
@@ -1580,8 +1675,21 @@ if _CUTILE_AVAILABLE:
                     stream,
                     (math.ceil(M / best.TILE_M), best.SPLIT_K),
                     _ct_proj_rms_fwd_kernel,
-                    (x, weight, proj, norm, r, M, N, K, eps,
-                     best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K),
+                    (
+                        x,
+                        weight,
+                        proj,
+                        norm,
+                        r,
+                        M,
+                        N,
+                        K,
+                        eps,
+                        best.TILE_M,
+                        best.TILE_N,
+                        best.TILE_K,
+                        best.SPLIT_K,
+                    ),
                 )
 
                 proj = proj.view(best.SPLIT_K, M, N).sum(dim=0)
@@ -1655,11 +1763,25 @@ if _CUTILE_AVAILABLE:
 
         def _make_args(tm):
             return (
-                proj_acc, norm_acc, bias_2d,
-                alpha_pre, alpha_post, alpha_res,
-                h_pre_out, h_post_out, h_res_out, r_out, proj_out,
-                M, N, K, n, eps,
-                tm, tile_n, split_k,
+                proj_acc,
+                norm_acc,
+                bias_2d,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                h_pre_out,
+                h_post_out,
+                h_res_out,
+                r_out,
+                proj_out,
+                M,
+                N,
+                K,
+                n,
+                eps,
+                tm,
+                tile_n,
+                split_k,
             )
 
         if cached is not None or not _CUTILE_EXPERIMENTAL_AVAILABLE:
@@ -1668,10 +1790,7 @@ if _CUTILE_AVAILABLE:
         else:
             from types import SimpleNamespace
 
-            configs = [
-                SimpleNamespace(TILE_M=tm)
-                for tm in _reduce_compute_h_autotune_configs(M)
-            ]
+            configs = [SimpleNamespace(TILE_M=tm) for tm in _reduce_compute_h_autotune_configs(M)]
             tuned = ct_experimental.autotune_launch(
                 stream,
                 grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M),),
@@ -1682,8 +1801,7 @@ if _CUTILE_AVAILABLE:
             best_tm = tuned.tuned_config.TILE_M
             _reduce_compute_h_best_cfg[cache_key] = best_tm
             ct.launch(
-                stream, (math.ceil(M / best_tm),),
-                _ct_reduce_compute_h_kernel, _make_args(best_tm),
+                stream, (math.ceil(M / best_tm),), _ct_reduce_compute_h_kernel, _make_args(best_tm)
             )
 
         return h_pre_out, h_post_out, h_res_out, r_out, proj_out
@@ -1752,8 +1870,19 @@ if _CUTILE_AVAILABLE:
                     (math.ceil(M / tm), split_k),
                     _ct_proj_rms_fwd_kernel,
                     (
-                        x, weight, proj_acc, norm_acc, r_placeholder, M, N, K, eps,
-                        tm, tn, tk, split_k,
+                        x,
+                        weight,
+                        proj_acc,
+                        norm_acc,
+                        r_placeholder,
+                        M,
+                        N,
+                        K,
+                        eps,
+                        tm,
+                        tn,
+                        tk,
+                        split_k,
                     ),
                 )
             else:
@@ -1766,14 +1895,28 @@ if _CUTILE_AVAILABLE:
                     grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M), cfg.SPLIT_K),
                     kernel=_ct_proj_rms_fwd_kernel,
                     args_fn=lambda cfg: (
-                        x, weight, proj_acc, norm_acc, r_placeholder, M, N, K, eps,
-                        cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.SPLIT_K,
+                        x,
+                        weight,
+                        proj_acc,
+                        norm_acc,
+                        r_placeholder,
+                        M,
+                        N,
+                        K,
+                        eps,
+                        cfg.TILE_M,
+                        cfg.TILE_N,
+                        cfg.TILE_K,
+                        cfg.SPLIT_K,
                     ),
                     search_space=configs,
                 )
                 best = tuned.tuned_config
                 _proj_rms_fwd_best_cfg[cache_key] = (
-                    best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K
+                    best.TILE_M,
+                    best.TILE_N,
+                    best.TILE_K,
+                    best.SPLIT_K,
                 )
                 tm, tn, tk, split_k = best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K
 
@@ -1785,17 +1928,38 @@ if _CUTILE_AVAILABLE:
                     (math.ceil(M / tm), split_k),
                     _ct_proj_rms_fwd_kernel,
                     (
-                        x, weight, proj_acc, norm_acc, r_placeholder, M, N, K, eps,
-                        tm, tn, tk, split_k,
+                        x,
+                        weight,
+                        proj_acc,
+                        norm_acc,
+                        r_placeholder,
+                        M,
+                        N,
+                        K,
+                        eps,
+                        tm,
+                        tn,
+                        tk,
+                        split_k,
                     ),
                 )
 
         # Launch reduce + compute_h kernel
         h_pre, h_post, h_res, r, proj_reduced = _cutile_reduce_compute_h(
-            proj_acc, norm_acc, bias,
-            alpha_pre, alpha_post, alpha_res,
-            n, M, N, K, eps,
-            tm, TILE_N, split_k,
+            proj_acc,
+            norm_acc,
+            bias,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            n,
+            M,
+            N,
+            K,
+            eps,
+            tm,
+            TILE_N,
+            split_k,
         )
         return h_pre, h_post, h_res, r, proj_reduced
 
@@ -1850,21 +2014,49 @@ if _CUTILE_AVAILABLE:
                     grid_fn=lambda cfg: (math.ceil(K / cfg.TILE_SIZE_K), 1),
                     kernel=_ct_proj_rms_bwd_kernel,
                     args_fn=lambda cfg: (
-                        x, weight, norm, grad_proj, grad_r, da, db, M, N, K, eps,
-                        cfg.TILE_SIZE_M, cfg.TILE_SIZE_N, cfg.TILE_SIZE_K,
+                        x,
+                        weight,
+                        norm,
+                        grad_proj,
+                        grad_r,
+                        da,
+                        db,
+                        M,
+                        N,
+                        K,
+                        eps,
+                        cfg.TILE_SIZE_M,
+                        cfg.TILE_SIZE_N,
+                        cfg.TILE_SIZE_K,
                     ),
                     search_space=configs,
                 )
                 best = tuned.tuned_config
                 _proj_rms_bwd_best_cfg[cache_key] = (
-                    best.TILE_SIZE_M, best.TILE_SIZE_N, best.TILE_SIZE_K,
+                    best.TILE_SIZE_M,
+                    best.TILE_SIZE_N,
+                    best.TILE_SIZE_K,
                 )
                 ct.launch(
                     stream,
                     (math.ceil(K / best.TILE_SIZE_K), 1),
                     _ct_proj_rms_bwd_kernel,
-                    (x, weight, norm, grad_proj, grad_r, da, db, M, N, K, eps,
-                     best.TILE_SIZE_M, best.TILE_SIZE_N, best.TILE_SIZE_K),
+                    (
+                        x,
+                        weight,
+                        norm,
+                        grad_proj,
+                        grad_r,
+                        da,
+                        db,
+                        M,
+                        N,
+                        K,
+                        eps,
+                        best.TILE_SIZE_M,
+                        best.TILE_SIZE_N,
+                        best.TILE_SIZE_K,
+                    ),
                 )
         else:
             num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -1881,20 +2073,20 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_fused_grad_h_proj_kernel(
-        GRAD_H_PRE,     # [M, n]
-        GRAD_H_POST,    # [M, n]
-        GRAD_H_RES,     # [M, n*n]
-        H_PRE,          # [M, n]
-        H_POST,         # [M, n]
-        PROJ,           # [M, N]
-        R,              # [M, 1]
-        GRAD_R_EXT,     # [M, 1]
-        Alpha_pre,      # [1]
-        Alpha_post,     # [1]
-        Alpha_res,      # [1]
-        GRAD_H,         # [M, TILE_SIZE_N] output
-        GRAD_PROJ,      # [M, TILE_SIZE_N] output
-        GRAD_R_TOTAL,   # [M, 1] output
+        GRAD_H_PRE,  # [M, n]
+        GRAD_H_POST,  # [M, n]
+        GRAD_H_RES,  # [M, n*n]
+        H_PRE,  # [M, n]
+        H_POST,  # [M, n]
+        PROJ,  # [M, N]
+        R,  # [M, 1]
+        GRAD_R_EXT,  # [M, 1]
+        Alpha_pre,  # [1]
+        Alpha_post,  # [1]
+        Alpha_res,  # [1]
+        GRAD_H,  # [M, TILE_SIZE_N] output
+        GRAD_PROJ,  # [M, TILE_SIZE_N] output
+        GRAD_R_TOTAL,  # [M, 1] output
         M: int,
         N: int,
         n: ConstInt,
@@ -1916,10 +2108,7 @@ if _CUTILE_AVAILABLE:
         alpha_post = ct.load(Alpha_post, index=(0,), shape=(1,)).item()
         alpha_res = ct.load(Alpha_res, index=(0,), shape=(1,)).item()
 
-        r_tile = ct.load(
-            R, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1),
-            padding_mode=PAD_ZERO,
-        )
+        r_tile = ct.load(R, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
         r_tile = ct.astype(r_tile, ct.float32)
 
         r_eps = r_tile + eps
@@ -1934,55 +2123,45 @@ if _CUTILE_AVAILABLE:
 
         if HAS_GRAD_H_PRE:
             gy_pre = ct.load(
-                GRAD_H_PRE, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
-                padding_mode=PAD_ZERO,
+                GRAD_H_PRE, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
             )
             gy_pre = ct.astype(gy_pre, ct.float32)
         else:
             gy_pre = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
-        h_pre = ct.load(
-            H_PRE, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
-            padding_mode=PAD_ZERO,
-        )
+        h_pre = ct.load(H_PRE, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO)
         h_pre = ct.astype(h_pre, ct.float32)
         proj_pre = ct.load(
-            PROJ, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
-            padding_mode=PAD_ZERO,
+            PROJ, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
         )
         proj_pre = ct.astype(proj_pre, ct.float32)
         grad_h_pre = gy_pre * h_pre * (1.0 - h_pre)
         grad_proj_pre = grad_h_pre * alpha_pre * inv_r_eps
         grad_r_from_h += ct.sum(
-            grad_h_pre * proj_pre * alpha_pre * (-inv_r_eps * inv_r_eps),
-            axis=1, keepdims=True,
+            grad_h_pre * proj_pre * alpha_pre * (-inv_r_eps * inv_r_eps), axis=1, keepdims=True
         )
         ct.store(GRAD_H, index=(tile_m_id, 0), tile=grad_h_pre.astype(GRAD_H.dtype))
         ct.store(GRAD_PROJ, index=(tile_m_id, 0), tile=grad_proj_pre.astype(GRAD_PROJ.dtype))
 
         if HAS_GRAD_H_POST:
             gy_post = ct.load(
-                GRAD_H_POST, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
-                padding_mode=PAD_ZERO,
+                GRAD_H_POST, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
             )
             gy_post = ct.astype(gy_post, ct.float32)
         else:
             gy_post = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
         h_post = ct.load(
-            H_POST, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n),
-            padding_mode=PAD_ZERO,
+            H_POST, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
         )
         h_post = ct.astype(h_post, ct.float32)
         proj_post = ct.load(
-            PROJ, index=(tile_m_id, 1), shape=(TILE_SIZE_M, n),
-            padding_mode=PAD_ZERO,
+            PROJ, index=(tile_m_id, 1), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
         )
         proj_post = ct.astype(proj_post, ct.float32)
         half_h_post = h_post * 0.5
         grad_h_post = gy_post * half_h_post * (1.0 - half_h_post) * 2.0
         grad_proj_post = grad_h_post * alpha_post * inv_r_eps
         grad_r_from_h += ct.sum(
-            grad_h_post * proj_post * alpha_post * (-inv_r_eps * inv_r_eps),
-            axis=1, keepdims=True,
+            grad_h_post * proj_post * alpha_post * (-inv_r_eps * inv_r_eps), axis=1, keepdims=True
         )
         ct.store(GRAD_H, index=(tile_m_id, 1), tile=grad_h_post.astype(GRAD_H.dtype))
         ct.store(GRAD_PROJ, index=(tile_m_id, 1), tile=grad_proj_post.astype(GRAD_PROJ.dtype))
@@ -1990,35 +2169,35 @@ if _CUTILE_AVAILABLE:
         for res_chunk in ct.static_iter(range(n)):
             if HAS_GRAD_H_RES:
                 grad_h_res = ct.load(
-                    GRAD_H_RES, index=(tile_m_id, res_chunk), shape=(TILE_SIZE_M, n),
+                    GRAD_H_RES,
+                    index=(tile_m_id, res_chunk),
+                    shape=(TILE_SIZE_M, n),
                     padding_mode=PAD_ZERO,
                 )
                 grad_h_res = ct.astype(grad_h_res, ct.float32)
             else:
                 grad_h_res = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
             proj_res = ct.load(
-                PROJ, index=(tile_m_id, 2 + res_chunk), shape=(TILE_SIZE_M, n),
+                PROJ,
+                index=(tile_m_id, 2 + res_chunk),
+                shape=(TILE_SIZE_M, n),
                 padding_mode=PAD_ZERO,
             )
             proj_res = ct.astype(proj_res, ct.float32)
             grad_proj_res = grad_h_res * alpha_res * inv_r_eps
             grad_r_from_h += ct.sum(
-                grad_h_res * proj_res * alpha_res * (-inv_r_eps * inv_r_eps),
-                axis=1, keepdims=True,
+                grad_h_res * proj_res * alpha_res * (-inv_r_eps * inv_r_eps), axis=1, keepdims=True
             )
+            ct.store(GRAD_H, index=(tile_m_id, 2 + res_chunk), tile=grad_h_res.astype(GRAD_H.dtype))
             ct.store(
-                GRAD_H, index=(tile_m_id, 2 + res_chunk),
-                tile=grad_h_res.astype(GRAD_H.dtype),
-            )
-            ct.store(
-                GRAD_PROJ, index=(tile_m_id, 2 + res_chunk),
+                GRAD_PROJ,
+                index=(tile_m_id, 2 + res_chunk),
                 tile=grad_proj_res.astype(GRAD_PROJ.dtype),
             )
 
         if HAS_GRAD_R_EXT:
             grad_r_ext_tile = ct.load(
-                GRAD_R_EXT, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1),
-                padding_mode=PAD_ZERO,
+                GRAD_R_EXT, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO
             )
             grad_r_ext_tile = ct.astype(grad_r_ext_tile, ct.float32)
         else:
@@ -2029,13 +2208,13 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_fused_grad_x_weight_kernel(
-        X,              # [M, K]
-        WEIGHT,         # [N, K]
-        GRAD_PROJ,      # [M, TILE_SIZE_N] precomputed
-        GRAD_R_TOTAL,   # [M, 1] precomputed
-        R,              # [M, 1]
-        GRAD_X,         # [M, K] output
-        GRAD_WEIGHT,    # [N, K] output
+        X,  # [M, K]
+        WEIGHT,  # [N, K]
+        GRAD_PROJ,  # [M, TILE_SIZE_N] precomputed
+        GRAD_R_TOTAL,  # [M, 1] precomputed
+        R,  # [M, 1]
+        GRAD_X,  # [M, K] output
+        GRAD_WEIGHT,  # [N, K] output
         M: int,
         N: int,
         K: int,
@@ -2054,38 +2233,35 @@ if _CUTILE_AVAILABLE:
 
         # Load weight tile once — only depends on K-tile
         weight_tile = ct.load(
-            WEIGHT, index=(0, tile_k_id), shape=(TILE_SIZE_N, TILE_SIZE_K),
-            padding_mode=PAD_ZERO,
+            WEIGHT, index=(0, tile_k_id), shape=(TILE_SIZE_N, TILE_SIZE_K), padding_mode=PAD_ZERO
         )
 
         acc_grad_weight = ct.full((TILE_SIZE_K, TILE_SIZE_N), 0.0, dtype=ct.float32)
 
         for tile_m_id in range(NUM_M_TILES):
             grad_proj_tile = ct.load(
-                GRAD_PROJ, index=(tile_m_id, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
+                GRAD_PROJ,
+                index=(tile_m_id, 0),
+                shape=(TILE_SIZE_M, TILE_SIZE_N),
                 padding_mode=PAD_ZERO,
             )
             x_tile = ct.load(
-                X, index=(tile_m_id, tile_k_id), shape=(TILE_SIZE_M, TILE_SIZE_K),
+                X,
+                index=(tile_m_id, tile_k_id),
+                shape=(TILE_SIZE_M, TILE_SIZE_K),
                 padding_mode=PAD_ZERO,
             )
             grad_r_total = ct.load(
-                GRAD_R_TOTAL, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1),
-                padding_mode=PAD_ZERO,
+                GRAD_R_TOTAL, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO
             )
-            r_tile = ct.load(
-                R, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1),
-                padding_mode=PAD_ZERO,
-            )
+            r_tile = ct.load(R, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
             r_tile = ct.astype(r_tile, ct.float32)
 
             # grad_x = grad_proj @ weight + grad_r_total * x / (r * K)
             inv_rK = 1.0 / (r_tile * K)
             acc_grad_x = (grad_r_total * inv_rK) * ct.astype(x_tile, ct.float32)
             acc_grad_x = ct.mma(
-                grad_proj_tile.astype(ct.tfloat32),
-                weight_tile.astype(ct.tfloat32),
-                acc=acc_grad_x,
+                grad_proj_tile.astype(ct.tfloat32), weight_tile.astype(ct.tfloat32), acc=acc_grad_x
             )
             ct.store(GRAD_X, index=(tile_m_id, tile_k_id), tile=acc_grad_x.astype(GRAD_X.dtype))
 
@@ -2096,17 +2272,21 @@ if _CUTILE_AVAILABLE:
                 acc=acc_grad_weight,
             )
 
-        ct.store(GRAD_WEIGHT, index=(0, tile_k_id), tile=acc_grad_weight.transpose().astype(GRAD_WEIGHT.dtype))
+        ct.store(
+            GRAD_WEIGHT,
+            index=(0, tile_k_id),
+            tile=acc_grad_weight.transpose().astype(GRAD_WEIGHT.dtype),
+        )
 
     @ct.kernel
     def _ct_scalar_grads_partials_kernel(
-        GRAD_H,           # [M, TILE_SIZE_N] precomputed
-        PROJ,           # [M, N]
-        R,              # [M, 1]
-        GRAD_ALPHA_PRE_PARTIALS,   # [num_m_blocks, 1] output
+        GRAD_H,  # [M, TILE_SIZE_N] precomputed
+        PROJ,  # [M, N]
+        R,  # [M, 1]
+        GRAD_ALPHA_PRE_PARTIALS,  # [num_m_blocks, 1] output
         GRAD_ALPHA_POST_PARTIALS,  # [num_m_blocks, 1] output
-        GRAD_ALPHA_RES_PARTIALS,   # [num_m_blocks, 1] output
-        GRAD_BIAS_PARTIALS,        # [num_m_blocks, TILE_SIZE_N] output
+        GRAD_ALPHA_RES_PARTIALS,  # [num_m_blocks, 1] output
+        GRAD_BIAS_PARTIALS,  # [num_m_blocks, TILE_SIZE_N] output
         M: int,
         N: int,
         n: int,
@@ -2132,18 +2312,13 @@ if _CUTILE_AVAILABLE:
         mask_res_2d = ct.reshape(mask_res, (1, TILE_SIZE_N))
 
         grad_h = ct.load(
-            GRAD_H, index=(bid_m, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
-            padding_mode=PAD_ZERO,
+            GRAD_H, index=(bid_m, 0), shape=(TILE_SIZE_M, TILE_SIZE_N), padding_mode=PAD_ZERO
         )
         proj_tile = ct.load(
-            PROJ, index=(bid_m, 0), shape=(TILE_SIZE_M, TILE_SIZE_N),
-            padding_mode=PAD_ZERO,
+            PROJ, index=(bid_m, 0), shape=(TILE_SIZE_M, TILE_SIZE_N), padding_mode=PAD_ZERO
         )
         proj_tile = ct.astype(proj_tile, ct.float32)
-        r_tile = ct.load(
-            R, index=(bid_m, 0), shape=(TILE_SIZE_M, 1),
-            padding_mode=PAD_ZERO,
-        )
+        r_tile = ct.load(R, index=(bid_m, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
         r_tile = ct.astype(r_tile, ct.float32)
 
         r_eps = r_tile + eps
@@ -2155,32 +2330,36 @@ if _CUTILE_AVAILABLE:
         ga_res = ct.reshape(ct.sum(ga_all * mask_res_2d), (1, 1))
         partial_gb = ct.sum(grad_h, axis=0, keepdims=False)
         ct.store(
-            GRAD_ALPHA_PRE_PARTIALS, index=(bid_m, 0),
+            GRAD_ALPHA_PRE_PARTIALS,
+            index=(bid_m, 0),
             tile=ga_pre.astype(GRAD_ALPHA_PRE_PARTIALS.dtype),
         )
         ct.store(
-            GRAD_ALPHA_POST_PARTIALS, index=(bid_m, 0),
+            GRAD_ALPHA_POST_PARTIALS,
+            index=(bid_m, 0),
             tile=ga_post.astype(GRAD_ALPHA_POST_PARTIALS.dtype),
         )
         ct.store(
-            GRAD_ALPHA_RES_PARTIALS, index=(bid_m, 0),
+            GRAD_ALPHA_RES_PARTIALS,
+            index=(bid_m, 0),
             tile=ga_res.astype(GRAD_ALPHA_RES_PARTIALS.dtype),
         )
         ct.store(
-            GRAD_BIAS_PARTIALS, index=(bid_m, 0),
+            GRAD_BIAS_PARTIALS,
+            index=(bid_m, 0),
             tile=ct.reshape(partial_gb, (1, TILE_SIZE_N)).astype(GRAD_BIAS_PARTIALS.dtype),
         )
 
     @ct.kernel
     def _ct_scalar_grads_reduce_kernel(
-        GRAD_ALPHA_PRE_PARTIALS,   # [num_m_blocks, 1]
+        GRAD_ALPHA_PRE_PARTIALS,  # [num_m_blocks, 1]
         GRAD_ALPHA_POST_PARTIALS,  # [num_m_blocks, 1]
-        GRAD_ALPHA_RES_PARTIALS,   # [num_m_blocks, 1]
-        GRAD_BIAS_PARTIALS,        # [num_m_blocks, TILE_SIZE_N]
-        GRAD_ALPHA_PRE,            # [1, 1] output
-        GRAD_ALPHA_POST,           # [1, 1] output
-        GRAD_ALPHA_RES,            # [1, 1] output
-        GRAD_BIAS,                 # [1, TILE_SIZE_N] output
+        GRAD_ALPHA_RES_PARTIALS,  # [num_m_blocks, 1]
+        GRAD_BIAS_PARTIALS,  # [num_m_blocks, TILE_SIZE_N]
+        GRAD_ALPHA_PRE,  # [1, 1] output
+        GRAD_ALPHA_POST,  # [1, 1] output
+        GRAD_ALPHA_RES,  # [1, 1] output
+        GRAD_BIAS,  # [1, TILE_SIZE_N] output
         NUM_M_BLOCKS: int,
         TILE_SIZE_N: ConstInt,
     ):
@@ -2192,20 +2371,16 @@ if _CUTILE_AVAILABLE:
 
         for bid_m in range(NUM_M_BLOCKS):
             acc_pre += ct.load(
-                GRAD_ALPHA_PRE_PARTIALS, index=(bid_m, 0), shape=(1, 1),
-                padding_mode=PAD_ZERO,
+                GRAD_ALPHA_PRE_PARTIALS, index=(bid_m, 0), shape=(1, 1), padding_mode=PAD_ZERO
             ).astype(ct.float32)
             acc_post += ct.load(
-                GRAD_ALPHA_POST_PARTIALS, index=(bid_m, 0), shape=(1, 1),
-                padding_mode=PAD_ZERO,
+                GRAD_ALPHA_POST_PARTIALS, index=(bid_m, 0), shape=(1, 1), padding_mode=PAD_ZERO
             ).astype(ct.float32)
             acc_res += ct.load(
-                GRAD_ALPHA_RES_PARTIALS, index=(bid_m, 0), shape=(1, 1),
-                padding_mode=PAD_ZERO,
+                GRAD_ALPHA_RES_PARTIALS, index=(bid_m, 0), shape=(1, 1), padding_mode=PAD_ZERO
             ).astype(ct.float32)
             acc_bias += ct.load(
-                GRAD_BIAS_PARTIALS, index=(bid_m, 0), shape=(1, TILE_SIZE_N),
-                padding_mode=PAD_ZERO,
+                GRAD_BIAS_PARTIALS, index=(bid_m, 0), shape=(1, TILE_SIZE_N), padding_mode=PAD_ZERO
             ).astype(ct.float32)
 
         ct.store(GRAD_ALPHA_PRE, index=(0, 0), tile=acc_pre.astype(GRAD_ALPHA_PRE.dtype))
@@ -2215,13 +2390,13 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_fused_compute_h_proj_rms_bwd_small_k_kernel(
-        X,              # [M, K]
-        WEIGHT,         # [N, K]
-        GRAD_PROJ,      # [M, TILE_N] precomputed
-        GRAD_R_TOTAL,   # [M, 1] precomputed
-        R,              # [M, 1]
-        GRAD_X,         # [M, K] output
-        GRAD_WEIGHT,    # [N, K] output
+        X,  # [M, K]
+        WEIGHT,  # [N, K]
+        GRAD_PROJ,  # [M, TILE_N] precomputed
+        GRAD_R_TOTAL,  # [M, 1] precomputed
+        R,  # [M, 1]
+        GRAD_X,  # [M, K] output
+        GRAD_WEIGHT,  # [N, K] output
         M: int,
         N: int,
         K: int,
@@ -2247,12 +2422,16 @@ if _CUTILE_AVAILABLE:
                 accumulator_db = ct.full((TILE_DB_SIZE_K, TILE_N_SIZE), 0.0, dtype=ct.float32)
                 for m_tile in range(NUM_M_TILES):
                     x_tile = ct.load(
-                        X, index=(m_tile, tile_id),
-                        shape=(TILE_DB_SIZE_M, TILE_DB_SIZE_K), padding_mode=zero_pad,
+                        X,
+                        index=(m_tile, tile_id),
+                        shape=(TILE_DB_SIZE_M, TILE_DB_SIZE_K),
+                        padding_mode=zero_pad,
                     )
                     grad_proj_tile = ct.load(
-                        GRAD_PROJ, index=(m_tile, 0),
-                        shape=(TILE_DB_SIZE_M, TILE_N_SIZE), padding_mode=zero_pad,
+                        GRAD_PROJ,
+                        index=(m_tile, 0),
+                        shape=(TILE_DB_SIZE_M, TILE_N_SIZE),
+                        padding_mode=zero_pad,
                     )
 
                     accumulator_db = ct.mma(
@@ -2262,7 +2441,8 @@ if _CUTILE_AVAILABLE:
                     )
 
                 ct.store(
-                    GRAD_WEIGHT, index=(0, tile_id),
+                    GRAD_WEIGHT,
+                    index=(0, tile_id),
                     tile=accumulator_db.transpose().astype(GRAD_WEIGHT.dtype),
                     allow_tma=False,
                 )
@@ -2279,36 +2459,47 @@ if _CUTILE_AVAILABLE:
                 dd_tile_idx = tile_id // NUM_DA_K_TILES
 
                 grad_proj_tile = ct.load(
-                    GRAD_PROJ, index=(dd_tile_idx, 0),
-                    shape=(TILE_DA_SIZE_M, TILE_N_SIZE), padding_mode=zero_pad,
+                    GRAD_PROJ,
+                    index=(dd_tile_idx, 0),
+                    shape=(TILE_DA_SIZE_M, TILE_N_SIZE),
+                    padding_mode=zero_pad,
                 )
                 grad_r_total = ct.load(
-                    GRAD_R_TOTAL, index=(dd_tile_idx, 0),
-                    shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad,
+                    GRAD_R_TOTAL,
+                    index=(dd_tile_idx, 0),
+                    shape=(TILE_DA_SIZE_M, 1),
+                    padding_mode=zero_pad,
                 )
                 r_tile = ct.load(
-                    R, index=(dd_tile_idx, 0),
-                    shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad,
+                    R, index=(dd_tile_idx, 0), shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad
                 )
                 r_tile = ct.astype(r_tile, ct.float32)
 
                 x_tile = ct.load(
-                    X, index=(dd_tile_idx, b_tile_idx),
-                    shape=(TILE_DA_SIZE_M, TILE_DA_SIZE_K), padding_mode=zero_pad,
+                    X,
+                    index=(dd_tile_idx, b_tile_idx),
+                    shape=(TILE_DA_SIZE_M, TILE_DA_SIZE_K),
+                    padding_mode=zero_pad,
                 )
                 inv_rK = 1.0 / (r_tile * K)
                 accumulator_da = (grad_r_total * inv_rK) * ct.astype(x_tile, ct.float32)
 
                 weight_tile = ct.load(
-                    WEIGHT, index=(0, b_tile_idx),
-                    shape=(TILE_N_SIZE, TILE_DA_SIZE_K), padding_mode=zero_pad,
+                    WEIGHT,
+                    index=(0, b_tile_idx),
+                    shape=(TILE_N_SIZE, TILE_DA_SIZE_K),
+                    padding_mode=zero_pad,
                 )
                 accumulator_da = ct.mma(
                     grad_proj_tile.astype(ct.tfloat32),
                     weight_tile.astype(ct.tfloat32),
                     acc=accumulator_da,
                 )
-                ct.store(GRAD_X, index=(dd_tile_idx, b_tile_idx), tile=accumulator_da.astype(GRAD_X.dtype))
+                ct.store(
+                    GRAD_X,
+                    index=(dd_tile_idx, b_tile_idx),
+                    tile=accumulator_da.astype(GRAD_X.dtype),
+                )
 
     def _fused_grad_x_weight_autotune_configs(N):
         """Autotune search space for fused grad_x + grad_weight kernel."""
@@ -2380,13 +2571,29 @@ if _CUTILE_AVAILABLE:
             (math.ceil(M / tile_m_precomp),),
             _ct_fused_grad_h_proj_kernel,
             (
-                grad_h_pre_arg, grad_h_post_arg, grad_h_res_arg,
-                h_pre, h_post, proj, r, grad_r_ext_arg,
-                alpha_pre, alpha_post, alpha_res,
-                grad_h_buf, grad_proj_buf, grad_r_total_buf,
-                M, N, n, eps,
-                tile_m_precomp, TILE_N,
-                int(has_grad_h_pre), int(has_grad_h_post), int(has_grad_h_res),
+                grad_h_pre_arg,
+                grad_h_post_arg,
+                grad_h_res_arg,
+                h_pre,
+                h_post,
+                proj,
+                r,
+                grad_r_ext_arg,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                grad_h_buf,
+                grad_proj_buf,
+                grad_r_total_buf,
+                M,
+                N,
+                n,
+                eps,
+                tile_m_precomp,
+                TILE_N,
+                int(has_grad_h_pre),
+                int(has_grad_h_post),
+                int(has_grad_h_res),
                 has_grad_r_ext_flag,
             ),
         )
@@ -2406,10 +2613,19 @@ if _CUTILE_AVAILABLE:
                     (math.ceil(K / tk),),
                     _ct_fused_grad_x_weight_kernel,
                     (
-                        x, weight, grad_proj_buf, grad_r_total_buf, r,
-                        grad_x, grad_weight,
-                        M, N, K,
-                        tm, tn, tk,
+                        x,
+                        weight,
+                        grad_proj_buf,
+                        grad_r_total_buf,
+                        r,
+                        grad_x,
+                        grad_weight,
+                        M,
+                        N,
+                        K,
+                        tm,
+                        tn,
+                        tk,
                     ),
                 )
             else:
@@ -2421,26 +2637,46 @@ if _CUTILE_AVAILABLE:
                     grid_fn=lambda cfg: (math.ceil(K / cfg.TILE_SIZE_K),),
                     kernel=_ct_fused_grad_x_weight_kernel,
                     args_fn=lambda cfg: (
-                        x, weight, grad_proj_buf, grad_r_total_buf, r,
-                        grad_x, grad_weight,
-                        M, N, K,
-                        cfg.TILE_SIZE_M, cfg.TILE_SIZE_N, cfg.TILE_SIZE_K,
+                        x,
+                        weight,
+                        grad_proj_buf,
+                        grad_r_total_buf,
+                        r,
+                        grad_x,
+                        grad_weight,
+                        M,
+                        N,
+                        K,
+                        cfg.TILE_SIZE_M,
+                        cfg.TILE_SIZE_N,
+                        cfg.TILE_SIZE_K,
                     ),
                     search_space=configs,
                 )
                 best = tuned.tuned_config
                 _fused_grad_x_weight_best_cfg[cache_key] = (
-                    best.TILE_SIZE_M, best.TILE_SIZE_N, best.TILE_SIZE_K,
+                    best.TILE_SIZE_M,
+                    best.TILE_SIZE_N,
+                    best.TILE_SIZE_K,
                 )
                 ct.launch(
                     stream,
                     (math.ceil(K / best.TILE_SIZE_K),),
                     _ct_fused_grad_x_weight_kernel,
                     (
-                        x, weight, grad_proj_buf, grad_r_total_buf, r,
-                        grad_x, grad_weight,
-                        M, N, K,
-                        best.TILE_SIZE_M, best.TILE_SIZE_N, best.TILE_SIZE_K,
+                        x,
+                        weight,
+                        grad_proj_buf,
+                        grad_r_total_buf,
+                        r,
+                        grad_x,
+                        grad_weight,
+                        M,
+                        N,
+                        K,
+                        best.TILE_SIZE_M,
+                        best.TILE_SIZE_N,
+                        best.TILE_SIZE_K,
                     ),
                 )
         else:
@@ -2450,9 +2686,16 @@ if _CUTILE_AVAILABLE:
                 (num_sms, 2, 1),
                 _ct_fused_compute_h_proj_rms_bwd_small_k_kernel,
                 (
-                    x, weight, grad_proj_buf, grad_r_total_buf, r,
-                    grad_x, grad_weight,
-                    M, N, K,
+                    x,
+                    weight,
+                    grad_proj_buf,
+                    grad_r_total_buf,
+                    r,
+                    grad_x,
+                    grad_weight,
+                    M,
+                    N,
+                    K,
                     TILE_N,
                 ),
             )
@@ -2474,11 +2717,19 @@ if _CUTILE_AVAILABLE:
             (num_m_blocks,),
             _ct_scalar_grads_partials_kernel,
             (
-                grad_h_buf, proj, r,
-                grad_alpha_pre_partials, grad_alpha_post_partials, grad_alpha_res_partials,
+                grad_h_buf,
+                proj,
+                r,
+                grad_alpha_pre_partials,
+                grad_alpha_post_partials,
+                grad_alpha_res_partials,
                 grad_bias_partials,
-                M, N, n, eps,
-                tile_m_scalar, TILE_N,
+                M,
+                N,
+                n,
+                eps,
+                tile_m_scalar,
+                TILE_N,
             ),
         )
         ct.launch(
@@ -2486,10 +2737,16 @@ if _CUTILE_AVAILABLE:
             (1,),
             _ct_scalar_grads_reduce_kernel,
             (
-                grad_alpha_pre_partials, grad_alpha_post_partials, grad_alpha_res_partials,
+                grad_alpha_pre_partials,
+                grad_alpha_post_partials,
+                grad_alpha_res_partials,
                 grad_bias_partials,
-                grad_alpha_pre, grad_alpha_post, grad_alpha_res, grad_bias,
-                num_m_blocks, TILE_N,
+                grad_alpha_pre,
+                grad_alpha_post,
+                grad_alpha_res,
+                grad_bias,
+                num_m_blocks,
+                TILE_N,
             ),
         )
 
@@ -2519,7 +2776,6 @@ if _CUTILE_AVAILABLE:
 # ============================================================================
 
 from megatron.core.transformer.hyper_connection import (
-    native_fused_add_3 as fused_add_3,
     native_h_aggregate,
     native_h_post_bda,
     native_proj_rms,
@@ -2551,9 +2807,7 @@ def _get_triton_h_post_bda_bwd():
     return globals().get("_triton_h_post_bda_bwd")
 
 
-def _torch_h_aggregate_bwd(
-    grad_output: Tensor, x: Tensor, h_pre: Tensor
-) -> Tuple[Tensor, Tensor]:
+def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tuple[Tensor, Tensor]:
     grad_x = grad_output.unsqueeze(2) * h_pre.unsqueeze(-1)
     grad_h = torch.sum(grad_output.unsqueeze(2) * x, dim=-1)
     return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype)
@@ -2603,11 +2857,7 @@ def _torch_proj_rms_compute_h(
     proj = torch.matmul(x, weight.t())
     r = x.float().norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
     alpha = torch.cat(
-        [
-            alpha_pre.expand(n),
-            alpha_post.expand(n),
-            alpha_res.expand(weight.shape[0] - 2 * n),
-        ],
+        [alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(weight.shape[0] - 2 * n)],
         dim=-1,
     )
     h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
@@ -2682,11 +2932,20 @@ if _CUTILE_AVAILABLE:
             eps: float = 1e-6,
         ):
             h_pre, h_post, h_res, r, proj_reduced = _cutile_proj_rms_compute_h_fwd(
-                x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps,
+                x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps
             )
             ctx.save_for_backward(
-                x, weight, h_pre, h_post, h_res, proj_reduced, r,
-                alpha_pre, alpha_post, alpha_res, bias,
+                x,
+                weight,
+                h_pre,
+                h_post,
+                h_res,
+                proj_reduced,
+                r,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                bias,
             )
             ctx.n = n
             ctx.eps = eps
@@ -2695,16 +2954,38 @@ if _CUTILE_AVAILABLE:
         @staticmethod
         def backward(ctx, grad_h_pre, grad_h_post, grad_h_res, grad_r_ext):
             (
-                x, weight, h_pre, h_post, h_res, proj, r,
-                alpha_pre, alpha_post, alpha_res, bias_param,
+                x,
+                weight,
+                h_pre,
+                h_post,
+                h_res,
+                proj,
+                r,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                bias_param,
             ) = ctx.saved_tensors
 
             grad_x, grad_weight, grad_ap, grad_apo, grad_ar, grad_bias = (
                 _cutile_fused_compute_h_proj_rms_bwd(
-                    x, weight, grad_h_pre, grad_h_post, grad_h_res,
-                    h_pre, h_post, h_res, proj, r, grad_r_ext,
-                    alpha_pre, alpha_post, alpha_res,
-                    bias_param, ctx.n, ctx.eps,
+                    x,
+                    weight,
+                    grad_h_pre,
+                    grad_h_post,
+                    grad_h_res,
+                    h_pre,
+                    h_post,
+                    h_res,
+                    proj,
+                    r,
+                    grad_r_ext,
+                    alpha_pre,
+                    alpha_post,
+                    alpha_res,
+                    bias_param,
+                    ctx.n,
+                    ctx.eps,
                 )
             )
 
