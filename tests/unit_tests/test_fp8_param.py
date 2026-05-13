@@ -91,8 +91,7 @@ class TestFP8Param:
         args = get_args()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
-            num_experts=args.num_experts,
-            moe_grouped_gemm=args.moe_grouped_gemm,
+            num_experts=args.num_experts, moe_grouped_gemm=args.moe_grouped_gemm
         )
         return GPTModel(
             config=config,

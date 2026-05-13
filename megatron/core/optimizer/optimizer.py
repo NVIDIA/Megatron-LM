@@ -1292,8 +1292,7 @@ class ChainedOptimizer(MegatronOptimizer):
         # may share the same model chunk, so defer param sync until all chained optimizers
         # have staged their params, then sync each model chunk once.
         defer_param_sync = (
-            self.config.reuse_grad_buf_for_mxfp8_param_ag
-            and not self.config.overlap_param_gather
+            self.config.reuse_grad_buf_for_mxfp8_param_ag and not self.config.overlap_param_gather
         )
         deferred_model_chunks = []
         deferred_model_chunk_ids = set()
