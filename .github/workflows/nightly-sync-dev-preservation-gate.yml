@@ -1,0 +1,430 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nightly Sync: Dev-Feature Preservation Gate
+# ==========================================
+#
+# Background
+# ----------
+# The nightly main->dev sync (see `nightly-sync-main-to-dev.yml`) merges
+# `origin/main` into `origin/dev` with `git merge -X theirs`. The
+# `-X theirs` strategy resolves every textual conflict in main's favour.
+#
+# The most common workflow this breaks is:
+#
+#   1. A feature lands on `dev` at time T0.
+#   2. The same feature lands on `main` at time T1 (later, possibly
+#      reformatted, refactored, or with different surrounding context).
+#   3. The nightly sync runs between T0 and T1, with `-X theirs`. Because
+#      main does not yet have the feature, the merge silently drops dev's
+#      addition wherever main happened to touch nearby lines.
+#
+# This has bitten the sync repeatedly. Examples from PR #4659 and #4716:
+#   - `transformer_layer.py` lost the `input_ids=None` parameter on
+#     `_forward_mlp_router` even though main never removed it.
+#   - `token_dispatcher.py` lost the
+#     `num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing`
+#     kwarg at the `_HybridEPManager(...)` call site.
+#   - `moe_layer.py` lost the `self._maybe_record_overload_factor(...)`
+#     call in `routed_experts_compute`.
+#   - `gpt_dynamic_inference_with_coordinator.py` lost
+#     `from megatron.training.arguments import parse_and_validate_args`
+#     even though `parse_and_validate_args(...)` is still called at line 216.
+#   - `data_samplers.py` / `utils.py` / `training.py` lost references to
+#     `args.dynamic_context_parallel` (kept main's `args.hybrid_context_parallel`
+#     alias, which is False when callers pass `--dynamic-context-parallel`).
+#   - `datasets/readme.md` lost the dev-only "Packing Scheduler" section.
+#
+# Goal
+# ----
+# Catch this class of regression deterministically, with no LLM in the
+# loop, the moment the sync bot pushes its Phase 1 commit. The gate runs
+# against the pushed `main2dev/<DATE>` branch and the sync PR. If it
+# finds lines that satisfy ALL of:
+#
+#     line is on `origin/dev`        (dev had it)
+#     line is NOT on `origin/main`   (main never owned it)
+#     line is NOT on the sync HEAD   (the merge dropped it)
+#
+# the workflow fails and posts a PR comment listing each missing line
+# with its file path. The sync bot or a human must then either restore
+# the line or justify the drop with a specific main commit before the
+# PR can ship.
+#
+# Why this is separate from `nightly-sync-main-to-dev.yml`
+# --------------------------------------------------------
+# The main sync workflow owns a single long-running Claude Code step.
+# The push happens inside that step. Adding a deterministic gate as
+# another step in the same job would not run on later fix-pushes
+# (`/ok to test` cycles do not re-run the workflow). Triggering on
+# `pull_request: [opened, synchronize]` against the sync PR makes the
+# gate run on every push — Phase 1 and every Phase 3 fix-push — and
+# blocks the PR from being marked ready via branch protection if it
+# fails.
+
+name: Nightly Sync - Dev-Feature Preservation Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - dev
+  # Allow manual re-runs from the Actions tab without pushing.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to audit'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preservation-gate:
+    # Only run on the bot's sync PRs. The head branch pattern is
+    # `main2dev/<DATE>` (see `nightly-sync-main-to-dev.yml` Compute
+    # branch name step). Skip for any other PR to avoid running the
+    # gate on unrelated dev-bound PRs.
+    if: |
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      (
+        (github.event_name == 'pull_request' &&
+         startsWith(github.head_ref, 'main2dev/')) ||
+        github.event_name == 'workflow_dispatch'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Compute PR / branch refs
+        id: refs
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR_NUMBER="${{ inputs.pr_number }}"
+            HEAD_REF=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
+              --json headRefName --jq '.headRefName')
+          else
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            HEAD_REF="${{ github.head_ref }}"
+          fi
+          echo "pr=$PR_NUMBER"      >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "::notice::Gating PR #$PR_NUMBER (head=$HEAD_REF)"
+
+      - name: Checkout sync branch (full history)
+        uses: actions/checkout@v6
+        with:
+          # We need history for both origin/dev and origin/main, plus
+          # the merge base, plus the sync branch's full tree.
+          fetch-depth: 0
+          ref: ${{ steps.refs.outputs.head_ref }}
+
+      - name: Fetch dev and main
+        run: |
+          git fetch origin dev:refs/remotes/origin/dev
+          git fetch origin main:refs/remotes/origin/main
+          echo "HEAD:        $(git rev-parse HEAD)"
+          echo "origin/dev:  $(git rev-parse origin/dev)"
+          echo "origin/main: $(git rev-parse origin/main)"
+          echo "merge-base:  $(git merge-base origin/dev origin/main)"
+
+      - name: Audit dev-only additions dropped by the merge
+        id: audit
+        run: |
+          set -euo pipefail
+
+          # The set of files where the bot's merged tree differs from
+          # the merge base of dev and main. We only audit files the
+          # sync actually touched.
+          BASE=$(git merge-base origin/dev origin/main)
+          mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD \
+            -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
+               '*.sh' '*.cpp' '*.cu' '*.h' \
+               2>/dev/null | sort -u)
+
+          if [ "${#CHANGED[@]}" -eq 0 ]; then
+            echo "No tracked-extension files changed; nothing to audit."
+            echo "violations=0" >> "$GITHUB_OUTPUT"
+            : > "$GITHUB_WORKSPACE/preservation-report.md"
+            exit 0
+          fi
+
+          : > "$GITHUB_WORKSPACE/preservation-report.md"
+          VIOLATIONS=0
+
+          # Files we know are intentionally main-overridden per the
+          # nightly-sync skill. Lines lost in these files are NOT
+          # automatic regressions — the bot may have justifiably kept
+          # main's version. We still report them, but as "info" rather
+          # than "error", and they do not fail the workflow.
+          INTENTIONAL_OVERRIDE_REGEX='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
+
+          # The dependency-management triple is *always* dev's by skill
+          # rule. Differences here are expected and not feature drops.
+          DEP_TRIPLE_REGEX='^(pyproject\.toml|uv\.lock|docker/Dockerfile\.ci\.dev)$'
+
+          # CODEOWNERS is never modified by the sync bot.
+          CODEOWNERS_REGEX='^\.github/CODEOWNERS$'
+
+          for f in "${CHANGED[@]}"; do
+            # Skip the special-cased categories.
+            if [[ "$f" =~ $DEP_TRIPLE_REGEX || "$f" =~ $CODEOWNERS_REGEX ]]; then
+              continue
+            fi
+
+            # File must exist on both dev and main to compare. If dev
+            # added the file outright and main never had it, the
+            # `comm` below will yield every line — which is correct
+            # behavior (a whole-file deletion is a real regression).
+            # If main deleted a file that dev still has, we treat the
+            # entire file's dev content as "dev-only" and check whether
+            # the merged tree retained it.
+            dev_lines=$(git show "origin/dev:$f"  2>/dev/null | sort -u || true)
+            main_lines=$(git show "origin/main:$f" 2>/dev/null | sort -u || true)
+            # `tree_lines` are the lines in the bot's merged tree.
+            # If the bot deleted the file outright, this is empty.
+            if [ -f "$f" ]; then
+              tree_lines=$(sort -u "$f" || true)
+            else
+              tree_lines=""
+            fi
+
+            # Lines present on dev but absent on main = dev-only additions.
+            dev_only=$(comm -23 \
+              <(printf '%s\n' "$dev_lines") \
+              <(printf '%s\n' "$main_lines") || true)
+
+            # Of those, lines NOT in the merged tree = dropped by the merge.
+            missing=$(comm -23 \
+              <(printf '%s\n' "$dev_only") \
+              <(printf '%s\n' "$tree_lines") || true)
+
+            # Filter out pure-whitespace lines and lines that contain
+            # no alphanumeric token — these are typically blank lines,
+            # bracket-only lines, or comment-only fragments that
+            # frequently differ for cosmetic reasons.
+            missing=$(printf '%s\n' "$missing" \
+              | grep -E '[[:alnum:]_]' \
+              || true)
+
+            if [ -z "$missing" ]; then
+              continue
+            fi
+
+            # Count of dropped lines for this file.
+            count=$(printf '%s\n' "$missing" | grep -c . || true)
+
+            # Determine severity. Lines lost in skill-sanctioned
+            # override files are "info" (the bot may have legitimately
+            # taken main's version). Everything else is "error" and
+            # fails the gate.
+            severity="error"
+            if [[ "$f" =~ $INTENTIONAL_OVERRIDE_REGEX ]]; then
+              severity="warning"
+            fi
+
+            {
+              echo ""
+              echo "### \`$f\`  ($count line(s), severity: $severity)"
+              echo ""
+              echo "Lines present on \`origin/dev\` and absent from both \`origin/main\` and the merged tree:"
+              echo ""
+              echo '```'
+              # Show up to 30 lines verbatim, then a tail summary if there
+              # are more, to keep PR comments readable.
+              printf '%s\n' "$missing" | head -30
+              if [ "$count" -gt 30 ]; then
+                echo "  ... ($((count - 30)) more line(s) omitted)"
+              fi
+              echo '```'
+            } >> "$GITHUB_WORKSPACE/preservation-report.md"
+
+            if [ "$severity" = "error" ]; then
+              # GitHub Actions inline annotation on the file.
+              echo "::error file=$f::Dev-only addition(s) dropped by merge: $count line(s). See PR comment."
+              VIOLATIONS=$((VIOLATIONS + count))
+            else
+              echo "::warning file=$f::Skill-sanctioned override file lost $count dev-only line(s); please verify."
+            fi
+          done
+
+          echo "violations=$VIOLATIONS" >> "$GITHUB_OUTPUT"
+          if [ "$VIOLATIONS" -gt 0 ]; then
+            echo "::error::Preservation gate failed: $VIOLATIONS dev-only line(s) dropped across non-exempt files."
+          fi
+
+      - name: Build / update PR comment
+        if: always()
+        env:
+          PR_NUMBER: ${{ steps.refs.outputs.pr }}
+          VIOLATIONS: ${{ steps.audit.outputs.violations }}
+        run: |
+          set -euo pipefail
+
+          MARKER='<!-- nightly-sync-dev-preservation-gate -->'
+          BODY_FILE=$(mktemp)
+
+          {
+            echo "$MARKER"
+            echo "## :shield: Dev-Feature Preservation Gate"
+            echo ""
+            if [ -s "$GITHUB_WORKSPACE/preservation-report.md" ]; then
+              if [ "${VIOLATIONS:-0}" -gt 0 ]; then
+                echo ":x: **${VIOLATIONS} dev-only line(s) dropped by the merge.**"
+              else
+                echo ":warning: Information-only: changes in skill-sanctioned override files."
+              fi
+              echo ""
+              echo "<details><summary>Per-file breakdown</summary>"
+              cat "$GITHUB_WORKSPACE/preservation-report.md"
+              echo ""
+              echo "</details>"
+              echo ""
+              echo "### How to resolve"
+              echo ""
+              echo "For each line listed under an \`error\` heading, classify:"
+              echo ""
+              echo "1. **Main intentionally removed the feature.** Find the"
+              echo "   specific commit in \`git log origin/main -- <file>\` that"
+              echo "   removed the line. Document it in the PR body and the"
+              echo "   gate will still fail — comment \`/preservation override\`"
+              echo "   on the PR to acknowledge."
+              echo "2. **Merge accident.** \`-X theirs\` resolved a nearby-line"
+              echo "   conflict in main's favour. Restore the dev line. The"
+              echo "   gate will go green on the next push."
+              echo ""
+              echo "Default to (2). Only declare (1) with a specific main commit"
+              echo "as evidence."
+              echo ""
+              echo "Lines in \`warning\` files (skill-sanctioned overrides like"
+              echo "\`training.py\`, \`utils.py\`, \`data_samplers.py\`) do not block"
+              echo "the gate but are likely the highest-signal regressions."
+              echo "Recent sync PRs (\`#4659\`, \`#4716\`) had every Phase-3 fix"
+              echo "land in one of these files."
+            else
+              echo ":white_check_mark: No dev-only additions dropped by the merge."
+            fi
+            echo ""
+            echo "_(Audit run: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`,"
+            echo "  HEAD: \`$(git rev-parse --short HEAD)\`)_"
+          } > "$BODY_FILE"
+
+          # Look for an existing gate comment via the marker and update
+          # it in place, else create a new one. This keeps the PR
+          # comment thread quiet across the Phase-3 fix-then-retest loop.
+          EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --json comments \
+            --jq ".comments[] | select(.body | startswith(\"$MARKER\")) | .url" \
+            | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            COMMENT_ID="${EXISTING##*#issuecomment-}"
+            gh api -X PATCH \
+              "repos/${{ github.repository }}/issues/comments/$COMMENT_ID" \
+              -f body="$(cat "$BODY_FILE")"
+            echo "::notice::Updated existing gate comment on PR #$PR_NUMBER"
+          else
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+              --body-file "$BODY_FILE"
+            echo "::notice::Posted new gate comment on PR #$PR_NUMBER"
+          fi
+
+      - name: Fail if violations
+        if: steps.audit.outputs.violations != '0'
+        run: |
+          echo "::error::Preservation gate found ${{ steps.audit.outputs.violations }} dev-only line(s) dropped by the merge. See the PR comment for the per-file breakdown."
+          exit 1
+
+  # Surfaces the prompt addendum that the sync bot's prompt in
+  # `nightly-sync-main-to-dev.yml` should incorporate. Kept as a
+  # separate informational job so this single file holds both halves
+  # of the change (deterministic gate above + prompt guidance here),
+  # and so a future maintainer editing the main sync prompt can find
+  # the exact text to copy in one place.
+  publish-prompt-addendum:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Emit prompt addendum
+        run: |
+          cat <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          ## Sync-bot prompt addendum
+
+          Paste the following block into the `prompt:` field of
+          `nightly-sync-main-to-dev.yml`'s `sync-main-to-dev` job,
+          immediately before the `**Phase 4 gate**` section. The
+          deterministic gate in this workflow is the safety net;
+          this addendum lets the agent fix violations proactively
+          so the gate stays green.
+
+          ````
+          **Dev-feature preservation (MANDATORY before pushing Phase 1
+          and before every Phase 3 fix-push):**
+
+          The most common sync regression is silently dropping a
+          dev-only feature that main does not have yet. Pattern:
+            1. Feature lands on dev at T0.
+            2. Same feature lands on main at T1 > T0.
+            3. Sync runs between T0 and T1. `-X theirs` drops dev's
+               feature whenever main touched a nearby line for an
+               unrelated reason.
+
+          After the `-X theirs` merge (and after any conflict surgery),
+          run this audit:
+
+              BASE=$(git merge-base origin/dev origin/main)
+              for f in $(git diff --name-only "$BASE"...HEAD \
+                          -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
+                          | sort -u); do
+                [ -f "$f" ] || continue
+                missing=$(comm -23 \
+                  <(git show "origin/dev:$f"  2>/dev/null | sort -u) \
+                  <(git show "origin/main:$f" 2>/dev/null | sort -u) \
+                  | comm -23 - <(sort -u "$f") \
+                  | grep -E '[[:alnum:]_]' || true)
+                [ -n "$missing" ] && { echo "=== $f ==="; printf '%s\n' "$missing"; }
+              done
+
+          For each line listed, classify:
+            (a) MAIN INTENTIONALLY REMOVED — find the specific commit
+                in `git log origin/main -- <file>` that removed the
+                line. Document in the PR body. Accept the drop.
+            (b) MERGE ACCIDENT — main never explicitly touched that
+                line. RESTORE the dev line.
+
+          Default to (b). Only declare (a) with a specific main
+          commit as evidence.
+
+          Recent regressions of this class (all (b)):
+            - transformer_layer.py `_forward_mlp_router(input_ids=None)`
+            - token_dispatcher.py `num_sms_preprocessing_api=...` kwarg
+            - moe_layer.py `self._maybe_record_overload_factor(...)` call
+            - gpt_dynamic_inference_with_coordinator.py
+              `from megatron.training.arguments import parse_and_validate_args`
+            - data_samplers.py / utils.py / training.py
+              `args.dynamic_context_parallel` (NOT `args.hybrid_context_parallel`,
+              dev's deprecated alias that main still uses)
+            - datasets/readme.md "Packing Scheduler" section
+
+          The `Nightly Sync - Dev-Feature Preservation Gate` workflow
+          runs this audit deterministically on every push to your PR
+          branch and posts a sticky PR comment with the per-file
+          breakdown. If you push and the gate fails, the comment lists
+          exactly which lines to restore or justify.
+          ````
+          EOF
