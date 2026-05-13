@@ -8,7 +8,7 @@ from typing import Optional, Protocol
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -509,7 +509,7 @@ class MoELayer(BaseMoELayer):
                         apply_module(self.shared_experts),
                         False,
                         tensor_parallel.random.get_cuda_rng_tracker,
-                        parallel_state.get_tensor_model_parallel_group(),
+                        self.tp_group,
                         hidden_states,
                     )
                 else:
@@ -672,7 +672,7 @@ class MoELayer(BaseMoELayer):
                     custom_forward,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    self.tp_group,
                     hidden_states,
                     intermediate_tensors,
                     padding_mask,
