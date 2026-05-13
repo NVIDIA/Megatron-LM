@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import List, NamedTuple, Optional, Set, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 
@@ -22,20 +22,9 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
 }
 
 
-class NormalizedCudaGraphModules(NamedTuple):
-    """Result of normalize_cuda_graph_modules."""
-
-    scopes: List[CudaGraphModule]
-    """Fully resolved CudaGraphModule enum values."""
-    deprecated: List[Tuple[str, str, object]]
-    """List of (scope_name, attr_name, new_value) for each deprecated scope that was found."""
-    used_full_scope: bool
-    """True if the input contained the deprecated 'full' shorthand."""
-
-
 def normalize_cuda_graph_modules(
     scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]]
-) -> NormalizedCudaGraphModules:
+) -> Tuple[List[CudaGraphModule], List[Tuple[str, str, object]], bool]:
     """Normalize mixed CUDA graph scope inputs into enum values plus deprecation metadata."""
 
     if scopes is None:
@@ -49,7 +38,7 @@ def normalize_cuda_graph_modules(
 
     if "full" in raw_scopes:
         assert raw_scopes == ["full"], "full scope cannot be used with other scopes."
-        return NormalizedCudaGraphModules([], [], True)
+        return [], [], True
 
     normalized_scopes: List[CudaGraphModule] = []
     deprecated_scopes: List[Tuple[str, str, object]] = []
@@ -67,7 +56,7 @@ def normalize_cuda_graph_modules(
             else:
                 normalized_scopes.append(CudaGraphModule[scope])
 
-    return NormalizedCudaGraphModules(normalized_scopes, deprecated_scopes, False)
+    return normalized_scopes, deprecated_scopes, False
 
 
 def normalize_inference_cuda_graph_scope(
