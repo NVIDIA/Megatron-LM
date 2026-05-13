@@ -198,9 +198,7 @@ class TestHasUnfinishedRequests:
 
     def test_returns_true_when_waiting_queue_nonempty(self):
         """has_unfinished_requests is True when only the waiting queue has entries."""
-        eng = _make_engine_skeleton(
-            context_has_unfinished=False, waiting_request_ids=[1, 2]
-        )
+        eng = _make_engine_skeleton(context_has_unfinished=False, waiting_request_ids=[1, 2])
         assert eng.has_unfinished_requests() is True
 
     def test_returns_false_when_both_empty(self):
@@ -310,9 +308,7 @@ class TestCheckStopWordsForRequestPostAppend:
         eng = _make_engine_skeleton(num_speculative_tokens=2)
         # Tokens [..., 99, 100, 200, 201]. Stop word [99, 100] sits 2 positions from the end.
         # detokenize_stop_sequence=False → trim = i + stop_len = 2 + 2 = 4 → generated_tokens cut.
-        req = _make_request(
-            generated_tokens=[1, 2, 99, 100, 200, 201], stop_word_ids=[[99, 100]]
-        )
+        req = _make_request(generated_tokens=[1, 2, 99, 100, 200, 201], stop_word_ids=[[99, 100]])
         hit, trimmed = eng._check_stop_words_for_request_post_append(req)
         assert hit is True
         # Stop word ends at index -3; with i=2, end_idx=-2 picks generated_tokens[-4:-2] = [99,100].
@@ -322,9 +318,7 @@ class TestCheckStopWordsForRequestPostAppend:
     def test_no_match_returns_no_hit(self):
         """Tokens that don't end with any stop word return (False, 0)."""
         eng = _make_engine_skeleton(num_speculative_tokens=2)
-        req = _make_request(
-            generated_tokens=[1, 2, 3, 4], stop_word_ids=[[99, 100], [200]]
-        )
+        req = _make_request(generated_tokens=[1, 2, 3, 4], stop_word_ids=[[99, 100], [200]])
         hit, trimmed = eng._check_stop_words_for_request_post_append(req)
         assert hit is False
         assert trimmed == 0

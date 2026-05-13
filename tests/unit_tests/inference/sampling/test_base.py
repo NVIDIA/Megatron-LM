@@ -74,11 +74,7 @@ class TestSampling:
         # Total tokens = 6 + 1 = 7.
         logits = torch.zeros(7, 8)
         out = sampler.sample_speculative(
-            logits,
-            num_decode=2,
-            num_prefill=1,
-            num_speculative_tokens=2,
-            context=_FakeContext(),
+            logits, num_decode=2, num_prefill=1, num_speculative_tokens=2, context=_FakeContext()
         )
         assert out.shape == (7,)
         # token_to_request_index = [0,0,0,1,1,1, 2]  (decode tokens grouped by request, then prefill)
@@ -111,11 +107,7 @@ class TestSampling:
         sampler = CapturingSampler()
         logits = torch.zeros(3, 8)
         sampler.sample_speculative(
-            logits,
-            num_decode=0,
-            num_prefill=3,
-            num_speculative_tokens=4,
-            context=_FakeContext(),
+            logits, num_decode=0, num_prefill=3, num_speculative_tokens=4, context=_FakeContext()
         )
         # No decode → token_to_request_index = [0, 1, 2] (just the prefill requests).
         assert captured["mapping"] == [0, 1, 2]

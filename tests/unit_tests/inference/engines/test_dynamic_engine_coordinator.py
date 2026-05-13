@@ -80,7 +80,9 @@ def _make_request_entry(request_id=1, prompt_tokens=None, generated_tokens=None)
     sp = SamplingParams(num_tokens_to_generate=5, termination_id=0)
     req = DynamicInferenceRequest(
         request_id=request_id,
-        prompt_tokens=prompt_tokens if prompt_tokens is not None else __import__('torch').tensor([1, 2, 3]),
+        prompt_tokens=(
+            prompt_tokens if prompt_tokens is not None else __import__('torch').tensor([1, 2, 3])
+        ),
         sampling_params=sp,
         generated_tokens=list(generated_tokens or []),
     )
@@ -309,7 +311,9 @@ class TestScheduleRequestsGenerationEpochStamping:
         import torch
 
         eng = _make_engine_skeleton(is_mp_coordinator=False)
-        entry, req = _make_request_entry(request_id=1, prompt_tokens=torch.tensor([], dtype=torch.long))
+        entry, req = _make_request_entry(
+            request_id=1, prompt_tokens=torch.tensor([], dtype=torch.long)
+        )
         eng.requests = {1: entry}
         eng.model_parallel_subscriber_socket.recv_multipart.return_value = [
             bytes([Headers.TP_BROADCAST.value]),

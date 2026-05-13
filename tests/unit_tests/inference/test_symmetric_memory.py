@@ -26,8 +26,9 @@ class TestSymmetricMemoryBufferInit:
 
     def test_init_failure_when_torch_symm_mem_missing(self):
         """When HAVE_TORCH_SYMM_MEM is False, init records the failure and leaves the buffer empty."""
-        with patch("megatron.core.inference.symmetric_memory.HAVE_TORCH_SYMM_MEM", False), patch(
-            "megatron.core.inference.symmetric_memory.HAVE_TRITON", True
+        with (
+            patch("megatron.core.inference.symmetric_memory.HAVE_TORCH_SYMM_MEM", False),
+            patch("megatron.core.inference.symmetric_memory.HAVE_TRITON", True),
         ):
             buf = SymmetricMemoryBuffer(size_in_mb=1, process_group=MagicMock())
         assert buf.symm_buffer is None
@@ -36,8 +37,9 @@ class TestSymmetricMemoryBufferInit:
 
     def test_init_failure_when_triton_missing(self):
         """When HAVE_TRITON is False, init records that triton is unavailable."""
-        with patch("megatron.core.inference.symmetric_memory.HAVE_TORCH_SYMM_MEM", True), patch(
-            "megatron.core.inference.symmetric_memory.HAVE_TRITON", False
+        with (
+            patch("megatron.core.inference.symmetric_memory.HAVE_TORCH_SYMM_MEM", True),
+            patch("megatron.core.inference.symmetric_memory.HAVE_TRITON", False),
         ):
             buf = SymmetricMemoryBuffer(size_in_mb=1, process_group=MagicMock())
         assert buf.symm_buffer is None
@@ -49,9 +51,11 @@ class TestSymmetricMemoryBufferInit:
         fake_symm_mem = MagicMock()
         fake_symm_mem.enable_symm_mem_for_group = MagicMock()
         fake_symm_mem.empty.side_effect = RuntimeError("oom")
-        with patch("megatron.core.inference.symmetric_memory.HAVE_TORCH_SYMM_MEM", True), patch(
-            "megatron.core.inference.symmetric_memory.HAVE_TRITON", True
-        ), patch("megatron.core.inference.symmetric_memory.symm_mem", fake_symm_mem):
+        with (
+            patch("megatron.core.inference.symmetric_memory.HAVE_TORCH_SYMM_MEM", True),
+            patch("megatron.core.inference.symmetric_memory.HAVE_TRITON", True),
+            patch("megatron.core.inference.symmetric_memory.symm_mem", fake_symm_mem),
+        ):
             buf = SymmetricMemoryBuffer(size_in_mb=1, process_group=MagicMock())
         assert buf.symm_buffer is None
         assert buf.symm_mem_hdl is None
@@ -124,9 +128,7 @@ class TestSymmetricMemoryBufferAllocation:
         """maybe_get_tensors packs multiple tensors with byte-aligned offsets."""
         buf = _make_buffer_with_handle(num_bytes=4096)
         # 4 fp32 = 16B, aligned to 16B; 1 int32 = 4B, aligned to 16B.
-        result = buf.maybe_get_tensors(
-            [(4, torch.float32), (1, torch.int32)], alignment=16
-        )
+        result = buf.maybe_get_tensors([(4, torch.float32), (1, torch.int32)], alignment=16)
         assert result["handle"] is buf.symm_mem_hdl
         tensors = result["tensors"]
         assert len(tensors) == 2
@@ -155,9 +157,7 @@ class TestSymmetricMemoryManager:
 
     def test_get_buffer_creates_on_first_access(self):
         """get_buffer constructs a new buffer the first time a key is used."""
-        with patch(
-            "megatron.core.inference.symmetric_memory.SymmetricMemoryBuffer"
-        ) as fake_cls:
+        with patch("megatron.core.inference.symmetric_memory.SymmetricMemoryBuffer") as fake_cls:
             fake_cls.return_value = "BUF"
             out = SymmetricMemoryManager.get_buffer("tp", process_group=MagicMock(), size_mb=128)
             assert out == "BUF"
@@ -168,9 +168,7 @@ class TestSymmetricMemoryManager:
 
     def test_get_buffer_reuses_existing_entry(self):
         """Subsequent get_buffer calls return the same instance without recreating."""
-        with patch(
-            "megatron.core.inference.symmetric_memory.SymmetricMemoryBuffer"
-        ) as fake_cls:
+        with patch("megatron.core.inference.symmetric_memory.SymmetricMemoryBuffer") as fake_cls:
             fake_cls.return_value = "BUF"
             first = SymmetricMemoryManager.get_buffer("tp", process_group=MagicMock())
             second = SymmetricMemoryManager.get_buffer("tp")  # no process_group needed now
@@ -184,9 +182,7 @@ class TestSymmetricMemoryManager:
 
     def test_get_buffer_uses_default_size(self):
         """When size_mb is omitted, the default is forwarded to SymmetricMemoryBuffer."""
-        with patch(
-            "megatron.core.inference.symmetric_memory.SymmetricMemoryBuffer"
-        ) as fake_cls:
+        with patch("megatron.core.inference.symmetric_memory.SymmetricMemoryBuffer") as fake_cls:
             fake_cls.return_value = "BUF"
             SymmetricMemoryManager.get_buffer("ep", process_group=MagicMock())
             kwargs = fake_cls.call_args.kwargs

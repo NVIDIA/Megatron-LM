@@ -22,7 +22,9 @@ class TestCommon:
     )
     def test_send_do_generate_broadcasts_choice_tensor(self):
         """send_do_generate constructs a [GENERATE_NUM] long tensor on the current device and broadcasts it from rank 0."""
-        with patch("megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common.torch.distributed.broadcast") as fake_bcast:
+        with patch(
+            "megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common.torch.distributed.broadcast"
+        ) as fake_bcast:
             common.send_do_generate()
         assert fake_bcast.call_count == 1
         args, kwargs = fake_bcast.call_args
