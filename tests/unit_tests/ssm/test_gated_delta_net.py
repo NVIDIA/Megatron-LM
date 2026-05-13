@@ -137,6 +137,59 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
+    def test_gpu_forward_recompute_norm_out(self):
+        torch.cuda.manual_seed_all(42)
+        self.transformer_config.recompute_granularity = "selective"
+        self.transformer_config.recompute_modules = ["gdn_norm_out"]
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=self.transformer_config
+        ).submodules
+        gdn = GatedDeltaNet(
+            self.transformer_config,
+            submodules=gdn_submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=pg_collection,
+        )
+        gdn = gdn.cuda().bfloat16()
+
+        assert gdn.recompute_norm_out is True
+
+        micro_batch_size = 2
+        seq_length = 64
+        hidden_states = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        attention_mask = None
+
+        output, bias = gdn(hidden_states, attention_mask)
+
+        assert output.shape == (
+            seq_length // self.sp_size // self.cp_size,
+            micro_batch_size,
+            gdn.config.hidden_size,
+        ), f"Output shape mismatch: {output.shape=}"
+        assert (
+            output.dtype == hidden_states.dtype
+        ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
+
+        # Backward exercises the recompute hook that
+        # CheckpointWithoutOutput.discard_output_and_register_recompute
+        # installed on `out`, so the gated norm + a2a runs a second time.
+        output.sum().backward()
+
     def test_jit_compiled_helpers(self):
         import torch._dynamo
 
