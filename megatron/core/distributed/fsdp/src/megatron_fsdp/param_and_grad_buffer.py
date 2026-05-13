@@ -3939,14 +3939,10 @@ class AllGatherPipeline:
                     self.bucket_status[bucket_key] = BucketStatus.EMPTY
         self.recycle_unused_buckets()
 
-        for bucket_id in range(self.num_buckets):
-            for bwd in [False, True]:
-                bucket_key = self.get_bucket_key(bucket_id, bwd)
-                status = self.bucket_status[bucket_key]
-                assert status is BucketStatus.EMPTY, (
-                    f"Bucket {bucket_key} is in status {status} after reset, "
-                    f"expected EMPTY. Full bucket_status: {self.bucket_status}."
-                )
+        assert all([status is BucketStatus.EMPTY for status in self.bucket_status.values()]), (
+            f"There are still working buckets, it is not safe to reset. "
+            f"bucket_status: {self.bucket_status}."
+        )
         assert all(
             [not can_be_released for can_be_released in self.bucket_can_be_released.values()]
         ), (

@@ -11,6 +11,7 @@ from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -948,14 +949,19 @@ def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
 class TestFsdpNonUnitBucketPreservation:
     """Regression test for the non-FSDP-unit bucket preservation fix.
 
-    MambaMixer.forward reads self.conv1d.weight as a raw tensor (bypassing
-    nn.Module.__call__), so no pre-forward hook ever gathers conv1d's bucket.
-    Before the fix, AllGatherPipeline.reset() freed every bucket's gather
-    scratch — including the non-unit one — and the next forward dereferenced
-    freed storage. A small bucket_size is required so conv1d.weight lands
-    in a different non-unit bucket from MambaMixer's recurse=False params
-    (A_log/D/dt_bias); otherwise MambaMixer's own hook refreshes the shared
-    bucket on set_param_data=True and the bug is masked.
+    Non-FSDP-unit buckets must remain persistently allocated: cross-module
+    readers (e.g. MambaMixer.forward, which reads self.conv1d.weight as a
+    raw tensor via causal_conv1d_fn(weight=...) instead of self.conv1d(...))
+    can dereference them at any time. Before the fix, AllGatherPipeline.reset()
+    freed every bucket's gather scratch — including the non-unit one — and
+    because nn.Module.__call__ is never invoked on conv1d, no hook ever fires
+    to refresh conv1d.weight's wbuf.data (set_param_data=True) afterwards.
+    The next forward then dereferences freed storage.
+
+    A small bucket_size is required so conv1d.weight lands in a different
+    non-unit bucket from MambaMixer's recurse=False params (A_log/D/dt_bias);
+    otherwise MambaMixer's own pre-forward hook gathers the shared bucket
+    and incidentally refreshes conv1d.weight, masking the bug.
     """
 
     @classmethod
@@ -1050,17 +1056,14 @@ class TestFsdpNonUnitBucketPreservation:
         )
 
         x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
-        # 2 iters minimum: iter 0 allocates non-unit buckets; iter 1's
-        # synchronize_param_gather() releases them and the subsequent forward
-        # dereferences freed storage if the fix is absent.
-        for _ in range(2):
-            fsdp_model.synchronize_param_gather()
-            out = fsdp_model(x)
-            out.sum().backward()
-            fsdp_model.finish_grad_sync()
-            for p in fsdp_model.parameters():
-                p.grad = None
+        out = fsdp_model(x)
+        out.sum().backward()
+        # Mirrors what the pipeline schedule does after backward: finalize_model_grads
+        # calls fsdp_model.finish_grad_sync(), which calls synchronize_param_gather()
+        # (because overlap_param_gather=True), which calls AllGatherPipeline.reset() —
+        # the buggy entry point that frees non-unit buckets.
+        finalize_model_grads([fsdp_model])
+        fsdp_model(x)
 
         # Surface any deferred CUDA errors before teardown.
         torch.cuda.synchronize()
-        fsdp_model.stop_communication()
