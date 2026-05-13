@@ -247,6 +247,36 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_padding = Fp8Padding(self.num_local_experts)
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
 
+        # When batch-invariant mode is on, redirect per-expert weight tensors to
+        # views into a single contiguous [E, N, K] buffer. This (a) avoids paying
+        # a stack-copy on every forward when our patched general_grouped_gemm
+        # needs a [E, N, K] tensor, and (b) makes training weight storage byte-
+        # identical to InferenceGroupedMLP._build_concatenated_weights, which is
+        # what gives bitwise train==inference parity for RL.
+        if self.config.batch_invariant_mode:
+            self._build_contiguous_weight_buffers()
+
+    @torch.no_grad()
+    def _build_contiguous_weight_buffers(self):
+        """Stack per-expert weights into contiguous [E, N, K] buffers and redirect
+        each weight{i}.data to a view into it. Idempotent.
+        """
+        for linear, buf_name in (
+            (self.linear_fc1, '_bik_fc1_weight'),
+            (self.linear_fc2, '_bik_fc2_weight'),
+        ):
+            if getattr(self, buf_name, None) is not None:
+                continue
+            per_expert = [getattr(linear, f'weight{i}') for i in range(self.num_local_experts)]
+            w0 = per_expert[0]
+            stacked = torch.empty(
+                self.num_local_experts, *w0.shape, device=w0.device, dtype=w0.dtype
+            )
+            for i, w in enumerate(per_expert):
+                stacked[i].copy_(w.data)
+                w.data = stacked[i]
+            self.register_buffer(buf_name, stacked, persistent=False)
+
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:

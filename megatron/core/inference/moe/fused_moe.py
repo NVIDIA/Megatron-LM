@@ -20,6 +20,10 @@ from megatron.core.inference.moe.permute import (
     unpermute_tokens,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    grouped_gemm_batch_invariant,
+    is_batch_invariant_mode_enabled,
+)
 
 try:
     from torch.nn.functional import grouped_mm
@@ -47,8 +51,18 @@ class ActivationType(Enum):
 def _bf16_grouped_mm(
     x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
-    """BF16 grouped GEMM using torch.nn.functional.grouped_mm."""
+    """BF16 grouped GEMM.
+
+    In batch-invariant mode, routes to the DeepGEMM-backed kernel shared with
+    the training path, so RL rollout==train log-probs match bitwise. Otherwise
+    uses torch.nn.functional.grouped_mm.
+    """
     assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
+    if is_batch_invariant_mode_enabled():
+        # weight is [E, N, K], which is the layout DeepGEMM's NT call expects directly.
+        return grouped_gemm_batch_invariant(
+            x_bf16, weight, offs=offs.to(torch.int32), m_total=x_bf16.shape[0]
+        )
     return grouped_mm(x_bf16, weight.transpose(1, 2), offs=offs)
 
 
@@ -130,6 +144,11 @@ def mcore_fused_moe(
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     # Fused quant kernels only apply to MXFP8 path
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
+
+    assert not (use_mxfp8 and is_batch_invariant_mode_enabled()), (
+        "Batch-invariant MoE is bf16-only. MXFP8 inference cannot be made "
+        "bitwise-identical to bf16 training. Disable mxfp8 or batch_invariant_mode."
+    )
 
     if use_mxfp8:
         assert (
