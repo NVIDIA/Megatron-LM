@@ -127,101 +127,41 @@ def _emit_lcm_block_ops(
             ops.append((src_global_rank, tuple(src_slice), tuple(dst_slice)))
 
 
-def _plan_multi_dim_lcm(
+def _tp_block_layout(
     param_name: str,
     src_metadata: ParameterMetadata,
     dst_metadata: ParameterMetadata,
-    descriptors: list[ShardingDescriptor],
-    my_global_rank: int,
-) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
-    """TP-only planner using LCM tiling with arbitrary integer src/dst strides."""
-    if not descriptors:
-        return []
-    if len(descriptors) != 1:
-        raise NotImplementedError(
-            f"{param_name}: _plan_multi_dim_lcm supports TP-only (one descriptor)"
-        )
-    if descriptors[0].name != "tp":
-        raise NotImplementedError(f"{param_name}: _plan_multi_dim_lcm expects TP descriptor")
-    d = descriptors[0]
-    if my_global_rank not in d.dst_dim_ranks:
-        return []
+    descriptor: ShardingDescriptor,
+    src_shape: tuple[int, ...],
+    dst_shape: tuple[int, ...],
+) -> list[tuple[int, int, int, int, int, str]]:
+    """Compute the per-block layout for a TP transfer.
 
-    src_shape = tuple(src_metadata.shape)
-    dst_shape = tuple(dst_metadata.shape)
+    Returns a list of ``(src_offset, dst_offset, full_block_len, src_stride,
+    dst_stride, label)`` tuples that the LCM micro-tiler iterates.
+
+    - Plain TP (no ``partition_sizes``): single block covering the full
+      partition dim with the descriptor's strides.
+    - Block-interleaved TP (``partition_sizes`` present, e.g. Mamba ``in_proj``):
+      one block per packed component, each independently sharded with stride=1.
+    """
+    d = descriptor
     dim = d.dim
     src_world = len(d.src_dim_ranks)
     dst_world = len(d.dst_dim_ranks)
-    src_local = src_shape[dim]
-    dst_local = dst_shape[dim]
-    if src_world * src_local != dst_world * dst_local:
-        raise RuntimeError(
-            f"{param_name}: size mismatch on TP dim{dim} "
-            f"(src_world={src_world}, src_local={src_local}, "
-            f"dst_world={dst_world}, dst_local={dst_local})"
-        )
-
-    ops: list[tuple[int, tuple[slice, ...], tuple[slice, ...]]] = []
-    _emit_lcm_block_ops(
-        param_name=param_name,
-        src_shape=src_shape,
-        dst_shape=dst_shape,
-        dim=dim,
-        src_world=src_world,
-        dst_world=dst_world,
-        src_stride=d.src_stride,
-        dst_stride=d.dst_stride,
-        full_block_len=dst_local * dst_world,
-        dst_local_rank=_get_rank_in_group(my_global_rank, d.dst_dim_ranks),
-        src_dim_ranks=d.src_dim_ranks,
-        src_block_offset=0,
-        dst_block_offset=0,
-        block_label=f"TP dim{dim}",
-        ops=ops,
-    )
-    _sort_ops_by_dst_offset(ops, dim)
-    return ops
-
-
-def _plan_block_interleaved(
-    param_name: str,
-    src_metadata: ParameterMetadata,
-    dst_metadata: ParameterMetadata,
-    descriptors: list[ShardingDescriptor],
-    my_global_rank: int,
-) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
-    """
-    Block-interleaved TP planner for parameters with ``partition_sizes``.
-
-    When a parameter packs multiple independently-sharded components of
-    *different* sizes (e.g. Mamba in_proj packs z, x, B, C, dt), a simple
-    contiguous concat produces the wrong layout.  Each block is gathered
-    (or scattered) across TP ranks independently before moving to the next.
-
-    ``partition_sizes`` lists the per-TP-rank block sizes along the partition
-    dim.  Block *i* occupies ``[sum(sizes[:i]), sum(sizes[:i+1]))`` in the
-    local tensor on every TP rank.  In the *full* (TP-gathered) tensor, block
-    *i* occupies ``[sum(full_sizes[:i]), sum(full_sizes[:i+1]))`` where
-    ``full_sizes[i] = sizes[i] * src_tp_world``.
-    """
-    if not descriptors or descriptors[0].name != "tp":
-        return []
-    d = descriptors[0]
-    if my_global_rank not in d.dst_dim_ranks:
-        return []
-
-    dim = d.dim
-    src_shape = tuple(src_metadata.shape)
-    dst_shape = tuple(dst_metadata.shape)
-    src_world = len(d.src_dim_ranks)
-    dst_world = len(d.dst_dim_ranks)
-    dst_local_rank = _get_rank_in_group(my_global_rank, d.dst_dim_ranks)
-
     src_sizes = src_metadata.partition_sizes
     dst_sizes = dst_metadata.partition_sizes
 
     if src_sizes is None and dst_sizes is None:
-        raise RuntimeError(f"{param_name}: _plan_block_interleaved called without partition_sizes")
+        src_local = src_shape[dim]
+        dst_local = dst_shape[dim]
+        if src_world * src_local != dst_world * dst_local:
+            raise RuntimeError(
+                f"{param_name}: size mismatch on TP dim{dim} "
+                f"(src_world={src_world}, src_local={src_local}, "
+                f"dst_world={dst_world}, dst_local={dst_local})"
+            )
+        return [(0, 0, dst_local * dst_world, d.src_stride, d.dst_stride, f"TP dim{dim}")]
 
     if src_sizes is not None:
         num_blocks = len(src_sizes)
@@ -229,12 +169,14 @@ def _plan_block_interleaved(
     else:
         num_blocks = len(dst_sizes)
         full_sizes = [s * dst_world for s in dst_sizes]
-
     if src_sizes is None:
         src_sizes = [f // src_world for f in full_sizes]
     if dst_sizes is None:
         dst_sizes = [f // dst_world for f in full_sizes]
 
+    blocks: list[tuple[int, int, int, int, int, str]] = []
+    src_off = 0
+    dst_off = 0
     for i in range(num_blocks):
         if src_sizes[i] * src_world != dst_sizes[i] * dst_world:
             raise RuntimeError(
@@ -242,32 +184,64 @@ def _plan_block_interleaved(
                 f"src_sizes[{i}]={src_sizes[i]}*{src_world} != "
                 f"dst_sizes[{i}]={dst_sizes[i]}*{dst_world}"
             )
+        blocks.append((src_off, dst_off, full_sizes[i], 1, 1, f"block {i}"))
+        src_off += src_sizes[i]
+        dst_off += dst_sizes[i]
+    return blocks
+
+
+def _plan_tp(
+    param_name: str,
+    src_metadata: ParameterMetadata,
+    dst_metadata: ParameterMetadata,
+    descriptors: list[ShardingDescriptor],
+    my_global_rank: int,
+) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
+    """Plan TP transfers via LCM tiling, supporting both plain and block-interleaved TP.
+
+    The block layout is derived once by ``_tp_block_layout`` — the inner
+    LCM micro-tile math (``_emit_lcm_block_ops``) is identical for both cases,
+    so the single-block plain-TP path is just a special case of the
+    multi-block partitioned path.
+    """
+    if not descriptors:
+        return []
+    if len(descriptors) != 1 or descriptors[0].name != "tp":
+        raise NotImplementedError(f"{param_name}: _plan_tp supports TP-only (one descriptor)")
+    d = descriptors[0]
+    if my_global_rank not in d.dst_dim_ranks:
+        return []
+
+    src_shape = tuple(src_metadata.shape)
+    dst_shape = tuple(dst_metadata.shape)
+    src_world = len(d.src_dim_ranks)
+    dst_world = len(d.dst_dim_ranks)
+    dst_local_rank = _get_rank_in_group(my_global_rank, d.dst_dim_ranks)
+
+    blocks = _tp_block_layout(
+        param_name, src_metadata, dst_metadata, d, src_shape, dst_shape
+    )
 
     ops: list[tuple[int, tuple[slice, ...], tuple[slice, ...]]] = []
-    src_block_offset = 0
-    dst_block_offset = 0
-    for blk in range(num_blocks):
+    for src_off, dst_off, full_len, src_stride, dst_stride, label in blocks:
         _emit_lcm_block_ops(
             param_name=param_name,
             src_shape=src_shape,
             dst_shape=dst_shape,
-            dim=dim,
+            dim=d.dim,
             src_world=src_world,
             dst_world=dst_world,
-            src_stride=1,
-            dst_stride=1,
-            full_block_len=full_sizes[blk],
+            src_stride=src_stride,
+            dst_stride=dst_stride,
+            full_block_len=full_len,
             dst_local_rank=dst_local_rank,
             src_dim_ranks=d.src_dim_ranks,
-            src_block_offset=src_block_offset,
-            dst_block_offset=dst_block_offset,
-            block_label=f"block {blk}",
+            src_block_offset=src_off,
+            dst_block_offset=dst_off,
+            block_label=label,
             ops=ops,
         )
-        src_block_offset += src_sizes[blk]
-        dst_block_offset += dst_sizes[blk]
-
-    _sort_ops_by_dst_offset(ops, dim)
+    _sort_ops_by_dst_offset(ops, d.dim)
     return ops
 
 
@@ -314,20 +288,11 @@ def _determine_source_ranks_for_dst_param(
 ) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
     """Route to dimension-specific planner based on parameter sharding type."""
 
-    # Regular TP/DP planning with EP-resolved metadata
+    # Regular TP/DP planning with EP-resolved metadata.  _plan_tp handles both
+    # plain TP and block-interleaved TP (partition_sizes-driven) layouts.
     descriptors = _build_descriptors_for_param(src_metadata=src_metadata, dst_metadata=dst_metadata)
     if descriptors:
-        # Use block-interleaved planner when partition_sizes is present
-        # (e.g. Mamba in_proj packs components of different sizes)
-        if src_metadata.partition_sizes is not None or dst_metadata.partition_sizes is not None:
-            return _plan_block_interleaved(
-                param_name=param_name,
-                src_metadata=src_metadata,
-                dst_metadata=dst_metadata,
-                descriptors=descriptors,
-                my_global_rank=my_global_rank,
-            )
-        return _plan_multi_dim_lcm(
+        return _plan_tp(
             param_name=param_name,
             src_metadata=src_metadata,
             dst_metadata=dst_metadata,

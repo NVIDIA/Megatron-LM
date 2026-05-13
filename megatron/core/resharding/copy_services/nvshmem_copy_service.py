@@ -27,10 +27,11 @@ class NVSHMEMCopyService(CopyService):
         super().__init__(group=group)
 
         self._remote = RemoteCopyService(group=group)
+        # Lazily initialized on first use to avoid side effects at import time
         self._initialized = False
 
-        # Keep original typed tensors (not uint8 views) so local copies preserve
-        # shape/strides semantics and avoid byte-offset pitfalls.
+        # NOTE: keep the original typed tensors here (not uint8 views) so local copies
+        # preserve shape/strides semantics and avoid byte-offset pitfalls.
         self._local_send_ops: Dict[int, torch.Tensor] = {}
         self._local_recv_ops: Dict[int, torch.Tensor] = {}
         self._local_copy_stream = torch.cuda.Stream()
@@ -60,6 +61,7 @@ class NVSHMEMCopyService(CopyService):
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
 
+        # Local transfers: keep them out of RemoteCopyService entirely.
         if dest_rank == self.rank:
             self._local_send_ops[task_id] = src_tensor
             return
@@ -89,6 +91,7 @@ class NVSHMEMCopyService(CopyService):
         if not dest_tensor.is_contiguous():
             dest_tensor = dest_tensor.contiguous()
 
+        # Local transfers: keep them out of RemoteCopyService entirely.
         if src_rank == self.rank:
             self._local_recv_ops[task_id] = dest_tensor
             return
@@ -118,7 +121,7 @@ class NVSHMEMCopyService(CopyService):
         """
         self._ensure_initialized()
 
-        # Local copies match by task_id (the NVSHMEM RemoteCopyService never sees them).
+        # 1) Run same-rank copies (match by task_id), like NCCL backend.
         if self._local_send_ops or self._local_recv_ops:
             missing_sends = set(self._local_recv_ops.keys()) - set(self._local_send_ops.keys())
             missing_recvs = set(self._local_send_ops.keys()) - set(self._local_recv_ops.keys())
@@ -145,11 +148,12 @@ class NVSHMEMCopyService(CopyService):
             self._local_send_ops.clear()
             self._local_recv_ops.clear()
 
-        # ALL ranks must call schedule() and run() because they contain collectives
-        # that require all ranks to participate:
-        #  - schedule() uses dist.all_gather_object()
-        #  - run() uses nvshmem.core.barrier_all()
-        # Critical for non-collocated refit where some ranks may have no work.
+        # 2) Execute remote schedule (if any remote sends/recvs were registered).
+        # NOTE: ALL ranks must call schedule() and run() because they contain collective
+        # operations that require all ranks to participate:
+        #  - schedule() has dist.all_gather_object() (torch distributed collective)
+        #  - run() has nvshmem.core.barrier_all() (nvshmem collective)
+        # This is critical for non-collocated refit where some ranks may have no work.
         # Local copies on `_local_copy_stream` run concurrently with this remote
         # NVSHMEM pipeline because the join below happens after `run()`.
         logger.info("NVSHMEMCopyService: building NVSHMEM schedule and executing")

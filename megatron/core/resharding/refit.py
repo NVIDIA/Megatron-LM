@@ -253,14 +253,17 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     core = unwrap_model(lm)
     decoder = core.decoder if hasattr(core, 'decoder') else core
 
-    # Eligible params must be computed while still visible as nn.Parameter (BF16).
+    # 1. Compute which parameters are eligible for MXFP8 conversion.
+    #    Must be done while params are still visible as nn.Parameter (BF16).
     convertible: set[str] = set()
     for name, param in decoder.named_parameters():
         if _should_quantize_param(param):
             convertible.add(f"decoder.{name}")
 
+    # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
     persistent_buffers = quantize_params_to_mxfp8(decoder)
 
+    # 3. Build the transform and attach it to the plan.
     plan.transform = MXFP8ReshardTransform(
         convertible_params=convertible,
         persistent_buffers=persistent_buffers,

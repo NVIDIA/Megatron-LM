@@ -68,6 +68,7 @@ class NCCLCopyService(CopyService):
             for req in reqs:
                 req.wait()
 
+        # Make sure the copy stream is finished
         torch.cuda.current_stream().wait_stream(self._copy_stream)
 
         if self.rank == 0:

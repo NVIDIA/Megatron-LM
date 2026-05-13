@@ -79,15 +79,18 @@ def execute_reshard_plan(
     transform's prepare_send / prepare_recv / finalize_recv methods instead
     of the default slice-and-copy logic.
     """
-    # Refit tensors (parameters + persistent buffers) are cached on each module
-    # so the named_modules() walk happens once per model, not per refit.
+    # Extract parameters and persistent buffers from models if present.
+    # Persistent buffers carry training state (e.g. MoE router expert_bias)
+    # and must be refit alongside parameters.  Cached on each module so the
+    # named_modules() walk happens once per model, not per refit.
     src_params = get_refit_tensor_dict(src_module) if src_module is not None else {}
     dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
 
-    # Dequantized BF16 views of MXFP8 source params are reused across multiple
-    # send ops for the same param.  Issue all dequants on a side stream and
-    # record per-param events so each send op only waits on its own dequant
-    # (later dequants can overlap with earlier sends' slicing on default stream).
+    # Cache dequantized BF16 views of MXFP8 source params so that multiple
+    # send ops for the same param reuse one dequant instead of repeating it.
+    # Issue all dequants on a side stream and record per-param events so each
+    # send op only waits on its own dequant (later dequants can overlap with
+    # earlier sends' slicing on the default stream).
     sendable_cache: dict[str, torch.Tensor] = {}
     sendable_events: dict[str, torch.cuda.Event] = {}
 
@@ -158,25 +161,29 @@ def execute_reshard_plan(
         if dst_param is None:
             continue
 
+        # Try to recv directly into the destination parameter slice to avoid
+        # allocating a separate buffer + a writeback copy.  This is safe when
+        # the slice view is already contiguous AND the parameter is a plain
+        # tensor (not quantized — quantized params need deferred accumulation).
         dst_slice_view = dst_param.data[op.my_slice]
         dst_is_mxfp8 = is_mxfp8tensor(dst_param)
 
         if not dst_is_mxfp8 and dst_slice_view.is_contiguous():
-            # Plain tensor: recv straight into the destination slice.
             service.submit_recv(dst_slice_view, op.peer_rank, task_id=op.task_id)
             writebacks.append(_Writeback(kind='direct'))
             continue
 
         if dst_is_mxfp8:
+            # TE MXFP8: recv directly into pre-allocated BF16 accumulation
+            # buffer to avoid per-slice BF16 allocations.
             full_bf16, _slices = _get_mxfp8_accumulator(pending_quantized, dst_param)
             accum_view = full_bf16[op.my_slice]
             if accum_view.is_contiguous():
-                # Recv straight into the BF16 accumulator slice.
                 service.submit_recv(accum_view, op.peer_rank, task_id=op.task_id)
                 writebacks.append(_Writeback(kind='direct'))
                 continue
 
-        # Fallback: stage into a temporary BF16 buffer.
+        # Fallback: stage into a temporary BF16 buffer (non-contiguous slice).
         recv_buffer = torch.empty_like(dst_slice_view.contiguous())
         service.submit_recv(recv_buffer, op.peer_rank, task_id=op.task_id)
         writebacks.append(
@@ -190,9 +197,14 @@ def execute_reshard_plan(
     torch.cuda.synchronize()
     dist.barrier(group=group)
 
-    # Writebacks: ``direct`` already landed in place; ``transform`` hands off to
-    # the transform; ``copy`` copies the staging buffer into the destination
-    # slice (deferring MXFP8 accumulation to one quantize_() per param).
+    # Write back received buffers into their destination parameter slices.
+    #
+    # For quantized destination params (fp8_param=true on receiver),
+    # accumulate ALL BF16 slices per-param before calling quantize_() once.
+    # This avoids corrupting MXFP8 per-block scales from partial-slice updates.
+    # Since refit overwrites every slice of each param, we allocate a fresh
+    # BF16 buffer (torch.empty) instead of dequantizing the existing MXFP8
+    # weights — this avoids a full-model-sized dequantize+clone.
     for i in range(len(writebacks)):
         wb = writebacks[i]
         writebacks[i] = None  # Drop reference eagerly so recv buffers can free.
@@ -202,7 +214,7 @@ def execute_reshard_plan(
             if wb.kind == 'transform':
                 transform.finalize_recv(wb.param_name, wb.dst_slice, wb.recv_bufs)
                 continue
-            # 'copy'
+            # 'copy' — direct buffer copy, with deferred MXFP8 accumulation if needed.
             if is_mxfp8tensor(wb.dst_param):
                 full_bf16, slices = _get_mxfp8_accumulator(pending_quantized, wb.dst_param)
                 slices.append((wb.dst_slice, wb.recv_buffer))
@@ -211,20 +223,24 @@ def execute_reshard_plan(
                 wb.dst_param.data[wb.dst_slice].copy_(wb.recv_buffer)
     writebacks.clear()
 
+    # Finalize deferred quantized param updates.
     had_mxfp8_staging = bool(pending_quantized)
     for _param_id, (dst_param, full_bf16, _slices) in pending_quantized.items():
         with torch.no_grad():
             dst_param.quantize_(full_bf16)
     pending_quantized.clear()
 
-    # Second sync: the writeback loop's .copy_() kernels are still async when
-    # execute_reshard_plan returns; without this CUDA-graph capture or callers
-    # that read params immediately race against the writes.
+    # Ensure all writeback copies are visible to subsequent CUDA ops (e.g. CUDA
+    # graph warmup).  The synchronize() above fires *before* the writeback loop,
+    # so without this second sync the .copy_() kernels are still async when
+    # execute_reshard_plan returns — creating a race with callers that immediately
+    # inspect or capture (via CUDA graphs) the destination parameters.
     torch.cuda.synchronize()
 
-    # MXFP8 destinations allocate a full-model-sized BF16 staging buffer that
-    # can dwarf the rest of the working set.  Reclaim it back to the driver
-    # when present; skip the (expensive) empty_cache walk otherwise.
+    # Release transient BF16 recv/accumulation buffers back to the CUDA driver.
+    # Without this the caching allocator retains the peak allocation, which can
+    # be significant for MXFP8 destinations (full model weight size in BF16).
+    # Skip the (expensive) empty_cache walk when no MXFP8 staging happened.
     if had_mxfp8_staging:
         torch.cuda.empty_cache()
 

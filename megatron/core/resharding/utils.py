@@ -447,6 +447,13 @@ def _filter_by_ep_local_rank(
 
     When EP sizes differ (resharding), expert matching is handled via
     ``resolved_name`` and no filter is applied here.
+
+    Why size check matters:
+      - Same size (EP=8→EP=8): local ranks 0-7 exist in both src and dst →
+        filter ensures dst EP local 0 uses src EP local 0 (same global experts).
+      - Different size (EP=8→EP=16): dst EP local 8 has no corresponding src
+        EP local → skip filter; expert reassignment is handled by resolved_name
+        matching, and the LCM/TP planner handles any TP dimension changes.
     """
     dst_ep_group = dst_metadata.expert_parallel_group_ranks
     if dst_ep_group is None:
@@ -458,6 +465,7 @@ def _filter_by_ep_local_rank(
         if src_meta_list[0].expert_parallel_group_ranks
         else None
     )
+    # EP resharding (sizes differ) — skip filter; keep all source candidates.
     if src_ep_size != len(dst_ep_group):
         return src_meta_list
 
@@ -468,6 +476,7 @@ def _filter_by_ep_local_rank(
         and m.expert_parallel_group_ranks.index(m.owner_rank) == dst_ep_local
     ]
     if not matching:
+        # Sizes match but no local rank match — configuration bug.
         available = [
             (
                 m.owner_rank,
@@ -487,12 +496,22 @@ def _filter_by_ep_local_rank(
 
 
 def _round_robin_dp(src_meta_list: list[ParameterMetadata], dst_rank: int) -> ParameterMetadata:
-    """Round-robin across source DP groups so transfer load spreads evenly."""
+    """Round-robin across source DP groups so transfer load spreads evenly.
+
+    Each DP group holds a complete copy of the model, so we can read from any
+    DP group; choosing via ``dst_rank % num_src_dp_groups`` ensures even
+    distribution even when destination has different DP configuration.  E.g.
+    with 4 src DP groups and 128 dst ranks, each src DP group is selected by
+    32 dst ranks (128/4=32).  Within the chosen DP group we further cycle
+    across available metadata entries to balance load across TP groups in the
+    DP replica.
+    """
     grouped_by_dp: dict[tuple[int, ...], list[ParameterMetadata]] = {}
     for meta in src_meta_list:
         dp_group = tuple(meta.data_parallel_group_ranks or [])
         grouped_by_dp.setdefault(dp_group, []).append(meta)
 
+    # Fast path: only one DP group present; no balancing necessary.
     if len(grouped_by_dp) == 1:
         return src_meta_list[0]
 
@@ -511,12 +530,16 @@ def select_src_metadata_balanced(
     The selected metadata supplies topology (TP/EP/DP group ranks) to the LCM
     planner.  Selection prefers a local copy when ``dst_rank`` itself owns a
     source replica, then round-robins across source DP groups to balance load.
+    A local copy is essentially free (``tensor.copy_()`` on same GPU), while
+    any remote transfer incurs significant overhead even within the same node.
     """
     if not src_meta_list:
         raise ValueError("src_meta_list must be non-empty")
 
     candidates = _filter_by_ep_local_rank(src_meta_list, dst_metadata, dst_rank)
 
+    # Local copy optimization (collocated mode): if dst_rank owns a source
+    # replica after EP filtering, use it directly to skip the network entirely.
     for meta in candidates:
         if meta.owner_rank == dst_rank:
             return meta
