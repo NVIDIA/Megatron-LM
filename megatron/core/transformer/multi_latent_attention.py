@@ -139,6 +139,7 @@ class MultiLatentAttention(Attention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ) -> None:
 
         super().__init__(
@@ -151,6 +152,7 @@ class MultiLatentAttention(Attention):
             pp_layer_offset=pp_layer_offset,
         )
         self.config: MLATransformerConfig
+        self.is_mtp_layer = is_mtp_layer
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
 
@@ -196,6 +198,14 @@ class MultiLatentAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
+        if self.config.experimental_attention_variant == "dsa":
+            # DSA's core attention re-uses ``self.layer_number`` for indexer loss
+            # bookkeeping, which must be globally unique across decoder and MTP
+            # layers; flag MTP so the core attention shifts its layer_number.
+            core_attn_extra_kwargs = {"is_mtp_layer": is_mtp_layer}
+        else:
+            core_attn_extra_kwargs = {}
+
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -207,6 +217,7 @@ class MultiLatentAttention(Attention):
             v_channels=self.config.v_head_dim,
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
+            **core_attn_extra_kwargs,
         )
 
         # Output.
@@ -476,6 +487,7 @@ class MLASelfAttention(MultiLatentAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -489,6 +501,7 @@ class MLASelfAttention(MultiLatentAttention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
         )
 
         if self.config.q_lora_rank is None:
@@ -1212,6 +1225,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -1225,6 +1239,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
 
         assert self.config.q_lora_rank is not None, (

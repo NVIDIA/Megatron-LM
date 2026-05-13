@@ -78,6 +78,20 @@ RUN bash -ex <<"EOF"
     rm -rf DeepEP
 EOF
 
+# Install fast-hadamard-transform.
+#
+# DSv4 sparse attention (CSA / DSA in megatron.core.transformer.experimental_attention_variant)
+# calls ``rotate_activation`` -> ``hadamard_transform`` unconditionally. The
+# package ships a legacy setup.py without ``setuptools`` declared in
+# ``build-system.requires``, so it cannot be resolved through ``uv lock`` /
+# ``uv sync`` in an isolated build env. Installing here in a separate
+# ``uv pip install --no-build-isolation`` step (analogous to DeepEP above)
+# keeps it out of ``uv.lock`` while still baking it into the CI image.
+RUN bash -ex <<"EOF"
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v \
+        'git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca'
+EOF
+
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 

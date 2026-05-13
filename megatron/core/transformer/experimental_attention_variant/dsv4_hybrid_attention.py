@@ -63,11 +63,13 @@ class DSv4HybridSelfAttention(MegatronModule):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         compress_ratio: Optional[int] = None,
+        is_mtp_layer: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(config=config)
         self.config: MLATransformerConfig
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
 
@@ -197,6 +199,7 @@ class DSv4HybridSelfAttention(MegatronModule):
             pg_collection=self.pg_collection,
             rotary_pos_emb=self.rotary_pos_emb,
             compress_ratio=compress_ratio,
+            is_mtp_layer=is_mtp_layer,
         )
 
         # ===========================================================================
@@ -243,6 +246,10 @@ class DSv4HybridSelfAttention(MegatronModule):
             mscale = 1.0
         else:
             rotary_pos_emb, mscale = self.rotary_pos_emb(seqlen, packed_seq=False)
+            # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+            # concentration factor (mscale) is NOT part of the DSv4 model contract --
+            # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+            mscale = 1.0
         return rotary_pos_emb, mscale
 
     def _get_qkv(self, hidden_states: torch.Tensor):

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule
@@ -110,6 +111,43 @@ def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tenso
     v = norm / math.sqrt(K) + eps
     r = (1.0 / v).to(dtype=input_dtype)
     return proj, r
+
+
+@torch.compile
+def learned_output_contract(
+    hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
+) -> Tensor:
+    """Learned output contraction: n-stream → 1-stream via sigmoid-gated weighted sum.
+
+    Replaces the uniform-mean ``HyperConnectionModule.output_contract`` with a
+    learned per-stream mixing function used at the exit of a block whose output
+    feeds an unembedding head (final block contraction, or per-depth contraction
+    for MTP). The mix coefficients are produced from the n-stream input via a
+    linear projection + RMS rescale + sigmoid gating, so they are conditioned on
+    the activation and on three learnable parameters.
+
+    Args:
+        hidden_states: [s, b, n*C] - n-stream hidden states.
+        head_fn: [n, n*C] - learnable mixing projection.
+        base: [n] - learnable per-stream bias added to the sigmoid logits.
+        scale: [1] - learnable scalar multiplied into the sigmoid logits.
+        n: Number of residual streams.
+        eps: Numerical-stability epsilon used in the RMS rescale and in the
+            sigmoid offset (matches `layernorm_epsilon`).
+
+    Returns:
+        [s, b, C] - contracted hidden states in the input dtype.
+    """
+    dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    head_fn = head_fn.to(torch.float32)
+    base = base.to(torch.float32)
+    scale = scale.to(torch.float32)
+    rsqrt = torch.rsqrt(hidden_states.square().mean(-1, keepdim=True) + eps)
+    mixes = F.linear(hidden_states, head_fn) * rsqrt
+    pre = torch.sigmoid(mixes * scale + base) + eps
+    y = torch.sum(pre.unsqueeze(-1) * hidden_states.view(*hidden_states.shape[:-1], n, -1), dim=-2)
+    return y.to(dtype)
 
 
 # ============================================================================

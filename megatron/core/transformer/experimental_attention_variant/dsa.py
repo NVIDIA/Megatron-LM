@@ -3,7 +3,7 @@
 import copy
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -89,11 +89,23 @@ class DSAIndexerLossLoggingHelper:
         tracker["avg_group"] = None
 
     @staticmethod
-    def reduce_loss_in_tracker():
-        """Collect and reduce the indexer losses across ranks."""
+    def reduce_loss_in_tracker(num_layers: Optional[int] = None):
+        """Collect and reduce the indexer losses across ranks.
+
+        Cross-PP ``all_reduce`` must be invoked on every rank in the pipeline-parallel
+        group, otherwise ranks without any indexer layer would skip the collective and
+        cause a hang. Pass ``num_layers`` to lazily initialize the tracker on such
+        ranks so they participate with a zero-filled tensor.
+
+        Args:
+            num_layers: Total number of decoder layers; required to lazily initialize
+                the tracker on ranks where no indexer layer ran.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
-            return
+            if num_layers is None:
+                return
+            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
         values = tracker["values"]
 
         torch.distributed.all_reduce(
@@ -120,6 +132,8 @@ class DSAIndexerLossLoggingHelper:
         wandb_writer=None,
         total_loss_dict=None,
         per_layer_logging: bool = False,
+        num_layers: Optional[int] = None,
+        csa_compress_ratios: Optional[List[int]] = None,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -130,17 +144,31 @@ class DSAIndexerLossLoggingHelper:
             wandb_writer: Weights & Biases writer.
             total_loss_dict: Dictionary to accumulate total losses.
             per_layer_logging: Whether to log per-layer losses.
+            num_layers: Total number of decoder layers (including MTP). Required
+                when running with hybrid attention layouts where some PP ranks may
+                not own any indexer layer; passing it ensures every PP rank
+                participates in the cross-PP ``all_reduce``.
+            csa_compress_ratios: Per-layer compress ratios for compressed sparse
+                attention. When provided, the cross-layer average uses the count
+                of layers with ``ratio == 4`` (the only ratio that owns an indexer)
+                as the divisor. Otherwise (legacy DSA path) every layer is assumed
+                to be an indexer layer and the divisor is the tracker tensor size.
         """
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(num_layers=num_layers)
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
 
         indexer_loss_values = tracker["values"] * loss_scale
-        num_layers = indexer_loss_values.shape[0]
 
-        # Average across all layers (assuming all layers have sparse attention)
-        avg_indexer_loss = indexer_loss_values.sum() / num_layers
+        if csa_compress_ratios is not None:
+            num_indexer_layers = sum(1 for r in csa_compress_ratios if r == 4)
+        else:
+            num_indexer_layers = indexer_loss_values.shape[0]
+
+        # Average across layers that actually own an indexer; layers without one
+        # contribute zero in ``tracker["values"]`` so they must not be in the divisor.
+        avg_indexer_loss = indexer_loss_values.sum() / max(num_indexer_layers, 1)
 
         # Log average loss
         if total_loss_dict is not None:
@@ -1050,10 +1078,15 @@ class DSAttention(MegatronModule):
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
         pg_collection: ProcessGroupCollection = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(config=config)
 
         self.layer_number = layer_number
+        # MTP layers re-use indices 1..mtp_num_layers internally; offset them
+        # past the main decoder so indexer loss accounting stays globally unique.
+        if is_mtp_layer:
+            self.layer_number = self.layer_number + self.config.num_layers
 
         self.indexer = build_module(
             submodules.indexer, config=self.config, pg_collection=pg_collection
@@ -1147,10 +1180,9 @@ class DSAttention(MegatronModule):
             )
             # Save indexer loss for logging
             if indexer_loss_coeff > 0:
+                num_layers_total = self.config.num_layers + (self.config.mtp_num_layers or 0)
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                    loss=indexer_loss,
-                    layer_number=self.layer_number,
-                    num_layers=self.config.num_layers,
+                    loss=indexer_loss, layer_number=self.layer_number, num_layers=num_layers_total
                 )
 
             # ===================================

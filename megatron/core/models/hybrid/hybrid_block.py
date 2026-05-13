@@ -25,12 +25,19 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    learned_output_contract,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -241,12 +248,19 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        skip_input_expand: bool = False,
     ) -> None:
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        # When the caller has already produced an n-stream tensor (e.g. mHC+MTP
+        # where ``MultiTokenPredictionLayer._concat_embeddings`` mixes embedding
+        # in per-stream via e_proj/h_proj), the entry-side ``input_expand`` must
+        # be skipped — otherwise the tensor is re-expanded to ``n*n*C`` and
+        # downstream mHC projections see a mismatched reduction dim.
+        self.skip_input_expand = skip_input_expand
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -365,6 +379,17 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+            if self.config.enable_hyper_connections:
+                hc_mult = self.config.num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
+                self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
+                self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
+                self.hc_head_scale = nn.Parameter(torch.ones(1))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -511,7 +536,7 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        if self.config.enable_hyper_connections and self.pre_process:
+        if self.config.enable_hyper_connections and self.pre_process and not self.skip_input_expand:
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.config.num_residual_streams
             )
@@ -625,10 +650,37 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                     is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
                 )
 
-        if self.config.enable_hyper_connections and self.post_process:
-            hidden_states = HyperConnectionModule.output_contract(
-                hidden_states, self.config.num_residual_streams
-            )
+        # Contract n-stream → 1-stream at the model output boundary so the
+        # downstream lm_head sees the right hidden dim.
+        #
+        # The MTP layer's inner HybridStack sets ``is_mtp_layer=True``; in that
+        # case the enclosing ``MultiTokenPredictionLayer._postprocess`` does
+        # the per-depth learned contraction, so we must leave the tensor
+        # multi-stream here.
+        #
+        # When ``post_layer_norm`` is True (the typical decoder boundary) the
+        # block owns ``hc_head_{fn,base,scale}`` and uses the learned contract.
+        # When it is False (e.g. the dummy-layer hybrid test that disables the
+        # final layernorm but still expects single-stream output downstream),
+        # we fall back to the legacy uniform-mean contract.
+        mhc_multistream = None
+        if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
+            if self.post_layer_norm:
+                if self.config.mtp_num_layers is not None:
+                    mhc_multistream = hidden_states
+                # [s, b, n*C] -> [s, b, C] via DSv4 learned contraction.
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
+            else:
+                hidden_states = HyperConnectionModule.output_contract(
+                    hidden_states, self.config.num_residual_streams
+                )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
@@ -639,6 +691,9 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         hidden_states = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        if mhc_multistream is not None:
+            return hidden_states, mhc_multistream
 
         return hidden_states
 
@@ -697,6 +752,25 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                         tp_group=self.tp_group,
                     )
                 )
+
+        # Save bare parameters/buffers that are direct attributes of this stack
+        # (e.g. hyper-connection learned weights: hc_head_fn, hc_head_base,
+        # hc_head_scale). The named_children loop above silently drops these
+        # since they are not nn.Module children. Mirrors the handling in
+        # MegatronModule.sharded_state_dict and TransformerBlock.
+        local_state_dict: dict = {}
+        self._save_to_state_dict(local_state_dict, '', keep_vars=True)
+        if local_state_dict:
+            metadata = ensure_metadata_has_dp_cp_group(metadata)
+            sharded_state_dict.update(
+                make_sharded_tensors_for_checkpoint(
+                    local_state_dict,
+                    prefix,
+                    sharded_offsets=sharded_offsets or (),
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            )
 
         return sharded_state_dict
 

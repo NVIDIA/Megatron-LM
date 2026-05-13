@@ -340,6 +340,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs["pg_collection"] = pg_collection
         if pp_layer_offset is not None:
             attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
+        # ``is_mtp_layer`` is forwarded to attention modules that need globally
+        # unique layer indexing (e.g. MLA + DSA indexer loss bookkeeping, DSv4
+        # hybrid + CSA). It is opt-in per attention module: only attach the
+        # kwarg when the target module accepts it, so we don't break standard
+        # ``Attention``/``SelfAttention`` subclasses whose ``__init__`` is strict.
+        from megatron.core.transformer.experimental_attention_variant.dsv4_hybrid_attention import (  # pylint: disable=import-outside-toplevel
+            DSv4HybridSelfAttention,
+        )
+        from megatron.core.transformer.multi_latent_attention import (  # pylint: disable=import-outside-toplevel
+            MLASelfAttention,
+        )
+
+        self_attn_module = getattr(submodules.self_attention, "module", submodules.self_attention)
+        if isinstance(self_attn_module, type) and issubclass(
+            self_attn_module, (MLASelfAttention, DSv4HybridSelfAttention)
+        ):
+            attention_optional_kwargs["is_mtp_layer"] = is_mtp_layer
 
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
@@ -1343,6 +1360,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(
             config=config,
@@ -1351,6 +1369,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            is_mtp_layer=is_mtp_layer,
         )
 
         if not _is_identity_op_spec(submodules.cross_attention_hyper_connection):
