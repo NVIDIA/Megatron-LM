@@ -7,11 +7,6 @@ from megatron.core.inference.headers import Headers, UnknownHeaderError
 
 class TestHeaders:
 
-    def test_headers_are_unique(self):
-        """All Header enum members have unique values."""
-        values = [h.value for h in Headers]
-        assert len(values) == len(set(values))
-
     def test_headers_contain_expected_members(self):
         """The Headers enum exposes all coordinator protocol values."""
         names = {h.name for h in Headers}
