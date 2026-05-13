@@ -38,6 +38,18 @@ from megatron.core.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
+    tp_group = getattr(pg_collection, 'tp', None)
+    dp_cp_group = getattr(pg_collection, 'dp_cp', None)
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError(
+            "pg_collection.tp and pg_collection.dp_cp must both be set or both be unset."
+        )
+    if tp_group is None:
+        return {}
+    return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
+
+
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -186,15 +198,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
-        logging_pg_kwargs = {}
-        if (
-            getattr(self.pg_collection, 'tp', None) is not None
-            and getattr(self.pg_collection, 'dp_cp', None) is not None
-        ):
-            logging_pg_kwargs = {
-                'tp_group': self.pg_collection.tp,
-                'dp_cp_group': self.pg_collection.dp_cp,
-            }
+        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
         layer_type_list, layer_offset = select_pipeline_segment(
             parsed.main_pattern or '',
