@@ -650,29 +650,37 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                     is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
                 )
 
-        # When MTP is enabled, save the pre-contraction multi-stream tensor
-        # for MTP depth input before applying the learned output contraction.
+        # Contract n-stream → 1-stream at the model output boundary so the
+        # downstream lm_head sees the right hidden dim.
         #
-        # Only contract at the boundary that also owns the final layernorm —
-        # i.e. the actual model output stage. Sub-blocks (e.g. the MTP
-        # layer's inner HybridStack, which sets ``post_layer_norm=False``)
-        # must leave the tensor multi-stream so the enclosing
-        # ``MultiTokenPredictionLayer._postprocess`` can run its per-depth
-        # learned contraction.
+        # The MTP layer's inner HybridStack sets ``is_mtp_layer=True``; in that
+        # case the enclosing ``MultiTokenPredictionLayer._postprocess`` does
+        # the per-depth learned contraction, so we must leave the tensor
+        # multi-stream here.
+        #
+        # When ``post_layer_norm`` is True (the typical decoder boundary) the
+        # block owns ``hc_head_{fn,base,scale}`` and uses the learned contract.
+        # When it is False (e.g. the dummy-layer hybrid test that disables the
+        # final layernorm but still expects single-stream output downstream),
+        # we fall back to the legacy uniform-mean contract.
         mhc_multistream = None
-        if self.config.enable_hyper_connections and self.post_process and self.post_layer_norm:
-            if self.config.mtp_num_layers is not None:
-                mhc_multistream = hidden_states
-            # DSv4 introduced the new learned output contraction for mHC.
-            # [s, b, n*C] -> [s, b, C]
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+        if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
+            if self.post_layer_norm:
+                if self.config.mtp_num_layers is not None:
+                    mhc_multistream = hidden_states
+                # [s, b, n*C] -> [s, b, C] via DSv4 learned contraction.
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
+            else:
+                hidden_states = HyperConnectionModule.output_contract(
+                    hidden_states, self.config.num_residual_streams
+                )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
