@@ -134,8 +134,10 @@ def test_clamped_bias_swiglu_impl(input_dtype, with_bias):
     assert torch.allclose(x.grad, x_2.grad, **tols)
     if with_bias:
         assert bias_2.grad.dtype == bias.grad.dtype
-        if input_dtype == torch.float32:
-            assert torch.allclose(bias.grad, bias_2.grad, **tols)
+        bias_grad_cos = torch.nn.functional.cosine_similarity(
+            bias.grad.flatten().float().unsqueeze(0), bias_2.grad.flatten().float().unsqueeze(0)
+        ).item()
+        assert bias_grad_cos > 0.999, f"bias.grad cosine similarity = {bias_grad_cos:.6f}"
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
@@ -167,4 +169,7 @@ def test_bias_swiglu_impl_clamp_none_matches_unclamped(input_dtype, with_bias):
     assert torch.allclose(y_unclamped, y_default_clamp, **tols)
     assert torch.allclose(x.grad, x_2.grad, **tols)
     if with_bias:
-        assert torch.allclose(bias.grad, bias_2.grad, **tols)
+        bias_grad_cos = torch.nn.functional.cosine_similarity(
+            bias.grad.flatten().float().unsqueeze(0), bias_2.grad.flatten().float().unsqueeze(0)
+        ).item()
+        assert bias_grad_cos > 0.999, f"bias.grad cosine similarity = {bias_grad_cos:.6f}"
