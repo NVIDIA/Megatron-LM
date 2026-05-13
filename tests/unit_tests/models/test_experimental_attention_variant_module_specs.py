@@ -482,7 +482,7 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
                 f"{self.MODULE}.get_experimental_attention_variant_module_spec",
                 return_value=attn_spec,
             ),
-            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=mlp_spec),
+            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=(mlp_spec, True)),
         ):
             specs = get_transformer_layer_with_experimental_attention_variant_spec(
                 cfg, backend=backend
@@ -519,7 +519,7 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
                 return_value=exp_attn_spec,
             ),
             patch(f"{self.MODULE}._get_self_attention_module_spec", return_value=std_attn_spec),
-            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=mlp_spec),
+            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=(mlp_spec, True)),
         ):
             specs = get_transformer_layer_with_experimental_attention_variant_spec(
                 cfg, backend=backend
@@ -556,8 +556,8 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
                 f"{self.MODULE}.get_experimental_attention_variant_module_spec",
                 return_value=attn_spec,
             ),
-            patch(f"{self.MODULE}._get_moe_module_spec", return_value=moe_spec),
-            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=dense_spec),
+            patch(f"{self.MODULE}._get_moe_module_spec", return_value=(moe_spec, False)),
+            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=(dense_spec, True)),
         ):
             specs = get_transformer_layer_with_experimental_attention_variant_spec(
                 cfg, backend=backend

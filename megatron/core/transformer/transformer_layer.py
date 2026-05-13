@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import warnings
 from abc import ABC
@@ -427,9 +428,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "Consider migrating the `mlp` submodule spec to a direct call of the "
                 "`as_mlp_submodule` classmethod instead.",
             )
-        self.mlp = submodules.mlp(
-            config=self.config, pg_collection=pg_collection, is_mtp_layer=self.is_mtp_layer
-        )
+        # Forward layer_number to MoELayer at construction so that routers which
+        # need it during __init__ (e.g. hash router) can see it; non-MoE
+        # builders don't accept the kwarg, so guard by introspection.
+        mlp_kwargs = {
+            "config": self.config,
+            "pg_collection": pg_collection,
+            "is_mtp_layer": self.is_mtp_layer,
+        }
+        try:
+            mlp_sig = inspect.signature(submodules.mlp)
+            if "layer_number" in mlp_sig.parameters:
+                mlp_kwargs["layer_number"] = self.layer_number
+        except (TypeError, ValueError):
+            pass
+        self.mlp = submodules.mlp(**mlp_kwargs)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 

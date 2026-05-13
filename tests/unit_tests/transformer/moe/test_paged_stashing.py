@@ -138,7 +138,7 @@ class MoEModelTestContainer:
             moe_layer = (
                 MoELayer(
                     self.config,
-                    transformer_layer_spec.submodules.mlp.submodules,
+                    transformer_layer_spec.submodules.mlp.keywords["submodules"],
                     layer_number=layer_number,
                 )
                 .cuda()
