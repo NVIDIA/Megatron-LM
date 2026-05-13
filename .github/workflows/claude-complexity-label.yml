@@ -14,7 +14,7 @@ jobs:
       issues: write
       id-token: write
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
@@ -27,7 +27,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ github.token }}
+          github_token: ${{ secrets.PAT }}
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
