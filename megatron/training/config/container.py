@@ -1,18 +1,31 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import os
-from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Type, TypeVar
+
 import yaml
-from omegaconf import OmegaConf
-from megatron.training.config.common_config import RNGConfig, DistributedInitConfig, ProfilingConfig
-from megatron.training.config.training_config import TokenizerConfig, TrainingConfig, ValidationConfig, SchedulerConfig, LoggerConfig, CheckpointConfig
-from megatron.core.optimizer import OptimizerConfig
-from megatron.core.msc_utils import MultiStorageClientFeature
+
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.training.config.resilience_config import RerunStateMachineConfig, StragglerDetectionConfig
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.optimizer import OptimizerConfig
+from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
+from megatron.training.config.resilience_config import (
+    RerunStateMachineConfig,
+    StragglerDetectionConfig,
+)
+from megatron.training.config.training_config import (
+    CheckpointConfig,
+    LoggerConfig,
+    SchedulerConfig,
+    TokenizerConfig,
+    TrainingConfig,
+    ValidationConfig,
+)
+from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
 
 T = TypeVar("T", bound="ConfigContainerBase")
@@ -80,6 +93,8 @@ class ConfigContainerBase:
         Returns:
             A new instance of this class initialized with the YAML file values
         """
+        from omegaconf import OmegaConf
+
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
             yaml_path_exists = msc.os.path.exists(yaml_path)
