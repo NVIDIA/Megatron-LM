@@ -43,6 +43,14 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
+    # Enable TE's cuDSL fused grouped MLP path for MoE buckets. The kernel
+    # additionally requires SM100 (Blackwell), so on H100/A100 CI this is a
+    # no-op; setting it here means the kernel is picked up automatically when
+    # Blackwell hardware joins the unit-test matrix.
+    if [[ "$BUCKET" == *"transformer/moe"* || "$BUCKET" == *"test_moe_experts"* ]]; then
+        export NVTE_CUTEDSL_FUSED_GROUPED_MLP=1
+    fi
+
 
     bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
       --tag $TAG \
