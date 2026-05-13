@@ -151,8 +151,6 @@ class TestFSDPTensorParallelMuon:
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.tensor import DTensor
 
-        from megatron.core.optimizer import emerging_optimizers as eopt_mod
-
         dp_size = torch.distributed.get_world_size()
         dp_rank = torch.distributed.get_rank()
         device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
@@ -204,14 +202,14 @@ class TestFSDPTensorParallelMuon:
                 g1.shape
             ), "boundary param grad should be unevenly sharded (local != global shape)"
 
-        real_gather = eopt_mod.gather_uneven_dtensor_to_full_tensor
+        real_gather = optimizer._gather_full_uneven_local_tensor_like
         gather_shapes = []
 
-        def counting_gather(value):
+        def counting_gather(value, local_tensor):
             gather_shapes.append(tuple(value.shape))
-            return real_gather(value)
+            return real_gather(value, local_tensor)
 
-        with patch.object(eopt_mod, "gather_uneven_dtensor_to_full_tensor", counting_gather):
+        with patch.object(optimizer, "_gather_full_uneven_local_tensor_like", counting_gather):
             optimizer.step()
 
         assert gather_shapes == [(6, cols)]
@@ -251,7 +249,7 @@ class TestFSDPTensorParallelMuon:
             )
             assert not torch.equal(local_value, initial_locals[idx])
 
-    def test_boundary_detector_includes_middle_split_params(self):
+    def test_boundary_detector_uses_first_and_last_non_empty_params(self):
         from torch.distributed.device_mesh import init_device_mesh
 
         dp_size = torch.distributed.get_world_size()
@@ -260,9 +258,10 @@ class TestFSDPTensorParallelMuon:
         dp_group = device_mesh.get_group("dp")
         cols = 4
 
-        # Optimizer groups can exclude Adam-managed tensors that are present in
-        # the underlying M-FSDP flat buffer. After that filtering, a split Muon
-        # tensor is not guaranteed to be first or last in the Muon param group.
+        # Even if more than two params look uneven in a synthetic layout, the
+        # M-FSDP flat-buffer assignment means only the first and last non-empty
+        # params on each DP rank can cross rank boundaries. Gathering every
+        # uneven DTensor is the expensive behavior this integration avoids.
         plans = [{0: 2, 1: 2}, {0: 1, 1: 3}, {0: 3, 1: 1}]
 
         params = []
@@ -273,12 +272,10 @@ class TestFSDPTensorParallelMuon:
 
         optimizer = _make_fsdp_muon(params, dp_group=dp_group)
 
-        assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0, 1, 2}
+        assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0, 2}
 
     def test_step_no_gather_when_all_params_local(self):
         from torch.distributed.device_mesh import init_device_mesh
-
-        from megatron.core.optimizer import emerging_optimizers as eopt_mod
 
         dp_size = torch.distributed.get_world_size()
         dp_rank = torch.distributed.get_rank()
@@ -301,19 +298,60 @@ class TestFSDPTensorParallelMuon:
 
         optimizer = _make_fsdp_muon(params, dp_group=dp_group)
 
-        real_gather = eopt_mod.gather_uneven_dtensor_to_full_tensor
+        real_gather = optimizer._gather_full_uneven_local_tensor_like
         gather_calls = []
 
-        def counting_gather(value):
+        def counting_gather(value, local_tensor):
             gather_calls.append(tuple(value.shape))
-            return real_gather(value)
+            return real_gather(value, local_tensor)
 
-        with patch.object(eopt_mod, "gather_uneven_dtensor_to_full_tensor", counting_gather):
+        with patch.object(optimizer, "_gather_full_uneven_local_tensor_like", counting_gather):
             optimizer.step()
 
         assert (
             gather_calls == []
         ), f"Expected no all-gathers for fully-local params, got {gather_calls}"
+
+    def test_boundary_metadata_collectives_are_cached_across_steps(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plans = [{0: 4}, {0: 2, 1: 4}, {1: 5}]
+        full_params = [
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) / 100
+            for rows in (4, 6, 5)
+        ]
+        full_grads = [
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) / 50
+            + 0.1
+            for rows in (4, 6, 5)
+        ]
+
+        params = []
+        for full_param, plan in zip(full_params, plans):
+            local_param = _local_slice(full_param, plan, dp_rank).contiguous()
+            params.append(nn.Parameter(_make_dtensor(local_param, full_param.shape, device_mesh)))
+
+        for param, full_grad, plan in zip(params, full_grads, plans):
+            local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+            param.grad = _make_dtensor(local_grad, full_grad.shape, device_mesh)
+
+        optimizer = _make_fsdp_muon(params, dp_group=dp_group)
+
+        with patch(
+            "torch.distributed.all_gather_object", wraps=torch.distributed.all_gather_object
+        ) as mocked_all_gather_object:
+            optimizer.step()
+            first_step_calls = mocked_all_gather_object.call_count
+            optimizer.step()
+
+        assert first_step_calls > 0
+        assert mocked_all_gather_object.call_count == first_step_calls
 
     def test_step_momentum_accumulates_across_steps(self):
         from torch.distributed.device_mesh import init_device_mesh
