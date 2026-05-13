@@ -2457,6 +2457,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 is_expert=is_expert,
                 input_size=input_size,
                 ffn_hidden_size=ffn_hidden_size,
+                apply_block_output_init_scaling=True,
             )
 
 else:

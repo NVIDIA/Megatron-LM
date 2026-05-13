@@ -16,4 +16,5 @@ Internal utility APIs.
 
 num_microbatches_calculator
 optimizer_param_scheduler
+scaling_recipe_contract
 ```

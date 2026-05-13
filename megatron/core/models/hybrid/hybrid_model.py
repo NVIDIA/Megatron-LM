@@ -13,6 +13,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parameterization import SCALING_RECIPE_DEPTH_MUP
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -110,12 +111,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
+        if config.scaling_recipe == SCALING_RECIPE_DEPTH_MUP:
+            raise NotImplementedError(
+                "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
+                "Transformer blocks only. HybridModel is out of scope for v1."
+            )
+
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        if self.config.use_mup and not getattr(HybridModel, "mup_warning_printed", False):
+        if self.model_scaling_policy.enabled and not getattr(
+            HybridModel, "mup_warning_printed", False
+        ):
             log_single_rank(
                 logger,
                 logging.WARNING,
@@ -287,10 +296,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=(
-                    config.embedding_init_method
-                    if config.use_mup and not self.share_embeddings_and_output_weights
-                    else config.init_method
+                init_method=self.model_scaling_policy.output_layer_init_method(
+                    share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
+                    default_init_method=config.init_method,
+                    embedding_init_method=config.embedding_init_method,
                 ),
                 bias=False,
                 skip_bias_add=False,
@@ -522,7 +531,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config=self.config,
                     cp_group=self.pg_collection.cp,
                     packed_seq_params=packed_seq_params,
-                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    scale_logits_fn=(
+                        self._scale_logits if self.model_scaling_policy.enabled else None
+                    ),
                 )
         sequence_parallel_override = False
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:

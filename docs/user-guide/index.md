@@ -21,6 +21,7 @@ Guides for using Megatron Core and Megatron-LM.
 msc_integration
 data-preparation
 training-examples
+scaling-recipes
 parallelism-guide
 features/index
 ```

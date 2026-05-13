@@ -47,11 +47,13 @@ from megatron.core.quantization.utils import (
 
 from megatron.training.argument_utils import ArgumentGroupFactory
 
+
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
+    parser = _add_scaling_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
     parser = _add_rl_args(parser)
@@ -323,6 +325,87 @@ def tuple_type(x):
         return x
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
+
+
+def _resolve_validation_attr(args, attr_name):
+    """Resolve validation fields from either flat argparse args or nested YAML namespaces."""
+    if hasattr(args, attr_name):
+        value = getattr(args, attr_name)
+        if value is not None:
+            return value
+    language_model = getattr(args, 'language_model', None)
+    if language_model is not None and hasattr(language_model, attr_name):
+        return getattr(language_model, attr_name)
+    return None
+
+
+def validate_depth_mup_optimizer_support(args) -> None:
+    """Enforce the public optimizer support surface for depth_mup."""
+    if _resolve_validation_attr(args, 'scaling_recipe') != 'depth_mup':
+        return
+
+    if _resolve_validation_attr(args, 'optimizer') not in ('adam',):
+        raise ValueError(
+            "scaling_recipe='depth_mup' currently supports optimizer='adam' only. "
+            "AdamW semantics should continue to use decoupled_weight_decay. "
+            "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
+            "and input/output-bias rules and is intentionally out of scope for v1."
+        )
+
+    weight_decay = _resolve_validation_attr(args, 'weight_decay')
+    decoupled_weight_decay = _resolve_validation_attr(args, 'decoupled_weight_decay')
+    if decoupled_weight_decay is None:
+        # CLI argparse does not expose this field directly; the optimizer config
+        # default is AdamW semantics.
+        decoupled_weight_decay = True
+    if (
+        weight_decay is not None
+        and weight_decay != 0.0
+        and decoupled_weight_decay is not True
+    ):
+        raise ValueError(
+            "scaling_recipe='depth_mup' with nonzero weight_decay requires "
+            "decoupled_weight_decay=True because the width-depth weight-decay scaling "
+            "is derived for AdamW. Use weight_decay=0.0 for coupled Adam, or enable "
+            "decoupled_weight_decay."
+        )
+
+
+def warn_deprecated_mup_aliases(args) -> None:
+    """Warn when users spell MuP through legacy aliases."""
+    deprecated_aliases = []
+    if getattr(args, 'use_mup', False):
+        deprecated_aliases.append('--use-mup')
+    if getattr(args, 'mup_base_hidden_size', None) is not None:
+        deprecated_aliases.append('--mup-base-hidden-size')
+    if getattr(args, 'mup_base_head_dim', None) is not None:
+        deprecated_aliases.append('--mup-base-head-dim')
+    if getattr(args, 'mup_width_mult', 1.0) != 1.0:
+        deprecated_aliases.append('--mup-width-mult')
+
+    if not deprecated_aliases:
+        return
+
+    warn_rank_0(
+        "Legacy MuP aliases are deprecated and will be removed in a future release: "
+        f"{', '.join(deprecated_aliases)}. Use `--scaling-recipe mup` with "
+        "`--scaling-base-hidden-size` and `--scaling-base-head-dim` instead. "
+        "`--mup-width-mult` is derived from the resolved scaling context and any "
+        "non-default supplied value must match the derived value."
+    )
+
+
+def validate_muon_scalar_optimizer_support(args) -> None:
+    """Keep YAML and CLI validation aligned for Muon scalar optimizer selection."""
+    muon_scalar_optimizer = _resolve_validation_attr(args, 'muon_scalar_optimizer')
+    if muon_scalar_optimizer is None:
+        return
+    if muon_scalar_optimizer not in ('adam', 'lion'):
+        raise ValueError(
+            "muon_scalar_optimizer must be one of ('adam', 'lion'). "
+            f"Got {muon_scalar_optimizer!r}."
+        )
+
 
 def validate_args(args, defaults={}):
 
@@ -1202,6 +1285,8 @@ def validate_args(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
+    validate_depth_mup_optimizer_support(args)
+    validate_muon_scalar_optimizer_support(args)
     if args.save is not None:
         assert args.save_interval is not None
         assert args.save_interval > 0
@@ -1666,6 +1751,11 @@ def validate_args(args, defaults={}):
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
+    from megatron.core.parameterization import build_resolved_scaling_context, sync_legacy_mup_fields
+
+    warn_deprecated_mup_aliases(args)
+    sync_legacy_mup_fields(args, build_resolved_scaling_context(args))
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -2018,6 +2108,20 @@ def _add_network_size_args(parser):
         "moe_aux_loss_coeff",
         "cp_comm_type",
         "cuda_graph_scope",
+        "use_mup",
+        "mup_width_mult",
+        "mup_base_hidden_size",
+        "mup_embedding_mult",
+        "mup_output_mult",
+        "mup_base_head_dim",
+        "mup_attn_scale_power",
+        "scaling_recipe",
+        "scaling_base_hidden_size",
+        "scaling_base_num_layers",
+        "scaling_base_head_dim",
+        "scaling_residual_branch_depth_power",
+        "scaling_hidden_lr_depth_power",
+        "scaling_block_out_proj_init_depth_power",
         # no CLI argument exists for these
         "virtual_pipeline_model_parallel_size",
         "params_dtype",
@@ -2158,6 +2262,49 @@ def _add_network_size_args(parser):
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
     return parser
+
+
+def _add_scaling_args(parser):
+    group = parser.add_argument_group(title='scaling')
+
+    group.add_argument('--scaling-recipe', type=str, default=None,
+                       choices=['none', 'mup', 'depth_mup'],
+                       help='Canonical scaling recipe. `mup` preserves current Megatron MuP; '
+                       '`depth_mup` is the spectral width-depth μP recipe for dense GPT-style '
+                       'residual Transformer blocks using `--optimizer adam` with AdamW-style '
+                       'semantics via `decoupled_weight_decay` when weight decay is nonzero.')
+    group.add_argument('--scaling-base-hidden-size', type=int, default=None,
+                       help='Reference hidden size for width-based scaling recipes.')
+    group.add_argument('--scaling-base-num-layers', type=int, default=None,
+                       help='Reference number of transformer layers for depth-based scaling recipes.')
+    group.add_argument('--scaling-base-head-dim', type=float, default=None,
+                       help='Reference attention head dimension for scaling recipes.')
+    group.add_argument('--scaling-residual-branch-depth-power', type=float, default=None,
+                       help='Relative depth exponent for residual branch outputs.')
+    group.add_argument('--scaling-hidden-lr-depth-power', type=float, default=None,
+                       help='Relative depth exponent for hidden matrix-like LR scaling.')
+    group.add_argument('--scaling-block-out-proj-init-depth-power', type=float, default=None,
+                       help='Relative depth exponent for block output projection initialization.')
+    group.add_argument('--allow-depth-mup-eval', action='store_true',
+                       help='Allow validation/eval loss for `depth_mup` by entering a validation-only '
+                       'runtime context. This does not enable general inference support.')
+
+    group.add_argument('--use-mup', action='store_true',
+                       help='Deprecated backward-compatible alias for `--scaling-recipe mup`.')
+    group.add_argument('--mup-width-mult', type=float, default=1.0,
+                       help='Deprecated compatibility field; derived from the resolved scaling context.')
+    group.add_argument('--mup-base-hidden-size', type=int, default=None,
+                       help='Deprecated backward-compatible alias for `--scaling-base-hidden-size`.')
+    group.add_argument('--mup-embedding-mult', type=float, default=1.0,
+                       help='MuP embedding output multiplier. Preserved for compatibility.')
+    group.add_argument('--mup-output-mult', type=float, default=1.0,
+                       help='MuP output/logit multiplier. Preserved for compatibility.')
+    group.add_argument('--mup-base-head-dim', type=float, default=None,
+                       help='Deprecated backward-compatible alias for `--scaling-base-head-dim`.')
+    group.add_argument('--mup-attn-scale-power', type=float, default=1.0,
+                       help='MuP attention scaling power. Preserved for compatibility.')
+    return parser
+
 
 def _add_straggler_detector_args(parser):
     from megatron.training.config import StragglerDetectionConfig

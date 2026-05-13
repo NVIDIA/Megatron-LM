@@ -87,6 +87,20 @@ def _default_param_overrides_factory() -> Dict[ParamKey, Dict[str, Any]]:
     }
 
 
+def _nonlinear_or_embedding_param_overrides(optimizer_name: str) -> Dict[ParamKey, Dict[str, Any]]:
+    """Route non-matrix / embedding-class params to the requested scalar optimizer."""
+    return {
+        ParamKey(
+            predicate=ParamPredicate(name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding)
+        ): {'optimizer': optimizer_name}
+    }
+
+
+def _muon_default_param_overrides(config) -> Dict[ParamKey, Dict[str, Any]]:
+    """Respect the configured scalar optimizer for Muon-family nonlinear params."""
+    return _nonlinear_or_embedding_param_overrides(config.muon_scalar_optimizer)
+
+
 @dataclass
 class EmergingOptimizerEntry:
     """Everything needed to create and configure an emerging optimizer.
@@ -95,6 +109,8 @@ class EmergingOptimizerEntry:
         optimizer_cls: The torch optimizer class.
         init_state_fn: Lazily initialises optimizer state (needed for checkpoint formats).
         config_to_kwargs: ``(config, model_chunks, pg_collection) -> dict`` of constructor kwargs.
+        config_to_param_overrides: ``config -> dict`` of per-parameter overrides derived from the
+            resolved optimizer config (e.g. Muon scalar optimizer selection).
         default_param_overrides: Per-parameter config overrides applied automatically
             (e.g. route non-linear params to Adam).
     """
@@ -102,6 +118,7 @@ class EmergingOptimizerEntry:
     optimizer_cls: type
     init_state_fn: Callable = _eopt_init_state_fn
     config_to_kwargs: Callable | None = None
+    config_to_param_overrides: Callable | None = None
     default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(
         default_factory=_default_param_overrides_factory
     )
@@ -402,8 +419,15 @@ def _default_adam_based_eopt_config_to_kwargs(
 ) -> Dict[str, Any]:
     """Convert OptimizerConfig to default emerging optimizer constructor kwargs."""
     kwargs = _kwargs_from_config(registry.get_optimizer_cls(eopt_name), eopt_name, config)
-    kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
+    kwargs["betas"] = _default_betas_for_eopt(eopt_name, config)
     return kwargs
+
+
+def _default_betas_for_eopt(eopt_name, config) -> tuple[float, float]:
+    """Return the default beta pair for an emerging optimizer."""
+    if eopt_name == "lion":
+        return (config.lion_beta1, config.lion_beta2)
+    return (config.adam_beta1, config.adam_beta2)
 
 
 # -----------------------------------------------------------------------
@@ -415,25 +439,13 @@ _EMERGING_OPTIMIZERS.update(
             optimizer_cls=TensorParallelMuon,
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_muon_config_to_kwargs,
-            default_param_overrides={
-                ParamKey(
-                    predicate=ParamPredicate(
-                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                    )
-                ): {'optimizer': 'adam'}
-            },
+            config_to_param_overrides=_muon_default_param_overrides,
         ),
         "adaptive_muon": EmergingOptimizerEntry(
             optimizer_cls=TensorParallelAdaptiveMuon,
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_adaptive_muon_config_to_kwargs,
-            default_param_overrides={
-                ParamKey(
-                    predicate=ParamPredicate(
-                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                    )
-                ): {'optimizer': 'adam'}
-            },
+            config_to_param_overrides=_muon_default_param_overrides,
         ),
     }
 )

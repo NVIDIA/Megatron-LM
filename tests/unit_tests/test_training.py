@@ -9,7 +9,11 @@ import torch
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
-from megatron.training.training import build_train_valid_test_data_iterators
+from megatron.training.training import (
+    _should_enable_depth_mup_eval,
+    build_train_valid_test_data_iterators,
+    preprocess_common_state_dict,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -56,6 +60,46 @@ def create_test_args():
     args.phase_transition_iterations = None
 
     return args
+
+
+def test_preprocess_common_state_dict_tolerates_missing_optional_param_group_keys():
+    base_group = {
+        "wd_mult": 1.0,
+        "lr_mult": 1.0,
+        "is_expert_parallel": False,
+        "is_decoupled_lr": False,
+        "max_lr": 1e-3,
+        "min_lr": 1e-5,
+    }
+    common_state_dict = {
+        "args": SimpleNamespace(use_distributed_optimizer=True, local_rank=7, rank=3),
+        "optimizer": {
+            "optimizer": {
+                "param_groups": [
+                    {**base_group, "params": ["missing_optional"]},
+                    {**base_group, "eps": 1e-8, "params": ["with_eps"]},
+                ]
+            },
+            "param_state": {},
+        },
+    }
+
+    preprocessed = preprocess_common_state_dict(common_state_dict)
+
+    param_groups = preprocessed["optimizer"]["optimizer"]["param_groups"]
+    assert [group["params"] for group in param_groups] == [["with_eps"], ["missing_optional"]]
+    assert "rank" not in preprocessed["args"]
+    assert "local_rank" not in preprocessed["args"]
+
+
+def test_should_enable_depth_mup_eval_defaults_missing_flag_to_false():
+    assert not _should_enable_depth_mup_eval(SimpleNamespace(scaling_recipe="depth_mup"))
+    assert not _should_enable_depth_mup_eval(
+        SimpleNamespace(scaling_recipe="mup", allow_depth_mup_eval=True)
+    )
+    assert _should_enable_depth_mup_eval(
+        SimpleNamespace(scaling_recipe="depth_mup", allow_depth_mup_eval=True)
+    )
 
 
 class TestTraining:

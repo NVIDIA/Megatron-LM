@@ -18,6 +18,12 @@ import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.core.parameterization import build_resolved_scaling_context, sync_legacy_mup_fields
+from megatron.training.arguments import (
+    validate_depth_mup_optimizer_support,
+    validate_muon_scalar_optimizer_support,
+    warn_deprecated_mup_aliases,
+)
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -46,6 +52,8 @@ def validate_yaml(args, defaults={}):
         split_data_path = args.data_path.split()
         if len(split_data_path) != 1:
             args.data_path = split_data_path
+    if not hasattr(args, 'step_batch_size_schedule'):
+        args.step_batch_size_schedule = None
 
     # Tensor model parallel size.
     args.model_parallel.tensor_model_parallel_size = min(
@@ -260,6 +268,8 @@ def validate_yaml(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
+    validate_depth_mup_optimizer_support(args)
+    validate_muon_scalar_optimizer_support(args)
     if args.save is not None:
         assert args.save_interval is not None
     # Mixed precision checks.
@@ -343,8 +353,12 @@ def validate_yaml(args, defaults={}):
     _print_args("arguments", args)
 
     #TODO: Added as much of the global initialization requires the model parallel arguments
-    args = SimpleNamespace(**args.__dict__, **args.model_parallel.__dict__)
-    args = SimpleNamespace(**args.__dict__, **args.language_model.__dict__)
+    args = SimpleNamespace(**{**args.__dict__, **args.model_parallel.__dict__})
+    args = SimpleNamespace(**{**args.__dict__, **args.language_model.__dict__})
+    if not hasattr(args, 'allow_depth_mup_eval'):
+        args.allow_depth_mup_eval = False
+    warn_deprecated_mup_aliases(args)
+    sync_legacy_mup_fields(args, build_resolved_scaling_context(args))
     # For GPT Layer spec in pretrain_gpt
     args.num_experts = args.language_model.num_moe_experts
 
@@ -377,10 +391,33 @@ def core_config_from_args(args, dataclass=TransformerConfig):
     Returns:
         SimpleNamespace: The returned namespace to build core config from
     """
+    defaultable_scaling_fields = {
+        "use_mup",
+        "mup_width_mult",
+        "mup_base_hidden_size",
+        "mup_embedding_mult",
+        "mup_output_mult",
+        "mup_base_head_dim",
+        "mup_attn_scale_power",
+        "scaling_recipe",
+        "scaling_base_hidden_size",
+        "scaling_base_num_layers",
+        "scaling_base_head_dim",
+        "scaling_residual_branch_depth_power",
+        "scaling_hidden_lr_depth_power",
+        "scaling_block_out_proj_init_depth_power",
+    }
     kw_args = {}
     for f in dataclasses.fields(dataclass):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+        elif f.name in defaultable_scaling_fields and f.default is not dataclasses.MISSING:
+            kw_args[f.name] = f.default
+        elif (
+            f.name in defaultable_scaling_fields
+            and f.default_factory is not dataclasses.MISSING
+        ):
+            kw_args[f.name] = f.default_factory()
         else:
             raise Exception(f"Missing argument {f.name} for {str(dataclass)} config")
     return kw_args
@@ -439,4 +476,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-
