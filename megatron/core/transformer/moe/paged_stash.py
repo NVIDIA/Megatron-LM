@@ -905,7 +905,7 @@ class PagedStashManager:
             or tensor.dim() == 0
             or not hasattr(tensor, 'grouped_tensor_scale_inv')
         ):
-            return tensor.detach()
+            return tensor
 
         assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"
 
