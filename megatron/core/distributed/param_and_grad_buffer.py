@@ -811,15 +811,16 @@ def group_params_for_buffers(
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
         is_expert_parallel = not getattr(param, 'allreduce', True)
+        is_layer_wise_managed = getattr(param, 'is_layer_wise_distributed_optimizer', False)
 
-        key = BufferKey(param_dtype, grad_dtype, is_expert_parallel)
+        key = BufferKey(param_dtype, grad_dtype, is_expert_parallel, is_layer_wise_managed)
         param_list = key_to_params.get(key, [])
         param_list.append(param)
         key_to_params[key] = param_list
 
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
-        offset_key = BufferKey(param.dtype, grad_dtype, is_expert_parallel)
+        offset_key = BufferKey(param.dtype, grad_dtype, is_expert_parallel, is_layer_wise_managed)
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1
         indices = key_to_indices.get(key, [])
@@ -1498,11 +1499,16 @@ def partition_buckets(
     if len(buffers) == 0:
         return []
 
+    # ``dtype_to_buffer_map`` is only used in Case 3 below to find *the* fp8
+    # (uint8) buffer. Other dtypes can legitimately appear in multiple buffers
+    # (e.g. LayerWise-managed bf16 weights + Adam-managed bf16 biases live in
+    # separate buffers but share the bf16 ``param_dtype``), so the uniqueness
+    # check is restricted to uint8.
     dtype_to_buffer_map = {}
     for buffer in buffers:
         dtype = buffer.param_dtype
-        # Make sure that the param_dtype of any two buffers is different.
-        assert dtype not in dtype_to_buffer_map
+        if dtype == torch.uint8:
+            assert dtype not in dtype_to_buffer_map
         dtype_to_buffer_map[dtype] = buffer
 
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
