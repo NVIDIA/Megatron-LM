@@ -11,6 +11,12 @@ import builtins
 import ast
 import enum
 from dataclasses import Field, fields
+import warnings
+import torch.nn.functional as F
+import torch
+
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.spec_utils import import_module
 
 from megatron.training.config import (
     DistributedInitConfig, 
@@ -24,6 +30,7 @@ from megatron.training.config import (
     StragglerDetectionConfig,
     RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
 )
+from megatron.training.models.hybrid import HybridModelConfig
 # TODO: support arg renames
 
 class TypeInferenceError(Exception):
@@ -262,6 +269,108 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def core_transformer_config_from_args(args, config_class=None):
+    from megatron.core.activations import squared_relu
+    from megatron.core.fusions.fused_bias_geglu import quick_gelu
+    from megatron.core.transformer import MLATransformerConfig
+    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+        HeterogeneousTransformerConfig,
+    )
+    from megatron.core.quantization.utils import (
+        kitchen_quantization_recipe_config,
+        load_quantization_recipe,
+    )
+
+    # Config class.
+    config_class = config_class or TransformerConfig
+
+    if args.multi_latent_attention:
+        config_class = MLATransformerConfig
+
+    if args.heterogeneous_layers_config_path is not None:
+        assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
+        config_class = HeterogeneousTransformerConfig
+
+    # Translate args to core transformer configuration
+    kw_args = {}
+    for f in dataclasses.fields(config_class):
+        if hasattr(args, f.name):
+            kw_args[f.name] = getattr(args, f.name)
+    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    kw_args['num_moe_experts'] = args.num_experts
+    kw_args['rotary_interleaved'] = args.rotary_interleaved
+    kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
+    kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['fp8_param'] = args.fp8_param_gather
+    kw_args['fp4_param'] = args.fp4_param_gather
+    if args.swiglu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    else:
+        kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
+    if args.squared_relu:
+        assert not args.swiglu
+        kw_args['activation_func'] = squared_relu
+    elif args.quick_geglu:
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = quick_gelu
+    if args.init_method_xavier_uniform:
+        kw_args['init_method'] = torch.nn.init.xavier_uniform_
+        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    if args.group_query_attention:
+        kw_args['num_query_groups'] = args.num_query_groups
+    else:
+        kw_args['num_query_groups'] = None
+    kw_args['config_logger_dir'] = args.config_logger_dir
+    if args.rope_type is None:
+        # Pop 'rope_type' to let the config class use the default value.
+        kw_args.pop('rope_type', None)
+    else:
+        assert (args.multi_latent_attention or args.rope_type == 'rope'), (
+            f'Common attention only support rope_type="rope", but got {args.rope_type}.'
+        )
+
+    if len(args.cp_comm_type) == 1:
+        kw_args['cp_comm_type'] = args.cp_comm_type[0]
+    if args.hybrid_layer_pattern is not None:
+        kw_args['is_hybrid_model'] = True
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+            kw_args['experimental_attention_variant'] = 'dsa'
+
+    kw_args['inference_sampling_seed'] = args.seed
+
+    # handle quantization config
+    # NOTE: Kitchen arguments are only added to the namespace when
+    # Kitchen library is available.
+    if hasattr(args, "kitchen_config_file") and args.kitchen_config_file is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = load_quantization_recipe(args.kitchen_config_file)
+    elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
+
+    kw_args['moe_latent_size'] = args.moe_latent_size
+
+    if args.te_precision_config_file:
+        assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
+        # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
+        kw_args['quant_recipe'] = load_quantization_recipe(args.te_precision_config_file)
+
+    if hasattr(args, "use_kitchen_attention"):
+        kw_args['use_kitchen_attention'] = args.use_kitchen_attention
+    if hasattr(args, "kitchen_attention_backend"):
+        kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
+
+    # Return config.
+    return config_class(**kw_args)
+
+
 def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
     """Create a config dataclass from the appropriate values in the `args` Namespace.
 
@@ -278,9 +387,60 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
     else:
         return kwargs
 
-def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer:
+
+def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
+    """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
+
+    assert args.use_legacy_models is False, "Hybrid model only supported in Mcore!"
+
+    kwargs = {}
+    if config is None:
+        transformer_cfg = core_transformer_config_from_args(args)
+    else:
+        transformer_cfg = config
+    kwargs["transformer"] = transformer_cfg
+
+    if transformer_cfg.transformer_impl == "inference_optimized":
+        assert (
+            not transformer_cfg.inference_fuse_tp_communication
+        ), "inference_fuse_tp_communication is not supported for HybridModel"
+    elif args.spec is not None:
+        kwargs["hybrid_stack_spec"] = import_module(args.spec)
+
+
+    kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
+    kwargs["position_embedding_type"] = args.position_embedding_type
+    kwargs["rotary_percent"] = args.rotary_percent
+    kwargs["rotary_base"] = args.rotary_base
+    kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
+
+    kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
+    kwargs["seq_length"] = args.max_position_embeddings
+    kwargs["share_embeddings_and_output_weights"] = not args.untie_embeddings_and_output_weights
+
+    if args.padded_vocab_size is not None:
+        kwargs["vocab_size"] = args.padded_vocab_size
+    else:
+        # Megatron-Bridge uses an explicit setting "should_pad_vocab" so that 
+        # when converting model configs from HF, we can set a vocab size and disable padding. 
+        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        kwargs["vocab_size"] = args.vocab_size
+        kwargs["should_pad_vocab"] = True
+
+    return HybridModelConfig(**kwargs)
+
+
+def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
+
+    if model_cfg is None:
+        msg = """
+        It is recommended to use a ModelConfig (e.g. megatron.training.models.HybridModelConfig) instead
+        of a model builder/model provider function pointer.
+        """
+        warnings.warn(msg)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
     ckpt_kwargs["save_optim"] = not args.no_save_optim
@@ -302,6 +462,7 @@ def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer
     cfg = PretrainConfigContainer(
         train=_default_config_from_args(TrainingConfig, args),
         validation=_default_config_from_args(ValidationConfig, args),
+        model=model_cfg,
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
         ddp=ddp_config,
