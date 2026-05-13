@@ -920,6 +920,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_sampling_seed: int = 42
     """ Random seed to use for sampling during inference. """
 
+    inference_logits_dtype: torch.dtype = torch.float32
+    """ Dtype for logits during inference.  Float32 improves sampling stability
+    by reducing tie-breaking non-determinism in argmax/multinomial. """
+
     symmetric_ar_type: Optional[Literal['two_shot', "one_shot", "multimem_all_reduce"]] = None
     """What type of symmetric all reduce to use. The default is None
     which is no use of symmetric memory.

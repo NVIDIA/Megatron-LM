@@ -153,7 +153,7 @@ class TextGenerationController:
         self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
-        logits_dtype = self.inference_wrapped_model.config.params_dtype
+        logits_dtype = self.model_config.inference_logits_dtype
 
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
@@ -653,7 +653,7 @@ class TextGenerationController:
 
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape,
-                dtype=self.model_config.params_dtype,
+                dtype=self.model_config.inference_logits_dtype,
                 tensor=logits,
                 pp_group=self.pp_group,
             )
@@ -870,7 +870,7 @@ class TextGenerationController:
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/pp-broadcast")
                 mtp_logits_2d = broadcast_from_last_pipeline_stage(
                     [active_request_count, self.vocab_size],
-                    dtype=self.model_config.params_dtype,
+                    dtype=self.model_config.inference_logits_dtype,
                     tensor=mtp_logits_2d,
                     pp_group=self.pp_group,
                 )
@@ -2124,7 +2124,7 @@ class TextGenerationController:
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, self.vocab_size],
-                        dtype=self.model_config.params_dtype,
+                        dtype=self.model_config.inference_logits_dtype,
                         tensor=logits,
                         pp_group=self.pp_group,
                     )
