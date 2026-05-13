@@ -238,6 +238,22 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
                         packed_seq_params=node.chunk_state.packed_seq_params,
                         sequence_len_offset=node.chunk_state.sequence_len_offset,
                     )
+                    # _forward_attention returns the bias_dropout_add output which can be a
+                    # view tensor (the mlp_bda's add into the post-attention residual produces
+                    # a view from a fused/JIT kernel). Downstream cuBLAS matmuls — including
+                    # the terminal MLP/MoE's pre_mlp_layernorm and the next attention's QKV
+                    # projection in a multi-pre-layer group — pick algorithms based on input
+                    # strides; a view's non-canonical strides can lead to different algo
+                    # selection across processes and produce ~1e-5 bit drift on the forward
+                    # output. TransformerLayer's full forward() inserts this exact call at the
+                    # MLP exit (transformer_layer.py:895) for the same reason; the
+                    # _forward_attention shortcut here doesn't get that cleanup, so we add it
+                    # explicitly. Same idea as the make_viewless_tensor in _maybe_apply_final_norm.
+                    hidden_states = make_viewless_tensor(
+                        inp=hidden_states,
+                        requires_grad=hidden_states.requires_grad,
+                        keep_graph=True,
+                    )
                 else:
                     raise ValueError(
                         f"HybridStack overlap does not support layer type '{item_type}' before "
