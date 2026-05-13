@@ -785,13 +785,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
-        if self._deepep_v2_dispatcher:
-            # DeepEP V2 dispatch already produced the grouped per-expert layout the
-            # parent TEGroupedMLP forward consumes (rows ordered by local expert,
-            # boundaries given by tokens_per_expert).
-            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
-
-        # Lazily build concatenated weights on first forward (after checkpoint load)
+        # Lazily build concatenated weights on first forward (after checkpoint
+        # load). Must happen before the deepep_v2 branch — _deepep_v2_expand_forward
+        # reads self._fc1_weight / self._fc2_weight directly.
         if not self._concatenated_weights_built:
             w = self.linear_fc1.weight0
             if isinstance(w, MXFP8Tensor) or (
@@ -801,6 +797,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
             else:
                 self._build_concatenated_weights()
             self._concatenated_weights_built = True
+
+        if self._deepep_v2_dispatcher:
+            # DeepEP V2's expand-mode dispatch (used under CUDA graph capture)
+            # writes into a worst-case-padded recv buffer, so sum(tokens_per_expert)
+            # < input.shape[0]. TEGroupedMLP's internal torch.split requires exact
+            # size match and cannot consume the padding. _deepep_v2_expand_forward
+            # calls grouped_mm directly with offs extended to cover pad rows.
+            return self._deepep_v2_expand_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."

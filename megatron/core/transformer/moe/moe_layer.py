@@ -711,6 +711,32 @@ class MoELayer(BaseMoELayer):
                             "combine_ms": 0.0,
                             "step_count": 0,
                         }
+                        # Register an atexit summary so we get output even if
+                        # the periodic threshold is never crossed (short runs,
+                        # or runs where the inference engine wraps later
+                        # decode steps in captured graphs).
+                        import atexit as _atexit
+                        _dispatcher_name = self.config.inference_moe_token_dispatcher_type
+                        def _final_moe_timing_summary():
+                            if (
+                                torch.distributed.is_initialized()
+                                and torch.distributed.get_rank() == 0
+                                and _MOE_TIMING_ACC["step_count"] > 0
+                            ):
+                                _n = _MOE_TIMING_ACC["step_count"]
+                                _disp = _MOE_TIMING_ACC["dispatch_ms"] / _n
+                                _exp = _MOE_TIMING_ACC["experts_ms"] / _n
+                                _comb = _MOE_TIMING_ACC["combine_ms"] / _n
+                                _total = _disp + _exp + _comb
+                                print(
+                                    f"[moe timing final] dispatcher={_dispatcher_name} "
+                                    f"steps={_n} avg_dispatch={_disp:.3f}ms "
+                                    f"avg_experts={_exp:.3f}ms avg_combine={_comb:.3f}ms "
+                                    f"avg_total={_total:.3f}ms "
+                                    f"(experts_pct={_exp / max(_total, 1e-9) * 100:.1f}%)",
+                                    flush=True,
+                                )
+                        _atexit.register(_final_moe_timing_summary)
                     torch.cuda.synchronize(); _t0 = _time.perf_counter()
 
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
@@ -734,11 +760,13 @@ class MoELayer(BaseMoELayer):
                     torch.cuda.synchronize(); _t3 = _time.perf_counter()
                     _MOE_TIMING_ACC["combine_ms"] += (_t3 - _t2) * 1e3
                     _MOE_TIMING_ACC["step_count"] += 1
-                    # Log every 50 layer-2 visits on rank 0.
+                    # Log every 10 layer-2 visits on rank 0. Short runs may
+                    # never cross higher thresholds; the atexit handler also
+                    # prints a final summary regardless.
                     if (
                         torch.distributed.is_initialized()
                         and torch.distributed.get_rank() == 0
-                        and _MOE_TIMING_ACC["step_count"] % 50 == 0
+                        and _MOE_TIMING_ACC["step_count"] % 10 == 0
                     ):
                         _n = _MOE_TIMING_ACC["step_count"]
                         _disp = _MOE_TIMING_ACC["dispatch_ms"] / _n
