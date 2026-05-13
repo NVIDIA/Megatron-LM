@@ -379,11 +379,16 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                 all_updates.append((p, pre_ns_grad, needs_gather, lr, group_kwargs))
 
         # Phase 2: AG all boundary gradients.
-        for i, (p, pre_ns_grad, needs_gather, lr, group_kwargs) in enumerate(all_updates):
-            if not needs_gather:
-                continue
-            full_pre_ns_grad = self._gather_full_uneven_local_tensor_like(p, pre_ns_grad)
-            all_updates[i] = (p, full_pre_ns_grad, True, lr, group_kwargs)
+        boundary_update_indices = [
+            i for i, (_, _, needs_gather, _, _) in enumerate(all_updates) if needs_gather
+        ]
+        if boundary_update_indices:
+            gathered_boundary_updates = self._gather_full_uneven_local_tensors_like(
+                [(all_updates[i][0], all_updates[i][1]) for i in boundary_update_indices]
+            )
+            for i, full_pre_ns_grad in zip(boundary_update_indices, gathered_boundary_updates):
+                p, _, _, lr, group_kwargs = all_updates[i]
+                all_updates[i] = (p, full_pre_ns_grad, True, lr, group_kwargs)
 
         # Phase 3: NS orthogonalization and weight update (fully local).
         from emerging_optimizers import utils
@@ -391,6 +396,8 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         with utils.fp32_matmul_precision(self.fp32_matmul_prec):
             for p, pre_ns_grad, is_gathered, lr, group_kwargs in all_updates:
                 if is_gathered:
+                    if pre_ns_grad is None:
+                        continue
                     orth_update = super(FSDPTensorParallelMuon, self).orthogonalize(
                         p, pre_ns_grad, **group_kwargs
                     )
@@ -572,6 +579,116 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
 
         _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
         return full_tensor
+
+    def _gather_full_uneven_local_tensors_like(
+        self, items: list[tuple[torch.Tensor, torch.Tensor]]
+    ) -> list[torch.Tensor | None]:
+        """Batch uneven gathers for boundary tensors.
+
+        Each boundary parameter still needs the same logical data as
+        `_gather_full_uneven_local_tensor_like`. Batching concatenates local
+        shards with the same dtype/device/group so the optimizer issues one
+        all-gather per batch instead of one all-gather per boundary parameter.
+        Ranks with empty local shards participate in the collective but do not
+        reconstruct or orthogonalize the full boundary tensor.
+        """
+        results: list[torch.Tensor | None] = [None] * len(items)
+        batches: dict[tuple[int, torch.dtype, torch.device], Dict[str, Any]] = {}
+
+        for item_idx, (dtensor_ref, local_tensor) in enumerate(items):
+            plan = self._get_uneven_gather_plan(dtensor_ref)
+            if plan is None:
+                results[item_idx] = self._gather_full_uneven_local_tensor_like(
+                    dtensor_ref, local_tensor
+                )
+                continue
+
+            key = (id(plan["shard_group"]), local_tensor.dtype, local_tensor.device)
+            batch = batches.setdefault(
+                key,
+                {
+                    "shard_group": plan["shard_group"],
+                    "dtype": local_tensor.dtype,
+                    "device": local_tensor.device,
+                    "item_indices": [],
+                    "plans": [],
+                },
+            )
+            batch["item_indices"].append(item_idx)
+            batch["plans"].append(plan)
+
+        for batch in batches.values():
+            self._gather_full_uneven_local_tensor_batch(items, results, batch)
+
+        return results
+
+    def _gather_full_uneven_local_tensor_batch(
+        self,
+        items: list[tuple[torch.Tensor, torch.Tensor]],
+        results: list[torch.Tensor | None],
+        batch: Dict[str, Any],
+    ) -> None:
+        shard_group = batch["shard_group"]
+        group_size = get_pg_size(shard_group)
+        group_rank = torch.distributed.get_rank(shard_group)
+        item_indices = batch["item_indices"]
+        plans = batch["plans"]
+
+        local_chunks = [items[item_idx][1].contiguous().view(-1) for item_idx in item_indices]
+        local_buffer = (
+            torch.cat(local_chunks)
+            if local_chunks and sum(chunk.numel() for chunk in local_chunks) > 0
+            else torch.empty(0, dtype=batch["dtype"], device=batch["device"])
+        )
+        expected_local_numel = sum(plan["chunk_infos"][group_rank]["numel"] for plan in plans)
+        if local_buffer.numel() != expected_local_numel:
+            raise AssertionError(
+                "Batched uneven DTensor gather local buffer size mismatch: "
+                f"got {local_buffer.numel()}, expected {expected_local_numel}."
+            )
+
+        rank_offsets: list[list[int]] = []
+        rank_total_numels: list[int] = []
+        for rank in range(group_size):
+            offsets = []
+            total_numel = 0
+            for plan in plans:
+                offsets.append(total_numel)
+                total_numel += plan["chunk_infos"][rank]["numel"]
+            rank_offsets.append(offsets)
+            rank_total_numels.append(total_numel)
+
+        group_tensors = [
+            torch.empty(total_numel, dtype=batch["dtype"], device=batch["device"])
+            for total_numel in rank_total_numels
+        ]
+        torch.distributed.all_gather(group_tensors, local_buffer, group=shard_group)
+
+        for batch_item_idx, item_idx in enumerate(item_indices):
+            dtensor_ref, local_tensor = items[item_idx]
+            if local_tensor.numel() == 0:
+                results[item_idx] = None
+                continue
+
+            full_tensor = torch.empty(
+                dtensor_ref.shape, dtype=local_tensor.dtype, device=local_tensor.device
+            )
+            assigned_numel = 0
+            plan = plans[batch_item_idx]
+            for rank, gathered_rank_tensor in enumerate(group_tensors):
+                chunk_info = plan["chunk_infos"][rank]
+                chunk_numel = chunk_info["numel"]
+                if chunk_numel == 0:
+                    continue
+                offset = rank_offsets[rank][batch_item_idx]
+                chunk_shape = chunk_info["shape"]
+                chunk_tensor = gathered_rank_tensor[offset : offset + chunk_numel].view(chunk_shape)
+                slices = tuple(slice(o, o + s) for o, s in zip(chunk_info["offset"], chunk_shape))
+                full_tensor[slices] = chunk_tensor
+                assigned_numel += chunk_numel
+
+            _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
+            results[item_idx] = full_tensor
 
     def _local_shard_from_full_update_like(self, dtensor_ref, full_update: torch.Tensor):
         if not hasattr(dtensor_ref._local_tensor, "__create_chunk_list__"):

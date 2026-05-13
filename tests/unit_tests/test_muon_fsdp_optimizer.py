@@ -202,17 +202,17 @@ class TestFSDPTensorParallelMuon:
                 g1.shape
             ), "boundary param grad should be unevenly sharded (local != global shape)"
 
-        real_gather = optimizer._gather_full_uneven_local_tensor_like
-        gather_shapes = []
+        real_gather = optimizer._gather_full_uneven_local_tensors_like
+        gather_batches = []
 
-        def counting_gather(value, local_tensor):
-            gather_shapes.append(tuple(value.shape))
-            return real_gather(value, local_tensor)
+        def counting_gather(items):
+            gather_batches.append([tuple(value.shape) for value, _ in items])
+            return real_gather(items)
 
-        with patch.object(optimizer, "_gather_full_uneven_local_tensor_like", counting_gather):
+        with patch.object(optimizer, "_gather_full_uneven_local_tensors_like", counting_gather):
             optimizer.step()
 
-        assert gather_shapes == [(6, cols)]
+        assert gather_batches == [[(6, cols)]]
 
         # Post-step: momentum buffers are DTensors in optimizer state.
         for idx, (param, plan) in enumerate(zip(params, plans)):
@@ -298,19 +298,63 @@ class TestFSDPTensorParallelMuon:
 
         optimizer = _make_fsdp_muon(params, dp_group=dp_group)
 
-        real_gather = optimizer._gather_full_uneven_local_tensor_like
+        real_gather = optimizer._gather_full_uneven_local_tensors_like
         gather_calls = []
 
-        def counting_gather(value, local_tensor):
-            gather_calls.append(tuple(value.shape))
-            return real_gather(value, local_tensor)
+        def counting_gather(items):
+            gather_calls.append([tuple(value.shape) for value, _ in items])
+            return real_gather(items)
 
-        with patch.object(optimizer, "_gather_full_uneven_local_tensor_like", counting_gather):
+        with patch.object(optimizer, "_gather_full_uneven_local_tensors_like", counting_gather):
             optimizer.step()
 
         assert (
             gather_calls == []
         ), f"Expected no all-gathers for fully-local params, got {gather_calls}"
+
+    def test_step_batches_multiple_split_boundary_params(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plans = [{0: 2, 1: 2}, {0: 4}, {0: 3, 1: 1}]
+        full_params = [
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) / 100
+            for rows in (4, 4, 4)
+        ]
+        full_grads = [
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) / 50
+            + 0.1
+            for rows in (4, 4, 4)
+        ]
+
+        params = []
+        for full_param, plan in zip(full_params, plans):
+            local_param = _local_slice(full_param, plan, dp_rank).contiguous()
+            params.append(nn.Parameter(_make_dtensor(local_param, full_param.shape, device_mesh)))
+
+        for param, full_grad, plan in zip(params, full_grads, plans):
+            local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+            param.grad = _make_dtensor(local_grad, full_grad.shape, device_mesh)
+
+        optimizer = _make_fsdp_muon(params, dp_group=dp_group)
+        assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0, 2}
+
+        real_gather = optimizer._gather_full_uneven_local_tensors_like
+        gather_batches = []
+
+        def counting_gather(items):
+            gather_batches.append([tuple(value.shape) for value, _ in items])
+            return real_gather(items)
+
+        with patch.object(optimizer, "_gather_full_uneven_local_tensors_like", counting_gather):
+            optimizer.step()
+
+        assert gather_batches == [[(4, cols), (4, cols)]]
 
     def test_boundary_metadata_collectives_are_cached_across_steps(self):
         from torch.distributed.device_mesh import init_device_mesh
