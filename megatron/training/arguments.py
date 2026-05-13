@@ -1797,10 +1797,6 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '
                        'See TransformerEngineMixedPrecision.md')
-    group.add_argument('--use-transformer-engine-op-fuser', action='store_true',
-                       help='Use Transformer Engine\'s op-based fused implementation for '
-                       'supported MLP/MoE paths (TEFusedMLP for dense, fused TEGroupedMLP '
-                       'for MoE). Mirrors TransformerConfig.use_transformer_engine_op_fuser.')
     return parser
 
 def _add_inference_args(parser):

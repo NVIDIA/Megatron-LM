@@ -564,60 +564,6 @@ def test_backward_dw_falls_back_to_wrappers_when_delay_wgrad_off():
     assert module.linear_fc2.backward_dw_calls == 1
 
 
-@pytest.mark.parametrize(
-    ("dispatcher_type", "flex_backend", "expected"),
-    [
-        ("flex", "hybridep", False),  # the silent-fallback case we're guarding
-        ("flex", "deepep", True),
-        ("alltoall", None, True),
-    ],
-)
-def test_is_fused_impl_supported_rejects_hybridep_dispatcher(
-    monkeypatch, dispatcher_type, flex_backend, expected
-):
-    """Megatron must not hand off to TE's fused op-fuser path under the HybridEP
-    dispatcher: TE silently falls back to basic-op and the differing size
-    contract crashes downstream. Other dispatchers are unaffected."""
-
-    class FakeGroupedLinear(torch.nn.Module):
-        pass
-
-    fake_ops_mod = SimpleNamespace(
-        GroupedLinear=FakeGroupedLinear, ScaledSwiGLU=object, ScaledClampedQGeGLU=object
-    )
-    fake_pytorch_mod = SimpleNamespace(GroupedLinear=FakeGroupedLinear, ops=fake_ops_mod)
-    fake_te = SimpleNamespace(pytorch=fake_pytorch_mod)
-
-    # Bypass TE-installation checks so we reach the HybridEP guard
-    monkeypatch.setattr(experts_module, "HAVE_TE", True)
-    monkeypatch.setattr(experts_module, "is_te_min_version", lambda *_a, **_kw: True)
-    monkeypatch.setattr(experts_module, "te", fake_te)
-    # `_is_fused_impl_supported` does `from transformer_engine.pytorch.ops import ...`
-    # which we satisfy via sys.modules.
-    import sys
-
-    monkeypatch.setitem(sys.modules, "transformer_engine", fake_te)
-    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", fake_pytorch_mod)
-    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.ops", fake_ops_mod)
-
-    module = TEGroupedMLP.__new__(TEGroupedMLP)
-    torch.nn.Module.__init__(module)
-    module.config = SimpleNamespace(
-        moe_token_dispatcher_type=dispatcher_type,
-        moe_flex_dispatcher_backend=flex_backend,
-        moe_apply_probs_on_input=False,
-        gated_linear_unit=True,
-    )
-    module.tp_group = SimpleNamespace(size=lambda: 1)
-    module.offload_expert_fc1 = False
-    module.offload_moe_act = False
-    module.linear_fc1 = FakeGroupedLinear()
-    module.linear_fc2 = FakeGroupedLinear()
-    module.activation_func = F.silu
-
-    assert module._is_fused_impl_supported() is expected
-
-
 @pytest.mark.skipif(
     not is_te_min_version("1.9.0.dev0"),
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",

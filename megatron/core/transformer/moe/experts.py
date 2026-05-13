@@ -316,15 +316,6 @@ class TEGroupedMLP(MegatronModule):
             return False  # Fine-grained activation offloading is not supported
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
-        # HybridEP pre-pads the token layout; TE's op-fuser uses a different size
-        # contract and its internal fusion pass silently falls back to basic-op
-        # under HybridEP, then downstream code crashes on the mismatch. Reject the
-        # fused path here until TE's fused path supports the HybridEP layout.
-        if (
-            self.config.moe_token_dispatcher_type == "flex"
-            and self.config.moe_flex_dispatcher_backend == "hybridep"
-        ):
-            return False
 
         # Check grouped linear modules
         if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
