@@ -536,11 +536,7 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        if (
-            self.config.enable_hyper_connections
-            and self.pre_process
-            and not self.skip_input_expand
-        ):
+        if self.config.enable_hyper_connections and self.pre_process and not self.skip_input_expand:
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.config.num_residual_streams
             )
@@ -664,11 +660,7 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         # ``MultiTokenPredictionLayer._postprocess`` can run its per-depth
         # learned contraction.
         mhc_multistream = None
-        if (
-            self.config.enable_hyper_connections
-            and self.post_process
-            and self.post_layer_norm
-        ):
+        if self.config.enable_hyper_connections and self.post_process and self.post_layer_norm:
             if self.config.mtp_num_layers is not None:
                 mhc_multistream = hidden_states
             # DSv4 introduced the new learned output contraction for mHC.
