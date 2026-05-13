@@ -258,6 +258,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "mp_policy": fully_shard_mp_policy,
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
+            "enable_trace_pool": ddp_config.fsdp_double_buffer,
         }
         if config.calculate_per_token_loss:
             gradient_scaling_factor = None

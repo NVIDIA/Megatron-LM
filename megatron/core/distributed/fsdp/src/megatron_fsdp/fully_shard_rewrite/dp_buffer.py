@@ -528,7 +528,9 @@ class DataParallelBuffer:
             prescale = True
 
         if not self.is_distributed:
-            comm_data = self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
+            comm_data = (
+                self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
+            )
             if prescale:
                 comm_data.mul_(self.gradient_scaling_factor)
             torch.distributed.all_reduce(comm_data, group=self.dp_group, op=op)

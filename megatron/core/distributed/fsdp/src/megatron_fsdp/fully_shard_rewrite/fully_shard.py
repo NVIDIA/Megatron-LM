@@ -39,6 +39,7 @@ def fully_shard(
     enable_unshard_prefetch: bool = True,
     enable_async_reduce_grad: bool = True,
     gradient_scaling_factor: Optional[float] = None,
+    enable_trace_pool: bool = False,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -71,6 +72,7 @@ def fully_shard(
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
         enable_async_reduce_grad=enable_async_reduce_grad,
+        enable_trace_pool=enable_trace_pool,
     )
     module._init_param_main_grad_func()
 

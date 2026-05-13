@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
+from .allocator import TracePoolAllocator
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
 
@@ -28,6 +29,9 @@ def _register_forward_hook(module: FSDPModule):
     """Register post-forward hook to reshard parameters."""
 
     def reshard_param_groups(module, *unused):
+        ctx = module._fsdp_root_context
+        if ctx.backward_phase and id(module) == ctx.backward_module:
+            return
         module.reshard()
 
     module._mfsdp_forward_hook = module.register_forward_hook(reshard_param_groups)
@@ -68,6 +72,10 @@ def _register_backward_pre_hook(module: FSDPModule):
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
         ctx = module._fsdp_root_context
+        if module._fsdp_state._is_root:
+            ctx.backward_done_modules.clear()
+            ctx.backward_phase = True
+            ctx._advance_backward_module()
         setattr(module, "post_backward_issued", False)
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
@@ -92,6 +100,8 @@ def _register_backward_hook(module: FSDPModule):
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
         ctx = module._fsdp_root_context
+        ctx.backward_done_modules.add(id(module))
+        ctx._advance_backward_module()
         module.reshard()
         module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         module.post_backward_issued = True
@@ -178,6 +188,36 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
                 param_group.release_grad_buffer()
         torch.cuda.current_stream().wait_stream(stream)
         root_state._post_backward_callback_queued = False
+        ctx.backward_phase = False
+        ctx.backward_module = None
+        ctx.backward_done_modules.clear()
+
+        # After the first backward pass, we have the full trace of bucket allocations
+        # and releases. We can now plan the memory pool based on this trace.
+        if isinstance(ctx.weight_bucket_allocator, TracePoolAllocator):
+            wbuf_alloc = ctx.weight_bucket_allocator
+            if wbuf_alloc.phase == "trace":
+                if torch.distributed.get_rank() == 0:
+                    print(wbuf_alloc.dump_trace())
+                wbuf_alloc.plan()
+            elif wbuf_alloc.phase == "optimized":
+                wbuf_alloc.reset_cursor()
+            else:
+                raise ValueError(
+                    f"Unexpected weight bucket allocator phase: {wbuf_alloc.phase}"
+                )
+        if isinstance(ctx.grad_bucket_allocator, TracePoolAllocator):
+            gbuf_alloc = ctx.grad_bucket_allocator
+            if gbuf_alloc.phase == "trace":
+                if torch.distributed.get_rank() == 0:
+                    print(gbuf_alloc.dump_trace())
+                gbuf_alloc.plan()
+            elif gbuf_alloc.phase == "optimized":
+                gbuf_alloc.reset_cursor()
+            else:
+                raise ValueError(
+                    f"Unexpected grad bucket allocator phase: {gbuf_alloc.phase}"
+                )
 
     state._post_backward_callback_queued = True
     Variable._execution_engine.queue_callback(
