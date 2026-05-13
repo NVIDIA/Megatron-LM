@@ -25,7 +25,6 @@ Index storage optimization:
 """
 
 import concurrent.futures
-import glob
 import hashlib
 import io
 import json
@@ -47,10 +46,18 @@ except ImportError:
   zstandard = None
 
 from megatron.core import parallel_state
-from megatron.core.msc_utils import open_file
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
 from megatron.training.utils import get_blend_and_blend_per_split, print_rank_0
+from megatron.training.utils_logits import (
+    is_remote_storage_path,
+    open_logit_file,
+    storage_dirname,
+    storage_glob,
+    storage_join,
+    storage_makedirs,
+    storage_move,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -745,8 +752,8 @@ class LogitsSaverHooks:
             folder, filename = _format_folder_and_filename(
                 self.save_dir, iteration, self.tp_rank, self.cp_rank, self.dp_rank, entry_suffix
             )
-            os.makedirs(folder, exist_ok=True)
-            with open_file(os.path.join(folder, filename), "wb") as f:
+            storage_makedirs(folder, exist_ok=True)
+            with open_logit_file(os.path.join(folder, filename), "wb") as f:
                 f.write(data)
         else:
             # Batched: accumulate in memory, flush when the iteration
@@ -776,7 +783,7 @@ class LogitsSaverHooks:
         tar_filename = _batched_tar_filename(
             self.cp_rank, self.dp_rank, last_iter,
         )
-        tar_path = os.path.join(self.save_dir, tar_filename)
+        tar_path = storage_join(self.save_dir, tar_filename)
 
         future = self._flush_executor.submit(
             LogitsSaverHooks._write_batched_tar, tar_path, writes, self._meta_bytes,
@@ -802,16 +809,21 @@ class LogitsSaverHooks:
         WebDataset groups them as individual samples keyed by iteration
         number.
         """
-        with tarfile.open(tar_path, "w") as tar:
-            info = tarfile.TarInfo(name=META_TAR_MEMBER)
-            info.size = len(meta_bytes)
-            tar.addfile(info, io.BytesIO(meta_bytes))
+        storage_makedirs(storage_dirname(tar_path), exist_ok=True)
+        write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"
+        with open_logit_file(write_path, "wb") as stream:
+            with tarfile.open(fileobj=stream, mode="w") as tar:
+                info = tarfile.TarInfo(name=META_TAR_MEMBER)
+                info.size = len(meta_bytes)
+                tar.addfile(info, io.BytesIO(meta_bytes))
 
-            for iteration, (data, entry_suffix) in writes.items():
-                member_name = f"{iteration}{entry_suffix}"
-                info = tarfile.TarInfo(name=member_name)
-                info.size = len(data)
-                tar.addfile(info, io.BytesIO(data))
+                for iteration, (data, entry_suffix) in writes.items():
+                    member_name = f"{iteration}{entry_suffix}"
+                    info = tarfile.TarInfo(name=member_name)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+        if write_path != tar_path:
+            storage_move(write_path, tar_path)
 
     def _wait_for_pending_flushes(self) -> None:
         """Block until all background flush futures have completed."""
@@ -862,7 +874,7 @@ def _read_logprobs_data(folder: str, base_filename: str) -> Optional[bytes]:
             path = os.path.join(folder, name)
             if not os.path.exists(path):
                 return None
-            with open_file(path, 'rb') as f:
+            with open_logit_file(path, 'rb') as f:
                 return f.read()
 
     elif os.path.isfile(tar_path):
@@ -896,17 +908,17 @@ def _read_from_batched_tar(
 ) -> Optional[bytes]:
     """Read a single iteration's data from a batched tar archive.
 
-    Supports both legacy TP-sharded tars (``tp{T}_cp{C}_dp{D}__{B}.tar``)
-    and unsharded tars (``cp{C}_dp{D}__{B}.tar``).  Tries unsharded first,
-    then falls back to sharded.
+    Supports the current unsharded tars (``cp{C}_dp{D}__{B}.tar``).
+    For local filesystems, legacy TP-sharded tars are still tried as a
+    fallback; remote MSC paths intentionally use only the current layout.
     """
-    # Try unsharded format first (current), then legacy TP-sharded.
-    for prefix in (
-        _batched_tar_prefix(cp_rank, dp_rank),
-        _batched_tar_prefix(cp_rank, dp_rank, tp_rank=tp_rank),
-    ):
-        pattern = os.path.join(save_dir, f"{prefix}*.tar")
-        for tar_path in _sorted_batched_tars(glob.glob(pattern)):
+    prefixes = [_batched_tar_prefix(cp_rank, dp_rank)]
+    if not is_remote_storage_path(save_dir):
+        prefixes.append(_batched_tar_prefix(cp_rank, dp_rank, tp_rank=tp_rank))
+
+    for prefix in prefixes:
+        pattern = storage_join(save_dir, f"{prefix}*.tar")
+        for tar_path in _sorted_batched_tars(storage_glob(pattern)):
             basename = os.path.basename(tar_path)
             m = _BATCHED_TAR_RE.match(basename)
             if not m:
@@ -914,16 +926,17 @@ def _read_from_batched_tar(
             if int(m.group("iter")) < iteration:
                 continue
             try:
-                with tarfile.open(tar_path, "r") as tar:
-                    for suffix in (".pt.zst", ".pt"):
-                        member_name = f"{iteration}{suffix}"
-                        try:
-                            member = tar.extractfile(member_name)
-                            if member is not None:
-                                raw = member.read()
-                                return _decompress_zstd(raw) if suffix == ".pt.zst" else raw
-                        except KeyError:
-                            continue
+                with open_logit_file(tar_path, "rb", prefetch_file=True) as stream:
+                    with tarfile.open(fileobj=stream, mode="r:*") as tar:
+                        for suffix in (".pt.zst", ".pt"):
+                            member_name = f"{iteration}{suffix}"
+                            try:
+                                member = tar.extractfile(member_name)
+                                if member is not None:
+                                    raw = member.read()
+                                    return _decompress_zstd(raw) if suffix == ".pt.zst" else raw
+                            except KeyError:
+                                continue
             except (tarfile.TarError, OSError):
                 continue
     return None

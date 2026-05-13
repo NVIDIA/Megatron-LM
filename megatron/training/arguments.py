@@ -2385,6 +2385,10 @@ def _add_logging_args(parser):
                        help='Number of workers for loading logits.')
     group.add_argument('--logits-load-prefetch-factor', type=int, default=4,
                        help='Prefetch factor for loading logits.')
+    group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
+                       help='For MSC/object-storage logits tar shards, number '
+                            'of whole tar shards to prefetch into the MSC '
+                            'cache ahead of WebDataset consumption.')
     group.add_argument('--logits-load-kd-loss-alpha', type=float, default=0.65,
                        help='KD loss alpha for loading logits.')
     group.add_argument('--logits-load-ignore-errors', action='store_true',

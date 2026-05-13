@@ -60,7 +60,6 @@ Usage example
 
 import concurrent.futures
 import functools
-import glob
 import logging
 import os
 import re
@@ -91,6 +90,14 @@ from megatron.training.logits_saver import (
   load_log_probs_by_rank,
 )
 from megatron.training.utils import print_rank_0
+from megatron.training.utils_logits import (
+  TarShardPrefetcher,
+  is_remote_storage_path,
+  register_msc_webdataset_handler,
+  storage_basename,
+  storage_glob,
+  storage_join,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +109,12 @@ def _detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
     ``max(D) + 1``, or ``None`` if no batched tars are found.
     """
     dp_ranks_found: set[int] = set()
-    for fname in os.listdir(logprobs_dir):
+    remote_logprobs = is_remote_storage_path(logprobs_dir)
+    for path in storage_glob(storage_join(logprobs_dir, "*.tar")):
+        fname = storage_basename(path)
         if m := _BATCHED_TAR_RE.match(fname):
+            if remote_logprobs and m.group("tp") is not None:
+                continue
             dp_ranks_found.add(int(m.group("dp")))
     if not dp_ranks_found:
         return None
@@ -266,6 +277,7 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         start_iteration: int = 0,
         decode_threads: int = 1,
         decode_lookahead: Optional[int] = None,
+        msc_prefetch_depth: int = 2,
     ):
         if wds is None:
             raise ImportError("The 'webdataset' package is required for _TeacherWebDataset.")
@@ -276,6 +288,9 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         self.dp_rank = dp_rank
         self.start_iteration = start_iteration
 
+        self._remote_logprobs = is_remote_storage_path(logprobs_dir)
+        self._msc_prefetch_depth = max(0, msc_prefetch_depth)
+
         # Per-tar dataset-identity verification: pass the student-side
         # hash into every decode_logprobs_sample call so it raises
         # RuntimeError when a tar's _meta.json hash doesn't match.
@@ -285,14 +300,19 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
             expected_hash=student_hash,
         )
 
-        self._decode_threads = max(1, int(decode_threads))
+        self._decode_threads = max(1, decode_threads)
         if decode_lookahead is None:
             decode_lookahead = max(2 * self._decode_threads, 4)
-        self._decode_lookahead = max(1, int(decode_lookahead))
+        self._decode_lookahead = max(1, decode_lookahead)
         if self._decode_threads > 1:
             print_rank_0(
                 f"Teacher logits decode: using {self._decode_threads} decode threads "
                 f"(lookahead={self._decode_lookahead}) in the WebDataset loader worker"
+            )
+        if self._remote_logprobs and self._msc_prefetch_depth > 0:
+            print_rank_0(
+                f"Teacher logits remote tar prefetch: {self._msc_prefetch_depth} "
+                "shard(s) ahead"
             )
 
         # DP remapping: detect saved DP size and compute mapping
@@ -313,25 +333,25 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
             )
 
     def _discover_shards(self, already_processed: set, dp_rank: int) -> list:
-        """Glob for new shards (unsharded first, then legacy sharded).
+        """Glob for new shards (current unsharded layout for remote paths).
 
         Args:
             already_processed: Set of URLs already processed (to skip).
             dp_rank: Saved DP rank to discover shards for.
         """
-        # Prefer unsharded tars; fall back to legacy TP-sharded.
-        for prefix in (
-            _batched_tar_prefix(self.cp_rank, dp_rank),
-            _batched_tar_prefix(self.cp_rank, dp_rank, tp_rank=self.tp_rank),
-        ):
+        prefixes = [_batched_tar_prefix(self.cp_rank, dp_rank)]
+        if not self._remote_logprobs:
+            prefixes.append(_batched_tar_prefix(self.cp_rank, dp_rank, tp_rank=self.tp_rank))
+
+        for prefix in prefixes:
             all_urls = _sorted_batched_tars(
-                glob.glob(os.path.join(self.logprobs_dir, f"{prefix}*.tar"))
+                storage_glob(storage_join(self.logprobs_dir, f"{prefix}*.tar"))
             )
             new_urls = []
             for url in all_urls:
                 if url in already_processed:
                     continue
-                m = _BATCHED_TAR_RE.match(os.path.basename(url))
+                m = _BATCHED_TAR_RE.match(storage_basename(url))
                 if m and int(m.group("iter")) >= self.start_iteration:
                     new_urls.append(url)
             if new_urls:
@@ -390,10 +410,10 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         dp_ranks = self._source_dp_ranks
         if len(dp_ranks) == 1:
             dp = dp_ranks[0]
+            legacy_hint = "" if self._remote_logprobs else f" (or tp{self.tp_rank}_cp{self.cp_rank}_dp{dp})"
             return FileNotFoundError(
                 f"No batched tar shards for "
-                f"cp{self.cp_rank}_dp{dp} (or "
-                f"tp{self.tp_rank}_cp{self.cp_rank}_dp{dp}) "
+                f"cp{self.cp_rank}_dp{dp}{legacy_hint} "
                 f"found at or after iteration {self.start_iteration} "
                 f"in '{self.logprobs_dir}'"
             )
@@ -404,7 +424,11 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
             f"in '{self.logprobs_dir}'"
         )
 
-    def _shard_pipelines(self, processed: set) -> Iterator[List]:
+    def _shard_pipelines(
+        self,
+        processed: set,
+        prefetcher: TarShardPrefetcher,
+    ) -> Iterator[List]:
         """Yield lists of WebDataset pipelines as new shards are discovered.
 
         Each yielded list has one pipeline per source DP rank.  Handles
@@ -422,12 +446,13 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
                 if not processed:
                     raise self._not_found_error()
                 return
-            for urls in urls_per_src:
-                processed.update(urls)
-            yield [
-                wds.WebDataset(urls, nodesplitter=lambda urls: urls, shardshuffle=False)
-                for urls in urls_per_src
-            ]
+            groups = list(zip(*urls_per_src))
+            for group in prefetcher.iter_prefetched(groups):
+                processed.update(group)
+                yield [
+                    wds.WebDataset([url], nodesplitter=lambda urls: urls, shardshuffle=False)
+                    for url in group
+                ]
 
     # ------------------------------------------------------------------
     #  Pipeline iteration helpers (serial and multi-threaded)
@@ -572,23 +597,32 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         processed: set = set()
+        if self._remote_logprobs:
+            # DataLoader workers may use spawn/forkserver, so register the
+            # WebDataset opener in the process that actually consumes shards.
+            register_msc_webdataset_handler(wds)
 
-        if self._decode_threads == 1:
-            for pipelines in self._shard_pipelines(processed):
-                if len(self._source_dp_ranks) > 1:
-                    yield from self._iter_zipped_serial(pipelines)
-                else:
-                    yield from self._iter_pipeline_serial(pipelines[0])
-        else:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=self._decode_threads,
-                thread_name_prefix="teacher-decode",
-            ) as pool:
-                for pipelines in self._shard_pipelines(processed):
+        with TarShardPrefetcher(
+            enabled=self._remote_logprobs,
+            depth=self._msc_prefetch_depth,
+            max_workers=max(1, self._msc_prefetch_depth * len(self._source_dp_ranks)),
+        ) as prefetcher:
+            if self._decode_threads == 1:
+                for pipelines in self._shard_pipelines(processed, prefetcher):
                     if len(self._source_dp_ranks) > 1:
-                        yield from self._iter_zipped_parallel(pool, pipelines)
+                        yield from self._iter_zipped_serial(pipelines)
                     else:
-                        yield from self._iter_pipeline_parallel(pool, pipelines[0])
+                        yield from self._iter_pipeline_serial(pipelines[0])
+            else:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self._decode_threads,
+                    thread_name_prefix="teacher-decode",
+                ) as pool:
+                    for pipelines in self._shard_pipelines(processed, prefetcher):
+                        if len(self._source_dp_ranks) > 1:
+                            yield from self._iter_zipped_parallel(pool, pipelines)
+                        else:
+                            yield from self._iter_pipeline_parallel(pool, pipelines[0])
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +729,9 @@ class CachedLogitsKDLoss:
             ``torch.load`` across in-flight samples.
         prefetch_factor: How many iterations each DataLoader worker
             pre-loads ahead (ignored when ``num_workers == 0``).
+        msc_prefetch_depth: For remote MSC tar shards, how many whole
+            shard objects to materialize into the MSC cache ahead of
+            WebDataset consumption.
     """
 
     def __init__(
@@ -702,10 +739,12 @@ class CachedLogitsKDLoss:
         logprobs_dir: str,
         num_workers: int = 1,
         prefetch_factor: int = 2,
+        msc_prefetch_depth: int = 2,
     ):
         self.logprobs_dir = logprobs_dir
         self._num_workers = num_workers
         self._prefetch_factor = prefetch_factor
+        self._msc_prefetch_depth = msc_prefetch_depth
 
         # ---- parallel-state bookkeeping ----
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -737,14 +776,20 @@ class CachedLogitsKDLoss:
         Returns:
             ``(use_webdataset, teacher_is_sharded)``.
         """
-        for fname in os.listdir(self.logprobs_dir):
+        remote_logprobs = is_remote_storage_path(self.logprobs_dir)
+        for path in storage_glob(storage_join(self.logprobs_dir, "*.tar")):
+            fname = storage_basename(path)
             m = _BATCHED_TAR_RE.match(fname)
             if not m:
+                continue
+            if remote_logprobs and m.group("tp") is not None:
                 continue
             if m.group("tp") is not None:
                 return True, True
             else:
                 return True, False
+        if remote_logprobs:
+            return True, False  # remote paths only support current batched tars
         return False, True  # map-style fallback ⇒ legacy sharded
 
     def _init_dataloader(self, start_iteration: int) -> None:
@@ -758,6 +803,7 @@ class CachedLogitsKDLoss:
                 self.dp_size,
                 start_iteration=start_iteration,
                 decode_threads=self._num_workers,
+                msc_prefetch_depth=self._msc_prefetch_depth,
             )
             sampler = None
         else:
@@ -892,10 +938,12 @@ class LossFuncCallable:
         prefetch_factor: int = 2,
         kd_loss_alpha: float = 0.5,
         ignore_errors: bool = False,
+        msc_prefetch_depth: int = 2,
     ):
         self.logprobs_dir = logprobs_dir
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
+        self.msc_prefetch_depth = msc_prefetch_depth
         self.kd_func = None
         self.alpha = kd_loss_alpha
         self.ignore_errors = ignore_errors
@@ -921,6 +969,7 @@ class LossFuncCallable:
                 logprobs_dir=self.logprobs_dir,
                 num_workers=self.num_workers,
                 prefetch_factor=self.prefetch_factor,
+                msc_prefetch_depth=self.msc_prefetch_depth,
             )
 
         # LM loss
