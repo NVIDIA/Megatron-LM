@@ -12,6 +12,7 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
@@ -1085,23 +1086,128 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         return hidden_states
 
-    def _checkpointed_forward(self, forward_func, *args, **kwargs):
+    def _checkpointed_forward(
+        self,
+        hidden_states: Tensor,
+        decoder_input: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+    ):
+        """Forward through ``_proj_and_transformer_layer`` with activation
+        recomputation.
+
+        Mirrors ``transformer_block._checkpointed_forward``:
+
+        * Non-tensor objects (``attention_bias``, ``inference_params``,
+          ``packed_seq_params``) are captured by the ``custom_forward``
+          closure; only tensor / ``None`` arguments flow positionally
+          through the underlying checkpoint primitive. This is required
+          by both backends: ``tensor_parallel.checkpoint`` because its
+          ``save_for_backward`` only accepts tensors and ``None``, and
+          ``te_checkpoint`` because its reentrant implementation only
+          tracks positional tensor inputs as checkpoint inputs (kwarg
+          tensors are not represented in the recompute backward path).
+        * Quantized recipes (fp8, fp4) route through ``te_checkpoint``;
+          everything else uses ``tensor_parallel.checkpoint``.
+        * Only ``fp8 + delayed scaling`` needs an outer quantization
+          context entered before ``te_checkpoint``; see the
+          ``outer_quantization_context`` block below.
+        """
+
+        def custom_forward(
+            hidden_states,
+            decoder_input,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+        ):
+            return self._proj_and_transformer_layer(
+                hidden_states=hidden_states,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                inference_params=inference_params,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+
+        # Decide the outer quantization context, matching
+        # ``transformer_block._checkpointed_forward``. Only ``fp8 + delayed
+        # scaling`` needs an active context at the ``te_checkpoint`` entry
+        # point: TE's ``_CheckpointFunction.forward`` samples
+        # ``FP8GlobalStateManager.is_fp8_enabled()`` there to gate the
+        # phase-1 amax-buffer stash that phase-2 backward looks up via
+        # ``global_fp8_buffer_pos_fwd_recompute``. With fp8 only entered
+        # *inside* ``_proj_and_transformer_layer``, TE samples fp8 as off,
+        # phase-1 skips the stash, and phase-2 raises ``KeyError``.
+        # Non-delayed fp8 recipes (MXFP8BlockScaling, Float8CurrentScaling)
+        # and fp4 (NVFP4BlockScaling) treat the stash/lookup as a noop, so
+        # the inner context entered inside ``_proj_and_transformer_layer``
+        # is sufficient.
+        if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed:
+            outer_quantization_context = get_fp8_context(self.config)
+        else:
+            outer_quantization_context = nullcontext()
+
         def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            if self.config.fp8:
+            # fp4 quantization is internally implemented via TE's
+            # ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``), so
+            # quantized recompute on either fp8 or fp4 must go through
+            # ``te_checkpoint``. Matches ``transformer_block``'s policy.
+            if self.config.fp8 or self.config.fp4:
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(
-                    forward_func,
+                    custom_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
-                    *args,
-                    **kwargs,
+                    hidden_states,
+                    decoder_input,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    sequence_len_offset,
                 )
             else:
+                # tensor_parallel.checkpoint stashes args via autograd's
+                # ``save_for_backward``, which only accepts tensors and ``None``.
+                # Pass tensor / ``None`` args positionally and capture the
+                # non-tensor objects (``attention_bias``, ``inference_params``,
+                # ``packed_seq_params``) via the ``custom_forward`` closure.
                 return tensor_parallel.checkpoint(
-                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
+                    custom_forward,
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                    decoder_input,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    sequence_len_offset,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -1111,13 +1217,27 @@ class MultiTokenPredictionLayer(MegatronModule):
             assert (
                 self.config.recompute_num_layers == 1
             ), "recompute_num_layers must be 1 for MTP recompute"
-            outputs = checkpoint_handler()
+            with outer_quantization_context:
+                outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
             # TODO: implement block-based recompute for MTP
             warnings.warn(
                 "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute."
             )
-            outputs = forward_func(*args, **kwargs)
+            outputs = self._proj_and_transformer_layer(
+                hidden_states=hidden_states,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                inference_params=inference_params,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -1176,7 +1296,6 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         if self.config.recompute_granularity == 'full' and self.training:
             hidden_states = self._checkpointed_forward(
-                self._proj_and_transformer_layer,
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
