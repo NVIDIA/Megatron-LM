@@ -157,6 +157,23 @@ def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, 
     return teacher
 
 
+def _freeze_base_for_mtp(model):
+    """Freeze everything except MTP layer parameters.
+
+    Used after QAD: load a quantized checkpoint, add MTP heads,
+    and train them with lm_loss while keeping the base model frozen.
+    """
+    trainable, frozen = 0, 0
+    for name, param in model.named_parameters():
+        if 'mtp.layers.' in name:
+            param.requires_grad = True
+            trainable += 1
+        else:
+            param.requires_grad = False
+            frozen += 1
+    print_rank_0(f"Freeze base for MTP: {frozen} frozen, {trainable} trainable")
+
+
 def modelopt_gpt_hybrid_builder(
     args,
     pre_process,
@@ -260,6 +277,22 @@ def modelopt_gpt_hybrid_builder(
                 use_arbitrary_attention_mask=False,
             )
 
+        # Build MTP block spec if MTP is enabled.
+        mtp_block_spec = None
+        if args.mtp_num_layers is not None:
+            from megatron.core.models.gpt.gpt_layer_specs import (
+                get_gpt_decoder_layer_specs,
+                get_gpt_mtp_block_spec,
+            )
+
+            use_te = args.transformer_impl == "transformer_engine"
+            decoder_layer_specs = get_gpt_decoder_layer_specs(
+                config, use_transformer_engine=use_te,
+            )
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config, decoder_layer_specs[-1], use_transformer_engine=use_te,
+            )
+
         model_kwargs = {
             "transformer_layer_spec": transformer_layer_spec,
             "vocab_size": args.padded_vocab_size,
@@ -273,6 +306,7 @@ def modelopt_gpt_hybrid_builder(
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            "mtp_block_spec": mtp_block_spec,
             "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
@@ -337,6 +371,9 @@ def modelopt_gpt_hybrid_builder(
     # modelopt_state (which transforms the model to have additional parameters) before returning.
     if args.load is not None:
         load_modelopt_state(model=model)
+
+    if args.freeze_base_for_mtp:
+        _freeze_base_for_mtp(model)
 
     _add_load_convert_hooks(model)
 
