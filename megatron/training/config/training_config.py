@@ -681,6 +681,9 @@ class TokenizerConfig:
     tokenizer_sentencepiece_legacy: bool = False
     """SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage."""
 
+    tokenizer_sentencepiece_ignore_extra_whitespaces: bool = True
+    """Whether to ignore extra whitespaces in the input text while encoding."""
+
     tokenizer_hf_no_use_fast: bool = False
     """Whether to use fast HuggingFace tokenizer."""
 

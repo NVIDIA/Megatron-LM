@@ -9,11 +9,27 @@ MEGATRON_TOKENIZERS = ['BertWordPieceLowerCase', 'BertWordPieceCase', 'GPT2BPETo
 
 SP_TOKENIZERS = ['SentencePieceTokenizer', 'GPTSentencePieceTokenizer', 'Llama2Tokenizer']
 
+SUPPORTED_TOKENIZERS = [
+    'HuggingFaceTokenizer',
+    'TikTokenizer',
+    'MultimodalTokenizer',
+    'NullTokenizer',
+    'NullMultimodalTokenizer',
+    'SFTTokenizer',
+    *MEGATRON_TOKENIZERS,
+    *SP_TOKENIZERS,
+]
+
 logger = logging.getLogger(__name__)
 
 
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
+    assert args.tokenizer_type in SUPPORTED_TOKENIZERS, (
+        f"tokenizer_type {args.tokenizer_type} is not supported. "
+        f"See list of available tokenizers: {SUPPORTED_TOKENIZERS}"
+    )
+
     kwargs = {}
     tokenizer_library = None
     tokenizer_path = None
@@ -34,6 +50,7 @@ def build_tokenizer(args, **kwargs):
         tokenizer_library = 'sentencepiece'
         tokenizer_path = args.tokenizer_model
         kwargs['chat_template'] = args.chat_template
+        kwargs['ignore_extra_whitespaces'] = args.tokenizer_sentencepiece_ignore_extra_whitespaces
         kwargs['legacy'] = args.tokenizer_sentencepiece_legacy
         kwargs['special_tokens'] = args.special_tokens
     elif args.tokenizer_type == 'TikTokenizer':
