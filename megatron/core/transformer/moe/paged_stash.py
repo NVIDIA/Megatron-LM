@@ -382,7 +382,7 @@ class PagedTensor:
             and isinstance(num_tokens_tensor, torch.Tensor)
             and num_tokens_tensor.numel() == 1
         )
-        self.num_tokens_tensor = num_tokens_tensor.clone()
+        self.num_tokens_tensor = num_tokens_tensor
         self.avg_num_tokens = avg_num_tokens
         self.vp_stage = vp_stage
         self.schedule_layer_no = schedule_layer_no
@@ -400,10 +400,9 @@ class PagedTensor:
         # Calculate number of pages needed
         self.max_num_pages = (self.max_num_tokens + page_size - 1) // page_size  # Ceiling division
 
-        # Page record: stores which pages are being used for this tensor
-        self.page_record = torch.zeros(self.max_num_pages, dtype=torch.int64, device=self.device)
-        # Set by copy kernel: 0 = data in CUDA stash, 1 = data in host (pinned) stash
-        self.spilled_to_host = torch.zeros(1, dtype=torch.int64, device=self.device)
+        # Page record / spill flag: allocated here; zeroed in offload_to_stash (pack stream).
+        self.page_record = torch.empty(self.max_num_pages, dtype=torch.int64, device=self.device)
+        self.spilled_to_host = torch.empty(1, dtype=torch.int64, device=self.device)
 
     @property
     def schedule_layer(self):
@@ -412,6 +411,10 @@ class PagedTensor:
 
     def offload_to_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
         """Offload the paged tensor to paged stash buffer (CUDA or host if CUDA full)."""
+        # Zero uninitialized metadata before copy kernel (enqueued on current stream;
+        # stash_paged_tensors runs offload on the pack stream).
+        self.page_record.zero_()
+        self.spilled_to_host.zero_()
         self._tensor = self._tensor.contiguous()
         if self.num_tokens_tensor.dim() == 0:
             self.num_tokens_tensor = self.num_tokens_tensor.reshape(1)
@@ -460,9 +463,16 @@ class PagedTensor:
         self._tensor = None
 
     def reload_from_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
-        """Reload the paged tensor from paged stash buffer (CUDA or host from spilled_to_host)."""
-        self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
-        tensor_to_reload = self._tensor
+        """Reload the paged tensor from paged stash buffer (CUDA or host from spilled_to_host).
+
+        ``_tensor`` must already be allocated on the main (default) stream by the caller;
+        this method only enqueues unpack-stream kernels that fill it from the stash.
+        """
+        assert self._tensor is not None, "reload_from_stash expects _tensor pre-allocated on main"
+        assert tuple(self._tensor.shape) == tuple(self.original_shape), (
+            f"_tensor shape {tuple(self._tensor.shape)} != original_shape {tuple(self.original_shape)}"
+        )
+        assert self._tensor.dtype == self.dtype and self._tensor.device == self.device
 
         if self.is_columnwise_scale_inv:
             num_tokens_tensor = self.num_tokens_tensor // SCALE_INV_BLOCK_SIZE
@@ -483,7 +493,7 @@ class PagedTensor:
         _paged_stash_pop_kernel[grid](
             paged_stash_buffer.cuda_buffer,
             host_src,
-            tensor_to_reload.view(paged_stash_buffer.cuda_buffer.dtype),
+            self._tensor.view(paged_stash_buffer.cuda_buffer.dtype),
             num_tokens_tensor,
             self.page_record,
             self.spilled_to_host,
@@ -718,17 +728,30 @@ class PagedStashManager:
 
     def reload_paged_tensors(self, pp_schedule_layer, no_wait=False):
         """Reload the paged tensors."""
+        current_stream = torch.cuda.current_stream()
         # Avoid waiting for main stream if reload is immediately after stash
         # since stash is already waiting for main stream
         if not no_wait or self.unpack_stream != self.pack_stream:
-            current_stream = torch.cuda.current_stream()
+            self.unpack_stream.wait_stream(current_stream)
+
+        reload_batch = []
+        if self.status == 'captured':
+            while len(self.paged_tensors_to_reload[pp_schedule_layer]) > 0:
+                reload_batch.append(self.paged_tensors_to_reload[pp_schedule_layer].pop(0))
+
+        # Allocate reload buffers on the current (main) stream; unpack waits below before fill.
+        for paged_tensor in reload_batch:
+            paged_tensor._tensor = torch.empty(
+                paged_tensor.original_shape, dtype=paged_tensor.dtype, device=paged_tensor.device
+            )
+
+        if reload_batch:
             self.unpack_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(self.unpack_stream):
             if self.status == 'captured':
                 self._unpack_stream_status = 'reloading'
-                while len(self.paged_tensors_to_reload[pp_schedule_layer]) > 0:
-                    paged_tensor = self.paged_tensors_to_reload[pp_schedule_layer].pop(0)
+                for paged_tensor in reload_batch:
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
                     paged_tensor.reload_from_stash(stash_buffer)
             else:
@@ -1013,10 +1036,6 @@ class PagedStashManager:
                 saved_state._tensor is not None
             ), f"saved_state._tensor is None {saved_state._tensor}"
 
-            # Record cross-stream usage (important when tensor was produced on another stream).
-            if isinstance(saved_state._tensor, torch.Tensor) and saved_state._tensor.is_cuda:
-                saved_state._tensor.record_stream(torch.cuda.current_stream())
-
             return saved_state._tensor.view(saved_state.original_shape)
 
         return saved_state
@@ -1061,7 +1080,8 @@ def get_paged_stash_context(
     stash_manager.max_num_tokens = max_num_tokens
     stash_manager.avg_num_tokens = avg_num_tokens
     assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor)
-    stash_manager.num_tokens_tensor = num_tokens_tensor
+    # One clone per context; PagedTensor reuses this tensor (no per-instance clone).
+    stash_manager.num_tokens_tensor = num_tokens_tensor.clone()
     stash_manager.set_current_layer_name(name) if name is not None else None
     pack_unpack_context = PagedStashContext(stash_manager)
     return pack_unpack_context
@@ -1191,21 +1211,35 @@ class PagedStashRunner:
 
         _track_cfg(config)
 
+        # Local import avoids circular import: schedules -> paged_stash -> multi_token_prediction
+        # -> megatron.core (still loading).
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
         for model_chunk in self.model:
             model_with_decoder = get_attr_wrapped_model(
                 model_chunk, "decoder", allow_none=False, return_model_obj=True
             )
             _track_cfg(model_with_decoder.config)
             for layer in model_with_decoder.decoder.layers:
-                mlp = layer.mlp
-                if hasattr(mlp, 'token_dispatcher') and hasattr(
+                transformer_layer = (
+                    layer.mtp_model_layer
+                    if isinstance(layer, MultiTokenPredictionLayer)
+                    else layer
+                )
+                mlp = getattr(transformer_layer, "mlp", None)
+                if mlp is not None and hasattr(mlp, 'token_dispatcher') and hasattr(
                     mlp.token_dispatcher, 'check_over_budget'
                 ):
                     self.moe_layers.append(mlp)
             if model_with_decoder.mtp_process:
                 for layer in model_with_decoder.mtp.layers:
-                    mlp = layer.mtp_model_layer.mlp
-                    if hasattr(mlp, 'token_dispatcher') and hasattr(
+                    transformer_layer = (
+                        layer.mtp_model_layer
+                        if isinstance(layer, MultiTokenPredictionLayer)
+                        else layer
+                    )
+                    mlp = getattr(transformer_layer, "mlp", None)
+                    if mlp is not None and hasattr(mlp, 'token_dispatcher') and hasattr(
                         mlp.token_dispatcher, 'check_over_budget'
                     ):
                         self.moe_layers.append(mlp)
