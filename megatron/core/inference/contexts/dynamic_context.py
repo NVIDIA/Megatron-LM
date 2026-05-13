@@ -361,7 +361,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
-            self.num_attention_layers = model_config.num_layers // pp_size
+            # Use the same per-PP-rank layer count as TransformerBlock (handles
+            # account_for_embedding_in_pipeline_split, account_for_loss_in_pipeline_split,
+            # uneven first/last PP stages, and pipeline_model_parallel_layout). Using
+            # num_layers // pp_size mis-sizes the KV layer_map and can raise KeyError in
+            # append_key_value_cache.
+            from megatron.core.transformer.transformer_block import get_num_layers_to_build
+
+            vp_sz = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+            if vp_sz is not None and vp_sz > 1:
+                vp_stage = parallel_state.get_virtual_pipeline_model_parallel_rank()
+            else:
+                vp_stage = None
+            self.num_attention_layers = get_num_layers_to_build(
+                model_config, vp_stage=vp_stage, pp_rank=None
+            )
             self.num_mamba_layers = 0
             (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
