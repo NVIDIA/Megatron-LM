@@ -531,7 +531,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             agv_p["handle"],
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
-            per_rank_max_tokens=per_rank_max
+            per_rank_max_tokens=per_rank_max,
         )
 
         topk = probs.shape[1]
