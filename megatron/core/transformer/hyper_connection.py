@@ -284,9 +284,14 @@ class HyperConnectionModule(MegatronModule):
             x_2d = x.reshape(s * b, self.n * self.hidden_size)
             with torch.cuda.nvtx.range("HyperConnection::fused_proj_rms_compute_h"):
                 h_pre, h_post, h_res, _ = self._proj_rms_compute_h_op(
-                    x_2d, self.mapping_proj.weight,
-                    self.alpha_pre, self.alpha_post, self.alpha_res,
-                    self.bias, self.n, self.norm_eps,
+                    x_2d,
+                    self.mapping_proj.weight,
+                    self.alpha_pre,
+                    self.alpha_post,
+                    self.alpha_res,
+                    self.bias,
+                    self.n,
+                    self.norm_eps,
                 )
             h_pre = h_pre.view(s, b, self.n)
             h_post = h_post.view(s, b, self.n)
@@ -299,9 +304,7 @@ class HyperConnectionModule(MegatronModule):
                 h_pre, h_post, h_res = self._compute_h(proj, r)
             h_res = h_res.view(s, b, self.n, self.n)
 
-        h_res = self._sinkhorn_op(
-            h_res, self.sinkhorn_iterations, self.norm_eps
-        )  # [s, b, n, n]
+        h_res = self._sinkhorn_op(h_res, self.sinkhorn_iterations, self.norm_eps)  # [s, b, n, n]
 
         return h_pre, h_post, h_res
 

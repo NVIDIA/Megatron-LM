@@ -107,9 +107,14 @@ def _ref_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6):
 
 
 def _ref_proj_rms_compute_h(
-    x: Tensor, weight: Tensor,
-    alpha_pre: Tensor, alpha_post: Tensor, alpha_res: Tensor,
-    bias: Tensor, n: int, eps: float = 1e-6,
+    x: Tensor,
+    weight: Tensor,
+    alpha_pre: Tensor,
+    alpha_post: Tensor,
+    alpha_res: Tensor,
+    bias: Tensor,
+    n: int,
+    eps: float = 1e-6,
 ):
     """Reference: fused proj_rms + compute_h."""
     proj = torch.matmul(x, weight.t())
@@ -117,9 +122,7 @@ def _ref_proj_rms_compute_h(
     K = x.shape[-1]
     r = norm / math.sqrt(K)  # [M, 1]
     N = proj.shape[-1]
-    alpha = torch.cat([
-        alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(N - 2 * n),
-    ])
+    alpha = torch.cat([alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(N - 2 * n)])
     h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
     h_pre = h[..., :n].sigmoid()
     h_post = h[..., n : 2 * n].sigmoid() * 2
@@ -386,7 +389,9 @@ class TestTritonHPostBDA:
 
     @_require_triton
     @pytest.mark.parametrize("with_bias", [True, False])
-    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256), (64, 8, 4, 4096), (128, 1, 8, 7168)])
+    @pytest.mark.parametrize(
+        "s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256), (64, 8, 4, 4096), (128, 1, 8, 7168)]
+    )
     def test_bwd_vs_reference(self, s, b, n, C, with_bias):
         """Triton hpb backward grads must match the PyTorch reference."""
         from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_bwd
@@ -401,7 +406,7 @@ class TestTritonHPostBDA:
 
         # -- Triton backward --
         g_hr_t, g_res_t, g_hp_t, g_x_t, g_bias_t = _triton_h_post_bda_bwd(
-            grad_out, hr_data, orig_data, hp_data, x_data, bias_data,
+            grad_out, hr_data, orig_data, hp_data, x_data, bias_data
         )
 
         # -- Reference backward via autograd --
@@ -424,7 +429,10 @@ class TestTritonHPostBDA:
             )
         if with_bias:
             torch.testing.assert_close(
-                g_bias_t, bi_r.grad, atol=BWD_ATOL, rtol=BWD_RTOL,
+                g_bias_t,
+                bi_r.grad,
+                atol=BWD_ATOL,
+                rtol=BWD_RTOL,
                 msg="Triton backward mismatch on bias",
             )
 
@@ -434,8 +442,10 @@ class TestTritonHPostBDA:
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256), (64, 8, 4, 4096)])
     def test_triton_vs_cutile(self, s, b, n, C, with_bias):
         """Triton and cuTile backward must produce identical results."""
-        from megatron.core.fusions.fused_mhc_kernels import _cutile_h_post_bda_bwd
-        from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_bwd
+        from megatron.core.fusions.fused_mhc_kernels import (
+            _cutile_h_post_bda_bwd,
+            _triton_h_post_bda_bwd,
+        )
 
         _info()
         hr_data = _rand(s, b, n, n)
@@ -446,18 +456,20 @@ class TestTritonHPostBDA:
         grad_out = _rand(s, b, n, C)
 
         triton_out = _triton_h_post_bda_bwd(
-            grad_out, hr_data, orig_data, hp_data, x_data, bias_data,
+            grad_out, hr_data, orig_data, hp_data, x_data, bias_data
         )
         cutile_out = _cutile_h_post_bda_bwd(
-            grad_out, hr_data, orig_data, hp_data, x_data, bias_data,
+            grad_out, hr_data, orig_data, hp_data, x_data, bias_data
         )
 
         for i, name in enumerate(["h_res", "orig_res", "h_post", "x", "bias"]):
             if triton_out[i] is None:
                 continue
             torch.testing.assert_close(
-                triton_out[i], cutile_out[i],
-                atol=BWD_ATOL, rtol=BWD_RTOL,
+                triton_out[i],
+                cutile_out[i],
+                atol=BWD_ATOL,
+                rtol=BWD_RTOL,
                 msg=f"Triton vs cuTile mismatch on {name}",
             )
 
@@ -471,12 +483,12 @@ class TestTritonHPostBDABwdE2EDebug:
         """Feed actual E2E backward inputs to Triton kernel and check for NaN."""
         from megatron.core.fusions.fused_mhc_kernels import (
             _cutile_h_post_bda_bwd,
+            _triton_h_post_bda_bwd,
             fused_h_aggregate,
             fused_h_post_bda,
             fused_proj_rms,
             fused_sinkhorn,
         )
-        from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_bwd
 
         s, b, n, C = 8, 4, 4, 1024
         eps = 1e-6
@@ -522,10 +534,12 @@ class TestTritonHPostBDABwdE2EDebug:
             assert not tr_t.isnan().any(), f"Triton {name} has NaN"
             assert not tr_t.isinf().any(), f"Triton {name} has Inf"
             torch.testing.assert_close(
-                tr_t, ct_t, atol=BWD_ATOL, rtol=BWD_RTOL,
+                tr_t,
+                ct_t,
+                atol=BWD_ATOL,
+                rtol=BWD_RTOL,
                 msg=f"Triton vs cuTile mismatch on {name} (E2E inputs)",
             )
-
 
 
 # ============================================================================
@@ -561,8 +575,8 @@ class TestTritonSinkhorn:
         from megatron.core.fusions.fused_mhc_kernels import (
             _cutile_sinkhorn_bwd,
             _cutile_sinkhorn_fwd,
+            triton_fused_sinkhorn,
         )
-        from megatron.core.fusions.fused_mhc_kernels import triton_fused_sinkhorn
 
         eps = 1e-6
         data = _rand(s, b, n, n)
@@ -657,10 +671,7 @@ class TestFusedProjRms:
 
 
 class TestFusedProjRmsComputeH:
-    @pytest.mark.parametrize(
-        "M,n,K",
-        [(256, 4, 4096), (64, 2, 512), (128, 4, 2048)],
-    )
+    @pytest.mark.parametrize("M,n,K", [(256, 4, 4096), (64, 2, 512), (128, 4, 2048)])
     def test_fwd_bwd_vs_reference(self, M, n, K):
         """E2E: public fused fwd output and bwd grads must match the PyTorch reference."""
         from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
@@ -716,9 +727,15 @@ class TestFusedProjRmsComputeH:
         )
         loss_r.backward()
 
-        torch.testing.assert_close(h_pre_f, h_pre_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_pre mismatch")
-        torch.testing.assert_close(h_post_f, h_post_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post mismatch")
-        torch.testing.assert_close(h_res_f, h_res_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_res mismatch")
+        torch.testing.assert_close(
+            h_pre_f, h_pre_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_pre mismatch"
+        )
+        torch.testing.assert_close(
+            h_post_f, h_post_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post mismatch"
+        )
+        torch.testing.assert_close(
+            h_res_f, h_res_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_res mismatch"
+        )
         torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="r mismatch")
         torch.testing.assert_close(
             xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on x"
@@ -735,9 +752,7 @@ class TestFusedProjRmsComputeH:
         _assert_cosine_similar(
             arf.grad, arr.grad, COSINE_SIM_THRESH, msg="backward mismatch on alpha_res"
         )
-        _assert_cosine_similar(
-            bf.grad, br.grad, COSINE_SIM_THRESH, msg="backward mismatch on bias"
-        )
+        _assert_cosine_similar(bf.grad, br.grad, COSINE_SIM_THRESH, msg="backward mismatch on bias")
 
 
 # ============================================================================
@@ -898,19 +913,12 @@ class TestEndToEndFused:
             loss.backward()
             return proj.detach(), r.detach(), output.detach(), aggregated.detach(), hs.grad.clone()
 
-
         proj_f, r_f, out_f, agg_f, grad_f = _run_fused()
         proj_r, r_r, out_r, agg_r, grad_r = _run_ref()
 
-        torch.testing.assert_close(
-            proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL
-        )
-        torch.testing.assert_close(
-            r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL
-        )
-        torch.testing.assert_close(
-            agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL
-        )
+        torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(
             out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch"
         )
@@ -952,7 +960,7 @@ class TestEndToEndFused:
 
             x_2d = hs.reshape(s * b, n * C)
             h_pre, h_post, h_res_logits, _ = fused_proj_rms_compute_h(
-                x_2d, w, ap, apo, ar, bias_p, n, eps,
+                x_2d, w, ap, apo, ar, bias_p, n, eps
             )
 
             h_pre = h_pre.view(s, b, n)
@@ -980,7 +988,7 @@ class TestEndToEndFused:
 
             x_2d = hs.reshape(s * b, n * C)
             h_pre, h_post, h_res_logits, _ = _ref_proj_rms_compute_h(
-                x_2d, w, ap, apo, ar, bias_p, n, eps,
+                x_2d, w, ap, apo, ar, bias_p, n, eps
             )
 
             h_pre = h_pre.view(s, b, n)
@@ -1008,7 +1016,9 @@ class TestEndToEndFused:
             out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch"
         )
         _assert_cosine_similar(
-            grad_f, grad_r, COSINE_SIM_THRESH,
+            grad_f,
+            grad_r,
+            COSINE_SIM_THRESH,
             msg="hidden_states grad (E2E backward, fused compute_h)",
         )
 
@@ -1161,8 +1171,7 @@ class TestEndToEndNativeBroadcast:
             out_b, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch (broadcast)"
         )
         _assert_cosine_similar(
-            grad_b, grad_r, COSINE_SIM_THRESH,
-            msg="hidden_states grad (E2E backward, broadcast)",
+            grad_b, grad_r, COSINE_SIM_THRESH, msg="hidden_states grad (E2E backward, broadcast)"
         )
 
 
@@ -1248,11 +1257,16 @@ class TestEndToEndFusedBroadcast:
             agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="aggregated mismatch (fused broadcast)"
         )
         torch.testing.assert_close(
-            out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL,
+            out_f,
+            out_r,
+            atol=FWD_ATOL,
+            rtol=FWD_RTOL,
             msg="h_post_bda output mismatch (fused broadcast)",
         )
         _assert_cosine_similar(
-            grad_f, grad_r, COSINE_SIM_THRESH,
+            grad_f,
+            grad_r,
+            COSINE_SIM_THRESH,
             msg="hidden_states grad (E2E backward, fused broadcast)",
         )
 
@@ -1294,7 +1308,7 @@ class TestEndToEndFusedBroadcast:
 
             x_2d = hs_map.reshape(s * b, n * C)
             h_pre, h_post, h_res_logits, _ = fused_proj_rms_compute_h(
-                x_2d, w, ap, apo, ar, bias_p, n, eps,
+                x_2d, w, ap, apo, ar, bias_p, n, eps
             )
 
             h_pre = h_pre.view(s, b, n)
@@ -1322,7 +1336,7 @@ class TestEndToEndFusedBroadcast:
 
             x_2d = hs.reshape(s * b, n * C)
             h_pre, h_post, h_res_logits, _ = _ref_proj_rms_compute_h(
-                x_2d, w, ap, apo, ar, bias_p, n, eps,
+                x_2d, w, ap, apo, ar, bias_p, n, eps
             )
 
             h_pre = h_pre.view(s, b, n)
@@ -1344,14 +1358,22 @@ class TestEndToEndFusedBroadcast:
         out_r, agg_r, grad_r = _run_ref()
 
         torch.testing.assert_close(
-            agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL,
+            agg_f,
+            agg_r,
+            atol=FWD_ATOL,
+            rtol=FWD_RTOL,
             msg="aggregated mismatch (fused compute_h broadcast)",
         )
         torch.testing.assert_close(
-            out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL,
+            out_f,
+            out_r,
+            atol=FWD_ATOL,
+            rtol=FWD_RTOL,
             msg="h_post_bda output mismatch (fused compute_h broadcast)",
         )
         _assert_cosine_similar(
-            grad_f, grad_r, COSINE_SIM_THRESH,
+            grad_f,
+            grad_r,
+            COSINE_SIM_THRESH,
             msg="hidden_states grad (E2E backward, fused compute_h broadcast)",
         )

@@ -72,9 +72,7 @@ class TestHyperConnectionCheckpoint:
         # Forward without checkpoint (reference)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(
-            hidden_states
-        )
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(hidden_states)
         mixed_ref = module.apply_h_res(h_res_ref, residual)
         loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
