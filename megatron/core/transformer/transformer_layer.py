@@ -537,6 +537,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
+    def _maybe_set_dynamic_cp_for_moe(self, packed_seq_params):
+        """Set dynamic CP group on MoE router for dynamic context parallelism.
+
+        Returns the original CP group so it can be restored later, or None if
+        no swap was needed.
+        """
+        if (
+            self.is_moe_layer
+            and packed_seq_params is not None
+            and getattr(packed_seq_params, 'local_cp_size', None) is not None
+        ):
+            assert packed_seq_params.cp_group is not None, (
+                "cp_group must be set in dynamic-cp mode"
+            )
+            orig = self.mlp.router.cp_group
+            self.mlp.router.cp_group = packed_seq_params.cp_group
+            return orig
+        return None
+
+    def _maybe_restore_cp_for_moe(self, orig_cp_group):
+        """Restore the MoE router's CP group after forward pass."""
+        if orig_cp_group is not None:
+            self.mlp.router.cp_group = orig_cp_group
+
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -713,12 +737,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             not self.config.enable_hyper_connections
         ), "Please use HyperConnectionTransformerLayer instead"
         hidden_states, context = self._forward_attention(*args, **kwargs)
+
+        # For dynamic CP: temporarily swap MoE router's CP group to the dynamic one
+        packed_seq_params = kwargs.get("packed_seq_params", None)
+        _orig_cp_group = self._maybe_set_dynamic_cp_for_moe(packed_seq_params)
+
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
             input_ids=kwargs.get("input_ids", None),
         )
+
+        # Restore original CP group
+        self._maybe_restore_cp_for_moe(_orig_cp_group)
+
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
@@ -1597,6 +1630,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs
         )
 
+        # For dynamic CP: temporarily swap MoE router's CP group
+        packed_seq_params = kwargs.get("packed_seq_params", None)
+        _orig_cp_group = self._maybe_set_dynamic_cp_for_moe(packed_seq_params)
+
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
@@ -1604,6 +1641,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             input_ids=kwargs.get("input_ids", None),
             mhc_recompute_manager=mhc_recompute_manager,
         )
+
+        self._maybe_restore_cp_for_moe(_orig_cp_group)
+
         return output, context
 
     def _forward_attention(
