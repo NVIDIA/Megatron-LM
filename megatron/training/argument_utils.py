@@ -391,8 +391,6 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
 def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
     """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
 
-    assert args.use_legacy_models is False, "Hybrid model only supported in Mcore!"
-
     kwargs = {}
     if config is None:
         transformer_cfg = core_transformer_config_from_args(args)
