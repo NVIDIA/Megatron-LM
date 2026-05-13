@@ -809,18 +809,24 @@ class TestTEGroupedMLP:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_gpu_fused_path_loss_decreases(self):
-        """End-to-end signal that the fused TE op-fuser path actually trains.
+        """End-to-end signal that the Megatron op-fuser wrapper actually trains.
 
         Builds a small grouped-MLP MoE layer with `use_transformer_engine_op_fuser=True`,
-        runs a few SGD steps minimizing `||output||^2`, and asserts the loss decreases
-        and stays finite. This catches regressions where the fused path silently no-ops
-        weight updates (the wgrad-hook plumbing fixed in PR #4311) or where the cached
-        `_fused_ops` view stops aliasing the underlying GroupedLinear weights — failure
-        modes that pass our mock-based unit tests but break real training.
+        runs a few Adam steps driving the output toward a fixed target, and asserts the
+        loss decreases and stays finite. This catches regressions in the Megatron-side
+        wrapper plumbing — `_make_fused_ops` op-sequence construction, the fused-impl
+        pre-forward hook, weight aliasing into the TE op wrappers, and (delayed-)wgrad
+        backward — failure modes that pass our mock-based unit tests but break real
+        training.
 
-        HybridEP is intentionally not exercised here: `_is_fused_impl_supported()` does
-        not currently gate on HybridEP, and TE's internal fusion pass can silently fall
-        back to the basic-op path under HybridEP, which is tracked separately.
+        IMPORTANT: this test does NOT verify that TE's underlying cuDSL fused grouped
+        MLP kernel is actually invoked. That kernel is gated by the
+        `NVTE_CUTEDSL_FUSED_GROUPED_MLP` env var which TE checks at import time, not
+        runtime; setting it inside pytest is a no-op (TE has already imported). When
+        that env var is absent, TE silently falls back to its basic-op path and the
+        wrapper still works — the loss still decreases. The functional test
+        `moe/gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser` sets the env var
+        in its recipe and is the real cuDSL kernel coverage.
         """
         try:
             from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401

@@ -3,6 +3,10 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+  # TE checks NVTE_CUTEDSL_FUSED_GROUPED_MLP at import time, so it must be set
+  # before training starts. Without it, TE's op-fuser silently falls back to
+  # basic-op and this recipe wouldn't actually exercise the cuDSL fused kernel.
+  NVTE_CUTEDSL_FUSED_GROUPED_MLP: 1
 MODEL_ARGS:
   --num-layers: 4
   --hidden-size: 512
