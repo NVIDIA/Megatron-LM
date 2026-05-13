@@ -494,10 +494,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             # GDN tensors are already TP-local here.
             return list(
                 split_dtensor(
-                    data,
-                    split_sizes,
-                    dim=split_dim,
-                    update_uneven_dtensor_chunk_meta=True,
+                    data, split_sizes, dim=split_dim, update_uneven_dtensor_chunk_meta=True
                 )
             )
 
