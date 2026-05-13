@@ -421,6 +421,40 @@ class TestFSDPTensorParallelMuon:
             gather_calls == [] and batch_calls == []
         ), f"Expected no all-gathers for fully-local params, got {gather_calls}, {batch_calls}"
 
+    def test_step_skips_boundary_ns_on_empty_local_shards(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plan = {0: 2, 1: 2}
+        full_param = torch.arange(4 * cols, device="cuda", dtype=torch.float32).view(4, cols) / 100
+        full_grad = torch.arange(4 * cols, device="cuda", dtype=torch.float32).view(4, cols) / 50
+
+        local_param = _local_slice(full_param, plan, dp_rank).contiguous()
+        param = nn.Parameter(_make_dtensor(local_param, full_param.shape, device_mesh))
+        local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+        param.grad = _make_dtensor(local_grad, full_grad.shape, device_mesh)
+
+        optimizer = _make_fsdp_muon([param], dp_group=dp_group)
+        orthogonalize_calls = []
+        real_orthogonalize = TensorParallelMuon.orthogonalize
+
+        def counting_orthogonalize(self, p, grad, **kwargs):
+            orthogonalize_calls.append(tuple(grad.shape))
+            return real_orthogonalize(self, p, grad, **kwargs)
+
+        with patch.object(TensorParallelMuon, "orthogonalize", counting_orthogonalize):
+            optimizer.step()
+
+        if local_param.numel() == 0:
+            assert orthogonalize_calls == []
+        else:
+            assert orthogonalize_calls == [tuple(full_grad.shape)]
+
     def test_step_batches_multiple_split_boundary_params(self):
         from torch.distributed.device_mesh import init_device_mesh
 
