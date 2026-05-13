@@ -117,7 +117,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 tokenizer=inference_engine.controller.tokenizer,
                 rank=dist.get_rank(),
                 server_port=kwargs.get('port', 8294),
-                parsers=[],
+                parsers=args.rl_inference_parsers,
                 verbose=kwargs.get('verbose', False),
             )
         else:
