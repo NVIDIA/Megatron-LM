@@ -211,6 +211,7 @@ if _TRITON_AVAILABLE:
 
         @staticmethod
         def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
+            """Run Triton Sinkhorn forward and save initial matrix for backward."""
             out, M_init = _triton_sinkhorn_fwd(input_logits, num_iterations, eps)
             ctx.save_for_backward(M_init)
             ctx.num_iterations = num_iterations
@@ -219,6 +220,7 @@ if _TRITON_AVAILABLE:
 
         @staticmethod
         def backward(ctx, grad_output: Tensor):
+            """Run Triton Sinkhorn backward."""
             (M_init,) = ctx.saved_tensors
             grad_input = _triton_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
             return grad_input, None, None
@@ -2874,6 +2876,7 @@ if _CUTILE_AVAILABLE:
 
         @staticmethod
         def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
+            """Run cuTile Sinkhorn forward and save initial matrix for backward."""
             output, M_init = _cutile_sinkhorn_fwd(input_logits, num_iterations, eps)
             ctx.save_for_backward(M_init)
             ctx.num_iterations = num_iterations
@@ -2882,6 +2885,7 @@ if _CUTILE_AVAILABLE:
 
         @staticmethod
         def backward(ctx, grad_output):
+            """Run cuTile Sinkhorn backward."""
             (M_init,) = ctx.saved_tensors
             grad_input = _cutile_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
             return grad_input, None, None
@@ -2891,12 +2895,14 @@ if _CUTILE_AVAILABLE:
 
         @staticmethod
         def forward(ctx, x: Tensor, h_pre: Tensor):
+            """Run cuTile h_aggregate forward."""
             output = _cutile_h_aggregate_fwd(x, h_pre)
             ctx.save_for_backward(x, h_pre)
             return output
 
         @staticmethod
         def backward(ctx, grad_output):
+            """Run cuTile h_aggregate backward."""
             x, h_pre = ctx.saved_tensors
             return _cutile_h_aggregate_bwd(grad_output, x, h_pre)
 
@@ -2905,6 +2911,7 @@ if _CUTILE_AVAILABLE:
 
         @staticmethod
         def forward(ctx, x: Tensor, weight: Tensor, eps: float = 1e-6):
+            """Run cuTile projection plus RMS normalization forward."""
             proj, norm, r = _cutile_proj_rms_fwd(x, weight, eps)
             ctx.save_for_backward(x, weight, norm)
             ctx.eps = eps
@@ -2912,6 +2919,7 @@ if _CUTILE_AVAILABLE:
 
         @staticmethod
         def backward(ctx, grad_proj, grad_r):
+            """Run cuTile projection plus RMS normalization backward."""
             x, weight, norm = ctx.saved_tensors
             grad_x, grad_weight = _cutile_proj_rms_bwd(grad_proj, grad_r, x, weight, norm, ctx.eps)
             return grad_x, grad_weight, None
@@ -2931,6 +2939,7 @@ if _CUTILE_AVAILABLE:
             n: int,
             eps: float = 1e-6,
         ):
+            """Run fused cuTile projection, RMS normalization, and compute_h forward."""
             h_pre, h_post, h_res, r, proj_reduced = _cutile_proj_rms_compute_h_fwd(
                 x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps
             )
@@ -2953,6 +2962,7 @@ if _CUTILE_AVAILABLE:
 
         @staticmethod
         def backward(ctx, grad_h_pre, grad_h_post, grad_h_res, grad_r_ext):
+            """Run fused cuTile projection, RMS normalization, and compute_h backward."""
             (
                 x,
                 weight,
@@ -2997,6 +3007,7 @@ class FusedHAggregate(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor, h_pre: Tensor):
+        """Run h_aggregate forward using the best available backend."""
         triton_fwd = _get_triton_h_aggregate_fwd()
         if triton_fwd is not None:
             output = triton_fwd(x, h_pre)
@@ -3009,6 +3020,7 @@ class FusedHAggregate(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Run h_aggregate backward using the best available backend."""
         x, h_pre = ctx.saved_tensors
         if _CUTILE_AVAILABLE:
             return _cutile_h_aggregate_bwd(grad_output, x, h_pre)
@@ -3027,6 +3039,7 @@ class FusedHPostBDA(torch.autograd.Function):
         x: Tensor,
         bias: Optional[Tensor],
     ):
+        """Run h_post_bda forward using the best available backend."""
         triton_fwd = _get_triton_h_post_bda_fwd()
         if triton_fwd is not None:
             output = triton_fwd(h_res, original_residual, h_post, x, bias)
@@ -3044,6 +3057,7 @@ class FusedHPostBDA(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Run h_post_bda backward using the best available backend."""
         if ctx.has_bias:
             h_res, orig_res, h_post, x, bias = ctx.saved_tensors
         else:

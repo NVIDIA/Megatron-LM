@@ -107,11 +107,13 @@ class BroadcastTensorFused(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, fused_add_3_fn):
+        """Return three view aliases and save the fused gradient combiner."""
         ctx.fused_add_3_fn = fused_add_3_fn
         return x.view_as(x), x.view_as(x), x.view_as(x)
 
     @staticmethod
     def backward(ctx, grad1, grad2, grad3):
+        """Combine gradients from the three broadcast aliases."""
         grads = [g for g in (grad1, grad2, grad3) if g is not None]
         if len(grads) == 0:
             return None, None
