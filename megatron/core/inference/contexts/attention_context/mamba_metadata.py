@@ -448,15 +448,15 @@ class MambaMetadata:
                 # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1],
                 #   which are within bounds and produce a valid but unused state
                 if real_count < max_count:
-                    self._intermediate_chunk_indices_buffer[real_count:].fill_(0)
-                    self._intermediate_abs_positions_buffer[real_count:].fill_(self.d_conv)
+                    self._intermediate_chunk_indices_buffer[real_count:max_count].fill_(0)
+                    self._intermediate_abs_positions_buffer[real_count:max_count].fill_(self.d_conv)
 
                 self.intermediate_count = real_count
                 self.per_request_intermediate_counts = counts_list
             else:
                 # All counts are 0
-                self._intermediate_chunk_indices_buffer.fill_(0)
-                self._intermediate_abs_positions_buffer.fill_(self.d_conv)
+                self._intermediate_chunk_indices_buffer[:max_count] = 0
+                self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
                 self.intermediate_count = 0
                 self.per_request_intermediate_counts = counts_list
 
@@ -465,8 +465,8 @@ class MambaMetadata:
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
             # (same rationale as padding comment above)
-            self._intermediate_chunk_indices_buffer.fill_(0)
-            self._intermediate_abs_positions_buffer.fill_(self.d_conv)
+            self._intermediate_chunk_indices_buffer[:max_count] = 0
+            self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
             self.intermediate_count = 0
             self.per_request_intermediate_counts = []
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]

@@ -521,7 +521,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         # Cap AGV CTAs when overlapping the shared expert so the AGV does not
         # starve the shared-expert GEMMs running on the side stream.
-        #agv_kwargs = {"max_num_blocks": 16} if self.shared_experts is not None else {}
+        # agv_kwargs = {"max_num_blocks": 16} if self.shared_experts is not None else {}
         agv_kwargs = {}
         multimem_all_gatherv_3tensor(
             agv_h["tensor"],
