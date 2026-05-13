@@ -116,12 +116,23 @@ def _make_dtensor(local_tensor, global_shape, device_mesh):
 
 
 def _attach_fake_mfsdp_bucket_metadata(param, bucket, item_id, offset):
-    bucket.item_index_map[item_id] = SimpleNamespace(global_data_index=offset)
+    bucket.item_index_map[item_id] = SimpleNamespace(
+        global_data_index=offset, size=torch.Size(param.shape).numel()
+    )
     param.orig_param = SimpleNamespace(_gbuf=bucket, _item_id=item_id)
 
 
-def _make_fake_mfsdp_bucket(bucket_id):
-    return SimpleNamespace(item_index_map={}, bucket_index=SimpleNamespace(bucket_id=bucket_id))
+def _make_fake_mfsdp_bucket(bucket_id, dp_rank, dp_size, shard_size):
+    return SimpleNamespace(
+        item_index_map={},
+        is_data_distributed=True,
+        bucket_index=SimpleNamespace(
+            bucket_id=bucket_id, global_data_index=0, size=shard_size * dp_size
+        ),
+        shard_bucket_index=SimpleNamespace(
+            bucket_id=bucket_id, global_data_index=shard_size * dp_rank, size=shard_size
+        ),
+    )
 
 
 class TestGetMFSDPModels:
@@ -259,7 +270,7 @@ class TestFSDPTensorParallelMuon:
             )
             assert not torch.equal(local_value, initial_locals[idx])
 
-    def test_boundary_detector_uses_first_and_last_non_empty_params(self):
+    def test_boundary_detector_without_mfsdp_metadata_includes_all_split_params(self):
         from torch.distributed.device_mesh import init_device_mesh
 
         dp_size = torch.distributed.get_world_size()
@@ -268,9 +279,9 @@ class TestFSDPTensorParallelMuon:
         dp_group = device_mesh.get_group("dp")
         cols = 4
 
-        # Without M-FSDP bucket metadata, the helper treats the group as one
-        # synthetic bucket and only selects the first/last non-empty params.
-        # Real M-FSDP optimizer params exercise bucket-aware detection below.
+        # Without M-FSDP bucket metadata, the safe fallback is to gather every
+        # globally split DTensor. Real M-FSDP optimizer params exercise the
+        # exact flat-interval detection below.
         plans = [{0: 2, 1: 2}, {0: 1, 1: 3}, {0: 3, 1: 1}]
 
         params = []
@@ -281,9 +292,9 @@ class TestFSDPTensorParallelMuon:
 
         optimizer = _make_fsdp_muon(params, dp_group=dp_group)
 
-        assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0, 2}
+        assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0, 1, 2}
 
-    def test_boundary_detector_uses_first_and_last_non_empty_params_per_mfsdp_bucket(self):
+    def test_boundary_detector_uses_mfsdp_flat_item_intervals(self):
         from torch.distributed.device_mesh import init_device_mesh
 
         dp_size = torch.distributed.get_world_size()
@@ -292,10 +303,9 @@ class TestFSDPTensorParallelMuon:
         dp_group = device_mesh.get_group("dp")
         cols = 4
 
-        # Param 2 is split across the rank 0/1 boundary, but it is neither the
-        # first nor last non-empty param in the overall optimizer group on
-        # either rank. It is the only non-empty param in its M-FSDP bucket, so
-        # bucket-aware boundary detection must still select it.
+        # Param 2 is split across the rank 0/1 flat-buffer boundary. The
+        # detector should select it from M-FSDP item interval metadata without
+        # relying on optimizer-group first/last parameter positions.
         plans = [{0: 4}, {1: 4}, {0: 2, 1: 2}, {0: 4}, {1: 4}]
         full_params = []
         full_grads = []
@@ -321,9 +331,9 @@ class TestFSDPTensorParallelMuon:
             param.grad = _make_dtensor(local_grad, full_grad.shape, device_mesh)
 
         buckets = [
-            _make_fake_mfsdp_bucket(0),
-            _make_fake_mfsdp_bucket(1),
-            _make_fake_mfsdp_bucket(2),
+            _make_fake_mfsdp_bucket(0, dp_rank, dp_size, shard_size=4 * cols),
+            _make_fake_mfsdp_bucket(1, dp_rank, dp_size, shard_size=2 * cols),
+            _make_fake_mfsdp_bucket(2, dp_rank, dp_size, shard_size=4 * cols),
         ]
         bucket_assignments = [
             (buckets[0], 0, 0),

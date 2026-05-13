@@ -27,7 +27,7 @@ try:
 
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         _assert_chunks_cover_full_tensor,
-        uneven_dtensor_to_full_tensor,
+        redistribute_uneven_dtensor_to_replicated,
         update_uneven_dtensor_chunk_metadata,
     )
 
@@ -38,7 +38,7 @@ except ImportError:
     Shard = None  # type: ignore[assignment,misc]
     _StridedShard = None  # type: ignore[assignment,misc]
     _assert_chunks_cover_full_tensor = None  # type: ignore[assignment]
-    uneven_dtensor_to_full_tensor = None  # type: ignore[assignment]
+    redistribute_uneven_dtensor_to_replicated = None  # type: ignore[assignment]
     update_uneven_dtensor_chunk_metadata = None  # type: ignore[assignment]
     _HAVE_DTENSOR = False
 
@@ -436,13 +436,13 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         local_tensor = dtensor.to_local()
         return local_tensor.numel() > 0 and tuple(dtensor.shape) != tuple(local_tensor.shape)
 
-    def _get_mfsdp_bucket_key_and_offset(self, param: torch.Tensor, param_idx: int):
-        """Return the M-FSDP bucket identity and flat-buffer offset for `param`.
+    def _get_mfsdp_param_layout(self, param: torch.Tensor, param_idx: int):
+        """Return M-FSDP flat-buffer layout metadata for `param`.
 
         FSDP optimizer params keep a pointer to the original module parameter.
-        M-FSDP attaches the original parameter's buffer and item id there, which
-        lets Muon reason about first/last params in the same flat bucket instead
-        of in the larger optimizer param group.
+        M-FSDP attaches the original parameter's backing buffer and item id
+        there, which lets Muon test whether the parameter's flat item interval
+        crosses a shard boundary exactly.
         """
         orig_param = getattr(param, "orig_param", None)
         if orig_param is None:
@@ -457,7 +457,11 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             )
 
         item_index = gbuf.item_index_map.get(item_id)
-        if item_index is None or not hasattr(item_index, "global_data_index"):
+        if (
+            item_index is None
+            or not hasattr(item_index, "global_data_index")
+            or not hasattr(item_index, "size")
+        ):
             raise AssertionError(
                 "M-FSDP optimizer parameter has invalid bucket item metadata required "
                 f"for Muon boundary gather detection: param_idx={param_idx}, "
@@ -465,20 +469,76 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             )
 
         bucket_index = getattr(gbuf, "bucket_index", None)
-        bucket_id = getattr(bucket_index, "bucket_id", getattr(gbuf, "bucket_id", None))
-        bucket_key = (id(gbuf), bucket_id)
-        order_key = (int(item_index.global_data_index), param_idx)
-        return bucket_key, order_key
+        shard_bucket_index = getattr(gbuf, "shard_bucket_index", None)
+        if (
+            bucket_index is None
+            or shard_bucket_index is None
+            or not hasattr(bucket_index, "global_data_index")
+            or not hasattr(bucket_index, "size")
+            or not hasattr(shard_bucket_index, "size")
+        ):
+            raise AssertionError(
+                "M-FSDP optimizer parameter is missing bucket/shard metadata required "
+                f"for Muon boundary gather detection: param_idx={param_idx}."
+            )
+
+        return gbuf, item_index, bucket_index, shard_bucket_index
+
+    def _mfsdp_param_crosses_shard_boundary(self, param: torch.Tensor, param_idx: int) -> bool:
+        """Return whether `param`'s flat M-FSDP item interval spans DP shards."""
+        layout = self._get_mfsdp_param_layout(param, param_idx)
+        if layout is None:
+            raise AssertionError(
+                "Expected M-FSDP parameter metadata while checking Muon boundary "
+                f"gather requirement: param_idx={param_idx}."
+            )
+
+        gbuf, item_index, bucket_index, shard_bucket_index = layout
+        if not getattr(gbuf, "is_data_distributed", True):
+            return False
+
+        item_size = int(item_index.size)
+        if item_size == 0:
+            return False
+
+        bucket_start = int(bucket_index.global_data_index)
+        bucket_size = int(bucket_index.size)
+        shard_size = int(shard_bucket_index.size)
+        if shard_size <= 0 or bucket_size % shard_size != 0:
+            raise AssertionError(
+                "Invalid M-FSDP shard metadata for Muon boundary gather detection: "
+                f"param_idx={param_idx}, bucket_size={bucket_size}, shard_size={shard_size}."
+            )
+
+        item_start = int(item_index.global_data_index)
+        item_end = item_start + item_size
+        if item_start < bucket_start or item_end > bucket_start + bucket_size:
+            raise AssertionError(
+                "M-FSDP item interval falls outside its bucket during Muon boundary "
+                f"gather detection: param_idx={param_idx}, item=({item_start}, {item_end}), "
+                f"bucket=({bucket_start}, {bucket_start + bucket_size})."
+            )
+
+        first_shard = (item_start - bucket_start) // shard_size
+        last_shard = (item_end - 1 - bucket_start) // shard_size
+        crosses_boundary = first_shard != last_shard
+
+        local_tensor = param.to_local()
+        if local_tensor.numel() > 0:
+            local_is_partial = tuple(param.shape) != tuple(local_tensor.shape)
+            if local_is_partial and not crosses_boundary:
+                raise AssertionError(
+                    "M-FSDP DTensor local shape indicates a split parameter, but flat "
+                    "bucket metadata does not cross a shard boundary: "
+                    f"param_idx={param_idx}, item=({item_start}, {item_end}), "
+                    f"shard_size={shard_size}, global_shape={tuple(param.shape)}, "
+                    f"local_shape={tuple(local_tensor.shape)}."
+                )
+
+        return crosses_boundary
 
     def _get_boundary_gather_param_indices(self, group: Dict[str, Any]) -> set[int]:
-        """Return globally-agreed bucket-boundary params needing all-gather.
-
-        Megatron-FSDP assigns each DP rank a contiguous slice within each flat
-        parameter bucket. Therefore, only the first and last non-empty Muon
-        parameters owned by a rank in each M-FSDP bucket can cross a DP
-        boundary. A Muon optimizer group may span multiple M-FSDP buckets, so
-        this detection must be bucket-aware.
-        """
+        """Return globally-agreed parameters whose flat items cross FSDP shard boundaries."""
         params = group["params"]
         cache_key = tuple(id(param) for param in params)
         cached_indices = self._boundary_gather_indices_cache.get(cache_key)
@@ -486,31 +546,22 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             return cached_indices
 
         has_mfsdp_params = any(getattr(param, "orig_param", None) is not None for param in params)
-        bucket_param_indices: dict[Any, list[tuple[tuple[int, int], int]]] = {}
-        for idx, param in enumerate(params):
-            if param.to_local().numel() == 0:
-                continue
-
-            bucket_metadata = self._get_mfsdp_bucket_key_and_offset(param, idx)
-            if bucket_metadata is None:
-                if has_mfsdp_params:
+        if has_mfsdp_params:
+            result = set()
+            for idx, param in enumerate(params):
+                if getattr(param, "orig_param", None) is None:
                     raise AssertionError(
                         "Muon optimizer group mixes M-FSDP params with params lacking "
                         f"M-FSDP bucket metadata: param_idx={idx}."
                     )
-                bucket_key = ("optimizer_group", 0)
-                order_key = (idx, idx)
-            else:
-                bucket_key, order_key = bucket_metadata
+                if self._mfsdp_param_crosses_shard_boundary(param, idx):
+                    result.add(idx)
+            self._boundary_gather_indices_cache[cache_key] = result
+            return result
 
-            bucket_param_indices.setdefault(bucket_key, []).append((order_key, idx))
-
-        local_boundary_indices: list[int] = []
-        for param_indices in bucket_param_indices.values():
-            param_indices.sort(key=lambda item: item[0])
-            for idx in {param_indices[0][1], param_indices[-1][1]}:
-                if self._needs_boundary_gather(params[idx]):
-                    local_boundary_indices.append(idx)
+        local_boundary_indices = [
+            idx for idx, param in enumerate(params) if self._needs_boundary_gather(param)
+        ]
 
         if self.dp_group is None or get_pg_size(self.dp_group) == 1:
             result = set(local_boundary_indices)
@@ -609,21 +660,21 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
 
     def _gather_full_uneven_local_tensor_like(
         self, dtensor_ref, local_tensor: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         """Gather a local tensor using the uneven sharding layout of `dtensor_ref`."""
         plan = self._get_uneven_gather_plan(dtensor_ref)
         if plan is None:
-            if uneven_dtensor_to_full_tensor is None:
+            if redistribute_uneven_dtensor_to_replicated is None:
                 raise RuntimeError(
-                    "Megatron-FSDP `uneven_dtensor_to_full_tensor` is required "
+                    "Megatron-FSDP `redistribute_uneven_dtensor_to_replicated` is required "
                     "to gather un-evenly sharded parameters for Muon step()."
                 )
             local_dtensor = self._dtensor_from_local_like(dtensor_ref, local_tensor.contiguous())
             if not hasattr(local_dtensor._local_tensor, "__create_chunk_list__"):
                 update_uneven_dtensor_chunk_metadata(local_dtensor)
-            full_tensor = uneven_dtensor_to_full_tensor(local_dtensor)
+            full_tensor = redistribute_uneven_dtensor_to_replicated(local_dtensor).to_local()
             self._copy_dtensor_chunk_metadata(dtensor_ref, local_dtensor)
-            return full_tensor
+            return None if local_tensor.numel() == 0 else full_tensor
 
         local_buffer = local_tensor.contiguous().view(-1)
         group_tensors = [
@@ -631,6 +682,9 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             for chunk_info in plan["chunk_infos"]
         ]
         torch.distributed.all_gather(group_tensors, local_buffer, group=plan["shard_group"])
+
+        if local_tensor.numel() == 0:
+            return None
 
         full_tensor = torch.empty(
             dtensor_ref.shape, dtype=local_tensor.dtype, device=local_tensor.device
