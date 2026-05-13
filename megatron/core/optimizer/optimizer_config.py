@@ -289,6 +289,11 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
+    muon_fsdp_batched_all_gather: bool = False
+    """If True, batch Muon+M-FSDP boundary parameter all-gathers by dtype/device/group.
+    This can reduce collective count but increases temporary peak memory.
+    """
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""

@@ -2347,6 +2347,10 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument('--muon-fsdp-batched-all-gather', action='store_true',
+                       help='Batch Muon+M-FSDP boundary parameter all-gathers by '
+                       'dtype/device/group. This can reduce collective count but increases '
+                       'temporary peak memory.')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')

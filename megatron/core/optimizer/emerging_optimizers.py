@@ -309,6 +309,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         self,
         params: ParamsT,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
+        fsdp_batched_all_gather: bool = False,
         **kwargs: Any,
     ) -> None:
         assert _HAVE_DTENSOR, (
@@ -316,6 +317,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             f"is required to use {type(self).__name__}."
         )
         self.dp_group = dp_group
+        self.fsdp_batched_all_gather = fsdp_batched_all_gather
         self._boundary_gather_indices_cache: Dict[tuple[int, ...], set[int]] = {}
         self._uneven_gather_plan_cache: Dict[int, Dict[str, Any]] = {}
         super().__init__(params, **kwargs)
@@ -383,9 +385,18 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             i for i, (_, _, needs_gather, _, _) in enumerate(all_updates) if needs_gather
         ]
         if boundary_update_indices:
-            gathered_boundary_updates = self._gather_full_uneven_local_tensors_like(
-                [(all_updates[i][0], all_updates[i][1]) for i in boundary_update_indices]
-            )
+            boundary_items = [
+                (all_updates[i][0], all_updates[i][1]) for i in boundary_update_indices
+            ]
+            if self.fsdp_batched_all_gather:
+                gathered_boundary_updates = self._gather_full_uneven_local_tensors_like(
+                    boundary_items
+                )
+            else:
+                gathered_boundary_updates = [
+                    self._gather_full_uneven_local_tensor_like(p, local_tensor)
+                    for p, local_tensor in boundary_items
+                ]
             for i, full_pre_ns_grad in zip(boundary_update_indices, gathered_boundary_updates):
                 p, _, _, lr, group_kwargs = all_updates[i]
                 all_updates[i] = (p, full_pre_ns_grad, True, lr, group_kwargs)
@@ -425,11 +436,48 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         local_tensor = dtensor.to_local()
         return local_tensor.numel() > 0 and tuple(dtensor.shape) != tuple(local_tensor.shape)
 
-    def _get_boundary_gather_param_indices(self, group: Dict[str, Any]) -> set[int]:
-        """Return globally-agreed first/last local params needing a boundary all-gather.
+    def _get_mfsdp_bucket_key_and_offset(self, param: torch.Tensor, param_idx: int):
+        """Return the M-FSDP bucket identity and flat-buffer offset for `param`.
 
-        Within a single M-FSDP DataParallelBuffer bucket, a DP rank owns one contiguous shard of
-        that bucket, so only the first/last non-empty params in that bucket can be partial.
+        FSDP optimizer params keep a pointer to the original module parameter.
+        M-FSDP attaches the original parameter's buffer and item id there, which
+        lets Muon reason about first/last params in the same flat bucket instead
+        of in the larger optimizer param group.
+        """
+        orig_param = getattr(param, "orig_param", None)
+        if orig_param is None:
+            return None
+
+        gbuf = getattr(orig_param, "_gbuf", None)
+        item_id = getattr(orig_param, "_item_id", None)
+        if gbuf is None or item_id is None or not hasattr(gbuf, "item_index_map"):
+            raise AssertionError(
+                "M-FSDP optimizer parameter is missing bucket metadata required "
+                f"for Muon boundary gather detection: param_idx={param_idx}."
+            )
+
+        item_index = gbuf.item_index_map.get(item_id)
+        if item_index is None or not hasattr(item_index, "global_data_index"):
+            raise AssertionError(
+                "M-FSDP optimizer parameter has invalid bucket item metadata required "
+                f"for Muon boundary gather detection: param_idx={param_idx}, "
+                f"item_id={item_id}."
+            )
+
+        bucket_index = getattr(gbuf, "bucket_index", None)
+        bucket_id = getattr(bucket_index, "bucket_id", getattr(gbuf, "bucket_id", None))
+        bucket_key = (id(gbuf), bucket_id)
+        order_key = (int(item_index.global_data_index), param_idx)
+        return bucket_key, order_key
+
+    def _get_boundary_gather_param_indices(self, group: Dict[str, Any]) -> set[int]:
+        """Return globally-agreed bucket-boundary params needing all-gather.
+
+        Megatron-FSDP assigns each DP rank a contiguous slice within each flat
+        parameter bucket. Therefore, only the first and last non-empty Muon
+        parameters owned by a rank in each M-FSDP bucket can cross a DP
+        boundary. A Muon optimizer group may span multiple M-FSDP buckets, so
+        this detection must be bucket-aware.
         """
         params = group["params"]
         cache_key = tuple(id(param) for param in params)
@@ -437,12 +485,30 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         if cached_indices is not None:
             return cached_indices
 
-        non_empty_indices = [
-            idx for idx, param in enumerate(params) if param.to_local().numel() > 0
-        ]
+        has_mfsdp_params = any(getattr(param, "orig_param", None) is not None for param in params)
+        bucket_param_indices: dict[Any, list[tuple[tuple[int, int], int]]] = {}
+        for idx, param in enumerate(params):
+            if param.to_local().numel() == 0:
+                continue
+
+            bucket_metadata = self._get_mfsdp_bucket_key_and_offset(param, idx)
+            if bucket_metadata is None:
+                if has_mfsdp_params:
+                    raise AssertionError(
+                        "Muon optimizer group mixes M-FSDP params with params lacking "
+                        f"M-FSDP bucket metadata: param_idx={idx}."
+                    )
+                bucket_key = ("optimizer_group", 0)
+                order_key = (idx, idx)
+            else:
+                bucket_key, order_key = bucket_metadata
+
+            bucket_param_indices.setdefault(bucket_key, []).append((order_key, idx))
+
         local_boundary_indices: list[int] = []
-        if non_empty_indices:
-            for idx in {non_empty_indices[0], non_empty_indices[-1]}:
+        for param_indices in bucket_param_indices.values():
+            param_indices.sort(key=lambda item: item[0])
+            for idx in {param_indices[0][1], param_indices[-1][1]}:
                 if self._needs_boundary_gather(params[idx]):
                     local_boundary_indices.append(idx)
 
