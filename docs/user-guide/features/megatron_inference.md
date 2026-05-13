@@ -3,7 +3,7 @@
 In-framework inference system for Megatron Core enabling training-inference consistency.
 
 ```{warning}
-**Experimental Feature**: Megatron in-framework inference is under active development and should be considered experimental. Performance is **not expected to match** dedicated inference engines like vLLM or SGLang.
+**Experimental Feature**: Megatron in-framework inference is under active development and should be considered experimental. Performance is **not expected to match** dedicated inference engines like vLLM, SGLang, or TensorRT-LLM.
 ```
 
 ## Overview
