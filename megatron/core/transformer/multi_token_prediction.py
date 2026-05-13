@@ -886,11 +886,15 @@ class MultiTokenPredictionLayer(MegatronModule):
                 submodules=hybrid_submodules,
                 layer_type_list=validate_segment_layers(mtp_layer_pattern),
                 pp_layer_offset=0,
-                pre_process=True,  # Always receives input from eh_proj
+                pre_process=True,  # Always receives input from eh_proj / e_proj+h_proj
                 post_layer_norm=False,  # MTP has its own final_layernorm
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
+                # mHC mode: ``_concat_embeddings`` already produced [s, b, n*h]
+                # via per-stream e_proj/h_proj; skip the entry-side expand that
+                # would otherwise blow the dim up to ``n*n*h``.
+                skip_input_expand=self.mhc_enabled,
             )
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer

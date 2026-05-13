@@ -248,12 +248,19 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        skip_input_expand: bool = False,
     ) -> None:
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        # When the caller has already produced an n-stream tensor (e.g. mHC+MTP
+        # where ``MultiTokenPredictionLayer._concat_embeddings`` mixes embedding
+        # in per-stream via e_proj/h_proj), the entry-side ``input_expand`` must
+        # be skipped — otherwise the tensor is re-expanded to ``n*n*C`` and
+        # downstream mHC projections see a mismatched reduction dim.
+        self.skip_input_expand = skip_input_expand
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -529,7 +536,11 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        if self.config.enable_hyper_connections and self.pre_process:
+        if (
+            self.config.enable_hyper_connections
+            and self.pre_process
+            and not self.skip_input_expand
+        ):
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.config.num_residual_streams
             )
@@ -645,28 +656,31 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
 
         # When MTP is enabled, save the pre-contraction multi-stream tensor
         # for MTP depth input before applying the learned output contraction.
+        #
+        # Only contract at the boundary that also owns the final layernorm —
+        # i.e. the actual model output stage. Sub-blocks (e.g. the MTP
+        # layer's inner HybridStack, which sets ``post_layer_norm=False``)
+        # must leave the tensor multi-stream so the enclosing
+        # ``MultiTokenPredictionLayer._postprocess`` can run its per-depth
+        # learned contraction.
         mhc_multistream = None
-        if self.config.enable_hyper_connections and self.post_process:
-            if self.config.mtp_num_layers is not None and self.post_layer_norm:
+        if (
+            self.config.enable_hyper_connections
+            and self.post_process
+            and self.post_layer_norm
+        ):
+            if self.config.mtp_num_layers is not None:
                 mhc_multistream = hidden_states
             # DSv4 introduced the new learned output contraction for mHC.
             # [s, b, n*C] -> [s, b, C]
-            if self.post_layer_norm:
-                hidden_states = learned_output_contract(
-                    hidden_states,
-                    self.hc_head_fn,
-                    self.hc_head_base,
-                    self.hc_head_scale,
-                    self.config.num_residual_streams,
-                    self.config.layernorm_epsilon,
-                )
-            else:
-                # Legacy averaging contract preserved for non-final blocks; the
-                # learned contract requires the per-block hc_head_* parameters
-                # that are only built when post_layer_norm is true.
-                hidden_states = HyperConnectionModule.output_contract(
-                    hidden_states, self.config.num_residual_streams
-                )
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.config.num_residual_streams,
+                self.config.layernorm_epsilon,
+            )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
