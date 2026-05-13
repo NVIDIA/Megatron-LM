@@ -5,6 +5,7 @@ TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama3_8b_fsdp_fp8"}
 TOKENIZER_ARG=${3:-"MOCK"} # Path to tokenizer model, or "MOCK"
 DATA_ARG=${4:-"MOCK"}     # Data prefix, or "MOCK"
 PROFILE=${PROFILE:-0}
+EMPTY_UNUSED_MEMORY_LEVEL=${EMPTY_UNUSED_MEMORY_LEVEL:-0}
 
 # Create directories if they don't exist
 mkdir -p "$(dirname "$CHECKPOINT_PATH")"
@@ -91,7 +92,7 @@ TRAINING_ARGS=(
     --bf16
     --cross-entropy-loss-fusion
     --manual-gc
-    --empty-unused-memory-level 1
+    --empty-unused-memory-level ${EMPTY_UNUSED_MEMORY_LEVEL}
     --exit-duration-in-mins 235
 )
 
