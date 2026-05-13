@@ -35,7 +35,7 @@ from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import sharded_state_dict_default, make_sharded_tensors_for_checkpoint
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
@@ -1072,5 +1072,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         tp_group=self.tp_group,
                     )
                 )
+
+        # Include direct nn.Parameter attributes (e.g. hc_head_fn/base/scale for
+        # learned output contraction) that are not sub-modules and would be missed
+        # by the named_children() loop above.
+        for pname, param in self._parameters.items():
+            if param is not None:
+                local_sd = {pname: param}
+                wrapped = make_sharded_tensors_for_checkpoint(
+                    local_sd, prefix, sharded_offsets=sharded_offsets,
+                )
+                sharded_state_dict.update(wrapped)
 
         return sharded_state_dict
