@@ -433,7 +433,7 @@ class MambaMixer(MegatronModule):
         _, batch, dim = hidden_states.shape
         conv_state, ssm_state = None, None
 
-        if in_inference_mode:
+        if in_inference_mode and inference_context is not None:
             if inference_context.is_dynamic_batching():
                 return self._dynamic_inference(hidden_states, inference_context)
             else:

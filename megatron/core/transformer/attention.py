@@ -1030,8 +1030,10 @@ class Attention(MegatronModule, ABC):
         is_using_flash_decode = is_inference_mode and self.config.flash_decode
         # is_using_flashinfer_rope - True if we are using the dynamic inference engine
         # with flashinfer fused rope
-        is_using_flashinfer_rope = is_inference_mode and (
-            not inference_context.is_static_batching()
+        is_using_flashinfer_rope = (
+            is_inference_mode
+            and inference_context is not None
+            and not inference_context.is_static_batching()
             and inference_context.use_flashinfer_fused_rope
         )
         if is_using_flash_decode or is_using_flashinfer_rope:

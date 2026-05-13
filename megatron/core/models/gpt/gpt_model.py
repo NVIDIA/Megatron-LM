@@ -346,7 +346,11 @@ class GPTModel(LanguageModule):
                 hasattr(inference_context, 'use_flashinfer_fused_rope')
                 and inference_context.use_flashinfer_fused_rope
             )
-            if in_inference_mode and (self.config.flash_decode or use_flash_infer_fused_rope):
+            if (
+                in_inference_mode
+                and inference_context is not None
+                and (self.config.flash_decode or use_flash_infer_fused_rope)
+            ):
                 assert (
                     not self.config.flash_decode
                 ) or inference_context.is_static_batching(), (
@@ -409,6 +413,7 @@ class GPTModel(LanguageModule):
 
         if (
             in_inference_mode
+            and inference_context is not None
             and (
                 (
                     self.config.cuda_graph_impl == "local"
@@ -430,8 +435,10 @@ class GPTModel(LanguageModule):
         if in_inference_mode:
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations
-            if inference_context.is_dynamic_batching() and is_using_quantization_scales(
-                self.config
+            if (
+                inference_context is not None
+                and inference_context.is_dynamic_batching()
+                and is_using_quantization_scales(self.config)
             ):
                 decoder_input[inference_context.padding_slice] = 0.0
 
@@ -610,6 +617,7 @@ class GPTModel(LanguageModule):
         # tokens rather than stale speculative tokens from the previous step.
         is_spec_decode = (
             in_inference_mode
+            and inference_context is not None
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
@@ -681,7 +689,11 @@ class GPTModel(LanguageModule):
                 config=self.config,
             )
 
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.config.materialize_only_last_token_logits
+        ):
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:

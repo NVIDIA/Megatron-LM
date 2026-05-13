@@ -423,6 +423,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # quantization scales to avoid corrupting amax calculations
             if (
                 in_inference_mode
+                and inference_context is not None
                 and inference_context.is_dynamic_batching()
                 and is_using_quantization_scales(self.config)
             ):
@@ -486,6 +487,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # tokens rather than stale speculative tokens from the previous step.
         is_spec_decode = (
             in_inference_mode
+            and inference_context is not None
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
@@ -526,7 +528,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                 )
         sequence_parallel_override = False
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.config.materialize_only_last_token_logits
+        ):
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
