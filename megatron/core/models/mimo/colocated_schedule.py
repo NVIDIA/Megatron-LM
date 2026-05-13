@@ -248,6 +248,10 @@ def _slice_for_encoder_dp(full_encoder_input, encoder_grid, llm_grid):
                     f"[seq, batch, hidden], got shape={tuple(tensor.shape)}"
                 )
             bs = tensor.shape[1]
+            if bs % scale != 0:
+                raise ValueError(
+                    f"Encoder fan-in: tensor batch={bs} not divisible by scale={scale}."
+                )
             ss = bs // scale
             if ss == 0:
                 raise ValueError(
