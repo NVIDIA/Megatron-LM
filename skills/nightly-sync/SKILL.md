@@ -244,9 +244,92 @@ for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
     echo "WARNING: $f differs from origin/dev"
   fi
 done
+
+# 3. Dev-feature preservation audit.
+#
+# The most common sync regression is silently dropping a dev-only feature
+# that main does not have yet. Pattern:
+#   T0: a feature lands on dev
+#   T1 > T0: the same feature lands on main (possibly reformatted)
+#   The sync runs between T0 and T1. `-X theirs` resolves any conflict in
+#   main's favour, dropping dev's addition wherever main happened to
+#   touch a nearby line for an unrelated reason.
+#
+# For each file the sync touched (modulo skill-sanctioned overrides and
+# the dependency triple), find every line that satisfies ALL of:
+#   line is on origin/dev        (dev had it)
+#   line is NOT on origin/main   (main never owned it)
+#   line is NOT in the merged tree  (the merge dropped it)
+# Filter out whitespace-only lines and bracket-only lines (they
+# frequently differ for cosmetic reasons).
+#
+# Files in the "Files to Override from Main" list (training.py,
+# initialize.py, utils.py, data_samplers.py, layer_wise_optimizer.py)
+# are exempt by skill convention — main may legitimately win there.
+# CODEOWNERS and the dep triple are checked above; skip them here.
+
+INTENTIONAL_OVERRIDE_REGEX='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
+SKIP_REGEX='^(pyproject\.toml|uv\.lock|docker/Dockerfile\.ci\.dev|\.github/CODEOWNERS)$'
+
+BASE=$(git merge-base origin/dev origin/main)
+VIOLATIONS=0
+for f in $(git diff --name-only "$BASE"...HEAD \
+            -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
+               '*.sh' '*.cpp' '*.cu' '*.h' \
+            | sort -u); do
+  [[ "$f" =~ $SKIP_REGEX ]] && continue
+  [[ "$f" =~ $INTENTIONAL_OVERRIDE_REGEX ]] && continue
+  [ -f "$f" ] || continue
+
+  missing=$(comm -23 \
+              <(git show "origin/dev:$f"  2>/dev/null | sort -u) \
+              <(git show "origin/main:$f" 2>/dev/null | sort -u) \
+            | comm -23 - <(sort -u "$f") \
+            | grep -E '[[:alnum:]_]' \
+            || true)
+
+  if [ -n "$missing" ]; then
+    echo "=== $f ==="
+    printf '%s\n' "$missing"
+    VIOLATIONS=$((VIOLATIONS + $(printf '%s\n' "$missing" | grep -c .)))
+  fi
+done
+
+if [ "$VIOLATIONS" -gt 0 ]; then
+  echo "ABORT: $VIOLATIONS dev-only line(s) dropped by the merge. For each:"
+  echo "  (a) MAIN INTENTIONALLY REMOVED — find the specific commit in"
+  echo "      'git log origin/main -- <file>' that removed it; document the"
+  echo "      SHA in the PR body, then the drop is acceptable."
+  echo "  (b) MERGE ACCIDENT — main never explicitly touched that line."
+  echo "      RESTORE the dev line (Edit/Write to put it back)."
+  echo "Default to (b); only declare (a) with a specific main commit as evidence."
+  exit 1
+fi
 ```
 
-The CODEOWNERS check is a HARD abort — never push if it fails.
+The CODEOWNERS check and the dev-feature preservation audit are HARD
+aborts — never push if either fails. The dep-triple check is a warning
+because git-source reconciliation can produce legitimate diffs there.
+
+Recent regressions the dev-feature audit would have flagged (all
+"merge accident" type from #4659 and #4716):
+
+- `transformer_layer.py` lost `_forward_mlp_router(input_ids=None)`
+- `token_dispatcher.py` lost the
+  `num_sms_preprocessing_api=...` kwarg on the `_HybridEPManager` call
+- `moe_layer.py` lost `self._maybe_record_overload_factor(...)`
+- `gpt_dynamic_inference_with_coordinator.py` lost
+  `from megatron.training.arguments import parse_and_validate_args`
+- `datasets/readme.md` lost the dev-only "Packing Scheduler" section
+- `data_samplers.py` / `utils.py` / `training.py` kept main's
+  `args.hybrid_context_parallel` instead of dev's
+  `args.dynamic_context_parallel` (counts as a MERGE ACCIDENT — dev's
+  reference is present, main's is the deprecated alias that's False
+  when callers pass `--dynamic-context-parallel`). These files are on
+  the override list so the audit treats them as "advisory", but you
+  should still rename `args.hybrid_context_parallel` →
+  `args.dynamic_context_parallel` on every reference after taking
+  main's version of these files.
 
 ### Commit and Push
 
