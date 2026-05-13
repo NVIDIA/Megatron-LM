@@ -596,7 +596,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     # Collect args, model, RNG.
+    # For LEGACY checkpoints, every unique (tp_rank, ep_rank) shard must be written by
+    # exactly one rank. Neither dp_rank==0 nor edp_rank==0 alone covers all shards when
+    # the dense and expert parallelism layouts disagree (e.g. TP > EP*ETP); the union
+    # does, with at most one rank per (tp_rank, ep_rank) inside any DP group.
     if not torch.distributed.is_initialized() \
+            or mpu.get_data_parallel_rank() == 0 \
             or mpu.get_expert_data_parallel_rank() == 0 \
             or ckpt_type != CheckpointType.LEGACY:
         if ckpt_type != CheckpointType.LEGACY:
