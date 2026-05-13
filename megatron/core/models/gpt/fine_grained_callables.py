@@ -275,7 +275,6 @@ class TransformerLayerNode(ScheduleNode):
         free_input = should_free_input(name, is_moe, config, num_local_experts)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
-        # Megatron-FSDP hooks setup.
         self.is_layer_first_node = None
         self.is_layer_last_node = None
 
@@ -293,7 +292,7 @@ class TransformerLayerNode(ScheduleNode):
         self.detached = tuple()
         self.before_detached = tuple()
         self.is_mtp = extra_args.get("is_mtp", False)
-        self.fsdp_post_backward_gradient_hooks = None
+        self.post_wgrad_grad_acc_hooks = None
 
         # Create flags to indicate first and last layer
         self.is_first_layer = extra_args.get("is_first_layer", False)
@@ -360,14 +359,14 @@ class TransformerLayerNode(ScheduleNode):
                 module.backward_dw()
             nvtx_range_pop(nvtx_msg)
 
-        # Setup delayed wgrad for Megatron FSDP by collecting gradient acc
-        # hooks if there is `.grad` attribute attached to param.
-        if self.fsdp_post_backward_gradient_hooks is None:
-            self.fsdp_post_backward_gradient_hooks = []
+        # Collecting gradient acc hooks if there is `post_wgrad_grad_acc_hook`
+        # attribute attached to param, o.w. the wgrad hook wouldn't be fired.
+        if self.post_wgrad_grad_acc_hooks is None:
+            self.post_wgrad_grad_acc_hooks = []
             for module in self.bwd_dw_callables:
                 for param in module.parameters():
                     # Collect hook only if the gradient is generated in current
-                    # TransformerLayerNode, because the fsdp_grad_acc hook needs
+                    # TransformerLayerNode, because the grad_acc hook needs
                     # to be executed right after `backward_dw` finishes.
                     # For example: Shared expert's hook should be collected in
                     # `attn` Node, even if the param belongs to `mlp` Node.
@@ -376,17 +375,15 @@ class TransformerLayerNode(ScheduleNode):
                         and param.requires_grad
                         and param.grad is not None
                     ):
-                        self.fsdp_post_backward_gradient_hooks.append(
-                            param.post_wgrad_grad_acc_hook
-                        )
+                        self.post_wgrad_grad_acc_hooks.append(param.post_wgrad_grad_acc_hook)
 
-        # Execute gradient accumulation hooks for Megatron FSDP.
-        if self.fsdp_post_backward_gradient_hooks:
+        # Execute gradient accumulation hooks after wgrad compute.
+        if self.post_wgrad_grad_acc_hooks:
             with torch.cuda.stream(self.stream):
-                for hook in self.fsdp_post_backward_gradient_hooks:
+                for hook in self.post_wgrad_grad_acc_hooks:
                     hook()
 
-        # Execute resharding hook for Megatron FSDP.
+        # Execute TransformerLayer backward hook.
         if self.is_layer_first_node:
             self._post_backward_hook()
 
@@ -400,12 +397,12 @@ class TransformerLayerNode(ScheduleNode):
         self.bwd_dw_callables = None
 
     def set_post_forward_hook(self, hook):
-        """Register a hook to release FSDP params after this node's forward pass."""
+        """Register post_forward_hook at TransformerLayer level."""
         self.is_layer_last_node = True
         self._post_forward_hook = hook
 
     def set_post_backward_hook(self, hook):
-        """Register a hook to release FSDP params after this node's backward pass."""
+        """Register post_backward_hook at TransformerLayer level."""
         self.is_layer_first_node = True
         self._post_backward_hook = hook
 
