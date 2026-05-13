@@ -3,9 +3,11 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
-  # TE checks NVTE_CUTEDSL_FUSED_GROUPED_MLP at import time, so it must be set
-  # before training starts. Without it, TE's op-fuser silently falls back to
-  # basic-op and this recipe wouldn't actually exercise the cuDSL fused kernel.
+  # Forward-compat with Blackwell: TE's cuDSL fused grouped MLP kernel
+  # additionally requires SM100, so on H100/A100 CI hardware this var is a no-op
+  # and TE falls back to its basic-op path. Setting it so the kernel is picked
+  # up automatically when Blackwell joins the CI matrix; the Megatron op-fuser
+  # wrapper (this PR's contribution) is exercised end-to-end on either path.
   NVTE_CUTEDSL_FUSED_GROUPED_MLP: 1
 MODEL_ARGS:
   --num-layers: 4

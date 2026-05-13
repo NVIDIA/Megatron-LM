@@ -820,13 +820,16 @@ class TestTEGroupedMLP:
         training.
 
         IMPORTANT: this test does NOT verify that TE's underlying cuDSL fused grouped
-        MLP kernel is actually invoked. That kernel is gated by the
-        `NVTE_CUTEDSL_FUSED_GROUPED_MLP` env var which TE checks at import time, not
-        runtime; setting it inside pytest is a no-op (TE has already imported). When
-        that env var is absent, TE silently falls back to its basic-op path and the
-        wrapper still works — the loss still decreases. The functional test
+        MLP kernel is actually invoked. That kernel additionally requires SM100
+        (Blackwell) compute capability, plus `NVTE_CUTEDSL_FUSED_GROUPED_MLP` set, plus
+        a fusion-registration that happens at TE module import. On H100/A100 hardware
+        (which is the current CI matrix) the kernel is unavailable regardless and TE
+        falls back to its basic-op path — the Megatron wrapper still runs end-to-end
+        and the loss still decreases. So this test covers the wrapper code this PR
+        adds; it does not cover the cuDSL kernel selection. The functional test
         `moe/gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser` sets the env var
-        in its recipe and is the real cuDSL kernel coverage.
+        in its recipe as Blackwell forward-compat, but on current CI hardware it also
+        runs basic-op.
         """
         try:
             from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
