@@ -1129,6 +1129,31 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
 
+        def _trim_step_entries_to_generated_keep(
+            request: DynamicInferenceRequest,
+            entries: Optional[list],
+            keep: int,
+            step_generated_count: int,
+            prompt_entries: Optional[list],
+            generated_entries: Optional[list],
+        ) -> Optional[list]:
+            """Trim generated-token entries while preserving same-step prompt entries."""
+            if entries is None:
+                return None
+            if request.sampling_params.skip_prompt_log_probs:
+                if step_generated_count == 0:
+                    return []
+                if len(entries) > step_generated_count:
+                    entries = entries[-step_generated_count:]
+                return entries[:keep]
+
+            prompt_length = len(request.prompt_tokens)
+            total_accumulated = len(prompt_entries or []) + len(generated_entries or [])
+            remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+            prompt_part = entries[:remaining_prompt_slots]
+            generated_part = entries[remaining_prompt_slots:]
+            return prompt_part + generated_part[:keep]
+
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
@@ -1161,20 +1186,48 @@ class DynamicInferenceEngine(AbstractEngine):
                     keep = request.sampling_params.num_tokens_to_generate - len(
                         request.generated_tokens
                     )
+                    step_generated_count = len(tokens)
                     tokens = tokens[:keep]
                     # Trim log probs / top-n to match so the counts stay in sync.
-                    if request_log_probs is not None:
-                        request_log_probs = request_log_probs[:keep]
+                    request_log_probs = _trim_step_entries_to_generated_keep(
+                        request,
+                        request_log_probs,
+                        keep,
+                        step_generated_count,
+                        request.prompt_log_probs,
+                        request.generated_log_probs,
+                    )
                     if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
+                        top_n_logprobs[req_idx] = _trim_step_entries_to_generated_keep(
+                            request,
+                            top_n_logprobs[req_idx],
+                            keep,
+                            step_generated_count,
+                            request.prompt_top_n_logprobs,
+                            request.generated_top_n_logprobs,
+                        )
                 termination_id = request.sampling_params.termination_id
                 if termination_id is not None and termination_id >= 0 and termination_id in tokens:
                     keep = tokens.index(termination_id) + 1
+                    step_generated_count = len(tokens)
                     tokens = tokens[:keep]
-                    if request_log_probs is not None:
-                        request_log_probs = request_log_probs[:keep]
+                    request_log_probs = _trim_step_entries_to_generated_keep(
+                        request,
+                        request_log_probs,
+                        keep,
+                        step_generated_count,
+                        request.prompt_log_probs,
+                        request.generated_log_probs,
+                    )
                     if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
+                        top_n_logprobs[req_idx] = _trim_step_entries_to_generated_keep(
+                            request,
+                            top_n_logprobs[req_idx],
+                            keep,
+                            step_generated_count,
+                            request.prompt_top_n_logprobs,
+                            request.generated_top_n_logprobs,
+                        )
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1276,10 +1329,24 @@ class DynamicInferenceEngine(AbstractEngine):
             # When a stop word was found mid-speculative-batch, trim log probs
             # and top_n_logprobs to match the truncated generated_tokens.
             if num_stop_word_trim > 0:
-                if request_log_probs is not None:
-                    request_log_probs = request_log_probs[:-num_stop_word_trim]
+                keep = max(0, len(tokens) - num_stop_word_trim)
+                request_log_probs = _trim_step_entries_to_generated_keep(
+                    request,
+                    request_log_probs,
+                    keep,
+                    len(tokens),
+                    request.prompt_log_probs,
+                    request.generated_log_probs,
+                )
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+                    top_n_logprobs[req_idx] = _trim_step_entries_to_generated_keep(
+                        request,
+                        top_n_logprobs[req_idx],
+                        keep,
+                        len(tokens),
+                        request.prompt_top_n_logprobs,
+                        request.generated_top_n_logprobs,
+                    )
 
             # Process log_probs if available (unified for both regular and chunked prefill)
             # Skip for requests being finished due to stop words — tokens are not

@@ -1021,6 +1021,20 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Mock logits matching input shape
         logits = torch.randn(1, 6, self.vocab_size, device='cuda')
+        if backend == "torch":
+            # The production dynamic step collects torch sampling buckets before
+            # calling this private helper. This test calls the helper directly,
+            # so set up deterministic greedy buckets and logits here.
+            ctx.active_request_metadata["temperature"][:2] = 1.0
+            ctx.active_request_metadata["top_k"][:2] = 1
+            ctx.active_request_metadata["top_p"][:2] = 0.0
+            self.text_generation_controller._dynamic_step_sample_bookkeeping()
+
+            expected_tokens = torch.tensor([11, 12, 99, 99, 22, 23], device='cuda')
+            logits.fill_(-1000.0)
+            logits[
+                0, torch.arange(expected_tokens.numel(), device='cuda'), expected_tokens
+            ] = 1000.0
         self.text_generation_controller._all_logits_cuda = logits
 
         self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
