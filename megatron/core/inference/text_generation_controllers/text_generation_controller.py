@@ -27,6 +27,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import (
+    GPUFuture,
     get_attention_mask,
     set_decode_expert_padding,
     set_moe_metadata_sync,
@@ -1693,12 +1694,15 @@ class TextGenerationController:
         }
 
     async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
+        self,
+        skip_bookkeeping: Optional[bool] = False,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+            loop (Optional[asyncio.AbstractEventLoop]): Event loop to use for GPU synchronization.
 
         Return:
             (Optional[Dict]): A dictionary containing:
@@ -1716,8 +1720,12 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
+        loop = get_asyncio_loop(loop)
+        gpu_done = GPUFuture(loop, interrupt_event_loop=True)
+
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
+            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             cuda_graph_request_count = (
                 context.padded_active_request_count
@@ -1748,24 +1756,25 @@ class TextGenerationController:
             context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
             range_pop()
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
+        # Trigger a faux-interrupt on the event loop after the forward pass GPU work completes.
+        # The actual await happens after the CPU has also enqueued sampling work.
+        # This allows the GPU to continue working (on sampling) while the faux-interrupt is handled.
+        gpu_done.record()
 
         with torch.inference_mode():
-            range_push("sampling")
-            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
-
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
                 self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
                 nvtx_range_pop("mtp-spec-decoding/verify")
+            else:
+                nvtx_range_push("sampling")
+                self._dynamic_step_sample_logits()
+                nvtx_range_pop("sampling")
+
+            await gpu_done
+
+            if self.num_speculative_tokens > 0:
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
@@ -1785,8 +1794,6 @@ class TextGenerationController:
                 # Phase 4: Release freed blocks. Deferred from Phase 2 so the
                 # data-dependent boolean-mask sync overlaps with MTP GPU work.
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
-            else:
-                self._dynamic_step_sample_logits()
 
             log_probs = None
             top_n_logprobs = None
@@ -1805,7 +1812,6 @@ class TextGenerationController:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                             log_probs_tensor
                         )
-            range_pop()
 
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do

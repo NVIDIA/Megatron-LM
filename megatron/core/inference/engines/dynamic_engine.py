@@ -1719,7 +1719,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(loop=self._loop)
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
