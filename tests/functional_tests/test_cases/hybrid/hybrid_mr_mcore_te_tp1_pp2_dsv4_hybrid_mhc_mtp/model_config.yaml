@@ -5,31 +5,40 @@ ENV_VARS:
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   ENABLE_LIGHTWEIGHT_MODE: true
 MODEL_ARGS:
-  --num-layers: 4
   --hidden-size: 512
   --num-attention-heads: 8
-  --multi-latent-attention: true
+  --num-query-groups: 8
+  --ffn-hidden-size: 2048
+  --kv-channels: 64
+  --mamba-num-heads: 8
+  --mamba-head-dim: 64
+  --mamba-state-dim: 128
+  --mamba-num-groups: 1
+  --normalization: RMSNorm
+  --disable-bias-linear: true
+  --squared-relu: true
+  --hybrid-layer-pattern: "C-D-/D-"
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
+  --rope-type: rope
   --q-lora-rank: 192
-  --kv-lora-rank: 64
   --qk-head-dim: 16
   --qk-pos-emb-head-dim: 8
   --v-head-dim: 16
-  --experimental-attention-variant: dsv4_hybrid
+  --csa-window-size: 128
+  --csa-compress-ratio-for-c: 4
+  --csa-compress-ratio-for-h: 128
+  --o-groups: 4
+  --o-lora-rank: 128
   --dsa-indexer-n-heads: 64
   --dsa-indexer-head-dim: 128
-  --dsa-indexer-topk: 512
-  --dsa-indexer-loss-coeff: 0.01
-  --dsa-indexer-use-sparse-loss: true
-  --csa-window-size: 128
-  --csa-compress-ratios: ([0,4,128,4,0])
-  --csa-compress-rotary-base: 40000
-  --attention-backend: fused
+  --dsa-indexer-topk: 64
+  --dsa-indexer-loss-coeff: 0.0
   --enable-hyper-connections: true
   --num-residual-streams: 4
   --mhc-sinkhorn-iterations: 20
   --mtp-num-layers: 1
   --mtp-loss-scaling-factor: 0.1
-  --pipeline-model-parallel-layout: "Et|t|t|tmL"
+  --attention-backend: unfused
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
@@ -38,16 +47,16 @@ MODEL_ARGS:
   --micro-batch-size: 4
   --global-batch-size: 32
   --seq-length: 1024
-  --position-embedding-type: rope
+  --position-embedding-type: none
   --max-position-embeddings: 1024
   --train-iters: 50
   --timing-log-level: 0
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.00015
@@ -72,6 +81,5 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
-  --attention-backend: unfused
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume
