@@ -232,6 +232,7 @@ class MultimodalModel(MegatronModule):
         attention_mask,
         position_ids,
         packed_seq_params,
+        padding_mask=None,
     ):
         """Apply CP split to model-forward inputs.
 
@@ -247,7 +248,7 @@ class MultimodalModel(MegatronModule):
         if cp_size <= 1:
             return (
                 decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids,
+                attention_mask, position_ids, padding_mask,
             )
         cp_rank = parallel_state.get_context_parallel_rank()
 
@@ -269,6 +270,8 @@ class MultimodalModel(MegatronModule):
                 labels = labels.index_select(1, idx)
             if loss_mask is not None:
                 loss_mask = loss_mask.index_select(1, idx)
+            if padding_mask is not None:
+                padding_mask = padding_mask.index_select(1, idx)
         else:
             def _split(t, seq_dim):
                 return None if t is None else _cp_split_tensor(
@@ -279,10 +282,11 @@ class MultimodalModel(MegatronModule):
             labels = _split(labels, 1)
             loss_mask = _split(loss_mask, 1)
             attention_mask = _split(attention_mask, 1)
+            padding_mask = _split(padding_mask, 1)
 
         return (
             decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids,
+            attention_mask, position_ids, padding_mask,
         )
 
     @contextlib.contextmanager
@@ -316,6 +320,7 @@ class MultimodalModel(MegatronModule):
         attention_mask: Tensor = None,
         labels: Tensor = None,
         loss_mask: Tensor = None,
+        padding_mask: Tensor = None,
         pixel_values: Tensor = None,
         image_grid_thw: Tensor = None,
         decoder_input: Tensor = None,
@@ -331,6 +336,11 @@ class MultimodalModel(MegatronModule):
             attention_mask: ``[B, S]`` attention mask (None in THD).
             labels: ``[B, S]`` target token IDs (``[1, T]`` in THD).
             loss_mask: ``[B, S]`` mask for loss (``[1, T]`` in THD).
+            padding_mask: ``[B, S]`` bool mask, True at collate-padded
+                positions (``[1, T]`` in THD). Forwarded to the language
+                decoder so MoE routing excludes padded tokens from aux
+                loss / z-loss / expert-bias accumulation. Distinct from
+                ``loss_mask``: only true padding, not SFT prompt tokens.
             pixel_values: Preprocessed image pixels.
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
             decoder_input: Pre-computed decoder input (skip embed).
@@ -369,7 +379,7 @@ class MultimodalModel(MegatronModule):
 
         (
             decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids,
+            attention_mask, position_ids, padding_mask,
         ) = self._cp_split_for_forward(
             decoder_input=decoder_input,
             input_ids=input_ids,
@@ -378,6 +388,7 @@ class MultimodalModel(MegatronModule):
             attention_mask=attention_mask,
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
         )
 
         with self._thd_mrope_no_cp_override(packed_seq_params):
@@ -388,5 +399,6 @@ class MultimodalModel(MegatronModule):
                 decoder_input=decoder_input,
                 labels=labels,
                 loss_mask=loss_mask,
+                padding_mask=padding_mask,
                 packed_seq_params=packed_seq_params,
             )
