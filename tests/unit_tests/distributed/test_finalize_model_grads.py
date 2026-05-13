@@ -1,9 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
-import importlib
 import inspect
 import os
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,7 +10,6 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
-    _update_router_expert_bias,
     finalize_model_grads,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -24,16 +20,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-_MISSING = object()
-_FINALIZE_MODEL_GRADS_MODULE = importlib.import_module(
-    "megatron.core.distributed.finalize_model_grads"
-)
-
-
-class _FinalizeModelGradsModel(torch.nn.Module):
-    def __init__(self, config):
+class _RouterExpertBiasModel(torch.nn.Module):
+    def __init__(self, config, local_tokens_per_expert):
         super().__init__()
         self.config = config
+        self.ddp_config = DistributedDataParallelConfig()
+        self.router = torch.nn.Module()
+        self.router.register_buffer("local_tokens_per_expert", local_tokens_per_expert)
+        self.router.register_buffer("expert_bias", torch.zeros_like(local_tokens_per_expert))
         self.finish_grad_sync_calls = 0
 
     def finish_grad_sync(self, force_all_reduce=False):
@@ -41,102 +35,68 @@ class _FinalizeModelGradsModel(torch.nn.Module):
         self.finish_grad_sync_calls += 1
 
 
-def _finalize_model_grads_config():
-    return SimpleNamespace(
-        timers=None,
-        flextron=False,
+def _router_expert_bias_config():
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=1,
+        use_cpu_initialization=True,
         moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        moe_router_bias_update_rate=0.25,
         moe_router_load_balancing_type="none",
     )
 
 
-def _patch_finalize_model_grads_collectives(monkeypatch):
-    def no_op(*args, **kwargs):
-        del args, kwargs
-
-    for name in (
-        "_allreduce_conditional_embedding_grads",
-        "_allreduce_non_tensor_model_parallel_grads",
-        "_allreduce_word_embedding_grads",
-        "_allreduce_position_embedding_grads",
-        "reset_model_temporary_tensors",
-    ):
-        monkeypatch.setattr(_FINALIZE_MODEL_GRADS_MODULE, name, no_op)
+def _router_bias_pg_collection(include_tp_dp_cp=True):
+    required_pgs = ['tp', 'pp', 'embd', 'pos_embd', 'dp_cp']
+    if include_tp_dp_cp:
+        required_pgs.append('tp_dp_cp')
+    return ProcessGroupCollection.use_mpu_process_groups(required_pgs)
 
 
-def _pg_collection(tp_dp_cp=_MISSING):
-    pg_collection = ProcessGroupCollection()
-    pg_collection.tp = object()
-    pg_collection.pp = object()
-    pg_collection.embd = None
-    pg_collection.pos_embd = None
-    pg_collection.dp_cp = object()
-    if tp_dp_cp is not _MISSING:
-        pg_collection.tp_dp_cp = tp_dp_cp
-    return pg_collection
+class TestFinalizeModelGradsMoEExpertBias:
+    def setup_method(self, method):
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=min(2, Utils.world_size))
 
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
 
-def test_update_router_expert_bias_uses_explicit_group(monkeypatch):
-    class RouterModule(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.local_tokens_per_expert = torch.tensor([1.0, 3.0])
-            self.expert_bias = torch.zeros(2)
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_finalize_model_grads_updates_router_expert_bias_with_custom_group(self):
+        config = _router_expert_bias_config()
+        device = torch.device("cuda", torch.cuda.current_device())
+        local_tokens = torch.tensor([float(torch.distributed.get_rank() + 1), 0.0], device=device)
+        model = _RouterExpertBiasModel(config, local_tokens)
 
-    group = object()
-    router = RouterModule()
-    config = type("Config", (), {"moe_router_bias_update_rate": 0.25})()
-    calls = []
+        finalize_model_grads([model], pg_collection=_router_bias_pg_collection())
 
-    def fake_get_updated_expert_bias(
-        tokens_per_expert, expert_bias, expert_bias_update_rate, tp_dp_cp_group=None
-    ):
-        calls.append((expert_bias_update_rate, tp_dp_cp_group))
-        return expert_bias + 1.0
+        expected_bias = torch.tensor([-0.25, 0.25], device=device)
+        torch.testing.assert_close(model.router.expert_bias, expected_bias)
+        torch.testing.assert_close(
+            model.router.local_tokens_per_expert, torch.zeros_like(local_tokens)
+        )
+        assert model.finish_grad_sync_calls == 1
 
-    monkeypatch.setattr(
-        _FINALIZE_MODEL_GRADS_MODULE, "get_updated_expert_bias", fake_get_updated_expert_bias
-    )
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_finalize_model_grads_requires_custom_group_before_grad_sync(self):
+        config = _router_expert_bias_config()
+        device = torch.device("cuda", torch.cuda.current_device())
+        pg_collections = [
+            _router_bias_pg_collection(include_tp_dp_cp=False),
+            _router_bias_pg_collection(),
+        ]
+        pg_collections[1].tp_dp_cp = None
 
-    _update_router_expert_bias([torch.nn.Sequential(router)], config, tp_dp_cp_group=group)
-
-    assert calls == [(0.25, group)]
-    torch.testing.assert_close(router.expert_bias, torch.ones(2))
-
-
-def test_finalize_model_grads_uses_pg_collection_tp_dp_cp(monkeypatch):
-    _patch_finalize_model_grads_collectives(monkeypatch)
-
-    group = object()
-    pg_collection = _pg_collection(tp_dp_cp=group)
-
-    calls = []
-
-    def fake_update_router_expert_bias(model, config, tp_dp_cp_group=None):
-        calls.append((model, config, tp_dp_cp_group))
-
-    monkeypatch.setattr(
-        _FINALIZE_MODEL_GRADS_MODULE, "_update_router_expert_bias", fake_update_router_expert_bias
-    )
-
-    config = _finalize_model_grads_config()
-    model = _FinalizeModelGradsModel(config)
-    finalize_model_grads([model], pg_collection=pg_collection)
-
-    assert model.finish_grad_sync_calls == 1
-    assert calls == [([model], config, group)]
-
-
-def test_finalize_model_grads_requires_tp_dp_cp_for_explicit_groups(monkeypatch):
-    _patch_finalize_model_grads_collectives(monkeypatch)
-
-    config = _finalize_model_grads_config()
-    model = _FinalizeModelGradsModel(config)
-
-    for pg_collection in (_pg_collection(), _pg_collection(tp_dp_cp=None)):
-        with pytest.raises(AssertionError, match="tp_dp_cp"):
-            finalize_model_grads([model], pg_collection=pg_collection)
-    assert model.finish_grad_sync_calls == 0
+        for pg_collection in pg_collections:
+            model = _RouterExpertBiasModel(config, torch.tensor([1.0, 0.0], device=device))
+            with pytest.raises(AssertionError, match="tp_dp_cp"):
+                finalize_model_grads([model], pg_collection=pg_collection)
+            assert model.finish_grad_sync_calls == 0
 
 
 class TestAllReduceLNGrads:

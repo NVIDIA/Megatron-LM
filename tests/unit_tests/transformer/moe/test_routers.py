@@ -26,34 +26,6 @@ except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
 
 
-def test_get_updated_expert_bias_uses_explicit_group(monkeypatch):
-    group = object()
-    all_reduce_groups = []
-
-    def fake_all_reduce(tensor, group=None):
-        all_reduce_groups.append(group)
-
-    def unexpected_default_group(**kwargs):
-        raise AssertionError("expected explicit tp_dp_cp_group")
-
-    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
-    monkeypatch.setattr(
-        "megatron.core.transformer.moe.moe_utils.parallel_state."
-        "get_tensor_and_data_parallel_group",
-        unexpected_default_group,
-    )
-
-    tokens_per_expert = torch.tensor([[1.0, 3.0]])
-    expert_bias = torch.zeros_like(tokens_per_expert)
-
-    updated_bias = get_updated_expert_bias(
-        tokens_per_expert, expert_bias, expert_bias_update_rate=0.1, tp_dp_cp_group=group
-    )
-
-    assert all_reduce_groups == [group]
-    torch.testing.assert_close(updated_bias, torch.tensor([[0.1, -0.1]]))
-
-
 class TestTop2Router:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
