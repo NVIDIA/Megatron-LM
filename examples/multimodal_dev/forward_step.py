@@ -237,9 +237,23 @@ def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=Fal
         cu_seqlens = list(accumulate(seqlens_list, initial=0))
         cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
 
+        # padding_mask: True at collate-padded positions within each packed
+        # sample. Real tokens occupy [cu_seqlens_padded[i], +seqlens_list[i]);
+        # the tail up to cu_seqlens_padded[i+1] is padding. Consumed by MoE
+        # routing in megatron.core to exclude padded tokens from aux loss,
+        # z-loss, and expert-bias accumulation.
+        total_tokens_padded = cu_seqlens_padded[-1]
+        padding_mask_thd = torch.zeros(total_tokens_padded, dtype=torch.bool)
+        for i, real_seqlen in enumerate(seqlens_list):
+            pad_start = cu_seqlens_padded[i] + real_seqlen
+            pad_end = cu_seqlens_padded[i + 1]
+            if pad_end > pad_start:
+                padding_mask_thd[pad_start:pad_end] = True
+
         packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
         packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
         packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
+        packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
 
         # TODO, maybe pixel_values's seqlens needs to be recorded. 
         packed_batch["pixel_values"] = torch.concat(pixel_values_list)
@@ -268,7 +282,10 @@ def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=Fal
         if divisible_by > 1:
             target_seqlens = math.ceil(target_seqlens / divisible_by) * divisible_by
         padded_batch = dict()
-        
+        # Capture real lengths before in-place padding so we can build a
+        # padding_mask for MoE routing (True at collate-padded positions).
+        real_seqlens = [s["input_ids"].shape[0] for s in batch]
+
         for sample in batch:
             sample["input_ids"] = F.pad(sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]), value=0)
             sample["labels"] = F.pad(sample["labels"], (0, target_seqlens - sample["labels"].shape[0]), value=-100)
@@ -277,6 +294,8 @@ def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=Fal
         padded_batch["input_ids"] = torch.concat([x["input_ids"].unsqueeze(0) for x in batch], dim=0)
         padded_batch["labels"] = torch.concat([x["labels"].unsqueeze(0) for x in batch], dim=0)
         padded_batch["loss_mask"] = torch.concat([x["loss_mask"].unsqueeze(0) for x in batch], dim=0)
+        positions = torch.arange(target_seqlens).unsqueeze(0)
+        padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
         padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
         # broadcast to all tp ranks
@@ -385,6 +404,7 @@ def forward_step(data_iterator, model):
         attention_mask=batch.get("attention_mask", None),
         labels=batch.get("labels", None),
         loss_mask=batch.get("loss_mask", None),
+        padding_mask=batch.get("padding_mask", None),
         pixel_values=pixel_values,
         image_grid_thw=batch.get("image_grid_thw", None),
         packed_seq_params=batch.get("packed_seq_params", None),
