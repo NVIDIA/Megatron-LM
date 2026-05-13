@@ -1,4 +1,4 @@
-"""FSDPModule implementation for the Megatron-FSDP fully_shard rewrite path."""
+"""FSDPModule implementation for Megatron-FSDP2."""
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple

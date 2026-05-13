@@ -5,16 +5,13 @@ from pathlib import Path
 from typing import Tuple
 
 import torch
-import torch.nn as nn
 import torch.distributed as dist
-
 import torch.distributed.checkpoint as dcp
+import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
-
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
-
 
 # -----------------------
 # Model definitions
@@ -63,11 +60,11 @@ def build_fsdp_model(
     use_megatron_fsdp: bool,
 ) -> Tuple["FSDPModule", torch.distributed.device_mesh.DeviceMesh]:
     if use_megatron_fsdp:
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import fully_shard, FSDPModule
         from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule, fully_shard
         sys.modules["get_state_dict"] = get_state_dict
     else:
-        from torch.distributed.fsdp import fully_shard, FSDPModule
+        from torch.distributed.fsdp import FSDPModule, fully_shard
 
     mesh = init_distributed()
     model = ToyModel(dim=dim, n_layers=n_layers).to("cuda")

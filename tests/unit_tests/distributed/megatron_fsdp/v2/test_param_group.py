@@ -16,9 +16,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.param_group import (
-    ParameterGroup,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 
 # ------------------------------------------------------------------ #
 #  Process group — init once per pytest session, shared by all tests

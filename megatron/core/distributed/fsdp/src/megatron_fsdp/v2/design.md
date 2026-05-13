@@ -1,4 +1,4 @@
-# Design: `fully_shard_rewrite` Implementation
+# Design: Megatron-FSDP2 Implementation
 
 ---
 

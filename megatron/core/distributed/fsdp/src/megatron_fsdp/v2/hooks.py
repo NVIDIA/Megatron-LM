@@ -1,4 +1,4 @@
-"""Forward and backward hook registration for the fully_shard rewrite path."""
+"""Forward and backward hook registration for Megatron-FSDP2."""
 
 import functools
 from typing import Any, Callable, Dict, List, Tuple

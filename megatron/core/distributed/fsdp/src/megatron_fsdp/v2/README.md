@@ -5,7 +5,7 @@ This directory contains the **fully_shard_v2** implementation — a PyTorch FSDP
 ## Architecture
 
 ```
-fully_shard_rewrite/
+v2/
 ├── README.md                    # This file
 ├── __init__.py                  # Public exports
 ├── fully_shard.py               # Core fully_shard() API + FSDPModule class

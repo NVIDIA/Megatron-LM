@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-"""Mixed precision policy helpers for the Megatron-FSDP fully_shard rewrite path.
+"""Mixed precision policy helpers for Megatron-FSDP2.
 
 This module owns the v2 policy data model. Translation from Megatron/MCore
 config objects belongs in the adapter layer.

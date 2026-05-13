@@ -1,5 +1,5 @@
 """
-Public fully_shard API for the Megatron-FSDP rewrite path.
+Public fully_shard API for Megatron-FSDP2.
 
 The implementation is split across:
 - fsdp_module.py: FSDPModule behavior and runtime state
