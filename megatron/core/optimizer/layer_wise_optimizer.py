@@ -33,6 +33,55 @@ from .param_layout import (
 logger = logging.getLogger(__name__)
 
 
+def is_layer_wise_managed_param(param: torch.nn.Parameter) -> bool:
+    """Whether a parameter is managed by :class:`LayerWiseDistributedOptimizer`.
+
+    Returns True for the 2D matrix-like weight parameters that Muon orthogonalizes
+    via Newton-Schulz, and False for embeddings, biases, LayerNorm weights, and
+    any other non-matrix parameter (which are handled by Adam through a separate
+    :class:`DistributedOptimizer`).
+
+    Mirrors the routing rule applied by ``_get_param_groups`` /
+    ``default_param_overrides`` for Muon.
+    """
+    if not param.dim() == 2:
+        return False
+    if getattr(param, 'is_embedding_or_output_parameter', False):
+        return False
+    return True
+
+
+def _bucket_is_layer_wise_managed(bucket) -> bool:
+    """Whether a DDP bucket belongs to a LayerWise-managed buffer.
+
+    Buckets are built from params that share a :class:`BufferKey`, so checking
+    the first param's tag is sufficient. When no tagging has been done (legacy
+    ping-pong path), LayerWise owns every bucket so we default to True.
+    """
+    if not bucket.params_list:
+        return False
+    param = bucket.params_list[0]
+    if not hasattr(param, 'is_layer_wise_distributed_optimizer'):
+        return True
+    return param.is_layer_wise_distributed_optimizer
+
+
+def tag_params_for_buffer_routing(model_chunks) -> None:
+    """Tag every requires-grad param with ``is_layer_wise_distributed_optimizer``.
+
+    Run this once on the un-DDP-wrapped model chunks before
+    :class:`DistributedDataParallel` constructs its grad/param buffers — the
+    grouping function ``group_params_for_buffers`` reads this attribute to
+    decide which buffer each param lands in (LayerWise shard-aligned buffer vs
+    DistOpt-style byte-level buffer).
+    """
+    for model_chunk in model_chunks:
+        for param in model_chunk.parameters():
+            if not param.requires_grad:
+                continue
+            param.is_layer_wise_distributed_optimizer = is_layer_wise_managed_param(param)
+
+
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
@@ -331,6 +380,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Returns:
             :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
         """
+        # Avoid a circular import: DistributedOptimizer imports LayerWise indirectly.
+        from .distrib_optimizer import DistributedOptimizer
+
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
@@ -343,7 +395,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             else:
                 dp_world_size = data_parallel_world_size
 
-            layouts[buffer_key] = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
+            # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
+            # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
+            # get DistOpt's byte-level layout.
+            if buffer_key.is_layer_wise_distributed_optimizer:
+                compute_per_buffer_layout = (
+                    LayerWiseDistributedOptimizer._compute_per_buffer_param_layout
+                )
+            else:
+                compute_per_buffer_layout = DistributedOptimizer._compute_per_buffer_param_layout
+            layouts[buffer_key] = compute_per_buffer_layout(
                 group_params, bucket_size, dp_world_size, ddp_config, param_indices
             )
         return FullParamLayout(layouts=layouts)
@@ -476,6 +537,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         param_to_shard: Dict[torch.nn.Parameter, int] = {}
         for full_layout in full_param_layouts:
             for buffer_key, layout in full_layout.layouts.items():
+                # Non-LayerWise buffers (e.g. Adam-managed embeddings, biases,
+                # layernorms with a DistOpt byte-level layout) are managed by a
+                # separate DistributedOptimizer; LayerWise does not own them.
+                if not buffer_key.is_layer_wise_distributed_optimizer:
+                    continue
                 dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
                 for param, (
                     param_start_index,
@@ -595,6 +661,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for model_chunk in model_chunks:
             for group in model_chunk.bucket_groups:
                 for bucket in group.buckets:
+                    if not _bucket_is_layer_wise_managed(bucket):
+                        continue
                     bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
                     for bucket_list, full_params_list in zip(
                         bucket_params_list, self.dp_cp_params_list
@@ -606,6 +674,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # Do the same for expert parallel bucket groups.
             for group in model_chunk.expert_parallel_bucket_groups:
                 for bucket in group.buckets:
+                    if not _bucket_is_layer_wise_managed(bucket):
+                        continue
                     if self.expt_dp_params_list is not None:
                         bucket_params_list = [
                             [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
