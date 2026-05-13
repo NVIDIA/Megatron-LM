@@ -478,12 +478,12 @@ def finalize_model_grads(
             assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
                 "pg_collection must have tp_dp_cp when " "moe_router_enable_expert_bias is enabled."
             )
+            tp_dp_cp_group = pg_collection.tp_dp_cp
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
         embd_group = pg_collection.embd
         pos_emb_group = pg_collection.pos_embd
         dp_cp_group = pg_collection.dp_cp
-        tp_dp_cp_group = pg_collection.tp_dp_cp if config.moe_router_enable_expert_bias else None
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
