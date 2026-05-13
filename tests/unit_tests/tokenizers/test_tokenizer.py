@@ -493,7 +493,7 @@ class TestTokenizerConfig:
         assert config.tokenizer_model == tokenizer_model
         assert config.metadata_path == metadata_path
         assert config.pad_vocab_size == pad_vocab_size
-        assert config.chat_template == chat_template 
+        assert config.chat_template == chat_template
 
     def test_config_failure(self):
         tokenizer_model = "/path/to/tokenizer"
@@ -508,9 +508,11 @@ class TestTokenizerConfig:
                 random_arg=True,
             )
 
+
 # ---------------------------------------------------------------------------
 # Unit tests for build_tokenizer function
 # ---------------------------------------------------------------------------
+
 
 class TestBuildTokenizer:
     def test_build_hf_tokenizer(self):
@@ -532,7 +534,7 @@ class TestBuildTokenizer:
         assert tokenizer._tokenizer.include_special_tokens == True
 
     def test_build_megatron_tokenizer(self):
-        special_tokens= [f'<extra_id_{i}>' for i in range(100)]
+        special_tokens = [f'<extra_id_{i}>' for i in range(100)]
         vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
         merges_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
 
@@ -572,7 +574,7 @@ class TestBuildTokenizer:
         assert tokenizer.chat_template == chat_template
         assert tokenizer._tokenizer.legacy == False
         assert tokenizer._tokenizer.ignore_extra_whitespaces == False
-    
+
     def test_build_tiktoken_tokenizer(self):
         chat_template = get_chat_template()
         vocab_size = 32000
@@ -620,9 +622,7 @@ class TestBuildTokenizer:
         vocab_size = 1111
 
         config = TokenizerConfig(
-            tokenizer_type="NullMultimodalTokenizer",
-            vocab_size=vocab_size,
-            pad_vocab_size=False,
+            tokenizer_type="NullMultimodalTokenizer", vocab_size=vocab_size, pad_vocab_size=False
         )
 
         tokenizer = build_tokenizer(config)
@@ -631,11 +631,11 @@ class TestBuildTokenizer:
         assert tokenizer.vocab_size == (vocab_size + 1)
 
     def test_tokenizer_failure(self):
-        config = TokenizerConfig(
-            tokenizer_type="UnknownTokenizer",
-        )
+        config = TokenizerConfig(tokenizer_type="UnknownTokenizer")
 
-        with pytest.raises(AssertionError, match="tokenizer_type UnknownTokenizer is not supported"):
+        with pytest.raises(
+            AssertionError, match="tokenizer_type UnknownTokenizer is not supported"
+        ):
             tokenizer = build_tokenizer(config)
 
 
