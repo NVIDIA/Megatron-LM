@@ -33,11 +33,13 @@ def build_tokenizer(args, **kwargs):
     elif args.tokenizer_type in SP_TOKENIZERS:
         tokenizer_library = 'sentencepiece'
         tokenizer_path = args.tokenizer_model
+        kwargs['chat_template'] = args.chat_template
         kwargs['legacy'] = args.tokenizer_sentencepiece_legacy
         kwargs['special_tokens'] = args.special_tokens
     elif args.tokenizer_type == 'TikTokenizer':
         tokenizer_library = 'tiktoken'
         tokenizer_path = args.tokenizer_model
+        kwargs['chat_template'] = args.chat_template
         if args.tiktoken_pattern:
             kwargs['pattern'] = args.tiktoken_pattern
         if args.vocab_size:
@@ -47,6 +49,7 @@ def build_tokenizer(args, **kwargs):
     elif args.tokenizer_type == 'HuggingFaceTokenizer':
         tokenizer_library = 'huggingface'
         tokenizer_path = args.tokenizer_model
+        kwargs['chat_template'] = args.chat_template
         kwargs['vocab_file'] = args.vocab_file
         kwargs['merges_file'] = args.merge_file
         kwargs['additional_special_tokens'] = args.special_tokens if args.special_tokens else []
@@ -80,7 +83,8 @@ def build_tokenizer(args, **kwargs):
         tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, **kwargs)
 
         # Add vocab size (if not already set from a checkpoint).
-        _set_padded_vocab_size(args, tokenizer)
+        if args.pad_vocab_size:
+            _set_padded_vocab_size(args, tokenizer)
 
         return tokenizer
 
@@ -93,7 +97,8 @@ def build_tokenizer(args, **kwargs):
     )
 
     # Add vocab size (if not already set from a checkpoint).
-    _set_padded_vocab_size(args, tokenizer)
+    if args.pad_vocab_size:
+        _set_padded_vocab_size(args, tokenizer)
 
     return tokenizer
 

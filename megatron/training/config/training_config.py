@@ -631,6 +631,9 @@ class TokenizerConfig:
     """Vocabulary size of the model (padded to be divisible by tensor model parallel size). 
     If not provided, it will be automatically calculated from vocab-size."""
 
+    pad_vocab_size: bool = True
+    """Whether to pad vocab size of the model automatically if padded_vocab_size is not provided."""
+
     vocab_file: str = None
     """Path to the vocab file."""
 
