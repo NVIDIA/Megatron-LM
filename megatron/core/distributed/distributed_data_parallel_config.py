@@ -48,6 +48,11 @@ class DistributedDataParallelConfig:
        value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
        buckets to ensure collectives do not become latency-bound)."""
 
+    num_buckets: Optional[int] = None
+    """Number of buckets for data-parallel communication. Should only specify one of
+       `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`
+       will be determined at runtime."""
+
     pad_buckets_for_high_nccl_busbw: bool = False
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
        ensure NCCL collectives have high bus bandwidth at large DP counts, since NCCL
@@ -225,3 +230,7 @@ class DistributedDataParallelConfig:
                 "Only need to explicitly specify param_name patterns for FP32 local accumulation "
                 "if .main_grads aren't already in FP32"
             )
+
+        if self.num_buckets is not None:
+            assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
+            assert self.num_buckets > 0, "num_buckets must be greater than 0"
