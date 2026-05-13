@@ -186,12 +186,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
+        logging_pg_kwargs = {}
+        if (
+            getattr(self.pg_collection, 'tp', None) is not None
+            and getattr(self.pg_collection, 'dp_cp', None) is not None
+        ):
+            logging_pg_kwargs = {
+                'tp_group': self.pg_collection.tp,
+                'dp_cp_group': self.pg_collection.dp_cp,
+            }
+
         layer_type_list, layer_offset = select_pipeline_segment(
             parsed.main_pattern or '',
             self.pg_collection.pp,
             vp_stage,
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            **logging_pg_kwargs,
         )
 
         # Determine if MTP is needed (based on pattern parsing)

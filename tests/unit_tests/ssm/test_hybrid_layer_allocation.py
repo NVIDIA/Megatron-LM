@@ -467,6 +467,16 @@ class TestSelectPipelineSegment:
         mock_log.assert_called_once()
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
+    def test_logging_receives_explicit_groups(self, mock_log):
+        tp_group = object()
+        dp_cp_group = object()
+        select_pipeline_segment(
+            "M*M*", pp_group=None, vp_stage=None, tp_group=tp_group, dp_cp_group=dp_cp_group
+        )
+        assert mock_log.call_args.kwargs["tp_group"] is tp_group
+        assert mock_log.call_args.kwargs["dp_cp_group"] is dp_cp_group
+
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_mutual_exclusivity_pipes_with_first_stage(self, mock_log):
         """Pipe separators + first_stage_layers should raise ValueError."""
         with pytest.raises(ValueError, match="Cannot specify"):
