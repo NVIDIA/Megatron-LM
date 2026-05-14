@@ -51,18 +51,21 @@ def is_layer_wise_managed_param(param: torch.nn.Parameter) -> bool:
     return True
 
 
-def _bucket_is_layer_wise_managed(bucket) -> bool:
+def _bucket_is_layer_wise_managed(bucket, default_for_untagged: bool = True) -> bool:
     """Whether a DDP bucket belongs to a LayerWise-managed buffer.
 
     Buckets are built from params that share a :class:`BufferKey`, so checking
-    the first param's tag is sufficient. When no tagging has been done (legacy
-    ping-pong path), LayerWise owns every bucket so we default to True.
+    the first param's tag is sufficient. ``default_for_untagged`` controls the
+    legacy (no-tagging) case: callers asking "is this mine?" from the LayerWise
+    side pass ``True`` (legacy LayerWise owns everything); callers asking from
+    the DistOpt side pass ``False`` (legacy DistOpt also owns everything, so
+    untagged buckets are *not* LayerWise-managed).
     """
     if not bucket.params_list:
         return False
     param = bucket.params_list[0]
     if not hasattr(param, 'is_layer_wise_distributed_optimizer'):
-        return True
+        return default_for_untagged
     return param.is_layer_wise_distributed_optimizer
 
 
@@ -242,42 +245,47 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             shard_cursor = 0
             bucket_numel_unpadded = 0
 
-        # -- 3. Emit one isolated bucket per shared-embedding param. -----
-        # Shared (tied) embeddings need their own bucket — typically because
-        # input and output embeddings are tied across pipeline-parallel
-        # stages and need a cross-stage all-reduce. Each shared embedding
-        # occupies shard 0 of its bucket alone; shards 1..dp_size-1 are
-        # filled with empty (padding) slots of the same numel so the bucket
-        # is shard-aligned and the embedding fits entirely within shard 0.
+        # -- 3. Walk all params in backprop order (= reversed forward) and emit
+        # buckets. Shared (tied) embeddings get an isolated bucket (typically
+        # because input/output embeddings are tied across pipeline-parallel
+        # stages and need a cross-stage all-reduce); each shared embedding
+        # occupies shard 0 of its bucket alone and shards 1..dp_size-1 are
+        # filled with same-size padding so the bucket stays shard-aligned and
+        # the embedding fits entirely within shard 0. Regular params get
+        # size-matched into shared buckets (current bucket grows until
+        # ``bucket_size``).
         #
-        # NOTE: This is expensive. Padding cost per shared embedding is
-        # (dp_size - 1) * pad_to_divisor(numel, shard_divisor) elements,
-        # which for a vocab x hidden embedding (e.g. 128k x 8192) at dp_size
-        # = 8 is roughly 7 * (vocab * hidden) elements — many GBs of the
-        # param buffer (and again of the grad buffer) per shared embedding.
-        # The cost is unavoidable while preserving the "no parameter crosses
-        # a shard boundary" invariant the layerwise scheme depends on for
-        # correct reduce-scatter + local optimizer step.
-        for param in reversed(shared_embedding_params):
+        # Bucket ids must be assigned in backprop order so that, when
+        # ``_ParamAndGradBuffer.__init__`` later iterates params in backprop
+        # order, the bucket id of consecutive params either stays the same or
+        # increments by exactly 1. Walking a single backprop pool here
+        # (rather than emitting all shared-embedding buckets up front)
+        # guarantees that interleaving.
+        #
+        # NOTE: shared-embedding buckets are expensive — ``(dp_size - 1) *
+        # pad_to_divisor(numel, shard_divisor)`` elements of padding per
+        # shared embedding (many GBs for a vocab × hidden embedding at
+        # dp_size=8). Unavoidable while preserving the "no parameter crosses
+        # a shard boundary" invariant.
+        for param in reversed(params):
+            if id(param) in assigned_param_ids:
+                continue
             param_numel = param.data.nelement()
-            assigned_param_ids.add(id(param))
-            shard_assignments[0].append((param, param_numel))
-            bucket_numel_unpadded += param_numel
-            # No size-matching: each shared embedding must be alone in its
-            # bucket. Pad shards 1..dp_size-1 with same-size empty slots.
-            for shard_id in range(1, dp_size):
-                shard_assignments[shard_id].append((None, param_numel))
-                size_match_padding_numel += param_numel
-            shard_cursor = pad_param_start(shard_cursor) + param_numel
-            _finalize_bucket()
+            if getattr(param, 'shared_embedding', False):
+                # Finalize any in-progress size-matching bucket so the
+                # shared-embedding bucket comes after it in backprop order.
+                _finalize_bucket()
+                assigned_param_ids.add(id(param))
+                shard_assignments[0].append((param, param_numel))
+                bucket_numel_unpadded += param_numel
+                for shard_id in range(1, dp_size):
+                    shard_assignments[shard_id].append((None, param_numel))
+                    size_match_padding_numel += param_numel
+                shard_cursor = pad_param_start(shard_cursor) + param_numel
+                _finalize_bucket()
+                continue
 
-        # -- 4. Size-matching loop for regular params. --------------------
-        while True:
-            param = _next_unassigned()
-            if param is None:
-                break
-
-            param_numel = param.data.nelement()
+            # Regular param: use as seed for size-matching.
             assigned_param_ids.add(id(param))
             shard_assignments[0].append((param, param_numel))
             bucket_numel_unpadded += param_numel
@@ -783,31 +791,50 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
         )
 
-    @torch.no_grad()
-    def step(self):  # type: ignore[no-untyped-def]
-        """step function for layer-wise optimizer.
+    def start_param_sync_for_bucket_group_subset(self) -> None:
+        """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
 
-        NOTE: bypassed when this optimizer is a child of an outer
-        ChainedOptimizer; in that case the sibling DistributedOptimizer's
-        step_with_ready_grads handles the param sync.
+        Walks each model chunk's dense + expert-parallel bucket groups and
+        skips any group not managed by LayerWise, so a sibling
+        :class:`DistributedOptimizer`'s own ``start_param_sync`` call does not
+        double-sync the same buckets. Uses
+        :meth:`DistributedDataParallel._start_bucket_group_param_sync` so FP8
+        post-all-gather processing (and MXFP8 copy) still runs.
         """
-        update_successful, grad_norm, num_zeros_in_grad = super().step()
+        for model_chunk in self.model_chunks:
+            for bucket_group in (
+                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            ):
+                if bucket_group.buckets and _bucket_is_layer_wise_managed(bucket_group.buckets[0]):
+                    model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Step then all-gather LayerWise-managed param buffers.
+
+        Placed on ``step_with_ready_grads`` (not ``step``) so the param sync also
+        runs when this optimizer is a child of an outer ``ChainedOptimizer``,
+        which calls ``step_with_ready_grads`` directly on each child and bypasses
+        ``step``.
+        """
+        success = super().step_with_ready_grads()
 
         # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
         if not self.overlap_param_gather:
             if self.use_buffer_param_sync:
                 # Model params are views into the DDP param buffer
-                # (ddp_config.use_distributed_optimizer=True).  The optimizer step
+                # (ddp_config.use_distributed_optimizer=True). The optimizer step
                 # already copied updated fp32 main params → bf16 model params (=
-                # buffer views), so the buffer is up-to-date.  Trigger the standard
-                # buffer all-gather (matches DistributedOptimizer's call site).
-                for model_chunk in self.model_chunks:
-                    model_chunk.start_param_sync()
+                # buffer views), so the buffer is up-to-date. Trigger the standard
+                # buffer all-gather, but only for LayerWise-managed bucket groups
+                # so a sibling DistributedOptimizer's own ``start_param_sync`` call
+                # is not duplicated for the same buckets.
+                self.start_param_sync_for_bucket_group_subset()
             else:
                 self.allgather_params()
 
-        return update_successful, grad_norm, num_zeros_in_grad
+        return success
 
     # TODO(deyuf): need to improve dist checkpointing design to properly handle this
     # fp32_from_fp16_params is list, each sub list could be empty if group is empty

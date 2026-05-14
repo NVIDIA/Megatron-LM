@@ -2824,6 +2824,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
+    def start_param_sync_for_bucket_group_subset(self) -> None:
+        """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
+
+        Walks each model chunk's DDP bucket groups and skips those tagged
+        ``is_layer_wise_distributed_optimizer=True`` (so a sibling
+        :class:`LayerWiseDistributedOptimizer` does not double-sync the same
+        buckets). When no LayerWise tagging is present every bucket group is
+        included — matching the previous ``model_chunk.start_param_sync()``
+        behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
+        so FP8 post-all-gather processing (and MXFP8 copy) still runs.
+        """
+        # Deferred import: layer_wise_optimizer's compute_full_param_layout
+        # lazily imports DistributedOptimizer, so importing the helper at
+        # module load here would create a cycle.
+        from .layer_wise_optimizer import _bucket_is_layer_wise_managed
+
+        for model_chunk in self.model_chunks:
+            for bucket_group in (
+                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            ):
+                if not bucket_group.buckets:
+                    continue
+                if _bucket_is_layer_wise_managed(
+                    bucket_group.buckets[0], default_for_untagged=False
+                ):
+                    continue
+                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful.
@@ -2847,8 +2875,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
             # call and subsequent all-gathers are launched in the forward pre-hook.
             if not self.ddp_config.overlap_param_gather:
-                for model_chunk in self.model_chunks:
-                    model_chunk.start_param_sync()
+                # Only sync DistOpt-managed bucket groups so a sibling
+                # LayerWiseDistributedOptimizer's own ``start_param_sync`` call
+                # is not duplicated for the same buckets.
+                self.start_param_sync_for_bucket_group_subset()
         if timers is not None:
             timers('params-all-gather').stop()
 
