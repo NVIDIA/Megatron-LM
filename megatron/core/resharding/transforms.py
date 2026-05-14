@@ -11,6 +11,7 @@ Reshard transforms for custom send/recv/writeback during weight transfer.
 
 import torch
 
+from megatron.core.fp8_utils import dequantize_fp8_tensor, is_mxfp8tensor
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 
@@ -104,13 +105,8 @@ def _ensure_sendable(param: torch.Tensor) -> torch.Tensor:
     dequantized to their original precision (usually BF16).  Standard
     parameters are returned via ``.data`` (unwrapped from autograd).
     """
-    try:
-        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as _TEMXFP8
-
-        if isinstance(param, _TEMXFP8):
-            return param.dequantize()
-    except ImportError:
-        pass
+    if is_mxfp8tensor(param):
+        return dequantize_fp8_tensor(param)
     return param.data
 
 
