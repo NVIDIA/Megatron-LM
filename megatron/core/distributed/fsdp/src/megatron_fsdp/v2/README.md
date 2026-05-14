@@ -8,10 +8,12 @@ This directory contains the **fully_shard_v2** implementation — a PyTorch FSDP
 v2/
 ├── README.md                    # This file
 ├── __init__.py                  # Public exports
-├── fully_shard.py               # Core fully_shard() API + FSDPModule class
+├── fully_shard.py               # Public fully_shard() API
+├── fsdp_module.py               # FSDPModule runtime state and methods
+├── hooks.py                     # Forward/backward hook registration
 ├── param_group.py               # ParameterGroup — groups params with shared buffers
 ├── dp_buffer.py                 # DataParallelBuffer — flat buffer management
-├── allocator.py                 # TemporaryBucketAllocator — temp buffer reuse
+├── allocator.py                 # BucketAllocator implementations
 ├── utils.py                     # Internal utility functions
 └── design.md                    # Detailed design documentation (overlap, memory, sync)
 ```

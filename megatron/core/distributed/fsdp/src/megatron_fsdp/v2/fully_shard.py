@@ -26,6 +26,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
 
+from .allocator import StorageFreeingBucketAllocator, TracePoolAllocator
 from .fsdp_module import FSDPModule
 from .hooks import (
     _register_backward_hook,
@@ -77,13 +78,21 @@ def fully_shard(
     new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
     module.__class__ = new_cls
 
+    bucket_allocator = (
+        TracePoolAllocator() if enable_trace_pool else StorageFreeingBucketAllocator()
+    )
+
     module._init_named_param_groups(
-        mesh, ignored_params, mp_policy=mp_policy, gradient_scaling_factor=gradient_scaling_factor
+        mesh,
+        ignored_params,
+        mp_policy=mp_policy,
+        bucket_allocator=bucket_allocator,
+        gradient_scaling_factor=gradient_scaling_factor,
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
         enable_async_reduce_grad=enable_async_reduce_grad,
-        enable_trace_pool=enable_trace_pool,
+        bucket_allocator=bucket_allocator,
     )
     module._init_param_main_grad_func()
 

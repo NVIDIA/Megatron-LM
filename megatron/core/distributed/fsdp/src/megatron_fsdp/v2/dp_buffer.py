@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .allocator import TemporaryBucketAllocator
+from .allocator import BucketAllocator, TemporaryBucketAllocator
 from .utils import ParamGroupIdx
 
 logger = logging.getLogger(__name__)
@@ -297,7 +297,8 @@ class DataParallelBuffer:
         dp_group: torch.distributed.ProcessGroup,
         param_group_id: ParamGroupIdx,
         *,
-        allocator: Optional[TemporaryBucketAllocator] = None,
+        allocator: Optional[BucketAllocator] = None,
+        buffer_role: str = "model_weight",
         is_distributed: bool = False,
         gradient_scaling_factor: Optional[float] = None,
         chunk_size_factor: int = 1,
@@ -309,6 +310,8 @@ class DataParallelBuffer:
         self.device = device
         self.dp_group = dp_group
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
+        self.buffer_role = buffer_role
+        self.alloc_key = (param_group_id, buffer_role)
         self.is_distributed = is_distributed
         self.gradient_scaling_factor = gradient_scaling_factor
 
@@ -461,7 +464,7 @@ class DataParallelBuffer:
 
     @torch.no_grad()
     def unshard(
-        self, async_op: bool = True
+        self, async_op: bool = True, bind_params: bool = True
     ) -> Tuple[torch.Tensor, Optional[torch.distributed.Work]]:
         """All-gather the full buffer from all shards and rebind param.data.
 
@@ -476,7 +479,7 @@ class DataParallelBuffer:
             return (self.data, None)
 
         bucket = self.allocator.allocate(
-            param_group_id=self.buffer_index.param_group_id,
+            key=self.alloc_key,
             size=self.buffer_index.bucket_meta.size,
             dtype=self.dtype,
             device=self.device,
@@ -492,11 +495,16 @@ class DataParallelBuffer:
             group=self.dp_group,
             async_op=async_op,
         )
+        if self._unsharded_buffer.is_cuda:
+            # The temporary bucket may be released from another stream before this
+            # collective finishes; record the producer stream for allocator safety.
+            self._unsharded_buffer.record_stream(torch.cuda.current_stream())
 
-        for p in self.params:
-            item_id = self.param_idx[p]
-            offset, size = self.buffer_index._get_item_offset(item_id)
-            p.data = self._unsharded_buffer[offset : offset + size].view(p.shape)
+        if bind_params:
+            for p in self.params:
+                item_id = self.param_idx[p]
+                offset, size = self.buffer_index._get_item_offset(item_id)
+                p.data = self._unsharded_buffer[offset : offset + size].view(p.shape)
 
         return (self._unsharded_buffer, work)
 
@@ -505,7 +513,7 @@ class DataParallelBuffer:
         """Release the temporary unsharded buffer allocated by unshard()."""
         if not self.is_distributed:
             return
-        self.allocator.free(self.buffer_index.param_group_id)
+        self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
     def fetch_unsharded_buffer(self) -> torch.Tensor:
@@ -514,7 +522,7 @@ class DataParallelBuffer:
             return self.data
         if self._unsharded_buffer is None:
             bucket = self.allocator.allocate(
-                param_group_id=self.buffer_index.param_group_id,
+                key=self.alloc_key,
                 size=self.buffer_index.bucket_meta.size,
                 dtype=self.dtype,
                 device=self.device,
@@ -523,7 +531,7 @@ class DataParallelBuffer:
         return self._unsharded_buffer
 
     @torch.no_grad()
-    def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
+    def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None, async_op: bool = False):
         """Reduce gradients across the data-parallel group.
 
         For distributed buffers: reduce-scatter the full gradient into each
@@ -532,6 +540,7 @@ class DataParallelBuffer:
         If grad_comm_dtype differs from self.dtype, communicate with a temporary
         casted tensor and cast the reduced result back before accumulation.
         """
+        del async_op
         grad_comm_dtype = grad_comm_dtype or self.dtype
 
         if self.gradient_scaling_factor in (None, 1.0):
@@ -557,6 +566,9 @@ class DataParallelBuffer:
 
         full_grad = self.fetch_unsharded_buffer()
         comm_input = full_grad if grad_comm_dtype == self.dtype else full_grad.to(grad_comm_dtype)
+        if full_grad.is_cuda:
+            # Keep temporary reduce-scatter buffers tied to the stream that uses them.
+            full_grad.record_stream(torch.cuda.current_stream())
         if prescale:
             comm_input.mul_(self.gradient_scaling_factor)
 

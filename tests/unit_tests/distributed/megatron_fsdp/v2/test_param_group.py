@@ -31,6 +31,10 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+    FullyShardMixedPrecisionPolicy,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 
 # ------------------------------------------------------------------ #
 #  Process group — init once per pytest session, shared by all tests
@@ -100,12 +104,15 @@ def _build_groups(strategy):
     for gid, params in enumerate([bf16_params, uint8_params]):
         if not params:
             continue
+        originals.append([p.detach().clone() for p in params])
         pg = ParameterGroup(
-            params=params, fsdp_unit_id=0, mesh=None, sharding_strategy=strategy, param_group_id=gid
+            params=params,
+            param_group_id=ParamGroupIdx(0, gid),
+            mp_policy=FullyShardMixedPrecisionPolicy(),
+            mesh=None,
+            sharding_strategy=strategy,
         )
         groups.append(pg)
-        # Snapshot original (pre-shard) values for later comparison
-        originals.append([p.detach().clone() for p in params])
     return groups, originals, dp_group, rank, torch.distributed.get_world_size(), device
 
 
@@ -266,7 +273,7 @@ def test_reduce_grad(strategy):
 
             # Pre-populate the allocator so reduce_grad sees the data
             bucket = gbuf.allocator.allocate(
-                param_group_id=gbuf.buffer_index.param_group_id,
+                key=gbuf.alloc_key,
                 size=full_size,
                 dtype=gbuf.dtype,
                 device=device,

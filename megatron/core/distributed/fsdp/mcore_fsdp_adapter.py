@@ -53,6 +53,7 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+        FullyShardFP8Policy,
         FullyShardMixedPrecisionPolicy,
     )
 
@@ -250,6 +251,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 torch.float32
                 if ddp_config.grad_reduce_in_fp32
                 else ddp_config.megatron_fsdp_grad_comm_dtype
+            ),
+            use_decoupled_grad=ddp_config.megatron_fsdp_use_decoupled_grad,
+            fp8=FullyShardFP8Policy(
+                enabled=ddp_config.fp8_param_gather,
+                recipe=config.fp8_recipe,
+                keep_transpose_cache=ddp_config.keep_fp8_transpose_cache,
             ),
         )
         kwargs = {

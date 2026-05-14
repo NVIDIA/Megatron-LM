@@ -28,7 +28,7 @@ from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from ..uneven_dtensor import make_uneven_dtensor
-from .allocator import TemporaryBucketAllocator, _free_storage
+from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .utils import ParamGroupIdx
@@ -60,7 +60,7 @@ class ParameterGroup:
         mesh: Optional[DeviceMesh] = None,
         sharding_strategy: str = "optim_grads_params",
         gradient_scaling_factor: Optional[float] = None,
-        allocator: Optional[TemporaryBucketAllocator] = None,
+        allocator: Optional[BucketAllocator] = None,
     ):
         self.params = params
         self.param_idx: Dict[torch.nn.Parameter, int] = {p: i for i, p in enumerate(params)}
@@ -70,14 +70,24 @@ class ParameterGroup:
         self.device = params[0].device
         self.dtype = params[0].dtype
         self.requires_grad = params[0].requires_grad
+        self.mp_policy = mp_policy
+        self.is_fp8_group = self.mp_policy.is_fp8_param(params[0])
+        self.needs_transpose_weight_buffer = self.mp_policy.needs_transpose_weight_buffer(
+            params[0]
+        )
+        assert all(self.mp_policy.is_fp8_param(p) == self.is_fp8_group for p in params), (
+            "FP8 and non-FP8 parameters must not share a ParameterGroup"
+        )
 
         # Setup device mesh and derived process group
+        if mesh is None:
+            mesh = DeviceMesh(
+                self.device.type,
+                list(range(torch.distributed.get_world_size(torch.distributed.group.WORLD))),
+            )
+        assert mesh.ndim == 1, "Only 1D mesh is supported"
         self.mesh = mesh
-        if mesh is not None:
-            assert mesh.ndim == 1, "Only 1D mesh is supported"
-            self.dp_group = mesh.get_group()
-        else:
-            self.dp_group = torch.distributed.group.WORLD
+        self.dp_group = mesh.get_group()
 
         self.sharding_strategy = sharding_strategy
         self.param_group_id = param_group_id
@@ -89,9 +99,8 @@ class ParameterGroup:
         else:
             self.chunk_size_factor = 1
 
-        self.mp_policy = mp_policy
         self.gradient_scaling_factor = gradient_scaling_factor
-        self.allocator = allocator
+        self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
 
         # Buffer references (initialized in _init_buffers)
         self.model_weight_buffer: Optional[DataParallelBuffer] = None
@@ -105,8 +114,24 @@ class ParameterGroup:
         # Initialize buffers and distributed parameters
         self._init_buffers()
 
-    def _create_buffer(self, dtype: torch.dtype, is_distributed: bool) -> DataParallelBuffer:
-        """Create a DataParallelBuffer with the given settings."""
+    def set_allocator(self, allocator: BucketAllocator) -> None:
+        self.allocator = allocator
+        for buffer in (
+            self.model_weight_buffer,
+            self.transpose_weight_buffer,
+            self.main_weight_buffer,
+            self.main_grad_buffer,
+        ):
+            if buffer is not None:
+                buffer.allocator = allocator
+
+    def _create_buffer(
+        self,
+        dtype: torch.dtype,
+        is_distributed: bool,
+        role: str,
+    ) -> DataParallelBuffer:
+        """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
             params=self.params,
             param_idx=self.param_idx,
@@ -114,6 +139,7 @@ class ParameterGroup:
             device=self.device,
             dp_group=self.dp_group,
             allocator=self.allocator,
+            buffer_role=role,
             is_distributed=is_distributed,
             param_group_id=self.param_group_id,
             gradient_scaling_factor=self.gradient_scaling_factor,
@@ -135,20 +161,32 @@ class ParameterGroup:
         shard_main_weights = s != "no_shard"
         shard_grads = s in ("optim_grads", "optim_grads_params")
 
-        # Create model weight buffer
+        # Create model weight buffer. FP8/MXFP8 parameters store their TE raw
+        # payload in the model buffer, so the buffer dtype is uint8 while the
+        # logical compute dtype remains on the parameter object.
         if s != "no_shard":
-            wbuf = self._create_buffer(self.dtype, shard_weights)
+            model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
+            wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight")
             wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
-                wbuf.set_item(i, p.detach())
+                wbuf.set_item(i, self.mp_policy.get_param_data(p))
             self.model_weight_buffer = wbuf
 
+            if self.needs_transpose_weight_buffer:
+                tbuf = self._create_buffer(torch.uint8, shard_weights, "transpose_weight")
+                tbuf.init_data(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
+                for i, p in enumerate(self.params):
+                    tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
+                self.transpose_weight_buffer = tbuf
+
         # Create main weight buffer for mixed precision
-        if self.mp_policy.main_params_dtype is not None:
-            mbuf = self._create_buffer(self.mp_policy.main_params_dtype, shard_main_weights)
+        main_params_dtype = self.mp_policy.main_params_dtype_for_param(self.params[0])
+        if main_params_dtype is not None:
+            mbuf = self._create_buffer(main_params_dtype, shard_main_weights, "main_weight")
             mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
-                mbuf.set_item(i, p.detach().to(self.mp_policy.main_params_dtype))
+                item = self.mp_policy.initial_main_weight(p)
+                mbuf.set_item(i, item.detach().to(main_params_dtype))
             self.main_weight_buffer = mbuf
 
         # Free the original full parameter tensors now that their data has been
@@ -156,32 +194,108 @@ class ParameterGroup:
         # unshard() rebinds .data to the all-gathered buffer, so the original
         # storage is never accessed again.
         for p in self.params:
+            if (
+                self.is_fp8_group
+                or self.model_weight_buffer is None
+                and self.main_weight_buffer is None
+            ):
+                continue
             _free_storage(p.data)
 
         # Create gradient buffer
         if self.requires_grad:
-            main_grads_dtype = self.dtype
-            if self.mp_policy.main_grads_dtype is not None:
-                main_grads_dtype = self.mp_policy.main_grads_dtype
-            gbuf = self._create_buffer(main_grads_dtype, shard_grads)
+            main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
+            gbuf = self._create_buffer(main_grads_dtype, shard_grads, "main_grad")
             gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
             self.main_grad_buffer = gbuf
 
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(self, async_op: bool = False):
+    def unshard(self, async_op: bool = False, is_bwd: bool = False):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
         After unshard, self.params.data points to full (unsharded) tensors.
         """
-        _, work = self.model_weight_buffer.unshard(async_op=async_op)
+        if is_bwd and self.transpose_weight_buffer is not None:
+            buffers = [(self.transpose_weight_buffer, True)]
+        else:
+            buffers = [(self.model_weight_buffer, False)]
+
+        work = None
+        for weight_buffer, use_transpose_buffer in buffers:
+            full_weight_buffer, weight_work = weight_buffer.unshard(
+                async_op=async_op,
+                bind_params=not self.is_fp8_group,
+            )
+            if work is None:
+                work = weight_work
+
+            if self.is_fp8_group and full_weight_buffer is not None:
+                for p in self.params:
+                    item_id = self.param_idx[p]
+                    offset, size = weight_buffer.buffer_index._get_item_offset(item_id)
+                    self.mp_policy.set_unsharded_weight(
+                        p,
+                        full_weight_buffer[offset : offset + size].view(p.shape),
+                        transpose=use_transpose_buffer,
+                    )
+
+        if self.is_fp8_group:
+            self.mp_policy.post_unshard(self.params, is_bwd=is_bwd)
         return work
 
     def reshard(self):
         """Reshard model weights by releasing unsharded buffer."""
         self.model_weight_buffer.reshard()
+        if self.transpose_weight_buffer is not None:
+            self.transpose_weight_buffer.reshard()
+        self.mp_policy.post_reshard(self.params)
+
+    @torch.no_grad()
+    def copy_main_weights_to_model_weights(self):
+        """Install optimized main weights into model compute weights."""
+        if self.main_weight_buffer is None:
+            return
+        if not self.is_fp8_group:
+            self.model_weight_buffer.data.copy_(self.main_weight_buffer.data)
+            return
+
+        assert self.model_weight_buffer is not None, "FP8 param gather requires a model buffer"
+        fp8_params = []
+        main_params = []
+        start_offsets = []
+        model_param_shards = []
+        for p in self.params:
+            item_id = self.param_idx[p]
+            model_shard = self.model_weight_buffer.get_item(item_id, only_shard=True)
+            if model_shard.numel() == 0:
+                fp8_params.append(p)
+                main_params.append(None)
+                start_offsets.append(None)
+                model_param_shards.append((None, None))
+                continue
+
+            transpose_shard = None
+            if self.transpose_weight_buffer is not None:
+                transpose_shard = self.transpose_weight_buffer.get_item(item_id, only_shard=True)
+            main_weight = self.main_weight_buffer.get_item(item_id, only_shard=True)
+            start_offset, _ = self.model_weight_buffer.buffer_index._get_item_slice_in_shard(
+                item_id
+            )
+            fp8_params.append(p)
+            main_params.append(main_weight)
+            start_offsets.append(start_offset)
+            model_param_shards.append((model_shard, transpose_shard))
+
+        self.mp_policy.quantize_main_weights_to_model(
+            fp8_params,
+            main_params,
+            start_offsets,
+            self.dp_group,
+            model_param_shards,
+        )
 
     def reduce_grad(self):
         """
@@ -233,14 +347,20 @@ class ParameterGroup:
                 data = param.data.detach()
 
             dist_param = torch.nn.Parameter(
-                make_uneven_dtensor(data, param.shape, self.mesh, placements)
+                make_uneven_dtensor(data, param.shape, self.mesh, placements),
+                requires_grad=param.requires_grad,
             )
             # Mark as FSDP parameter for special handling
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
             self.dist_params.append(dist_param)
 
-        # Create gradient DTensor views
+        # Create gradient DTensor views. Some groups, e.g. uint8 FP8 model
+        # payloads, do not require grads and therefore have no grad buffer.
+        if self.main_grad_buffer is None:
+            self.dist_grads = [None for _ in self.params]
+            return
+
         is_grad_shard = is_param_shard
         for p in self.params:
             gbuf = self.main_grad_buffer
