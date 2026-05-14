@@ -51,6 +51,7 @@ __all__ = [
     "grouped_gemm_batch_invariant",
     "BatchInvariantGroupedGemmFn",
     "HAVE_DEEPGEMM_BF16",
+    "deterministic_index_add",
 ]
 
 
@@ -496,13 +497,102 @@ def mean_dim(
     return output
 
 
+def deterministic_index_add(
+    out: torch.Tensor,
+    idx: torch.Tensor,
+    src: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Deterministic, CUDA-graph-compatible equivalent of `out.index_add_(0, idx, src)`.
+
+    Math: ``out[i] += sum over j where idx[j]==i of src[j]``.
+
+    Unlike `torch.Tensor.index_add_`, the result is bitwise-stable across
+    runs *without* requiring `torch.use_deterministic_algorithms(True)`, and
+    captures cleanly into a `torch.cuda.CUDAGraph` (no `.item()`, no
+    data-dependent shapes).
+
+    Algorithm: sort by `idx` (duplicates become contiguous segments) →
+    inclusive fp32 cumsum on the sorted src → `searchsorted` gives a fixed
+    `(M+1,)` boundary tensor → segment sums via gather + subtract.
+
+    Args:
+        out: (M, H) destination, updated in place.
+        idx: (N,) integer indices in [0, M). Need not be sorted; we sort
+            internally with stable=True.
+        src: (N, H) contributions in the same dtype as `out` (any precision —
+            cumsum accumulates in fp32 then casts back).
+        valid_mask: optional (N,) bool. Rows with mask=False contribute zero;
+            their idx is clamped to a valid range so the corresponding update
+            is a no-op. Use this instead of slicing `src[:n_used]` to keep
+            shapes static under CG capture.
+    Returns:
+        `out` (same tensor, updated).
+
+    Memory: an fp32 (N+1, H) cumsum buffer; ~4*N*H bytes peak.
+    """
+    if valid_mask is not None:
+        src = src * valid_mask.unsqueeze(-1).to(src.dtype)
+        idx = idx.clamp(min=0, max=out.shape[0] - 1)
+
+    sorted_idx, perm = idx.sort(stable=True)
+    sorted_src = src.index_select(0, perm)
+    H = sorted_src.shape[-1]
+    csum = sorted_src.to(torch.float32).cumsum(dim=0)
+    zero = torch.zeros(1, H, device=csum.device, dtype=torch.float32)
+    csum_with_zero = torch.cat([zero, csum], dim=0)
+
+    M = out.shape[0]
+    queries = torch.arange(M + 1, device=idx.device, dtype=sorted_idx.dtype)
+    boundaries = torch.searchsorted(sorted_idx, queries)
+    seg_sum = csum_with_zero[boundaries[1:]] - csum_with_zero[boundaries[:-1]]
+    out.add_(seg_sum.to(out.dtype))
+    return out
+
+
+# Kernel backend for mm / addmm. Selected at `enable_batch_invariant_mode` time
+# from `TransformerConfig.batch_invariant_kernel_backend`.
+#   "deepgemm" (default): DeepGEMM `bf16_gemm_nt` — bitwise-identical to
+#       `torch.mm`. Requires bf16 CUDA inputs on Hopper/Blackwell.
+#   "triton": BIK Triton `matmul_persistent` — works on any CUDA device with
+#       bf16/fp16/fp32. Has small rounding drift vs `torch.mm`.
+_BIK_BACKENDS = ("deepgemm", "triton")
+_BIK_BACKEND: str = "deepgemm"
+
+
+def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """`a @ b` via DeepGEMM `bf16_gemm_nt`.
+
+    `aten::mm` is (M, K) @ (K, N). DeepGEMM NT layout is (M, K) @ (N, K).T,
+    so we transpose B before passing. Bitwise-identical to `torch.mm` on
+    Hopper/Blackwell, deterministic across runs, batch-invariant.
+    """
+    if a.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"batch_invariant_kernel_backend='deepgemm' requires bf16 inputs "
+            f"(got {a.dtype}); use backend='triton' for fp16/fp32."
+        )
+    M = a.shape[0]
+    N = b.shape[1]
+    d = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    deep_gemm.bf16_gemm_nt(a, b.transpose(0, 1).contiguous(), d)
+    return d
+
+
 def mm_batch_invariant(a, b):
-    """Batch-invariant replacement for `aten::mm` using a persistent matmul kernel."""
+    """Batch-invariant replacement for `aten::mm`."""
+    if _BIK_BACKEND == "deepgemm":
+        return _mm_deepgemm(a, b)
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
-    """Batch-invariant replacement for `aten::addmm` using a persistent matmul kernel."""
+    """Batch-invariant replacement for `aten::addmm`."""
+    if _BIK_BACKEND == "deepgemm":
+        out = _mm_deepgemm(a, b)
+        if bias is not None:
+            out = out + bias
+        return out
     return matmul_persistent(a, b, bias=bias)
 
 
@@ -1542,11 +1632,30 @@ def is_batch_invariant_mode_enabled():
     return _batch_invariant_MODE
 
 
-def enable_batch_invariant_mode():
-    """Enable global batch-invariant mode and patch Aten/TE kernels."""
-    global _batch_invariant_MODE, _batch_invariant_LIB
+def enable_batch_invariant_mode(backend: str = "deepgemm"):
+    """Enable global batch-invariant mode and patch Aten/TE kernels.
+
+    Args:
+        backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.
+            "deepgemm" (default) routes bf16 CUDA inputs through DeepGEMM
+            `bf16_gemm_nt`. "triton" routes through the BIK Triton
+            `matmul_persistent` kernel (works for bf16/fp16/fp32 and on
+            any CUDA device). Grouped GEMM always uses DeepGEMM regardless.
+    """
+    global _batch_invariant_MODE, _batch_invariant_LIB, _BIK_BACKEND
     if _batch_invariant_MODE:
         return
+    if backend not in _BIK_BACKENDS:
+        raise ValueError(
+            f"Unknown batch_invariant_kernel_backend={backend!r}; "
+            f"expected one of {_BIK_BACKENDS}."
+        )
+    if backend == "deepgemm" and not HAVE_DEEPGEMM_BF16:
+        raise RuntimeError(
+            "batch_invariant_kernel_backend='deepgemm' requires DeepGEMM with "
+            "bf16 bindings. Install DeepGEMM or use backend='triton'."
+        )
+    _BIK_BACKEND = backend
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")

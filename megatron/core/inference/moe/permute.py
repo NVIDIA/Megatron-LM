@@ -13,6 +13,10 @@ from unittest.mock import MagicMock
 
 import torch
 
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    deterministic_index_add,
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.utils import null_decorator
 
 try:
@@ -464,6 +468,25 @@ def unpermute_tokens(
         permuted_probs.dtype == torch.float32
     ), f"permuted_probs must be fp32, got {permuted_probs.dtype}"
     output_size, hidden_dim = expert_output.shape
+
+    # Triton kernel below uses tl.atomic_add (non-deterministic). BIK path
+    # replaces it with an order-invariant sort + cumsum combine. Rows past
+    # `n_used` and rows with `permutation_map < 0` are masked out instead
+    # of sliced so the shape stays static (CUDA-graph capturable).
+    if is_batch_invariant_mode_enabled():
+        if out is None:
+            out = torch.zeros(
+                num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device
+            )
+        else:
+            out.zero_()
+        full_idx = permutation_map.to(torch.int64)
+        rows = torch.arange(full_idx.size(0), device=full_idx.device, dtype=torch.int64)
+        valid_mask = (full_idx >= 0) & (rows < n_used.to(torch.int64))
+        weighted = expert_output.to(torch.float32) * permuted_probs.unsqueeze(-1)
+        deterministic_index_add(out, full_idx, weighted, valid_mask=valid_mask)
+        return out
+
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     if out is None:
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)

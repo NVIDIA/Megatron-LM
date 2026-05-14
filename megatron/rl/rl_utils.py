@@ -467,6 +467,18 @@ def update_inference_logprobs_group_stats(
         group_stats.max_inf_prob = inf_probs.max().item()
         group_stats.mean_inf_prob = inf_probs.mean().item()
 
+        # Surface inf-vs-train logprob delta in stdout (no wandb dependency).
+        # Always prints so we can compare BIK on vs off in the same log.
+        bik_tag = "[bik]" if is_batch_invariant_mode_enabled() else "[base]"
+        print_rank_0(
+            f"{bik_tag} inf-vs-train logprob: "
+            f"max_abs_diff={group_stats.max_inf_train_prob_abs_diff:.3e} "
+            f"mean_abs_diff={group_stats.mean_inf_train_prob_abs_diff:.3e} "
+            f"max_ratio={group_stats.max_piold_to_inf_prob:.6f} "
+            f"min_ratio={group_stats.min_piold_to_inf_prob:.6f} "
+            f"n={int(n_elems.item())}"
+        )
+
 
 def align_unpacked_inference_logprobs(
     inference_logprobs: List[torch.Tensor],
@@ -1973,9 +1985,10 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
-    # Set cudagraph scope for inference.
+    # Respect `--cuda-graph-impl=none` (parity runs); otherwise force "local".
     model[0].config.cuda_graph_scope = args.cuda_graph_scope
-    model[0].config.cuda_graph_impl = "local"
+    if args.cuda_graph_impl != "none":
+        model[0].config.cuda_graph_impl = "local"
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module

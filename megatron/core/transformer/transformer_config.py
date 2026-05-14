@@ -904,9 +904,19 @@ class TransformerConfig(ModelParallelConfig):
     batch_invariant_mode: bool = False
     """If true, uses batch-invariant kernels that provide deterministic forward execution regardless
        of batch size. This ensures bitwise identical results when the same inputs are processed
-       in different batch configurations. This will significantly affect speed of 
+       in different batch configurations. This will significantly affect speed of
        training and inference as the kernels are not full optimized.
        Defaults to False."""
+
+    batch_invariant_kernel_backend: str = "deepgemm"
+    """Backend used by `batch_invariant_mode` for mm / addmm dispatch.
+       - "deepgemm" (default): DeepGEMM `bf16_gemm_nt`. Requires bf16 CUDA
+         inputs and DeepGEMM with bf16 bindings (Hopper / Blackwell).
+         Bitwise-identical to `torch.mm`.
+       - "triton": BIK Triton `matmul_persistent` kernel. Works on any
+         CUDA device for bf16/fp16/fp32 inputs.
+       Grouped GEMM always uses DeepGEMM regardless. Ignored when
+       `batch_invariant_mode=False`."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
