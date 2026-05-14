@@ -90,7 +90,7 @@ mlm = [
 ]
 
 dev = [
-    "nvidia-modelopt[torch]>=0.43; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]>=0.44; sys_platform != 'darwin'",
     "nvidia-resiliency-ext",
     "tqdm",
     "einops~=0.8",
@@ -193,7 +193,7 @@ no-build-isolation-package = [
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
 # We don't define override-dependencies globally but rather locally where we need it.
-# For instance, when installing into a PyTorch base image, we don't want to install torch, 
+# For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
 override-dependencies = [
     "torch; sys_platform == 'never'",
