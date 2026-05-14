@@ -65,7 +65,6 @@ MODEL_OPTIONS="\
   --inference-dynamic-batching-num-cuda-graphs 2 \
   --decode-only-cuda-graphs \
   --cuda-graph-impl local \
-  --cuda-graph-scope full \
   --use-checkpoint-args \
   --enable-experimental \
   --cross-entropy-loss-fusion \
@@ -104,7 +103,6 @@ MODEL_OPTIONS="\
   --tiktoken-pattern v2 \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model ${TOKENIZER_MODEL} \
-  --tokenizer-hf-include-special-tokens \
   --dist-ckpt-strictness log_unexpected \
   --ckpt-format torch_dist \
   --ckpt-fully-parallel-save \

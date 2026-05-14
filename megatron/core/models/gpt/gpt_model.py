@@ -24,7 +24,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -230,6 +230,8 @@ class GPTModel(LanguageModule):
                 pg_collection=self.pg_collection,
             )
 
+            self._setup_mtp_cuda_graphs()
+
         # Output
         if self.post_process:
 
@@ -413,13 +415,7 @@ class GPTModel(LanguageModule):
 
         if (
             in_inference_mode
-            and (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
+            and (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context.is_static_batching()
         ):
             current_batch_size = input_ids.shape[0]
@@ -506,7 +502,6 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        is_spec_decode: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -520,9 +515,6 @@ class GPTModel(LanguageModule):
             padding_mask (Tensor, optional): Padding mask for MoE routing.
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from routing computations.
-            is_spec_decode (bool, optional): Explicitly override whether speculative
-                decoding is active.  When ``None`` (default) the flag is inferred from
-                ``inference_context.num_speculative_tokens``.
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -590,7 +582,6 @@ class GPTModel(LanguageModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
-            is_spec_decode=is_spec_decode,
         )
 
     def _postprocess(
@@ -612,7 +603,6 @@ class GPTModel(LanguageModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
-        is_spec_decode=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -626,12 +616,11 @@ class GPTModel(LanguageModule):
         # Check if speculative decoding is active. When it is, MTP must be
         # computed *after* verification so that it is conditioned on verified
         # tokens rather than stale speculative tokens from the previous step.
-        if is_spec_decode is None:
-            is_spec_decode = (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
-            )
+        is_spec_decode = (
+            in_inference_mode
+            and inference_context.is_dynamic_batching()
+            and inference_context.num_speculative_tokens > 0
+        )
 
         # logits and loss
         output_weight = None

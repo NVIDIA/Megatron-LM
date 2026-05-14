@@ -139,7 +139,7 @@ class TestFP4Param:
         if kwargs.get("enable_cuda_graph", False):
             args.cuda_graph_impl = "transformer_engine"
             args.cuda_graph_warmup_steps = 0
-            args.cuda_graph_scope = "full"
+            args.cuda_graph_modules = "full"
 
         for key, value in kwargs.items():
             if key == "enable_cuda_graph":

@@ -47,7 +47,7 @@ from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.utils import toggle_cuda_graphs, transition_moe_cudagraphs
 from megatron.core.utils import (
     get_asyncio_loop,
@@ -1564,10 +1564,7 @@ def prepare_data_for_update(
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
             forward_backward_func = get_forward_backward_func()
-            if (
-                args.cuda_graph_impl == "local"
-                and CudaGraphScope.full_iteration in args.cuda_graph_scope
-            ):
+            if args.cuda_graph_impl == "full_iteration":
                 forward_backward_func = FullCudaGraphWrapper(
                     forward_backward_func,
                     cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
@@ -2030,9 +2027,11 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
-    # Change cudagraph scope for inference (empty list = full-layer capture)
-    model[0].config.cuda_graph_scope = []
+    # Use local CUDA graphs during rollout inference. An empty module list preserves
+    # full-layer capture when the configured inference scope is layer.
+    model[0].config.cuda_graph_modules = []
     model[0].config.cuda_graph_impl = "local"
+    model[0].config.inference_cuda_graph_scope = args.inference_cuda_graph_scope
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
@@ -2091,14 +2090,19 @@ def megatron_rl_inference_mode(
         # Reset drop_and_pad leaked from inference decode
         set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
 
-        # Restore partial capture cudagraph scope for training if this is MoE
+        # Restore cudagraph scope for training.
+        # MoE partial capture requires specific scopes that aren't user-facing.
+        model[0].config.cuda_graph_impl = args.cuda_graph_impl
+        model[0].config.inference_cuda_graph_scope = args.inference_cuda_graph_scope
         if args.num_experts is not None:
-            model[0].config.cuda_graph_scope = [
-                CudaGraphScope.mamba,
-                CudaGraphScope.attn,
-                CudaGraphScope.moe_router,
-                CudaGraphScope.moe_preprocess,
+            model[0].config.cuda_graph_modules = [
+                CudaGraphModule.mamba,
+                CudaGraphModule.attn,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
             ]
+        else:
+            model[0].config.cuda_graph_modules = copy.copy(args.cuda_graph_modules)
 
         # Switch MoE layers to partial CUDA graph capture for training
         if args.rl_training_cuda_graphs and args.num_experts is not None:

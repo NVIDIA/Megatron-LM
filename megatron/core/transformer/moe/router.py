@@ -826,6 +826,7 @@ class InferenceTopKRouter(TopKRouter):
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        layer_number: Optional[int] = None,
     ) -> None:
         """Initialize the specialized inference top-k router.
 
@@ -843,17 +844,12 @@ class InferenceTopKRouter(TopKRouter):
             f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
         )
 
-        super().__init__(config=config, pg_collection=pg_collection)
-
-        self.is_inference_cuda_graphed_iteration = False
-
-    def set_inference_cuda_graphed_iteration(self):
-        """Enable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = True
-
-    def unset_inference_cuda_graphed_iteration(self):
-        """Disable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = False
+        super().__init__(
+            config=config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            layer_number=layer_number,
+        )
 
     @staticmethod
     @torch.compile
@@ -902,12 +898,18 @@ class InferenceTopKRouter(TopKRouter):
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
         """Simplified forward pass for inference - returns dense tensors only.
 
         Args:
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
+            input_ids (torch.Tensor, optional): Not used in inference.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -915,7 +917,7 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
-        if self.training or not self.is_inference_cuda_graphed_iteration:
-            return super().forward(input, padding_mask)
+        if self.training:
+            return super().forward(input, padding_mask, input_ids)
 
         return self._forward(input, padding_mask)

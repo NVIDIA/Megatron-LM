@@ -30,7 +30,6 @@ def get_moe_module_spec(
         use_te: Whether to use Transformer Engine.
         num_experts: Number of experts.
         moe_grouped_gemm: Whether to use grouped GEMM.
-        moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
     """
     if use_te is not None and use_te:
         backend: BackendSpecProvider = TESpecProvider()

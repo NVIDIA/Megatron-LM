@@ -52,7 +52,7 @@ MODEL_ARGS:
   --seq-length: 4096
   --max-position-embeddings: 4096
   --micro-batch-size: 1
-  --enable-cuda-graph: true
+  --cuda-graph-impl: local
   --te-rng-tracker: true
   --inference-rng-tracker: true
   --moe-pad-experts-for-cuda-graph-inference: true
