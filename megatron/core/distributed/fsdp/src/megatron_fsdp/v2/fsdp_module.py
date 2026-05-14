@@ -24,7 +24,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from .allocator import BucketAllocator, StorageFreeingBucketAllocator, TracePoolAllocator
+from .allocator import BucketAllocator
 from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -61,6 +61,18 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     ag_stream: torch.cuda.Stream  # all-gather / unshard stream
     rs_stream: torch.cuda.Stream  # reduce-scatter stream
+
+    # ------------------------------------------------------------------
+    # Bucket allocator
+    # ------------------------------------------------------------------
+    bucket_allocator: BucketAllocator
+    """
+    Bucket allocator for temporary all-gather and reduce-scatter buffers.
+
+    Buffer roles are part of each allocation key, so one allocator can safely
+    manage all DataParallelBuffer temporary buckets without requiring separate
+    weight/gradient allocator instances.
+    """
 
     # ------------------------------------------------------------------
     # Forward execution ordering
@@ -127,31 +139,6 @@ class _FSDPRootContext:
     _reversed_order: List["FSDPModule"] = field(default_factory=list)
     """``list(reversed(forward_order))`` — precomputed backward processing order."""
 
-    # ------------------------------------------------------------------
-    # Bucket allocators (weight and gradient buffers)
-    # ------------------------------------------------------------------
-    weight_bucket_allocator: Optional[BucketAllocator] = None
-    """
-    Bucket allocator for weight (parameter) buffers used during all-gather.
-
-    When set, this allocator manages the lifecycle and reuse of flat
-    contiguous weight buffers across FSDP modules, enabling memory-efficient
-    double-buffering and custom allocation strategies for unsharded parameters.
-
-    If ``None``, each module allocates its own weight buffer independently.
-    """
-
-    grad_bucket_allocator: Optional[BucketAllocator] = None
-    """
-    Bucket allocator for gradient buffers used during reduce-scatter.
-
-    When set, this allocator manages the lifecycle and reuse of flat
-    contiguous gradient accumulation buffers across FSDP modules, enabling
-    memory-efficient pipelining of gradient reduction.
-
-    If ``None``, each module allocates its own gradient buffer independently.
-    """
-
     def _advance_backward_module(self) -> None:
         """Set ``backward_module`` to the first module in ``_reversed_order``
         that is NOT in ``backward_done_modules``."""
@@ -192,6 +179,7 @@ class FSDPModule(nn.Module):
         mesh: Optional[DeviceMesh],
         ignored_params: Optional[set],
         mp_policy: FullyShardMixedPrecisionPolicy,
+        bucket_allocator: BucketAllocator,
         gradient_scaling_factor: Optional[float] = None,
     ):
         """
@@ -222,6 +210,7 @@ class FSDPModule(nn.Module):
             mp_policy=mp_policy,
             mesh=mesh,
             ignored_params=ignored_params,
+            allocator=bucket_allocator,
             gradient_scaling_factor=gradient_scaling_factor,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
@@ -314,7 +303,10 @@ class FSDPModule(nn.Module):
                 torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
 
     def _init_fsdp_state(
-        self, enable_unshard_prefetch, enable_async_reduce_grad, enable_trace_pool=False
+        self,
+        enable_unshard_prefetch,
+        enable_async_reduce_grad,
+        bucket_allocator: BucketAllocator,
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root."""
         forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
@@ -331,33 +323,19 @@ class FSDPModule(nn.Module):
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
             _reversed_order=list(reversed(forward_order)),
-            weight_bucket_allocator=(
-                TracePoolAllocator() if enable_trace_pool else StorageFreeingBucketAllocator()
-            ),
-            grad_bucket_allocator=TracePoolAllocator() if enable_trace_pool else None,
+            bucket_allocator=bucket_allocator,
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
+
+        for module in forward_order:
+            for param_group in module._fsdp_param_groups:
+                param_group.set_allocator(root_context.bucket_allocator)
+
         for child in self.modules():
             if child is not self and isinstance(child, FSDPModule):
                 child._fsdp_state._is_root = False
                 setattr(child, "_fsdp_root_context", root_context)
-
-                # Reset the bucket allocator. Since this requires certain global information,
-                # we need to update the bucket allocator for all child FSDP modules each time.
-                for param_group in child._fsdp_param_groups:
-                    if root_context.weight_bucket_allocator is not None:
-                        for weight_buffer in (
-                            param_group.model_weight_buffer,
-                            param_group.transpose_weight_buffer,
-                        ):
-                            if weight_buffer is not None:
-                                weight_buffer.allocator = root_context.weight_bucket_allocator
-                    if (
-                        param_group.main_grad_buffer is not None
-                        and root_context.grad_bucket_allocator is not None
-                    ):
-                        param_group.main_grad_buffer.allocator = root_context.grad_bucket_allocator
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
@@ -755,6 +733,7 @@ class FSDPModule(nn.Module):
 def _get_module_fsdp_param_groups(
     module: nn.Module,
     mp_policy: FullyShardMixedPrecisionPolicy,
+    allocator: BucketAllocator,
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,
     gradient_scaling_factor: Optional[float] = None,
@@ -789,6 +768,7 @@ def _get_module_fsdp_param_groups(
                 param_group_id=ParamGroupIdx(id(module), i),
                 mp_policy=mp_policy,
                 gradient_scaling_factor=gradient_scaling_factor,
+                allocator=allocator,
             )
         )
 

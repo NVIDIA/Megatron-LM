@@ -6,7 +6,9 @@
 
 | File | Role in overlap |
 |---|---|
-| `fully_shard.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, all hooks, `unshard()`, `reshard()`, `reduce_grad()`, final callback |
+| `fully_shard.py` | Public `fully_shard()` API and allocator selection |
+| `fsdp_module.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, `unshard()`, `reshard()`, `reduce_grad()` |
+| `hooks.py` | Forward/backward hook registration and final callback |
 | `param_group.py` | `ParameterGroup.unshard(async_op)`, `reduce_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
 | `dp_buffer.py` | `DataParallelBuffer.unshard(async_op)` (all-gather + `p.data` rebind), `reduce_grad()` (reduce-scatter + shard accumulation) |
 | `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
@@ -29,6 +31,11 @@ class _FSDPRootContext:
     rs_stream: torch.cuda.Stream   # reduce-scatter side stream
     # When the corresponding feature flag is False, these are set to
     # torch.cuda.current_stream() so stream-context switches become no-ops.
+
+    # --- Temporary bucket allocator ---
+    bucket_allocator: BucketAllocator
+    # One allocator handles all temporary buckets. Allocation keys include
+    # both parameter-group identity and buffer role.
 
     # --- Static execution order (set at init, never mutated) ---
     forward_order: List[FSDPModule]
@@ -77,22 +84,28 @@ class _FSDPRootContext:
 ### Initialization in `_init_fsdp_state()`
 
 ```python
+bucket_allocator = TracePoolAllocator() if enable_trace_pool else StorageFreeingBucketAllocator()
+module._init_named_param_groups(..., bucket_allocator=bucket_allocator)
+
 forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
 root_context = _FSDPRootContext(
     ag_stream=torch.cuda.Stream() if enable_unshard_prefetch else torch.cuda.current_stream(),
     rs_stream=torch.cuda.Stream() if enable_async_reduce_grad else torch.cuda.current_stream(),
+    bucket_allocator=bucket_allocator,
     forward_order=forward_order,
     reduce_grad_buckets={id(m): [] for m in forward_order},
     unshard_done_events={id(m): None for m in forward_order},
     enable_unshard_prefetch=enable_unshard_prefetch,
     enable_async_reduce_grad=enable_async_reduce_grad,
 )
-# Root gets its own context; each child is overwritten with the same object:
+# Root and children share one context and one bucket allocator:
+for module in forward_order:
+    for param_group in module._fsdp_param_groups:
+        param_group.set_allocator(root_context.bucket_allocator)
 for child in self.modules():
     if child is not self and isinstance(child, FSDPModule):
-        child._init_fsdp_state(...)     # creates a child-local context first
         child._fsdp_state._is_root = False
-        setattr(child, "_fsdp_root_context", root_context)   # then replaced by root's
+        setattr(child, "_fsdp_root_context", root_context)
 ```
 
 `forward_order` is **static** (module tree topology, computed once). There is no first-pass
@@ -640,8 +653,8 @@ interface, letting callers swap allocation strategies without changing
 
 ```
 BucketAllocator  (interface)
-|-- TemporaryBucketAllocator        — legacy: allocates per pg_id, frees + deletes
-|-- StorageFreeingBucketAllocator   — allocates per pg_id, frees storage but keeps bucket
+|-- TemporaryBucketAllocator        — legacy: allocates per key, frees + deletes
+|-- StorageFreeingBucketAllocator   — allocates per key, frees storage but keeps bucket
 |                                     (same tensor object reused on next allocation)
 \-- TracePoolAllocator             — two-phase: trace → plan → static pool
 ```
@@ -658,16 +671,16 @@ that eliminates allocation overhead and fragmentation.
 
 | Phase | Behaviour |
 |---|---|
-| **Trace** (``plan()`` not yet called) | Records every ``allocate`` / ``free`` call as a ``(seq, op, param_group_id)`` event.  Also stores ``(size, dtype, device)`` metadata per ``param_group_id``.  Buckets are allocated via ``torch.empty`` as usual.  Duplicate allocs (without an intervening free) do not generate new trace events. |
-| **Plan** (``plan()``) | Replays the trace to build intervals ``(alloc_seq, free_seq, size)`` for each matched alloc/free pair, groups them by ``(dtype, device)``, and runs a greedy left-edge interval-coloring algorithm per group.  Each color is a **slot** in a contiguous flat pool tensor.  Because the same ``param_group_id`` may appear in multiple intervals, ``_slot_map[pg_id]`` is a **list** of slot indices in alloc order. |
-| **Optimized** (after ``plan()``) | ``allocate`` returns a ``Bucket`` with a slice-view into the pool, advancing a per-pg_id cursor through the slot list.  ``free`` marks the most recently allocated slot as unused (idempotent).  ``reset_cursor()`` rewinds all cursors between micro-batches so the same sequence replays. |
+| **Trace** (``plan()`` not yet called) | Records every ``allocate`` / ``free`` call as a ``(seq, op, key)`` event.  Also stores ``(size, dtype, device)`` metadata per key.  Buckets are allocated via ``torch.empty`` as usual.  Duplicate allocs (without an intervening free) do not generate new trace events. |
+| **Plan** (``plan()``) | Replays the trace to build intervals ``(alloc_seq, free_seq, size)`` for each matched alloc/free pair, groups them by ``(dtype, device)``, and runs a greedy left-edge interval-coloring algorithm per group.  Each color is a **slot** in a contiguous flat pool tensor.  Because the same key may appear in multiple intervals, ``_slot_map[key]`` is a **list** of slot indices in alloc order. |
+| **Optimized** (after ``plan()``) | ``allocate`` returns a ``Bucket`` with a slice-view into the pool, advancing a per-key cursor through the slot list.  ``free`` marks the most recently allocated slot as unused (idempotent).  ``reset_cursor()`` rewinds all cursors between micro-batches so the same sequence replays. |
 
-**Slot lists and cursors.**  A single ``param_group_id`` can appear in multiple
+**Slot lists and cursors.**  A single allocation key can appear in multiple
 intervals — e.g., forward unshard → free → backward unshard → free.  The plan
 may assign these intervals to *different* slots (if they overlap) or *reuse*
-the same slot (if they don't).  ``_slot_map`` therefore maps each pg_id to a
+the same slot (if they don't).  ``_slot_map`` therefore maps each key to a
 **list** of slot indices in the exact alloc order.  During optimized-phase
-runtime a per-pg_id **cursor** tracks which list entry to consume next; between
+runtime a per-key **cursor** tracks which list entry to consume next; between
 micro-batches ``reset_cursor()`` rewinds all cursors to 0.
 
 **Greedy left-edge coloring.**  For each ``(dtype, device)`` group, intervals are
@@ -699,18 +712,18 @@ print(allocator.total_pool_bytes)       # bytes across all groups
 allocator.reset()                       # back to trace phase
 ```
 
-**Lifecycle diagram for one ``param_group_id`` across two micro-batches.**
+**Lifecycle diagram for one allocation key across two micro-batches.**
 
 ```
 Trace phase                            Optimized phase
 -----------                            ---------------
-allocate(pg) → torch.empty  --.         allocate(pg) → pool slot 0   (cursor 0→1)
-free(pg)     → _free_storage  | plan    free(pg)     → slot free
-allocate(pg) → torch.empty  --'         allocate(pg) → pool slot 1   (cursor 1→2)
-free(pg)     → _free_storage           free(pg)     → slot free
+allocate(key) → torch.empty  --.         allocate(key) → pool slot 0   (cursor 0→1)
+free(key)     → _free_storage  | plan    free(key)     → slot free
+allocate(key) → torch.empty  --'         allocate(key) → pool slot 1   (cursor 1→2)
+free(key)     → _free_storage           free(key)     → slot free
                                         -- reset_cursor() --
-                                        allocate(pg) → pool slot 0   (cursor 0→1)
-                                        free(pg)     → slot free
+                                        allocate(key) → pool slot 0   (cursor 0→1)
+                                        free(key)     → slot free
                                         ...
 ```
 

@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .allocator import TemporaryBucketAllocator
+from .allocator import BucketAllocator, TemporaryBucketAllocator
 from .utils import ParamGroupIdx
 
 logger = logging.getLogger(__name__)
@@ -297,7 +297,7 @@ class DataParallelBuffer:
         dp_group: torch.distributed.ProcessGroup,
         param_group_id: ParamGroupIdx,
         *,
-        allocator: Optional[TemporaryBucketAllocator] = None,
+        allocator: Optional[BucketAllocator] = None,
         buffer_role: str = "model_weight",
         is_distributed: bool = False,
         gradient_scaling_factor: Optional[float] = None,

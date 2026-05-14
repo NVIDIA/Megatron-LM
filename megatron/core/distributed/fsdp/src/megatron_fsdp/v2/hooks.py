@@ -211,26 +211,16 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
 
         # After the first backward pass, we have the full trace of bucket allocations
         # and releases. We can now plan the memory pool based on this trace.
-        if isinstance(ctx.weight_bucket_allocator, TracePoolAllocator):
-            wbuf_alloc = ctx.weight_bucket_allocator
-            if wbuf_alloc.phase == "trace":
+        if isinstance(ctx.bucket_allocator, TracePoolAllocator):
+            bucket_alloc = ctx.bucket_allocator
+            if bucket_alloc.phase == "trace":
                 if torch.distributed.get_rank() == 0:
-                    logger.debug(wbuf_alloc.dump_trace())
-                wbuf_alloc.plan()
-            elif wbuf_alloc.phase == "optimized":
-                wbuf_alloc.reset_cursor()
+                    logger.debug(bucket_alloc.dump_trace())
+                bucket_alloc.plan()
+            elif bucket_alloc.phase == "optimized":
+                bucket_alloc.reset_cursor()
             else:
-                raise ValueError(f"Unexpected weight bucket allocator phase: {wbuf_alloc.phase}")
-        if isinstance(ctx.grad_bucket_allocator, TracePoolAllocator):
-            gbuf_alloc = ctx.grad_bucket_allocator
-            if gbuf_alloc.phase == "trace":
-                if torch.distributed.get_rank() == 0:
-                    logger.debug(gbuf_alloc.dump_trace())
-                gbuf_alloc.plan()
-            elif gbuf_alloc.phase == "optimized":
-                gbuf_alloc.reset_cursor()
-            else:
-                raise ValueError(f"Unexpected grad bucket allocator phase: {gbuf_alloc.phase}")
+                raise ValueError(f"Unexpected bucket allocator phase: {bucket_alloc.phase}")
 
     state._post_backward_callback_queued = True
     Variable._execution_engine.queue_callback(

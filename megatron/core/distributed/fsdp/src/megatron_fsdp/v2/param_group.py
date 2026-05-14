@@ -28,7 +28,7 @@ from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from ..uneven_dtensor import make_uneven_dtensor
-from .allocator import TemporaryBucketAllocator, _free_storage
+from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .utils import ParamGroupIdx
@@ -60,6 +60,7 @@ class ParameterGroup:
         mesh: Optional[DeviceMesh] = None,
         sharding_strategy: str = "optim_grads_params",
         gradient_scaling_factor: Optional[float] = None,
+        allocator: Optional[BucketAllocator] = None,
     ):
         self.params = params
         self.param_idx: Dict[torch.nn.Parameter, int] = {p: i for i, p in enumerate(params)}
@@ -99,7 +100,7 @@ class ParameterGroup:
             self.chunk_size_factor = 1
 
         self.gradient_scaling_factor = gradient_scaling_factor
-        self.allocator = TemporaryBucketAllocator()
+        self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
 
         # Buffer references (initialized in _init_buffers)
         self.model_weight_buffer: Optional[DataParallelBuffer] = None
@@ -112,6 +113,17 @@ class ParameterGroup:
 
         # Initialize buffers and distributed parameters
         self._init_buffers()
+
+    def set_allocator(self, allocator: BucketAllocator) -> None:
+        self.allocator = allocator
+        for buffer in (
+            self.model_weight_buffer,
+            self.transpose_weight_buffer,
+            self.main_weight_buffer,
+            self.main_grad_buffer,
+        ):
+            if buffer is not None:
+                buffer.allocator = allocator
 
     def _create_buffer(
         self,
