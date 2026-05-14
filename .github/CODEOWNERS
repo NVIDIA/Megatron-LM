@@ -1,5 +1,7 @@
 megatron/core/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
+megatron/core/models/common/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
+
 megatron/core/models/gpt/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
 megatron/core/models/multimodal/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/multi-modal
