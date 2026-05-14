@@ -174,18 +174,14 @@ class TestCheckpointOnlineConvert:
         not is_torch_min_version("2.4.0"),
         reason="Requires DTensor and DeviceMesh support (PyTorch >= 2.4.0).",
     )
-    @pytest.mark.parametrize(
-        "nd_topology",
-        [
-            pytest.param({"EP": 2}, id="EP2"),
-        ],
-    )
+    @pytest.mark.parametrize("nd_topology", [pytest.param({"EP": 2}, id="EP2")])
     def test_nd_parallel_to_fully_shard_v2(self, nd_topology):
         """
         Save a checkpoint from an ND-parallel (distributed-optimizer) model
         and load it into a fully_shard v2 model.  Verify the state dict.
         """
-        from torch.distributed.checkpoint import load as dcp_load, save as dcp_save
+        from torch.distributed.checkpoint import load as dcp_load
+        from torch.distributed.checkpoint import save as dcp_save
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
 
@@ -242,15 +238,15 @@ class TestCheckpointOnlineConvert:
                 if _normalize_key(l_key) == canonical:
                     matched_key = l_key
                     break
-            assert matched_key is not None, (
-                f"Key {s_key} (canonical: {canonical}) not found in v2 state dict"
-            )
+            assert (
+                matched_key is not None
+            ), f"Key {s_key} (canonical: {canonical}) not found in v2 state dict"
             l_val = loaded_full[matched_key]
             if s_val.numel() > 0:
                 nonempty = True
-            assert s_val.shape == l_val.shape, (
-                f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
-            )
+            assert (
+                s_val.shape == l_val.shape
+            ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
             assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
 
         world_size = torch.distributed.get_world_size()
@@ -271,27 +267,15 @@ class TestCheckpointOnlineConvert:
         not is_torch_min_version("2.4.0"),
         reason="Requires DTensor and DeviceMesh support (PyTorch >= 2.4.0).",
     )
-    @pytest.mark.parametrize(
-        "nd_topology",
-        [
-            pytest.param({"EP": 2}, id="EP2"),
-        ],
-    )
+    @pytest.mark.parametrize("nd_topology", [pytest.param({"EP": 2}, id="EP2")])
     @pytest.mark.parametrize(
         "source_configs",
         [
             pytest.param(
-                dict(data_parallel_sharding_strategy="optim_grads_params"),
-                id="optim_grads_params",
+                dict(data_parallel_sharding_strategy="optim_grads_params"), id="optim_grads_params"
             ),
-            pytest.param(
-                dict(data_parallel_sharding_strategy="optim_grads"),
-                id="optim_grads",
-            ),
-            pytest.param(
-                dict(data_parallel_sharding_strategy="optim"),
-                id="optim",
-            ),
+            pytest.param(dict(data_parallel_sharding_strategy="optim_grads"), id="optim_grads"),
+            pytest.param(dict(data_parallel_sharding_strategy="optim"), id="optim"),
         ],
     )
     def test_megatron_fsdp_baseline_to_fully_shard_v2(self, nd_topology, source_configs):
@@ -299,7 +283,8 @@ class TestCheckpointOnlineConvert:
         Save a checkpoint from a Megatron-FSDP baseline model and load it
         into a fully_shard v2 model.  Verify the state dict.
         """
-        from torch.distributed.checkpoint import load as dcp_load, save as dcp_save
+        from torch.distributed.checkpoint import load as dcp_load
+        from torch.distributed.checkpoint import save as dcp_save
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         shard_str = source_configs["data_parallel_sharding_strategy"]
@@ -315,8 +300,7 @@ class TestCheckpointOnlineConvert:
             )
         )
         source_model, source_sd = TestCheckpointOnlineConvert._training_loop(
-            **nd_topology,
-            **baseline_configs,
+            **nd_topology, **baseline_configs
         )
         source_full = _state_dict_to_full_tensor(source_sd)
 
@@ -347,10 +331,7 @@ class TestCheckpointOnlineConvert:
                 recompute_num_layers=1,
             )
         )
-        v2_model, v2_sd = TestCheckpointOnlineConvert._training_loop(
-            **nd_topology,
-            **v2_configs,
-        )
+        v2_model, v2_sd = TestCheckpointOnlineConvert._training_loop(**nd_topology, **v2_configs)
 
         mapped_sd = _build_key_mapping(source_sd, v2_sd)
         dcp_load(state_dict=mapped_sd, checkpoint_id=str(ckpt_dir))
@@ -368,15 +349,15 @@ class TestCheckpointOnlineConvert:
                 if _normalize_key(l_key) == canonical:
                     matched_key = l_key
                     break
-            assert matched_key is not None, (
-                f"Key {s_key} (canonical: {canonical}) not found in v2 state dict"
-            )
+            assert (
+                matched_key is not None
+            ), f"Key {s_key} (canonical: {canonical}) not found in v2 state dict"
             l_val = loaded_full[matched_key]
             if s_val.numel() > 0:
                 nonempty = True
-            assert s_val.shape == l_val.shape, (
-                f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
-            )
+            assert (
+                s_val.shape == l_val.shape
+            ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
             assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
 
         world_size = torch.distributed.get_world_size()

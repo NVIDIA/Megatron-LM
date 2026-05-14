@@ -114,7 +114,7 @@ module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 
 ### `FSDPModule.unshard(async_op, bwd_pass)`
 
-```
+```python
 stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
 # *** Critical: synchronize ag_stream with current_stream before launching AG ***
@@ -221,7 +221,7 @@ module.post_backward_issued = True
 
 ### `FSDPModule.reduce_grad(async_op)`
 
-```
+```python
 stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
 # --- Step 1: Sliding drain — free grad buffers 2 positions back in backward order ---
@@ -626,24 +626,7 @@ fully-synchronized parameters and gradients.
    (analogous to `suggested_AG_prefetch_size` in the old `AllGatherPipeline`) would
    yield better overlap.
 
-2. **`p.data` rebind before AG completion.** `DataParallelBuffer.unshard()` rebinds
-   `p.data` to the unsharded buffer slice immediately inside the stream context, before
-   the NCCL all-gather fills the data. Correctness is guarded by the outer `event.wait()`,
-   but the internal state of `DataParallelBuffer` is briefly inconsistent. A cleaner design
-   is to return the buffer without rebinding and let `FSDPModule.unshard()` do the rebind
-   after the wait.
-
-3. **Child `_init_fsdp_state` call is redundant.** Each child creates its own
-   `_FSDPRootContext` in `_init_fsdp_state()`, only to have it immediately overwritten by
-   the root's context (`setattr(child, "_fsdp_root_context", root_context)`). The child-local
-   stream allocation is wasted. A small refactor would pass `root_context` directly to avoid
-   the redundant allocation.
-
-4. ~~**`torch.current_stream()` vs `torch.cuda.current_stream()`.**~~ **RESOLVED.** The final
-   callback now uses `torch.cuda.current_stream().wait_stream(stream)` consistently with the
-   rest of the file.
-
-5. **Outer-DP / HSDP.** `_FSDPRootContext` does not carry an outer-DP stream for the second
+2. **Outer-DP / HSDP.** `_FSDPRootContext` does not carry an outer-DP stream for the second
    all-gather needed in hybrid-sharding (outer-DP × inner-FSDP) setups. This mirrors the
    `outer_fsdp_group_param_gather_stream` in the old `AllGatherPipeline`.
 
@@ -665,7 +648,7 @@ BucketAllocator  (interface)
 
 ### `TracePoolAllocator`
 
-**Purpose.**  During activation recompute and gradient reduction the FSDP
+**Purpose.**  During parameter unshard and gradient reduction the FSDP
 framework allocates and frees temporary flat buffers (all-gather input/output,
 gradient accumulation) in a deterministic, repeatable order.  `TracePoolAllocator`
 replaces per-call `torch.empty` + `_free_storage` with a one-time planned pool

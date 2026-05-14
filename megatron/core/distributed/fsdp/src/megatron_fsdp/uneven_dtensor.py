@@ -489,6 +489,7 @@ def split_dtensor(
 def make_uneven_dtensor(
     local_tensor: torch.Tensor, shape: torch.Size, dp_mesh: DeviceMesh, placements: List[Placement]
 ):
+    """Create a DTensor from a possibly uneven local shard with known global shape."""
     assert dp_mesh.ndim == 1, "Only 1D mesh is supported for now"
     return DTensor.from_local(
         local_tensor=local_tensor.view(-1, *shape[1:]),
@@ -507,6 +508,7 @@ def get_state_dict(
     submodules: Optional[set[nn.Module]] = None,
     options: Optional["StateDictOptions"] = None,
 ) -> tuple[dict[str, "ValueType"], "OptimizerStateType"]:
+    """Produce model and optimizer state dicts with uneven DTensor preprocessing."""
     for param in model.parameters():
         assert isinstance(param, DTensor), "Expected all parameters to be DTensors"
 

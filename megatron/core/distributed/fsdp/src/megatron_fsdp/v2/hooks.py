@@ -1,6 +1,21 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Forward and backward hook registration for Megatron-FSDP2."""
 
 import functools
+import logging
 from typing import Any, Callable, Dict, List, Tuple
 
 import torch
@@ -11,6 +26,8 @@ from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 from .allocator import TracePoolAllocator
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
+
+logger = logging.getLogger(__name__)
 
 
 def _register_forward_pre_hook(module: FSDPModule):
@@ -198,26 +215,22 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
             wbuf_alloc = ctx.weight_bucket_allocator
             if wbuf_alloc.phase == "trace":
                 if torch.distributed.get_rank() == 0:
-                    print(wbuf_alloc.dump_trace())
+                    logger.debug(wbuf_alloc.dump_trace())
                 wbuf_alloc.plan()
             elif wbuf_alloc.phase == "optimized":
                 wbuf_alloc.reset_cursor()
             else:
-                raise ValueError(
-                    f"Unexpected weight bucket allocator phase: {wbuf_alloc.phase}"
-                )
+                raise ValueError(f"Unexpected weight bucket allocator phase: {wbuf_alloc.phase}")
         if isinstance(ctx.grad_bucket_allocator, TracePoolAllocator):
             gbuf_alloc = ctx.grad_bucket_allocator
             if gbuf_alloc.phase == "trace":
                 if torch.distributed.get_rank() == 0:
-                    print(gbuf_alloc.dump_trace())
+                    logger.debug(gbuf_alloc.dump_trace())
                 gbuf_alloc.plan()
             elif gbuf_alloc.phase == "optimized":
                 gbuf_alloc.reset_cursor()
             else:
-                raise ValueError(
-                    f"Unexpected grad bucket allocator phase: {gbuf_alloc.phase}"
-                )
+                raise ValueError(f"Unexpected grad bucket allocator phase: {gbuf_alloc.phase}")
 
     state._post_backward_callback_queued = True
     Variable._execution_engine.queue_callback(

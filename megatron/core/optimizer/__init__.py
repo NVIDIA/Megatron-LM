@@ -966,11 +966,14 @@ def get_megatron_optimizer(
             )
             if (
                 not USING_PYTORCH_OPTIMIZER
+                and config.use_precision_aware_optimizer
                 and getattr(optimizer_part.optimizer, "master_weights", None) is not None
             ):
-                # NOTE(@cspades): Megatron-FSDP provides main weights as DTensors.
-                # FusedAdam's internal master_weights are redundant and cause
-                # correctness issues with 1D DTensor parameters. Always disable.
+                # NOTE(@cspades): FusedAdam is provided Megatron-FSDP's main weights as
+                # non-quantized DTensor(s). Megatron-FSDP should NEVER use FusedAdam's
+                # main weights, complete waste of memory as the optimizer step is still
+                # applied to the Megatron-FSDP main weight and extended to FusedAdam
+                # main weights. Override this here.
                 setattr(optimizer_part.optimizer, "master_weights", False)
 
             optimizers.append(optimizer_part)

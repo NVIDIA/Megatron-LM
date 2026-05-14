@@ -1466,7 +1466,7 @@ class MegatronFSDP(torch.nn.Module):
         for param_name in sorted(norms.keys()):
             pn = norms[param_name]["param_norm"]
             gn = norms[param_name]["grad_norm"]
-            print(
+            logger.info(
                 f"{prefix} iter={iteration} param={param_name} "
                 f"param_norm={pn:.6f} grad_norm={gn:.6f}"
             )

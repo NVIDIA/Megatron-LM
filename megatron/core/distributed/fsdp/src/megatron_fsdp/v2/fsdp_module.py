@@ -1,5 +1,20 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """FSDPModule implementation for Megatron-FSDP2."""
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -12,6 +27,8 @@ from .allocator import BucketAllocator, StorageFreeingBucketAllocator, TracePool
 from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
+
+logger = logging.getLogger(__name__)
 
 
 class _FSDPState:
@@ -592,7 +609,7 @@ class FSDPModule(nn.Module):
         for param_name in sorted(norms.keys()):
             param_norm = norms[param_name]["param_norm"]
             grad_norm = norms[param_name]["grad_norm"]
-            print(
+            logger.info(
                 f"{prefix} iter={iteration} param={param_name} "
                 f"param_norm={param_norm:.6f} grad_norm={grad_norm:.6f}"
             )
@@ -688,7 +705,7 @@ class FSDPModule(nn.Module):
             f"Summary: {group_idx} groups, {total_model_elems:,} model elems, "
             f"comm={_mb(total_comm)}, pad={_mb(total_pad)}"
         )
-        print("\n".join(lines))
+        logger.info("\n".join(lines))
 
     def _set_nan_check(self, enable_nan_checks: bool):
         """Enable or disable NaN checking."""

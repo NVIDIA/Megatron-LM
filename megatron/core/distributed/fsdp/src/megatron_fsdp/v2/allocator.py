@@ -1,5 +1,19 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -8,6 +22,8 @@ from .utils import ParamGroupIdx
 
 @dataclasses.dataclass
 class Bucket:
+    """Lightweight container for a temporary allocated tensor buffer."""
+
     data: torch.Tensor
 
 
@@ -147,6 +163,7 @@ class TracePoolAllocator(BucketAllocator):
     @dataclasses.dataclass
     class _TraceEvent:
         """A single alloc or free recorded during the trace phase."""
+
         seq: int
         op: str  # "alloc" | "free"
         param_group_id: ParamGroupIdx
@@ -154,6 +171,7 @@ class TracePoolAllocator(BucketAllocator):
     @dataclasses.dataclass
     class _Interval:
         """An allocation's lifetime: from alloc_seq to free_seq with a given size."""
+
         param_group_id: ParamGroupIdx
         size: int
         alloc_seq: int
@@ -164,18 +182,18 @@ class TracePoolAllocator(BucketAllocator):
     def __init__(self) -> None:
         super().__init__()
         # Phase bookkeeping
-        self._phase: str = "trace"                       # "trace" | "optimized"
-        self._seq: int = 0                               # monotonic alloc/free counter
+        self._phase: str = "trace"  # "trace" | "optimized"
+        self._seq: int = 0  # monotonic alloc/free counter
 
         # Trace state
         self._trace: List["TracePoolAllocator._TraceEvent"] = []
         self._trace_meta: Dict[ParamGroupIdx, Tuple[int, torch.dtype, torch.device]] = {}
-        self._buckets: Dict[ParamGroupIdx, Bucket] = {}   # only used in trace phase
+        self._buckets: Dict[ParamGroupIdx, Bucket] = {}  # only used in trace phase
 
         # Pool state — populated by plan(), used in optimized phase
         self._pools: Dict[Tuple[torch.dtype, torch.device], torch.Tensor] = {}
         self._slot_map: Dict[ParamGroupIdx, List[int]] = {}  # pg_id -> [slot indices]
-        self._slot_cursors: Dict[ParamGroupIdx, int] = {}    # pg_id -> next index to use
+        self._slot_cursors: Dict[ParamGroupIdx, int] = {}  # pg_id -> next index to use
         self._slots: List["TracePoolAllocator._Slot"] = []
 
     # -- Phase 1: trace -------------------------------------------------- #
@@ -320,8 +338,8 @@ class TracePoolAllocator(BucketAllocator):
 
         # free_slots: list of (local_slot_index, free_seq)
         free_slots: List[Tuple[int, int]] = []
-        group_slots: List["TracePoolAllocator._Slot"] = []    # slots for this group
-        local_to_global: Dict[int, int] = {}                   # local index -> global index
+        group_slots: List["TracePoolAllocator._Slot"] = []  # slots for this group
+        local_to_global: Dict[int, int] = {}  # local index -> global index
 
         for iv in intervals:
             assigned = False
@@ -330,8 +348,8 @@ class TracePoolAllocator(BucketAllocator):
                 if slot_free_seq < iv.alloc_seq:
                     slot = group_slots[slot_idx]
                     if iv.size > slot.size:
-                        slot.size = iv.size                   # grow if needed
-                    free_slots[i] = (slot_idx, iv.free_seq)   # update free time
+                        slot.size = iv.size  # grow if needed
+                    free_slots[i] = (slot_idx, iv.free_seq)  # update free time
                     self._slot_map.setdefault(iv.param_group_id, []).append(
                         local_to_global[slot_idx]
                     )
@@ -378,8 +396,7 @@ class TracePoolAllocator(BucketAllocator):
         slot_list = self._slot_map[param_group_id]
         cursor = self._slot_cursors.get(param_group_id, 0)
         assert cursor < len(slot_list), (
-            f"no slot available for pg={param_group_id} "
-            f"(cursor={cursor}, slots={slot_list})"
+            f"no slot available for pg={param_group_id} " f"(cursor={cursor}, slots={slot_list})"
         )
         slot_idx = slot_list[cursor]
         self._slot_cursors[param_group_id] = cursor + 1
@@ -389,9 +406,9 @@ class TracePoolAllocator(BucketAllocator):
             f"slot {slot_idx} already in use (pg={param_group_id}, "
             f"cursor={cursor}, slot_list={slot_list})"
         )
-        assert size <= slot.size, (
-            f"requested {size} > slot capacity {slot.size} (pg={param_group_id})"
-        )
+        assert (
+            size <= slot.size
+        ), f"requested {size} > slot capacity {slot.size} (pg={param_group_id})"
         pool = self._pools[(slot.dtype, slot.device)]
         slot.in_use = True
         self._seq += 1
@@ -403,9 +420,7 @@ class TracePoolAllocator(BucketAllocator):
         Double-frees are silently ignored (idempotent).
         """
         # The last allocated slot for this pg_id is at cursor - 1
-        slot_idx = self._slot_map[param_group_id][
-            self._slot_cursors.get(param_group_id, 1) - 1
-        ]
+        slot_idx = self._slot_map[param_group_id][self._slot_cursors.get(param_group_id, 1) - 1]
         slot = self._slots[slot_idx]
         self._seq += 1
         if not slot.in_use:
@@ -471,6 +486,7 @@ class TracePoolAllocator(BucketAllocator):
 
     @property
     def phase(self) -> str:
+        """Current allocator phase: 'trace', 'plan', or 'optimized'."""
         return self._phase
 
     @property
