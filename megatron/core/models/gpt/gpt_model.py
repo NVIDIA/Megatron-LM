@@ -10,6 +10,7 @@ from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
@@ -308,7 +309,7 @@ class GPTModel(LanguageModule):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = InferenceMode.is_active()
 
         # Decoder embedding.
         if decoder_input is not None:
@@ -345,7 +346,11 @@ class GPTModel(LanguageModule):
                 hasattr(inference_context, 'use_flashinfer_fused_rope')
                 and inference_context.use_flashinfer_fused_rope
             )
-            if in_inference_mode and (self.config.flash_decode or use_flash_infer_fused_rope):
+            if (
+                in_inference_mode
+                and inference_context is not None
+                and (self.config.flash_decode or use_flash_infer_fused_rope)
+            ):
                 assert (
                     not self.config.flash_decode
                 ) or inference_context.is_static_batching(), (
@@ -377,7 +382,7 @@ class GPTModel(LanguageModule):
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
         elif self.position_embedding_type == 'yarn':
-            if self.training or not self.config.flash_decode:
+            if not InferenceMode.is_active() or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
@@ -393,7 +398,7 @@ class GPTModel(LanguageModule):
                     "YarnRotaryEmbedding yet."
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
-            if self.training or not self.config.flash_decode:
+            if not InferenceMode.is_active() or not self.config.flash_decode:
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
@@ -408,6 +413,7 @@ class GPTModel(LanguageModule):
 
         if (
             in_inference_mode
+            and inference_context is not None
             and (
                 (
                     self.config.cuda_graph_impl == "local"
@@ -429,8 +435,10 @@ class GPTModel(LanguageModule):
         if in_inference_mode:
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations
-            if inference_context.is_dynamic_batching() and is_using_quantization_scales(
-                self.config
+            if (
+                inference_context is not None
+                and inference_context.is_dynamic_batching()
+                and is_using_quantization_scales(self.config)
             ):
                 decoder_input[inference_context.padding_slice] = 0.0
 
@@ -563,6 +571,7 @@ class GPTModel(LanguageModule):
             loss_mask=loss_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
@@ -586,6 +595,7 @@ class GPTModel(LanguageModule):
         loss_mask=None,
         decoder_input=None,
         attention_mask=None,
+        padding_mask=None,
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
@@ -600,7 +610,7 @@ class GPTModel(LanguageModule):
         Applies Multi-Token Prediction if enabled, generates output logits through
         the output layer, and computes language model loss when labels are provided.
         """
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = InferenceMode.is_active()
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
@@ -609,6 +619,7 @@ class GPTModel(LanguageModule):
         # tokens rather than stale speculative tokens from the previous step.
         is_spec_decode = (
             in_inference_mode
+            and inference_context is not None
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
@@ -629,6 +640,7 @@ class GPTModel(LanguageModule):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
                 embedding=self.embedding,
                 **(extra_block_kwargs or {}),
             )
@@ -680,7 +692,11 @@ class GPTModel(LanguageModule):
                 config=self.config,
             )
 
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.config.materialize_only_last_token_logits
+        ):
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
