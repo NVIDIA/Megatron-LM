@@ -17,7 +17,6 @@ from tests.unit_tests.a2a_overlap.utils import (
     build_gpt_model,
     build_input_data,
     deterministic_mode,
-    env_vars_ctx,
     fsdp_train_step,
     get_test_config,
     get_valid_flex_dispatcher_backend,
