@@ -89,7 +89,9 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
         ("paused_only", 2, 2, [5, 7, 0, 0, 0, 0, 0, 0], 0, 12),
     ],
 )
-def test_block_usage_counts_no_prefix_caching(scope, paused, total, counts, expected_active, expected_paused):
+def test_block_usage_counts_no_prefix_caching(
+    scope, paused, total, counts, expected_active, expected_paused
+):
     """get_active_used / get_paused_used sum request_kv_block_counts over the
     [paused:total] and [:paused] slices respectively."""
     ctx = _make_context(
@@ -106,10 +108,7 @@ def test_block_usage_counts_no_prefix_caching(scope, paused, total, counts, expe
 
 @pytest.mark.parametrize(
     "policy,expect_timestamps",
-    [
-        (PrefixCachingEvictionPolicy.LRU, True),
-        (PrefixCachingEvictionPolicy.REF_ZERO, False),
-    ],
+    [(PrefixCachingEvictionPolicy.LRU, True), (PrefixCachingEvictionPolicy.REF_ZERO, False)],
 )
 def test_prefix_caching_state_layout(policy, expect_timestamps):
     """Prefix-caching mode allocates block_hashes (initially -1) and ref_counts
@@ -169,23 +168,9 @@ def test_prefix_caching_allocate_and_hash_registration():
     "paused,total,active_assignments,paused_assignments,expected_active,expected_paused",
     [
         # active rows [1:3] reference {2,3,4,5}; no paused rows assigned.
-        (
-            1,
-            3,
-            {1: [2, 3, -1, -1], 2: [3, 4, 5, -1]},
-            {},
-            4,
-            0,
-        ),
+        (1, 3, {1: [2, 3, -1, -1], 2: [3, 4, 5, -1]}, {}, 4, 0),
         # paused rows [:2] reference {1,2,3}; no active rows assigned.
-        (
-            2,
-            2,
-            {},
-            {0: [1, 2, -1, -1], 1: [1, 3, -1, -1]},
-            0,
-            3,
-        ),
+        (2, 2, {}, {0: [1, 2, -1, -1], 1: [1, 3, -1, -1]}, 0, 3),
     ],
 )
 def test_block_usage_counts_with_prefix_caching(
@@ -197,7 +182,9 @@ def test_block_usage_counts_with_prefix_caching(
     for row_idx, ids in {**active_assignments, **paused_assignments}.items():
         request_to_kv[row_idx] = torch.tensor(ids, dtype=torch.int32)
     ctx = _make_context(
-        paused_request_count=paused, total_request_count=total, request_to_kv_block_ids=request_to_kv
+        paused_request_count=paused,
+        total_request_count=total,
+        request_to_kv_block_ids=request_to_kv,
     )
     a = KVBlockAllocator(ctx, total_count=TOTAL_COUNT, paused_count=3, enable_prefix_caching=True)
     assert a.get_active_used() == expected_active

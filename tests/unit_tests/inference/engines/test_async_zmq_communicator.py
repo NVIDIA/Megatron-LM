@@ -39,12 +39,21 @@ def _make_comm(rank=0, world_size=1):
         # Leader rank with one follower; element-wise max + broadcast.
         (0, 2, (7,), [struct.pack("!1i", 9)], 9, struct.pack("!1i", 9)),
         # Leader with two followers and two values; element-wise max.
-        (0, 3, (3, 6), [struct.pack("!2i", 4, 8), struct.pack("!2i", 5, 7)], (5, 8), struct.pack("!2i", 5, 8)),
+        (
+            0,
+            3,
+            (3, 6),
+            [struct.pack("!2i", 4, 8), struct.pack("!2i", 5, 7)],
+            (5, 8),
+            struct.pack("!2i", 5, 8),
+        ),
         # Follower path: reads broadcast, returns the value.
         (1, 2, (2,), struct.pack("!1i", 11), 11, None),
     ],
 )
-async def test_sync_all_reduce_max(rank, world_size, local_vals, peer_payloads, expected_result, expected_broadcast):
+async def test_sync_all_reduce_max(
+    rank, world_size, local_vals, peer_payloads, expected_result, expected_broadcast
+):
     """sync_all_reduce_max implements element-wise max across ranks via ZMQ:
     the leader collects N-1 follower payloads, computes the max, and broadcasts;
     each follower sends its payload and reads back the broadcast.

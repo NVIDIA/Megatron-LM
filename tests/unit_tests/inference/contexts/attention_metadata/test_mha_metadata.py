@@ -42,7 +42,9 @@ def test_set_state_data_slices_views_per_active_request_count(cls):
         max_seqlen=512,
     )
     m.bind_gpu_buffers(_make_gpu_view())
-    m.set_state_data(padded_active_request_count=n, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
+    m.set_state_data(
+        padded_active_request_count=n, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k
+    )
 
     assert m.state_data["query_lengths"].shape == (n,)
     assert m.state_data["cu_query_seq_lengths"].shape == (n + 1,)

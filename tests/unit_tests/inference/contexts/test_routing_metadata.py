@@ -20,7 +20,9 @@ def _make_context(active_token_count=10, using_cuda_graph=False):
     return ctx
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="RoutingMetadata uses cuda.current_device")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="RoutingMetadata uses cuda.current_device"
+)
 class TestRoutingMetadata:
 
     def test_lazy_buffer_allocation_and_recording_lifecycle(self):
@@ -72,7 +74,9 @@ class TestRoutingMetadata:
             (False, False, "valid", (7, 2, TOPK)),
         ],
     )
-    def test_get_routing_indices(self, using_cuda_graph, buffer_allocated, recorded_data, expected_shape):
+    def test_get_routing_indices(
+        self, using_cuda_graph, buffer_allocated, recorded_data, expected_shape
+    ):
         """get_routing_indices either slices the static buffer (CUDA-graph mode)
         or stacks per-layer RouterReplay tensors (eager mode); returns None when
         no data is available."""
