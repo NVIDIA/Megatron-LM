@@ -118,6 +118,44 @@ class TestNonuniformTPUtilities:
 
         assert active_ranks == [1, 2, 3, 4, 5, 6]
 
+    @patch('megatron.core.distributed.nonuniform_tp.parallel_state')
+    @patch('megatron.core.distributed.nonuniform_tp.dist')
+    def test_initialize_nonuniform_tp_creates_groups_on_nonmember_ranks(
+        self, mock_dist, mock_parallel_state
+    ):
+        """All ranks must enter replacement group creation in the same order."""
+        mock_dist.get_rank.return_value = 4
+        mock_parallel_state.get_context_parallel_world_size.return_value = 1
+
+        ntp_config = NonuniformTPConfig(
+            tp_base=4,
+            tp_spares=2,
+            num_reduced_tp_dp_ranks=1,
+            non_active_ranks_per_dp={(0, 0, 0): [2, 3]},
+        )
+
+        assert initialize_nonuniform_tp_process_groups(ntp_config, exit_spares=False)
+        mock_dist.new_group.assert_called_once_with(ranks=[0, 1])
+
+    @patch('megatron.core.distributed.nonuniform_tp.parallel_state')
+    @patch('megatron.core.distributed.nonuniform_tp.dist')
+    def test_initialize_nonuniform_tp_returns_false_after_group_creation_for_spares(
+        self, mock_dist, mock_parallel_state
+    ):
+        """Spare ranks still participate in group creation before opting out."""
+        mock_dist.get_rank.return_value = 2
+        mock_parallel_state.get_context_parallel_world_size.return_value = 1
+
+        ntp_config = NonuniformTPConfig(
+            tp_base=4,
+            tp_spares=2,
+            num_reduced_tp_dp_ranks=1,
+            non_active_ranks_per_dp={(0, 0, 0): [2, 3]},
+        )
+
+        assert not initialize_nonuniform_tp_process_groups(ntp_config, exit_spares=False)
+        mock_dist.new_group.assert_called_once_with(ranks=[0, 1])
+
 
 class TestNonuniformTPBufferLayout:
     """Test NTP gradient-buffer layout compatibility with DDP buffer features."""
@@ -527,19 +565,14 @@ class TestNonuniformTPEndToEnd:
             non_active_ranks_per_dp={(0, 0, 0): [2, 3]},  # DP=0: GPUs 2,3 are spares
         )
 
-        # Check if this rank is a spare (will exit during initialization)
-        # Spare ranks: DP=0 with tp_rank=2,3
-        is_spare = dp_rank == 0 and tp_rank in [2, 3]
-
         # Reconfigure process groups for NTP
-        # Note: spare ranks will call sys.exit(0) in initialize_nonuniform_tp_process_groups
+        # Spare ranks must still enter NTP group creation before opting out so distributed
+        # group creation order stays consistent for later tests in the same pytest shard.
         from megatron.core.distributed.nonuniform_tp import initialize_nonuniform_tp_process_groups
 
-        if is_spare:
-            # For spare ranks in test, just mark as passed and exit gracefully
+        is_active_rank = initialize_nonuniform_tp_process_groups(ntp_config, exit_spares=False)
+        if not is_active_rank:
             pytest.skip(f"Rank {rank} is a spare rank, skipping test gracefully")
-
-        initialize_nonuniform_tp_process_groups(ntp_config)
 
         # After reconfiguration, check TP size
         tp_size_after = parallel_state.get_tensor_model_parallel_world_size()

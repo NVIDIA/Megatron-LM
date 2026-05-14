@@ -472,96 +472,93 @@ def initialize_nonuniform_tp_process_groups(
     dp_replica_size = tp_base * cp_size
     num_reduced_dp_ranks = ntp_config.num_reduced_tp_dp_ranks
 
-    # Determine if current rank is in a reduced TP DP replica
-    dp_replica_id = rank // dp_replica_size
-    if dp_replica_id >= num_reduced_dp_ranks:
-        # This rank is in a normal TP DP replica, no reconfiguration needed
+    active_local_ranks_by_dp = []
+    for reduced_dp_replica_id in range(num_reduced_dp_ranks):
+        active_ranks_for_cp = [
+            get_active_ranks_for_dp(
+                reduced_dp_replica_id, tp_base, ntp_config, cp_rank=cp_rank
+            )
+            for cp_rank in range(cp_size)
+        ]
+        if any(active_ranks != active_ranks_for_cp[0] for active_ranks in active_ranks_for_cp):
+            raise RuntimeError(
+                "Legacy NTP process-group reconfiguration requires the same active "
+                "local TP ranks for every CP slice in a DP replica."
+            )
+        active_local_ranks_by_dp.append(active_ranks_for_cp[0])
+
+    current_dp_replica_id = rank // dp_replica_size
+    current_local_rank_in_dp = rank % dp_replica_size
+    current_tp_rank_in_slice = current_local_rank_in_dp % tp_base
+
+    for reduced_dp_replica_id, active_local_ranks in enumerate(active_local_ranks_by_dp):
+        dp_replica_start = reduced_dp_replica_id * dp_replica_size
         logger.info(
-            "[NTP] Rank %s is in normal TP DP replica %s, skipping reconfiguration",
+            "[NTP] Rank %s creating groups for reduced DP replica %s: active_local_ranks=%s",
             rank,
-            dp_replica_id,
+            reduced_dp_replica_id,
+            active_local_ranks,
         )
-        return True
 
-    local_rank_in_dp = rank % dp_replica_size
-    cp_rank_in_dp = local_rank_in_dp // tp_base if cp_size > 1 else 0
+        if cp_size > 1:
+            # With CP enabled: recreate TP, CP, and TP-CP groups.
+            for cp_rank in range(cp_size):
+                cp_slice_start = dp_replica_start + cp_rank * tp_base
+                tp_group_ranks = [cp_slice_start + local_tp for local_tp in active_local_ranks]
+                tp_group = dist.new_group(ranks=tp_group_ranks)
 
-    # This rank is in a reduced TP DP replica - need to reconfigure
-    # Get active ranks for this DP replica (supports non-contiguous)
-    active_local_ranks = get_active_ranks_for_dp(
-        dp_replica_id, tp_base, ntp_config, cp_rank=cp_rank_in_dp
-    )
+                if rank in tp_group_ranks:
+                    parallel_state._TENSOR_MODEL_PARALLEL_GROUP = tp_group
+                    parallel_state._TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
+                    parallel_state._MODEL_PARALLEL_GROUP = tp_group
+                    parallel_state._MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
+                    logger.info("[NTP] Rank %s created TP group: %s", rank, tp_group_ranks)
 
-    logger.info(
-        "[NTP] Rank %s in DP replica %s: active_local_ranks=%s",
-        rank,
-        dp_replica_id,
-        active_local_ranks,
-    )
+            # Create new CP groups (one per active TP position).
+            for tp_rank_in_slice in active_local_ranks:
+                cp_group_ranks = [
+                    dp_replica_start + tp_rank_in_slice + i * tp_base for i in range(cp_size)
+                ]
+                cp_group = dist.new_group(ranks=cp_group_ranks)
 
-    if cp_size > 1:
-        # With CP enabled: recreate TP, CP, and TP-CP groups
-        dp_replica_start = dp_replica_id * dp_replica_size
+                if rank in cp_group_ranks:
+                    parallel_state._CONTEXT_PARALLEL_GROUP = cp_group
+                    parallel_state._CONTEXT_PARALLEL_GLOBAL_RANKS = cp_group_ranks
+                    logger.info("[NTP] Rank %s created CP group: %s", rank, cp_group_ranks)
 
-        # Create new TP groups (one per CP slice in this DP replica)
-        for cp_rank in range(cp_size):
-            cp_slice_start = dp_replica_start + cp_rank * tp_base
-            tp_group_ranks = [cp_slice_start + local_tp for local_tp in active_local_ranks]
-            tp_group = dist.new_group(ranks=tp_group_ranks)
-
-            if rank in tp_group_ranks:
-                parallel_state._TENSOR_MODEL_PARALLEL_GROUP = tp_group
-                parallel_state._TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
-                parallel_state._MODEL_PARALLEL_GROUP = tp_group
-                parallel_state._MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
-                logger.info("[NTP] Rank %s created TP group: %s", rank, tp_group_ranks)
-
-        # Create new CP groups (one per active TP position)
-        for tp_rank_in_slice in active_local_ranks:
-            cp_group_ranks = [
-                dp_replica_start + tp_rank_in_slice + i * tp_base for i in range(cp_size)
-            ]
-            cp_group = dist.new_group(ranks=cp_group_ranks)
-
-            if rank in cp_group_ranks:
-                parallel_state._CONTEXT_PARALLEL_GROUP = cp_group
-                parallel_state._CONTEXT_PARALLEL_GLOBAL_RANKS = cp_group_ranks
-                logger.info("[NTP] Rank %s created CP group: %s", rank, cp_group_ranks)
-
-        # Update TENSOR_AND_CONTEXT_PARALLEL_GROUP
-        tp_rank_in_slice = local_rank_in_dp % tp_base
-        if tp_rank_in_slice in active_local_ranks:
             tp_cp_group_ranks = []
             for cp_r in range(cp_size):
                 for active_tp in active_local_ranks:
                     tp_cp_group_ranks.append(dp_replica_start + cp_r * tp_base + active_tp)
             tp_cp_group = dist.new_group(ranks=tp_cp_group_ranks)
-            parallel_state._TENSOR_AND_CONTEXT_PARALLEL_GROUP = tp_cp_group
-            logger.info("[NTP] Rank %s created TP-CP group: %s", rank, tp_cp_group_ranks)
+            if rank in tp_cp_group_ranks:
+                parallel_state._TENSOR_AND_CONTEXT_PARALLEL_GROUP = tp_cp_group
+                logger.info("[NTP] Rank %s created TP-CP group: %s", rank, tp_cp_group_ranks)
         else:
-            # Non-active (spare) rank - exit
-            logger.info("[NTP] Rank %s is a spare rank with CP, exiting", rank)
-            if exit_spares:
-                sys.exit(0)
-            return False
-    else:
-        # No CP: simpler case
-        dp_replica_start = dp_replica_id * dp_replica_size
-        tp_group_ranks = [dp_replica_start + local_tp for local_tp in active_local_ranks]
-
-        if rank in tp_group_ranks:
+            tp_group_ranks = [dp_replica_start + local_tp for local_tp in active_local_ranks]
             tp_group = dist.new_group(ranks=tp_group_ranks)
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = tp_group
-            parallel_state._MODEL_PARALLEL_GROUP = tp_group
-            parallel_state._TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
-            parallel_state._MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
-            logger.info("[NTP] Rank %s created TP group: %s", rank, tp_group_ranks)
-        else:
-            # Non-active (spare) rank - exit
-            logger.info("[NTP] Rank %s is a spare rank, exiting", rank)
-            if exit_spares:
-                sys.exit(0)
-            return False
+
+            if rank in tp_group_ranks:
+                parallel_state._TENSOR_MODEL_PARALLEL_GROUP = tp_group
+                parallel_state._MODEL_PARALLEL_GROUP = tp_group
+                parallel_state._TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
+                parallel_state._MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
+                logger.info("[NTP] Rank %s created TP group: %s", rank, tp_group_ranks)
+
+    if current_dp_replica_id >= num_reduced_dp_ranks:
+        logger.info(
+            "[NTP] Rank %s is in normal TP DP replica %s, skipping reconfiguration",
+            rank,
+            current_dp_replica_id,
+        )
+        return True
+
+    active_local_ranks = active_local_ranks_by_dp[current_dp_replica_id]
+    if current_tp_rank_in_slice not in active_local_ranks:
+        logger.info("[NTP] Rank %s is a spare rank, exiting", rank)
+        if exit_spares:
+            sys.exit(0)
+        return False
 
     return True
 
