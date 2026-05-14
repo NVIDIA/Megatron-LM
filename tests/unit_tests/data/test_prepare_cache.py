@@ -113,6 +113,7 @@ def _build_prepare_cache_args(file_prefixes, data_cache_path, **overrides):
         tokenizer_type="NullTokenizer",
         vocab_size=2048,
         padded_vocab_size=None,
+        pad_vocab_size=True,
         make_vocab_size_divisible_by=128,
         rank=0,
         world_size=4,
