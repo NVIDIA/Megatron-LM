@@ -40,15 +40,13 @@ def _generate_graphs(num_cuda_graphs, use_non_decode=True):
     return graph_list
 
 
-def _match(real, graph_list, ep_group, strict=False, decode_only=False, num_speculative_tokens=0):
+def _match(real, graph_list, ep_group, strict=False):
     return CUDAGraphBatchDimensionBuilder.match_graph_config(
         real_batch_dim=real,
         cuda_graph_batch_dimensions_list=graph_list,
         strict=strict,
-        decode_only_cuda_graphs=decode_only,
         ep_group=ep_group,
-        smallest_non_decode_cuda_graph_size=min(MIXED_PREFILL_COUNT, MAX_REQUESTS),
-        num_speculative_tokens=num_speculative_tokens,
+        match_ep_token_counts=True,
     )
 
 
@@ -116,6 +114,77 @@ class TestCUDAGraphTokenCountAlignment:
         )
 
 
+class TestGenerateCUDAGraphEdgeCases:
+    """Single-process tests for graph generation edge cases."""
+
+    def test_generate_cuda_graph_edge_cases(self):
+        """Edge cases in graph generation:
+        max_tokens > max_requests, small max_tokens, step_size floor, speculative decoding.
+        """
+
+        # max_tokens > max_requests: decode graphs capped, prefill graphs span full budget
+        g_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            tp_size=1,
+            num_cuda_graphs=8,
+            cuda_graph_max_tokens=512,
+            cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+            max_requests=64,
+            max_tokens=512,
+            max_sequence_length=4096,
+            use_cuda_graphs_for_non_decode_steps=True,
+        )
+        decode_graphs = [g for g in g_list if g.prefill_req_count == 0]
+        prefill_graphs = [g for g in g_list if g.prefill_req_count > 0]
+        assert all(g.token_count <= 64 for g in decode_graphs)
+        assert prefill_graphs and max(g.token_count for g in prefill_graphs) > 64
+
+        # max_tokens < num_cuda_graphs: step_size could round to zero
+        g_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            tp_size=1,
+            num_cuda_graphs=32,
+            cuda_graph_max_tokens=10,
+            cuda_graph_mixed_prefill_request_count=0,
+            max_requests=10,
+            max_tokens=10,
+            max_sequence_length=4096,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        assert len(g_list) > 0 and all(g.token_count > 0 for g in g_list)
+
+        # Step size >= tp_size for various TP sizes
+        for tp_size in (1, 2, 4, 8):
+            g_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                tp_size=tp_size,
+                num_cuda_graphs=64,
+                cuda_graph_max_tokens=tp_size,
+                cuda_graph_mixed_prefill_request_count=0,
+                max_requests=tp_size,
+                max_tokens=tp_size,
+                max_sequence_length=4096,
+                use_cuda_graphs_for_non_decode_steps=False,
+            )
+            assert len(g_list) > 0
+            for g in g_list:
+                assert g.token_count % tp_size == 0
+
+        # Speculative decoding with max_tokens >> max_requests * (spec+1)
+        for num_spec in (1, 3, 7):
+            g_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                tp_size=1,
+                num_cuda_graphs=8,
+                cuda_graph_max_tokens=1024,
+                cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+                max_requests=32,
+                max_tokens=1024,
+                max_sequence_length=4096,
+                use_cuda_graphs_for_non_decode_steps=True,
+                num_speculative_tokens=num_spec,
+            )
+            for g in [g for g in g_list if g.prefill_req_count == 0]:
+                assert g.token_count == g.decode_req_count * (num_spec + 1)
+                assert g.decode_req_count <= 32
+
+
 class TestMatchGraphConfigWithEP:
     """Tests for match_graph_config with expert parallelism.
 
@@ -175,13 +244,14 @@ class TestMatchGraphConfigWithEP:
         assert result is not None
 
     # ------------------------------------------------------------------ #
-    # 3. decode_only_cuda_graphs=True, some ranks have prefill → all None
+    # 3. Any rank has prefill → all ranks fall back to eager (None)
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
     @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
-    def test_decode_only_graphs_with_mixed_ranks(self, num_cuda_graphs):
-        """When decode_only_cuda_graphs=True and at least one EP rank has a
-        prefill request, ALL ranks should get None (eager mode)."""
+    def test_any_prefill_rank_forces_eager(self, num_cuda_graphs):
+        """When at least one EP rank has a prefill request,
+        adjust_batch_dims_for_expert_parallelism returns None and ALL ranks
+        get None from match_graph_config (eager mode)."""
         ep_group = self._get_ep_group()
         graph_list = _generate_graphs(num_cuda_graphs)
         rank = dist.get_rank()
@@ -192,11 +262,9 @@ class TestMatchGraphConfigWithEP:
         else:
             real = BD(token_count=32, prefill_req_count=0, decode_req_count=32)
 
-        result = _match(real, graph_list, ep_group=ep_group, decode_only=True)
+        result = _match(real, graph_list, ep_group=ep_group)
         _assert_consistent_across_ranks(result, ep_group)
-        assert (
-            result is None
-        ), "All ranks should run eager when decode_only=True and some rank has prefill"
+        assert result is None, "All ranks should run eager when any rank has prefill"
 
     # ------------------------------------------------------------------ #
     # 4. Mixed prefill graphs with strict matching
@@ -286,11 +354,13 @@ class TestMatchGraphConfigWithEP:
     # ------------------------------------------------------------------ #
     # 9. All ranks decode-only with decode_only_cuda_graphs → should match
     # ------------------------------------------------------------------ #
+    # 9. All ranks decode-only → EP max-reduce finds a matching graph
+    # ------------------------------------------------------------------ #
     @pytest.mark.internal
     @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
-    def test_decode_only_graphs_all_decode(self, num_cuda_graphs):
-        """When all EP ranks are decode-only and decode_only_cuda_graphs=True,
-        a match should be found."""
+    def test_all_decode_ranks_match(self, num_cuda_graphs):
+        """When all EP ranks are decode-only, the all-reduce max lifts token
+        counts to the largest rank's value and a matching graph is found."""
         ep_group = self._get_ep_group()
         graph_list = _generate_graphs(num_cuda_graphs)
         rank = dist.get_rank()
@@ -298,9 +368,9 @@ class TestMatchGraphConfigWithEP:
         token_count = (rank + 1) * 4
         real = BD(token_count=token_count, prefill_req_count=0, decode_req_count=token_count)
 
-        result = _match(real, graph_list, ep_group=ep_group, decode_only=True)
+        result = _match(real, graph_list, ep_group=ep_group)
         _assert_consistent_across_ranks(result, ep_group)
-        assert result is not None, "All-decode batch with decode_only_cuda_graphs should match"
+        assert result is not None, "All-decode batch should match a graph"
 
     # ------------------------------------------------------------------ #
     # 10. Real batch exceeds all graphs → None on all ranks
@@ -443,9 +513,7 @@ class TestSpeculativeDecodingBatchDimensions:
         token_count = decode_reqs * (num_speculative_tokens + 1)
         real = BD(token_count=token_count, prefill_req_count=0, decode_req_count=decode_reqs)
 
-        result = _match(
-            real, graph_list, ep_group=ep_group, num_speculative_tokens=num_speculative_tokens
-        )
+        result = _match(real, graph_list, ep_group=ep_group)
 
         # All ranks should end up syncing to the maximum requirement and picking the same graph
         _assert_consistent_across_ranks(result, ep_group)
@@ -458,14 +526,9 @@ class TestSpeculativeDecodingBatchDimensions:
     def test_ep_mixed_decode_prefill_with_speculative_tokens(self, num_cuda_graphs):
         """Verify EP sync when ranks have different request states with speculative tokens.
 
-        Even ranks have decode-only requests (with speculative token multiplier).
-        Odd ranks have mixed prefill+decode requests. After the EP all-reduce,
-        all ranks must agree on a graph that accommodates both states.
-
-        This tests the scenario where the CUDA graph config changes after EP
-        sync — a decode-only rank may be forced into a mixed graph, and the
-        speculative token multiplier must be preserved correctly through the
-        transition.
+        Even ranks have decode-only requests; odd ranks have mixed prefill+decode.
+        Since any prefill rank causes all ranks to fall back to eager (None),
+        the test verifies that all ranks consistently get None.
         """
         ep_group = self._get_ep_group()
         num_speculative_tokens = 2
@@ -505,30 +568,18 @@ class TestSpeculativeDecodingBatchDimensions:
                 decode_req_count=decode_reqs,
             )
 
-        result = _match(
-            real, graph_list, ep_group=ep_group, num_speculative_tokens=num_speculative_tokens
-        )
+        result = _match(real, graph_list, ep_group=ep_group)
 
-        # All ranks must agree on a graph after EP sync.
+        # Any rank has prefill → all ranks get None (eager mode).
         _assert_consistent_across_ranks(result, ep_group)
-
-        # The matched graph must have enough tokens for the largest rank's needs.
-        if result is not None:
-            max_token_count = max(
-                4 * (num_speculative_tokens + 1), 2 * (num_speculative_tokens + 1) + 8
-            )
-            assert result.token_count >= max_token_count, (
-                f"Matched graph token_count {result.token_count} < " f"required {max_token_count}"
-            )
+        assert result is None, "Any prefill rank should force all ranks to eager mode"
 
     @pytest.mark.internal
     def test_ep_speculative_decode_to_mixed_graph_transition(self):
-        """Verify that a decode-only rank can use a mixed graph after EP sync.
+        """Verify EP consistency when ranks have mixed prefill/decode states.
 
-        When one EP rank is decode-only and another has prefill, the sync
-        may force the decode-only rank into a mixed graph. The decode request
-        count and speculative token multiplier must still be valid in the
-        selected graph.
+        When one EP rank is decode-only and another has prefill, the NCCL
+        EP sync detects the prefill and returns None for all ranks (eager mode).
         """
         ep_group = self._get_ep_group()
         num_speculative_tokens = 3
@@ -560,13 +611,8 @@ class TestSpeculativeDecodingBatchDimensions:
             # Prefill-only: forces even ranks out of decode-only graph.
             real = BD(token_count=32, prefill_req_count=2, decode_req_count=0)
 
-        result = _match(
-            real, graph_list, ep_group=ep_group, num_speculative_tokens=num_speculative_tokens
-        )
+        result = _match(real, graph_list, ep_group=ep_group)
 
+        # Odd ranks have prefill → any prefill rank forces all to eager (None).
         _assert_consistent_across_ranks(result, ep_group)
-        # After EP sync, a graph must be found (mixed graphs accommodate both).
-        assert result is not None, (
-            f"Rank {rank}: no graph matched after EP sync. "
-            f"Decode-only ranks should transition to mixed graphs."
-        )
+        assert result is None, "Any prefill rank should force all ranks to eager mode"

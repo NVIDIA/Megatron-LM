@@ -141,6 +141,11 @@ def add_text_generate_ptq_args(parser):
             "the recipe is authoritative for quant_cfg, algorithm, and KV cache config."
         ),
     )
+    group.add_argument(
+        "--sync-expert-weight-amax",
+        action="store_true",
+        help="Synchronize expert weight amax across experts.",
+    )
     add_modelopt_args(parser)
     return parser
 
@@ -239,6 +244,8 @@ def get_calib_dataloader(
             for i, line in enumerate(f):
                 if len(all_texts) == calib_size:
                     break
+                if not line.strip():
+                    continue
                 sample = json.loads(line)
 
                 # Extract text field from various possible keys

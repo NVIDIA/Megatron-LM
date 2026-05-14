@@ -36,6 +36,17 @@ def rewind_kv_cache(
     if num_active_requests is None:
         num_active_requests = N
 
+    # Bulk-extract scalars once via .tolist() instead of per-element .item().
+    # Avoids N round-trips through the Python/C++ boundary inside the loop.
+    accepted_list = accepted_counts.tolist()
+    prefill_list = prefill_status.tolist()
+    offset_list = last_kv_block_offset.tolist()
+    length_list = kv_length_offsets.tolist()
+    block_count_list = kv_block_counts.tolist()
+    last_block_list = last_kv_block_id.tolist()
+    kv_block_ids_list = kv_block_ids.tolist()
+    max_blocks = kv_block_ids.shape[1]
+
     blocks_to_release = torch.empty_like(last_kv_block_id)
     remove_mask = torch.empty(N, device=accepted_counts.device, dtype=torch.bool)
 
@@ -45,12 +56,12 @@ def rewind_kv_cache(
             remove_mask[i] = False
             continue
 
-        accepted = accepted_counts[i].item()
-        prefill = prefill_status[i].item()
-        last_offset = last_kv_block_offset[i].item()
-        kv_length = kv_length_offsets[i].item()
-        block_count = kv_block_counts[i].item()
-        last_block = last_kv_block_id[i].item()
+        accepted = accepted_list[i]
+        prefill = prefill_list[i]
+        last_offset = offset_list[i]
+        kv_length = length_list[i]
+        block_count = block_count_list[i]
+        last_block = last_block_list[i]
 
         # Number of tokens to rewind (rejected speculative tokens).
         # For prefill requests, no speculative tokens were forwarded through the model,
@@ -81,11 +92,11 @@ def rewind_kv_cache(
 
         # Update last_kv_block_id to point to the previous block (at index new_count - 1)
         prev_idx = max(new_block_count - 1, 0)
-        prev_block_id = kv_block_ids[i, prev_idx].item()
+        prev_block_id = kv_block_ids_list[i][prev_idx]
         last_kv_block_id[i] = prev_block_id if remove else last_block
 
         # Clear the released block entry (at index new_count, which was the old last block)
-        scatter_idx = min(new_block_count, kv_block_ids.shape[1] - 1)
+        scatter_idx = min(new_block_count, max_blocks - 1)
         if remove:
             kv_block_ids[i, scatter_idx] = -1
 
