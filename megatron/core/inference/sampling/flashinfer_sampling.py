@@ -52,7 +52,7 @@ class FlashInferSampling(Sampling):
         """FlashInfer fused top-k / top-p sampling kernel.
 
         Args:
-            logits: Logits tensor of shape `[>=n, vocab_size]`.
+            logits: Logits tensor of shape `[1, >=n, vocab_size]`
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
@@ -82,9 +82,9 @@ class FlashInferSampling(Sampling):
         # Clamp temperature to avoid division by 0.
         temperature = temperature.clamp(min=1e-6)
         if gather_indices is None:
-            scaled = logits[:n] / temperature.unsqueeze(1)
+            scaled = logits[0, :n] / temperature.unsqueeze(1)
         else:
-            scaled = logits[gather_indices[:n], :] / temperature.unsqueeze(1)
+            scaled = logits[0, gather_indices[:n], :] / temperature.unsqueeze(1)
         probs = torch.softmax(scaled, dim=-1)
 
         # Sentinel values disable filtering:
