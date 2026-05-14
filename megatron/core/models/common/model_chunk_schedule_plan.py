@@ -196,8 +196,13 @@ class TransformerLayerSchedulePlan:
             f"but got {type(self.layer).__name__}."
         )
 
+        if isinstance(self.layer, TransformerLayer):
+            hook_module = self.layer
+        else:
+            hook_module = self.layer.mtp_model_layer
+
         # After the last backward op (attn), release backward-pass params.
-        self.attn.set_post_backward_hook(lambda: post_backward_hook(self.layer))
+        self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
 
         # Determine the last node in forward order.
         if isinstance(self.moe_combine, NoopScheduleNode):
@@ -206,7 +211,7 @@ class TransformerLayerSchedulePlan:
             last_fwd_node = self.moe_combine
 
         # After the last forward op, release forward-pass params.
-        last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(self.layer))
+        last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
 
     def get_fp8_context(self):
         """
