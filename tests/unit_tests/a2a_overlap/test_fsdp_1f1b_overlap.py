@@ -53,7 +53,6 @@ class TestFSDP1F1BOverlap:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
@@ -101,7 +100,7 @@ class TestFSDP1F1BOverlap:
         forward/backward; test uses combined_1f1b_schedule_for_no_pipelining.
         """
         num_layers = 2
-        extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type,}
+        extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         extra_kwargs.update(kwargs)
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
