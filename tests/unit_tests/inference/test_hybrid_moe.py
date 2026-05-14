@@ -26,6 +26,7 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
@@ -125,6 +126,11 @@ class _TestDynamicInferenceBase:
     MAX_SEQ_LEN = 512
     VOCAB_SIZE = 128
 
+    def setup_method(self, method):
+        # Mirror what StaticInferenceEngine/DynamicInferenceEngine do at engine start:
+        # the model is being driven by an inference workload, so InferenceMode is active.
+        InferenceMode.set_active()
+
     def teardown_method(self, method):
         # CUDA-graph replay is asynchronous at the CPU level. Synchronize device
         # then barrier so no rank races into the next test's collectives while
@@ -132,6 +138,7 @@ class _TestDynamicInferenceBase:
         torch.cuda.synchronize()
         torch.distributed.barrier()
         delete_cuda_graphs()
+        InferenceMode.unset_active()
 
     def _build_model(self, inference_moe_token_dispatcher_type='nvls'):
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
