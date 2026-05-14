@@ -101,9 +101,7 @@ def _maybe_apply_final_norm(node: ScheduleNode, hidden_states: Tensor):
     final_norm = final_norm or getattr(node.chunk_state.model.decoder, "final_layernorm", None)
     if not node.is_mtp and final_norm is not None and node.is_last_layer:
         hidden_states = final_norm(hidden_states)
-        hidden_states = make_viewless_tensor(
-            inp=hidden_states, requires_grad=True, keep_graph=True
-        )
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
     return hidden_states
 
 
@@ -293,8 +291,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
         if terminal_type == LayerSymbols.MLP:
             with _get_inner_quant_context(terminal_layer):
                 hidden_states = terminal_layer._forward_mlp(
-                    hidden_states,
-                    padding_mask=node.chunk_state.padding_mask,
+                    hidden_states, padding_mask=node.chunk_state.padding_mask
                 )
             return _maybe_apply_final_norm(node, hidden_states)
         if terminal_type == LayerSymbols.MOE:

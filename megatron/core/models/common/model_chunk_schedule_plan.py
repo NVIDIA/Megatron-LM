@@ -88,10 +88,7 @@ class TransformerLayerSchedulePlan:
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
-        if (
-            hasattr(self, 'pre_dispatch_computation')
-            and self.pre_dispatch_computation is not None
-        ):
+        if hasattr(self, 'pre_dispatch_computation') and self.pre_dispatch_computation is not None:
             del self.pre_dispatch_computation
             self.pre_dispatch_computation = None
         if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
@@ -398,10 +395,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Subclasses extend this hook to thread additional metadata (e.g. hybrid
         layer-type symbols) without overriding ``_build_layer_schedule_plan``.
         """
-        return {
-            "is_first_layer": layer_idx == 0,
-            "is_last_layer": layer_idx == num_layers - 1,
-        }
+        return {"is_first_layer": layer_idx == 0, "is_last_layer": layer_idx == num_layers - 1}
 
     @property
     def event(self):

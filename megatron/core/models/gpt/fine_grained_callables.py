@@ -263,9 +263,5 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     layer.init_backward_dw_wrapper()
 
     forward_funcs = [pre_dispatch_func, dispatch_func, mlp_func, combine_func, None]
-    backward_dw = {
-        "pre_dispatch_computation": layer.backward_dw_wrapper,
-        "mlp": layer.mlp,
-    }
+    backward_dw = {"pre_dispatch_computation": layer.backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
-

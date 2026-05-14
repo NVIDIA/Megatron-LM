@@ -201,10 +201,7 @@ class TestHybridModel:
     def test_grouped_sharded_state_dict_uses_transformer_checkpoint_keys(self):
         """Grouped HybridModel checkpoints should be load-compatible with GPTModel keys."""
         model_config = TransformerConfig(
-            num_layers=2,
-            hidden_size=256,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
+            num_layers=2, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
         )
         model = HybridModel(
             config=model_config,

@@ -373,14 +373,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MEME") == {'*': 0, 'D': 0, 'G': 0, 'M': 2, '-': 0, 'E': 2}
 
     def test_group_pattern(self):
-        assert get_hybrid_layer_counts("M[M*]E") == {
-            '*': 1,
-            'D': 0,
-            'G': 0,
-            'M': 2,
-            '-': 0,
-            'E': 1,
-        }
+        assert get_hybrid_layer_counts("M[M*]E") == {'*': 1, 'D': 0, 'G': 0, 'M': 2, '-': 0, 'E': 1}
 
     def test_mtp_with_attention(self):
         # MTP pattern "*M" repeated 3 depths -> 3 attn + 3 mamba from MTP

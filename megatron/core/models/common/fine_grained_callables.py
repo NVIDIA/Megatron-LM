@@ -39,13 +39,7 @@ def build_mtp_layer_callables(layer):
     forward_funcs, backward_dw, is_moe, num_local_experts = build_layer_callables(
         layer.mtp_model_layer
     )
-    (
-        pre_dispatch_forward,
-        dispatch_forward,
-        mlp_forward,
-        combine_forward,
-        _,
-    ) = forward_funcs
+    (pre_dispatch_forward, dispatch_forward, mlp_forward, combine_forward, _) = forward_funcs
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
     def submodule_mtp_pre_dispatch_forward(node, hidden_states):

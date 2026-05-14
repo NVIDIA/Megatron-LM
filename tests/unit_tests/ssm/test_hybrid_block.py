@@ -244,15 +244,10 @@ class TestHybridBlock:
         sequence_length = 16
         micro_batch_size = 2
         hidden_states = torch.randn(
-            sequence_length,
-            micro_batch_size,
-            flat_block.config.hidden_size,
-            device="cuda",
+            sequence_length, micro_batch_size, flat_block.config.hidden_size, device="cuda"
         )
         attention_mask = torch.ones(
-            (micro_batch_size, 1, sequence_length, sequence_length),
-            dtype=bool,
-            device="cuda",
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
         )
 
         with torch.no_grad():

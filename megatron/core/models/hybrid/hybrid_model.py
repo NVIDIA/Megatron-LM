@@ -487,11 +487,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # separately, when running inference, or when speculative decoding is
         # active). ``self.mtp_process`` guards against models built without an
         # MTP block.
-        if (
-            mtp_in_postprocess
-            and self.mtp_process
-            and not (in_inference_mode or is_spec_decode)
-        ):
+        if mtp_in_postprocess and self.mtp_process and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
