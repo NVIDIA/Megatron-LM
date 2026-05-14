@@ -210,7 +210,6 @@ def test_preprocess_mmdata():
             "10",
             "--log-interval",
             "1",
-            "--pad-vocab-size",
         ]
 
         do_test_preprocess_mmdata(temp_dir, extra_args=gpt_args)
