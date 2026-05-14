@@ -216,6 +216,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_token_dropping": False,
     "moe_z_loss_coeff": None,
     "moe_enable_routing_replay": False,
+    "mrope_interleaved": False,
     "mrope_section": None,
     "mup_attn_scale_power": 1.0,
     "mup_base_head_dim": None,
