@@ -163,17 +163,18 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 "1F1B overlap with FSDP does not support double buffer. "
                 "Please set fsdp_double_buffer=False in the ddp config."
             )
-            partial_cuda_graph_scopes = [
-                scope
-                for scope in config.cuda_graph_scope
-                if scope
-                not in (CudaGraphScope.full_iteration, CudaGraphScope.full_iteration_inference)
-            ]
-            assert not partial_cuda_graph_scopes, (
-                "1F1B overlap with FSDP does not support partial CUDA graph scopes "
-                f"({partial_cuda_graph_scopes}). "
-                "Please use cuda_graph_scope='full' or disable CUDA graphs."
-            )
+            if config.cuda_graph_impl not in ["none", "full_iteration"]:
+                partial_cuda_graph_scopes = [
+                    scope
+                    for scope in config.cuda_graph_scope
+                    if scope
+                    not in (CudaGraphScope.full_iteration, CudaGraphScope.full_iteration_inference)
+                ]
+                assert not partial_cuda_graph_scopes, (
+                    "1F1B overlap with FSDP does not support partial CUDA graph scopes "
+                    f"({partial_cuda_graph_scopes}). "
+                    "Please use cuda_graph_scope='full' or disable CUDA graphs."
+                )
 
         if (
             config.overlap_moe_expert_parallel_comm
