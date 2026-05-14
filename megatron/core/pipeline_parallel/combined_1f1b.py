@@ -395,8 +395,8 @@ def combined_forward_backward_step(
         ):
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)
-                # Validation workaround: disable per-layer forward reshard in EP-overlap
-                # schedule to avoid releasing weights before the matching backward consumes them.
+                # Wire explicit FSDP reshard hooks for the EP-overlap schedule,
+                # which bypasses the normal TransformerLayer-level FSDP hooks.
                 layer_plan.set_fsdp_reshard_hooks(
                     forward_fsdp_wrapper.post_forward_release_module,
                     forward_fsdp_wrapper.post_backward_release_module,
