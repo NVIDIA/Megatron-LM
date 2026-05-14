@@ -2781,11 +2781,17 @@ if _CUTILE_AVAILABLE:
 # ============================================================================
 
 from megatron.core.transformer.hyper_connection import (
+    native_fused_add_3,
     native_h_aggregate,
     native_h_post_bda,
     native_proj_rms,
     native_sinkhorn,
 )
+
+
+def fused_add_3(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
+    """Add three tensors using the native torch.compile-backed implementation."""
+    return native_fused_add_3(a, b, c)
 
 
 def _get_triton_sinkhorn():
