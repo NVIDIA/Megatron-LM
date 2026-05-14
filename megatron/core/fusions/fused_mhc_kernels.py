@@ -2866,7 +2866,7 @@ def _torch_proj_rms_compute_h(
     eps: float,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     proj = torch.matmul(x, weight.t())
-    r = x.float().norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
+    r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
     alpha = torch.cat(
         [alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(weight.shape[0] - 2 * n)],
         dim=-1,
@@ -2875,7 +2875,7 @@ def _torch_proj_rms_compute_h(
     h_pre = h[..., :n].sigmoid()
     h_post = h[..., n : 2 * n].sigmoid() * 2
     h_res = h[..., 2 * n :]
-    return h_pre, h_post, h_res, r.to(dtype=x.dtype)
+    return h_pre, h_post, h_res, r
 
 
 if _CUTILE_AVAILABLE:
