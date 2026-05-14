@@ -2685,7 +2685,7 @@ requires-dist = [
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
     { name = "multi-storage-client", marker = "extra == 'lts'", specifier = "~=0.27" },
     { name = "numpy" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.43" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.44" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=b2bb3d728a18795807d9f76c535e005a609a1b01" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
     { name = "omegaconf", marker = "extra == 'training'" },
@@ -3541,7 +3541,7 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.43.0"
+version = "0.44.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ninja" },
@@ -3562,7 +3562,7 @@ dependencies = [
     { name = "tqdm" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/4e/c0ec675bb74ee8bf1b10f1c9ab2a722a082d83a81c94f4fa7d7659cd40cb/nvidia_modelopt-0.43.0-py3-none-any.whl", hash = "sha256:fe11a49e16230435b3a17153bcdb5717b2859a61544cdbe9dcb3f062ba2c203a", size = 1196533, upload-time = "2026-04-16T19:45:10.876Z" },
+    { url = "https://files.pythonhosted.org/packages/83/ab/7e12dd238638624cb9d48904e9205abe16a5b26bdd5f9b91e3357821cf90/nvidia_modelopt-0.44.0-py3-none-any.whl", hash = "sha256:9b54a853dfda161db97a0dfce4d7c24269d1d19966b5e2026094186af897f74d", size = 1604658, upload-time = "2026-05-13T20:47:04.007Z" },
 ]
 
 [[package]]
