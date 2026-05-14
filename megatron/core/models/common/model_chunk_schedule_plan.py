@@ -14,7 +14,6 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
