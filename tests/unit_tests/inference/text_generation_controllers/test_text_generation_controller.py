@@ -29,6 +29,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_mtp_block_spec,
@@ -181,6 +182,10 @@ class TextGenerationControllerTestBase:
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
         )
 
+        # Mirror what StaticInferenceEngine/DynamicInferenceEngine do at engine start:
+        # the model is being driven by an inference workload, so InferenceMode is active.
+        InferenceMode.set_active()
+
 
 class TestTextGenerationController(TextGenerationControllerTestBase):
 
@@ -193,6 +198,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        InferenceMode.unset_active()
 
     def test_sample_from_logits(self):
         self.setup_model(torch.float32)
@@ -1619,6 +1627,7 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
     """
 
     def teardown_method(self, method):
+        InferenceMode.unset_active()
         Utils.destroy_model_parallel()
 
     def setup_model(

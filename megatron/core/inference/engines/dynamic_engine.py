@@ -42,7 +42,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, await_process_call
+from megatron.core.inference.utils import Counter, InferenceMode, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
@@ -257,6 +257,9 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+
+        # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
+        InferenceMode.set_active()
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -728,6 +731,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        InferenceMode.unset_active()
+
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
@@ -776,6 +781,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Skip if not suspended or in the process of suspending.
         if self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
+
+        InferenceMode.set_active()
 
         # Resume.
         with self.__class__.suspend_resume_ctx(

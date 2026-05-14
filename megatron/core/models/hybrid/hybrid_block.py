@@ -19,6 +19,7 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -263,7 +264,7 @@ class HybridStack(MegatronModule):
             )
             and inference_context
             and inference_context.is_static_batching()
-            and not self.training
+            and InferenceMode.is_active()
         ):
             current_batch_size = hidden_states.shape[1]
             sequence_len_offset = torch.tensor(
