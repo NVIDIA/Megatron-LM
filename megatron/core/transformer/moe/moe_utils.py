@@ -252,7 +252,14 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
-        """Preserve the aux_loss by storing it in the context to avoid garbage collection.
+        """Preserve the aux_loss metadata so backward can construct a gradient tensor.
+
+        We store shape/dtype/device on ctx instead of using save_for_backward.
+        Under partial CUDA graph capture, the actual aux_loss tensor can live in
+        a CG memory pool that gets recycled on replay, causing saved_tensors to
+        appear "freed" on the second backward pass. Since the backward only needs
+        aux_loss's shape (for torch.ones_like-style grad construction), saving
+        metadata is sufficient and CG-safe.
 
         Args:
             output (torch.Tensor): The output tensor.
@@ -261,7 +268,9 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         Returns:
             torch.Tensor: The output tensor.
         """
-        ctx.save_for_backward(aux_loss)
+        ctx.aux_loss_shape = aux_loss.shape
+        ctx.aux_loss_dtype = aux_loss.dtype
+        ctx.aux_loss_device = aux_loss.device
         return output
 
     @staticmethod
@@ -275,13 +284,16 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
             Tuple[torch.Tensor, torch.Tensor]: The gradient of the output, scaled auxiliary loss
                                                gradient.
         """
-        (aux_loss,) = ctx.saved_tensors
         if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
             MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                1.0, device=aux_loss.device
+                1.0, device=ctx.aux_loss_device
             )
         aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
-        scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
+        scaled_aux_loss_grad = torch.ones(
+            ctx.aux_loss_shape,
+            dtype=ctx.aux_loss_dtype,
+            device=ctx.aux_loss_device,
+        ) * aux_loss_backward_scale
         return grad_output, scaled_aux_loss_grad
 
     @staticmethod

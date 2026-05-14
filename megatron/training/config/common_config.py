@@ -62,6 +62,9 @@ class ProfilingConfig:
     memory_snapshot_path: str = "snapshot.pickle"
     """Specifies where to dump the memory history pickle."""
 
+    memory_snapshot_iter: int = -1
+    """If >=0, only record memory history during the iteration with this number, then dump and stop. If -1, falls back to dumping every log_interval (no per-iteration timeline)."""
+
     record_shapes: bool = False
     """Record shapes of tensors in `torch.autograd.profiler.emit_nvtx` for the Nsys profiler."""
 

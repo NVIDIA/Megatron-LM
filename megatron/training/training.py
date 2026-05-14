@@ -2469,9 +2469,23 @@ def training_log(
             total_loss_dict=total_loss_dict,
         )
     # Dump memory snapshot and print metrics to stdout.
+    if (
+        args.record_memory_history
+        and args.memory_snapshot_iter >= 0
+        and iteration == args.memory_snapshot_iter
+        and (is_last_rank() or torch.distributed.get_backend() == 'fake')
+    ):
+        snapshot = torch.cuda.memory._snapshot()
+        from pickle import dump
+
+        with open(args.memory_snapshot_path, 'wb') as f:
+            dump(snapshot, f)
+        torch.cuda.memory._record_memory_history(enabled=None)
     if iteration % args.log_interval == 0 or is_first_iteration:
-        if args.record_memory_history and (
-            is_last_rank() or torch.distributed.get_backend() == 'fake'
+        if (
+            args.record_memory_history
+            and args.memory_snapshot_iter < 0
+            and (is_last_rank() or torch.distributed.get_backend() == 'fake')
         ):
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
@@ -3349,6 +3363,15 @@ def train(
             seqlen_squared_sum_this_global_batch = 0
         else:
             ft_integration.on_training_step_start()
+            if (
+                args.record_memory_history
+                and args.memory_snapshot_iter >= 0
+                and iteration == 0
+                and (is_last_rank() or torch.distributed.get_backend() == 'fake')
+            ):
+                torch.cuda.memory._record_memory_history(
+                    enabled='all', context='all', stacks='python', max_entries=10**6
+                )
             (
                 loss_dict,
                 skipped_iter,

@@ -808,12 +808,18 @@ class TEGroupedMLP(MegatronModule):
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
-        # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
+        # Check activation: SwiGLU, quick GEGLU (TE >= 2.15), or squared-relu (TE mxfp8-srelu branch)
         # Use config.activation_func instead of self.activation_func because when
         # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
-        if not self.config.gated_linear_unit:
+        if self.config.activation_func == squared_relu:
+            try:
+                from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
+            except ImportError:
+                return _unsupported("squared_relu needs TE with ScaledSReLU op")
+            # squared_relu is non-GLU; skip the gated_linear_unit check
+        elif not self.config.gated_linear_unit:
             return _unsupported("gated_linear_unit not enabled")
-        if self.config.activation_func == F.silu:
+        elif self.config.activation_func == F.silu:
             pass  # SwiGLU — supported
         elif self.config.activation_func == quick_gelu:
             try:
@@ -888,7 +894,7 @@ class TEGroupedMLP(MegatronModule):
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU or clamped quick-GEGL)
+        # Activation and post-multiply probs (SwiGLU, clamped quick-GEGLU, or squared-ReLU)
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         if self.config.activation_func == F.silu and self.config.gated_linear_unit:
             op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
@@ -900,9 +906,12 @@ class TEGroupedMLP(MegatronModule):
                 )
             else:
                 op = te.pytorch.ops.ScaledClampedQGeGLU(glu_interleave_size=glu_interleave)
+        elif self.config.activation_func == squared_relu:
+            op = te.pytorch.ops.ScaledSReLU()
         else:
             raise RuntimeError(
-                "_make_fused_ops expected SwiGLU or quick_gelu with gated_linear_unit; "
+                "_make_fused_ops expected SwiGLU, quick_gelu (with gated_linear_unit), "
+                "or squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
         ops.append(op)

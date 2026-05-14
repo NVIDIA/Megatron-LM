@@ -53,6 +53,19 @@ try:
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
     from transformer_engine.pytorch.utils import make_weak_ref
 
+    def _set_skip_fp8_weight_update(value: bool):
+        """Compat: old TE exposed FP8GlobalStateManager.set_skip_fp8_weight_update_tensor;
+        newer TE stores the flag on FP8GlobalStateManager.quantization_state."""
+        if hasattr(FP8GlobalStateManager, "set_skip_fp8_weight_update_tensor"):
+            FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(value)
+            return
+        qstate = FP8GlobalStateManager.quantization_state
+        if qstate.skip_fp8_weight_update_tensor is None:
+            qstate.skip_fp8_weight_update_tensor = torch.empty(
+                1, dtype=torch.float32, device="cuda"
+            )
+        qstate.skip_fp8_weight_update_tensor.fill_(value)
+
     HAVE_TE_GRAPHS = True
 except:
     HAVE_TE_GRAPHS = False
@@ -608,7 +621,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
             # Note that FP8GlobalStateManager.is_first_fp8_module() is inacccurate as each
             # layer may be in its own fp8 context, when the fp8 recipe != delayed_scaling
             if runner.is_first_layer and (runner.fp8_param_cache_updated != is_first_microbatch):
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
+                _set_skip_fp8_weight_update(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
         runner.fwd_graph.replay()
@@ -735,13 +748,13 @@ class _CudaGraphRunner(torch.nn.Module):
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+                _set_skip_fp8_weight_update(False)
 
             if self.fp4_enabled:
                 from megatron.core.fp4_utils import get_fp4_recipe  # to avoid circular import
 
                 self.fp4_recipe = get_fp4_recipe(self.base_module.config)
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+                _set_skip_fp8_weight_update(False)
 
     def __str__(self):
         return "%s; hid %s" % (
