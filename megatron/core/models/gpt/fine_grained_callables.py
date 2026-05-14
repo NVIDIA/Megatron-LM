@@ -61,7 +61,7 @@ def should_free_input(name, is_moe, config, num_local_experts):
         return False
     enable_deepep = (
         config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "deepep"
+        and config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
     )
     enable_hybridep = (
         config.moe_token_dispatcher_type == "flex"
@@ -423,7 +423,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     is_moe = isinstance(layer.mlp, MoELayer)
     enable_deepep = (
         layer.config.moe_token_dispatcher_type == "flex"
-        and layer.config.moe_flex_dispatcher_backend == "deepep"
+        and layer.config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
     )
     enable_hybridep = (
         layer.config.moe_token_dispatcher_type == "flex"

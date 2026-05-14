@@ -18,8 +18,11 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import (
+    deepepv2_combine,
+    deepepv2_dispatch,
     fused_combine,
     fused_dispatch,
+    get_elastic_buffer,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     set_deepep_num_sms,
@@ -961,24 +964,42 @@ class _DispatchManager(ABC):
     can be the number of local experts, or the size of sub_group.
     """
 
+    token_probs: Optional[torch.Tensor]
+    dispatched_probs: Optional[torch.Tensor]
+
     @abstractmethod
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Set up metadata of routing_map and probs."""
         pass
 
     @abstractmethod
-    def dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
         """Dispatch the hidden_states according to the routing_map."""
         pass
 
     @abstractmethod
-    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
         """Combine the hidden_states after expert processing."""
         pass
 
     @abstractmethod
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Get the permuted hidden states by instances."""
+        pass
+
+    @abstractmethod
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        """Get the number of tokens per expert."""
         pass
 
     @abstractmethod
@@ -1399,6 +1420,233 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _DeepepV2Manager(_DispatchManager):
+    """
+    A manager class for the DeepEP v2 ElasticBuffer backend.
+
+    This keeps the original DeepEP backend isolated under "deepep", while "deepepv2"
+    uses the v2 dispatch/combine APIs.
+    """
+
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        num_experts: int,
+        config: TransformerConfig,
+    ):
+        self.group = group
+        self.num_local_experts = num_local_experts
+        self.config = config
+
+        self.router_topk = router_topk
+        self.num_experts = num_experts
+        self.router_dtype = config.moe_router_dtype
+        self.capacity_factor = config.moe_expert_capacity_factor
+        self.permute_fusion = config.moe_permute_fusion
+        self.num_sms = config.moe_deepep_num_sms
+
+        self.token_indices: Optional[torch.Tensor] = None
+        self.token_probs: Optional[torch.Tensor] = None
+        self.handle = None
+        self.buffer = None
+
+        if deepepv2_dispatch is None:
+            raise ImportError(
+                "DeepEP v2 is not installed. Please install a DeepEP package that provides "
+                "ElasticBuffer."
+            )
+
+    def _get_buffer(self, hidden_states: torch.Tensor):
+        self.buffer = get_elastic_buffer(
+            self.group,
+            num_max_tokens_per_rank=hidden_states.shape[0],
+            hidden=hidden_states.shape[1],
+            num_topk=self.token_indices.shape[1],
+        )
+        return self.buffer
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        num_tokens = routing_map.shape[0]
+
+        routing_map = routing_map.reshape(num_tokens, self.num_experts)
+        probs = probs.reshape(num_tokens, self.num_experts)
+        # Convert the format of routing map from multihot to indices.
+        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
+        # Mask the indices of dropped tokens with -1
+        if self.capacity_factor is not None:
+            mask = self.token_probs == 0
+            self.token_indices = self.token_indices.masked_fill(mask, -1)
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
+        # DeepEP v2 only supports float32 probs
+        if self.token_probs.dtype != torch.float32:
+            if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
+                logger.warning(
+                    "DeepEP v2 only supports float32 probs, please set --moe-router-dtype=fp32"
+                )
+            self.token_probs = self.token_probs.float()
+        buffer = self._get_buffer(hidden_states)
+        hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+            deepepv2_dispatch(
+                buffer,
+                hidden_states,
+                self.token_indices,
+                self.token_probs,
+                self.num_experts,
+                num_max_tokens_per_rank=hidden_states.shape[0],
+                expert_alignment=1,
+                num_sms=self.num_sms,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+        )
+        self.handle = handle
+        self.tokens_per_expert = num_tokens_per_expert
+        self.dispatched_indices = dispatched_indices
+        self.dispatched_probs = dispatched_probs
+
+        return hidden_states
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
+        hidden_states, _ = deepepv2_combine(
+            self.buffer,
+            hidden_states,
+            self.handle,
+            num_sms=self.num_sms,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        self.handle = None
+        self.dispatched_indices = None
+        self.dispatched_probs = None
+        return hidden_states
+
+    def _indices_to_multihot(self, indices, probs):
+        """
+        Converts a tensor of indices to a multihot vector.
+
+        Args:
+            indices (torch.Tensor): [num_tokens, topk] token indices, where -1 means masked out.
+            probs (torch.Tensor): [num_tokens, topk] token probabilities.
+
+        Returns:
+            A tuple of (routing_map, probs), where routing_map is the multihot vector
+            and probs is the multihot probabilities.
+        """
+        batch_size = indices.shape[0]
+        multihot_routing_map = torch.zeros(
+            (batch_size, self.num_local_experts), dtype=torch.long, device=indices.device
+        )
+
+        multihot_probs = torch.zeros(
+            (batch_size, self.num_local_experts), dtype=torch.float, device=indices.device
+        )
+
+        mask = indices != -1
+        valid_indices = indices[mask]
+        row_indices = torch.arange(batch_size, device=indices.device).repeat_interleave(
+            mask.sum(dim=1)
+        )
+        multihot_routing_map[row_indices, valid_indices] = 1
+        multihot_probs[row_indices, valid_indices] = probs[mask]
+        return multihot_routing_map.bool(), multihot_probs
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        """
+        Get the number of tokens per expert.
+        """
+        return self.tokens_per_expert
+
+    def _pad_routing_map(
+        self, routing_map: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Pad the routing map to the nearest multiple of the pad_multiple.
+        """
+        pad_multiple = get_align_size_for_quantization(self.config)
+
+        num_input_tokens = routing_map.shape[0]
+        target_tokens_per_expert = (
+            torch.ceil(tokens_per_expert / pad_multiple) * pad_multiple
+        ).long()
+
+        # Check if there are enough tokens to pad
+        enough_tokens_to_pad = torch.all(target_tokens_per_expert <= num_input_tokens)
+        if not enough_tokens_to_pad:
+            logger.warning(
+                "Not enough tokens to pad. The total number of tokens received in this rank "
+                "is smaller than the target number of tokens for each expert. "
+                "Falling back to explicit padding within GroupedMLP"
+            )
+        else:
+            if is_experimental_enabled() and self.permute_fusion:
+                from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+
+                routing_map = fused_pad_routing_map(routing_map, pad_multiple)
+            else:
+                routing_map = pad_routing_map(routing_map, pad_multiple)
+            tokens_per_expert = target_tokens_per_expert
+        return routing_map, tokens_per_expert
+
+    def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if is_experimental_enabled() and self.permute_fusion:
+            self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
+                self.dispatched_indices, self.dispatched_probs, self.num_local_experts
+            )
+        else:
+            self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
+                self.dispatched_indices, self.dispatched_probs
+            )
+        if self.config.moe_router_padding_for_quantization:
+            self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
+                self.dispatched_routing_map, self.tokens_per_expert
+            )
+
+        self.hidden_shape_before_permute = hidden_states.shape
+        assert self.dispatched_probs.dtype == torch.float32, "DeepEP v2 only supports float32 probs"
+        (
+            hidden_states,
+            permuted_probs,
+            self.reversed_mapping_for_combine,
+            self.pad_offsets,
+            self.tokens_per_expert,
+        ) = permute(
+            hidden_states,
+            self.dispatched_routing_map,
+            probs=self.dispatched_probs,
+            num_out_tokens=self.tokens_per_expert.sum().item(),
+            fused=self.permute_fusion,
+            tokens_per_expert=self.tokens_per_expert,
+            align_size=get_align_size_for_quantization(self.config),
+        )
+        if self.router_dtype == "fp64":
+            permuted_probs = permuted_probs.to(torch.float64)
+        return hidden_states, permuted_probs
+
+    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = unpermute(
+            hidden_states,
+            self.reversed_mapping_for_combine,
+            restore_shape=self.hidden_shape_before_permute,
+            routing_map=self.dispatched_routing_map,
+            fused=self.permute_fusion,
+            pad_offsets=self.pad_offsets,
+        )
+        return hidden_states
+
+
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """A flexible token dispatcher that abstracts the underlying tensor and expert
     parallelism. It uses a single communication group over all TP and EP ranks,
@@ -1425,9 +1673,20 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
+        self._comm_manager: _DispatchManager
         if self.config.moe_flex_dispatcher_backend == "deepep":
             assert self.tp_size * self.ep_size > 1, "DeepEP dispatcher requires TPxEP > 1"
             self._comm_manager = _DeepepManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
+        elif self.config.moe_flex_dispatcher_backend == "deepepv2":
+            assert self.tp_size * self.ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"
+            self._comm_manager = _DeepepV2Manager(
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
                 router_topk=self.tp_size * self.config.moe_router_topk,
@@ -1446,7 +1705,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
-                "Please set --moe-flex-dispatcher-backend=deepep or "
+                "Please set --moe-flex-dispatcher-backend=deepep, "
+                "--moe-flex-dispatcher-backend=deepepv2 or "
                 "--moe-flex-dispatcher-backend=hybridep"
             )
 
