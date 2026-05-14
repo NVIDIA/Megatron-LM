@@ -14,7 +14,7 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
@@ -175,7 +175,7 @@ class TransformerLayerSchedulePlan:
             self.mtp_post_process = NoopScheduleNode()
 
         # mlp and combine may receive dgrad from attn, which is managed by cuda graph.
-        if CudaGraphScope.attn in self.config.cuda_graph_scope:
+        if CudaGraphModule.attn in self.config.cuda_graph_modules:
             self.mlp.manual_grads_release = False
             self.moe_combine.manual_grads_release = False
 
