@@ -23,6 +23,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
     tensor_merge,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
@@ -32,6 +33,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
+    cat_with_oom_fallback,
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
@@ -426,12 +428,12 @@ class MambaMixer(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = InferenceMode.is_active()
 
         _, batch, dim = hidden_states.shape
         conv_state, ssm_state = None, None
 
-        if in_inference_mode:
+        if in_inference_mode and inference_context is not None:
             if inference_context.is_dynamic_batching():
                 return self._dynamic_inference(hidden_states, inference_context)
             else:
@@ -1422,12 +1424,12 @@ def _split_tensor_factory(
         )
         return chunk_sh_tens
 
-    @torch.no_grad()
-    def sh_ten_merge_fn(sub_state_dict):
-        return torch.cat(sub_state_dict)
-
     return ShardedTensorFactory(
-        orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
+        orig_sh_ten.key,
+        orig_sh_ten.data,
+        sh_ten_build_fn,
+        cat_with_oom_fallback,
+        orig_sh_ten.replica_id,
     )
 
 

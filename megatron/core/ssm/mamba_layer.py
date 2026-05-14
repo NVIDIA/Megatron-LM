@@ -14,6 +14,7 @@ from torch import Tensor
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphScope
@@ -209,7 +210,7 @@ class MambaLayer(GraphableMegatronModule):
             and not torch.is_inference_mode_enabled()  # for inference eager dummy_forward
         ):
             return True
-        elif not self.training and (
+        elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None
