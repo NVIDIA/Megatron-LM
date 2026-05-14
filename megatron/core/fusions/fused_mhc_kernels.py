@@ -1704,7 +1704,10 @@ if _CUTILE_AVAILABLE:
 
     def _reduce_compute_h_autotune_configs(M):
         """Generate autotune search space for reduce_compute_h kernel."""
+        min_tile_m = 16 if M >= 16 else 1
         for tile_m in (128, 64, 32, 16, 8, 4, 2, 1):
+            if tile_m < min_tile_m:
+                continue
             if tile_m <= M and M % tile_m == 0:
                 yield tile_m
 
