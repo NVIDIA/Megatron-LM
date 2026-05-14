@@ -18,6 +18,7 @@ from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
@@ -543,13 +544,14 @@ class TestGPTWithDynamicInference:
         input_ids, position_ids = inference_context.current_input_and_position_ids()
 
         # Run the forward pass with inference parameters.
-        logits = self.gpt_model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=None,
-            inference_context=inference_context,
-            runtime_gather_output=True,
-        )
+        with InferenceMode.active():
+            logits = self.gpt_model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                inference_context=inference_context,
+                runtime_gather_output=True,
+            )
 
         # Verify the output shape.
         assert logits.shape[0] == 1
