@@ -20,6 +20,9 @@ on:
           - "functional-only"
         default: "all"
 
+permissions:
+  contents: read
+
 jobs:
   trigger-mbridge-tests:
     runs-on: ubuntu-latest

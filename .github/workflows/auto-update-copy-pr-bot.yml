@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "0 0 * * *"
 
+permissions:
+  contents: read
+
 jobs:
   auto-update-copy-pr-bot:
     runs-on: ubuntu-latest
