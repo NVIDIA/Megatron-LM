@@ -539,7 +539,7 @@ class GPTModel(LanguageModule):
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
         # Run decoder.
-        hidden_states = self.decoder(
+        decoder_output = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -552,6 +552,13 @@ class GPTModel(LanguageModule):
             padding_mask=padding_mask,
             **(extra_block_kwargs or {}),
         )
+        # When mHC + MTP, the decoder returns (contracted, multi-stream).
+        # MTP needs multi-stream; lm_head needs contracted.
+        if isinstance(decoder_output, tuple):
+            hidden_states, mhc_multistream = decoder_output
+        else:
+            hidden_states = decoder_output
+            mhc_multistream = None
 
         return self._postprocess(
             hidden_states=hidden_states,
@@ -574,6 +581,7 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            mhc_multistream=mhc_multistream,
         )
 
     def _postprocess(
@@ -598,6 +606,7 @@ class GPTModel(LanguageModule):
         inference_context=None,
         output_processor=None,
         output_processor_context=None,
+        mhc_multistream=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -627,6 +636,7 @@ class GPTModel(LanguageModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
+                mhc_multistream=mhc_multistream,
                 attention_mask=attention_mask,
                 inference_params=None,  # MTP layers don't use KV cache
                 rotary_pos_emb=rotary_pos_emb,
