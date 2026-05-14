@@ -16,6 +16,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -451,7 +452,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         Check if we should call the local cudagraph path.
         """
         if (
-            not self.training
+            InferenceMode.is_active()
             and hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
