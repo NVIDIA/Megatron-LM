@@ -79,7 +79,6 @@ def get_gpt_layer_with_inference_submodules(
     qk_l2_norm: Optional[bool] = False,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for inference optimized linear layers.
     Args:
@@ -635,7 +634,6 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
         )
     else:
         dense_layer_spec = get_gpt_layer_local_spec(
