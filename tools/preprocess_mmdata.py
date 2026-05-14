@@ -112,8 +112,6 @@ def get_args():
                        help='Converting text to ids will not include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
-    group.add_argument("--pad-vocab-size", action="store_true", default=True,
-                       help='Whether or not to allow PreTrainedTokenizer to execute remote code')
 
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
