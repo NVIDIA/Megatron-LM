@@ -282,16 +282,10 @@ class TransformerLayerNode(ScheduleNode):
         return self.submodule(self, *args)
 
     def backward_impl(self, outputs, output_grad):
-        """Run the slot's backward, holding output_grads when wgrad is delayed."""
+        """Run the slot's backward and return the input grads."""
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
         self.default_backward_func(outputs + self.before_detached, grads)
-        # Release the output grad memory after backward finishes, except when
-        # delay_wgrad_compute is enabled — then the grads are kept until every
-        # registered ``backward_dw`` callable has run.
-        if self.delay_wgrad_compute:
-            self.output_grads = grads
-            self.delay_grads_release = len(self.bwd_dw_callables) > 0
 
         return grads
 
@@ -307,13 +301,6 @@ class TransformerLayerNode(ScheduleNode):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
             nvtx_range_pop(nvtx_msg)
-
-        # The output grad memory is last used in wgrad compute; safe to release now.
-        assert self.delay_grads_release, "output grad memory should be valid before wgrad."
-        if self.manual_release_grads:
-            for tensor in self.output_grads:
-                tensor.untyped_storage().resize_(0)
-        self.output_grads = None
 
         self.bwd_dw_callables = None
 
