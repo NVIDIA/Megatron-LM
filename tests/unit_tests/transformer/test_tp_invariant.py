@@ -63,8 +63,7 @@ def _te_tp_invariant_patches_applied() -> bool:
     transformer_engine site-packages copy."""
     try:
         import transformer_engine.pytorch.module.linear as _te_linear
-        src = inspect.getsource(_te_linear._Linear.forward)
-        return ("tp_invariant" in src.lower()) or ("NVTE_TP_INVARIANT_MODE" in src)
+        return "NVTE_TP_INVARIANT_MODE" in inspect.getsource(_te_linear)
     except Exception:
         return False
 
