@@ -1227,6 +1227,21 @@ class MambaMixer(MegatronModule):
         ssm_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
         return (conv_states_shape, ssm_states_shape)
 
+    def backward_dw(self):
+        """Compute weight gradients for the linear layers wrapped by this mixer.
+
+        Mirrors ``GatedDeltaNet.backward_dw``. The selective-scan kernel is a
+        single autograd function whose wgrad runs in the regular backward pass,
+        so only the input/output projections need delayed wgrad here. Each
+        ``backward_dw`` call is a no-op unless the underlying linear is built
+        from a TE primitive that supports delayed wgrad; if the spec uses
+        non-TE linears, ``backward_dw`` simply does nothing.
+        """
+        if hasattr(self.in_proj, "backward_dw"):
+            self.in_proj.backward_dw()
+        if hasattr(self.out_proj, "backward_dw"):
+            self.out_proj.backward_dw()
+
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.
 
