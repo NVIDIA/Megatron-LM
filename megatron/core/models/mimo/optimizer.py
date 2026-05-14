@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -48,6 +48,11 @@ class MimoOptimizer(MegatronOptimizer):
         ]
         self.is_stub_optimizer = len(self._active_optimizers) == 0
         self.optimizer = None  # Base class compat
+        # Stashed by `sharded_state_dict` so `load_state_dict` can recover
+        # non-sharded scalars (notably `param_state_sharding_type`) that
+        # dist_checkpointing's common-state path drops on ranks whose active
+        # module isn't present on rank 0.
+        self._last_sharded_metadata: Dict[str, Any] = {}
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
@@ -144,6 +149,12 @@ class MimoOptimizer(MegatronOptimizer):
         as ShardedObjects by sharded_state_dict(), then delegates to each
         per-module optimizer's load_state_dict.
         """
+        # The sharding-type metadata isn't saved to the checkpoint — it's a
+        # load-time interpretation hint that the caller supplies via
+        # the metadata kwarg on the most recent sharded_state_dict call. We
+        # recover it here for ranks whose active module wasn't on rank 0 at
+        # save time (and so dropped it via the common-state path).
+        recovered_sharding_type = self._last_sharded_metadata.get('distrib_optim_sharding_type')
         for name, info in self.module_infos.items():
             if not (info.is_active and info.optimizer):
                 continue
@@ -154,6 +165,12 @@ class MimoOptimizer(MegatronOptimizer):
             for sub_sd, inner_opt in _iter_optimizer_sub_dicts(module_sd, info.optimizer):
                 _restore_param_groups(sub_sd, inner_opt, name)
                 _restore_grad_scaler(sub_sd)
+                if (
+                    recovered_sharding_type is not None
+                    and 'param_state' in sub_sd
+                    and 'param_state_sharding_type' not in sub_sd
+                ):
+                    sub_sd['param_state_sharding_type'] = recovered_sharding_type
 
             info.optimizer.load_state_dict(module_sd)
 
@@ -162,6 +179,8 @@ class MimoOptimizer(MegatronOptimizer):
         through distributed save as ShardedObjects (common.pt is rank-0 only,
         which misses LLM optimizer state in non-colocated mode).
         """
+        # Stash for load_state_dict
+        self._last_sharded_metadata = dict(kwargs.get('metadata', {}) or {})
         sharded_state = {}
         for name, info in self.module_infos.items():
             if info.is_active and info.optimizer:
@@ -253,7 +272,13 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
         )
     for loaded_g, current_g in zip(loaded_pg, current_pg):
         loaded_g['params'] = current_g['params']
-    sub_sd['optimizer']['param_groups'] = loaded_pg
+    # `sub_sd['optimizer']` may be absent on load: when the per-module state_dict
+    # produced by DistributedOptimizer.state_dict() only contains `param_groups`
+    # under the 'optimizer' key, `_extract_param_groups` removes it at save time
+    # and the resulting empty dict can be dropped during dist_checkpointing
+    # common-state save/load. Use setdefault so the restored param_groups land
+    # in the right place regardless.
+    sub_sd.setdefault('optimizer', {})['param_groups'] = loaded_pg
 
 
 def _restore_grad_scaler(sub_sd):
@@ -267,17 +292,21 @@ def _restore_grad_scaler(sub_sd):
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Includes pp_rank so only one PP stage writes the metadata,
-    and dp_rank so only dp_rank=0 writes (others are replicas).
+    Returns (tp_rank, pp_rank, dp_rank) so only (0, 0, 0) within each
+    module's parallelism group is the main replica; all other ranks
+    in the same module are non-main replicas of the same object.
     """
     assert pg_collection is not None, "pg_collection required for checkpoint replica_id"
+    assert (
+        hasattr(pg_collection, 'tp') and pg_collection.tp is not None
+    ), "pg_collection.tp must be set for checkpoint deduplication"
     assert (
         hasattr(pg_collection, 'pp') and pg_collection.pp is not None
     ), "pg_collection.pp must be set for checkpoint deduplication"
     assert (
         hasattr(pg_collection, 'dp') and pg_collection.dp is not None
     ), "pg_collection.dp must be set for checkpoint deduplication"
-    return (0, pg_collection.pp.rank(), pg_collection.dp.rank())
+    return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
