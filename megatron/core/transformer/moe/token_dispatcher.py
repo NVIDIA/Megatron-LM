@@ -964,42 +964,24 @@ class _DispatchManager(ABC):
     can be the number of local experts, or the size of sub_group.
     """
 
-    token_probs: Optional[torch.Tensor]
-    dispatched_probs: Optional[torch.Tensor]
-
     @abstractmethod
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Set up metadata of routing_map and probs."""
         pass
 
     @abstractmethod
-    def dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        async_finish: bool = True,
-        allocate_on_comm_stream: bool = True,
-    ) -> torch.Tensor:
+    def dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Dispatch the hidden_states according to the routing_map."""
         pass
 
     @abstractmethod
-    def combine(
-        self,
-        hidden_states: torch.Tensor,
-        async_finish: bool = True,
-        allocate_on_comm_stream: bool = True,
-    ) -> torch.Tensor:
+    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Combine the hidden_states after expert processing."""
         pass
 
     @abstractmethod
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Get the permuted hidden states by instances."""
-        pass
-
-    @abstractmethod
-    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        """Get the number of tokens per expert."""
         pass
 
     @abstractmethod
