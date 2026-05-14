@@ -125,143 +125,11 @@ if not HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
 
 @dataclass(frozen=True)
 class FullyShardFP8Policy:
-    """FP8 recipe behavior owned by the v2 ``fully_shard`` path."""
+    """FP8 recipe settings owned by the v2 ``fully_shard`` path."""
 
     enabled: bool = False
     recipe: Optional[str] = None
     keep_transpose_cache: bool = False
-
-    def model_init_context(self):
-        """Return the model-init context for FP8 parameter creation."""
-        if not self.enabled:
-            return nullcontext()
-
-        # TE initializes FP8 parameters while preserving a high-precision value
-        # that can seed the optimizer main-weight buffer.
-        assert (
-            QUANTIZED_MODEL_INIT_CLASS is not nullcontext
-        ), "Transformer Engine is required for FP8 parameter initialization"
-        args = {"enabled": True}
-        if "preserve_high_precision_init_val" in inspect.signature(
-            QUANTIZED_MODEL_INIT_CLASS
-        ).parameters:
-            args["preserve_high_precision_init_val"] = True
-        return QUANTIZED_MODEL_INIT_CLASS(**args)
-
-    def is_param(self, tensor: torch.Tensor) -> bool:
-        """Return whether ``tensor`` is backed by a Transformer Engine FP8 tensor."""
-        return is_fp8_param(tensor)
-
-    def group_key_dtype(self, tensor: torch.Tensor):
-        """Return the dtype key used to keep FP8 tensors in their own param group."""
-        return "float8" if self.is_param(tensor) else tensor.dtype
-
-    def model_buffer_dtype(self, tensor: torch.Tensor) -> torch.dtype:
-        """Return the dtype used by the model-weight communication buffer."""
-        return torch.uint8 if self.is_param(tensor) else tensor.dtype
-
-    def model_buffer_item(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Return the tensor view that should be stored in the model-weight buffer."""
-        return get_fp8_raw_data(tensor) if self.is_param(tensor) else tensor.detach()
-
-    def needs_transpose_buffer(self, tensor: torch.Tensor) -> bool:
-        """Return whether the FP8 recipe needs a separately sharded transpose payload."""
-        return HAVE_TE_MXFP8 and isinstance(tensor, MXFP8Tensor)
-
-    def transpose_buffer_item(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Return the FP8 transpose payload view for recipes that need one."""
-        return get_fp8_raw_data(tensor, transpose=True)
-
-    def initial_main_weight(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Return the high-precision main-weight value for optimizer state."""
-        if not self.is_param(tensor):
-            return tensor.detach()
-        if hasattr(tensor, "get_high_precision_init_val"):
-            item = tensor.get_high_precision_init_val()
-            tensor.clear_high_precision_init_val()
-            return item
-
-        # If TE did not preserve the FP32 init value, recover a main-weight
-        # value from the FP8 tensor before the original full parameter is freed.
-        assert isinstance(TE_VERSION, PkgVersion) and TE_VERSION >= PkgVersion(
-            "2.0"
-        ), "Transformer Engine >= 2.0 is required for FP8 dequantize"
-        return tensor.dequantize()
-
-    def set_unsharded_weight(
-        self, tensor: torch.Tensor, data: torch.Tensor, transpose: bool = False
-    ) -> None:
-        """Attach an unsharded raw FP8 payload to a TE FP8 parameter."""
-        assert self.is_param(tensor), (
-            f"Type {type(tensor)} is not a Transformer Engine FP8 tensor"
-        )
-        if transpose:
-            assert self.needs_transpose_buffer(tensor), (
-                f"Type {type(tensor)} has no transpose payload"
-            )
-            attr = "_columnwise_data"
-        else:
-            attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
-
-        # Rebind TE's raw uint8 payload to the all-gathered FSDP buffer view.
-        old_data = getattr(tensor, attr)
-        if old_data is not None:
-            assert old_data.dtype == data.dtype, (
-                f"FP8 raw dtype mismatch: {old_data.dtype} vs {data.dtype}"
-            )
-            assert old_data.shape == data.shape, (
-                f"FP8 raw shape mismatch: {old_data.shape} vs {data.shape}"
-            )
-        setattr(tensor, attr, data)
-
-    def post_unshard(self, params: List[torch.Tensor]) -> None:
-        """Run recipe-specific processing after FP8 all-gather."""
-        params = [param for param in params if self.is_param(param)]
-        if len(params) == 0:
-            return
-
-        # TE rebuilds recipe-specific state after FSDP all-gather, e.g. MXFP8
-        # columnwise payloads used by GEMMs.
-        if HAVE_TE_POST_ALL_GATHER_PROCESSING:
-            post_all_gather_processing(params)
-            return
-        for param in params:
-            if hasattr(param, "_create_transpose"):
-                param._create_transpose()
-            else:
-                param._create_columnwise()
-
-    def post_reshard(self, params: List[torch.Tensor]) -> None:
-        """Run recipe-specific cleanup after FP8 parameters are resharded."""
-        if self.keep_transpose_cache:
-            return
-        for param in params:
-            if not self.is_param(param):
-                continue
-            # Drop full-weight transpose/cache views after FSDP reshard releases
-            # the unsharded payload.
-            if hasattr(param, "_transpose_invalid"):
-                param._transpose_invalid = True
-                param._transpose = None
-            elif not self.needs_transpose_buffer(param):
-                param.update_usage(rowwise_usage=True, columnwise_usage=False)
-
-    def quantize_main_weights_to_model(
-        self,
-        model_params: List[torch.Tensor],
-        main_params: List[torch.Tensor],
-        start_offsets: List[int],
-        data_parallel_group: torch.distributed.ProcessGroup,
-        fsdp_shard_model_params: List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
-    ) -> None:
-        """Quantize high-precision main weights into FP8 model-weight shards."""
-        quantize_main_weights_to_fp8(
-            model_params,
-            main_params,
-            start_offsets,
-            data_parallel_group,
-            fsdp_shard_model_params,
-        )
 
 
 @dataclass(frozen=True)
@@ -293,35 +161,48 @@ class FullyShardMixedPrecisionPolicy:
 
     def model_init_context(self):
         """Return the model-init context for mixed precision parameter creation."""
-        return self.fp8.model_init_context()
+        if not self.fp8.enabled:
+            return nullcontext()
+
+        # TE initializes FP8 parameters while preserving a high-precision value
+        # that can seed the optimizer main-weight buffer.
+        assert (
+            QUANTIZED_MODEL_INIT_CLASS is not nullcontext
+        ), "Transformer Engine is required for FP8 parameter initialization"
+        args = {"enabled": True}
+        if "preserve_high_precision_init_val" in inspect.signature(
+            QUANTIZED_MODEL_INIT_CLASS
+        ).parameters:
+            args["preserve_high_precision_init_val"] = True
+        return QUANTIZED_MODEL_INIT_CLASS(**args)
 
     def group_key_dtype(self, tensor: torch.Tensor):
         """Return the parameter grouping dtype key."""
-        return self.fp8.group_key_dtype(tensor)
+        if not self.is_fp8_param(tensor):
+            return tensor.dtype
+        return ("quantized", type(tensor).__name__, self.fp8.recipe)
 
     def is_fp8_param(self, tensor: torch.Tensor) -> bool:
         """Return whether ``tensor`` is managed as an FP8 parameter."""
-        return self.fp8.is_param(tensor)
+        return is_fp8_param(tensor)
 
     def model_weight_buffer_dtype(self, tensor: torch.Tensor) -> torch.dtype:
         """Return the model-weight buffer dtype for ``tensor``."""
-        return self.fp8.model_buffer_dtype(tensor)
+        return torch.uint8 if self.is_fp8_param(tensor) else tensor.dtype
 
-    def model_weight_buffer_item(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Return the tensor view to store in the model-weight buffer."""
-        return self.fp8.model_buffer_item(tensor)
+    def get_param_data(self, tensor: torch.Tensor, transpose: bool = False) -> torch.Tensor:
+        """Return the parameter data view to store in the model-weight buffer."""
+        if self.is_fp8_param(tensor):
+            return get_fp8_raw_data(tensor, transpose=transpose)
+        return tensor.detach()
 
     def needs_transpose_weight_buffer(self, tensor: torch.Tensor) -> bool:
         """Return whether ``tensor`` needs an extra transpose/columnwise buffer."""
-        return self.fp8.needs_transpose_buffer(tensor)
-
-    def transpose_weight_buffer_item(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Return the tensor view to store in the transpose-weight buffer."""
-        return self.fp8.transpose_buffer_item(tensor)
+        return HAVE_TE_MXFP8 and isinstance(tensor, MXFP8Tensor)
 
     def main_params_dtype_for_param(self, tensor: torch.Tensor) -> Optional[torch.dtype]:
         """Return the main-parameter dtype for a parameter group."""
-        if self.fp8.is_param(tensor) and self.main_params_dtype is None:
+        if self.is_fp8_param(tensor) and self.main_params_dtype is None:
             return torch.float32
         return self.main_params_dtype
 
@@ -329,29 +210,105 @@ class FullyShardMixedPrecisionPolicy:
         """Return the main-gradient dtype for a parameter group."""
         if self.main_grads_dtype is not None:
             return self.main_grads_dtype
-        return torch.bfloat16 if self.fp8.is_param(tensor) else tensor.dtype
+        return torch.bfloat16 if self.is_fp8_param(tensor) else tensor.dtype
 
     def initial_main_weight(self, tensor: torch.Tensor) -> torch.Tensor:
         """Return the initial high-precision optimizer weight for ``tensor``."""
-        return self.fp8.initial_main_weight(tensor)
+        if not self.is_fp8_param(tensor):
+            return tensor.detach()
+        if hasattr(tensor, "get_high_precision_init_val"):
+            item = tensor.get_high_precision_init_val()
+            tensor.clear_high_precision_init_val()
+            return item
 
-    def bind_params_on_unshard(self, tensor: torch.Tensor) -> bool:
-        """Return whether unshard can bind gathered storage directly to params."""
-        return not self.fp8.is_param(tensor)
+        # If TE did not preserve the FP32 init value, recover a main-weight
+        # value from the FP8 tensor before the original full parameter is freed.
+        assert isinstance(TE_VERSION, PkgVersion) and TE_VERSION >= PkgVersion(
+            "2.0"
+        ), "Transformer Engine >= 2.0 is required for FP8 dequantize"
+        return tensor.dequantize()
 
     def set_unsharded_weight(
-        self, tensor: torch.Tensor, data: torch.Tensor, transpose: bool = False
+        self,
+        tensor: torch.Tensor,
+        data: torch.Tensor,
+        transpose: bool = False,
     ) -> None:
         """Attach an unsharded FP8 payload to an FP8 parameter."""
-        self.fp8.set_unsharded_weight(tensor, data, transpose=transpose)
+        assert self.is_fp8_param(tensor), (
+            f"Type {type(tensor)} is not a Transformer Engine FP8 tensor"
+        )
+        if transpose:
+            assert self.needs_transpose_weight_buffer(tensor), (
+                f"Type {type(tensor)} has no transpose payload"
+            )
+            attr = "_columnwise_data"
+        else:
+            attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
 
-    def post_unshard(self, params: List[torch.Tensor]) -> None:
+        # Rebind TE's raw uint8 payload to the all-gathered FSDP buffer view.
+        old_data = getattr(tensor, attr)
+        if old_data is not None:
+            assert old_data.dtype == data.dtype, (
+                f"FP8 raw dtype mismatch: {old_data.dtype} vs {data.dtype}"
+            )
+            assert old_data.shape == data.shape, (
+                f"FP8 raw shape mismatch: {old_data.shape} vs {data.shape}"
+            )
+        setattr(tensor, attr, data)
+
+    def post_unshard(self, params: List[torch.Tensor], is_bwd: bool = False) -> None:
         """Run post-unshard mixed precision processing for a parameter group."""
-        self.fp8.post_unshard(params)
+        params = [param for param in params if self.is_fp8_param(param)]
+        if len(params) == 0:
+            return
+
+        if self.needs_transpose_weight_buffer(params[0]):
+            # Match v1: forward only rebinds rowwise raw data. Do not mark the
+            # MXFP8 columnwise payload unavailable since TE may request the
+            # backward workspace from inside the forward call stack.
+            if is_bwd:
+                self.create_transpose_cache(params)
+            return
+
+        # TE rebuilds recipe-specific state after FSDP all-gather for recipes
+        # where columnwise data is derived from the all-gathered rowwise data.
+        self.create_transpose_cache(params)
+        self.set_weight_usage(params, rowwise=not is_bwd, columnwise=True)
+
+    def create_transpose_cache(self, params: List[torch.Tensor]) -> None:
+        """Run TE post-all-gather processing for FP8 parameters."""
+        if HAVE_TE_POST_ALL_GATHER_PROCESSING:
+            post_all_gather_processing(params)
+            return
+        for param in params:
+            if hasattr(param, "_create_transpose"):
+                param._create_transpose()
+            else:
+                param._create_columnwise()
+
+    def set_weight_usage(
+        self, params: List[torch.Tensor], *, rowwise: bool, columnwise: bool
+    ) -> None:
+        """Set FP8 rowwise/columnwise usage flags when TE exposes them."""
+        for param in params:
+            if self.is_fp8_param(param) and hasattr(param, "update_usage"):
+                param.update_usage(rowwise_usage=rowwise, columnwise_usage=columnwise)
 
     def post_reshard(self, params: List[torch.Tensor]) -> None:
         """Run post-reshard mixed precision processing for a parameter group."""
-        self.fp8.post_reshard(params)
+        if self.fp8.keep_transpose_cache:
+            return
+        for param in params:
+            if not self.is_fp8_param(param):
+                continue
+            # Drop full-weight transpose/cache views after FSDP reshard releases
+            # the unsharded payload.
+            if hasattr(param, "_transpose_invalid"):
+                param._transpose_invalid = True
+                param._transpose = None
+            elif not self.needs_transpose_weight_buffer(param):
+                param.update_usage(rowwise_usage=True, columnwise_usage=False)
 
     def quantize_main_weights_to_model(
         self,
@@ -362,7 +319,7 @@ class FullyShardMixedPrecisionPolicy:
         fsdp_shard_model_params: List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
     ) -> None:
         """Quantize high-precision main weights into FP8 model-weight shards."""
-        self.fp8.quantize_main_weights_to_model(
+        quantize_main_weights_to_fp8(
             model_params,
             main_params,
             start_offsets,

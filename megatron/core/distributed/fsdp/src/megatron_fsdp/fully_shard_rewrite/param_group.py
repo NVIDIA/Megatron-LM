@@ -46,7 +46,6 @@ class ParameterGroup:
         mesh: Optional[DeviceMesh] = None,
         sharding_strategy: str = "optim_grads_params",
         gradient_scaling_factor: Optional[float] = None,
-        allocator: Optional[TemporaryBucketAllocator] = None,
     ):
         self.params = params
         self.param_idx: Dict[torch.nn.Parameter, int] = {p: i for i, p in enumerate(params)}
@@ -84,7 +83,7 @@ class ParameterGroup:
             self.chunk_size_factor = 1
 
         self.gradient_scaling_factor = gradient_scaling_factor
-        self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
+        self.allocator = TemporaryBucketAllocator()
 
         # Buffer references (initialized in _init_buffers)
         self.model_weight_buffer: Optional[DataParallelBuffer] = None
@@ -142,14 +141,14 @@ class ParameterGroup:
             wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight")
             wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
-                wbuf.set_item(i, self.mp_policy.model_weight_buffer_item(p))
+                wbuf.set_item(i, self.mp_policy.get_param_data(p))
             self.model_weight_buffer = wbuf
 
             if self.needs_transpose_weight_buffer:
                 tbuf = self._create_buffer(torch.uint8, shard_weights, "transpose_weight")
                 tbuf.init_data(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
                 for i, p in enumerate(self.params):
-                    tbuf.set_item(i, self.mp_policy.transpose_weight_buffer_item(p))
+                    tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
                 self.transpose_weight_buffer = tbuf
 
         # Create main weight buffer for mixed precision
@@ -181,37 +180,38 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(self, async_op: bool = False):
+    def unshard(self, async_op: bool = False, is_bwd: bool = False):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
         After unshard, self.params.data points to full (unsharded) tensors.
         """
-        full_weight_buffer, work = self.model_weight_buffer.unshard(
-            async_op=async_op,
-            bind_params=self.mp_policy.bind_params_on_unshard(self.params[0]),
-        )
-        if self.is_fp8_group:
-            for p in self.params:
-                item_id = self.param_idx[p]
-                offset, size = self.model_weight_buffer.buffer_index._get_item_offset(item_id)
-                self.mp_policy.set_unsharded_weight(
-                    p, full_weight_buffer[offset : offset + size].view(p.shape)
-                )
+        if is_bwd and self.transpose_weight_buffer is not None:
+            buffers = [(self.transpose_weight_buffer, True)]
+        else:
+            buffers = [(self.model_weight_buffer, False)]
 
-            if self.transpose_weight_buffer is not None:
-                full_transpose_buffer, _ = self.transpose_weight_buffer.unshard(
-                    async_op=async_op, bind_params=False
-                )
+        work = None
+        for weight_buffer, use_transpose_buffer in buffers:
+            full_weight_buffer, weight_work = weight_buffer.unshard(
+                async_op=async_op,
+                bind_params=not self.is_fp8_group,
+            )
+            if work is None:
+                work = weight_work
+
+            if self.is_fp8_group and full_weight_buffer is not None:
                 for p in self.params:
                     item_id = self.param_idx[p]
-                    offset, size = self.transpose_weight_buffer.buffer_index._get_item_offset(
-                        item_id
-                    )
+                    offset, size = weight_buffer.buffer_index._get_item_offset(item_id)
                     self.mp_policy.set_unsharded_weight(
-                        p, full_transpose_buffer[offset : offset + size].view(p.shape), True
+                        p,
+                        full_weight_buffer[offset : offset + size].view(p.shape),
+                        transpose=use_transpose_buffer,
                     )
-            self.mp_policy.post_unshard(self.params)
+
+        if self.is_fp8_group:
+            self.mp_policy.post_unshard(self.params, is_bwd=is_bwd)
         return work
 
     def reshard(self):

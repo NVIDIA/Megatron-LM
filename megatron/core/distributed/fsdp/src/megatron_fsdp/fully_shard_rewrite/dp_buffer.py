@@ -478,6 +478,10 @@ class DataParallelBuffer:
             group=self.dp_group,
             async_op=async_op,
         )
+        if self._unsharded_buffer.is_cuda:
+            # The temporary bucket may be released from another stream before this
+            # collective finishes; record the producer stream for allocator safety.
+            self._unsharded_buffer.record_stream(torch.cuda.current_stream())
 
         if bind_params:
             for p in self.params:
@@ -542,6 +546,9 @@ class DataParallelBuffer:
 
         full_grad = self.fetch_unsharded_buffer()
         comm_input = full_grad if grad_comm_dtype == self.dtype else full_grad.to(grad_comm_dtype)
+        if full_grad.is_cuda:
+            # Keep temporary reduce-scatter buffers tied to the stream that uses them.
+            full_grad.record_stream(torch.cuda.current_stream())
         if prescale:
             comm_input.mul_(self.gradient_scaling_factor)
 

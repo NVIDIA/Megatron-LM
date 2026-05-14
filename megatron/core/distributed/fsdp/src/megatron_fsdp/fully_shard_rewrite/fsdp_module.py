@@ -308,7 +308,7 @@ class FSDPModule(nn.Module):
                         ).any(), f"NaN detected in dist param for parameter {name}"
 
                 with torch.cuda.stream(stream):
-                    param_group.unshard()
+                    param_group.unshard(is_bwd=bwd_pass)
 
             # Record event to track when unshard is done for this module
             if async_op:
