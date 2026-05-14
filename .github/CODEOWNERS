@@ -1,5 +1,7 @@
 megatron/core/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
+megatron/core/models/common/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
+
 megatron/core/models/gpt/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
 megatron/core/models/multimodal/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/multi-modal
@@ -13,13 +15,14 @@ megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
 
 megatron/core/tokenizers/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/tokenizers
 
+megatron/core/distributed/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/data-parallelism
 megatron/core/distributed/fsdp/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
 
 megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
 
 megatron/core/dist_checkpointing/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-checkpointing
 
-megatron/core/optimizer/distrib_optimizer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+megatron/core/optimizer/distrib_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
 
 megatron/core/inference/modelopt_support @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/quantization-and-inference
 
