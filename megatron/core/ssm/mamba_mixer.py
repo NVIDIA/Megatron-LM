@@ -28,6 +28,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -271,6 +274,11 @@ class MambaMixer(MegatronModule):
         ]
         setattr(self.in_proj.weight, "partition_sizes", in_proj_partition_sizes)
 
+        self.offload_ssm_training = (
+            self.config.fine_grained_activation_offloading
+            and "mamba_ssm_training" in self.config.offload_modules
+        )
+
         if not self.use_mem_eff_path:
             log_single_rank(
                 logger,
@@ -461,7 +469,16 @@ class MambaMixer(MegatronModule):
             y = self._ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
-            y = self._ssm_training(zxBCdt, packed_seq_params)
+            ssm_training_offload_manager = off_interface(
+                self.offload_ssm_training, zxBCdt, "mamba_ssm_training"
+            )
+            with ssm_training_offload_manager as zxBCdt:
+                y = self._ssm_training(zxBCdt, packed_seq_params)
+            y = ssm_training_offload_manager.group_offload(
+                y,
+                forced_released_tensors=[zxBCdt],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
+            )
 
         out, out_bias = self.out_proj(y)
 
