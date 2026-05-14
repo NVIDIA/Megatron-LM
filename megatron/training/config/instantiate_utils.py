@@ -7,8 +7,13 @@ from enum import Enum
 from textwrap import dedent
 from typing import Any, Callable, Sequence
 
-from omegaconf import OmegaConf
-from omegaconf._utils import is_structured_config
+try:
+    from omegaconf import OmegaConf
+    from omegaconf._utils import is_structured_config
+
+    HAVE_OMEGACONF = True
+except ImportError:
+    HAVE_OMEGACONF = False
 
 
 class InstantiationException(Exception):
@@ -158,6 +163,11 @@ def instantiate(
                                 or instantiation fails in STRICT mode.
         TypeError: If the _partial_ flag is not a boolean.
     """
+    if not HAVE_OMEGACONF:
+        raise ImportError(
+            "omegaconf is required for config instantiation. "
+            "Install via `pip install omegaconf`."
+        )
 
     # Return None if config is None
     if config is None:
