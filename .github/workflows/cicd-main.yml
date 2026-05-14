@@ -60,7 +60,7 @@ jobs:
 
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Check NVIDIA SSO membership
@@ -69,6 +69,7 @@ jobs:
         with:
           username: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
           github_token: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
+          sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
 
       - name: Set maintainer status
         id: check-membership
@@ -76,9 +77,10 @@ jobs:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
+          IS_WORKFLOW_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
-          # Skip SSO check for scheduled jobs, main branch, or merge groups
-          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
+          # Skip SSO check for scheduled jobs, main branch, merge groups, or manual dispatches
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ] || [ "${IS_WORKFLOW_DISPATCH}" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
@@ -131,7 +133,160 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
+
+  configure:
+    runs-on: ubuntu-latest
+    needs: [pre-flight]
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    outputs:
+      scope:          ${{ steps.configure.outputs.scope }}
+      n_repeat:       ${{ steps.configure.outputs.n_repeat }}
+      lightweight:    ${{ steps.configure.outputs.lightweight }}
+      lts:            ${{ steps.configure.outputs.lts }}
+      mbridge_suite:  ${{ steps.configure.outputs.mbridge_suite }}
+      dev:            ${{ steps.configure.outputs.dev }}
+      cadence:        ${{ steps.configure.outputs.cadence }}
+      cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
+    steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Configure
+        id: configure
+        shell: bash -x -e -u -o pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
+          IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+
+          # Fetch all labels in a single API call; fall back to empty list if no PR
+          LABELS=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json labels --jq '[.labels[].name]') || LABELS='[]'
+
+          HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
+          HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
+          HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
+          HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
+
+          if [ "$IS_MERGE_GROUP" == "true" ]; then
+            SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=false
+          elif [ "$HAS_RUN_TESTS" == "true" ]; then
+            SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=true
+          elif [ "$HAS_RUN_FUNCTIONAL" == "true" ]; then
+            SCOPE=L1; N_REPEAT=5; LIGHTWEIGHT=false
+          elif [ "$IS_CI_WORKLOAD" == "true" ] || [ "$EVENT_NAME" == "workflow_dispatch" ]; then
+            # Scheduled / dispatch / release have no PR labels; default to the
+            # full functional tier (L1) so cadence (set below) is the
+            # discriminator. `workflow_dispatch` is forced into this branch
+            # because upstream pre-flight reports is_ci_workload=false when
+            # dispatched from a `pull-request/*` branch, which would otherwise
+            # drop us into the slim tier.
+            SCOPE=L1; N_REPEAT=5; LIGHTWEIGHT=false
+          else
+            SCOPE=L0; N_REPEAT=5; LIGHTWEIGHT=false
+          fi
+
+          if [ "$HAS_MBRIDGE" == "true" || $IS_MERGE_GROUP == "true" ]; then
+            MBRIDGE_SUITE="L1"
+          else
+            MBRIDGE_SUITE="unit-only"
+          fi
+
+          # Cadence: trigger-driven test selection axis (see filter_by_cadence
+          # in tests/test_utils/python_scripts/recipe_parser.py). PR labels
+          # `Run tests` and `Run functional tests` bypass the cadence filter so
+          # contributors retain a manual override.
+          if [ "$IS_MERGE_GROUP" == "true" ]; then
+            CADENCE=mergegroup
+          elif [ "$EVENT_NAME" == "schedule" ] || [ "$EVENT_NAME" == "workflow_dispatch" ]; then
+            CADENCE=nightly
+          else
+            CADENCE=pr
+          fi
+
+          if [ "$HAS_RUN_TESTS" == "true" ] || [ "$HAS_RUN_FUNCTIONAL" == "true" ]; then
+            CADENCE_BYPASS=true
+            CADENCE_OUTPUT=""
+          else
+            CADENCE_BYPASS=false
+            CADENCE_OUTPUT="$CADENCE"
+          fi
+
+          DEV=true
+
+          echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
+          echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
+          echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
+          echo "lts=$HAS_LTS"                   | tee -a $GITHUB_OUTPUT
+          echo "mbridge_suite=$MBRIDGE_SUITE"   | tee -a $GITHUB_OUTPUT
+          echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
+          echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
+          echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
+
+          # Pre-compute active row markers for the decision tree
+          _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
+          _RT=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" == "true" ]                                        && echo "**→**" || echo "" )
+          _RF=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" == "true" ]  && echo "**→**" || echo "" )
+          _CI=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" != "true" ] && [ "$IS_CI_WORKLOAD" == "true" ] && echo "**→**" || echo "" )
+          _DF=$( [ "$SCOPE" == "L0" ]                                                                                      && echo "**→**" || echo "" )
+          _LTS=$( [ "$HAS_LTS" == "true" ]                                                                                 && echo "**→**" || echo "" )
+          _DEV=$( [ "$HAS_LTS" != "true" ]                                                                                 && echo "**→**" || echo "" )
+          _CMG=$( [ "$CADENCE" == "mergegroup" ] && echo "**→**" || echo "" )
+          _CN=$(  [ "$CADENCE" == "nightly" ]    && echo "**→**" || echo "" )
+          _CPR=$( [ "$CADENCE" == "pr" ]         && echo "**→**" || echo "" )
+
+          cat <<SUMMARY >> $GITHUB_STEP_SUMMARY
+          Beep boop 🤖 I have consulted the labels and decided to run **$SCOPE** $( [ "$LIGHTWEIGHT" == "true" ] && echo "in lightweight mode " || echo "" )against the **$( [ "$HAS_LTS" == "true" ] && echo "lts" || echo "dev" )** container with **$N_REPEAT** repetition(s). You are welcome.
+
+          | Setting | Value |
+          |---|---|
+          | \`scope\` | \`$SCOPE\` |
+          | \`n_repeat\` | \`$N_REPEAT\` |
+          | \`lightweight\` | \`$LIGHTWEIGHT\` |
+          | \`lts\` | \`$HAS_LTS\` |
+          | \`dev\` | \`$DEV\` |
+          | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
+          | \`cadence\` | \`$CADENCE\` |
+          | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
+
+          ### Decision tree
+
+          **Test scope**
+
+          | | Trigger | \`scope\` | \`n_repeat\` | \`lightweight\` |
+          |---|---|---|---|---|
+          | $_MG | Merge group | \`L1\` | \`1\` | \`false\` |
+          | $_RT | Label: _Run tests_ | \`L1\` | \`1\` | \`true\` |
+          | $_RF | Label: _Run functional tests_ | \`L1\` | \`5\` | \`false\` |
+          | $_CI | Schedule / dispatch (CI workload) | \`L1\` | \`5\` | \`false\` |
+          | $_DF | _(default)_ | \`L0\` | \`5\` | \`false\` |
+
+          **Cadence** _(filter bypassed when \`Run tests\` or \`Run functional tests\` label is set)_
+
+          | | Trigger | \`cadence\` |
+          |---|---|---|
+          | $_CMG | Merge group | \`mergegroup\` |
+          | $_CN  | Schedule / dispatch | \`nightly\` |
+          | $_CPR | PR push (default) | \`pr\` |
+
+          **Container image**
+
+          | | Trigger | \`image\` |
+          |---|---|---|
+          | $_LTS | Label: _container::lts_ | \`lts\` |
+          | $_DEV | _(default)_ | \`dev\` |
+
+          ### Glossary
+          - **\`lightweight\`**: trains for 4 steps instead of 100 and skips comparison against golden values — faster feedback, no correctness guarantees
+          - **\`lts\`**: uses the Long Term Support container base image instead of the latest dev image
+          - **\`dev\`**: uses the latest development container base image (default)
+          - **\`cadence\`**: per-test trigger filter (recipe \`cadence:\` field). Recipes default to \`[pr, nightly, mergegroup]\`.
+          SUMMARY
 
   linting:
     runs-on: ubuntu-latest
@@ -152,7 +307,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           version: 0.7.2
 
@@ -162,11 +317,11 @@ jobs:
 
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Run linting
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         run: |
           export PATH=".venv/bin:$PATH"
           export GITLAB_ENDPOINT=github.com
@@ -195,9 +350,11 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - pre-flight
+      - configure
       - cicd-wait-in-queue
     if: |
       needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && (
         success()
@@ -207,24 +364,10 @@ jobs:
       )
       && !cancelled()
     outputs:
-      mbridge-test-suite: ${{ steps.select-mbridge-test-suite.outputs.main }}
+      mbridge-test-suite: ${{ needs.configure.outputs.mbridge_suite }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@main
-
-      - name: Select MBridge test suite
-        id: select-mbridge-test-suite
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          TEST_SUITE=$(gh pr view $PR_NUMBER --json labels | jq -r 'if [.labels[].name] | any(. == "Run MBridge tests") then "all" else "unit-only" end')
-          echo "main=$TEST_SUITE" | tee -a $GITHUB_OUTPUT
 
       - name: How-To
         run: bash .github/scripts/readme.sh
@@ -249,7 +392,7 @@ jobs:
     steps:
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Checkout MBridge and create testing branch
@@ -340,7 +483,7 @@ jobs:
           echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
 
   cicd-container-build:
-    needs: [is-not-external-contributor, pre-flight, cicd-wait-in-queue, cicd-compute-build-matrix]
+    needs: [is-not-external-contributor, pre-flight, configure, cicd-wait-in-queue, cicd-compute-build-matrix]
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.cicd-compute-build-matrix.outputs.matrix) }}
@@ -360,7 +503,7 @@ jobs:
     steps:
       - name: Get PR info
         id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Get merge commit sha
@@ -392,17 +535,11 @@ jobs:
       - name: Install GH CLI
         shell: bash -x -e -u -o pipefail {0}
         run: |
-          apt-get update
-          apt-get install -y gh
-
-      - name: Has lts label
-        id: has-lts-label
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_LTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "container::lts")') || echo "false"
-          echo "main=$HAS_LTS_LABEL" | tee -a $GITHUB_OUTPUT
+          for i in 1 2 3; do
+            apt-get update && apt-get install -y gh && break
+            echo "apt attempt $i failed, retrying..."
+            sleep 10
+          done
 
       - name: Download test data
         shell: bash
@@ -411,12 +548,6 @@ jobs:
           pip install --no-cache-dir click requests
           python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
           echo "::endgroup::"
-
-      - name: Install GH CLI
-        shell: bash
-        run: |
-          apt-get update
-          apt-get install -y gh
 
       - name: Get last merged PR
         id: cache_from
@@ -444,7 +575,7 @@ jobs:
         shell: bash
         id: base-image
         env:
-          HAS_LTS_LABEL: ${{ steps.has-lts-label.outputs.main }}
+          HAS_LTS_LABEL: ${{ needs.configure.outputs.lts }}
         run: |
           if [ "$HAS_LTS_LABEL" == "true" ]; then
             NGC_VERSION=$(cat docker/.ngc_version.lts)
@@ -457,10 +588,10 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4.0.0
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.1.0
         with:
           file: ./docker/Dockerfile.ci.dev
           push: true
@@ -553,17 +684,18 @@ jobs:
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
-          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
 
   cicd-parse-integration-tests-h100:
     runs-on: ubuntu-latest
     needs:
       - pre-flight
+      - configure
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
     if: |
       needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
@@ -580,53 +712,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@main
-
-      - name: Has Run tests label
-        id: has-run-tests-label
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
-          echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
-
-      - name: Has Run functional tests label
-        id: has-run-functional-tests-label
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
-        run: |
-          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")')
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL=${HAS_RUN_FUNCTIONAL_TESTS_LABEL:-$IS_CI_WORKLOAD}
-          echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
-
       - name: Parse functional tests
         id: main
         env:
-          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL: ${{ steps.has-run-functional-tests-label.outputs.main == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
+          SCOPE: ${{ needs.configure.outputs.scope }}
+          LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
+          CADENCE: ${{ needs.configure.outputs.cadence }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
-            ARGS=(
-              --scope mr-github
-              --enable-lightweight-mode
-            )
-          elif [ "$HAS_RUN_FUNCTIONAL_TESTS_LABEL" == "true" ]; then
-            ARGS=(
-              --scope mr-github
-            )
-          else
-            ARGS=(
-              --scope mr-github-slim
-            )
-          fi
+          ARGS=(--scope $SCOPE)
+          [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+          # CADENCE is empty when label-based bypass is active; pass through
+          # only when set so generate_jet_trigger_job sees None and skips the filter.
+          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
@@ -658,6 +757,7 @@ jobs:
     needs:
       - is-not-external-contributor
       - pre-flight
+      - configure
       - cicd-wait-in-queue
       - cicd-parse-integration-tests-h100
       - cicd-unit-tests-latest
@@ -670,6 +770,7 @@ jobs:
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-integration-tests-h100.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
@@ -693,20 +794,24 @@ jobs:
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
-          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
-          is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}
+          scope: ${{ needs.configure.outputs.scope }}
+          n_repeat: ${{ needs.configure.outputs.n_repeat }}
+          lightweight: ${{ needs.configure.outputs.lightweight }}
+          cadence: ${{ needs.configure.outputs.cadence }}
 
   cicd-parse-integration-tests-gb200:
     runs-on: ubuntu-latest
     needs:
       - is-not-external-contributor
       - pre-flight
+      - configure
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
     if: |
       needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
@@ -723,53 +828,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@main
-
-      - name: Has Run tests label
-        id: has-run-tests-label
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
-          echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
-
-      - name: Has Run functional tests label
-        id: has-run-functional-tests-label
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
-        run: |
-          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")')
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL=${HAS_RUN_FUNCTIONAL_TESTS_LABEL:-$IS_CI_WORKLOAD}
-          echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
-
       - name: Parse functional tests
         id: main
         env:
-          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL: ${{ steps.has-run-functional-tests-label.outputs.main == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
+          SCOPE: ${{ needs.configure.outputs.scope }}
+          LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
+          CADENCE: ${{ needs.configure.outputs.cadence }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
-            ARGS=(
-              --scope mr-github
-              --enable-lightweight-mode
-            )
-          elif [ "$HAS_RUN_FUNCTIONAL_TESTS_LABEL" == "true" ]; then
-            ARGS=(
-              --scope mr-github
-            )
-          else
-            ARGS=(
-              --scope mr-github-slim
-            )
-          fi
+          ARGS=(--scope $SCOPE)
+          [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+          # CADENCE is empty when label-based bypass is active; pass through
+          # only when set so generate_jet_trigger_job sees None and skips the filter.
+          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
@@ -801,6 +873,7 @@ jobs:
     needs:
       - is-not-external-contributor
       - pre-flight
+      - configure
       - cicd-wait-in-queue
       - cicd-parse-integration-tests-gb200
       - cicd-unit-tests-latest
@@ -814,6 +887,7 @@ jobs:
       needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-integration-tests-gb200.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
@@ -837,13 +911,16 @@ jobs:
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ github.sha }}
-          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
-          is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}
+          scope: ${{ needs.configure.outputs.scope }}
+          n_repeat: ${{ needs.configure.outputs.n_repeat }}
+          lightweight: ${{ needs.configure.outputs.lightweight }}
           platform: dgx_gb200
+          cadence: ${{ needs.configure.outputs.cadence }}
 
   Nemo_CICD_Test:
     needs:
       - pre-flight
+      - is-not-external-contributor
       - cicd-unit-tests-latest
       - cicd-integration-tests-latest-h100
       - cicd-integration-tests-latest-gb200
@@ -869,19 +946,71 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
+          DOCS_ONLY: ${{ needs.pre-flight.outputs.docs_only }}
+          IS_DEPLOYMENT: ${{ needs.pre-flight.outputs.is_deployment_workflow }}
+          IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
+          UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
+          H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
+          GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure" and .name != "merge-queue-notification" and .name != "cicd-mbridge-testing")] | length') || echo 0
-          SKIPPED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "skipped" and .name != "merge-queue-notification" and .name != "cicd-mbridge-testing")] | length') || echo 0
+          # Docs-only and deployment workflows intentionally skip all tests
+          if [ "$DOCS_ONLY" == "true" ] || [ "$IS_DEPLOYMENT" == "true" ]; then
+            echo "✅ Docs-only or deployment workflow — test checks skipped"
+            exit 0
+          fi
 
-          if [ "${FAILED_JOBS:-0}" -eq 0 ] && ([ "${SKIPPED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]); then
-              echo "✅ All previous jobs completed successfully"
-              exit 0
+          FAILED=false
+
+          # Unit tests must always succeed (never skipped or cancelled)
+          if [ "$UNIT_RESULT" != "success" ]; then
+            echo "❌ cicd-unit-tests-latest: $UNIT_RESULT"
+            FAILED=true
+          fi
+
+          # H100 integration tests must always succeed
+          if [ "$H100_RESULT" != "success" ]; then
+            echo "❌ cicd-integration-tests-latest-h100: $H100_RESULT"
+            FAILED=true
+          fi
+
+          # GB200 integration tests may be skipped only for non-maintainer PRs
+          # (no GB200 runners available); maintainer runs must always succeed
+          if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
+            echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
+            FAILED=true
+          elif [ "$GB200_RESULT" != "success" ] && [ "$GB200_RESULT" != "skipped" ]; then
+            echo "❌ cicd-integration-tests-latest-gb200: $GB200_RESULT"
+            FAILED=true
+          fi
+
+          # Broad scan: catch any individual job failures or cancellations
+          # (e.g. a single matrix instance cancelled mid-run)
+          BAD_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '
+            [.jobs[] | select(
+              .status == "completed"
+              and (.conclusion == "failure" or .conclusion == "cancelled")
+              and .name != "merge-queue-notification"
+              and .name != "cicd-mbridge-testing"
+            )] | length
+          ') || BAD_JOBS=0
+
+          if [ "${BAD_JOBS:-0}" -gt 0 ]; then
+            echo "❌ Found ${BAD_JOBS} failed or cancelled job(s):"
+            gh run view $GITHUB_RUN_ID --json jobs --jq '
+              .jobs[] | select(
+                .status == "completed"
+                and (.conclusion == "failure" or .conclusion == "cancelled")
+                and .name != "merge-queue-notification"
+                and .name != "cicd-mbridge-testing"
+              ) | .name + " → " + .conclusion
+            '
+            FAILED=true
+          fi
+
+          if [ "$FAILED" != "true" ]; then
+            echo "✅ All previous jobs completed successfully"
           else
-              echo "❌ Found $FAILED_JOBS failed job(s)"
-              # Show which jobs failed
-              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion == "failure") | .name'
-              exit 1
+            exit 1
           fi
 
   Coverage_Fake:
@@ -891,7 +1020,6 @@ jobs:
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-        || github.event == 'merge_group'
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
@@ -917,6 +1045,7 @@ jobs:
     if: |
       (
         (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
+        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
         || success()
       )
       && !cancelled()
@@ -925,6 +1054,11 @@ jobs:
       matrix:
         flag: [unit-test]
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -955,6 +1089,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6

@@ -216,33 +216,54 @@ def get_test_config(num_layers=1, num_moe_experts=8, extra_kwargs={}, moe_groupe
         multi_latent_attention=True,
         num_moe_experts=num_moe_experts,
         moe_grouped_gemm=moe_grouped_gemm,
+        moe_router_dtype="fp32",
         **extra_kwargs,
     )
     return config
 
 
 def get_valid_token_dispatcher_types():
-    try:
-        from deep_ep import Buffer
-        from deep_ep.utils import EventHandle, EventOverlap
+    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
 
+    if HAVE_HYBRIDEP or HAVE_DEEP_EP:
         return ["alltoall", "flex"]
-    except ImportError:
+    else:
         return ["alltoall"]
+
+
+def get_valid_flex_dispatcher_backend():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
+
+    if HAVE_HYBRIDEP:
+        return "hybridep"
+    elif HAVE_DEEP_EP:
+        return "deepep"
+    else:
+        return None
 
 
 def get_valid_fp8_flags():
     from megatron.core.enums import Fp8Recipe
+    from megatron.training.utils import get_device_arch_version
 
     fp8_types = ["e4m3", "hybrid"]
     recipes = []
-    valid_flags = []
-    if is_te_min_version("2.3.0.dev0"):
-        recipes.append(Fp8Recipe.blockwise)
-        recipes.append(Fp8Recipe.tensorwise)
+    arch = get_device_arch_version()
 
+    if is_te_min_version("2.3.0.dev0"):
+        recipes.append(Fp8Recipe.tensorwise)  # Hopper + Blackwell
+
+    if is_te_min_version("2.4.0.dev0") and arch == 9:
+        recipes.append(Fp8Recipe.blockwise)  # Hopper only
+
+    if is_te_min_version("2.3.0.dev0") and arch >= 10:
+        recipes.append(Fp8Recipe.mxfp8)  # Blackwell only
+
+    valid_flags = []
     for fp8_type in fp8_types:
         for recipe in recipes:
+            if fp8_type == "hybrid" and recipe == Fp8Recipe.mxfp8:
+                continue
             valid_flags.append((fp8_type, recipe))
     valid_flags.append(None)
 

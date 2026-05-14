@@ -18,6 +18,7 @@ from typing import NoReturn, Optional, Union
 
 import torch
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -46,18 +47,15 @@ except ImportError:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
 
-try:
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELinear,
         set_save_original_input,
     )
     from megatron.core.post_training.modelopt.layers import Linear
-
-    HAVE_TE = True
-except ImportError:
+else:
     TEColumnParallelLinear, TELinear, Linear, set_save_original_input = None, None, None, None
-    HAVE_TE = False
 
 
 @dataclass

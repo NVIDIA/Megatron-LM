@@ -6,13 +6,13 @@ from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
+)
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
 )
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
@@ -20,13 +20,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import (
-    SequentialMLP,
-    TEGroupedMLP,
-    TEGroupedMLPSubmodules,
-)
+from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -59,39 +56,34 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=True
         )
-        assert isinstance(layer_submodules.mlp.submodules, MoESubmodules)
-        assert isinstance(
-            layer_submodules.mlp.submodules.experts.submodules, TEGroupedMLPSubmodules
-        )
+        mlp_submodules = get_submodules(layer_submodules.mlp)
+        assert isinstance(mlp_submodules, MoESubmodules)
+        experts_submodules = get_submodules(mlp_submodules.experts)
+        assert isinstance(experts_submodules, GroupedMLPSubmodules)
         model = TEGroupedMLP(
-            num_local_experts,
-            transformer_config,
-            layer_submodules.mlp.submodules.experts.submodules,
-            pg_collection,
+            num_local_experts, transformer_config, experts_submodules, pg_collection
         )
     elif expert_type == 'sequential':
         layer_submodules = get_gpt_layer_local_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        assert isinstance(layer_submodules.mlp.submodules, MoESubmodules)
-        assert isinstance(layer_submodules.mlp.submodules.experts.submodules, MLPSubmodules)
+        mlp_submodules = get_submodules(layer_submodules.mlp)
+        assert isinstance(mlp_submodules, MoESubmodules)
+        experts_submodules = get_submodules(mlp_submodules.experts)
+        assert isinstance(experts_submodules, MLPSubmodules)
         model = SequentialMLP(
-            num_local_experts,
-            transformer_config,
-            layer_submodules.mlp.submodules.experts.submodules,
-            pg_collection,
+            num_local_experts, transformer_config, experts_submodules, pg_collection
         )
     elif expert_type == 'te_sequential':
         layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
             num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        assert isinstance(layer_submodules.mlp.submodules, MoESubmodules)
-        assert isinstance(layer_submodules.mlp.submodules.experts.submodules, MLPSubmodules)
+        mlp_submodules = get_submodules(layer_submodules.mlp)
+        assert isinstance(mlp_submodules, MoESubmodules)
+        experts_submodules = get_submodules(mlp_submodules.experts)
+        assert isinstance(experts_submodules, MLPSubmodules)
         model = SequentialMLP(
-            num_local_experts,
-            transformer_config,
-            layer_submodules.mlp.submodules.experts.submodules,
-            pg_collection,
+            num_local_experts, transformer_config, experts_submodules, pg_collection
         )
     else:
         raise ValueError(
@@ -189,7 +181,7 @@ class TestExpertLayerReconfiguration:
             model_A = initialize_expert_layer(1, use_glu, expert_type)
             sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
-            save_strategy = get_default_save_sharded_strategy()
+            save_strategy = TorchDistSaveShardedStrategy()
             if use_fpsl:
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
@@ -213,7 +205,7 @@ class TestExpertLayerReconfiguration:
             )
             model_B = initialize_expert_layer(1, use_glu, expert_type)
             if use_fpsl:
-                load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+                load_strategy = TorchDistLoadShardedStrategy()
                 load_strategy = FullyParallelLoadStrategyWrapper(
                     load_strategy,
                     parallel_state.get_data_parallel_group(with_context_parallel=True),
@@ -284,7 +276,7 @@ class TestExpertLayerReconfiguration:
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module)
             sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
-            save_strategy = get_default_save_sharded_strategy()
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 
@@ -362,7 +354,7 @@ class TestExpertLayerReconfiguration:
             model_A(input_tensor, tokens_per_expert, probs)
             sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
-            save_strategy = get_default_save_sharded_strategy()
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 

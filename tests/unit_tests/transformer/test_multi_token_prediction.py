@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import sys
@@ -7,14 +7,15 @@ import pytest
 import torch
 
 from megatron.core.enums import ModelType
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
@@ -40,12 +41,10 @@ from megatron.training.utils import get_batch_on_this_cp_rank, unwrap_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-try:
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TEColumnParallelGroupedLinear = None
 
 _SEED = 42
 
@@ -687,7 +686,7 @@ class TestMTPLossLoggingHelper:
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 
 
-class TestMultiTokenPredictionMamba:
+class TestMultiTokenPredictionHybrid:
     """Test Multi-Token Prediction with Mamba hybrid models."""
 
     def setup_method(self, method):
@@ -713,10 +712,10 @@ class TestMultiTokenPredictionMamba:
         config = core_transformer_config_from_args(args)
 
         # MTP is configured via unified pattern in hybrid_layer_pattern
-        # MambaModel creates the MTP block internally based on the parsed pattern
-        model = MambaModel(
+        # HybridModel creates the MTP block internally based on the parsed pattern
+        model = HybridModel(
             config=config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=args.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
@@ -736,7 +735,7 @@ class TestMultiTokenPredictionMamba:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-        sys.argv = ['test_multi_token_prediction_mamba.py']
+        sys.argv = ['test_multi_token_prediction_hybrid.py']
         args = parse_args()
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
@@ -764,7 +763,7 @@ class TestMultiTokenPredictionMamba:
         args.bf16 = True
         # Unified pattern: "main/mtp/mtp" - main decoder "M*M*", MTP pattern "M*" with 2 depths
         args.hybrid_layer_pattern = "M*M*/M*/M*"
-        args.spec = "megatron.core.models.mamba.mamba_layer_specs.mamba_stack_spec"
+        args.spec = "megatron.core.models.hybrid.hybrid_layer_specs.hybrid_stack_spec"
 
         if fp8 is not None:
             args.fp8 = 'e4m3'
@@ -921,7 +920,7 @@ class TestMultiTokenPredictionMamba:
         try:
             mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
             mamba_model = unwrap_model(mamba_model)
-            assert isinstance(mamba_model[0], MambaModel)
+            assert isinstance(mamba_model[0], HybridModel)
             assert mamba_model[0].mtp is not None
         except AssertionError as e:
             if "Multi-Token Prediction (MTP) is not yet supported" in str(e):

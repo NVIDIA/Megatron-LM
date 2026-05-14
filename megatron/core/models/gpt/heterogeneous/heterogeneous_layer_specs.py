@@ -1,8 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
+from functools import partial
 from typing import Optional
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -30,9 +32,7 @@ from megatron.core.transformer.transformer_layer import (
 from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -42,9 +42,7 @@ try:
     from megatron.core.transformer.heterogeneous.linear_replacements import (
         TELayerNormColumnParallelLinearGathered,
     )
-
-    HAVE_TE = True
-except ImportError:
+else:
     (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -52,7 +50,6 @@ except ImportError:
         TERowParallelLinear,
         TELayerNormColumnParallelLinearGathered,
     ) = (None, None, None, None, None)
-    HAVE_TE = False
 
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
@@ -132,17 +129,19 @@ def _get_heterogenous_attention_spec(
 
 def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):
     if mlp_config.no_op:
-        mlp = ModuleSpec(module=IdentityOp)
+        return IdentityOp
     elif mlp_config.replace_with_linear:
-        mlp = ModuleSpec(
-            module=(
-                TELayerNormColumnParallelLinearGathered if use_te else ColumnParallelLinearGathered
+        return partial(
+            (
+                not_none(TELayerNormColumnParallelLinearGathered)
+                if use_te
+                else ColumnParallelLinearGathered
             ),
-            params={"tp_comm_buffer_name": "linear_mlp"},
+            tp_comm_buffer_name="linear_mlp",
         )
     else:
-        mlp = ModuleSpec(
-            module=MLP,
+        return partial(
+            MLP.as_mlp_submodule,
             submodules=MLPSubmodules(
                 linear_fc1=(
                     not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
@@ -150,7 +149,6 @@ def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):
                 linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
             ),
         )
-    return mlp
 
 
 def _get_sharded_state_dict_keys_map(block_config: TransformerBlockConfig, use_te: bool):

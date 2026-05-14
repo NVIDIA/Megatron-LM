@@ -4,12 +4,17 @@ import asyncio
 import logging
 import multiprocessing
 import sys
-import time
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
+
+try:
+    FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
+except PackageNotFoundError:
+    FLASHINFER_JIT_CACHE_VERSION = None
 
 
 def device_memory_summary() -> str:
@@ -68,6 +73,7 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
 
 # Initialize cache for sequence parallel modules
 moe_layer_cache = None
+_moe_metadata_sync_initialized = False
 
 
 def _init_moe_expert_cache(model):
@@ -93,6 +99,25 @@ def _init_moe_expert_cache(model):
             walk(child)
 
     walk(model)
+
+
+def set_moe_metadata_sync(model) -> None:
+    """Set _runs_metadata_sync on inference dispatchers.
+
+    Exactly one dispatcher per model — the first MoE layer — fires update_metadata
+    each step. All subsequent layers skip it to avoid redundant collective calls.
+    Must be called once after the model is built and put into eval mode.
+    """
+    global moe_layer_cache, _moe_metadata_sync_initialized
+    if _moe_metadata_sync_initialized:
+        return
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+    for i, moe_layer in enumerate(moe_layer_cache):
+        dispatcher = getattr(moe_layer, '_inference_token_dispatcher', None)
+        if dispatcher is not None:
+            dispatcher._runs_metadata_sync = i == 0
+    _moe_metadata_sync_initialized = True
 
 
 def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int = None):
@@ -157,58 +182,43 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
 
-def prewarm_flashinfer_jit():
-    """Pre-compile FlashInfer CUTLASS fused MoE kernels if not already cached.
+def check_flashinfer_jit_cache_installed(log_version: bool = False):
+    """Verify that the flashinfer-jit-cache package is installed.
 
-    FlashInfer uses JIT compilation via ninja to build CUTLASS kernels on first use.
-    This can take several minutes and blocks CUDA graph warmup. This function triggers
-    the compilation early so the cached .so is ready before the warmup loop.
+    The flashinfer-jit-cache package provides pre-compiled CUTLASS fused MoE kernels
+    so they don't need to be JIT-compiled at runtime. This avoids a multi-minute
+    compilation step during CUDA graph warmup.
+
+    Raises:
+        RuntimeError: If flashinfer-jit-cache is not installed and CUDA version is 12 or 13.
     """
-    try:
-        from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
-    except ImportError:
+    if FLASHINFER_JIT_CACHE_VERSION is not None:
+        if log_version:
+            logging.info(
+                f"Found flashinfer-jit-cache {FLASHINFER_JIT_CACHE_VERSION} with "
+                "pre-compiled CUTLASS kernels."
+            )
         return
 
-    major, minor = torch.cuda.get_device_capability()
-    device_arch = f"{major * 10 + minor}"
-    logging.info(
-        "Pre-compiling FlashInfer CUTLASS kernels for sm_%s "
-        "(one-time cost, may take several minutes)...",
-        device_arch,
+    cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else None
+
+    if cuda_major == "12":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu129\n"
+        )
+    elif cuda_major == "13":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu130\n"
+        )
+    else:
+        install_cmd = ""
+
+    raise RuntimeError(
+        "The 'flashinfer-jit-cache' package is required for expert parallel inference "
+        f"but is not installed. {install_cmd}"
     )
-    t0 = time.time()
-    get_cutlass_fused_moe_module(device_arch)
-    logging.info(
-        "FlashInfer CUTLASS kernel compilation finished in %.1f seconds.", time.time() - t0
-    )
-
-
-def set_inference_cuda_graphed_iteration_for_ep_inference(model):
-    """Enable CUDA graph compatibility for expert parallel inference.
-
-    Sets a flag in all MoELayers indicating the current iteration is being
-    captured/executed in a CUDA graph. This allows the dispatcher to adjust
-    its behavior for CUDA graph compatibility.
-    """
-    global moe_layer_cache
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
-
-    for moe_layer in moe_layer_cache:
-        moe_layer.set_inference_cuda_graphed_iteration()
-
-
-def unset_inference_cuda_graphed_iteration_for_ep_inference(model):
-    """Disable CUDA graph compatibility for expert parallel inference.
-
-    Clears the flag in all MoELayers, restoring standard dispatcher behavior.
-    """
-    global moe_layer_cache
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
-
-    for moe_layer in moe_layer_cache:
-        moe_layer.unset_inference_cuda_graphed_iteration()
 
 
 def tensor_swap(x, src_idxs, dst_idxs):

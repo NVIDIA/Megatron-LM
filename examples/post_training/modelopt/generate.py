@@ -14,9 +14,11 @@ from datasets import load_dataset
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
+from utils import get_hf_tokenizer
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
@@ -72,14 +74,12 @@ def get_conversations(example):
 
 
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_generate_args,
-        args_defaults={
+    parse_and_validate_args(extra_args_provider=add_generate_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        },
-    )
+        })
+    initialize_megatron()
 
     check_arguments()
 
@@ -99,7 +99,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]
@@ -121,9 +121,7 @@ if __name__ == "__main__":
     else:
         dataset = load_dataset(args.finetune_hf_dataset, split=args.finetune_data_split)
 
-    tokenizer = get_tokenizer()._tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
+    tokenizer = get_hf_tokenizer()
 
 
     if args.load is not None:
@@ -158,9 +156,10 @@ if __name__ == "__main__":
                         )
                     )
                 )
-                input_ids = tokenizer.apply_chat_template(
-                    new_conversations, return_tensors="pt", add_generation_prompt=True
+                encoding = tokenizer.apply_chat_template(
+                    new_conversations, return_tensors="pt", add_generation_prompt=True, return_dict=True
                 )
+                input_ids = encoding["input_ids"]
                 with torch.no_grad():
                     output_ids = simple_generate(
                         unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
