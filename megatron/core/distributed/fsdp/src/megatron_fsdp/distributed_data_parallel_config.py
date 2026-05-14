@@ -5,8 +5,6 @@ from typing import Optional
 
 import torch
 
-from megatron.core.utils import is_torch_min_version
-
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -88,7 +86,9 @@ class DistributedDataParallelConfig:
     If True, use all-gather during the initial Megatron-FSDP parameter
     synchronization step. This can increase overlap between the first
     parameter all-gather and computation, helping to better hide the
-    initial communication cost.
+    initial communication cost. Should be deactivated when using
+    full-iteration CG, or partial CG if AG/RS is launched beyond the
+    CG capture scope but is waited on during the capture scope.
     """
 
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
@@ -163,14 +163,3 @@ class DistributedDataParallelConfig:
     recommended to avoid casting the gradient to the parameter precision and creating
     a casted-copy of the gradient shard that cannot be dereferenced due to replay.
     """
-
-    def __post_init__(self):
-        import os
-
-        """Check the validity of the config."""
-        if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
-            if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
-                raise ValueError(
-                    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
-                    "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
-                )

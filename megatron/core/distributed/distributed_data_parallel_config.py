@@ -154,7 +154,9 @@ class DistributedDataParallelConfig:
     If True, use all-gather during the initial Megatron-FSDP parameter
     synchronization step. This can increase overlap between the first
     parameter all-gather and computation, helping to better hide the
-    initial communication cost.
+    initial communication cost. Should be deactivated when using
+    full-iteration CG, or partial CG if AG/RS is launched beyond the
+    CG capture scope but is waited on during the capture scope.
     """
 
     outer_dp_sharding_strategy: str = 'no_shard'
