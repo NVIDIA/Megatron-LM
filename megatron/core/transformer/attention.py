@@ -13,6 +13,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -34,7 +35,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
@@ -123,8 +123,8 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
-class LinearQkv(Protocol):
-    """Protocol for linear_qkv modules."""
+class LinearQkvInterface(Protocol):
+    """Interface for linear_qkv modules."""
 
     def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
         """Applies linear_qkv."""
@@ -152,13 +152,13 @@ class LinearQkvBuilder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str,
         tp_group: torch.distributed.ProcessGroup | None = None,
-    ) -> LinearQkv: ...
+    ) -> LinearQkvInterface: ...
 
 
-class LinearLayer(Protocol):
-    """Protocol for linear_q and linear_kv modules."""
+class LinearInterface(Protocol):
+    """Interface for linear_q and linear_kv modules."""
 
-    def forward(self, input: Tensor, /) -> Tuple[Tensor, object]:
+    def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
         """Applies linear_q/linear_kv."""
         ...
 
@@ -178,23 +178,23 @@ class LinearLayerBuilder(Protocol):
         bias: bool,
         skip_bias_add: bool,
         is_expert: bool,
-    ) -> LinearLayer: ...
+    ) -> LinearInterface: ...
 
 
-class CoreAttention(Protocol):
-    """Protocol for core_attention modules."""
+class CoreAttentionInterface(Protocol):
+    """Interface for core_attention modules."""
 
     def forward(
         self,
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Optional[Tensor],
+        attention_mask: Tensor | None,
         /,
         *,
         attn_mask_type: AttnMaskType,
-        attention_bias: Optional[Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
+        attention_bias: Tensor | None,
+        packed_seq_params: PackedSeqParams | None,
     ) -> Tensor:
         """Applies dot product attention."""
         ...
@@ -210,10 +210,42 @@ class CoreAttentionBuilder(Protocol):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: Optional[str],
-        softmax_scale: Optional[float],
-        pg_collection: Optional[ProcessGroupCollection],
-    ) -> CoreAttention: ...
+        cp_comm_type: str | None,
+        softmax_scale: float | None,
+        pg_collection: ProcessGroupCollection | None,
+    ) -> CoreAttentionInterface: ...
+
+
+class LinearProjInterface(Protocol):
+    """Interface for linear_proj modules."""
+
+    def forward(self, hidden_states: Tensor, /) -> tuple[Tensor, Tensor | None]:
+        """Applies the linear projection to the output of the core attention."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Computes weight gradients of output projection layer."""
+        ...
+
+
+class LinearProjBuilder(Protocol):
+    """Protocol for building linear_proj layers."""
+
+    def __call__(
+        self,
+        query_projection_size: int,
+        hidden_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> LinearProjInterface: ...
 
 
 @dataclass
@@ -224,7 +256,7 @@ class SelfAttentionSubmodules:
 
     linear_qkv: LinearQkvBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
     q_layernorm: LayerNormBuilder | None = None
     k_layernorm: LayerNormBuilder | None = None
 
@@ -238,7 +270,7 @@ class CrossAttentionSubmodules:
     linear_q: LinearLayerBuilder
     linear_kv: LinearLayerBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
 
 
 class Attention(MegatronModule, ABC):
@@ -357,12 +389,11 @@ class Attention(MegatronModule, ABC):
         )
 
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
+        self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -1051,7 +1082,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor | None]:
         """
         Perform a forward pass through the attention module.
 
@@ -1104,13 +1135,15 @@ class Attention(MegatronModule, ABC):
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
-        is_inference_mode = inference_context is not None and not self.training
+        is_inference_mode = InferenceMode.is_active()
         # is_using_flash_decode - True is we are using the static inference engine with flash decode
         is_using_flash_decode = is_inference_mode and self.config.flash_decode
         # is_using_flashinfer_rope - True if we are using the dynamic inference engine
         # with flashinfer fused rope
-        is_using_flashinfer_rope = is_inference_mode and (
-            not inference_context.is_static_batching()
+        is_using_flashinfer_rope = (
+            is_inference_mode
+            and inference_context is not None
+            and not inference_context.is_static_batching()
             and inference_context.use_flashinfer_fused_rope
         )
         if is_using_flash_decode or is_using_flashinfer_rope:
@@ -1189,7 +1222,7 @@ class Attention(MegatronModule, ABC):
         in_decode_mode = (
             inference_context is not None
             and inference_context.is_decode_only()
-            and not self.training
+            and InferenceMode.is_active()
         )
 
         # This branch only runs in the decode phase of flash decoding and returns after the linear
@@ -1214,8 +1247,7 @@ class Attention(MegatronModule, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
-            output, bias = self.linear_proj(context_layer)
-            self.pg_collection.cp = _orig_cp_group
+            output, bias = apply_module(self.linear_proj)(context_layer)
             return output, bias
 
         if (
@@ -1384,7 +1416,7 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="linear_proj")
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
         with attn_proj_manager as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
+            output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 
