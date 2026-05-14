@@ -2,7 +2,6 @@
 
 import logging
 import math
-from collections import defaultdict
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -121,29 +120,30 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         ddp_config,
         param_indices: Optional[List[int]] = None,
     ) -> 'PerBufferParamLayout':
-        """Compute parameter layout with shard-aligned buckets via size-matching.
+        """Compute parameter layout with shard-aligned buckets via LPT bin-packing.
 
-        Assigns parameters to ``dp_size`` equal-sized shards within each bucket
-        so that no parameter is ever split across a shard boundary.
+        Assigns parameters to ``dp_size`` shards within each bucket so that no
+        parameter is split across a shard boundary, while keeping each bucket
+        confined to a contiguous range in backprop order.
 
         **Algorithm** (operates in reverse model / backprop order):
 
-        1. Separate shared-embedding parameters (isolated buckets, emitted first).
-        2. Pool the remaining parameters in backprop order, indexed by numel.
-        3. Pop the next unassigned parameter and assign it to shard 0.
-        4. For shards 1 … ``dp_size - 1``, assign the next unassigned parameter
-           of the same numel (also in backprop order).  If none is available,
-           insert padding of that numel.  Every shard grows by the same amount,
-           so all shards stay the same size.
-        5. When the bucket total reaches *bucket_size*, finalise the bucket
-           (pad shard size to :meth:`_shard_divisor`) and start a new one.
-        6. Repeat from 3 until all parameters are assigned.
+        1. Walk parameters in backprop order, accumulating them into a chunk.
+           A shared (tied) embedding triggers an immediate finalisation
+           followed by an isolated bucket for that embedding alone.
+        2. When the chunk's total numel reaches ``bucket_size`` (or all
+           params have been consumed), bin-pack the chunk into ``dp_size``
+           shards via greedy LPT — sort by numel descending and assign each
+           param to the shard with the smallest current load.
+        3. Pad each shard to ``max(shard_cursors)`` aligned to
+           :meth:`_shard_divisor`, then emit the bucket.
 
-        Because repeated layers produce many parameters of the same shape,
-        size-matching naturally keeps whole parameters together without any
-        name-parsing heuristic.  Padding overhead is low (depending on number
-        of layers and number of shards) — zero when every shape group has a
-        count divisible by ``dp_size``.
+        Each bucket therefore spans a contiguous backprop range so that
+        ``overlap_grad_reduce`` can dispatch the bucket's reduce-scatter as
+        soon as the bucket's backward segment finishes — preserving the
+        original DDP overlap semantics.  LPT bin-packing keeps shards close
+        to balanced; for uniform transformer blocks where ``params_per_layer
+        * num_layers`` is a multiple of ``dp_size`` the packing is perfect.
 
         Args:
             params: Parameters in model-definition (forward) order.
@@ -158,189 +158,99 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         dp_size = data_parallel_world_size
         shard_divisor = LayerWiseDistributedOptimizer._shard_divisor(dp_size, ddp_config)
 
-        # -- 0. Separate shared-embedding params. -------------------------
-        shared_embedding_params: List[torch.nn.Parameter] = []
-        regular_params: List[torch.nn.Parameter] = []
-        total_param_numel = 0
-        for param in params:
-            total_param_numel += param.data.nelement()
-            if getattr(param, 'shared_embedding', False):
-                shared_embedding_params.append(param)
-            else:
-                regular_params.append(param)
+        total_param_numel = sum(p.data.nelement() for p in params)
 
-        # -- 1. Build backprop-order pool & per-size index. ---------------
-        pool = list(reversed(regular_params))
-        assigned_param_ids: set[int] = set()  # id(param) of assigned params
-
-        size_groups: Dict[int, List[torch.nn.Parameter]] = defaultdict(list)
-        for param in pool:
-            size_groups[param.data.nelement()].append(param)
-        size_cursors: Dict[int, int] = defaultdict(int)
-
-        overall_cursor = 0
-
-        def _next_unassigned() -> Optional[torch.nn.Parameter]:
-            nonlocal overall_cursor
-            while overall_cursor < len(pool):
-                if id(pool[overall_cursor]) not in assigned_param_ids:
-                    return pool[overall_cursor]
-                overall_cursor += 1
-            return None
-
-        def _next_with_size(param_numel: int) -> Optional[torch.nn.Parameter]:
-            """Next unassigned param of size *param_numel* in backprop order."""
-            group = size_groups[param_numel]
-            cursor = size_cursors[param_numel]
-            while cursor < len(group):
-                if id(group[cursor]) not in assigned_param_ids:
-                    size_cursors[param_numel] = cursor
-                    return group[cursor]
-                cursor += 1
-            size_cursors[param_numel] = cursor
-            return None
-
-        # -- 2. Output accumulators and per-bucket shard state. ----------
         param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = {}
         bucket_indices: List[Tuple[int, int]] = []
         per_bucket_numel_unpadded: List[int] = []
-        buffer_cursor = 0  # write position in the contiguous buffer
+        buffer_cursor = 0
         bucket_id = 0
+        shard_imbalance_padding_numel = 0
 
-        # Per-shard state for the bucket currently being built.
-        # `shard_assignments[i]` holds an ordered list of (param | None, numel)
-        # entries to be written into shard i; a `None` entry is empty padding
-        # that keeps every shard the same size.
-        shard_assignments: List[List[Tuple[Optional[torch.nn.Parameter], int]]] = [
-            [] for _ in range(dp_size)
-        ]
-        shard_cursor = 0  # position within each shard (identical for all shards)
-        bucket_numel_unpadded = 0
-        size_match_padding_numel = 0  # elements used for empty-shard-slot padding
+        def _emit_bucket(
+            chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False
+        ) -> None:
+            """Bin-pack *chunk_params* into ``dp_size`` shards and emit a bucket.
 
-        def _finalize_bucket() -> None:
-            nonlocal buffer_cursor, bucket_id, shard_assignments
-            nonlocal shard_cursor, bucket_numel_unpadded
-            if shard_cursor == 0:
+            With ``shared_embedding=True``, the chunk must contain a single
+            parameter; it goes into shard 0 with same-size padding in
+            shards 1..dp_size-1 so the embedding fits entirely within one
+            shard (needed for the cross-stage tied-embedding all-reduce).
+            """
+            nonlocal buffer_cursor, bucket_id, shard_imbalance_padding_numel
+            if not chunk_params:
                 return
-            padded_shard_size = pad_to_divisor(shard_cursor, shard_divisor)
-            bucket_start_index = buffer_cursor
 
+            shard_assignments: List[List[Tuple[Optional[torch.nn.Parameter], int]]] = [
+                [] for _ in range(dp_size)
+            ]
+            shard_cursors = [0] * dp_size
+
+            if shared_embedding:
+                assert len(chunk_params) == 1
+                param = chunk_params[0]
+                numel = param.data.nelement()
+                shard_assignments[0].append((param, numel))
+                shard_cursors[0] = numel
+                for shard_id in range(1, dp_size):
+                    shard_assignments[shard_id].append((None, numel))
+                    shard_cursors[shard_id] = numel
+            else:
+                # Greedy LPT: largest first, assign to the least-loaded shard.
+                # The within-shard order is sorted-by-numel, not backprop —
+                # that is fine because all params in the chunk share the same
+                # bucket_id, so DDP's backprop-order iteration still sees
+                # monotonic bucket_ids across the chunk boundary.
+                for param in sorted(chunk_params, key=lambda p: -p.data.nelement()):
+                    numel = param.data.nelement()
+                    min_shard = min(range(dp_size), key=lambda s: shard_cursors[s])
+                    placement = pad_param_start(shard_cursors[min_shard])
+                    shard_assignments[min_shard].append((param, numel))
+                    shard_cursors[min_shard] = placement + numel
+
+            padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
+            bucket_start_index = buffer_cursor
             for shard_id in range(dp_size):
                 shard_start_index = bucket_start_index + shard_id * padded_shard_size
                 cursor = shard_start_index
-                for param, numel in shard_assignments[shard_id]:
+                for p, numel in shard_assignments[shard_id]:
                     cursor = pad_param_start(cursor)
-                    if param is not None:
-                        param_index_map[param] = (cursor, cursor + numel, bucket_id)
+                    if p is not None:
+                        param_index_map[p] = (cursor, cursor + numel, bucket_id)
                     cursor += numel
-
+                shard_imbalance_padding_numel += padded_shard_size - shard_cursors[shard_id]
             bucket_end_index = bucket_start_index + dp_size * padded_shard_size
             bucket_indices.append((bucket_start_index, bucket_end_index))
-            per_bucket_numel_unpadded.append(bucket_numel_unpadded)
+            per_bucket_numel_unpadded.append(sum(p.data.nelement() for p in chunk_params))
             buffer_cursor = bucket_end_index
             bucket_id += 1
 
-            shard_assignments = [[] for _ in range(dp_size)]
-            shard_cursor = 0
-            bucket_numel_unpadded = 0
-
-        # -- 3. Walk all params in backprop order (= reversed forward) and emit
-        # buckets. Shared (tied) embeddings get an isolated bucket (typically
-        # because input/output embeddings are tied across pipeline-parallel
-        # stages and need a cross-stage all-reduce); each shared embedding
-        # occupies shard 0 of its bucket alone and shards 1..dp_size-1 are
-        # filled with same-size padding so the bucket stays shard-aligned and
-        # the embedding fits entirely within shard 0. Regular params get
-        # size-matched into shared buckets (current bucket grows until
-        # ``bucket_size``).
-        #
-        # Bucket ids must be assigned in backprop order so that, when
-        # ``_ParamAndGradBuffer.__init__`` later iterates params in backprop
-        # order, the bucket id of consecutive params either stays the same or
-        # increments by exactly 1. Walking a single backprop pool here
-        # (rather than emitting all shared-embedding buckets up front)
-        # guarantees that interleaving.
-        #
-        # NOTE: shared-embedding buckets are expensive — ``(dp_size - 1) *
-        # pad_to_divisor(numel, shard_divisor)`` elements of padding per
-        # shared embedding (many GBs for a vocab × hidden embedding at
-        # dp_size=8). Unavoidable while preserving the "no parameter crosses
-        # a shard boundary" invariant.
+        # Each chunk spans a contiguous backprop range. Bucket ids therefore
+        # increase monotonically when ``_ParamAndGradBuffer.__init__`` iterates
+        # params in backprop order, satisfying its ``bucket_id == cur + 1``
+        # invariant.
+        chunk_params: List[torch.nn.Parameter] = []
+        chunk_numel = 0
         for param in reversed(params):
-            if id(param) in assigned_param_ids:
-                continue
             param_numel = param.data.nelement()
             if getattr(param, 'shared_embedding', False):
-                # Finalize any in-progress size-matching bucket so the
-                # shared-embedding bucket comes after it in backprop order.
-                _finalize_bucket()
-                assigned_param_ids.add(id(param))
-                shard_assignments[0].append((param, param_numel))
-                bucket_numel_unpadded += param_numel
-                for shard_id in range(1, dp_size):
-                    shard_assignments[shard_id].append((None, param_numel))
-                    size_match_padding_numel += param_numel
-                shard_cursor = pad_param_start(shard_cursor) + param_numel
-                _finalize_bucket()
+                # Finalize any in-progress chunk so the shared-embedding
+                # bucket comes after it in backprop order.
+                _emit_bucket(chunk_params)
+                chunk_params = []
+                chunk_numel = 0
+                _emit_bucket([param], shared_embedding=True)
                 continue
+            chunk_params.append(param)
+            chunk_numel += param_numel
+            if bucket_size is not None and chunk_numel >= bucket_size:
+                _emit_bucket(chunk_params)
+                chunk_params = []
+                chunk_numel = 0
+        _emit_bucket(chunk_params)
 
-            # Regular param: use as seed for size-matching.
-            assigned_param_ids.add(id(param))
-            shard_assignments[0].append((param, param_numel))
-            bucket_numel_unpadded += param_numel
-
-            for shard_id in range(1, dp_size):
-                # Prefer an exact-numel peer; this gives the cleanest layout
-                # (no inner-shard padding).
-                matched_param = _next_with_size(param_numel)
-                if matched_param is not None:
-                    assigned_param_ids.add(id(matched_param))
-                    shard_assignments[shard_id].append((matched_param, param_numel))
-                    bucket_numel_unpadded += param_numel
-                    continue
-
-                # No exact peer. Greedily pack as many smaller params from the
-                # queue as fit within this shard slot (sized to ``param_numel``).
-                # Cuts overhead from unique-large seeds (e.g. an embedding)
-                # that would otherwise force ``(dp_size - 1) * param_numel`` of
-                # empty padding.
-                useful_in_slot = 0
-                slot_cursor = 0
-                while True:
-                    candidate_param = _next_unassigned()
-                    if candidate_param is None:
-                        break
-                    candidate_numel = candidate_param.data.nelement()
-                    candidate_start = pad_param_start(slot_cursor)
-                    if candidate_start + candidate_numel > param_numel:
-                        break
-                    assigned_param_ids.add(id(candidate_param))
-                    shard_assignments[shard_id].append((candidate_param, candidate_numel))
-                    bucket_numel_unpadded += candidate_numel
-                    slot_cursor = candidate_start + candidate_numel
-                    useful_in_slot += candidate_numel
-
-                # Pad the remainder of the slot up to ``param_numel``.
-                padding_start = pad_param_start(slot_cursor)
-                padding_size = param_numel - padding_start
-                if padding_size > 0:
-                    shard_assignments[shard_id].append((None, padding_size))
-                size_match_padding_numel += param_numel - useful_in_slot
-
-            shard_cursor = pad_param_start(shard_cursor) + param_numel
-
-            if bucket_size is not None:
-                bucket_total = dp_size * pad_to_divisor(shard_cursor, shard_divisor)
-                if bucket_total >= bucket_size:
-                    _finalize_bucket()
-
-        _finalize_bucket()
-
-        # -- 5. Log padding overhead. ------------------------------------
         total_buffer_numel = bucket_indices[-1][1] if bucket_indices else 0
         total_padding = total_buffer_numel - total_param_numel
-        alignment_and_shard_end_padding = total_padding - size_match_padding_numel
         log_single_rank(
             logger,
             logging.INFO,
@@ -350,8 +260,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             f"total_param_numel={total_param_numel}, "
             f"total_buffer_numel={total_buffer_numel}, "
             f"total_padding={total_padding} "
-            f"(size_match={size_match_padding_numel}, "
-            f"alignment+shard_end={alignment_and_shard_end_padding}), "
+            f"(shard_imbalance={shard_imbalance_padding_numel}), "
             f"overhead={total_padding / max(total_param_numel, 1) * 100:.1f}%",
         )
 
