@@ -2084,22 +2084,10 @@ def _add_inference_args(parser):
     group.add_argument(
         '--cuda-graph-scope',
         nargs='+',
-        type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope,
-        default=[],
-        help='Determines the CUDA graphs capturing scope. '
-        'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
-        '"attn": captures operations in TransformerLayer._forward_attention(). '
-        '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
-        '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
-        '"moe_router": captures operations in TransformerLayer._forward_mlp() up to MoELayer.router(), '
-        'including the shared experts if they are not overlapped with EP comm. '
-        '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
-        '"mamba": captures the mamba layer. '
-        '"full_iteration": captures a whole training iteration. '
-        '"full_iteration_inference": captures a whole inference iteration. '
-        'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
-        'If not specified, the default scope is to capture the whole Transformer layer. '
-        'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.',
+        type=_parse_cuda_graph_modules_arg,
+        default=None,
+        dest='cuda_graph_scope_deprecated',
+        help=argparse.SUPPRESS,  # hidden; use --cuda-graph-modules instead
     )
     group.add_argument(
         '--use-legacy-static-engine',
