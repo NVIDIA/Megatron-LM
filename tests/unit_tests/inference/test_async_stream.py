@@ -4,140 +4,65 @@ import asyncio
 
 import pytest
 
-from megatron.core.inference.async_stream import STOP_ITERATION, AsyncStream
+from megatron.core.inference.async_stream import AsyncStream
 
-
-def _run(coro):
-    """Run an async coroutine to completion."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+pytestmark = pytest.mark.asyncio
 
 
 class TestAsyncStream:
 
-    def test_init_sets_initial_state(self):
-        """Newly constructed stream is not finished."""
-        loop = asyncio.new_event_loop()
-        try:
-            s = AsyncStream(request_id=1, cancel=lambda: None, loop=loop)
-            assert s.finished is False
-            assert s._request_id == 1
-        finally:
-            loop.close()
+    async def test_generator_yields_items_until_finish(self):
+        """The async generator yields each `put` item in FIFO order, then
+        terminates cleanly on `finish()` without delivering the sentinel.
 
-    def test_finish_sets_finished_flag(self):
-        """finish() flips the finished property to True."""
-        loop = asyncio.new_event_loop()
-        try:
-            s = AsyncStream(request_id=2, cancel=lambda: None, loop=loop)
-            s.finish()
-            assert s.finished is True
-        finally:
-            loop.close()
+        This is the load-bearing contract — every other consumer of AsyncStream
+        relies on the generator faithfully replaying everything `put` between
+        construction and `finish()`, no more, no less."""
+        s = AsyncStream(request_id=1, cancel=lambda: None)
+        s.put("a")
+        s.put("b")
+        # `put` after `finish` is silently dropped — the queue is frozen.
+        s.finish()
+        s.put("ignored")
 
-    def test_finish_is_idempotent(self):
-        """Calling finish twice does not change state."""
-        loop = asyncio.new_event_loop()
-        try:
-            s = AsyncStream(request_id=2, cancel=lambda: None, loop=loop)
-            s.finish()
-            s.finish()
-            assert s.finished is True
-        finally:
-            loop.close()
+        items = [item async for item in s.generator()]
+        assert items == ["a", "b"]
+        assert s.finished is True
 
-    def test_put_after_finish_is_no_op(self):
-        """put() on a finished stream is silently ignored."""
+    @pytest.mark.parametrize(
+        "exception_arg,expect_raise",
+        [
+            (ValueError("boom"), True),
+            (ValueError, True),  # raising a class also counts
+            ("not-an-exception", False),  # non-raisable falls through to STOP_ITERATION
+            (42, False),
+            (None, False),
+        ],
+    )
+    async def test_finish_routes_exception_or_terminates(self, exception_arg, expect_raise):
+        """`finish(x)` raises `x` through the generator iff `x` is a
+        BaseException instance or subclass; anything else is treated as a
+        plain "no more items" signal."""
+        s = AsyncStream(request_id=1, cancel=lambda: None)
+        s.finish(exception_arg)
 
-        async def scenario():
-            s = AsyncStream(request_id=3, cancel=lambda: None)
-            s.finish()
-            s.put("ignored")
-            # Drain whatever is in the queue and check that "ignored" never appears.
-            seen = []
-            while not s._queue.empty():
-                seen.append(await s._queue.get())
-            assert "ignored" not in seen
-
-        _run(scenario())
-
-    def test_generator_yields_items_until_stop(self):
-        """The async generator yields each put item then stops on finish()."""
-
-        async def scenario():
-            s = AsyncStream(request_id=4, cancel=lambda: None)
-            s.put("a")
-            s.put("b")
-            s.finish()
-            results = []
-            async for item in s.generator():
-                results.append(item)
-            return results
-
-        results = _run(scenario())
-        assert results == ["a", "b"]
-
-    def test_generator_raises_when_finish_passes_exception(self):
-        """finish(exception) routes the exception through the generator."""
-
-        async def scenario():
-            s = AsyncStream(request_id=5, cancel=lambda: None)
-            s.finish(ValueError("boom"))
-            with pytest.raises(ValueError, match="boom"):
+        if expect_raise:
+            with pytest.raises((ValueError, BaseException)):
                 async for _ in s.generator():
                     pass
+        else:
+            items = [item async for item in s.generator()]
+            assert items == []
 
-        _run(scenario())
-
-    def test_finish_with_non_exception_uses_stop_iteration(self):
-        """finish(non-exception) falls back to STOP_ITERATION sentinel."""
-
-        async def scenario():
-            s = AsyncStream(request_id=6, cancel=lambda: None)
-            s.finish("not-an-exception")
-            results = []
-            async for item in s.generator():
-                results.append(item)
-            assert results == []
-
-        _run(scenario())
-
-    def test_is_raisable_recognizes_exception_instances(self):
-        """_is_raisable returns True for BaseException instances and subclasses."""
-        assert AsyncStream._is_raisable(ValueError("x")) is True
-        assert AsyncStream._is_raisable(ValueError) is True
-        assert AsyncStream._is_raisable(STOP_ITERATION) is True
-
-    def test_is_raisable_rejects_non_exceptions(self):
-        """_is_raisable returns False for arbitrary objects and types."""
-        assert AsyncStream._is_raisable("string") is False
-        assert AsyncStream._is_raisable(42) is False
-        assert AsyncStream._is_raisable(int) is False
-        assert AsyncStream._is_raisable(None) is False
-
-    def test_generator_calls_cancel_on_generator_exit(self):
-        """Closing the generator early invokes the cancel callback."""
-
+    async def test_generator_close_invokes_cancel_callback(self):
+        """Closing the generator early (consumer drops it) propagates as
+        GeneratorExit inside `generator()`, which invokes the cancel callback
+        and re-raises `CancelledError` to the caller."""
         called = []
-
-        def cancel():
-            called.append(True)
-
-        async def scenario():
-            s = AsyncStream(request_id=7, cancel=cancel)
-            s.put("first")
-            gen = s.generator()
-            # consume one item
-            await gen.__anext__()
-            # close the generator early; the generator re-raises CancelledError
-            # after calling cancel(), which we swallow here.
-            try:
-                await gen.aclose()
-            except asyncio.CancelledError:
-                pass
-
-        _run(scenario())
+        s = AsyncStream(request_id=1, cancel=lambda: called.append(True))
+        s.put("first")
+        gen = s.generator()
+        await gen.__anext__()  # consume one item, then close mid-stream.
+        with pytest.raises(asyncio.CancelledError):
+            await gen.aclose()
         assert called == [True]

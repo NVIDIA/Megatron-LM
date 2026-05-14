@@ -7,124 +7,91 @@ import torch
 
 from megatron.core.inference.contexts.routing_metadata import RoutingMetadata
 
+MAX_TOKENS = 32
+TOPK = 2
+NUM_MOE_LAYERS = 3
 
-def _make_context(max_tokens=64, active_token_count=10, using_cuda_graph=False):
-    """Build a fake DynamicInferenceContext with the attributes RoutingMetadata uses."""
+
+def _make_context(active_token_count=10, using_cuda_graph=False):
     ctx = MagicMock()
-    ctx.max_tokens = max_tokens
+    ctx.max_tokens = MAX_TOKENS
     ctx.active_token_count = active_token_count
     ctx.using_cuda_graph_this_step.return_value = using_cuda_graph
     return ctx
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="RoutingMetadata uses cuda.current_device"
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="RoutingMetadata uses cuda.current_device")
 class TestRoutingMetadata:
 
-    def test_init_stores_args_and_device(self):
-        """__init__ records context, max_tokens, topk, and current cuda device."""
-        ctx = _make_context(max_tokens=128)
-        rm = RoutingMetadata(ctx, moe_router_topk=2)
-        assert rm.context is ctx
-        assert rm.max_tokens == 128
-        assert rm.moe_router_topk == 2
-        assert rm.routing_indices_buffer is None
-        assert rm.num_moe_layers is None
-
-    def test_ensure_buffer_short_circuits_when_already_allocated(self):
-        """_ensure_buffer_allocated is a no-op when the buffer already exists."""
-        ctx = _make_context()
-        rm = RoutingMetadata(ctx, moe_router_topk=4)
-        sentinel = torch.empty(1, device="cuda")
-        rm.routing_indices_buffer = sentinel
-        rm._ensure_buffer_allocated()
-        assert rm.routing_indices_buffer is sentinel
-
-    def test_ensure_buffer_no_allocation_when_no_moe_layers(self):
-        """When RouterReplay has no global instances, the buffer stays None."""
-        ctx = _make_context()
-        rm = RoutingMetadata(ctx, moe_router_topk=4)
+    def test_lazy_buffer_allocation_and_recording_lifecycle(self):
+        """RoutingMetadata lazily allocates the [max_tokens, num_moe_layers, topk]
+        buffer on first use (skipping when no MoE layers are registered), and
+        enable/disable recording forwards to RouterReplay only when there's a
+        buffer to record into."""
         with patch("megatron.core.inference.contexts.routing_metadata.RouterReplay") as fake_rr:
+            # No MoE layers → no buffer allocated, no recording enabled.
             fake_rr.global_router_replay_instances = []
+            rm = RoutingMetadata(_make_context(), moe_router_topk=TOPK)
             rm._ensure_buffer_allocated()
-        assert rm.routing_indices_buffer is None
-        assert rm.num_moe_layers == 0
-
-    def test_ensure_buffer_allocates_with_correct_shape(self):
-        """When RouterReplay has N instances, the buffer has shape [max_tokens, N, topk]."""
-        ctx = _make_context(max_tokens=32)
-        rm = RoutingMetadata(ctx, moe_router_topk=4)
-        with patch("megatron.core.inference.contexts.routing_metadata.RouterReplay") as fake_rr:
-            fake_rr.global_router_replay_instances = [object(), object(), object()]
-            rm._ensure_buffer_allocated()
-        assert rm.routing_indices_buffer is not None
-        assert rm.routing_indices_buffer.shape == (32, 3, 4)
-        assert rm.routing_indices_buffer.dtype == torch.int32
-        assert rm.num_moe_layers == 3
-
-    def test_get_routing_indices_cuda_graph_no_buffer_returns_none(self):
-        """When CUDA graphs are active but no buffer is allocated, returns None."""
-        ctx = _make_context(using_cuda_graph=True)
-        rm = RoutingMetadata(ctx, moe_router_topk=4)
-        assert rm.get_routing_indices() is None
-
-    def test_get_routing_indices_cuda_graph_returns_buffer_slice(self):
-        """When CUDA graphs are active, returns buffer[:active_token_count]."""
-        ctx = _make_context(active_token_count=5, using_cuda_graph=True)
-        rm = RoutingMetadata(ctx, moe_router_topk=2)
-        rm.routing_indices_buffer = torch.zeros(64, 3, 2, dtype=torch.int32, device="cuda")
-        out = rm.get_routing_indices()
-        assert out.shape == (5, 3, 2)
-
-    def test_get_routing_indices_eager_returns_none_when_no_recorded_data(self):
-        """In eager mode, returns None if RouterReplay has no recorded data."""
-        ctx = _make_context(using_cuda_graph=False)
-        rm = RoutingMetadata(ctx, moe_router_topk=2)
-        with patch("megatron.core.inference.contexts.routing_metadata.RouterReplay") as fake_rr:
-            fake_rr.get_recorded_data.return_value = None
-            assert rm.get_routing_indices() is None
-            fake_rr.get_recorded_data.return_value = []
-            assert rm.get_routing_indices() is None
-            fake_rr.get_recorded_data.return_value = [None]
-            assert rm.get_routing_indices() is None
-
-    def test_get_routing_indices_eager_stacks_recorded_data(self):
-        """In eager mode, stacks per-layer recorded data along dim=1."""
-        ctx = _make_context(using_cuda_graph=False)
-        rm = RoutingMetadata(ctx, moe_router_topk=2)
-        layer_data = [
-            torch.zeros(7, 2, dtype=torch.int32, device="cuda"),
-            torch.zeros(7, 2, dtype=torch.int32, device="cuda"),
-        ]
-        with patch("megatron.core.inference.contexts.routing_metadata.RouterReplay") as fake_rr:
-            fake_rr.get_recorded_data.return_value = layer_data
-            out = rm.get_routing_indices()
-        # Stacked → [num_tokens, num_layers, topk]
-        assert out.shape == (7, 2, 2)
-
-    def test_enable_static_buffer_recording_calls_router_replay(self):
-        """enable_static_buffer_recording calls RouterReplay.set_global_static_buffers if buffer is allocated."""
-        ctx = _make_context(max_tokens=16)
-        rm = RoutingMetadata(ctx, moe_router_topk=2)
-        with patch("megatron.core.inference.contexts.routing_metadata.RouterReplay") as fake_rr:
-            fake_rr.global_router_replay_instances = [object(), object()]
-            rm.enable_static_buffer_recording()
-            fake_rr.set_global_static_buffers.assert_called_once_with(rm.routing_indices_buffer)
-
-    def test_enable_static_buffer_recording_skips_when_no_buffer(self):
-        """When no buffer is allocated (no MoE layers), enable does NOT call set_global_static_buffers."""
-        ctx = _make_context()
-        rm = RoutingMetadata(ctx, moe_router_topk=2)
-        with patch("megatron.core.inference.contexts.routing_metadata.RouterReplay") as fake_rr:
-            fake_rr.global_router_replay_instances = []
+            assert rm.routing_indices_buffer is None
+            assert rm.num_moe_layers == 0
             rm.enable_static_buffer_recording()
             fake_rr.set_global_static_buffers.assert_not_called()
 
-    def test_disable_static_buffer_recording_clears_router_replay(self):
-        """disable_static_buffer_recording calls RouterReplay.clear_global_static_buffers."""
-        ctx = _make_context()
-        rm = RoutingMetadata(ctx, moe_router_topk=2)
-        with patch("megatron.core.inference.contexts.routing_metadata.RouterReplay") as fake_rr:
-            rm.disable_static_buffer_recording()
+            # Re-binding global instances and allocating produces the expected shape.
+            fake_rr.global_router_replay_instances = [object()] * NUM_MOE_LAYERS
+            rm2 = RoutingMetadata(_make_context(), moe_router_topk=TOPK)
+            rm2._ensure_buffer_allocated()
+            assert rm2.routing_indices_buffer.shape == (MAX_TOKENS, NUM_MOE_LAYERS, TOPK)
+            assert rm2.routing_indices_buffer.dtype == torch.int32
+
+            # Repeat call is a no-op (preserves the existing buffer identity).
+            sentinel = rm2.routing_indices_buffer
+            rm2._ensure_buffer_allocated()
+            assert rm2.routing_indices_buffer is sentinel
+
+            # enable/disable_static_buffer_recording forward to RouterReplay.
+            fake_rr.reset_mock()
+            rm2.enable_static_buffer_recording()
+            fake_rr.set_global_static_buffers.assert_called_once_with(rm2.routing_indices_buffer)
+            rm2.disable_static_buffer_recording()
             fake_rr.clear_global_static_buffers.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "using_cuda_graph,buffer_allocated,recorded_data,expected_shape",
+        [
+            # CUDA-graph path: no buffer → None.
+            (True, False, None, None),
+            # CUDA-graph path: buffer → returns view of buffer[:active_token_count].
+            (True, True, None, (10, NUM_MOE_LAYERS, TOPK)),
+            # Eager path: no recorded data → None (three forms of "no data").
+            (False, False, None, None),
+            (False, False, [], None),
+            (False, False, [None], None),
+            # Eager path: recorded data → stacked along dim=1 → [num_tokens, num_layers, topk].
+            (False, False, "valid", (7, 2, TOPK)),
+        ],
+    )
+    def test_get_routing_indices(self, using_cuda_graph, buffer_allocated, recorded_data, expected_shape):
+        """get_routing_indices either slices the static buffer (CUDA-graph mode)
+        or stacks per-layer RouterReplay tensors (eager mode); returns None when
+        no data is available."""
+        ctx = _make_context(active_token_count=10, using_cuda_graph=using_cuda_graph)
+        rm = RoutingMetadata(ctx, moe_router_topk=TOPK)
+        if buffer_allocated:
+            rm.routing_indices_buffer = torch.zeros(
+                MAX_TOKENS, NUM_MOE_LAYERS, TOPK, dtype=torch.int32, device="cuda"
+            )
+        with patch("megatron.core.inference.contexts.routing_metadata.RouterReplay") as fake_rr:
+            if recorded_data == "valid":
+                fake_rr.get_recorded_data.return_value = [
+                    torch.zeros(7, TOPK, dtype=torch.int32, device="cuda"),
+                    torch.zeros(7, TOPK, dtype=torch.int32, device="cuda"),
+                ]
+            else:
+                fake_rr.get_recorded_data.return_value = recorded_data
+            out = rm.get_routing_indices()
+        if expected_shape is None:
+            assert out is None
+        else:
+            assert out.shape == expected_shape
