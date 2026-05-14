@@ -33,12 +33,13 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
+    get_async_strategy,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_pg_rank, get_pg_size, get_torch_version, is_torch_min_version
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -71,19 +72,6 @@ try:
 except Exception:
     has_nvidia_modelopt = False
 
-
-try:
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
-        FileSystemWriterAsync,
-    )
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
-        save_state_dict_async_plan,
-    )
-
-    HAVE_NVRX = True
-except (ImportError, ModuleNotFoundError):
-
-    HAVE_NVRX = False
 
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
@@ -608,7 +596,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     # Collect args, model, RNG.
+    # For LEGACY checkpoints, every unique (tp_rank, ep_rank) shard must be written by
+    # exactly one rank. Neither dp_rank==0 nor edp_rank==0 alone covers all shards when
+    # the dense and expert parallelism layouts disagree (e.g. TP > EP*ETP); the union
+    # does, with at most one rank per (tp_rank, ep_rank) inside any DP group.
     if not torch.distributed.is_initialized() \
+            or mpu.get_data_parallel_rank() == 0 \
             or mpu.get_expert_data_parallel_rank() == 0 \
             or ckpt_type != CheckpointType.LEGACY:
         if ckpt_type != CheckpointType.LEGACY:
@@ -694,6 +687,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
+                _, async_modules = get_async_strategy(args.async_strategy)
+                FileSystemWriterAsync = async_modules["FileSystemWriterAsync"]
+                save_state_dict_async_plan = async_modules["save_state_dict_async_plan"]
                 _cpu_shm = getattr(args, 'async_ckpt_use_cpu_shm', False)
                 _writer_kwargs = {}
                 if _cpu_shm:
@@ -718,7 +714,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 save_state_dict_ret = save_state_dict_async_plan(
                     state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
                 )
-                async_save_request = get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
+                async_save_request = get_save_and_finalize_callbacks(
+                    fs_storage_writer, save_state_dict_ret, args.async_strategy
+                )
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
                 torch.distributed.checkpoint.save(
@@ -1373,21 +1371,6 @@ def _load_base_checkpoint(
             checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
         try:
             state_dict = torch.load(checkpoint_name, map_location='cpu')
-        except ModuleNotFoundError:
-            from megatron.legacy.fp16_deprecated import loss_scaler
-
-            # For backward compatibility.
-            if not rank0:
-                print_rank_0(' > deserializing using the old code structure ...')
-            sys.modules['fp16.loss_scaler'] = sys.modules['megatron.legacy.fp16_deprecated.loss_scaler']
-            sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
-                'megatron.legacy.fp16_deprecated.loss_scaler'
-            ]
-            sys.modules['megatron.model'] = sys.modules['megatron.legacy.model']
-            state_dict = torch.load(checkpoint_name, map_location='cpu')
-            sys.modules.pop('fp16.loss_scaler', None)
-            sys.modules.pop('megatron.fp16.loss_scaler', None)
-            sys.modules.pop('megatron.model', None)
         except Exception as e:
             print('could not load the checkpoint')
             print(e)
@@ -2040,10 +2023,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
                  f'p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ] '
                  f'at iteration {iteration}')
-                 
-    if has_nvidia_modelopt:
-        print_distributed_quant_summary(model, msg="After loading checkpoint")
-        
+
     # Additional callback for wandb (last rank)
     if not torch.distributed.is_initialized() \
        or is_last_rank():
@@ -2065,6 +2045,28 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if not log_printed:
                     print_rank_0(">>> Inserting 'default_config' field into optimizer.param_groups...")
                 log_printed = True
+
+    if has_nvidia_modelopt:
+        print_distributed_quant_summary(model, msg="After loading checkpoint")
+
+        # Load teacher model in Distillation mode.
+        if getattr(args, "export_kd_teacher_load", None):
+            from megatron.post_training.checkpointing import load_modelopt_checkpoint
+
+            unwrapped_model = unwrap_model(model)[0]
+            # Note: load_modelopt_checkpoint may call this function so we prevent infinite recursion.
+            if hasattr(unwrapped_model, 'teacher_model'):
+                teacher = unwrapped_model.teacher_model
+                print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
+                # [WAR]: To avoid error out on loading teacher's checkpoint, we temporarily
+                # set args.finetune to True while loading the teacher checkpoint.
+                original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
+                args.finetune = True
+                if args.export_kd_teacher_ckpt_format is not None:
+                    args.ckpt_format = args.export_kd_teacher_ckpt_format
+                load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
+                args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
+                print_rank_0("... teacher loaded successfully.")
 
     return iteration, num_floating_point_operations_so_far
 

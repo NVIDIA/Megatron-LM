@@ -27,6 +27,7 @@ from megatron.post_training.utils import (
 from megatron.training import get_args
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
@@ -102,14 +103,12 @@ def check_arguments():
 
 
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_convert_args,
-        args_defaults={
+    parse_and_validate_args(extra_args_provider=add_convert_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        },
-    )
+        })
+    initialize_megatron()
     check_arguments()
 
     args = get_args()

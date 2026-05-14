@@ -42,14 +42,12 @@ def extract_feature(dataset, model, output_dir, idx_start, idx_end):
             torch.distributed.barrier()
 
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_extract_args,
-        args_defaults={
+    parse_and_validate_args(extra_args_provider=add_extract_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        },
-    )
+        })
+    initialize_megatron()
 
     args = get_args()
     tokenizer = get_tokenizer()
