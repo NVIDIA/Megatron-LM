@@ -634,14 +634,26 @@ class TestCrossRanksReads:
             if parallel_within_dp
             else torch.distributed.group.WORLD
         )
-        state_dict = self.get_sharded_state_dict(ranks_placement)
+        save_state_dict = self.get_sharded_state_dict(ranks_placement)
         with TempNamedDir(tmp_path_dist_ckpt / 'determine_cross_rank_reads') as ckpt_dir:
             save_strategy = FullyParallelSaveStrategyWrapper(
                 TorchDistSaveShardedStrategy(),
                 parallelization_group,
                 replicate_local_replicas=replicate_local_replicas,
             )
-            save_strategy.save(state_dict, ckpt_dir)
+            save_strategy.save(save_state_dict, ckpt_dir)
+
+            # Build a *fresh* state dict for the load. When
+            # ``replicate_local_replicas=True`` the save step mutates
+            # ``sh.key`` / ``sh.replica_id`` in place (the shadow
+            # rename), so reusing ``save_state_dict`` would feed the
+            # load picker a topology that no longer matches the on-disk
+            # checkpoint and would shift the picker to a different rank
+            # — exactly the cross-read regression this helper is
+            # supposed to detect. In production this can't happen
+            # because the load receives a freshly-built sharded state
+            # dict from the model.
+            state_dict = self.get_sharded_state_dict(ranks_placement)
 
             # Construct the base strategy directly (instead of via
             # ``get_default_strategy``) so we can pass the
