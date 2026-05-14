@@ -70,7 +70,9 @@ async def test_ep_protocol_tags_work_consensus_and_completion():
     assert consensus.all_pausing
     assert communicator.calls == [
         ("async", EPAsyncPhase.WORK_CONSENSUS, 0, (3, -1), False),
+        ("async", EPAsyncPhase.WORK_CONSENSUS_ACK, 0, (1,), False),
         ("async", EPAsyncPhase.STEP_COMPLETE, 0, (1,), False),
+        ("async", EPAsyncPhase.STEP_COMPLETE_ACK, 0, (1,), False),
     ]
     assert protocol.diagnostics()["work_consensus"] == 1
     assert protocol.diagnostics()["work_completions"] == 1
@@ -115,7 +117,9 @@ async def test_ep_protocol_local_mode_nested_steps_and_collective_errors():
     ],
 )
 async def test_ep_step_begin_reuses_or_discards_with_global_state(global_state, expected):
-    communicator = _RecordingEPCommunicator(async_results=[(1, 0), 1], sync_results=[global_state])
+    communicator = _RecordingEPCommunicator(
+        async_results=[(1, 0), 1], sync_results=[global_state, 1]
+    )
     protocol = EPAsyncStepProtocol(communicator)
     await protocol.establish_work_consensus(local_work=1, signal_consensus=False)
 
@@ -134,7 +138,7 @@ async def test_ep_step_begin_reuses_or_discards_with_global_state(global_state, 
         decision.discard_pending_forward,
         decision.row_mapped_forward,
     ) == expected
-    assert communicator.calls[1] == (
+    assert communicator.calls[2] == (
         "sync",
         EPAsyncPhase.STEP_BEGIN,
         0,
@@ -155,7 +159,7 @@ async def test_ep_step_begin_reuses_or_discards_with_global_state(global_state, 
 def test_ep_async_handoff_launches_or_skips_with_global_state(
     has_real_work, can_launch, global_state, expected
 ):
-    communicator = _RecordingEPCommunicator(sync_results=[global_state])
+    communicator = _RecordingEPCommunicator(sync_results=[global_state, 1])
     protocol = EPAsyncStepProtocol(communicator)
 
     decision = protocol.decide_async_handoff(
@@ -178,14 +182,24 @@ def test_ep_async_handoff_launches_or_skips_with_global_state(
                 int(has_real_work and can_launch),
                 int(has_real_work and not can_launch),
             ),
-        )
+        ),
+        ("sync", EPAsyncPhase.ASYNC_HANDOFF_ACK, 0, (1,)),
     ]
 
 
 @pytest.mark.internal
 def test_ep_protocol_diagnostics_count_reuse_discard_launch_and_skip():
     communicator = _RecordingEPCommunicator(
-        sync_results=[(1, 1, 1, 1, 0, 0, 0, 0), (1, 1, 1, 0, 0, 1, 0, 0), (1, 1, 0), (1, 1, 1)]
+        sync_results=[
+            (1, 1, 1, 1, 0, 0, 0, 0),
+            1,
+            (1, 1, 1, 0, 0, 1, 0, 0),
+            1,
+            (1, 1, 0),
+            1,
+            (1, 1, 1),
+            1,
+        ]
     )
     protocol = EPAsyncStepProtocol(communicator)
 
@@ -722,7 +736,6 @@ def test_launch_async_decode_graph_captured_graph_launch_and_required_gate(
     ("case", "expected_ok", "expected_disable_reason"),
     [
         ("disabled", False, None),
-        ("handoff_skipped", False, "ep async handoff skipped"),
         ("prepare_failed", False, "failed to prepare next-step metadata"),
         ("success", True, None),
     ],
@@ -745,6 +758,27 @@ def test_prepare_async_decode_after_sampling_handoff_paths(
     if case == "disabled":
         assert "prepare" not in events
         assert ("handoff", True, False) in events
+    elif case == "prepare_failed":
+        assert ("handoff", True, False) in events
+    else:
+        assert not any(event[0] == "handoff" for event in events if isinstance(event, tuple))
+    if expected_disable_reason is not None:
+        assert ("disable", expected_disable_reason) in events
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("launch_decision", "expected_ok", "expected_disable_reason"),
+    [(True, True, None), (False, False, "ep async handoff skipped")],
+)
+def test_confirm_prepared_ep_async_handoff_paths(
+    launch_decision, expected_ok, expected_disable_reason
+):
+    controller, _context = _make_async_gate_controller()
+    events = _install_async_prepare_stubs(controller, launch_decision=launch_decision)
+
+    assert controller._confirm_prepared_ep_async_handoff() is expected_ok
+    assert ("handoff", True, True) in events
     if expected_disable_reason is not None:
         assert ("disable", expected_disable_reason) in events
 

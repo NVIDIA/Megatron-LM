@@ -8,10 +8,14 @@ class EPAsyncPhase(str, Enum):
     """Tagged collective phases owned by the EP async protocol."""
 
     WORK_CONSENSUS = "ep_work_consensus"
+    WORK_CONSENSUS_ACK = "ep_work_consensus_ack"
     STEP_COMPLETE = "ep_step_complete"
+    STEP_COMPLETE_ACK = "ep_step_complete_ack"
     GRAPH_SHAPE = "ep_graph_shape"
     STEP_BEGIN = "ep_step_begin"
+    STEP_BEGIN_ACK = "ep_step_begin_ack"
     ASYNC_HANDOFF = "ep_async_handoff"
+    ASYNC_HANDOFF_ACK = "ep_async_handoff_ack"
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,11 @@ class EPAsyncStepProtocol:
             self._collective_error_count += 1
             raise
 
+    async def _ack_at_step(
+        self, phase: EPAsyncPhase, step_id: int, *, async_op: bool = True
+    ) -> None:
+        await self._all_reduce_max_at_step(phase, step_id, 1, async_op=async_op)
+
     def _sync_all_reduce_max_at_step(
         self, phase: EPAsyncPhase, step_id: int, *local_vals: int
     ) -> int | tuple[int, ...]:
@@ -132,6 +141,9 @@ class EPAsyncStepProtocol:
         except Exception:
             self._collective_error_count += 1
             raise
+
+    def _sync_ack_at_step(self, phase: EPAsyncPhase, step_id: int) -> None:
+        self._sync_all_reduce_max_at_step(phase, step_id, 1)
 
     async def all_reduce_max(
         self, phase: EPAsyncPhase, *local_vals: int, async_op: bool = True
@@ -158,6 +170,7 @@ class EPAsyncStepProtocol:
         global_work, global_consensus = await self._all_reduce_max_at_step(
             EPAsyncPhase.WORK_CONSENSUS, step_id, local_work, consensus_val, async_op=async_op
         )
+        await self._ack_at_step(EPAsyncPhase.WORK_CONSENSUS_ACK, step_id, async_op=async_op)
         self._work_consensus_count += 1
 
         return EPWorkConsensus(
@@ -173,6 +186,7 @@ class EPAsyncStepProtocol:
             await self._all_reduce_max_at_step(
                 EPAsyncPhase.STEP_COMPLETE, step_id, 1, async_op=async_op
             )
+            await self._ack_at_step(EPAsyncPhase.STEP_COMPLETE_ACK, step_id, async_op=async_op)
             self._work_completion_count += 1
         finally:
             self._finish_ep_step()
@@ -224,6 +238,7 @@ class EPAsyncStepProtocol:
             local_real_missing_forward,
             local_real_missing_sample,
         )
+        self._sync_ack_at_step(EPAsyncPhase.STEP_BEGIN_ACK, step_id)
 
         use_pending_async_sample = bool(any_pending_sample and not any_real_missing_sample)
         reuse_pending_forward = bool(
@@ -259,6 +274,7 @@ class EPAsyncStepProtocol:
         any_real, any_launch, any_real_skip = self._sync_all_reduce_max_at_step(
             EPAsyncPhase.ASYNC_HANDOFF, step_id, local_real, local_launch, local_real_skip
         )
+        self._sync_ack_at_step(EPAsyncPhase.ASYNC_HANDOFF_ACK, step_id)
         launch_async_forward = bool(any_launch and not any_real_skip)
         if launch_async_forward:
             self._async_handoff_launch_count += 1

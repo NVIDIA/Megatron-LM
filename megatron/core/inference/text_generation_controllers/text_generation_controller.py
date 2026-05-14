@@ -2150,14 +2150,8 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason(allow_mtp=True)
         self._record_async_eligibility_result(self._async_disable_reason)
-        handoff_decision = self._decide_ep_async_handoff(
-            has_real_work=True, can_launch_async_handoff=(self._async_disable_reason is None)
-        )
         if self._async_disable_reason is not None:
-            return False
-        if not handoff_decision.launch_async_forward:
-            self._async_disable_reason = "ep async handoff skipped"
-            self._record_async_disable_reason(self._async_disable_reason)
+            self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
             return False
 
         range_push("async_prepare_next_step")
@@ -2166,9 +2160,22 @@ class TextGenerationController:
         if not async_next_prepared:
             self._async_disable_reason = "failed to prepare next-step metadata"
             self._record_async_disable_reason(self._async_disable_reason)
+            self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
             return False
 
         return True
+
+    def _confirm_prepared_ep_async_handoff(self) -> bool:
+        """Publish the EP handoff decision after next-step metadata and sample copy are queued."""
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=True, can_launch_async_handoff=True
+        )
+        if handoff_decision.launch_async_forward:
+            return True
+
+        self._async_disable_reason = "ep async handoff skipped"
+        self._record_async_disable_reason(self._async_disable_reason)
+        return False
 
     def _async_scheduling_global_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return non-step-local reasons async scheduling is disabled, or None."""
@@ -2729,11 +2736,12 @@ class TextGenerationController:
 
         self._try_launch_dummy_async_handoff()
 
+        # EP step completion is a protocol boundary. Dummy ranks have no CPU
+        # bookkeeping to naturally wait on GPU progress, so wait here before
+        # they advertise the work step as complete.
+        torch.cuda.current_stream().synchronize()
+
         # clear the context of any temporary state from the dummy forward
-        # GPU consumers were enqueued on the same stream as any reset-time GPU
-        # writes, so stream ordering is enough here. Synchronizing would block
-        # the CPU EP completion protocol behind the async handoff and can
-        # deadlock with real ranks that correctly leave their handoff in flight.
         context.reset()
 
     @torch.inference_mode()
@@ -3202,31 +3210,32 @@ class TextGenerationController:
                     async_sampled_mtp_tokens_cpu,
                     async_sample_ready_event,
                 ) = self._async_transfer_samples_to_cpu(active_request_count)
-                if async_forward_graph is not None:
-                    range_push("async_forward_graph_launch")
-                    self._launch_async_forward_graph(async_forward_graph)
-                    async_h2d_done_event = async_forward_graph.h2d_done_event
-                    range_pop()
-                else:
-                    range_push("async_transfer_bookkeeping_to_gpu")
-                    async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
-                        include_token_to_input_ids=False,
-                        refresh_request_staging=False,
-                        record_done_event=True,
-                    )
-                    range_pop()
-                    range_push("async_forward_launch")
-                    next_input_ids, next_position_ids = context.current_input_and_position_ids()
-                    self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
-                    self._async_forward_launch_count += 1
-                    self._async_pending_forward = True
-                    self._record_async_pending_forward_requests()
-                    self._async_pending_cuda_graph_request_count = (
-                        context.padded_active_request_count
-                        if context.using_cuda_graph_this_step()
-                        else None
-                    )
-                    range_pop()
+                if self._confirm_prepared_ep_async_handoff():
+                    if async_forward_graph is not None:
+                        range_push("async_forward_graph_launch")
+                        self._launch_async_forward_graph(async_forward_graph)
+                        async_h2d_done_event = async_forward_graph.h2d_done_event
+                        range_pop()
+                    else:
+                        range_push("async_transfer_bookkeeping_to_gpu")
+                        async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
+                            include_token_to_input_ids=False,
+                            refresh_request_staging=False,
+                            record_done_event=True,
+                        )
+                        range_pop()
+                        range_push("async_forward_launch")
+                        next_input_ids, next_position_ids = context.current_input_and_position_ids()
+                        self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+                        self._async_forward_launch_count += 1
+                        self._async_pending_forward = True
+                        self._record_async_pending_forward_requests()
+                        self._async_pending_cuda_graph_request_count = (
+                            context.padded_active_request_count
+                            if context.using_cuda_graph_this_step()
+                            else None
+                        )
+                        range_pop()
 
             if deferred_mtp_blocks_to_release is not None:
                 range_push("mtp_deferred_release_memory_blocks")
