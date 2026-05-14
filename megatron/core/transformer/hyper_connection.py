@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule
@@ -122,6 +123,20 @@ class BroadcastTensorFused(torch.autograd.Function):
         if len(grads) == 2:
             return grads[0] + grads[1], None
         return ctx.fused_add_3_fn(grad1, grad2, grad3), None
+def learned_output_contract(
+    hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
+) -> Tensor:
+    """Learned output contraction: n-stream → 1-stream via sigmoid-gated weighted sum."""
+    dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    head_fn = head_fn.to(torch.float32)
+    base = base.to(torch.float32)
+    scale = scale.to(torch.float32)
+    rsqrt = torch.rsqrt(hidden_states.square().mean(-1, keepdim=True) + eps)
+    mixes = F.linear(hidden_states, head_fn) * rsqrt
+    pre = torch.sigmoid(mixes * scale + base) + eps
+    y = torch.sum(pre.unsqueeze(-1) * hidden_states.view(*hidden_states.shape[:-1], n, -1), dim=-2)
+    return y.to(dtype)
 
 
 # ============================================================================
