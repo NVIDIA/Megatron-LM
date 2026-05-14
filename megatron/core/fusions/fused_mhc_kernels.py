@@ -15,10 +15,39 @@ Four fused operations:
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+def _forced_backend() -> str:
+    value = os.getenv("MHC_FORCE_BACKEND", "auto").strip().lower()
+    value = value.replace("-", "_").replace("+", "_")
+    aliases = {
+        "auto": "auto",
+        "mixed": "auto",
+        "default": "auto",
+        "native": "native",
+        "torch": "native",
+        "pytorch": "native",
+        "none": "native",
+        "triton": "triton",
+        "triton_native": "triton",
+        "cutile": "cutile",
+        "cu_tile": "cutile",
+        "cuda_tile": "cutile",
+    }
+    if value not in aliases:
+        valid = ", ".join(sorted(aliases))
+        raise ValueError(f"Unsupported MHC_FORCE_BACKEND={value!r}; expected one of: {valid}")
+    return aliases[value]
+
 
 # ---------------------------------------------------------------------------
 # Check cuTile availability
@@ -39,11 +68,6 @@ except ImportError:
     pass
 
 
-def is_cutile_available() -> bool:
-    """Return True if cuTile fused kernels are available."""
-    return _CUTILE_AVAILABLE
-
-
 # ---------------------------------------------------------------------------
 # Check Triton availability
 # ---------------------------------------------------------------------------
@@ -57,8 +81,41 @@ except ImportError:
     pass
 
 
+_MHC_FORCED_BACKEND = _forced_backend()
+
+if _MHC_FORCED_BACKEND == "native":
+    _TRITON_AVAILABLE = False
+    _CUTILE_AVAILABLE = False
+    _CUTILE_EXPERIMENTAL_AVAILABLE = False
+elif _MHC_FORCED_BACKEND == "triton":
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("MHC_FORCE_BACKEND=triton was requested, but Triton is not available")
+    _CUTILE_AVAILABLE = False
+    _CUTILE_EXPERIMENTAL_AVAILABLE = False
+elif _MHC_FORCED_BACKEND == "cutile":
+    if not _CUTILE_AVAILABLE:
+        raise RuntimeError("MHC_FORCE_BACKEND=cutile was requested, but cuTile is not available")
+    _TRITON_AVAILABLE = False
+
+if _env_flag("MHC_DISABLE_TRITON"):
+    if _MHC_FORCED_BACKEND == "triton":
+        raise ValueError("MHC_FORCE_BACKEND=triton conflicts with MHC_DISABLE_TRITON=1")
+    _TRITON_AVAILABLE = False
+
+if _env_flag("MHC_DISABLE_CUTILE"):
+    if _MHC_FORCED_BACKEND == "cutile":
+        raise ValueError("MHC_FORCE_BACKEND=cutile conflicts with MHC_DISABLE_CUTILE=1")
+    _CUTILE_AVAILABLE = False
+    _CUTILE_EXPERIMENTAL_AVAILABLE = False
+
+
+def is_cutile_available() -> bool:
+    """Return True if cuTile fused kernels are enabled."""
+    return _CUTILE_AVAILABLE
+
+
 def is_triton_available() -> bool:
-    """Return True if Triton is available for supported mHC kernels."""
+    """Return True if Triton is enabled for supported mHC kernels."""
     return _TRITON_AVAILABLE
 
 
