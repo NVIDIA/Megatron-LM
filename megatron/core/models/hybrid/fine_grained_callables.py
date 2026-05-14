@@ -39,6 +39,7 @@ class _SharedExpertBackwardDWWrapper:
             )
 
     def backward_dw(self):
+        """Run shared-expert backward wgrad after pre-dispatch autograd backward."""
         if self.shared_expert_dw_callable is not None:
             self.shared_expert_dw_callable()
         self.layer = None

@@ -98,6 +98,7 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
         self.mtp_post_process = NoopScheduleNode()
 
     def get_fp8_context(self):
+        """Return an FP8 context only for plain transformer layers."""
         # Grouped hybrid layers (and inferred-layer-type entries that point at
         # a HybridStack rather than a plain TransformerLayer) don't have a
         # ``layer_number`` we can hand to ``get_fp8_context``; the inner layers
@@ -121,7 +122,8 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
 
     LAYER_SCHEDULE_PLAN_CLASS = HybridStackSchedulePlan
 
-    def init(self, model, *args, **kwargs):
+    def __init__(self, model, *args, **kwargs):
+        """Initialize the hybrid chunk plan after validating cuda graph support."""
         assert model.config.cuda_graph_impl == "none", (
             "EP A2A overlap with grouped HybridStack patterns (e.g. '[*E]') does not "
             "support cuda graphs yet. Set cuda_graph_impl='none' or use an ungrouped pattern."

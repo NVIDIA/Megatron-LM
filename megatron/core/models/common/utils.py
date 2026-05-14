@@ -134,6 +134,7 @@ class PreProcessNode(ScheduleNode):
         self.chunk_state = chunk_state
 
     def forward_impl(self):
+        """Run model preprocessing and store chunk-level inputs for layer nodes."""
         if not self.model.pre_process:
             self.chunk_state.decoder_input = self.model.decoder.input_tensor
         (
@@ -177,6 +178,7 @@ class PostProcessNode(ScheduleNode):
         self.chunk_state = chunk_state
 
     def forward_impl(self, hidden_states):
+        """Run model postprocessing for the chunk's final hidden states."""
         empty_decoder = len(self.model.decoder.layers) == 0
         layer_norm = self.model.decoder.final_layernorm
         if not self.model.config.mtp_num_layers and empty_decoder and layer_norm:
@@ -323,7 +325,7 @@ class TransformerLayerNode(ScheduleNode):
 
 
 class _BackwardDWWrapper:
-    """Backward weight-gradient wrapper for the ``pre_dispatch_computation`` slot of a transformer layer.
+    """Backward weight-gradient wrapper for a transformer pre-dispatch slot.
 
     Runs the layer's ``self_attention.backward_dw`` plus, on MoE layers, the
     shared-expert ``backward_dw``; coordinates with the cuda-graph wgrad
@@ -352,6 +354,7 @@ class _BackwardDWWrapper:
         self.cuda_graph_scope = layer.config.cuda_graph_scope
 
     def backward_dw(self):
+        """Run eager or graphed backward wgrad callables for the wrapped layer."""
         is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
         if self.shared_expert_dw_callable is not None and (
             not is_replay or CudaGraphScope.moe_router not in self.cuda_graph_scope
