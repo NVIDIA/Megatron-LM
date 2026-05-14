@@ -318,12 +318,6 @@ class TransformerLayerNode(ScheduleNode):
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
         self.default_backward_func(outputs + self.before_detached, grads)
-        # release the output grad memory after backward finishes,
-        # except when delay_wgrad_comptue is enabled, the grad should be
-        # kept until all modules' backward_dw has been invoked.
-        if self.delay_wgrad_compute:
-            self.output_grads = grads
-            self.delay_grads_release = len(self.bwd_dw_callables) > 0
 
         # return grads for record stream
         return grads
@@ -340,13 +334,6 @@ class TransformerLayerNode(ScheduleNode):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
             nvtx_range_pop(nvtx_msg)
-
-        # the output grad memory is last used in wgrad compute, should be safe to release.
-        assert self.delay_grads_release, "output grad memory should be valid before wgrad."
-        if self.manual_release_grads:
-            for tensor in self.output_grads:
-                tensor.untyped_storage().resize_(0)
-        self.output_grads = None
 
         self.bwd_dw_callables = None
 
@@ -671,14 +658,17 @@ def build_mtp_layer_callables(layer):
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
             hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
-        input_ids, position_ids, decoder_input, hidden_states = layer._get_embeddings(
+        input_ids, position_ids, padding_mask, decoder_input, hidden_states = layer._get_embeddings(
             input_ids=node.chunk_state.input_ids,
             position_ids=node.chunk_state.position_ids,
             embedding=node.chunk_state.model.embedding,
             hidden_states=hidden_states,
+            packed_seq_params=node.chunk_state.packed_seq_params,
+            padding_mask=node.chunk_state.padding_mask,
         )
         node.chunk_state.input_ids = input_ids
         node.chunk_state.position_ids = position_ids
+        node.chunk_state.padding_mask = padding_mask
 
         # MTP Layer Preprocess
         # norm, linear projection and transformer

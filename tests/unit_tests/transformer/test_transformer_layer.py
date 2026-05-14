@@ -9,6 +9,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -109,17 +110,18 @@ class TestParallelTransformerLayer:
                 max_batch_size=micro_batch_size, max_sequence_length=sequence_length
             )
             outputs = {}
-            for mlp_chunks_for_prefill in [1, 4]:
-                transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
-                hidden_states, context = parallel_transformer_layer(
-                    hidden_states=input_hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                )
-                assert hidden_states.shape[0] == sequence_length
-                assert hidden_states.shape[1] == micro_batch_size
-                assert hidden_states.shape[2] == hidden_size
-                outputs[mlp_chunks_for_prefill] = (hidden_states, context)
+            with InferenceMode.active():
+                for mlp_chunks_for_prefill in [1, 4]:
+                    transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
+                    hidden_states, context = parallel_transformer_layer(
+                        hidden_states=input_hidden_states,
+                        attention_mask=attention_mask,
+                        inference_context=inference_context,
+                    )
+                    assert hidden_states.shape[0] == sequence_length
+                    assert hidden_states.shape[1] == micro_batch_size
+                    assert hidden_states.shape[2] == hidden_size
+                    outputs[mlp_chunks_for_prefill] = (hidden_states, context)
 
             assert torch.equal(outputs[1][0], outputs[4][0])
 

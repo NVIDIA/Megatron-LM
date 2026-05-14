@@ -15,6 +15,7 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
@@ -626,8 +627,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
         if using_fused_tp_inference_kernel:
@@ -805,8 +806,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and not isinstance(self.mlp, IdentityOp)
         )
 
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
         if self.recompute_mlp:
@@ -896,8 +897,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
         if self.recompute_pre_mlp_layernorm:
@@ -1309,7 +1310,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         ):
             return True
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
-        elif not self.training and (
+        elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
