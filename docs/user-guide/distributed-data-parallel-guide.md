@@ -25,11 +25,13 @@ This guide helps you choose between different data parallelism strategies availa
 ## DDP (Distributed Data Parallel)
 
 ### When to Use
+- **Small to medium models** where full model replication fits in GPU memory (often under ~10B parameters, depending on hardware/configuration)
 - **Multi-node training** where network bandwidth is limited
-- **Small to medium models** (< 100B parameters)
 - **Fast convergence needed** - DDP has minimal overhead
 - **Stability is critical** - mature, well-tested implementation
 - **Custom training loops** with fine-grained control over communication
+
+> **Note**: DDP requires replicating the full model on each GPU. The feasibility depends on available GPU memory, model architecture, and precision. According to the PyTorch FSDP paper, DDP encountered out-of-memory errors when training models at ~2.28B parameters. For larger models, consider Megatron-FSDP with parameter sharding.
 
 ### Key Features
 - Replicate full model on each rank
@@ -85,11 +87,11 @@ DistributedDataParallelConfig(
 ## Megatron-FSDP
 
 ### When to Use
-- **Very large models** (> 100B parameters) where memory is the bottleneck
-- **Multi-node with good connectivity** (low latency network)
-- **Memory-limited scenarios** - parameters are sharded across ranks
-- **Want to keep using distributed_optimizer** - natural fit with Megatron paradigms
+- **Larger models** where parameter sharding improves memory efficiency (commonly beneficial for 10B+ parameters, but depends on hardware/batch size)
+- **Memory-limited scenarios** - parameters are sharded across ranks to reduce per-GPU memory footprint
+- **Multi-node with good connectivity** (low latency network for efficient all-gather operations)
 - **Mixed precision training** (BF16/FP16) where memory savings matter most
+- **Want to keep using distributed_optimizer** - natural fit with Megatron paradigms
 
 ### Key Features
 - Shard parameter and optimizer states across data parallel group
@@ -191,23 +193,26 @@ torchrun --nproc_per_node=8 train.py \
 
 ```
 Start
-  └─ Model size?
-      ├─ < 100B params
+  └─ Full model fits in GPU memory?
+      ├─ Yes (typically small-to-medium models < ~10B)
       │   └─ Use DDP ✅ (simplest, lowest latency)
       │
-      ├─ 100B - 500B params
-      │   └─ Network fast & low latency?
-      │       ├─ Yes → Megatron-FSDP or DDP
-      │       └─ No → Megatron-FSDP (better scaling)
+      ├─ No, or getting close to memory limits
+      │   └─ Sharding helps?
+      │       ├─ Yes → Megatron-FSDP (most models 10B+)
+      │       └─ Try with TP/PP first → DDP + model parallelism
       │
-      └─ > 500B params
-          └─ Use Megatron-FSDP + TP + PP ✅
+      └─ Not sure? Consider:
+          - Hardware available (GPU memory, interconnect bandwidth)
+          - Model architecture (attention patterns, activation size)
+          - Batch size requirements
+          - Network constraints (single-node vs multi-node)
 
-Considerations:
+Other factors:
   - PyTorch version? → Use Torch-FSDP2 if >= 2.4
-  - Stability critical? → Use Megatron-FSDP or DDP
+  - Stability critical? → Use Megatron-FSDP or DDP (both proven)
   - Want latest features? → Use Torch-FSDP2
-  - Custom training loop? → Use DDP
+  - Custom training loop? → DDP or Torch-FSDP2
 ```
 
 ## Performance Tips
