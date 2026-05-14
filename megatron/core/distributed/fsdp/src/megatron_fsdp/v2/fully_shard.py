@@ -1,5 +1,19 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
-Public fully_shard API for the Megatron-FSDP rewrite path.
+Public fully_shard API for Megatron-FSDP2.
 
 The implementation is split across:
 - fsdp_module.py: FSDPModule behavior and runtime state
@@ -32,13 +46,14 @@ def fully_shard(
     shard_placement_fn: Optional[
         Callable[[nn.Parameter], Optional[Shard]]
     ] = None,  # TODO: implement
-    mp_policy: Optional[FullyShardMixedPrecisionPolicy] = None,  # TODO: implement
+    mp_policy: Optional[FullyShardMixedPrecisionPolicy] = None,
     offload_policy: Optional["OffloadPolicy"] = None,  # TODO: implement
     ignored_params: Optional[set[nn.Parameter]] = None,
     # --- Megatron-FSDP specific options ---
     enable_unshard_prefetch: bool = True,
     enable_async_reduce_grad: bool = True,
     gradient_scaling_factor: Optional[float] = None,
+    enable_trace_pool: bool = False,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -63,14 +78,12 @@ def fully_shard(
     module.__class__ = new_cls
 
     module._init_named_param_groups(
-        mesh,
-        ignored_params,
-        mp_policy=mp_policy,
-        gradient_scaling_factor=gradient_scaling_factor,
+        mesh, ignored_params, mp_policy=mp_policy, gradient_scaling_factor=gradient_scaling_factor
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
         enable_async_reduce_grad=enable_async_reduce_grad,
+        enable_trace_pool=enable_trace_pool,
     )
     module._init_param_main_grad_func()
 

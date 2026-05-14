@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import os
 import sys
@@ -5,16 +19,13 @@ from pathlib import Path
 from typing import Tuple
 
 import torch
-import torch.nn as nn
 import torch.distributed as dist
-
 import torch.distributed.checkpoint as dcp
+import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
-
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
-
 
 # -----------------------
 # Model definitions
@@ -63,11 +74,11 @@ def build_fsdp_model(
     use_megatron_fsdp: bool,
 ) -> Tuple["FSDPModule", torch.distributed.device_mesh.DeviceMesh]:
     if use_megatron_fsdp:
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import fully_shard, FSDPModule
         from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule, fully_shard
         sys.modules["get_state_dict"] = get_state_dict
     else:
-        from torch.distributed.fsdp import fully_shard, FSDPModule
+        from torch.distributed.fsdp import FSDPModule, fully_shard
 
     mesh = init_distributed()
     model = ToyModel(dim=dim, n_layers=n_layers).to("cuda")

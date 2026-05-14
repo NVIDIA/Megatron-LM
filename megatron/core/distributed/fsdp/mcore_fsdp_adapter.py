@@ -51,8 +51,8 @@ try:
         MegatronFSDP,
         MixedPrecisionPolicy,
     )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import FSDPModule
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.mixed_precision import (
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
         FullyShardFP8Policy,
         FullyShardMixedPrecisionPolicy,
     )
@@ -224,9 +224,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if ddp_config.use_megatron_fsdp:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import (
-                fully_shard,
-            )
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import fully_shard
         else:
             from torch.distributed.fsdp import fully_shard
 
@@ -265,6 +263,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "mp_policy": fully_shard_mp_policy,
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
+            "enable_trace_pool": ddp_config.fsdp_double_buffer,
         }
         if config.calculate_per_token_loss:
             gradient_scaling_factor = None

@@ -14,7 +14,6 @@
 
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .fully_shard import fully_shard, fully_shard_model, fully_shard_optimizer
-from .fully_shard_rewrite import FSDPModule, fully_shard
 from .megatron_fsdp import MegatronFSDP
 from .mixed_precision import MixedPrecisionPolicy
 from .package_info import (
@@ -31,6 +30,7 @@ from .package_info import (
     __version__,
 )
 from .utils import FSDPDistributedIndex
+from .v2 import FSDPModule, fully_shard
 
 __all__ = [
     "DistributedDataParallelConfig",

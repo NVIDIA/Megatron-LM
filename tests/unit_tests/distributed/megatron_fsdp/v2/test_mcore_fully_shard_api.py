@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 
 import pytest
@@ -72,12 +72,12 @@ class TestMegatronFSDPE2E:
         MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
         GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
         NUM_TRAINING_STEPS = kwargs.get("train_iters", 20)
-        TP = kwargs.get("tensor_model_parallel_size", 1)
-        PP = kwargs.get("pipeline_model_parallel_size", 1)
-        VPP = kwargs.get("num_layers_per_virtual_pipeline_stage", None)
-        EP = kwargs.get("expert_model_parallel_size", 1)
-        ETP = kwargs.get("expert_tensor_parallel_size", 1)
-        OUTER_DP = kwargs.get("num_distributed_optimizer_instances", 1)
+        TP = kwargs.get("TP", 1)
+        PP = kwargs.get("PP", 1)
+        VPP = kwargs.get("VPP", None)
+        EP = kwargs.get("EP", 1)
+        ETP = kwargs.get("ETP", 1)
+        OUTER_DP = kwargs.get("OUTER_DP", 1)
 
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
@@ -174,11 +174,9 @@ class TestMegatronFSDPE2E:
                     main_params_dtype="fp32",
                     exp_avg_dtype="bf16",
                     exp_avg_sq_dtype="bf16",
+                    moe_grouped_gemm=True,
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
-                    recompute_granularity="full",
-                    recompute_method="uniform",
-                    recompute_num_layers=1,
                     use_fully_shard_api=True,
                     use_precision_aware_optimizer=True,
                 ),
@@ -209,12 +207,13 @@ class TestMegatronFSDPE2E:
                     init_model_with_meta_device=True,
                     ckpt_format="fsdp_dtensor",
                     gradient_accumulation_fusion=False,
+                    **nd_topology,
                     **reference_spec_configs,
                 )
             else:
                 reference_spec_configs["fp8_param_gather"] = False
                 ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_distributed_optimizer=True, **reference_spec_configs
+                    use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
                 )
 
         outputs = TestMegatronFSDPE2E._training_loop(
@@ -222,6 +221,7 @@ class TestMegatronFSDPE2E:
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
+            **nd_topology,
             **spec_configs,
         )
         reference_outputs = ref_cache[ref_cache_key]
@@ -236,9 +236,9 @@ class TestMegatronFSDPE2E:
                     atol=0,
                     rtol=0.05,
                     msg=(
-                        f"Loss mismatch at step {step}, FSDP Loss = {loss.item()}, "
-                        f"Reference Loss = {ref_loss.item()}"
-                        f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
+                        f"Loss mismatch at step {step}, FSDP Loss = {loss.detach().item()}, "
+                        f"Reference Loss = {ref_loss.detach().item()}"
+                        f", Compare = {compare_losses(loss.detach().item(), ref_loss.detach().item())}"
                         f", outputs = {outputs}, reference_outputs = {reference_outputs}"
                     ),
                 )

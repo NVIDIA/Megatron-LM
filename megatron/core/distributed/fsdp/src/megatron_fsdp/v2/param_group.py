@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Parameter Group for FSDP
 
@@ -65,12 +79,14 @@ class ParameterGroup:
         )
 
         # Setup device mesh and derived process group
+        if mesh is None:
+            mesh = DeviceMesh(
+                self.device.type,
+                list(range(torch.distributed.get_world_size(torch.distributed.group.WORLD))),
+            )
+        assert mesh.ndim == 1, "Only 1D mesh is supported"
         self.mesh = mesh
-        if mesh is not None:
-            assert mesh.ndim == 1, "Only 1D mesh is supported"
-            self.dp_group = mesh.get_group()
-        else:
-            self.dp_group = torch.distributed.group.WORLD
+        self.dp_group = mesh.get_group()
 
         self.sharding_strategy = sharding_strategy
         self.param_group_id = param_group_id
@@ -166,7 +182,11 @@ class ParameterGroup:
         # unshard() rebinds .data to the all-gathered buffer, so the original
         # storage is never accessed again.
         for p in self.params:
-            if self.is_fp8_group:
+            if (
+                self.is_fp8_group
+                or self.model_weight_buffer is None
+                and self.main_weight_buffer is None
+            ):
                 continue
             _free_storage(p.data)
 
@@ -315,14 +335,20 @@ class ParameterGroup:
                 data = param.data.detach()
 
             dist_param = torch.nn.Parameter(
-                make_uneven_dtensor(data, param.shape, self.mesh, placements)
+                make_uneven_dtensor(data, param.shape, self.mesh, placements),
+                requires_grad=param.requires_grad,
             )
             # Mark as FSDP parameter for special handling
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
             self.dist_params.append(dist_param)
 
-        # Create gradient DTensor views
+        # Create gradient DTensor views. Some groups, e.g. uint8 FP8 model
+        # payloads, do not require grads and therefore have no grad buffer.
+        if self.main_grad_buffer is None:
+            self.dist_grads = [None for _ in self.params]
+            return
+
         is_grad_shard = is_param_shard
         for p in self.params:
             gbuf = self.main_grad_buffer

@@ -1,4 +1,4 @@
-# Design: `fully_shard_rewrite` Implementation
+# Design: Megatron-FSDP2 Implementation
 
 ---
 
@@ -9,7 +9,7 @@
 | `fully_shard.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, all hooks, `unshard()`, `reshard()`, `reduce_grad()`, final callback |
 | `param_group.py` | `ParameterGroup.unshard(async_op)`, `reduce_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
 | `dp_buffer.py` | `DataParallelBuffer.unshard(async_op)` (all-gather + `p.data` rebind), `reduce_grad()` (reduce-scatter + shard accumulation) |
-| `allocator.py` | `TemporaryBucketAllocator` — pooled memory for unsharded parameter and gradient buffers |
+| `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
 | `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
 
 No changes to `utils.py` are needed for either overlap feature.
@@ -47,6 +47,31 @@ class _FSDPRootContext:
     # --- Feature flags ---
     enable_unshard_prefetch: bool
     enable_async_reduce_grad: bool
+
+    # --- Activation recompute support ---
+    backward_phase: bool = False
+    # True from the root backward pre-hook until the final callback.
+
+    backward_module: Optional[int] = None
+    # ``id(module)`` of the FSDP module whose backward is pending next.
+    # Derived from ``_reversed_order`` and ``backward_done_modules`` — NOT
+    # set by any hook directly.  Updated by ``_advance_backward_module()``.
+
+    backward_done_modules: set = field(default_factory=set)
+    # Set of ``id(module)`` for FSDP modules whose backward has completed.
+    # Populated in ``post_backward``, cleared in the root backward pre-hook.
+
+    _reversed_order: List[FSDPModule] = field(default_factory=list)
+    # ``list(reversed(forward_order))`` — precomputed backward processing order.
+
+    def _advance_backward_module(self) -> None:
+        """Set ``backward_module`` to the first module in ``_reversed_order``
+        that is NOT in ``backward_done_modules``."""
+        for m in self._reversed_order:
+            if id(m) not in self.backward_done_modules:
+                self.backward_module = id(m)
+                return
+        self.backward_module = None
 ```
 
 ### Initialization in `_init_fsdp_state()`
@@ -89,7 +114,7 @@ module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 
 ### `FSDPModule.unshard(async_op, bwd_pass)`
 
-```
+```python
 stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
 # *** Critical: synchronize ag_stream with current_stream before launching AG ***
@@ -122,10 +147,12 @@ for module in [self] + prefetch:
         event = stream.record_event()
         ctx.unshard_done_events[id(module)] = event   # store completion signal
 
-# Synchronize self: block main stream until this module's AG is done
+# Synchronize self: block main stream until this module's AG is done.
+# The event is NOT cleared here — it persists as a "currently unsharded" flag
+# and is only cleared by reshard(). This prevents redundant all-gathers during
+# activation recompute and prefetch re-entry (see Feature 3 below).
 if ctx.unshard_done_events[id(self)] is not None:
     ctx.unshard_done_events[id(self)].wait()          # main stream waits on ag_stream event
-    ctx.unshard_done_events[id(self)] = None          # consume and reset
 
 # Install full parameter tensors into the nn.Module (safe after event.wait)
 for param_names, param_group in self._named_param_groups:
@@ -194,7 +221,7 @@ module.post_backward_issued = True
 
 ### `FSDPModule.reduce_grad(async_op)`
 
-```
+```python
 stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
 # --- Step 1: Sliding drain — free grad buffers 2 positions back in backward order ---
@@ -310,13 +337,143 @@ def _post_backward_final_callback(root_state, root_module):
 
 ---
 
+## Feature 3: Activation Recomputation (Gradient Checkpointing)
+
+### Problem
+
+When activation checkpointing re-runs a forward pass during backward, the FSDP
+forward hooks fire again. Without mitigation this causes two problems:
+
+1. **Redundant all-gather**: `forward_pre_hook` → `unshard()` launches a second
+   all-gather even though parameters are already unsharded.
+2. **Premature reshard**: `forward_hook` → `reshard()` releases the unsharded
+   parameter buffer before backward gradient computation has consumed it.
+
+The baseline Megatron-FSDP addresses this by setting `TrainingState.PRE_BACKWARD`
+on all submodules before backprop (`megatron_fsdp.py:900-938`).
+
+### Solution Overview
+
+Two mechanisms:
+
+| Mechanism | Effect |
+|---|---|
+| **Derived `backward_module`** | `_advance_backward_module()` scans `_reversed_order` for the first module **not** in `backward_done_modules`. This identifies the pending module even when activation recompute fires **before** any layer's `pre_backward_hook` (which is always the case — the checkpoint wrapper triggers recompute, then backward flows through the recomputed graph). |
+| **Persistent `unshard_done_events`** | Event is only cleared by `reshard()`, never by `unshard()`. Prevents redundant all-gathers. |
+
+The `backward_phase` flag gates the forward post-hook check; `backward_done_modules`
+drives both the derived pointer and the prefetch guard.
+
+### Hook Entry Points
+
+```python
+# _register_forward_hook → reshard_param_groups:
+if ctx.backward_phase and id(module) == ctx.backward_module:
+    return                              # skip reshard — this is the pending module
+
+# _register_backward_pre_hook → pre_backward_hook (root only):
+ctx.backward_done_modules.clear()
+ctx.backward_phase = True
+ctx._advance_backward_module()          # picks first non-done in _reversed_order
+
+# _register_backward_hook → post_backward:
+ctx.backward_done_modules.add(id(module))
+ctx._advance_backward_module()          # advances to next pending module
+module.reshard()
+
+# _register_post_backward_final_callback:
+ctx.backward_phase = False
+ctx.backward_module = None
+ctx.backward_done_modules.clear()
+```
+
+### Prefetch Constraint
+
+During backward, `unshard(bwd_pass=True)` prefetches the next module in
+`_reversed_order`.  An extra guard skips modules whose backward is already done:
+
+```python
+# fsdp_module.py — unshard()
+if bwd_pass and id(module) in ctx.backward_done_modules:
+    continue        # backward already done — skip prefetch
+```
+
+### Timeline
+
+Consider two FSDP-wrapped layers L1, L2 checkpointed together.
+`forward_order = [root, L1, L2]`, `_reversed_order = [L2, L1, root]`.
+
+```
+----- FORWARD (normal) ----------------------------------
+L1: pre → unshard(L1) → forward → reshard(L1)
+L2: pre → unshard(L2) → forward → reshard(L2)
+      (checkpoint drops intermediates)
+
+----- BACKWARD (root enters phase) ----------------------
+root pre_backward:
+  clear done_modules, backward_phase = True
+  _advance → backward_module = L2    (first not done)
+  unshard(root)
+
+----- ACTIVATION RECOMPUTE (L1→L2, inside checkpoint backward) --
+L1 pre → unshard(L1) → forward
+L1 post: L1 ≠ backward_module(L2) → reshard(L1)
+L2 pre → unshard(L2)                (event[L2] set, persistent)
+L2 post: L2 == backward_module → skip reshard
+
+----- L2 BACKWARD ----------------------------------------
+L2 pre_backward → unshard(L2)       (event set → skip)
+L2 backward compute
+L2 post_backward:
+  done_modules.add(L2), _advance → L1, reshard
+
+----- L1 BACKWARD ----------------------------------------
+L1 pre_backward → unshard(L1)       (re-allocates, all-gathers)
+L1 backward (gradients already computed → copies .grad)
+L1 post_backward:
+  done_modules.add(L1), _advance → root, reshard
+
+----- FINAL CALLBACK --------------------------------------
+backward_phase = False
+backward_module = None
+done_modules.clear()
+```
+
+### Key Design Decisions
+
+1. **`backward_module` is derived, not set by hooks.**  Activation recompute
+   always fires before any layer's `pre_backward_hook`.  Deriving from the done
+   set + `_reversed_order` correctly identifies the pending module regardless
+   of timing.
+
+2. **`_advance_backward_module()` is called at exactly two points:** root
+   `pre_backward_hook` (after clearing the done set) and `post_backward`
+   (after adding a done module).  These are the only mutations to `backward_done_modules`.
+
+3. **`backward_done_modules` serves dual purpose:** drives the derived pointer
+   AND gates the prefetch guard in `unshard()`.
+
+4. **Event persists between `unshard()` and `reshard()`.**  `unshard()` no
+   longer clears its own event.  Prevents redundant all-gathers.
+
+### Edge Cases
+
+- **Sync mode (`enable_unshard_prefetch=False`):** No event is recorded,
+  so the persistent-event mechanism does not apply.  `backward_module` still
+  prevents premature resharding.
+- **Module not reached by backward:** The final callback runs `reshard()`
+  for untouched modules.
+- **Multiple micro-batches:** All state is reset in the final callback.
+
+---
+
 ## Complete Timeline
 
 ```
 FORWARD PASS (enable_unshard_prefetch=True)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-main stream:  │← compute L[0] →│← compute L[1] →│← compute L[2] →│
-ag_stream:    │AG(L[0])  AG(L[1])│        AG(L[2])│                │
+---------------------------------------------------------
+main stream:  |← compute L[0] →|← compute L[1] →|← compute L[2] →|
+ag_stream:    |AG(L[0])  AG(L[1])|        AG(L[2])|                |
 
 pre-hook L[0]: async unshard L[0] + prefetch L[1] on ag_stream
                event[L[0]].wait() → main stream unblocks
@@ -330,10 +487,10 @@ pre-hook L[2]: event[L[2]].wait() → main stream unblocks
                _replace_module_parameter(L[2])
 
 BACKWARD PASS (enable_async_reduce_grad=True)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-main stream:  │bwd L[2]│copy grad[2]│bwd L[1]│copy grad[1]│bwd L[0]│copy grad[0]│
-ag_stream:    │AG(L[1]) prefetch    │AG(L[0]) prefetch     │                      │
-rs_stream:    │                RS(L[2]) ──────│     RS(L[1]) ──────│   RS(L[0])───│
+---------------------------------------------------------
+main stream:  |bwd L[2]|copy grad[2]|bwd L[1]|copy grad[1]|bwd L[0]|copy grad[0]|
+ag_stream:    |AG(L[1]) prefetch    |AG(L[0]) prefetch     |                      |
+rs_stream:    |                RS(L[2]) ------|     RS(L[1]) ------|   RS(L[0])---|
 
 post-bwd L[2]: reshard, copy grad[2]→main_grad, rs_stream.wait(main), RS(L[2]), event[2]
 post-bwd L[1]: drain event[2-2]? (i=1, no drain), copy grad[1], RS(L[1]), event[1]
@@ -469,23 +626,93 @@ fully-synchronized parameters and gradients.
    (analogous to `suggested_AG_prefetch_size` in the old `AllGatherPipeline`) would
    yield better overlap.
 
-2. **`p.data` rebind before AG completion.** `DataParallelBuffer.unshard()` rebinds
-   `p.data` to the unsharded buffer slice immediately inside the stream context, before
-   the NCCL all-gather fills the data. Correctness is guarded by the outer `event.wait()`,
-   but the internal state of `DataParallelBuffer` is briefly inconsistent. A cleaner design
-   is to return the buffer without rebinding and let `FSDPModule.unshard()` do the rebind
-   after the wait.
-
-3. **Child `_init_fsdp_state` call is redundant.** Each child creates its own
-   `_FSDPRootContext` in `_init_fsdp_state()`, only to have it immediately overwritten by
-   the root's context (`setattr(child, "_fsdp_root_context", root_context)`). The child-local
-   stream allocation is wasted. A small refactor would pass `root_context` directly to avoid
-   the redundant allocation.
-
-4. ~~**`torch.current_stream()` vs `torch.cuda.current_stream()`.**~~ **RESOLVED.** The final
-   callback now uses `torch.cuda.current_stream().wait_stream(stream)` consistently with the
-   rest of the file.
-
-5. **Outer-DP / HSDP.** `_FSDPRootContext` does not carry an outer-DP stream for the second
+2. **Outer-DP / HSDP.** `_FSDPRootContext` does not carry an outer-DP stream for the second
    all-gather needed in hybrid-sharding (outer-DP × inner-FSDP) setups. This mirrors the
    `outer_fsdp_group_param_gather_stream` in the old `AllGatherPipeline`.
+
+---
+
+## Bucket Allocator Hierarchy
+
+`allocator.py` provides a polymorphic allocator family via the `BucketAllocator`
+interface, letting callers swap allocation strategies without changing
+`DataParallelBuffer` or `ParameterGroup`.
+
+```
+BucketAllocator  (interface)
+|-- TemporaryBucketAllocator        — legacy: allocates per pg_id, frees + deletes
+|-- StorageFreeingBucketAllocator   — allocates per pg_id, frees storage but keeps bucket
+|                                     (same tensor object reused on next allocation)
+\-- TracePoolAllocator             — two-phase: trace → plan → static pool
+```
+
+### `TracePoolAllocator`
+
+**Purpose.**  During parameter unshard and gradient reduction the FSDP
+framework allocates and frees temporary flat buffers (all-gather input/output,
+gradient accumulation) in a deterministic, repeatable order.  `TracePoolAllocator`
+replaces per-call `torch.empty` + `_free_storage` with a one-time planned pool
+that eliminates allocation overhead and fragmentation.
+
+**Design — three phases.**
+
+| Phase | Behaviour |
+|---|---|
+| **Trace** (``plan()`` not yet called) | Records every ``allocate`` / ``free`` call as a ``(seq, op, param_group_id)`` event.  Also stores ``(size, dtype, device)`` metadata per ``param_group_id``.  Buckets are allocated via ``torch.empty`` as usual.  Duplicate allocs (without an intervening free) do not generate new trace events. |
+| **Plan** (``plan()``) | Replays the trace to build intervals ``(alloc_seq, free_seq, size)`` for each matched alloc/free pair, groups them by ``(dtype, device)``, and runs a greedy left-edge interval-coloring algorithm per group.  Each color is a **slot** in a contiguous flat pool tensor.  Because the same ``param_group_id`` may appear in multiple intervals, ``_slot_map[pg_id]`` is a **list** of slot indices in alloc order. |
+| **Optimized** (after ``plan()``) | ``allocate`` returns a ``Bucket`` with a slice-view into the pool, advancing a per-pg_id cursor through the slot list.  ``free`` marks the most recently allocated slot as unused (idempotent).  ``reset_cursor()`` rewinds all cursors between micro-batches so the same sequence replays. |
+
+**Slot lists and cursors.**  A single ``param_group_id`` can appear in multiple
+intervals — e.g., forward unshard → free → backward unshard → free.  The plan
+may assign these intervals to *different* slots (if they overlap) or *reuse*
+the same slot (if they don't).  ``_slot_map`` therefore maps each pg_id to a
+**list** of slot indices in the exact alloc order.  During optimized-phase
+runtime a per-pg_id **cursor** tracks which list entry to consume next; between
+micro-batches ``reset_cursor()`` rewinds all cursors to 0.
+
+**Greedy left-edge coloring.**  For each ``(dtype, device)`` group, intervals are
+sorted by ``alloc_seq``.  For each interval the algorithm tries to reuse a slot
+whose previous occupant has already freed (``slot_free_seq < alloc_seq``).  If no
+slot is free a new one is allocated.  The slot is sized to the maximum bucket
+assigned to it.  After coloring, slots are laid out contiguously and a single
+``torch.empty`` is issued per group.
+
+**Properties.**
+
+- **Optimal slot count:** left-edge produces the minimum number of slots for
+  interval graphs — it is impossible to use fewer without causing a conflict.
+- **Repeatable trace required:** the same allocate/free call sequence must
+  repeat across micro-batches.  Call ``reset_cursor()`` between micro-batches;
+  call ``reset()`` to re-profile if the pattern changes.
+- **Double-free safe:** ``free`` is idempotent (silently returns if the slot
+  is already free), matching ``TemporaryBucketAllocator``'s behavior.
+
+**API.**
+
+```python
+allocator = TracePoolAllocator()
+# … run one iteration (trace phase) …
+pool_elems = allocator.plan()          # returns total element count
+# … subsequent micro-batches use the pool …
+allocator.reset_cursor()                # between micro-batches
+print(allocator.total_pool_bytes)       # bytes across all groups
+allocator.reset()                       # back to trace phase
+```
+
+**Lifecycle diagram for one ``param_group_id`` across two micro-batches.**
+
+```
+Trace phase                            Optimized phase
+-----------                            ---------------
+allocate(pg) → torch.empty  --.         allocate(pg) → pool slot 0   (cursor 0→1)
+free(pg)     → _free_storage  | plan    free(pg)     → slot free
+allocate(pg) → torch.empty  --'         allocate(pg) → pool slot 1   (cursor 1→2)
+free(pg)     → _free_storage           free(pg)     → slot free
+                                        -- reset_cursor() --
+                                        allocate(pg) → pool slot 0   (cursor 0→1)
+                                        free(pg)     → slot free
+                                        ...
+```
+
+No ``torch.empty`` or storage resizing occurs in the optimized phase — the pool
+owns all memory, and buckets are lightweight views.

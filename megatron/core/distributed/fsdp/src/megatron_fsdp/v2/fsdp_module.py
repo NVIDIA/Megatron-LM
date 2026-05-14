@@ -1,7 +1,22 @@
-"""FSDPModule implementation for the Megatron-FSDP fully_shard rewrite path."""
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from dataclasses import dataclass, field
+"""FSDPModule implementation for Megatron-FSDP2."""
+
 from contextlib import nullcontext
+import logging
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -9,9 +24,12 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from .allocator import BucketAllocator, StorageFreeingBucketAllocator, TracePoolAllocator
 from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
+
+logger = logging.getLogger(__name__)
 
 
 class _FSDPState:
@@ -90,6 +108,58 @@ class _FSDPRootContext:
 
     enable_async_reduce_grad: bool = True
     """Whether to overlap gradient reduction with backward computation."""
+
+    # ------------------------------------------------------------------
+    # Activation recompute / gradient checkpointing support
+    # ------------------------------------------------------------------
+    backward_phase: bool = False
+    """True from the root backward pre-hook until the final callback."""
+
+    backward_module: Optional[int] = None
+    """``id(module)`` of the FSDP module whose backward is pending next.
+    Derived from ``_reversed_order`` and ``backward_done_modules`` — NOT
+    set by any hook directly.  Updated by ``_advance_backward_module()``."""
+
+    backward_done_modules: set = field(default_factory=set)
+    """Set of ``id(module)`` for FSDP modules whose backward has completed.
+    Populated in ``post_backward``, cleared in the root backward pre-hook."""
+
+    _reversed_order: List["FSDPModule"] = field(default_factory=list)
+    """``list(reversed(forward_order))`` — precomputed backward processing order."""
+
+    # ------------------------------------------------------------------
+    # Bucket allocators (weight and gradient buffers)
+    # ------------------------------------------------------------------
+    weight_bucket_allocator: Optional[BucketAllocator] = None
+    """
+    Bucket allocator for weight (parameter) buffers used during all-gather.
+
+    When set, this allocator manages the lifecycle and reuse of flat
+    contiguous weight buffers across FSDP modules, enabling memory-efficient
+    double-buffering and custom allocation strategies for unsharded parameters.
+
+    If ``None``, each module allocates its own weight buffer independently.
+    """
+
+    grad_bucket_allocator: Optional[BucketAllocator] = None
+    """
+    Bucket allocator for gradient buffers used during reduce-scatter.
+
+    When set, this allocator manages the lifecycle and reuse of flat
+    contiguous gradient accumulation buffers across FSDP modules, enabling
+    memory-efficient pipelining of gradient reduction.
+
+    If ``None``, each module allocates its own gradient buffer independently.
+    """
+
+    def _advance_backward_module(self) -> None:
+        """Set ``backward_module`` to the first module in ``_reversed_order``
+        that is NOT in ``backward_done_modules``."""
+        for m in self._reversed_order:
+            if id(m) not in self.backward_done_modules:
+                self.backward_module = id(m)
+                return
+        self.backward_module = None
 
     def get_prefetch_next_modules(
         self, module: "FSDPModule", bwd_pass: bool = False
@@ -243,7 +313,9 @@ class FSDPModule(nn.Module):
                     continue
                 torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
 
-    def _init_fsdp_state(self, enable_unshard_prefetch, enable_async_reduce_grad):
+    def _init_fsdp_state(
+        self, enable_unshard_prefetch, enable_async_reduce_grad, enable_trace_pool=False
+    ):
         """Initialize FSDP state and mark nested FSDP modules as non-root."""
         forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
         root_context = _FSDPRootContext(
@@ -258,17 +330,34 @@ class FSDPModule(nn.Module):
             unshard_done_events={id(module): None for module in forward_order},
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
+            _reversed_order=list(reversed(forward_order)),
+            weight_bucket_allocator=(
+                TracePoolAllocator() if enable_trace_pool else StorageFreeingBucketAllocator()
+            ),
+            grad_bucket_allocator=TracePoolAllocator() if enable_trace_pool else None,
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
         for child in self.modules():
             if child is not self and isinstance(child, FSDPModule):
-                child._init_fsdp_state(
-                    enable_unshard_prefetch=enable_unshard_prefetch,
-                    enable_async_reduce_grad=enable_async_reduce_grad,
-                )
                 child._fsdp_state._is_root = False
                 setattr(child, "_fsdp_root_context", root_context)
+
+                # Reset the bucket allocator. Since this requires certain global information,
+                # we need to update the bucket allocator for all child FSDP modules each time.
+                for param_group in child._fsdp_param_groups:
+                    if root_context.weight_bucket_allocator is not None:
+                        for weight_buffer in (
+                            param_group.model_weight_buffer,
+                            param_group.transpose_weight_buffer,
+                        ):
+                            if weight_buffer is not None:
+                                weight_buffer.allocator = root_context.weight_bucket_allocator
+                    if (
+                        param_group.main_grad_buffer is not None
+                        and root_context.grad_bucket_allocator is not None
+                    ):
+                        param_group.main_grad_buffer.allocator = root_context.grad_bucket_allocator
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
@@ -297,6 +386,8 @@ class FSDPModule(nn.Module):
         for module in [self] + prefetch_modules:
             if ctx.unshard_done_events[id(module)] is not None:
                 continue  # Skip if unshard already issued for this module
+            if bwd_pass and id(module) in ctx.backward_done_modules:
+                continue  # Skip prefetch for modules whose backward is already done
 
             # Unshard parameters for this module
             for param_names, param_group in module._named_param_groups:
@@ -315,10 +406,12 @@ class FSDPModule(nn.Module):
                 event = stream.record_event()
                 ctx.unshard_done_events[id(module)] = event
 
-        # Ensure unshard is complete before forward
+        # Ensure unshard is complete before forward.
+        # The event is NOT cleared here — it persists as a "currently unsharded"
+        # flag and is only cleared by reshard().  This prevents redundant
+        # all-gathers during activation recompute and prefetch re-entry.
         if ctx.unshard_done_events[id(self)] is not None:
             ctx.unshard_done_events[id(self)].wait()
-            ctx.unshard_done_events[id(self)] = None
 
         # Replace module parameters with unsharded versions
         for param_names, param_group in self._named_param_groups:
@@ -535,7 +628,7 @@ class FSDPModule(nn.Module):
         for param_name in sorted(norms.keys()):
             param_norm = norms[param_name]["param_norm"]
             grad_norm = norms[param_name]["grad_norm"]
-            print(
+            logger.info(
                 f"{prefix} iter={iteration} param={param_name} "
                 f"param_norm={param_norm:.6f} grad_norm={grad_norm:.6f}"
             )
@@ -617,13 +710,13 @@ class FSDPModule(nn.Module):
                     dist_idx = param_group.param_idx.get(param)
                     offset_info = ""
                     if param_group.model_weight_buffer is not None and dist_idx is not None:
-                        item_index = param_group.model_weight_buffer.buffer_index.item_index_map.get(
-                            dist_idx
+                        item_index = (
+                            param_group.model_weight_buffer.buffer_index.item_index_map.get(
+                                dist_idx
+                            )
                         )
                         if item_index is not None:
-                            offset_info = (
-                                f" @{item_index.global_data_index:,}+{item_index.size:,}"
-                            )
+                            offset_info = f" @{item_index.global_data_index:,}+{item_index.size:,}"
                     lines.append(f"    {param_name:50s} {str(tuple(param.shape)):24s}{offset_info}")
                 group_idx += 1
 
@@ -631,7 +724,7 @@ class FSDPModule(nn.Module):
             f"Summary: {group_idx} groups, {total_model_elems:,} model elems, "
             f"comm={_mb(total_comm)}, pad={_mb(total_pad)}"
         )
-        print("\n".join(lines))
+        logger.info("\n".join(lines))
 
     def _set_nan_check(self, enable_nan_checks: bool):
         """Enable or disable NaN checking."""

@@ -1,3 +1,18 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
 import math
 from collections import namedtuple
 from typing import Dict, List, Optional, Tuple
@@ -6,6 +21,8 @@ import torch
 
 from .allocator import TemporaryBucketAllocator
 from .utils import ParamGroupIdx
+
+logger = logging.getLogger(__name__)
 
 
 class BufferIndex:
@@ -365,7 +382,7 @@ class DataParallelBuffer:
 
             # Bounds check: end must not exceed data size
             if s_end > data_nel:
-                print(
+                logger.warning(
                     f"{label_prefix}OVERFLOW: item {s_id} shape={list(shape)} "
                     f"local=[{s_start}, {s_end}) but data.numel()={data_nel} "
                     f"(global=[{g_start}, {g_start + size}))"
@@ -377,7 +394,7 @@ class DataParallelBuffer:
                 n_start, n_end, n_id, n_gstart, n_size = slices[i + 1]
                 if s_end > n_start:
                     overlap = s_end - n_start
-                    print(
+                    logger.warning(
                         f"{label_prefix}OVERLAP: item {s_id} shape={list(shape)} "
                         f"local=[{s_start}, {s_end}) overlaps item {n_id} "
                         f"local=[{n_start}, {n_end}) by {overlap} elements "
@@ -415,7 +432,7 @@ class DataParallelBuffer:
             a_start, a_end, a_id, a_shape = ranges[i]
             b_start, b_end, b_id, b_shape = ranges[i + 1]
             if a_end > b_start:
-                print(
+                logger.warning(
                     f"{label_prefix}GLOBAL OVERLAP: item {a_id} shape={list(a_shape)} "
                     f"[{a_start}, {a_end}) vs item {b_id} shape={list(b_shape)} "
                     f"[{b_start}, {b_end}) overlap={a_end - b_start}"
@@ -514,7 +531,7 @@ class DataParallelBuffer:
         return self._unsharded_buffer
 
     @torch.no_grad()
-    def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
+    def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None, async_op: bool = False):
         """Reduce gradients across the data-parallel group.
 
         For distributed buffers: reduce-scatter the full gradient into each
@@ -523,6 +540,7 @@ class DataParallelBuffer:
         If grad_comm_dtype differs from self.dtype, communicate with a temporary
         casted tensor and cast the reduced result back before accumulation.
         """
+        del async_op
         grad_comm_dtype = grad_comm_dtype or self.dtype
 
         if self.gradient_scaling_factor in (None, 1.0):
@@ -536,7 +554,9 @@ class DataParallelBuffer:
             prescale = True
 
         if not self.is_distributed:
-            comm_data = self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
+            comm_data = (
+                self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
+            )
             if prescale:
                 comm_data.mul_(self.gradient_scaling_factor)
             torch.distributed.all_reduce(comm_data, group=self.dp_group, op=op)
