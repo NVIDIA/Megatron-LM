@@ -456,7 +456,9 @@ class HybridStack(MegatronModule):
         if sharded_layer_prefix is None:
             sharded_layer_prefix = layer_prefix
 
-        for local_layer_idx, (layer_type, layer) in enumerate(zip(self.layer_type_list, self.layers)):
+        for local_layer_idx, (layer_type, layer) in enumerate(
+            zip(self.layer_type_list, self.layers)
+        ):
             state_dict_prefix = f'{layer_prefix}{local_layer_idx}.'
             logical_layer_idx = (
                 self.logical_layer_offset
@@ -490,18 +492,8 @@ class HybridStack(MegatronModule):
         for name, module in self.named_children():
             if not module is self.layers:
                 module_sharded_state_dict = sharded_state_dict_default(
-                    module,
-                    f'{prefix}{name}.',
-                    sharded_offsets,
-                    metadata,
-                    tp_group=self.tp_group,
+                    module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=self.tp_group
                 )
-                if name == "final_norm":
-                    replace_prefix_for_sharding(
-                        module_sharded_state_dict,
-                        f'{prefix}{name}.',
-                        f'{prefix}final_layernorm.',
-                    )
                 sharded_state_dict.update(module_sharded_state_dict)
 
         return sharded_state_dict

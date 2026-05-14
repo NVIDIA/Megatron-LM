@@ -121,6 +121,13 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
 
     LAYER_SCHEDULE_PLAN_CLASS = HybridStackSchedulePlan
 
+    def init(self, model, *args, **kwargs):
+        assert model.config.cuda_graph_impl == "none", (
+            "EP A2A overlap with grouped HybridStack patterns (e.g. '[*E]') does not "
+            "support cuda graphs yet. Set cuda_graph_impl='none' or use an ungrouped pattern."
+        )
+        super().init(model, *args, **kwargs)
+
     def _extra_args_for_layer(self, module, layer_idx, num_layers):
         extra_args = super()._extra_args_for_layer(module, layer_idx, num_layers)
         extra_args["layer_type"] = (
