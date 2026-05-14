@@ -18,6 +18,7 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.utils import get_asyncio_loop
 
 try:
@@ -128,6 +129,8 @@ class StaticInferenceEngine(AbstractEngine):
             # Restore original context when falling back to legacy static engine
             self.controller.inference_wrapped_model.inference_context = original_context
             self.legacy = True
+
+        InferenceMode.set_active()
 
     def get_new_request_id(self) -> str:
         """Gets a new request id from the scheduler"""
