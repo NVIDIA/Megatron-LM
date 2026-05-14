@@ -10,6 +10,7 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -19,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
@@ -48,6 +50,13 @@ if HAVE_FLASHINFER:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = True
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
+
+try:
+    import triton  # pylint: disable=unused-import
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
@@ -342,6 +351,11 @@ class MoELayer(BaseMoELayer):
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
+            elif config.inference_grouped_gemm_backend == 'vllm':
+                assert HAVE_TRITON, (
+                    "inference_grouped_gemm_backend='vllm' requires Triton. "
+                    "Install triton (pip install triton)."
+                )
             self._setup_inference_mode(pg_collection)
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
@@ -357,8 +371,8 @@ class MoELayer(BaseMoELayer):
         Called from __init__ when config.transformer_impl == "inference_optimized".
         Stores the training dispatcher and creates the inference dispatcher selected
         by config.inference_moe_token_dispatcher_type ('nccl' or 'nvls').
-        The active dispatcher is swapped automatically via the train() override:
-        eval mode → inference dispatcher, train mode → standard dispatcher.
+        The active dispatcher is selected at the start of `forward` based on
+        `InferenceMode.is_active()`.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
         dispatcher_cls = (
@@ -373,17 +387,25 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
         )
 
-    def train(self, mode: bool = True):
-        """Swap token dispatcher when switching between train and eval modes."""
-        super().train(mode)
-        if hasattr(self, "_inference_token_dispatcher"):
-            if mode:
-                self.token_dispatcher = self._training_token_dispatcher
-                self.shared_expert_overlap = self.config.moe_shared_expert_overlap
-            else:
-                self.token_dispatcher = self._inference_token_dispatcher
-                self.shared_expert_overlap = False
-        return self
+        # Wire shared-expert overlap into the inference dispatcher (NVLS only).
+        # The dispatcher launches the shared-expert forward on SharedExpertMLP.stream
+        # concurrently with AGV+experts+RSV and adds it back in combine_postprocess.
+        if (
+            dispatcher_type == 'nvls'
+            and self.use_shared_expert
+            and self.config.moe_shared_expert_overlap
+        ):
+            self._inference_token_dispatcher.set_shared_experts(self.shared_experts)
+            # With MoE latent projections, the shared expert must run on the full
+            # hidden_states (pre-latent) and its output added post-fc2_latent_proj.
+            # The dispatcher only sees latent-dim tensors, so we move the launch+add
+            # into preprocess/postprocess on the layer and tell the dispatcher to
+            # skip its own internal launch+add.
+            if self.config.moe_latent_size:
+                self._inference_token_dispatcher._external_shared_expert_launch = True
+        # Inference only: side-stream shared-expert output for latent-MoE + NVLS overlap
+        # (preprocess launches on SharedExpertMLP.stream; postprocess joins+adds).
+        self._latent_shared_expert_output: Optional[torch.Tensor] = None
 
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
         """Initializes CUDA events and streams for overlapping expert
@@ -414,11 +436,33 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher.
         """
-        # Project the hidden_states from hidden dimension down to latent dimenion.
+        # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
+        # expert on its side stream BEFORE fc1_latent_proj so it sees the full
+        # hidden_states. The corresponding join+add runs in postprocess after
+        # fc2_latent_proj. Skipped on the training / NCCL paths.
+        if (
+            self.config.moe_latent_size
+            and self.shared_expert_overlap
+            and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
+        ):
+            stream = SharedExpertMLP.stream
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                self._latent_shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+        elif self.config.moe_latent_size:
+            if self.shared_expert_overlap:
+                if self.training:
+                    raise AssertionError(
+                        "Shared expert overlap with MoE latent projections is not supported "
+                        "during training. Disable moe_shared_expert_overlap."
+                    )
+                raise AssertionError(
+                    "Shared expert overlap with MoE latent projections requires the NVLS "
+                    "inference dispatcher. Either disable moe_shared_expert_overlap or set "
+                    "inference_moe_token_dispatcher_type='nvls'."
+                )
+        # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
-            assert (
-                not self.shared_expert_overlap
-            ), "Shared expert overlap not supported when MoE latent projections are used."
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
@@ -479,7 +523,7 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and not self.training:
+        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
@@ -504,7 +548,11 @@ class MoELayer(BaseMoELayer):
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
-        in latent dimension if needed. Combine expert output with shared_experts if needed."""
+        in latent dimension if needed. Combine expert output with shared_experts if needed.
+
+        _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
+        shared-expert overlap). It is populated in preprocess and joined here, after
+        fc2_latent_proj, so the dimensions match the full hidden dim."""
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
@@ -512,6 +560,15 @@ class MoELayer(BaseMoELayer):
 
         if shared_expert_output is not None:
             output = output + shared_expert_output
+        elif (
+            isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
+            and self._latent_shared_expert_output is not None
+        ):
+            # This codepath is for inference-only shared-expert overlap of latent MoEs.
+            # Must happen post-fc2_latent_proj so dimensions match.
+            torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
+            output = output + self._latent_shared_expert_output
+            self._latent_shared_expert_output = None
         return output
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
@@ -526,7 +583,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -548,6 +605,18 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        # Select the active token dispatcher based on whether the inference engine
+        # is currently using the model. Only applies when the inference dispatcher
+        # was set up (config.transformer_impl == "inference_optimized").
+        if hasattr(self, "_inference_token_dispatcher"):
+            if InferenceMode.is_active():
+                self.token_dispatcher = self._inference_token_dispatcher
+                self.shared_expert_overlap = (
+                    self._inference_token_dispatcher.shared_experts is not None
+                )
+            else:
+                self.token_dispatcher = self._training_token_dispatcher
+                self.shared_expert_overlap = self.config.moe_shared_expert_overlap
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()

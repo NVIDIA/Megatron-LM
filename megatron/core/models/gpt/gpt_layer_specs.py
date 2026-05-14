@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import warnings
+from functools import partial
 from typing import Optional, Union
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -34,11 +35,12 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
-from megatron.core.typed_torch import copy_signature
+from megatron.core.typed_torch import copy_signature, not_none
 from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
@@ -485,7 +487,7 @@ def get_mlp_module_spec(
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     use_te_op_fuser: Optional[bool] = False,
-) -> ModuleSpec:
+) -> MlpBuilder:
     """Helper function to get module spec for MLP/MoE"""
     if fp8 is not None:
         warnings.warn(
@@ -516,7 +518,7 @@ def get_mlp_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
-) -> ModuleSpec:
+) -> MlpBuilder:
     """Helper function to get module spec for MLP/MoE"""
 
     linear_fc2 = backend.row_parallel_linear()
@@ -524,14 +526,14 @@ def get_mlp_module_spec_for_backend(
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        module = TEFusedMLP if use_te_op_fuser else MLP
+        module = not_none(TEFusedMLP).as_mlp_submodule if use_te_op_fuser else MLP.as_mlp_submodule
         if backend.fuse_layernorm_and_linear():
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
         else:
             linear_fc1 = backend.column_parallel_linear()
-        return ModuleSpec(
-            module=module,
+        return partial(
+            module,
             submodules=MLPSubmodules(
                 linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
             ),
@@ -754,15 +756,22 @@ def get_gpt_mtp_block_spec_for_backend(
         mtp_model_layer_spec=transformer_layer_spec, backend=backend
     )
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
-    mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
+    if config.mtp_use_repeated_layer:
+        mtp_layer_specs = [mtp_layer_spec]
+    else:
+        mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
 
-    offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
-    # split the mtp layer specs to only include the layers that are built in this pipeline stage.
-    mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
+    if not config.mtp_use_repeated_layer:
+        offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
+        # Split the MTP layer specs to only include the layers that are built in this
+        # pipeline stage.
+        mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
+        if len(mtp_layer_specs) > 0:
+            assert (
+                len(mtp_layer_specs) == config.mtp_num_layers
+            ), f"All MTP layers must reside in the same pipeline stage"
+
     if len(mtp_layer_specs) > 0:
-        assert (
-            len(mtp_layer_specs) == config.mtp_num_layers
-        ), f"currently all of the mtp layers must stage in the same pipeline stage."
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
     else:
         mtp_block_spec = None

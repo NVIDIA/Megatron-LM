@@ -125,3 +125,9 @@ linkcheck_ignore = [
 linkcheck_anchors_ignore_for_url = [
     r"https://docs\.pytorch\.org/.*",
 ]
+
+# PyTorch docs anchor IDs change between stable versions; verify the page
+# loads but skip anchor validation to avoid spurious failures on redirects.
+linkcheck_anchors_ignore_for_url = [
+    "https://docs.pytorch.org/.*",
+]
