@@ -458,6 +458,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         extra_block_kwargs=None,
         inference_context=None,
         is_spec_decode=None,
+        output_processor=None,
+        output_processor_context=None,
     ):
         """Postprocess HybridStack hidden states into logits or language-model loss.
 
