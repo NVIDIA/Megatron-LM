@@ -368,23 +368,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             # append_key_value_cache.
             from megatron.core.transformer.transformer_block import get_num_layers_to_build
 
-            # Match TransformerBlock / attention inference: take physical PP rank from the PP
-            # process group when provided (see get_pg_rank(pg_collection.pp) in attention.py).
-            # Virtual pipeline *world size* comes from model_config—the same source
-            # get_num_layers_to_build uses internally—rather than parallel_state globals.
-            # Virtual *stage* is not the PP group rank (that rank is the physical stage); keep
-            # the MPU virtual slot when interleaved VPP is enabled.
-            vp_sz = model_config.virtual_pipeline_model_parallel_size
-            if vp_sz is not None and vp_sz > 1:
-                vp_stage = parallel_state.get_virtual_pipeline_model_parallel_rank()
-            else:
-                vp_stage = None
+            # Interleaved / virtual PP is not used for inference (see
+            # AbstractModelInferenceWrapper: Iterable models are rejected). Always pass
+            # vp_stage=None into get_num_layers_to_build, consistent with attention inference
+            # (e.g. get_transformer_layer_offset(..., vp_stage=None, pp_rank=...)).
+            # When pg_collection is set, use the PP group's rank (same as attention.py).
             if pg_collection is not None:
                 pp_rank = get_pg_rank(pg_collection.pp)
             else:
                 pp_rank = None
             self.num_attention_layers = get_num_layers_to_build(
-                model_config, vp_stage=vp_stage, pp_rank=pp_rank
+                model_config, vp_stage=None, pp_rank=pp_rank
             )
             self.num_mamba_layers = 0
             (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
