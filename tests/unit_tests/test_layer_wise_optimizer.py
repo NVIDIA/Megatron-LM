@@ -81,6 +81,7 @@ class TestLayerWiseOptimizer:
         model_kwargs=None,
         use_layer_wise=True,
         copy_from=None,
+        use_param_layout=False,
     ):
         """Create model, DDP wrapper, and optimizer.
 
@@ -90,6 +91,11 @@ class TestLayerWiseOptimizer:
             model_kwargs: Optional kwargs for model initialization
             use_layer_wise: If True, use LayerWiseDistributedOptimizer via dist_muon;
                           if False, use standard muon ChainedOptimizer (for reference)
+            use_param_layout: If True, supply DDP a precomputed shard-aligned
+                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
+                + ``start_param_sync``). If False (default), build DDP without a layout
+                so ``LayerWiseDistributedOptimizer`` syncs via the legacy
+                flatten / ``all_gather_v`` / unflatten ``allgather_params()`` codepath.
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -100,10 +106,21 @@ class TestLayerWiseOptimizer:
         model = model_class(**model_kwargs).bfloat16().cuda()
         model.requires_grad_(True)
 
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-        model = DistributedDataParallel(
-            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-        )
+        if use_param_layout:
+            from megatron.training.training import wrap_model_chunks_with_ddp
+
+            ddp_config = DistributedDataParallelConfig()
+            model = wrap_model_chunks_with_ddp(
+                [model],
+                TransformerConfig(num_attention_heads=1, num_layers=1),
+                ddp_config,
+                use_layer_wise_distributed_optimizer=use_layer_wise,
+            )[0]
+        else:
+            ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+            model = DistributedDataParallel(
+                TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+            )
         if copy_from:
             model.module.load_state_dict(copy_from.module.state_dict())
         else:
@@ -136,6 +153,7 @@ class TestLayerWiseOptimizer:
         overlap_param_gather=True,
         grad_reduce_in_fp32=False,
         bucket_size=None,
+        use_param_layout=False,
     ):
         """Create model, DDP wrapper, and optimizer with overlap-param-gather enabled.
 
@@ -151,6 +169,9 @@ class TestLayerWiseOptimizer:
             overlap_param_gather: If True, defer param all-gather to bucket infrastructure
             grad_reduce_in_fp32: If True, reduce grads in fp32 (regression test for dtype fix)
             bucket_size: Maximum number of parameters per bucket (None = single bucket)
+            use_param_layout: If True, supply DDP a precomputed shard-aligned
+                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
+                + ``start_param_sync``). If False (default), build DDP without a layout.
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -161,16 +182,37 @@ class TestLayerWiseOptimizer:
         model = model_class(**model_kwargs).bfloat16().cuda()
         model.requires_grad_(True)
 
-        ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=False,
-            overlap_param_gather=True,
-            overlap_grad_reduce=True,
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
-            bucket_size=bucket_size,
-        )
-        model = DistributedDataParallel(
-            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-        )
+        # overlap_param_gather=True requires bucketing, which only happens when
+        # overlap_grad_reduce=True (otherwise DDP forces bucket_size=None). Couple
+        # the two so a caller only has to flip one.
+        overlap_grad_reduce = overlap_param_gather
+
+        if use_param_layout:
+            from megatron.training.training import wrap_model_chunks_with_ddp
+
+            ddp_config = DistributedDataParallelConfig(
+                overlap_param_gather=overlap_param_gather,
+                overlap_grad_reduce=overlap_grad_reduce,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+                bucket_size=bucket_size,
+            )
+            model = wrap_model_chunks_with_ddp(
+                [model],
+                TransformerConfig(num_attention_heads=1, num_layers=1),
+                ddp_config,
+                use_layer_wise_distributed_optimizer=True,
+            )[0]
+        else:
+            ddp_config = DistributedDataParallelConfig(
+                use_distributed_optimizer=False,
+                overlap_param_gather=overlap_param_gather,
+                overlap_grad_reduce=overlap_grad_reduce,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+                bucket_size=bucket_size,
+            )
+            model = DistributedDataParallel(
+                TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+            )
         if copy_from:
             model.module.load_state_dict(copy_from.module.state_dict())
         else:
@@ -206,9 +248,12 @@ class TestLayerWiseOptimizer:
         reference_model.load_state_dict(model.module.state_dict())
         return reference_model
 
-    def test_basic(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_basic(self, use_param_layout):
         """Test basic LayerWiseDistributedOptimizer initialization and step with bf16."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer()
+        model, optimizer, pg_collection = self.create_model_and_optimizer(
+            use_param_layout=use_param_layout
+        )
 
         # Verify basic properties
         assert optimizer is not None, "Optimizer should not be None"
@@ -336,13 +381,16 @@ class TestLayerWiseOptimizer:
                     sh_base.replica_id[2] == 0
                 ), f'Expected DP replica_id to be 0 for layer-wise optimizer, got: {sh_base.replica_id[2]}'
 
-    def test_multiple_optimizers(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_multiple_optimizers(self, use_param_layout):
         """Test LayerWiseDistributedOptimizer with multiple chained optimizers.
 
         Uses get_megatron_muon_optimizer which produces multiple chained optimizers
         (muon for 2D weights + adam for 1D biases). Tests allgather with multiple ranks.
         """
-        model, optimizer, pg_collection = self.create_model_and_optimizer()
+        model, optimizer, pg_collection = self.create_model_and_optimizer(
+            use_param_layout=use_param_layout
+        )
 
         ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
         model = DistributedDataParallel(
@@ -436,17 +484,23 @@ class TestLayerWiseOptimizer:
         ):
             LayerWiseDistributedOptimizer([wrapped_optimizer], lw_config, pg_collection)
 
-    def _run_parameter_update_test(self, model_class=SimpleModel):
+    def _run_parameter_update_test(self, use_param_layout, model_class=SimpleModel):
         """Helper method to test parameter updates with a given model class.
 
         Args:
-            model_class: Model class to use for testing
+            use_param_layout: forwarded to create_model_and_optimizer.
+            model_class: Model class to use for testing.
         """
-        model, optimizer, pg_collection = self.create_model_and_optimizer(model_class=model_class)
+        model, optimizer, pg_collection = self.create_model_and_optimizer(
+            model_class=model_class, use_param_layout=use_param_layout
+        )
 
         # Create reference model and optimizer using the same function
         reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
-            model_class=model_class, use_layer_wise=False, copy_from=model
+            model_class=model_class,
+            use_layer_wise=False,
+            copy_from=model,
+            use_param_layout=use_param_layout,
         )
 
         # Set same gradients on both models
@@ -474,17 +528,19 @@ class TestLayerWiseOptimizer:
         for param, ref_param in zip(model.parameters(), reference_model.parameters()):
             torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
 
-    def test_parameter_updates(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_parameter_updates(self, use_param_layout):
         """Test LayerWiseDistributedOptimizer actually updates model parameters."""
-        self._run_parameter_update_test()
+        self._run_parameter_update_test(use_param_layout=use_param_layout)
 
-    def test_parameter_updates_insufficient_parameters(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_parameter_updates_insufficient_parameters(self, use_param_layout):
         """Test LayerWiseDistributedOptimizer when there are insufficient parameters for all ranks.
 
         Uses a tiny model with only 1 layer (2 parameters: weight and bias).
         This will be insufficient when world size > 2.
         """
-        self._run_parameter_update_test(model_class=TinyModel)
+        self._run_parameter_update_test(use_param_layout=use_param_layout, model_class=TinyModel)
 
     def test_broadcast_vs_allgather(self):
         """Test LayerWiseDistributedOptimizer allgather code agains broadcast code."""
@@ -524,10 +580,11 @@ class TestLayerWiseOptimizer:
 
     # ---- Overlap-param-gather tests ----
 
-    def test_overlap_param_gather_basic(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_basic(self, use_param_layout):
         """Test overlap-param-gather path: init, forward/backward/step, bucket-based param sync."""
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather()
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            use_param_layout=use_param_layout
         )
 
         assert optimizer is not None, "Optimizer should not be None"
@@ -572,15 +629,16 @@ class TestLayerWiseOptimizer:
                         msg=f"Parameter {name} differs between rank 0 and rank {i}",
                     )
 
-    def test_overlap_param_gather_parameter_updates(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_parameter_updates(self, use_param_layout):
         """Test overlap-param-gather produces same parameter updates as standard optimizer."""
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather()
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            use_param_layout=use_param_layout
         )
 
         # Create reference model with standard (non-layer-wise) optimizer
         reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
-            use_layer_wise=False, copy_from=model
+            use_layer_wise=False, copy_from=model, use_param_layout=use_param_layout
         )
 
         # Set same gradients on both models
@@ -602,7 +660,8 @@ class TestLayerWiseOptimizer:
         for param, ref_param in zip(model.parameters(), reference_model.parameters()):
             torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
 
-    def test_overlap_param_gather_vs_sync_allgather(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_vs_sync_allgather(self, use_param_layout):
         """Key correctness test: overlap path and sync allgather produce identical updates.
 
         Compares:
@@ -611,12 +670,14 @@ class TestLayerWiseOptimizer:
         """
         # Create overlap model
         overlap_model, overlap_optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(overlap_param_gather=True)
+            self.create_model_and_optimizer_with_overlap_param_gather(
+                overlap_param_gather=True, use_param_layout=use_param_layout
+            )
         )
 
         # Create sync model with same weights (overlap_param_gather=True but sync allgather)
         sync_model, sync_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=overlap_model
+            overlap_param_gather=False, copy_from=overlap_model, use_param_layout=use_param_layout
         )
 
         # Verify initial parameters match
@@ -722,18 +783,22 @@ class TestLayerWiseOptimizer:
                 msg="Overlap-param-gather and standard paths produced different updates",
             )
 
-    def test_overlap_param_gather_insufficient_parameters(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_insufficient_parameters(self, use_param_layout):
         """Test overlap-param-gather with TinyModel (only 2 params).
 
         Many ranks will have no assigned params when world_size > 2.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            model_class=TinyModel
+            model_class=TinyModel, use_param_layout=use_param_layout
         )
 
         # Create reference model with standard (non-layer-wise) optimizer
         reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
-            model_class=TinyModel, use_layer_wise=False, copy_from=model
+            model_class=TinyModel,
+            use_layer_wise=False,
+            copy_from=model,
+            use_param_layout=use_param_layout,
         )
 
         # Set same gradients on both models
@@ -793,7 +858,8 @@ class TestLayerWiseOptimizer:
         for param, ref_param in zip(model.parameters(), reference_model.parameters()):
             torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
 
-    def test_overlap_param_gather_multi_iteration(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_multi_iteration(self, use_param_layout):
         """Test overlap-param-gather correctness over multiple training iterations.
 
         Runs multiple forward/backward/step iterations using the async allgather path.
@@ -801,12 +867,12 @@ class TestLayerWiseOptimizer:
         model using the sync path.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True
+            overlap_param_gather=True, use_param_layout=use_param_layout
         )
 
         # Create reference model with sync allgather for comparison
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
         )
 
         for iteration in range(3):
@@ -841,17 +907,18 @@ class TestLayerWiseOptimizer:
                     msg=f"Parameters diverged at iteration {iteration}",
                 )
 
-    def test_overlap_param_gather_async_dispatch_and_finish(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_async_dispatch_and_finish(self, use_param_layout):
         """Test async dispatch + finish_param_sync cycle (the actual runtime path).
 
         start_param_sync() (no force_sync) dispatches async all-gathers, then
         finish_param_sync() waits on the handle and unflattens gathered params.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True
+            overlap_param_gather=True, use_param_layout=use_param_layout
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
         )
 
         # Set identical gradients on both models
@@ -900,14 +967,15 @@ class TestLayerWiseOptimizer:
                         msg=f"Parameter {name} differs between rank 0 and rank {i}",
                     )
 
-    def test_overlap_param_gather_finish_chains_next_bucket(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_finish_chains_next_bucket(self, use_param_layout):
         """Test that finish_param_sync() dispatches next_param_gather_bucket_group.
 
         Uses a small bucket_size to force multiple bucket groups, then dispatches
         only the last bucket group and verifies that finishing it chains to the next.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, bucket_size=2000
+            overlap_param_gather=True, bucket_size=2000, use_param_layout=use_param_layout
         )
 
         bucket_groups = model.bucket_groups
@@ -915,7 +983,10 @@ class TestLayerWiseOptimizer:
             pytest.skip("Need multiple bucket groups to test chaining")
 
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model, bucket_size=2000
+            overlap_param_gather=False,
+            copy_from=model,
+            bucket_size=2000,
+            use_param_layout=use_param_layout,
         )
 
         # Set identical gradients on both models
@@ -961,17 +1032,18 @@ class TestLayerWiseOptimizer:
                 msg="Chained bucket finish produced different params than sync path",
             )
 
-    def test_overlap_param_gather_forward_pre_hook(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_forward_pre_hook(self, use_param_layout):
         """Test forward pre-hooks trigger finish_param_sync during model(input).
 
         After async dispatch, running model(input) fires forward pre-hooks that
         call finish_param_sync() on each bucket group, completing the param sync.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True
+            overlap_param_gather=True, use_param_layout=use_param_layout
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
         )
 
         # Set identical gradients on both models
@@ -1002,7 +1074,8 @@ class TestLayerWiseOptimizer:
                 msg="Forward pre-hook path produced different params than sync path",
             )
 
-    def test_overlap_param_gather_grad_reduce_in_fp32(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_grad_reduce_in_fp32(self, use_param_layout):
         """Regression test: grad_reduce_in_fp32 must not cause dtype mismatch in broadcasts.
 
         When grad_reduce_in_fp32=True, the grad buffer dtype is fp32 but broadcast
@@ -1010,10 +1083,13 @@ class TestLayerWiseOptimizer:
         would cause a dtype mismatch error in the per-rank broadcast calls.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, grad_reduce_in_fp32=True
+            overlap_param_gather=True, grad_reduce_in_fp32=True, use_param_layout=use_param_layout
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model, grad_reduce_in_fp32=True
+            overlap_param_gather=False,
+            copy_from=model,
+            grad_reduce_in_fp32=True,
+            use_param_layout=use_param_layout,
         )
 
         # Set identical gradients on both models
@@ -1040,17 +1116,18 @@ class TestLayerWiseOptimizer:
                 msg="grad_reduce_in_fp32 path produced different params than reference",
             )
 
-    def test_overlap_param_gather_hook_enable_disable_cycle(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_hook_enable_disable_cycle(self, use_param_layout):
         """Test the training loop's hook lifecycle: disable → manual sync → enable → forward.
 
         The training loop disables hooks before iteration 1 (for initialization),
         then enables them for subsequent iterations. This test exercises that cycle.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True
+            overlap_param_gather=True, use_param_layout=use_param_layout
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
         )
 
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
@@ -1102,7 +1179,8 @@ class TestLayerWiseOptimizer:
                 msg="Params diverged after iteration 2 (hooks re-enabled)",
             )
 
-    def test_overlap_param_gather_multi_iteration_with_hooks(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_multi_iteration_with_hooks(self, use_param_layout):
         """Test multiple iterations using forward pre-hooks (not manual force_sync).
 
         Runs 3 iterations where each iteration uses: set grads → step → async dispatch →
@@ -1110,10 +1188,10 @@ class TestLayerWiseOptimizer:
         allgather after each iteration.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True
+            overlap_param_gather=True, use_param_layout=use_param_layout
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
         )
 
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
@@ -1144,7 +1222,8 @@ class TestLayerWiseOptimizer:
                     msg=f"Parameters diverged at iteration {iteration}",
                 )
 
-    def test_overlap_param_gather_start_sync_with_autograd(self):
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    def test_overlap_param_gather_start_sync_with_autograd(self, use_param_layout):
         """Regression test: start_param_sync must work when autograd is active.
 
         _flatten_dense_tensors on params with requires_grad=True produces a tensor
@@ -1160,10 +1239,10 @@ class TestLayerWiseOptimizer:
         next bucket group.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True
+            overlap_param_gather=True, use_param_layout=use_param_layout
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
         )
 
         # Confirm params require grad (the precondition for this bug).
