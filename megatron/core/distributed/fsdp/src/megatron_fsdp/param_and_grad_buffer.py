@@ -3158,53 +3158,6 @@ class ParamAndGradBuffer:
         )
         _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
 
-    def copy_model_weights_to_main_weights(self):
-        """
-        Refresh the fp32 main weights from the current model weights.
-
-        Mirror of :meth:`copy_main_weights_to_model_weights` in reverse: copies
-        each (sharded) model_weight_buffer slice into its corresponding
-        main_weight_buffer slice with implicit upcast (bf16/fp16 -> fp32).
-
-        Used by ``DistributedOptimizer._copy_model_params_to_main_params`` on
-        the ``--finetune`` / ``--no-load-optim`` path, where DCP has populated
-        model weights but optimizer state (and therefore main_weight_buffer)
-        was not loaded from the checkpoint.
-
-        FP8 model params are not supported here; resuming an FP8 checkpoint
-        without optimizer state would need fp8 -> fp32 dequantization which is
-        not yet wired up. Raises ``NotImplementedError`` if any FP8 param is
-        encountered.
-        """
-        for pg in self.parameter_groups:
-            mbuf = pg.main_weight_buffer
-            wbuf = pg.model_weight_buffer
-            if mbuf is None:
-                continue
-            for param in pg.params:
-                if is_float8tensor(param) or is_blockwise_float8tensor(param):
-                    raise NotImplementedError(
-                        "Megatron-FSDP copy_model_weights_to_main_weights does not "
-                        "support FP8 parameters; resume with optimizer state instead "
-                        "of --finetune / --no-load-optim."
-                    )
-                item_id = mbuf.param_idx[param]
-                if wbuf is not None:
-                    if wbuf.is_data_distributed or mbuf.is_data_distributed:
-                        model_param = wbuf.get_item(item_id, only_shard=True)
-                        main_weight = mbuf.get_item(item_id, only_shard=True)
-                    else:
-                        model_param = wbuf.get_item(item_id)
-                        main_weight = mbuf.get_item(item_id)
-                else:
-                    assert not mbuf.is_data_distributed
-                    model_param = to_local_if_dtensor(param)
-                    main_weight = mbuf.get_item(item_id)
-
-                if model_param.numel() > 0:
-                    # .copy_ upcasts bf16/fp16 model -> fp32 main automatically.
-                    main_weight.data.copy_(model_param.view(main_weight.shape))
-
     def all_gather_parameters(self, async_op: bool = True):
         """All gather the parameters.
         Args:

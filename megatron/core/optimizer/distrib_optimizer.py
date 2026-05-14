@@ -2928,15 +2928,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         if self.ddp_config.use_megatron_fsdp:
-            # Under FSDP, model and main params live in DP-sharded buffers
-            # managed by ``param_and_grad_buffer``. Reach into each model
-            # chunk and refresh the fp32 main buffer from the (now-loaded)
-            # bf16/fp16 model buffer. This is the analogue of the
-            # non-FSDP branch below — both directions copy model -> main
-            # for the ``--finetune`` / ``--no-load-optim`` path where DCP
-            # populated model weights but not optimizer state.
-            for model_chunk in self.model_chunks:
-                model_chunk.param_and_grad_buffer.copy_model_weights_to_main_weights()
+            # No-op under Megatron-FSDP: by the time we get here, the fp32
+            # ``main_weight_buffer`` is already populated and ``model_weight_buffer``
+            # mirrors it (bf16/fp16). Mechanism:
+            #   1. ``MegatronFSDP`` registers a ``state_dict`` pre-hook that runs
+            #      ``_replace_param_with_distributed_if_needed`` before any state_dict
+            #      op, which swaps each module ``nn.Parameter`` to point at the fp32
+            #      ``main_weight_buffer`` slice
+            #      (megatron_fsdp.py:1099-1102 / :1327-1344).
+            #   2. The preceding ``model.load_state_dict(state_dict["model"])`` (from
+            #      checkpointing.py:_load_base_checkpoint -> dcp.load_state_dict, then
+            #      load_model_state_dict) therefore writes the checkpoint's fp32
+            #      tensors directly into ``main_weight_buffer``. ``--no-load-optim``
+            #      only skips ``state_dict["optimizer"]`` (Adam moments + group
+            #      metadata); it does NOT skip main params, because they live in the
+            #      *model* state dict under fsdp_dtensor.
+            #   3. A ``load_state_dict`` post-hook then calls
+            #      ``copy_main_weights_to_model_weights``
+            #      (megatron_fsdp.py:1093-1095, :1408-1413), which casts
+            #      main_weight_buffer down to bf16/fp16 to refresh
+            #      model_weight_buffer.
+            # Implementing a model->main copy here would *downgrade* main precision
+            # from the loaded fp32 to ``model_weight.float()`` (bf16-cast-back-to-fp32);
+            # see PR #4748 / #4753 history for an empirical verification.
             return
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
