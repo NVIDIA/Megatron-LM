@@ -1420,7 +1420,7 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
-class _DeepepV2Manager(_DispatchManager):
+class _DeepepV2Manager(_DeepepManager):
     """
     A manager class for the DeepEP v2 ElasticBuffer backend.
 
@@ -1436,6 +1436,7 @@ class _DeepepV2Manager(_DispatchManager):
         num_experts: int,
         config: TransformerConfig,
     ):
+        # Do not call _DeepepManager.__init__; v2-only images may not ship the v1 Buffer API.
         self.group = group
         self.num_local_experts = num_local_experts
         self.config = config
@@ -1466,18 +1467,6 @@ class _DeepepV2Manager(_DispatchManager):
             num_topk=self.token_indices.shape[1],
         )
         return self.buffer
-
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
-        num_tokens = routing_map.shape[0]
-
-        routing_map = routing_map.reshape(num_tokens, self.num_experts)
-        probs = probs.reshape(num_tokens, self.num_experts)
-        # Convert the format of routing map from multihot to indices.
-        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
-        # Mask the indices of dropped tokens with -1
-        if self.capacity_factor is not None:
-            mask = self.token_probs == 0
-            self.token_indices = self.token_indices.masked_fill(mask, -1)
 
     def dispatch(
         self,
@@ -1531,119 +1520,6 @@ class _DeepepV2Manager(_DispatchManager):
         self.handle = None
         self.dispatched_indices = None
         self.dispatched_probs = None
-        return hidden_states
-
-    def _indices_to_multihot(self, indices, probs):
-        """
-        Converts a tensor of indices to a multihot vector.
-
-        Args:
-            indices (torch.Tensor): [num_tokens, topk] token indices, where -1 means masked out.
-            probs (torch.Tensor): [num_tokens, topk] token probabilities.
-
-        Returns:
-            A tuple of (routing_map, probs), where routing_map is the multihot vector
-            and probs is the multihot probabilities.
-        """
-        batch_size = indices.shape[0]
-        multihot_routing_map = torch.zeros(
-            (batch_size, self.num_local_experts), dtype=torch.long, device=indices.device
-        )
-
-        multihot_probs = torch.zeros(
-            (batch_size, self.num_local_experts), dtype=torch.float, device=indices.device
-        )
-
-        mask = indices != -1
-        valid_indices = indices[mask]
-        row_indices = torch.arange(batch_size, device=indices.device).repeat_interleave(
-            mask.sum(dim=1)
-        )
-        multihot_routing_map[row_indices, valid_indices] = 1
-        multihot_probs[row_indices, valid_indices] = probs[mask]
-        return multihot_routing_map.bool(), multihot_probs
-
-    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        """
-        Get the number of tokens per expert.
-        """
-        return self.tokens_per_expert
-
-    def _pad_routing_map(
-        self, routing_map: torch.Tensor, tokens_per_expert: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Pad the routing map to the nearest multiple of the pad_multiple.
-        """
-        pad_multiple = get_align_size_for_quantization(self.config)
-
-        num_input_tokens = routing_map.shape[0]
-        target_tokens_per_expert = (
-            torch.ceil(tokens_per_expert / pad_multiple) * pad_multiple
-        ).long()
-
-        # Check if there are enough tokens to pad
-        enough_tokens_to_pad = torch.all(target_tokens_per_expert <= num_input_tokens)
-        if not enough_tokens_to_pad:
-            logger.warning(
-                "Not enough tokens to pad. The total number of tokens received in this rank "
-                "is smaller than the target number of tokens for each expert. "
-                "Falling back to explicit padding within GroupedMLP"
-            )
-        else:
-            if is_experimental_enabled() and self.permute_fusion:
-                from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
-
-                routing_map = fused_pad_routing_map(routing_map, pad_multiple)
-            else:
-                routing_map = pad_routing_map(routing_map, pad_multiple)
-            tokens_per_expert = target_tokens_per_expert
-        return routing_map, tokens_per_expert
-
-    def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if is_experimental_enabled() and self.permute_fusion:
-            self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
-                self.dispatched_indices, self.dispatched_probs, self.num_local_experts
-            )
-        else:
-            self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
-                self.dispatched_indices, self.dispatched_probs
-            )
-        if self.config.moe_router_padding_for_quantization:
-            self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
-                self.dispatched_routing_map, self.tokens_per_expert
-            )
-
-        self.hidden_shape_before_permute = hidden_states.shape
-        assert self.dispatched_probs.dtype == torch.float32, "DeepEP v2 only supports float32 probs"
-        (
-            hidden_states,
-            permuted_probs,
-            self.reversed_mapping_for_combine,
-            self.pad_offsets,
-            self.tokens_per_expert,
-        ) = permute(
-            hidden_states,
-            self.dispatched_routing_map,
-            probs=self.dispatched_probs,
-            num_out_tokens=self.tokens_per_expert.sum().item(),
-            fused=self.permute_fusion,
-            tokens_per_expert=self.tokens_per_expert,
-            align_size=get_align_size_for_quantization(self.config),
-        )
-        if self.router_dtype == "fp64":
-            permuted_probs = permuted_probs.to(torch.float64)
-        return hidden_states, permuted_probs
-
-    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = unpermute(
-            hidden_states,
-            self.reversed_mapping_for_combine,
-            restore_shape=self.hidden_shape_before_permute,
-            routing_map=self.dispatched_routing_map,
-            fused=self.permute_fusion,
-            pad_offsets=self.pad_offsets,
-        )
         return hidden_states
 
 
