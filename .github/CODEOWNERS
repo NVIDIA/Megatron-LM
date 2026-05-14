@@ -20,7 +20,7 @@ megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/c
 
 megatron/core/dist_checkpointing/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-checkpointing
 
-megatron/core/optimizer/distrib_optimizer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+megatron/core/optimizer/distrib_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
 
 megatron/core/inference/modelopt_support @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/quantization-and-inference
 
