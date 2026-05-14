@@ -2928,9 +2928,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         if self.ddp_config.use_megatron_fsdp:
-            # For FSDP, DCP loads checkpoint data directly into main_weight_buffer
-            # (fp32 main params), and a post-load hook copies main → model weights.
-            # Both main params and model params are already correct at this point.
+            # Under FSDP, model and main params live in DP-sharded buffers
+            # managed by ``param_and_grad_buffer``. Reach into each model
+            # chunk and refresh the fp32 main buffer from the (now-loaded)
+            # bf16/fp16 model buffer. This is the analogue of the
+            # non-FSDP branch below — both directions copy model -> main
+            # for the ``--finetune`` / ``--no-load-optim`` path where DCP
+            # populated model weights but not optimizer state.
+            for model_chunk in self.model_chunks:
+                model_chunk.param_and_grad_buffer.copy_model_weights_to_main_weights()
             return
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
