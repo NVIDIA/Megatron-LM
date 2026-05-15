@@ -1643,11 +1643,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        residual = hidden_states
-
         nvtx_range_push(suffix="self_attention_hyper_connection")
-        hidden_states, self_attn_h_res, self_attn_hc_h_post = self.self_attention_hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (
+            self.self_attention_hyper_connection(
+                hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            )
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
 
@@ -1741,10 +1741,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         mhc_mlp_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
 
-        residual = hidden_states
-
         nvtx_range_push(suffix="mlp_hyper_connection")
-        hidden_states, mlp_h_res, mlp_hc_h_post = self.mlp_hyper_connection(
+        hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")

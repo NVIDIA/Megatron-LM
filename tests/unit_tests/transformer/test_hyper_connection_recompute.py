@@ -72,7 +72,7 @@ class TestHyperConnectionCheckpoint:
         # Forward without checkpoint (reference)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module._forward_normal(hidden_states)
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(hidden_states)
         mixed_ref = module.apply_h_res(h_res_ref, residual)
         loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
@@ -83,8 +83,8 @@ class TestHyperConnectionCheckpoint:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = CheckpointManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module._forward_with_checkpoint(
-            hidden_states_ckpt, manager
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = (
+            module._forward_with_checkpoint(hidden_states_ckpt, manager)
         )
         mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
         # Calculate loss before discarding outputs
@@ -181,7 +181,7 @@ class TestHyperConnectionCheckpoint:
         # Reference: forward without manager (uses _forward_normal)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module.forward(
+        aggregated_ref, h_res_ref, h_post_ref, _ = module.forward(
             hidden_states, mhc_recompute_manager=None
         )
         loss_ref = aggregated_ref.sum() + h_res_ref.sum() + h_post_ref.sum()
@@ -192,7 +192,7 @@ class TestHyperConnectionCheckpoint:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = CheckpointManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, _ = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
         loss_ckpt = aggregated_ckpt.sum() + h_res_ckpt.sum() + h_post_ckpt.sum()
@@ -260,7 +260,7 @@ class TestMHCBlockRecomputeIntegration:
         h = hidden_states_ref
         r = residual_ref
         for module in modules:
-            agg, h_res, h_post = module.forward(h, mhc_recompute_manager=None)
+            agg, h_res, h_post, _ = module.forward(h, mhc_recompute_manager=None)
             agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=None)
             mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
             h = agg + mixed
@@ -280,7 +280,7 @@ class TestMHCBlockRecomputeIntegration:
         h = hidden_states_ckpt
         r = residual_ckpt
         for module in modules:
-            agg, h_res, h_post = module.forward(h, mhc_recompute_manager=manager)
+            agg, h_res, h_post, _ = module.forward(h, mhc_recompute_manager=manager)
             agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=manager)
             mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
             h = agg + mixed
@@ -338,7 +338,7 @@ class TestMHCBlockRecomputeIntegration:
         # Reference
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module.forward(
+        aggregated_ref, h_res_ref, h_post_ref, _ = module.forward(
             hidden_states_ref, mhc_recompute_manager=None
         )
         aggregated_ref, _ = module.apply_h_post(
@@ -357,7 +357,7 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = CheckpointManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, _ = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
 

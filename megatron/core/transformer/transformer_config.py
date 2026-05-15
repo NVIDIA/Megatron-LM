@@ -1047,13 +1047,13 @@ class TransformerConfig(ModelParallelConfig):
     """Initial value of Gating Factor (alpha in paper)."""
 
     use_fused_mhc: bool = False
-    """Use cuTile fused kernels for mHC operations.
+    """Use unified fused kernels for mHC operations.
 
     When True, attempts to replace the reference mHC modules (SinkhornKnopp,
-    H_aggregate, H_post_bda, ProjRms) with fused cuda.tile (cuTile) autograd
-    functions for better performance on supported GPUs.  Requires cuTile to be
-    installed; if cuTile is unavailable the flag is silently reset to False and
-    a warning is emitted.
+    H_aggregate, H_post_bda, ProjRms) with fused/autograd implementations for
+    better performance on supported GPUs.  Backend selection is internal and
+    op-specific: Triton for Sinkhorn and H_post_bda backward when available,
+    cuTile for the remaining fused kernels when available, then torch fallback.
     """
 
     mhc_recompute_layer_num: Optional[int] = None
@@ -1815,23 +1815,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
-            try:
-                from megatron.core.fusions.fused_mhc_kernels import is_cutile_available
-
-                if not is_cutile_available():
-                    warnings.warn(
-                        "use_fused_mhc is enabled but cuda.tile (cuTile) is not installed. "
-                        "Falling back to reference mHC implementations.",
-                        UserWarning,
-                    )
-                    self.use_fused_mhc = False
-            except ImportError:
-                warnings.warn(
-                    "use_fused_mhc is enabled but fused_mhc_kernels module could not be "
-                    "imported. Falling back to reference mHC implementations.",
-                    UserWarning,
-                )
-                self.use_fused_mhc = False
 
         if self.fine_grained_activation_offloading:
             assert (
