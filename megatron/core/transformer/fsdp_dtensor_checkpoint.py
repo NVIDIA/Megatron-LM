@@ -31,7 +31,6 @@ try:
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        split_dtensor,
         uneven_dtensor_to_full_tensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
@@ -490,14 +489,6 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             split_dim: Dimension along which to split.
         """
         total_split = sum(split_sizes)
-        if isinstance(data, DTensor) and data.shape[split_dim] == total_split:
-            # GDN tensors are already TP-local here.
-            return list(
-                split_dtensor(
-                    data, split_sizes, dim=split_dim, update_uneven_dtensor_chunk_meta=True
-                )
-            )
-
         # Use dist_param (always a DTensor) for global shape/numel,
         # as data may be a regular Tensor (e.g., optimizer states).
         global_shape = dist_param.shape
