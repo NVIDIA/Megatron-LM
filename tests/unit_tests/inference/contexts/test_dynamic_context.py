@@ -1391,9 +1391,9 @@ class TestDynamicContext:
         num_layers = 10
         num_first = 4
         num_last = 6
-        assert num_first + num_last == num_layers, (
-            "PP=2 with both ends set: all layers must live on first+last stages (no middle ranks)."
-        )
+        assert (
+            num_first + num_last == num_layers
+        ), "PP=2 with both ends set: all layers must live on first+last stages (no middle ranks)."
 
         model_config = TransformerConfig(
             params_dtype=torch.float32,
