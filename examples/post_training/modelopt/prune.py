@@ -22,10 +22,7 @@ import modelopt.torch.prune as mtp
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.export.plugins.megatron_importer import GPTModelImporter
 from modelopt.torch.prune.plugins.mcore_minitron import SUPPORTED_HPARAMS
-from modelopt.torch.utils.dataset_utils import (
-    get_dataset_dataloader,
-    get_supported_datasets,
-)
+from modelopt.torch.utils.dataset_utils import get_dataset_samples, get_supported_datasets
 from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
 from utils import get_hf_tokenizer
 
@@ -316,18 +313,35 @@ if __name__ == "__main__":
     def _hf_dataset_forward_loop_func(model):
         if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"  # better for calibration
 
-        dataloader = get_dataset_dataloader(
-            dataset_name=args.calib_dataset,
-            tokenizer=tokenizer,
-            num_samples=args.calib_size,
-            max_sample_length=args.calib_max_sequence_length,
-            batch_size=1,
-            device="cuda",
+        # WAR for modelopt <= 0.44: pack calibration samples into uniform-length sequences
+        # instead of using `get_dataset_dataloader` (which tokenizes each sample independently
+        # with truncation + padding, discarding long-document context and feeding padding tokens
+        # to the importance estimator). Each calibration sample here is a contiguous slice of
+        # the concatenated token stream, matching what Megatron-Bridge's calibration loop does.
+        # TODO: revert to `get_dataset_dataloader(..., pack=True, ...)` once modelopt 0.45
+        # ships and Megatron-LM bumps the pin (see Model-Optimizer PR #1501).
+        seq_len = args.calib_max_sequence_length
+        # Pull extra raw samples so we have enough tokens to fill `calib_size` packed chunks.
+        # cnn_dailymail articles are ~700-1000 tokens on average; 2x is a safe oversample.
+        samples = get_dataset_samples(args.calib_dataset, num_samples=args.calib_size * 2)
+        sep_id = tokenizer.eos_token_id
+        token_stream: list[int] = []
+        for s in samples:
+            token_stream.extend(tokenizer.encode(s, add_special_tokens=False))
+            token_stream.append(sep_id)
+            if len(token_stream) >= args.calib_size * seq_len:
+                break
+
+        n_chunks = min(args.calib_size, len(token_stream) // seq_len)
+        print_rank_0(
+            f"Calibration packing: {len(samples)} raw samples -> {len(token_stream)} tokens "
+            f"-> {n_chunks} chunks of {seq_len} tokens."
         )
-        for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
-            megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
+        for i in tqdm(range(n_chunks), disable=torch.distributed.get_rank()):
+            chunk = token_stream[i * seq_len : (i + 1) * seq_len]
+            input_ids = torch.tensor([chunk], dtype=torch.long, device="cuda")
+            megatron_prefill(model, input_ids, skip_return_logits=True)
 
     print_rank_0(f"Pruning model with export_config: {args.prune_export_config}")
     config = {"forward_loop": _hf_dataset_forward_loop_func}
