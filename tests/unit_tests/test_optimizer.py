@@ -23,6 +23,10 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.optimizer import (
+    get_param_group_identifier_sort_key,
+    get_param_group_identifier_tuple,
+)
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -67,6 +71,59 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+def test_param_group_identifier_tuple_tolerates_missing_optional_keys():
+    group = {"wd_mult": 1.0, "lr_mult": 1.0, "is_expert_parallel": False, "is_decoupled_lr": False}
+
+    ident = get_param_group_identifier_tuple(group)
+
+    assert ident[:4] == (1.0, 1.0, False, False)
+    assert ident[4:] == (None, None, None, None)
+
+
+def test_param_group_identifier_tuple_reads_pre_keys_and_optional_fields():
+    group = {
+        "pre_wd_mult": 0.0,
+        "pre_lr_mult": 0.5,
+        "pre_is_expert_parallel": False,
+        "pre_is_decoupled_lr": True,
+    }
+
+    ident = get_param_group_identifier_tuple(group)
+
+    assert ident[:4] == (0.0, 0.5, False, True)
+    assert ident[4:] == (None, None, None, None)
+
+
+def test_param_group_identifier_tuple_tolerates_and_sorts_optional_resume_fields():
+    current_group = {
+        "wd_mult": 1.0,
+        "lr_mult": 1.0,
+        "is_expert_parallel": False,
+        "is_decoupled_lr": False,
+        "max_lr": 1e-4,
+        "min_lr": 1e-6,
+        "eps": 1e-8,
+        "optimizer": "adam",
+    }
+    older_checkpoint_group = {
+        "wd_mult": 1.0,
+        "lr_mult": 1.0,
+        "is_expert_parallel": False,
+        "is_decoupled_lr": False,
+    }
+    mixed_groups = [older_checkpoint_group, current_group]
+
+    current_ident = get_param_group_identifier_tuple(current_group)
+    older_ident = get_param_group_identifier_tuple(older_checkpoint_group)
+
+    assert current_ident[:4] == older_ident[:4]
+    assert current_ident[4:] == (1e-4, 1e-6, 1e-8, "adam")
+    assert older_ident[4:] == (None, None, None, None)
+
+    mixed_groups.sort(key=get_param_group_identifier_sort_key)
+    assert mixed_groups == [older_checkpoint_group, current_group]
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
