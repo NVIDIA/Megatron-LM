@@ -22,6 +22,7 @@ def get_hybrid_stack_modelopt_spec(
     local_core_attention: bool = False,
     remap_te_layernorm: bool = False,
     use_default_te_spec: bool = False,
+    moe_grouped_gemm: bool = True,
 ) -> ModuleSpec:
     """Get the hybrid stack spec for ModelOpt PTQ and TensorRT-LLM export.
 
@@ -33,7 +34,9 @@ def get_hybrid_stack_modelopt_spec(
 
     When use_default_te_spec=True, this returns the standard hybrid_stack_spec from
     hybrid_layer_specs.py which uses full TE modules (TELayerNormColumnParallelLinear,
-    TERowParallelLinear, TEDotProductAttention, TENorm, moe_grouped_gemm=True).
+    TERowParallelLinear, TEDotProductAttention, TENorm). MoE experts use
+    TEGroupedMLP iff moe_grouped_gemm=True; ModelOpt flows that operate on
+    per-expert linears (e.g. pruning) should pass moe_grouped_gemm=False.
 
 
     Args:
@@ -42,11 +45,13 @@ def get_hybrid_stack_modelopt_spec(
         remap_te_layernorm: whether to perform sharded state_dict prefix mapping
             on layernorm (only for use_default_te_spec=False)
         use_default_te_spec: whether to use the default Transformer-Engine spec
+        moe_grouped_gemm: whether MoE experts use TEGroupedMLP via grouped GEMM
+            (only for use_default_te_spec=True)
     """
     if use_default_te_spec:
-        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.models.hybrid.hybrid_layer_specs import get_hybrid_stack_spec
 
-        return hybrid_stack_spec
+        return get_hybrid_stack_spec(moe_grouped_gemm=moe_grouped_gemm)
 
     return _get_hybrid_stack_local_spec(
         local_core_attention=local_core_attention, remap_te_layernorm=remap_te_layernorm

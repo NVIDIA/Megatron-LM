@@ -13,6 +13,7 @@ import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
@@ -21,6 +22,7 @@ from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelop
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
+from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
@@ -221,6 +223,18 @@ def modelopt_gpt_hybrid_builder(
                 config=config,
                 use_te=args.transformer_impl == "transformer_engine",
             )
+        elif args.export_default_te_spec:
+            # Use the canonical full Transformer Engine spec (mirrors gpt_builder)
+            # instead of the modelopt-customized spec. Required by pruning, which
+            # operates on the un-customized layer graph.
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                config.num_moe_experts,
+                config.moe_grouped_gemm,
+                config.qk_layernorm,
+                config.multi_latent_attention,
+                config.experimental_attention_variant,
+                qk_l2_norm=config.qk_l2_norm,
+            )
         else:
             if config.context_parallel_size > 1:
                 print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
@@ -262,7 +276,6 @@ def modelopt_gpt_hybrid_builder(
                 DeprecationWarning,
                 stacklevel=2,
             )
-        from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 
         if args.export_default_te_spec and args.export_te_mcore_model:
             logging.getLogger(__name__).warning(
@@ -274,6 +287,7 @@ def modelopt_gpt_hybrid_builder(
         hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model,
             use_default_te_spec=args.export_default_te_spec,
+            moe_grouped_gemm=args.moe_grouped_gemm,
         )
         model_kwargs = {
             "hybrid_stack_spec": hybrid_stack_spec,

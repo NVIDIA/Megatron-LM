@@ -1,148 +1,103 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Sample Generate GPT."""
+"""MMLU evaluation for Megatron-LM models.
+
+The plugin runs a single prefill pass per batch and selects the answer as argmax over
+the choice token logits at the last prompt position (lm-evaluation-harness style),
+instead of autoregressively generating tokens.
+"""
+
+import argparse
 import functools
 import os
 import sys
 import warnings
-import datasets
-import logging
-import torch.distributed as dist
+
+import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
-import torch
-from diskcache import Cache
+import modelopt.torch.quantization as mtq
+from modelopt.torch.utils.plugins import megatron_generate as _mg_plugin
+from modelopt.torch.utils.plugins import megatron_mmlu
+from utils import get_hf_tokenizer
+
+# WAR for modelopt <= 0.44: megatron_prefill's logits slice is non-contiguous when sequence
+# parallelism pads seq_length to a multiple of TP; broadcast_from_last_pipeline_stage asserts
+# contiguity. Fixed upstream for 0.45.
+_orig_broadcast = _mg_plugin.broadcast_from_last_pipeline_stage
+
+
+def _broadcast_contiguous(size, dtype, tensor=None, pp_group=None):
+    if tensor is not None:
+        tensor = tensor.contiguous()
+    return _orig_broadcast(size, dtype, tensor, pp_group)
+
+
+_mg_plugin.broadcast_from_last_pipeline_stage = _broadcast_contiguous
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from utils import get_hf_tokenizer
 from megatron.training.utils import print_rank_0, unwrap_model
-import modelopt.torch.quantization as mtq
 from model_provider import model_provider
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO) # set to debug if you need more logging
+warnings.filterwarnings("ignore")
 
-warnings.filterwarnings('ignore')
 
 def add_mmlu_args(parser):
-    """Add additional arguments for ModelOpt text generation PTQ."""
-    group = parser.add_argument_group(title='ModelOpt text generation ptq')
-    group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
-    group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
-    group.add_argument("--lower-bound", type=float, default=None)
-    group.add_argument("--no-subject-prompt", action="store_true", help="Use empty prompt instead of subject-based prompt.")
-    group.add_argument("--mmlu-dataset", type=str, default="cais/mmlu", help="The default dataset to use is cais/mmlu from the HG hub.")
-    group.add_argument("--cache-dir", type=str, default=None)
+    """Add additional arguments for MMLU evaluation."""
+    group = parser.add_argument_group(title="ModelOpt MMLU evaluation")
+    group.add_argument(
+        "--fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of MMLU test set (per subject) to evaluate on.",
+    )
+    group.add_argument(
+        "--few-shots",
+        type=int,
+        default=0,
+        help="Number of few-shot examples to prepend to each prompt.",
+    )
+    group.add_argument(
+        "--mmlu-batch-size",
+        type=int,
+        default=1,
+        help="Batch size for the batched prefill evaluation.",
+    )
+    group.add_argument(
+        "--lower-bound",
+        type=float,
+        default=None,
+        help="Optional accuracy threshold; the script asserts the average is above this value.",
+    )
+    # Kept for backward compatibility with prior MLM_EXTRA_ARGS callers. Has no effect:
+    # `megatron_mmlu` already disables its progress bar on non-master ranks.
+    group.add_argument("--disable-tqdm", action="store_true", help=argparse.SUPPRESS)
+    group.add_argument(
+        "--mmlu-dataset", type=str, default="cais/mmlu", help=argparse.SUPPRESS
+    )
     add_modelopt_args(parser)
     return parser
 
 
-def get_all_subjects():
-    """Return all MMLU subjects."""
-    return [
-        'abstract_algebra',
-        'anatomy',
-        'astronomy',
-        'business_ethics',
-        'clinical_knowledge',
-        'college_biology',
-        'college_chemistry',
-        'college_computer_science',
-        'college_mathematics',
-        'college_medicine',
-        'college_physics',
-        'computer_security',
-        'conceptual_physics',
-        'econometrics',
-        'electrical_engineering',
-        'elementary_mathematics',
-        'formal_logic',
-        'global_facts',
-        'high_school_biology',
-        'high_school_chemistry',
-        'high_school_computer_science',
-        'high_school_european_history',
-        'high_school_geography',
-        'high_school_government_and_politics',
-        'high_school_macroeconomics',
-        'high_school_mathematics',
-        'high_school_microeconomics',
-        'high_school_physics',
-        'high_school_psychology',
-        'high_school_statistics',
-        'high_school_us_history',
-        'high_school_world_history',
-        'human_aging',
-        'human_sexuality',
-        'international_law',
-        'jurisprudence',
-        'logical_fallacies',
-        'machine_learning',
-        'management',
-        'marketing',
-        'medical_genetics',
-        'miscellaneous',
-        'moral_disputes',
-        'moral_scenarios',
-        'nutrition',
-        'philosophy',
-        'prehistory',
-        'professional_accounting',
-        'professional_law',
-        'professional_medicine',
-        'professional_psychology',
-        'public_relations',
-        'security_studies',
-        'sociology',
-        'us_foreign_policy',
-        'virology',
-        'world_religions',
-    ]
-
-
-def format_example(example, include_answer: bool = True):
-    """Format an example into a multi-choices problem."""
-    prompt = example["question"]
-    for choice, answer in zip(["A", "B", "C", "D"], example["choices"]):
-        prompt += "\n{}. {}".format(choice, answer)
-    if include_answer:
-        prompt += "\nAnswer: {}\n\n".format(["A", "B", "C", "D"][example["answer"]])
-    else:
-        prompt += "\nAnswer:"
-    return prompt
-
-
-def generate_prompt(test_example, dev_examples, few_shots=0, no_subject_prompt=False):
-    """Generating few-shot prompts."""
-    if no_subject_prompt:
-        prompt = ""
-    else:
-        prompt = "The following are multiple choice questions (with answers) about {}.\n\n".format(
-            " ".join(test_example["subject"].split("_"))
-        )
-    for i in range(few_shots):
-        prompt += format_example(dev_examples[i])
-    prompt += format_example(test_example, include_answer=False)
-    return prompt
-
-
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_mmlu_args, args_defaults={
-            'tokenizer_type': 'HuggingFaceTokenizer',
-            'no_load_rng': True,
-            'no_load_optim': True,
-        })
+    parse_and_validate_args(
+        extra_args_provider=add_mmlu_args,
+        args_defaults={
+            "tokenizer_type": "HuggingFaceTokenizer",
+            "no_load_rng": True,
+            "no_load_optim": True,
+        },
+    )
     initialize_megatron()
 
     args = get_args()
-    cache = Cache(args.cache_dir)
+
     # Meta device initialization for ParallelLinear only works if using cpu initialization.
     # Meta device initialization is used such that models can be materialized in low-precision
     # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
@@ -157,7 +112,10 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder),
+        wrap_with_ddp=False,
+    )
     report_current_memory_info()
 
     # Materialize the model from meta device to gpu before loading the checkpoint.
@@ -166,12 +124,12 @@ if __name__ == "__main__":
     unwrapped_model.to_empty(device="cuda")
     report_current_memory_info()
 
-    disable_tqdm = args.disable_tqdm or torch.distributed.get_rank() > 0
-
     tokenizer = get_hf_tokenizer()
 
     if args.load is not None:
-        load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
+        load_modelopt_checkpoint(
+            model, strict=not args.untie_embeddings_and_output_weights
+        )
         print_rank_0("Done loading checkpoint")
 
     # Fold the scalars into weight for speedup.
@@ -179,63 +137,25 @@ if __name__ == "__main__":
     # however, this is not the case when share_embeddings_and_output_weights is False.
     # [TODO]: fold_weight does not support TEGroupedMLP (QuantTEColumnParallelGroupedLinear)
     # which stores per-expert weights as weight0, weight1, etc. instead of a single weight.
-    has_grouped_mlp = any("TEGroupedMLP" in type(m).__name__ for m in unwrapped_model.modules())
-    if not getattr(unwrapped_model, "share_embeddings_and_output_weights", False) and not has_grouped_mlp:
+    has_grouped_mlp = any(
+        "TEGroupedMLP" in type(m).__name__ for m in unwrapped_model.modules()
+    )
+    if (
+        not getattr(unwrapped_model, "share_embeddings_and_output_weights", False)
+        and not has_grouped_mlp
+    ):
         mtq.fold_weight(unwrapped_model)
 
-    all_subjects = get_all_subjects()
-
-    all_correct = {}
-
-    for subject in all_subjects:
-        test_data = datasets.load_dataset(args.mmlu_dataset, subject, split="test")
-        dev_data = datasets.load_dataset(args.mmlu_dataset, subject, split="dev")
-
-        correct = []
-        for idx, test_example in enumerate(test_data):
-            if idx > args.fraction * len(test_data):
-                break
-            label = ["A", "B", "C", "D"][test_example["answer"]]
-            prompt = generate_prompt(test_example, dev_data, few_shots=0, no_subject_prompt=args.no_subject_prompt)
-            cache_key = f"{args.load}_{subject}_{prompt}" # model name, subject, prompt
-
-            if cache_key in cache:
-                predict = cache[cache_key]
-                if dist.get_rank() == 0:
-                    logger.debug(f"Cache hit for {args.load}_{subject}")
-            else:
-                tokens = tokenizer(prompt, return_tensors="pt")
-                with torch.no_grad():
-                    generated_ids = simple_generate(
-                        unwrapped_model, tokens.input_ids.cuda(), osl=2, disable_tqdm=disable_tqdm
-                    )
-                predict = tokenizer.batch_decode(generated_ids)[0].strip()
-                if torch.distributed.get_rank() == 0:
-                    cache.add(cache_key, predict)
-
-            correct += [True] if predict.startswith(label) else [False]
-        all_correct[subject] = correct
-
-        if torch.distributed.get_rank() == 0:
-            print(
-                "{:48}| {:.3f} | {:5}/{:5}".format(
-                    subject, sum(correct) / len(correct), sum(correct), len(correct)
-                ),
-                flush=True,
-            )
-
-    avg_correct = []
-
-    for subject, correct in all_correct.items():
-        avg_correct += correct
-
-    if torch.distributed.get_rank() == 0:
-        print(
-            "{:48}| {:.3f} | {:5}/{:5}".format(
-                "average", sum(avg_correct) / len(avg_correct), sum(avg_correct), len(avg_correct)
-            ),
-            flush=True,
+    with torch.no_grad():
+        avg = megatron_mmlu(
+            unwrapped_model,
+            tokenizer,
+            few_shots=args.few_shots,
+            fraction=args.fraction,
+            batch_size=args.mmlu_batch_size,
         )
 
-        if args.lower_bound is not None:
-            assert sum(avg_correct) / len(avg_correct) > args.lower_bound
+    if torch.distributed.get_rank() == 0 and args.lower_bound is not None:
+        assert avg > args.lower_bound, (
+            f"MMLU accuracy {avg:.4f} below lower bound {args.lower_bound}"
+        )
