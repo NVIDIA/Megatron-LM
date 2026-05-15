@@ -94,17 +94,26 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
-param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+param_group_identifier_keys = (
+    'wd_mult',
+    'lr_mult',
+    'is_expert_parallel',
+    'is_decoupled_lr',
+    'eps',
+    'optimizer',
+)
 param_group_identifier_defaults = {
     'wd_mult': 1.0,
     'lr_mult': 1.0,
     'is_expert_parallel': False,
     'is_decoupled_lr': False,
+    'eps': None,
+    'optimizer': None,
 }
 
 
 def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
-    """Return the stable legacy identifier for optimizer param-group matching and resume."""
+    """Return a stable identifier for optimizer param-group matching and resume."""
     values = []
     for key in param_group_identifier_keys:
         if key in param_group:
@@ -114,6 +123,11 @@ def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
         else:
             values.append(param_group_identifier_defaults[key])
     return tuple(values)
+
+
+def get_param_group_identifier_sort_key(param_group: Dict) -> tuple:
+    """Return a None-safe ordering key for optimizer param-group identifiers."""
+    return tuple((value is not None, value) for value in get_param_group_identifier_tuple(param_group))
 
 
 class MegatronOptimizer(ABC):

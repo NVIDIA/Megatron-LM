@@ -12,12 +12,31 @@ IS_OUTPUT_PARAMETER_ATTR = 'is_output_parameter'
 ROLE_EMBEDDING = 'embedding'
 ROLE_OUTPUT = 'output'
 ROLE_SHARED_EMBEDDING_OUTPUT = 'shared_embedding_output'
+ROLE_BLOCK_OUT_PROJ = 'block_out_proj'
 ROLE_HIDDEN_MATRIX = 'hidden_matrix'
 ROLE_HIDDEN_VECTOR = 'hidden_vector'
+ROLE_HIDDEN_BIAS = 'hidden_bias'
+ROLE_NORM_SCALE = 'norm_scale'
+ROLE_NORM_BIAS = 'norm_bias'
+ROLE_QK_NORM_SCALE = 'qk_norm_scale'
+ROLE_HIDDEN_VECTOR_OTHER = 'hidden_vector_other'
+ROLE_VECTOR_LIKE = 'vector_like'
 ROLE_MUON_MANAGED_MATRIX = 'muon_managed_matrix'
 
 _EMBEDDING_CLASS_ROLES = frozenset((ROLE_EMBEDDING, ROLE_OUTPUT, ROLE_SHARED_EMBEDDING_OUTPUT))
 _OUTPUT_ROLES = frozenset((ROLE_OUTPUT, ROLE_SHARED_EMBEDDING_OUTPUT))
+_HIDDEN_VECTOR_ROLES = frozenset(
+    (
+        ROLE_HIDDEN_VECTOR,
+        ROLE_HIDDEN_BIAS,
+        ROLE_NORM_SCALE,
+        ROLE_NORM_BIAS,
+        ROLE_QK_NORM_SCALE,
+        ROLE_HIDDEN_VECTOR_OTHER,
+        ROLE_VECTOR_LIKE,
+    )
+)
+_NORM_ROLES = frozenset((ROLE_NORM_SCALE, ROLE_NORM_BIAS, ROLE_QK_NORM_SCALE))
 
 
 def set_parameterization_metadata(
@@ -62,10 +81,69 @@ def is_vector_like_parameter(param: Any, param_name: Optional[str] = None) -> bo
     return param.dim() <= 1
 
 
-def is_hidden_matrix_parameter(param: Any, param_name: Optional[str] = None) -> bool:
+def _lower_name(param_name: Optional[str]) -> str:
+    return param_name.lower() if param_name else ''
+
+
+def is_qk_norm_parameter(param: Any, param_name: Optional[str] = None) -> bool:
+    role = get_parameterization_role(param)
+    if role == ROLE_QK_NORM_SCALE:
+        return True
+    name = _lower_name(param_name)
+    return param.dim() <= 1 and ('q_layernorm.' in name or 'k_layernorm.' in name)
+
+
+def is_norm_parameter(param: Any, param_name: Optional[str] = None) -> bool:
+    role = get_parameterization_role(param)
+    if role in _NORM_ROLES:
+        return True
+    if param.dim() > 1:
+        return False
+    name = _lower_name(param_name)
+    return 'layernorm' in name or 'layer_norm' in name or 'rmsnorm' in name or '.norm.' in name
+
+
+def is_hidden_bias_parameter(param: Any, param_name: Optional[str] = None) -> bool:
+    role = get_parameterization_role(param)
+    if role == ROLE_HIDDEN_BIAS:
+        return True
+    if role in _EMBEDDING_CLASS_ROLES or role in _NORM_ROLES:
+        return False
+    name = _lower_name(param_name)
+    return param.dim() <= 1 and name.endswith('.bias') and not is_norm_parameter(param, param_name)
+
+
+def should_skip_depth_mup_vector_weight_decay(
+    param: Any, param_name: Optional[str] = None, *, apply_wd_to_qk_layernorm: bool = False
+) -> bool:
+    """Return true for vector-like params outside the depth-MuP hidden-bias table row."""
     if is_embedding_class_parameter(param, param_name):
         return False
-    return param.dim() > 1
+    if is_hidden_bias_parameter(param, param_name):
+        return False
+    if apply_wd_to_qk_layernorm and is_qk_norm_parameter(param, param_name):
+        return False
+    if is_norm_parameter(param, param_name):
+        return True
+    return param.dim() <= 1
+
+
+def is_hidden_vector_parameter(param: Any, param_name: Optional[str] = None) -> bool:
+    role = get_parameterization_role(param)
+    if role in _HIDDEN_VECTOR_ROLES:
+        return True
+    if role in _EMBEDDING_CLASS_ROLES:
+        return False
+    return param.dim() <= 1 and not is_embedding_class_parameter(param, param_name)
+
+
+def is_hidden_matrix_parameter(param: Any, param_name: Optional[str] = None) -> bool:
+    role = get_parameterization_role(param)
+    if role in (ROLE_HIDDEN_MATRIX, ROLE_BLOCK_OUT_PROJ):
+        return True
+    if role in _HIDDEN_VECTOR_ROLES or role in _EMBEDDING_CLASS_ROLES:
+        return False
+    return param.dim() > 1 and not is_embedding_class_parameter(param, param_name)
 
 
 def is_muon_managed_matrix_parameter(param: Any, *, optimizer_type: str) -> bool:
