@@ -160,6 +160,7 @@ class TestMegatronFSDPE2E:
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
                     use_fully_shard_api=True,
+                    gradient_accumulation_fusion=True,
                 ),
                 id="optim_grads_params_double_buffer",
             ),

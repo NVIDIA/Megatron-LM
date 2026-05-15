@@ -72,12 +72,10 @@ class ParameterGroup:
         self.requires_grad = params[0].requires_grad
         self.mp_policy = mp_policy
         self.is_fp8_group = self.mp_policy.is_fp8_param(params[0])
-        self.needs_transpose_weight_buffer = self.mp_policy.needs_transpose_weight_buffer(
-            params[0]
-        )
-        assert all(self.mp_policy.is_fp8_param(p) == self.is_fp8_group for p in params), (
-            "FP8 and non-FP8 parameters must not share a ParameterGroup"
-        )
+        self.needs_transpose_weight_buffer = self.mp_policy.needs_transpose_weight_buffer(params[0])
+        assert all(
+            self.mp_policy.is_fp8_param(p) == self.is_fp8_group for p in params
+        ), "FP8 and non-FP8 parameters must not share a ParameterGroup"
 
         # Setup device mesh and derived process group
         if mesh is None:
@@ -126,10 +124,7 @@ class ParameterGroup:
                 buffer.allocator = allocator
 
     def _create_buffer(
-        self,
-        dtype: torch.dtype,
-        is_distributed: bool,
-        role: str,
+        self, dtype: torch.dtype, is_distributed: bool, role: str
     ) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
@@ -226,8 +221,7 @@ class ParameterGroup:
         work = None
         for weight_buffer, use_transpose_buffer in buffers:
             full_weight_buffer, weight_work = weight_buffer.unshard(
-                async_op=async_op,
-                bind_params=not self.is_fp8_group,
+                async_op=async_op, bind_params=not self.is_fp8_group
             )
             if work is None:
                 work = weight_work
@@ -290,11 +284,7 @@ class ParameterGroup:
             model_param_shards.append((model_shard, transpose_shard))
 
         self.mp_policy.quantize_main_weights_to_model(
-            fp8_params,
-            main_params,
-            start_offsets,
-            self.dp_group,
-            model_param_shards,
+            fp8_params, main_params, start_offsets, self.dp_group, model_param_shards
         )
 
     def reduce_grad(self):

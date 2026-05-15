@@ -30,10 +30,10 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
     FullyShardMixedPrecisionPolicy,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 
 # ------------------------------------------------------------------ #
@@ -273,10 +273,7 @@ def test_reduce_grad(strategy):
 
             # Pre-populate the allocator so reduce_grad sees the data
             bucket = gbuf.allocator.allocate(
-                key=gbuf.alloc_key,
-                size=full_size,
-                dtype=gbuf.dtype,
-                device=device,
+                key=gbuf.alloc_key, size=full_size, dtype=gbuf.dtype, device=device
             )
             bucket.data.copy_(full)
 

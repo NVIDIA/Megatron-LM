@@ -170,9 +170,10 @@ class FullyShardMixedPrecisionPolicy:
             QUANTIZED_MODEL_INIT_CLASS is not nullcontext
         ), "Transformer Engine is required for FP8 parameter initialization"
         args = {"enabled": True}
-        if "preserve_high_precision_init_val" in inspect.signature(
-            QUANTIZED_MODEL_INIT_CLASS
-        ).parameters:
+        if (
+            "preserve_high_precision_init_val"
+            in inspect.signature(QUANTIZED_MODEL_INIT_CLASS).parameters
+        ):
             args["preserve_high_precision_init_val"] = True
         return QUANTIZED_MODEL_INIT_CLASS(**args)
 
@@ -229,19 +230,16 @@ class FullyShardMixedPrecisionPolicy:
         return tensor.dequantize()
 
     def set_unsharded_weight(
-        self,
-        tensor: torch.Tensor,
-        data: torch.Tensor,
-        transpose: bool = False,
+        self, tensor: torch.Tensor, data: torch.Tensor, transpose: bool = False
     ) -> None:
         """Attach an unsharded FP8 payload to an FP8 parameter."""
-        assert self.is_fp8_param(tensor), (
-            f"Type {type(tensor)} is not a Transformer Engine FP8 tensor"
-        )
+        assert self.is_fp8_param(
+            tensor
+        ), f"Type {type(tensor)} is not a Transformer Engine FP8 tensor"
         if transpose:
-            assert self.needs_transpose_weight_buffer(tensor), (
-                f"Type {type(tensor)} has no transpose payload"
-            )
+            assert self.needs_transpose_weight_buffer(
+                tensor
+            ), f"Type {type(tensor)} has no transpose payload"
             attr = "_columnwise_data"
         else:
             attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
@@ -249,12 +247,12 @@ class FullyShardMixedPrecisionPolicy:
         # Rebind TE's raw uint8 payload to the all-gathered FSDP buffer view.
         old_data = getattr(tensor, attr)
         if old_data is not None:
-            assert old_data.dtype == data.dtype, (
-                f"FP8 raw dtype mismatch: {old_data.dtype} vs {data.dtype}"
-            )
-            assert old_data.shape == data.shape, (
-                f"FP8 raw shape mismatch: {old_data.shape} vs {data.shape}"
-            )
+            assert (
+                old_data.dtype == data.dtype
+            ), f"FP8 raw dtype mismatch: {old_data.dtype} vs {data.dtype}"
+            assert (
+                old_data.shape == data.shape
+            ), f"FP8 raw shape mismatch: {old_data.shape} vs {data.shape}"
         setattr(tensor, attr, data)
 
     def post_unshard(self, params: List[torch.Tensor], is_bwd: bool = False) -> None:
@@ -320,11 +318,7 @@ class FullyShardMixedPrecisionPolicy:
     ) -> None:
         """Quantize high-precision main weights into FP8 model-weight shards."""
         quantize_main_weights_to_fp8(
-            model_params,
-            main_params,
-            start_offsets,
-            data_parallel_group,
-            fsdp_shard_model_params,
+            model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
         )
 
 

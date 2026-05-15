@@ -51,10 +51,7 @@ class BucketAllocator:
         raise NotImplementedError
 
     def free(
-        self,
-        key: Optional[AllocatorKey] = None,
-        *,
-        param_group_id: Optional[AllocatorKey] = None,
+        self, key: Optional[AllocatorKey] = None, *, param_group_id: Optional[AllocatorKey] = None
     ) -> None:
         """Free the bucket associated with the given key."""
         raise NotImplementedError
@@ -87,10 +84,7 @@ class TemporaryBucketAllocator(BucketAllocator):
         return self.buckets[key]
 
     def free(
-        self,
-        key: Optional[AllocatorKey] = None,
-        *,
-        param_group_id: Optional[AllocatorKey] = None,
+        self, key: Optional[AllocatorKey] = None, *, param_group_id: Optional[AllocatorKey] = None
     ) -> None:
         key = _resolve_key(key, param_group_id)
         if key in self.buckets:
@@ -127,10 +121,7 @@ class StorageFreeingBucketAllocator(BucketAllocator):
         return self.buckets[key]
 
     def free(
-        self,
-        key: Optional[AllocatorKey] = None,
-        *,
-        param_group_id: Optional[AllocatorKey] = None,
+        self, key: Optional[AllocatorKey] = None, *, param_group_id: Optional[AllocatorKey] = None
     ) -> None:
         key = _resolve_key(key, param_group_id)
         if key in self.buckets:
@@ -259,10 +250,7 @@ class TracePoolAllocator(BucketAllocator):
         return self._pool_allocate(key, size, dtype, device)
 
     def free(
-        self,
-        key: Optional[AllocatorKey] = None,
-        *,
-        param_group_id: Optional[AllocatorKey] = None,
+        self, key: Optional[AllocatorKey] = None, *, param_group_id: Optional[AllocatorKey] = None
     ) -> None:
         """Dispatch to trace or pool path depending on phase."""
         key = _resolve_key(key, param_group_id)
@@ -326,10 +314,7 @@ class TracePoolAllocator(BucketAllocator):
                         size, dtype, device = meta
                         intervals.append(
                             self._Interval(
-                                key=ev.key,
-                                size=size,
-                                alloc_seq=alloc_seq,
-                                free_seq=ev.seq,
+                                key=ev.key, size=size, alloc_seq=alloc_seq, free_seq=ev.seq
                             )
                         )
 
@@ -455,9 +440,7 @@ class TracePoolAllocator(BucketAllocator):
             f"slot {slot_idx} already in use (key={key}, "
             f"cursor={cursor}, slot_list={slot_list})"
         )
-        assert (
-            size <= slot.size
-        ), f"requested {size} > slot capacity {slot.size} (key={key})"
+        assert size <= slot.size, f"requested {size} > slot capacity {slot.size} (key={key})"
         pool = self._pools[(slot.dtype, slot.device)]
         slot.in_use = True
         self._seq += 1
