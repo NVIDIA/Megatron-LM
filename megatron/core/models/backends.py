@@ -179,7 +179,7 @@ class InferenceSpecProvider(BackendSpecProvider):
 
     @override
     def row_parallel_linear(self) -> type[InferenceRowParallelLinear]:
-        """Which row parallel linear module TE backend uses"""
+        """Which row parallel linear module Inference backend uses"""
         return InferenceRowParallelLinear
 
     @override
