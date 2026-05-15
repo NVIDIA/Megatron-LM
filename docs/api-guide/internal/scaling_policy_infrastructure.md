@@ -56,6 +56,8 @@ rules:
 - SGD vector-like parameters use `lr * mup_width_mult`;
 - Muon-managed matrices stay on Muon scaling rather than Adam-style MuP LR
   overrides.
+- Muon-family nonlinear and embedding-class scalar parameters are routed through
+  the configured scalar optimizer, currently `adam` or `lion`.
 
 For `depth_mup`, the policy is Adam/AdamW-only. Nonzero weight decay requires
 `decoupled_weight_decay=True`; coupled Adam/L2 is allowed only with

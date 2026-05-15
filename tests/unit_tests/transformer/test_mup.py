@@ -44,7 +44,11 @@ from megatron.core.transformer.transformer_layer import (
     _get_mlp_builder_module,
 )
 from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal
-from megatron.training.arguments import add_megatron_arguments, validate_depth_mup_optimizer_support
+from megatron.training.arguments import (
+    add_megatron_arguments,
+    validate_depth_mup_optimizer_support,
+    validate_muon_scalar_optimizer_support,
+)
 from megatron.training.yaml_arguments import core_config_from_args
 
 
@@ -329,6 +333,17 @@ class TestMuPConfigValidation:
                 scaling_recipe='depth_mup',
                 mtp_num_layers=1,
             )
+
+    def test_muon_scalar_optimizer_gate_rejects_invalid_yaml_value(self):
+        with pytest.raises(ValueError, match='muon_scalar_optimizer'):
+            validate_muon_scalar_optimizer_support(
+                SimpleNamespace(muon_scalar_optimizer='sgd')
+            )
+
+    def test_muon_scalar_optimizer_gate_accepts_supported_values(self):
+        validate_muon_scalar_optimizer_support(SimpleNamespace(muon_scalar_optimizer='adam'))
+        validate_muon_scalar_optimizer_support(SimpleNamespace(muon_scalar_optimizer='lion'))
+        validate_muon_scalar_optimizer_support(SimpleNamespace())
 
 
 class TestScalingRecipeSurfaces:

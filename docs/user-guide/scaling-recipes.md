@@ -48,6 +48,11 @@ scale, and optimizer multipliers. `--mup-width-mult` is no longer an independent
 input. If it is provided on the CLI for compatibility, it must match the derived
 value.
 
+When MuP is combined with Muon-family optimizers, Muon-managed matrix parameters
+keep Muon's spectral scaling. Nonlinear and embedding-class scalar parameters
+are routed through `--muon-scalar-optimizer`, which currently accepts `adam` or
+`lion`.
+
 ## Legacy MuP Flags
 
 The following flags are accepted for checkpoint and script compatibility, but are
