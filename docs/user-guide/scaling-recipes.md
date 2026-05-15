@@ -12,12 +12,13 @@
 Scaling recipes choose the parameterization used to transfer hyperparameters
 between model sizes. The canonical flag is `--scaling-recipe`.
 
-Megatron currently exposes two recipes:
+Megatron currently exposes three recipes:
 
 | Recipe | Behavior |
 | --- | --- |
 | `none` | Standard Megatron parameterization. This is the default. |
 | `mup` | Width MuP for hidden-size transfer. |
+| `depth_mup` | Experimental dense-transformer width-depth MuP for AdamW-style training. |
 
 ## Standard Parameterization
 
@@ -62,6 +63,59 @@ deprecated as user-facing inputs:
 `--mup-embedding-mult`, `--mup-output-mult`, and `--mup-attn-scale-power` remain
 MuP-specific tuning knobs. When `--mup-output-mult` is left at `1.0`, Megatron
 sets it to `1 / width_mult` for non-base widths.
+
+## Depth MuP
+
+Use `--scaling-recipe depth_mup` when transferring from a base width and depth to
+a target dense GPT-style transformer width and depth.
+
+```bash
+--scaling-recipe depth_mup \
+--scaling-base-hidden-size 1024 \
+--scaling-base-num-layers 12 \
+--scaling-base-head-dim 64
+```
+
+Megatron derives both multipliers internally:
+
+```text
+width_mult = hidden_size / scaling_base_hidden_size
+depth_mult = num_layers / scaling_base_num_layers
+```
+
+`depth_mup` includes the width-MuP model-side behavior, plus depth-aware residual
+branch scaling, dense block output-projection initialization, and Adam/AdamW
+optimizer multipliers. The default depth behavior is:
+
+| Mechanism | Default multiplier |
+| --- | --- |
+| Dense self-attention and dense MLP residual branch output | `depth_mult^-1` |
+| Hidden matrix Adam LR | `width_mult^-1` |
+| Hidden matrix Adam epsilon | `(width_mult * depth_mult)^-1` |
+| Hidden vector Adam epsilon | `(width_mult * depth_mult)^-1` |
+| Embedding/output-class Adam epsilon | `width_mult^-1` |
+| Hidden matrix AdamW weight decay | `width_mult` |
+| Dense block output-projection initialization | `depth_mult^+0.5` |
+
+`depth_mup` is intentionally narrow. It currently supports `--optimizer adam`.
+If `weight_decay` is nonzero, the optimizer must use AdamW-style decoupled
+weight decay (`decoupled_weight_decay=True`). Coupled Adam/L2 is allowed only
+with `weight_decay=0.0`.
+
+Megatron also keeps the standard distinction between hidden biases and
+normalization vectors. Under `depth_mup`, hidden linear/attention/MLP biases keep
+base weight decay, while normalization vectors and otherwise unknown 1-D tensors
+stay on the conservative no-weight-decay path. q/k layernorm vectors use weight
+decay only when `apply_wd_to_qk_layernorm=True`.
+
+The supported runtime path is training. Megatron's validation-loss path enables
+the required internal scaling-policy eval context automatically. This does not
+make generation, inference, or fused TP inference residual scaling supported.
+
+The current implementation fails closed for unsupported surfaces, including
+cross-attention, hybrid/Mamba layer patterns, MTP, multi-latent attention,
+experimental attention variants, MoE, non-Adam optimizers, and TE fused MLPs
+when nontrivial dense block output-init depth scaling would be required.
 
 ## Checkpoints and YAML
 

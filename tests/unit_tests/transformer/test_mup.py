@@ -11,6 +11,7 @@ These tests verify that MuP is correctly implemented in Megatron-LM:
 
 import argparse
 import dataclasses
+import functools
 import logging
 import math
 import warnings
@@ -28,15 +29,30 @@ from megatron.core.optimizer import (
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
 from megatron.core.parameterization import (
+    allow_scaling_policy_eval,
     build_legacy_mup_training_policy,
     build_model_scaling_policy,
     build_scaling_context,
+    build_training_scaling_policy,
 )
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import (
+    TransformerLayer,
+    TransformerLayerSubmodules,
+    _get_mlp_builder_module,
+)
 from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal
-from megatron.training.arguments import add_megatron_arguments
+from megatron.training.arguments import add_megatron_arguments, validate_depth_mup_optimizer_support
 from megatron.training.yaml_arguments import core_config_from_args
+
+
+def _combined_override_for_param(overrides, param, param_name):
+    matches = [
+        override for param_key, override in overrides.items() if param_key.matches(param, param_name)
+    ]
+    return combine_param_group_overrides(matches)
 
 
 class TestMuPConfigValidation:
@@ -201,6 +217,119 @@ class TestMuPConfigValidation:
                 scaling_base_hidden_size=256,
             )
 
+    def test_depth_mup_resolves_distinct_recipe_defaults(self):
+        """Depth-MuP is width-MuP-family behavior without setting the legacy use_mup bit."""
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_base_head_dim=64,
+        )
+        context = build_scaling_context(config)
+
+        assert config.scaling_recipe == 'depth_mup'
+        assert config.use_mup is False
+        assert context.uses_width_mup is True
+        assert context.is_depth_mup is True
+        assert context.width_mult == pytest.approx(4.0)
+        assert context.depth_mult == pytest.approx(2.0)
+        assert context.base_hidden_size == 256
+        assert context.base_num_layers == 6
+        assert context.base_head_dim == 64
+        assert context.residual_branch_depth_power == pytest.approx(-1.0)
+        assert context.hidden_lr_depth_power == pytest.approx(0.0)
+        assert context.block_out_proj_init_depth_power == pytest.approx(0.5)
+        assert context.output_mult == pytest.approx(0.25)
+
+    def test_depth_mup_manual_overrides_can_zero_recipe_defaults(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_residual_branch_depth_power=0.0,
+            scaling_block_out_proj_init_depth_power=0.0,
+        )
+        context = build_scaling_context(config)
+
+        assert context.residual_branch_depth_power == pytest.approx(0.0)
+        assert context.block_out_proj_init_depth_power == pytest.approx(0.0)
+
+    def test_mup_does_not_inherit_depth_mup_defaults(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+        )
+        context = build_scaling_context(config)
+
+        assert context.recipe == 'mup'
+        assert context.depth_mult == pytest.approx(2.0)
+        assert context.residual_branch_depth_power == pytest.approx(0.0)
+        assert context.hidden_lr_depth_power == pytest.approx(0.0)
+        assert context.block_out_proj_init_depth_power == pytest.approx(0.0)
+
+    def test_depth_mup_conflicts_with_legacy_use_mup_alias(self):
+        with pytest.raises(ValueError, match='conflicts with --use-mup'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='depth_mup',
+                use_mup=True,
+            )
+
+    def test_depth_mup_rejects_unsupported_attention_and_moe_surfaces(self):
+        with pytest.raises(NotImplementedError, match='multi_latent_attention'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='depth_mup',
+                multi_latent_attention=True,
+            )
+        with pytest.raises(NotImplementedError, match='experimental attention variants'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='depth_mup',
+                experimental_attention_variant='gated_delta_net',
+                linear_attention_freq=1,
+            )
+        with pytest.raises(NotImplementedError, match='MoE depth transfer'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='depth_mup',
+                num_moe_experts=4,
+            )
+        with pytest.raises(NotImplementedError, match='Hybrid/Mamba'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='depth_mup',
+                is_hybrid_model=True,
+            )
+        with pytest.raises(NotImplementedError, match='MTP depth transfer'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='depth_mup',
+                mtp_num_layers=1,
+            )
+
 
 class TestScalingRecipeSurfaces:
     """Tests for public config surfaces that feed the scaling context."""
@@ -208,7 +337,11 @@ class TestScalingRecipeSurfaces:
     SCALING_FIELD_NAMES = {
         'scaling_recipe',
         'scaling_base_hidden_size',
+        'scaling_base_num_layers',
         'scaling_base_head_dim',
+        'scaling_residual_branch_depth_power',
+        'scaling_hidden_lr_depth_power',
+        'scaling_block_out_proj_init_depth_power',
         'use_mup',
         'mup_width_mult',
         'mup_base_hidden_size',
@@ -238,6 +371,23 @@ class TestScalingRecipeSurfaces:
         assert args.scaling_base_hidden_size == 256
         assert args.mup_base_head_dim == 64
         assert args.mup_width_mult == 1.0
+
+        depth_args, _ = parser.parse_known_args(
+            [
+                '--scaling-recipe',
+                'depth_mup',
+                '--scaling-base-hidden-size',
+                '256',
+                '--scaling-base-num-layers',
+                '6',
+                '--scaling-residual-branch-depth-power',
+                '-1.0',
+            ]
+        )
+
+        assert depth_args.scaling_recipe == 'depth_mup'
+        assert depth_args.scaling_base_num_layers == 6
+        assert depth_args.scaling_residual_branch_depth_power == pytest.approx(-1.0)
 
     def test_cli_explicit_mup_width_mult_one_is_validated(self):
         """Explicit legacy width multiplier must match the derived value, even at 1.0."""
@@ -441,6 +591,97 @@ class TestScalingRecipeSurfaces:
         assert runtime_args.scaling_base_head_dim is None
         assert runtime_args.mup_base_head_dim is None
         assert runtime_args.mup_width_mult == pytest.approx(4.0)
+
+    def test_load_checkpoint_args_restores_depth_mup_scaling_fields(self, monkeypatch):
+        """use-checkpoint-args must preserve the canonical depth-MuP surface."""
+        from megatron.training import checkpointing
+
+        checkpoint_args = SimpleNamespace(
+            num_layers=12,
+            hidden_size=1024,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_base_head_dim=64,
+            scaling_residual_branch_depth_power=-1.0,
+            scaling_hidden_lr_depth_power=0.0,
+            scaling_block_out_proj_init_depth_power=0.5,
+            use_mup=False,
+            mup_width_mult=1.0,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_attn_scale_power=1.0,
+        )
+        state_dict = {'args': checkpoint_args, 'iteration': 11}
+        monkeypatch.setattr(
+            checkpointing,
+            '_load_base_checkpoint',
+            lambda *args, **kwargs: (state_dict, 'model_optim_rng.pt', False, None),
+        )
+        runtime_args = SimpleNamespace(
+            load='dummy-checkpoint',
+            iteration=0,
+            use_tokenizer_model_from_checkpoint_args=False,
+            use_mp_args_from_checkpoint_args=False,
+        )
+
+        checkpointing.load_args_from_checkpoint(runtime_args)
+
+        assert runtime_args.iteration == 11
+        assert runtime_args.use_mup is False
+        assert runtime_args.scaling_recipe == 'depth_mup'
+        assert runtime_args.scaling_base_hidden_size == 256
+        assert runtime_args.scaling_base_num_layers == 6
+        assert runtime_args.scaling_base_head_dim == 64
+        assert runtime_args.scaling_residual_branch_depth_power == pytest.approx(-1.0)
+        assert runtime_args.scaling_hidden_lr_depth_power == pytest.approx(0.0)
+        assert runtime_args.scaling_block_out_proj_init_depth_power == pytest.approx(0.5)
+
+    def test_distributed_resume_preprocessing_tolerates_missing_optional_group_keys(self):
+        """Distributed resume sorting must tolerate groups without eps/optimizer."""
+        from megatron.training.training import preprocess_common_state_dict
+
+        common_state_dict = {
+            'args': SimpleNamespace(
+                use_distributed_optimizer=True,
+                rank=3,
+                local_rank=1,
+            ),
+            'optimizer': {
+                'optimizer': {
+                    'param_groups': [
+                        {
+                            'wd_mult': 1.0,
+                            'lr_mult': 1.0,
+                            'is_expert_parallel': False,
+                            'is_decoupled_lr': False,
+                            'max_lr': 1.0e-3,
+                            'min_lr': 1.0e-5,
+                            'eps': 1.0e-8,
+                            'optimizer': 'adam',
+                            'params': [1],
+                        },
+                        {
+                            'wd_mult': 1.0,
+                            'lr_mult': 1.0,
+                            'is_expert_parallel': False,
+                            'is_decoupled_lr': False,
+                            'max_lr': 1.0e-3,
+                            'min_lr': 1.0e-5,
+                            'params': [0],
+                        },
+                    ]
+                }
+            },
+        }
+
+        preprocessed = preprocess_common_state_dict(common_state_dict)
+
+        param_groups = preprocessed['optimizer']['optimizer']['param_groups']
+        assert [group['params'] for group in param_groups] == [[0], [1]]
+        assert 'rank' not in preprocessed['args']
+        assert 'local_rank' not in preprocessed['args']
 
     def test_load_non_mup_checkpoint_clears_width_mult_provenance(self, monkeypatch):
         """Old no-scaling checkpoints must clear stale CLI scaling state."""
@@ -922,6 +1163,206 @@ class TestMuPConfigIntegration:
         actual_std = tensor.std().item()
 
         assert abs(actual_std - expected_std) < expected_std * 0.15
+
+    def test_depth_mup_residual_multiplier_exact_depth_factors(self):
+        base_depth_config = TransformerConfig(
+            hidden_size=512,
+            num_layers=12,
+            num_attention_heads=8,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=512,
+            scaling_base_num_layers=12,
+        )
+        double_depth_config = TransformerConfig(
+            hidden_size=512,
+            num_layers=24,
+            num_attention_heads=8,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=512,
+            scaling_base_num_layers=12,
+        )
+
+        assert build_model_scaling_policy(base_depth_config).residual_branch_multiplier == pytest.approx(1.0)
+        assert build_model_scaling_policy(double_depth_config).residual_branch_multiplier == pytest.approx(0.5)
+
+    def test_depth_mup_default_block_output_init_rebases_to_base_depth(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+        )
+        policy = build_model_scaling_policy(config)
+        init_fn = policy.dense_block_output_init_method(
+            default_init_method=config.output_layer_init_method,
+            init_method_std=config.init_method_std,
+            num_layers=config.num_layers,
+            is_hybrid_model=config.is_hybrid_model,
+            output_layer_init_method_is_user_provided=False,
+        )
+        weights = torch.empty(200_000)
+        init_fn(weights)
+
+        expected_std = config.init_method_std / (
+            math.sqrt(2 * config.scaling_base_num_layers) * math.sqrt(policy.context.width_mult)
+        )
+        assert abs(weights.std().item() - expected_std) < expected_std * 0.05
+
+    def test_plain_mlp_requires_explicit_block_output_init_scaling_opt_in(self):
+        class DummyLinear(torch.nn.Module):
+            def __init__(self, init_method):
+                super().__init__()
+                self.init_method = init_method
+
+            def forward(self, hidden_states):
+                return hidden_states, None
+
+            def backward_dw(self):
+                return None
+
+        def fc1_builder(input_size, output_size, *, init_method, **kwargs):
+            return DummyLinear(init_method)
+
+        def fc2_builder(input_size, output_size, *, init_method, **kwargs):
+            return DummyLinear(init_method)
+
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_block_out_proj_init_depth_power=-0.5,
+        )
+        submodules = MLPSubmodules(linear_fc1=fc1_builder, linear_fc2=fc2_builder)
+
+        plain_mlp = MLP(config, submodules, apply_block_output_init_scaling=False)
+        scaled_mlp = MLP(config, submodules, apply_block_output_init_scaling=True)
+
+        assert plain_mlp.linear_fc2.init_method is config.output_layer_init_method
+        assert scaled_mlp.linear_fc2.init_method is not config.output_layer_init_method
+
+    def test_partial_mlp_builder_receives_block_output_init_scaling_opt_in(self):
+        class DummyLinear(torch.nn.Module):
+            def __init__(self, init_method):
+                super().__init__()
+                self.init_method = init_method
+
+            def forward(self, hidden_states):
+                return hidden_states, None
+
+            def backward_dw(self):
+                return None
+
+        def fc1_builder(input_size, output_size, *, init_method, **kwargs):
+            return DummyLinear(init_method)
+
+        def fc2_builder(input_size, output_size, *, init_method, **kwargs):
+            return DummyLinear(init_method)
+
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+        )
+        submodules = MLPSubmodules(linear_fc1=fc1_builder, linear_fc2=fc2_builder)
+        mlp_builder = functools.partial(MLP.as_mlp_submodule, submodules=submodules)
+
+        assert _get_mlp_builder_module(mlp_builder) is MLP
+
+        additional_mlp_kwargs = {"apply_block_output_init_scaling": True}
+        mlp = mlp_builder(
+            config=config,
+            pg_collection=SimpleNamespace(tp=None),
+            is_mtp_layer=False,
+            **additional_mlp_kwargs,
+        )
+
+        assert mlp.linear_fc2.init_method is not config.output_layer_init_method
+
+    def test_transformer_layer_residual_branch_scaling_helper(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_residual_branch_depth_power=-0.5,
+        )
+        layer = object.__new__(TransformerLayer)
+        layer.model_scaling_policy = build_model_scaling_policy(config)
+
+        output = torch.ones(4, 8)
+        bias = torch.ones(8)
+        scaled_output, scaled_bias = layer._scale_dense_residual_branch_output(
+            (output, bias), branch_name='self attention', using_fused_tp_inference_kernel=False
+        )
+        expected_mult = (
+            config.num_layers / config.scaling_base_num_layers
+        ) ** config.scaling_residual_branch_depth_power
+        assert torch.equal(scaled_output, output * expected_mult)
+        assert torch.equal(scaled_bias, bias * expected_mult)
+
+        with pytest.raises(NotImplementedError, match='Residual-branch scaling'):
+            layer._scale_dense_residual_branch_output(
+                (output, bias), branch_name='self attention', using_fused_tp_inference_kernel=True
+            )
+
+    def test_allow_scaling_policy_eval_allows_unfused_validation_scaling(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=24,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=12,
+        )
+        layer = object.__new__(TransformerLayer)
+        layer.model_scaling_policy = build_model_scaling_policy(config)
+        layer.training = False
+
+        output = torch.ones(2, 2)
+        bias = torch.full((2, 2), 3.0)
+        with pytest.raises(NotImplementedError, match='during inference'):
+            layer._scale_dense_residual_branch_output(
+                (output, bias), branch_name='self attention', using_fused_tp_inference_kernel=False
+            )
+
+        with allow_scaling_policy_eval(True):
+            scaled_output, scaled_bias = layer._scale_dense_residual_branch_output(
+                (output, bias), branch_name='self attention', using_fused_tp_inference_kernel=False
+            )
+
+        assert torch.equal(scaled_output, output * 0.5)
+        assert torch.equal(scaled_bias, bias * 0.5)
+
+    def test_transformer_layer_rejects_cross_attention_for_depth_mup(self):
+        class DummyCrossAttention(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+
+            def forward(self, *args, **kwargs):
+                return torch.ones(1, 1, 1), None
+
+        config = TransformerConfig(
+            hidden_size=16,
+            num_layers=12,
+            num_attention_heads=4,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=8,
+            scaling_base_num_layers=6,
+        )
+        submodules = TransformerLayerSubmodules(cross_attention=DummyCrossAttention)
+
+        with pytest.raises(NotImplementedError, match='Cross-attention is out of scope for v1'):
+            TransformerLayer(config=config, submodules=submodules)
 
 
 class TestMuPOptimizerTypeHandling:
