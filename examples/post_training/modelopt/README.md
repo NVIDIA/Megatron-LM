@@ -185,9 +185,9 @@ MLM_MODEL_SAVE=Qwen3-8B-Pruned \
 ./prune.sh Qwen/Qwen3-8B
 ```
 
-The default calibration dataset is `cnn_dailymail`. Override it by adding
-`--calib-dataset <hf_dataset_name_or_local_jsonl>` to `MLM_EXTRA_ARGS`
-(e.g. `nemotron-post-training-dataset-v2` — gated, requires `hf auth login`).
+The default calibration dataset is `nemotron-post-training-dataset-v2` (gated, requires
+`hf auth login`). Override it by adding `--calib-dataset <hf_dataset_name_or_local_jsonl>`
+to `MLM_EXTRA_ARGS` (e.g. `cnn_dailymail` for an ungated alternative).
 
 > [!TIP]
 > If number of layers in the model is not divisible by pipeline parallel size (PP), you can configure uneven

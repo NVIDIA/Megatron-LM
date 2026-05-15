@@ -146,7 +146,7 @@ def add_prune_args(parser):
     group.add_argument(
         "--calib-dataset",
         type=str,
-        default="cnn_dailymail",
+        default="nemotron-post-training-dataset-v2",
         help=(
             f"HF Dataset name or local .jsonl path for calibration "
             f"(supported options: {', '.join(get_supported_datasets())}). "

@@ -82,7 +82,7 @@ def add_text_generate_ptq_args(parser):
     group.add_argument(
         "--calib-dataset-path-or-name",
         type=str,
-        default="cnn_dailymail",
+        default="nemotron-post-training-dataset-v2",
         help="Path to local calibration dataset file (.jsonl) or HuggingFace dataset name.",
     )
     group.add_argument(
