@@ -123,6 +123,8 @@ class BroadcastTensorFused(torch.autograd.Function):
         if len(grads) == 2:
             return grads[0] + grads[1], None
         return ctx.fused_add_3_fn(grad1, grad2, grad3), None
+
+
 def learned_output_contract(
     hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
 ) -> Tensor:
