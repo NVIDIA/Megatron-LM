@@ -9,8 +9,12 @@ These tests verify that MuP is correctly implemented in Megatron-LM:
 4. LR override computation
 """
 
+import argparse
+import dataclasses
 import logging
 import math
+import warnings
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -26,10 +30,13 @@ from megatron.core.optimizer_param_scheduler import combine_param_group_override
 from megatron.core.parameterization import (
     build_legacy_mup_training_policy,
     build_model_scaling_policy,
+    build_scaling_context,
 )
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal
+from megatron.training.arguments import add_megatron_arguments
+from megatron.training.yaml_arguments import core_config_from_args
 
 
 class TestMuPConfigValidation:
@@ -46,6 +53,8 @@ class TestMuPConfigValidation:
         )
         assert config.mup_base_hidden_size == 512
         assert config.mup_width_mult == 1.0
+        assert config.scaling_recipe == 'mup'
+        assert config.scaling_base_hidden_size == 512
 
     def test_mup_width_mult_calculation(self):
         """width_mult = hidden_size / base_hidden_size."""
@@ -57,6 +66,8 @@ class TestMuPConfigValidation:
             mup_base_hidden_size=256,
         )
         assert config.mup_width_mult == 4.0
+        assert config.scaling_recipe == 'mup'
+        assert config.scaling_base_hidden_size == 256
 
     def test_mup_width_mult_fractional(self):
         """width_mult can be fractional (smaller than base)."""
@@ -75,6 +86,8 @@ class TestMuPConfigValidation:
         assert config.use_mup is False
         assert config.mup_width_mult == 1.0
         assert config.mup_base_hidden_size is None
+        assert config.scaling_recipe == 'none'
+        assert config.scaling_base_hidden_size is None
 
     def test_mup_base_hidden_size_must_be_positive(self):
         """mup_base_hidden_size must be positive."""
@@ -87,6 +100,464 @@ class TestMuPConfigValidation:
                 mup_base_hidden_size=0,
             )
         assert "positive" in str(exc_info.value).lower()
+
+    def test_scaling_recipe_mup_sets_legacy_fields(self):
+        """Canonical MuP fields populate the legacy fields used by existing call sites."""
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=4,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_head_dim=64,
+        )
+
+        assert config.use_mup is True
+        assert config.mup_base_hidden_size == 256
+        assert config.mup_base_head_dim == 64
+        assert config.mup_width_mult == pytest.approx(4.0)
+        assert config.scaling_base_hidden_size == 256
+        assert config.scaling_base_head_dim == 64
+
+    def test_legacy_mup_fields_resolve_to_canonical_recipe(self):
+        """Legacy MuP flags remain compatible but are not separate state."""
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=4,
+            num_attention_heads=16,
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_base_head_dim=64,
+        )
+
+        assert config.scaling_recipe == 'mup'
+        assert config.scaling_base_hidden_size == 256
+        assert config.scaling_base_head_dim == 64
+        assert build_scaling_context(config).width_mult == pytest.approx(4.0)
+
+    def test_scaling_recipe_none_rejects_scaling_overrides(self):
+        """Scaling fields cannot silently affect standard parameterization."""
+        with pytest.raises(ValueError, match="Scaling overrides"):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=4,
+                num_attention_heads=16,
+                scaling_recipe='none',
+                scaling_base_hidden_size=256,
+            )
+
+    def test_use_mup_conflicts_with_scaling_recipe_none(self):
+        """The deprecated MuP boolean cannot override an explicit canonical recipe."""
+        with pytest.raises(ValueError, match="conflicts"):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=4,
+                num_attention_heads=16,
+                scaling_recipe='none',
+                use_mup=True,
+            )
+
+    def test_canonical_and_legacy_base_hidden_must_match(self):
+        """Canonical and deprecated base hidden-size fields are aliases."""
+        with pytest.raises(ValueError, match="conflicts"):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=4,
+                num_attention_heads=16,
+                scaling_recipe='mup',
+                scaling_base_hidden_size=256,
+                mup_base_hidden_size=512,
+            )
+
+    def test_deprecated_width_mult_must_match_derived_value(self):
+        """mup_width_mult is accepted only when it matches the derived width."""
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=4,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            mup_width_mult=4.0,
+        )
+        assert config.mup_width_mult == pytest.approx(4.0)
+
+        with pytest.raises(ValueError, match="must match the derived"):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=4,
+                num_attention_heads=16,
+                scaling_recipe='mup',
+                scaling_base_hidden_size=256,
+                mup_width_mult=2.0,
+            )
+
+    def test_scaling_override_without_recipe_is_rejected(self):
+        """Base scaling fields do not implicitly enable MuP."""
+        with pytest.raises(ValueError, match="Scaling overrides"):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=4,
+                num_attention_heads=16,
+                scaling_base_hidden_size=256,
+            )
+
+
+class TestScalingRecipeSurfaces:
+    """Tests for public config surfaces that feed the scaling context."""
+
+    SCALING_FIELD_NAMES = {
+        'scaling_recipe',
+        'scaling_base_hidden_size',
+        'scaling_base_head_dim',
+        'use_mup',
+        'mup_width_mult',
+        'mup_base_hidden_size',
+        'mup_embedding_mult',
+        'mup_output_mult',
+        'mup_base_head_dim',
+        'mup_attn_scale_power',
+    }
+
+    def test_cli_parser_accepts_canonical_scaling_args(self):
+        """The explicit scaling arg group owns canonical and legacy MuP flags."""
+        parser = argparse.ArgumentParser(allow_abbrev=False)
+        add_megatron_arguments(parser)
+
+        args, _ = parser.parse_known_args(
+            [
+                '--scaling-recipe',
+                'mup',
+                '--scaling-base-hidden-size',
+                '256',
+                '--mup-base-head-dim',
+                '64',
+            ]
+        )
+
+        assert args.scaling_recipe == 'mup'
+        assert args.scaling_base_hidden_size == 256
+        assert args.mup_base_head_dim == 64
+        assert args.mup_width_mult == 1.0
+
+    def test_cli_explicit_mup_width_mult_one_is_validated(self):
+        """Explicit legacy width multiplier must match the derived value, even at 1.0."""
+        parser = argparse.ArgumentParser(allow_abbrev=False)
+        add_megatron_arguments(parser)
+
+        args, _ = parser.parse_known_args(
+            [
+                '--scaling-recipe',
+                'mup',
+                '--scaling-base-hidden-size',
+                '256',
+                '--mup-width-mult',
+                '1.0',
+            ]
+        )
+        args.hidden_size = 1024
+
+        with pytest.raises(ValueError, match="must match the derived"):
+            build_scaling_context(args)
+
+    def test_yaml_core_config_defaults_missing_scaling_fields(self):
+        """Existing YAML files may omit the new scaling fields."""
+        values = {}
+        for field in dataclasses.fields(TransformerConfig):
+            if field.name in self.SCALING_FIELD_NAMES:
+                continue
+            if field.default is not dataclasses.MISSING:
+                values[field.name] = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                values[field.name] = field.default_factory()
+            elif field.type is int:
+                values[field.name] = 1
+            else:
+                values[field.name] = None
+        values['hidden_size'] = 512
+        values['num_layers'] = 2
+        values['num_attention_heads'] = 8
+
+        kwargs = core_config_from_args(SimpleNamespace(**values), TransformerConfig)
+
+        assert kwargs['scaling_recipe'] is None
+        assert kwargs['scaling_base_hidden_size'] is None
+        assert kwargs['mup_width_mult'] == 1.0
+
+    def test_yaml_default_width_mult_is_not_treated_as_explicit(self):
+        """Full legacy YAML files may materialize the old default width multiplier."""
+        yaml_args = SimpleNamespace(
+            hidden_size=1024,
+            scaling_recipe=None,
+            scaling_base_hidden_size=None,
+            scaling_base_head_dim=None,
+            use_mup=True,
+            mup_width_mult=1.0,
+            mup_base_hidden_size=256,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=None,
+            mup_attn_scale_power=1.0,
+        )
+
+        context = build_scaling_context(yaml_args)
+
+        assert context.width_mult == pytest.approx(4.0)
+
+    def test_scaling_context_matches_legacy_checkpoint_and_canonical_args(self):
+        """Checkpoint compatibility compares effective scaling, not flag spelling."""
+        legacy_checkpoint_args = SimpleNamespace(
+            hidden_size=1024,
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_width_mult=1.0,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=64,
+            mup_attn_scale_power=1.0,
+        )
+        canonical_args = SimpleNamespace(
+            hidden_size=1024,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_head_dim=64,
+            use_mup=False,
+            mup_width_mult=1.0,
+            mup_base_hidden_size=None,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=None,
+            mup_attn_scale_power=1.0,
+        )
+
+        assert build_scaling_context(
+            legacy_checkpoint_args
+        ) == build_scaling_context(canonical_args)
+
+    def test_checkpoint_scaling_sync_populates_canonical_fields(self):
+        """Old checkpoints with only legacy MuP fields become canonical before copy."""
+        from megatron.training.checkpointing import _sync_checkpoint_scaling_args
+
+        legacy_checkpoint_args = SimpleNamespace(
+            hidden_size=1024,
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_width_mult=1.0,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=64,
+            mup_attn_scale_power=1.0,
+        )
+
+        _sync_checkpoint_scaling_args(legacy_checkpoint_args)
+
+        assert legacy_checkpoint_args.scaling_recipe == 'mup'
+        assert legacy_checkpoint_args.scaling_base_hidden_size == 256
+        assert legacy_checkpoint_args.scaling_base_head_dim == 64
+        assert legacy_checkpoint_args.mup_width_mult == pytest.approx(4.0)
+
+    def test_check_checkpoint_args_compares_effective_scaling_context(self, monkeypatch):
+        """The real checkpoint check accepts legacy and canonical spellings if equivalent."""
+        from megatron.training import checkpointing
+
+        runtime_args = SimpleNamespace(
+            num_layers=2,
+            hidden_size=1024,
+            num_attention_heads=16,
+            add_position_embedding=True,
+            vocab_file=None,
+            data_parallel_random_init=False,
+            phase_transition_iterations=None,
+            use_dist_ckpt=False,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_head_dim=64,
+            use_mup=False,
+            mup_width_mult=1.0,
+            mup_base_hidden_size=None,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=None,
+            mup_attn_scale_power=1.0,
+        )
+        checkpoint_args = SimpleNamespace(
+            num_layers=2,
+            hidden_size=1024,
+            num_attention_heads=16,
+            add_position_embedding=True,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_width_mult=1.0,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=64,
+            mup_attn_scale_power=1.0,
+        )
+        monkeypatch.setattr(checkpointing, 'get_args', lambda: runtime_args)
+        monkeypatch.setattr(checkpointing, 'get_checkpoint_version', lambda: 3.0)
+
+        checkpointing.check_checkpoint_args(checkpoint_args)
+
+    def test_load_checkpoint_args_clears_optional_scaling_fields(self, monkeypatch):
+        """use-checkpoint-args must clear stale optional canonical fields."""
+        from megatron.training import checkpointing
+
+        checkpoint_args = SimpleNamespace(
+            num_layers=2,
+            hidden_size=1024,
+            num_attention_heads=16,
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_width_mult=1.0,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_attn_scale_power=1.0,
+        )
+        state_dict = {'args': checkpoint_args, 'iteration': 7}
+        monkeypatch.setattr(
+            checkpointing,
+            '_load_base_checkpoint',
+            lambda *args, **kwargs: (state_dict, 'model_optim_rng.pt', False, None),
+        )
+        runtime_args = SimpleNamespace(
+            load='dummy-checkpoint',
+            iteration=0,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_head_dim=64,
+            mup_base_head_dim=64,
+            use_tokenizer_model_from_checkpoint_args=False,
+            use_mp_args_from_checkpoint_args=False,
+        )
+
+        checkpointing.load_args_from_checkpoint(runtime_args)
+
+        assert runtime_args.iteration == 7
+        assert runtime_args.scaling_recipe == 'mup'
+        assert runtime_args.scaling_base_hidden_size == 256
+        assert runtime_args.scaling_base_head_dim is None
+        assert runtime_args.mup_base_head_dim is None
+        assert runtime_args.mup_width_mult == pytest.approx(4.0)
+
+    def test_load_non_mup_checkpoint_clears_width_mult_provenance(self, monkeypatch):
+        """Checkpoint args must also clear stale CLI explicit-width provenance."""
+        from megatron.training import checkpointing
+
+        checkpoint_args = SimpleNamespace(hidden_size=1024)
+        state_dict = {'args': checkpoint_args, 'iteration': 3}
+        monkeypatch.setattr(
+            checkpointing,
+            '_load_base_checkpoint',
+            lambda *args, **kwargs: (state_dict, 'model_optim_rng.pt', False, None),
+        )
+        runtime_args = SimpleNamespace(
+            load='dummy-checkpoint',
+            iteration=0,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_head_dim=None,
+            use_mup=False,
+            mup_width_mult=1.0,
+            _mup_width_mult_explicit=True,
+            use_tokenizer_model_from_checkpoint_args=False,
+            use_mp_args_from_checkpoint_args=False,
+        )
+
+        checkpointing.load_args_from_checkpoint(runtime_args)
+
+        assert runtime_args.iteration == 3
+        assert runtime_args.scaling_recipe == 'none'
+        assert runtime_args.mup_width_mult == 1.0
+        assert runtime_args._mup_width_mult_explicit is False
+        assert build_scaling_context(runtime_args).recipe == 'none'
+
+    def test_checkpoint_derived_width_mult_does_not_warn_as_deprecated_cli(self):
+        """Normalized checkpoint state should not look like user-provided --mup-width-mult."""
+        from megatron.training.arguments import warn_deprecated_mup_aliases
+
+        checkpoint_derived_args = SimpleNamespace(
+            rank=0,
+            use_mup=False,
+            mup_base_hidden_size=None,
+            mup_base_head_dim=None,
+            mup_width_mult=4.0,
+            _mup_width_mult_explicit=False,
+        )
+
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            warn_deprecated_mup_aliases(checkpoint_derived_args)
+
+        assert len(caught_warnings) == 0
+
+    def test_false_width_mult_marker_overrides_stale_non_default_value(self):
+        """Marker-present False means checkpoint/internal provenance, not explicit user input."""
+        checkpoint_derived_args = SimpleNamespace(
+            hidden_size=1024,
+            scaling_recipe='none',
+            scaling_base_hidden_size=None,
+            scaling_base_head_dim=None,
+            use_mup=False,
+            mup_width_mult=4.0,
+            _mup_width_mult_explicit=False,
+            mup_base_hidden_size=None,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=None,
+            mup_attn_scale_power=1.0,
+        )
+
+        assert build_scaling_context(checkpoint_derived_args).recipe == 'none'
+
+    def test_checkpoint_derived_legacy_aliases_do_not_warn_as_deprecated_cli(self):
+        """Checkpoint-synced legacy fields should not masquerade as user CLI aliases."""
+        from megatron.training.arguments import warn_deprecated_mup_aliases
+
+        checkpoint_derived_args = SimpleNamespace(
+            rank=0,
+            use_mup=True,
+            _use_mup_explicit=False,
+            mup_base_hidden_size=256,
+            _mup_base_hidden_size_explicit=False,
+            mup_base_head_dim=64,
+            _mup_base_head_dim_explicit=False,
+            mup_width_mult=4.0,
+            _mup_width_mult_explicit=False,
+        )
+
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            warn_deprecated_mup_aliases(checkpoint_derived_args)
+
+        assert len(caught_warnings) == 0
+
+    def test_user_provided_legacy_aliases_warn_as_deprecated_cli(self):
+        """Real user-provided legacy aliases should still produce a deprecation warning."""
+        from megatron.training.arguments import warn_deprecated_mup_aliases
+
+        user_args = SimpleNamespace(
+            rank=0,
+            use_mup=True,
+            _use_mup_explicit=True,
+            mup_base_hidden_size=256,
+            _mup_base_hidden_size_explicit=True,
+            mup_base_head_dim=64,
+            _mup_base_head_dim_explicit=True,
+            mup_width_mult=1.0,
+            _mup_width_mult_explicit=True,
+        )
+
+        with pytest.warns(UserWarning) as caught_warnings:
+            warn_deprecated_mup_aliases(user_args)
+
+        warning_text = str(caught_warnings[0].message)
+        assert '--use-mup' in warning_text
+        assert '--mup-base-hidden-size' in warning_text
+        assert '--mup-base-head-dim' in warning_text
+        assert '--mup-width-mult' in warning_text
 
 
 class TestMuPInitMethods:
@@ -177,7 +648,7 @@ class TestMuPWarnings:
 
     def test_mup_warns_with_custom_init_method(self):
         """Warn when MuP is enabled and init_method is user-provided."""
-        with pytest.warns(UserWarning, match="use_mup is enabled"):
+        with pytest.warns(UserWarning, match="scaling recipe 'mup' is enabled"):
             TransformerConfig(
                 hidden_size=512,
                 num_layers=4,
@@ -189,7 +660,7 @@ class TestMuPWarnings:
 
     def test_mup_warns_with_custom_output_layer_init_method(self):
         """Warn when MuP is enabled and output_layer_init_method is user-provided."""
-        with pytest.warns(UserWarning, match="use_mup is enabled"):
+        with pytest.warns(UserWarning, match="scaling recipe 'mup' is enabled"):
             TransformerConfig(
                 hidden_size=512,
                 num_layers=4,

@@ -39,7 +39,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.parameterization import (
-    build_resolved_scaling_context,
+    build_scaling_context,
     sync_legacy_mup_fields,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -179,8 +179,8 @@ def check_checkpoint_args(checkpoint_args):
         _compare('tensor_model_parallel_size')
         _compare('pipeline_model_parallel_size')
 
-    checkpoint_scaling_context = build_resolved_scaling_context(checkpoint_args)
-    args_scaling_context = build_resolved_scaling_context(args)
+    checkpoint_scaling_context = build_scaling_context(checkpoint_args)
+    args_scaling_context = build_scaling_context(args)
     assert checkpoint_scaling_context == args_scaling_context, (
         f"Scaling recipe from checkpoint ({checkpoint_scaling_context}) is not equal to "
         f"the input argument value ({args_scaling_context})."
@@ -191,7 +191,7 @@ def _sync_checkpoint_scaling_args(checkpoint_args):
     """Populate canonical scaling fields on checkpoint args before force-copying them."""
 
     sync_legacy_mup_fields(
-        checkpoint_args, build_resolved_scaling_context(checkpoint_args)
+        checkpoint_args, build_scaling_context(checkpoint_args)
     )
 
 

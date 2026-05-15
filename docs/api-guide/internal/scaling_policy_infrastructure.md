@@ -9,13 +9,14 @@
 
 # Scaling Policy Infrastructure
 
-This internal policy layer centralizes Megatron's existing parameterization hooks
-without adding a new user-facing recipe surface.
+This internal policy layer centralizes Megatron's parameterization hooks behind a
+scaling context.
 
-The current scaling context resolves the legacy `use_mup` fields into model-side and
-optimizer-side decisions. Standard Megatron behavior is represented as the
-identity policy, so code paths can call the same hooks whether or not MuP is
-active.
+The current public recipes are `none` and `mup`. The policy resolver also accepts
+legacy MuP aliases, then syncs them to the canonical recipe fields so model,
+optimizer, YAML, and checkpoint paths see the same effective scaling context.
+Standard Megatron behavior is represented as the identity policy, so code paths
+can call the same hooks whether or not MuP is active.
 
 ## Model Policy
 
