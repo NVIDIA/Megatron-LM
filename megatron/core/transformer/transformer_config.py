@@ -2845,10 +2845,9 @@ class TransformerConfig(ModelParallelConfig):
             # Needed for passing variable sequences between pp stages.
             self.variable_seq_lengths = True
 
-            # TODO(tailaim): add support for other dispatcher types
-            assert self.moe_token_dispatcher_type == "alltoall", (
-                f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
-                f"got '{self.moe_token_dispatcher_type}'"
+            assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
+                f"sequence_packing only supports moe_token_dispatcher_type in "
+                f"('alltoall', 'flex'), got '{self.moe_token_dispatcher_type}'"
             )
 
             supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
