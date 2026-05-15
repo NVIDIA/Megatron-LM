@@ -90,7 +90,7 @@ mlm = [
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     "transformer-engine[pytorch,core_cu13]",
-    "nvidia-resiliency-ext",
+    "nvidia-resiliency-ext~=0.6.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
@@ -189,7 +189,7 @@ no-build-isolation-package = [
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
 # We don't define override-dependencies globally but rather locally where we need it.
-# For instance, when installing into a PyTorch base image, we don't want to install torch, 
+# For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
 override-dependencies = [
     "torch; sys_platform == 'never'",
@@ -205,7 +205,6 @@ flash_mla = [
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "71bbefbf153418f943640df0f7373625dc93fa46" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "15a851565a4ce846c04431ecb0cf09903ab4837e" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
