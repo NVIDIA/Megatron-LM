@@ -25,10 +25,11 @@ logger = logging.getLogger(__name__)
 
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
-    assert args.tokenizer_type in SUPPORTED_TOKENIZERS, (
-        f"tokenizer_type {args.tokenizer_type} is not supported. "
-        f"See list of available tokenizers: {SUPPORTED_TOKENIZERS}"
-    )
+    if args.tokenizer_type not in SUPPORTED_TOKENIZERS: 
+        raise ValueError(
+            f"tokenizer_type {args.tokenizer_type} is not supported. "
+            f"See list of available tokenizers: {SUPPORTED_TOKENIZERS}"
+        )
 
     kwargs = {}
     tokenizer_library = None
