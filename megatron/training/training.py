@@ -1394,6 +1394,18 @@ def wrap_model_chunks_with_ddp(
                     expert_data_parallel_world_size=expert_data_parallel_world_size,
                 )
 
+    # Under the layer-wise distributed optimizer with no pre-computed layout (Muon and other
+    # non-Adam/SGD optimizers using the legacy ``allgather_params`` sync path), DDP falls back
+    # to the default layout. Without per-param start padding, cuBLAS MXFP8 wgrad on
+    # cuBLASLt 12.8.x rejects the heuristic for mid-bucket params whose ``main_grad`` slice
+    # lands at low (16-byte) D-pointer alignment. Request 64-element start padding for that
+    # path; ignored when ``full_param_layout`` is supplied.
+    pad_param_starts = (
+        DP is DDP
+        and use_layer_wise_distributed_optimizer
+        and not use_layer_wise_param_layout
+    )
+
     # Wrap each chunk.
     wrapped = []
     for chunk, layout, disable_bucketing in zip(
@@ -1404,6 +1416,8 @@ def wrap_model_chunks_with_ddp(
             chunk_kwargs["pg_collection"] = pg_collection
         if layout is not None:
             chunk_kwargs["full_param_layout"] = layout
+        if pad_param_starts:
+            chunk_kwargs["pad_param_starts"] = True
         wrapped.append(
             DP(
                 config=config,

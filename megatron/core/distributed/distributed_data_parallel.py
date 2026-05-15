@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from contextlib import contextmanager
@@ -39,6 +39,11 @@ class DistributedDataParallel(_BaseDataParallel):
         full_param_layout: Optional FullParamLayout providing pre-computed layouts for all
             dtype groups. When provided, each buffer uses the corresponding PerBufferParamLayout
             instead of computing a default one.
+        pad_param_starts: If True (and ``full_param_layout`` is not provided), each buffer's
+            default layout rounds per-param start indices up to a 64-element boundary. The
+            layer-wise distributed optimizer relies on this for cuBLAS MXFP8 wgrad D-pointer
+            alignment; standard distributed optimizer doesn't need it here because it supplies
+            a pre-padded ``full_param_layout`` instead.
 
     """
 
@@ -50,6 +55,7 @@ class DistributedDataParallel(_BaseDataParallel):
         disable_bucketing: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         full_param_layout: Optional[FullParamLayout] = None,
+        pad_param_starts: bool = False,
     ):
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -251,6 +257,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
+                pad_param_starts=pad_param_starts,
             )
             if buffer_key.is_expert_parallel:
                 self.expert_parallel_buffers.append(buffer)

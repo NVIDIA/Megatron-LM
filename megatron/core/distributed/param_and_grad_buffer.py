@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 import functools
@@ -833,21 +833,33 @@ def group_params_for_buffers(
 
 
 def _compute_default_per_buffer_param_layout(
-    params: List[torch.nn.Parameter], bucket_size: Optional[int]
+    params: List[torch.nn.Parameter], bucket_size: Optional[int], pad_param_starts: bool = False
 ) -> 'PerBufferParamLayout':
     """Compute parameter layout for the non-distributed-optimizer case.
 
-    No padding is applied. Parameters are iterated in reverse order (backprop order)
-    and grouped into buckets of approximately `bucket_size` elements.
+    By default no padding is applied. When ``pad_param_starts`` is True, each parameter's
+    start index is rounded up to a 64-element boundary, mirroring what
+    ``DistributedOptimizer._compute_per_buffer_param_layout`` does. This is needed by the
+    layer-wise distributed optimizer (Muon and other non-Adam/SGD optimizers): without
+    per-param alignment, mid-bucket params' ``main_grad`` slices land at low (16-byte)
+    D-pointer alignment in the MXFP8 wgrad path on cuBLASLt 12.8.x, and
+    ``cublasLtMatmulAlgoGetHeuristic`` returns ``CUBLAS_STATUS_NOT_SUPPORTED``.
+    Memory cost: <= 63 * 2 bytes = 126 bytes per param (trivial).
+
+    Parameters are iterated in reverse order (backprop order) and grouped into buckets of
+    approximately ``bucket_size`` elements.
 
     Args:
         params: List of parameters to lay out.
         bucket_size: Approximate number of elements per bucket, or None for a single bucket.
+        pad_param_starts: If True, round each param's start index up to a 64-element
+            boundary. Caller is responsible for deciding when this is needed (e.g.,
+            layer-wise distributed optimizer with MXFP8 wgrad).
 
     Returns:
         PerBufferParamLayout with the computed mapping.
     """
-    from ..optimizer.param_layout import PerBufferParamLayout
+    from ..optimizer.param_layout import PerBufferParamLayout, pad_param_start
 
     param_index_map = {}
     bucket_indices = []
@@ -859,6 +871,8 @@ def _compute_default_per_buffer_param_layout(
     bucket_id = 0
 
     for param in params[::-1]:
+        if pad_param_starts:
+            param_start_index = pad_param_start(param_start_index)
         this_numel = param.data.nelement()
         param_end_index = param_start_index + this_numel
         param_index_map[param] = (param_start_index, param_end_index, bucket_id)
@@ -903,6 +917,10 @@ class _ParamAndGradBuffer:
         param_indices: The index of each param among the params with same dtype, if a param is fp8,
             use its "fake" high precision dtype to determine which params have same dtype with it.
             These indices are needed when loading a non-native-fp8 checkpoint in native-fp8 mode.
+        pad_param_starts: If True and ``param_layout`` is not supplied, the default layout
+            rounds each param's start index up to a 64-element boundary (needed for cuBLAS
+            MXFP8 wgrad D-pointer alignment under the layer-wise distributed optimizer).
+            Ignored when ``param_layout`` is provided (the supplied layout decides padding).
     """
 
     def __init__(
@@ -919,6 +937,7 @@ class _ParamAndGradBuffer:
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
         param_layout: Optional['PerBufferParamLayout'] = None,
+        pad_param_starts: bool = False,
     ):
 
         if pg_collection is None:
@@ -954,9 +973,14 @@ class _ParamAndGradBuffer:
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
 
-        # Use the provided layout if given, otherwise compute the default (no-padding) layout.
+        # Use the provided layout if given, otherwise compute the default layout. The default
+        # layout applies per-param 64-element start padding only when pad_param_starts is set
+        # (needed for cuBLAS MXFP8 wgrad D-pointer alignment under the layer-wise distributed
+        # optimizer); otherwise no padding.
         if param_layout is None:
-            param_layout = _compute_default_per_buffer_param_layout(self.params, bucket_size)
+            param_layout = _compute_default_per_buffer_param_layout(
+                self.params, bucket_size, pad_param_starts=pad_param_starts
+            )
         self.param_index_map = param_layout.param_index_map
         self.bucket_indices = param_layout.bucket_indices
         per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
