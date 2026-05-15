@@ -227,7 +227,9 @@ class DataParallelInferenceCoordinator:
         # Metrics backend (defaults to no-op when not provided).
         self.metrics: CoordinatorMetrics = metrics if metrics is not None else NoOpMetrics()
         # Best-effort gauge update; eventual consistency is sufficient for observability.
-        self.metrics.gauge("coordinator_active_engines", float(len(self.identities_of_data_parallel_ranks)))
+        self.metrics.gauge(
+            "coordinator_active_engines", float(len(self.identities_of_data_parallel_ranks))
+        )
 
     def get_next_data_parallel_rank(self):
         """
@@ -291,7 +293,9 @@ class DataParallelInferenceCoordinator:
             len(self.identities_of_data_parallel_ranks),
         )
         # Best-effort gauge update; eventual consistency is sufficient for observability.
-        self.metrics.gauge("coordinator_active_engines", float(len(self.identities_of_data_parallel_ranks)))
+        self.metrics.gauge(
+            "coordinator_active_engines", float(len(self.identities_of_data_parallel_ranks))
+        )
 
     def _send_to_engine(self, identity, payload):
         """Send payload to an engine, removing it from the pool if unreachable.
@@ -513,7 +517,9 @@ class DataParallelInferenceCoordinator:
                     else:
                         # If all engines have died, we are in an abnormal state, and must exit cleanly.
                         self.metrics.inc("coordinator_all_engines_exhausted_total")
-                        logging.error("Coordinator: no reachable engines for request %d", request_id)
+                        logging.error(
+                            "Coordinator: no reachable engines for request %d", request_id
+                        )
                         del self.request_id_to_client_id[request_id]
                         del self.request_id_to_client_request_id[request_id]
                         return
@@ -550,7 +556,10 @@ class DataParallelInferenceCoordinator:
                         continue
 
                     if header == Headers.PAUSE:
-                        idem_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
+                        idem_states = (
+                            self.CoordinatorState.PAUSED,
+                            self.CoordinatorState.SUSPENDED,
+                        )
                         if self.state == self.CoordinatorState.RUNNING:
                             self.state = self.CoordinatorState.PAUSED
                         elif self.state in idem_states:
@@ -575,7 +584,10 @@ class DataParallelInferenceCoordinator:
                             continue
                         self.state = self.CoordinatorState.PAUSED
                     elif header == Headers.STOP:
-                        good_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
+                        good_states = (
+                            self.CoordinatorState.PAUSED,
+                            self.CoordinatorState.SUSPENDED,
+                        )
                         if self.state not in good_states:
                             logging.warning("Coordinator: ignoring STOP in state %s", self.state)
                             continue

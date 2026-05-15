@@ -91,10 +91,7 @@ def _make_minimal_coordinator(
     return coordinator
 
 
-def _make_start_loop_coordinator(
-    metrics: CoordinatorMetrics,
-    num_engines: int = 1,
-):
+def _make_start_loop_coordinator(metrics: CoordinatorMetrics, num_engines: int = 1):
     """Build a coordinator ready to run start() with a mock ZMQ socket.
 
     Bypasses __init__ and populates only the state required by the start() loop.
@@ -109,7 +106,9 @@ def _make_start_loop_coordinator(
     coordinator.data_parallel_size = num_engines
     coordinator.enable_prefix_caching = False
     coordinator.block_size_tokens = 4
-    coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+    coordinator.prefix_caching_coordinator_policy = (
+        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+    )
     coordinator.hash_to_rank_info = {}
     coordinator._assignment_counter = 0
     coordinator._round_robin_idx = 0
@@ -210,10 +209,7 @@ class TestRoutingMetrics:
     def _make_cache_coordinator(self, policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK):
         m = TestMetrics()
         c = _make_minimal_coordinator(
-            enable_prefix_caching=True,
-            block_size_tokens=4,
-            policy=policy,
-            metrics=m,
+            enable_prefix_caching=True, block_size_tokens=4, policy=policy, metrics=m
         )
         return c, m
 
@@ -262,9 +258,7 @@ class TestRoutingMetrics:
         assert m.counters["routing_stale_detected_total"] == 0
 
     def test_routing_round_robin_policy_records_no_quality_metrics(self):
-        c, m = self._make_cache_coordinator(
-            policy=PrefixCachingCoordinatorPolicy.ROUND_ROBIN
-        )
+        c, m = self._make_cache_coordinator(policy=PrefixCachingCoordinatorPolicy.ROUND_ROBIN)
         c.hash_to_rank_info[99] = {b"engine-0": 1}
 
         c.get_best_data_parallel_rank([99], record_metrics=True)
@@ -281,9 +275,7 @@ class TestRoutingMetrics:
         assert m.counters["routing_cache_miss_total"] == 0
 
     def test_routing_longest_prefix_policy_returns_cache_hit_metric(self):
-        c, m = self._make_cache_coordinator(
-            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
-        )
+        c, m = self._make_cache_coordinator(policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX)
         c.hash_to_rank_info[10] = {b"engine-0": 1}
         c.hash_to_rank_info[20] = {b"engine-0": 2}
 
@@ -384,9 +376,7 @@ class TestRoutingLatencyRecorded:
             (b"client-1", msgpack.packb([Headers.CONNECT.value], use_bin_type=True)),
             (
                 b"client-1",
-                msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, 0, [1, 2, 3], {}], use_bin_type=True
-                ),
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 0, [1, 2, 3], {}], use_bin_type=True),
             ),
             (b"client-1", msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True)),
         ]
@@ -470,9 +460,7 @@ class TestMessageProcessingLatencyRecorded:
             (b"client-1", msgpack.packb([Headers.CONNECT.value], use_bin_type=True)),
             (
                 b"client-1",
-                msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, 0, [1, 2, 3], {}], use_bin_type=True
-                ),
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 0, [1, 2, 3], {}], use_bin_type=True),
             ),
             (b"client-1", msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True)),
         ]
@@ -507,10 +495,8 @@ class TestUnknownSenderMetric:
         mock_socket.recv_multipart.side_effect = [
             (
                 b"unknown-client",
-                msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, 0, [1, 2, 3], {}], use_bin_type=True
-                ),
-            ),
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 0, [1, 2, 3], {}], use_bin_type=True),
+            )
         ]
 
         with pytest.raises(StopIteration):
@@ -529,7 +515,7 @@ class TestUnknownSenderMetric:
         m = TestMetrics()
         coordinator, mock_socket = _make_start_loop_coordinator(m)
         mock_socket.recv_multipart.side_effect = [
-            (b"unknown-client", msgpack.packb([Headers.PAUSE.value], use_bin_type=True)),
+            (b"unknown-client", msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
         ]
 
         with pytest.raises(StopIteration):
@@ -548,7 +534,7 @@ class TestUnknownSenderMetric:
         m = TestMetrics()
         coordinator, mock_socket = _make_start_loop_coordinator(m)
         mock_socket.recv_multipart.side_effect = [
-            (b"unknown-client", msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True)),
+            (b"unknown-client", msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
         ]
 
         with pytest.raises(StopIteration):
@@ -587,9 +573,7 @@ class TestAllEnginesExhaustedMetric:
             (b"client-1", msgpack.packb([Headers.CONNECT.value], use_bin_type=True)),
             (
                 b"client-1",
-                msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, 0, [1, 2, 3], {}], use_bin_type=True
-                ),
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 0, [1, 2, 3], {}], use_bin_type=True),
             ),
         ]
 
@@ -619,10 +603,7 @@ class TestEngineReplyInternalErrorMetric:
 
         # ENGINE_REPLY from a sender not in identities_of_data_parallel_ranks.
         mock_socket.recv_multipart.side_effect = [
-            (
-                b"unknown-engine",
-                msgpack.packb([Headers.ENGINE_REPLY.value, []], use_bin_type=True),
-            ),
+            (b"unknown-engine", msgpack.packb([Headers.ENGINE_REPLY.value, []], use_bin_type=True))
         ]
 
         with pytest.raises(AssertionError):
@@ -659,15 +640,15 @@ class TestInitActiveEnginesGauge:
         mock_context = MagicMock()
         mock_context.socket.return_value = mock_socket
 
-        with patch(
-            "megatron.core.inference.data_parallel_inference_coordinator.zmq.Context",
-            return_value=mock_context,
-        ), patch("socket.gethostname", return_value="localhost"):
+        with (
+            patch(
+                "megatron.core.inference.data_parallel_inference_coordinator.zmq.Context",
+                return_value=mock_context,
+            ),
+            patch("socket.gethostname", return_value="localhost"),
+        ):
             coordinator = DataParallelInferenceCoordinator(
-                pipe_connection=mock_pipe,
-                data_parallel_size=2,
-                tokenizer=MagicMock(),
-                metrics=m,
+                pipe_connection=mock_pipe, data_parallel_size=2, tokenizer=MagicMock(), metrics=m
             )
 
         assert m.gauges.get("coordinator_active_engines") == 2.0
@@ -702,11 +683,13 @@ class TestEntrypointMetricsForwarding:
         mock_context = MagicMock()
         mock_context.socket.return_value = mock_socket
 
-        with patch(
-            "megatron.core.inference.data_parallel_inference_coordinator.zmq.Context",
-            return_value=mock_context,
-        ), patch("socket.gethostname", return_value="localhost"), patch.object(
-            DataParallelInferenceCoordinator, "start"
+        with (
+            patch(
+                "megatron.core.inference.data_parallel_inference_coordinator.zmq.Context",
+                return_value=mock_context,
+            ),
+            patch("socket.gethostname", return_value="localhost"),
+            patch.object(DataParallelInferenceCoordinator, "start"),
         ):
             DataParallelInferenceCoordinator.entrypoint(
                 pipe_connection=mock_pipe,
