@@ -293,6 +293,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_grouped_gemm_backend": "vllm",
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",
+    "sequence_packing_scheduler": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
