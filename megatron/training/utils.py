@@ -575,7 +575,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
             _broadcast(buf)
 
-        if args.dynamic_context_parallel:
+        if args.hybrid_context_parallel:
             seq_len = torch.tensor(
                 batch['tokens'].shape[0], dtype=torch.int32, device=torch.cuda.current_device()
             )
@@ -607,7 +607,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['attention_mask'])
 
     else:
-        if args.dynamic_context_parallel:
+        if args.hybrid_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
             shape = seq_len.item()
@@ -620,7 +620,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         if args.create_attention_mask_in_dataloader:
             shape_attention_mask = (
                 (args.micro_batch_size, 1, args.seq_length, args.seq_length)
-                if not args.dynamic_context_parallel
+                if not args.hybrid_context_parallel
                 else (1, 1, shape[0], shape[0])
             )
             attention_mask = torch.empty(
@@ -630,14 +630,14 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             attention_mask = None
         position_ids = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
         cu_seqlens = None
-        if args.dynamic_context_parallel or args.sft:
+        if args.hybrid_context_parallel or args.sft:
             max_seqlen = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
         else:
             max_seqlen = None
 
         local_cp_size = (
             torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
-            if args.dynamic_context_parallel
+            if args.hybrid_context_parallel
             else None
         )
 

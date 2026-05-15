@@ -228,6 +228,8 @@ class PostProcessNode(ScheduleNode):
             sequence_len_offset=self.chunk_state.sequence_len_offset,
             runtime_gather_output=self.chunk_state.runtime_gather_output,
             extra_block_kwargs=self.chunk_state.extra_block_kwargs,
+            output_processor=self.chunk_state.output_processor,
+            output_processor_context=self.chunk_state.output_processor_context,
         )
 
         # For now, 1f1b only supports fp16 module
@@ -350,34 +352,6 @@ class TransformerLayerNode(ScheduleNode):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
             nvtx_range_pop(nvtx_msg)
-
-        # Collecting gradient acc hooks if there is `post_wgrad_grad_acc_hook`
-        # attribute attached to param, o.w. the wgrad hook wouldn't be fired.
-        if self.post_wgrad_grad_acc_hooks is None:
-            self.post_wgrad_grad_acc_hooks = []
-            for module in self.bwd_dw_callables:
-                for param in module.parameters():
-                    # Collect hook only if the gradient is generated in current
-                    # TransformerLayerNode, because the grad_acc hook needs
-                    # to be executed right after `backward_dw` finishes.
-                    # For example: Shared expert's hook should be collected in
-                    # `attn` Node, even if the param belongs to `mlp` Node.
-                    if (
-                        getattr(param, "post_wgrad_grad_acc_hook", False)
-                        and param.requires_grad
-                        and param.grad is not None
-                    ):
-                        self.post_wgrad_grad_acc_hooks.append(param.post_wgrad_grad_acc_hook)
-
-        # Execute gradient accumulation hooks after wgrad compute.
-        if self.post_wgrad_grad_acc_hooks:
-            with torch.cuda.stream(self.stream):
-                for hook in self.post_wgrad_grad_acc_hooks:
-                    hook()
-
-        # Execute TransformerLayer backward hook.
-        if self.is_layer_first_node:
-            self._post_backward_hook()
 
         self.bwd_dw_callables = None
 
@@ -726,14 +700,17 @@ def build_mtp_layer_callables(layer):
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
             hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
-        input_ids, position_ids, decoder_input, hidden_states = layer._get_embeddings(
+        input_ids, position_ids, padding_mask, decoder_input, hidden_states = layer._get_embeddings(
             input_ids=node.chunk_state.input_ids,
             position_ids=node.chunk_state.position_ids,
             embedding=node.chunk_state.model.embedding,
             hidden_states=hidden_states,
+            packed_seq_params=node.chunk_state.packed_seq_params,
+            padding_mask=node.chunk_state.padding_mask,
         )
         node.chunk_state.input_ids = input_ids
         node.chunk_state.position_ids = position_ids
+        node.chunk_state.padding_mask = padding_mask
 
         # MTP Layer Preprocess
         # norm, linear projection and transformer

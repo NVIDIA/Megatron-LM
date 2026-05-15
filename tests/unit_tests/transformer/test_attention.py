@@ -889,7 +889,6 @@ def _test_parallel_attention_correctness(
         Utils.destroy_model_parallel()
 
 
-# TODO(yuzhongw): Add test case for fallback_to_eager_attn
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize("apply_rope_fusion", [False, True])
 @pytest.mark.parametrize(

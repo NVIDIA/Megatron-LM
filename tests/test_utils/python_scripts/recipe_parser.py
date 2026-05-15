@@ -38,6 +38,18 @@ LEGACY_SCOPE_ALIASES = {
 }
 
 
+def _resolve_scope_alias(scope_value: str) -> str:
+    """Resolve a legacy scope value to its L-tier alias (or return it unchanged).
+
+    Applied both to recipe rows when flattening and to the `--scope` filter
+    input, so callers can pass either the legacy name (e.g. `nightly`) or the
+    new L-tier name (e.g. `L2`) and hit the same recipe rows.
+    """
+    if scope_value in LEGACY_SCOPE_ALIASES:
+        return LEGACY_SCOPE_ALIASES[scope_value][0]
+    return scope_value
+
+
 def _apply_scope_alias(scope_value: str, explicit_cadence: Optional[List[str]]) -> tuple:
     """Resolve a legacy scope value to (new_scope, cadence).
 
@@ -211,11 +223,18 @@ def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Op
 
 
 def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdict]:
-    """Returns all workload with matching scope."""
+    """Returns all workload with matching scope.
+
+    The filter input is run through the same legacy-scope alias as recipe
+    rows, so callers passing the legacy name (e.g. `--scope nightly`,
+    `--scope mr-github`) match recipes that have already been rewritten to
+    the new L-tier vocabulary (e.g. `scope: [L2]`, `scope: [L1]`).
+    """
+    resolved_scope = _resolve_scope_alias(scope)
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
-        if workload_manifest.spec["scope"] == scope
+        if workload_manifest.spec["scope"] == resolved_scope
     )
 
     if len(workload_manifests) == 0:

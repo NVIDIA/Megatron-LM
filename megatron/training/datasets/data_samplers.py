@@ -54,7 +54,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_size=mpu.get_data_parallel_world_size(),
         )
     elif args.dataloader_type == 'single':
-        if args.dynamic_context_parallel:
+        if args.hybrid_context_parallel:
             batch_sampler = HybridCPMegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
@@ -106,7 +106,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
     # Torch dataloader.
-    if args.dynamic_context_parallel:
+    if args.hybrid_context_parallel:
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
