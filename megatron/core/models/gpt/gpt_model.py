@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, Literal, Optional
+from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
 from torch import Tensor
@@ -10,6 +10,7 @@ from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
@@ -308,7 +309,7 @@ class GPTModel(LanguageModule):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = InferenceMode.is_active()
 
         # Decoder embedding.
         if decoder_input is not None:
@@ -345,7 +346,11 @@ class GPTModel(LanguageModule):
                 hasattr(inference_context, 'use_flashinfer_fused_rope')
                 and inference_context.use_flashinfer_fused_rope
             )
-            if in_inference_mode and (self.config.flash_decode or use_flash_infer_fused_rope):
+            if (
+                in_inference_mode
+                and inference_context is not None
+                and (self.config.flash_decode or use_flash_infer_fused_rope)
+            ):
                 assert (
                     not self.config.flash_decode
                 ) or inference_context.is_static_batching(), (
@@ -377,7 +382,7 @@ class GPTModel(LanguageModule):
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
         elif self.position_embedding_type == 'yarn':
-            if self.training or not self.config.flash_decode:
+            if not InferenceMode.is_active() or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
@@ -393,7 +398,7 @@ class GPTModel(LanguageModule):
                     "YarnRotaryEmbedding yet."
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
-            if self.training or not self.config.flash_decode:
+            if not InferenceMode.is_active() or not self.config.flash_decode:
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
@@ -408,6 +413,7 @@ class GPTModel(LanguageModule):
 
         if (
             in_inference_mode
+            and inference_context is not None
             and (
                 (
                     self.config.cuda_graph_impl == "local"
@@ -429,8 +435,10 @@ class GPTModel(LanguageModule):
         if in_inference_mode:
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations
-            if inference_context.is_dynamic_batching() and is_using_quantization_scales(
-                self.config
+            if (
+                inference_context is not None
+                and inference_context.is_dynamic_batching()
+                and is_using_quantization_scales(self.config)
             ):
                 decoder_input[inference_context.padding_slice] = 0.0
 
@@ -491,6 +499,8 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor_context: Optional[Any] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -504,6 +514,10 @@ class GPTModel(LanguageModule):
             padding_mask (Tensor, optional): Padding mask for MoE routing.
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from routing computations.
+            output_processor (Callable, optional): Custom postprocess hook that receives
+                decoder hidden states and output-layer helpers, then returns the model output.
+            output_processor_context (Any, optional): User-defined context object forwarded to
+                `output_processor`.
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -557,12 +571,15 @@ class GPTModel(LanguageModule):
             loss_mask=loss_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            output_processor=output_processor,
+            output_processor_context=output_processor_context,
         )
 
     def _postprocess(
@@ -578,19 +595,22 @@ class GPTModel(LanguageModule):
         loss_mask=None,
         decoder_input=None,
         attention_mask=None,
+        padding_mask=None,
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
+        output_processor=None,
+        output_processor_context=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
         Applies Multi-Token Prediction if enabled, generates output logits through
         the output layer, and computes language model loss when labels are provided.
         """
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = InferenceMode.is_active()
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
@@ -599,6 +619,7 @@ class GPTModel(LanguageModule):
         # tokens rather than stale speculative tokens from the previous step.
         is_spec_decode = (
             in_inference_mode
+            and inference_context is not None
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
@@ -619,6 +640,7 @@ class GPTModel(LanguageModule):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
                 embedding=self.embedding,
                 **(extra_block_kwargs or {}),
             )
@@ -650,7 +672,31 @@ class GPTModel(LanguageModule):
                 )
         sequence_parallel_override = False
 
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+        if output_processor is not None:
+            return output_processor(
+                hidden_states=hidden_states,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                labels=labels,
+                loss_mask=loss_mask,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                runtime_gather_output=runtime_gather_output,
+                context=output_processor_context,
+                compute_language_model_loss=self.compute_language_model_loss,
+                scale_logits=self._scale_logits,
+                config=self.config,
+            )
+
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.config.materialize_only_last_token_logits
+        ):
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
@@ -719,6 +765,9 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        *,
+        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor_context: Optional[Any] = None,
     ):
         """Builds a computation schedule plan for the model.
 
@@ -745,6 +794,10 @@ class GPTModel(LanguageModule):
                 Parameters for inference. Defaults to None.
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
             padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
+            output_processor (Callable, optional): Custom postprocess hook to run in the
+                schedule-plan postprocess node instead of the default logits/loss path.
+            output_processor_context (Any, optional): User-defined context object forwarded to
+                `output_processor`.
 
         Returns:
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.
@@ -767,6 +820,8 @@ class GPTModel(LanguageModule):
             runtime_gather_output,
             loss_mask,
             padding_mask,
+            output_processor=output_processor,
+            output_processor_context=output_processor_context,
         )
 
     def sharded_state_dict(

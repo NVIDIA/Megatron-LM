@@ -20,6 +20,7 @@ from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_qui
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -59,7 +60,7 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
-from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 
 logger = logging.getLogger(__name__)
 
@@ -647,6 +648,24 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _vllm_forward(self, hidden_states, probs, routing_map):
+        """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
+        local_expert_start = self.ep_group.rank() * self.num_local_experts
+        output = vllm_fused_moe(
+            hidden_states,
+            probs,
+            self._fc1_weight,
+            self._fc2_weight,
+            activation_type=self._mcore_activation_type,
+            num_local_experts=self.num_local_experts,
+            local_expert_start=local_expert_start,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+            routing_map=routing_map,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+            num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
+        )
+        return output, None
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -671,7 +690,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 Required for the FlashInfer CUDA-graphed path, None otherwise.
         """
 
-        if self.training:
+        if not InferenceMode.is_active():
             assert (
                 not self.config.fp8_recipe == "mxfp8"
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
@@ -698,6 +717,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return self._mcore_fused_moe_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
+            return self._vllm_forward(
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
+            )
 
 
 class SequentialMLP(MegatronModule):
@@ -709,7 +732,7 @@ class SequentialMLP(MegatronModule):
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
     def __init__(
         self,
-        num_local_experts,
+        num_local_experts: int,
         config: TransformerConfig,
         submodules: MLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,

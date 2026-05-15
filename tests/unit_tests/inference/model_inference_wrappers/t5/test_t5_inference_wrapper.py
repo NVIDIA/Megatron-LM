@@ -12,6 +12,7 @@ from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper import (
     T5InferenceWrapper,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.T5.t5_model import T5Model
 from megatron.core.models.T5.t5_spec import (
     get_t5_decoder_with_transformer_engine_block_spec,
@@ -80,7 +81,10 @@ class TestT5InferenceWrapper:
 
         self.inference_wrapped_model = T5InferenceWrapper(t5_model, inference_context)
 
+        InferenceMode.set_active()
+
     def teardown_method(self, method):
+        InferenceMode.unset_active()
         Utils.destroy_model_parallel()
 
     def test_inference_only_tensor_parallel(self):
