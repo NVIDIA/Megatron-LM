@@ -149,6 +149,7 @@ def create_args():
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
     args.async_strategy = "nvrx"
+    args.verify_integrity = False
 
     yield args
 
