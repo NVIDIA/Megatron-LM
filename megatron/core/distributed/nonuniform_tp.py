@@ -475,9 +475,7 @@ def initialize_nonuniform_tp_process_groups(
     active_local_ranks_by_dp = []
     for reduced_dp_replica_id in range(num_reduced_dp_ranks):
         active_ranks_for_cp = [
-            get_active_ranks_for_dp(
-                reduced_dp_replica_id, tp_base, ntp_config, cp_rank=cp_rank
-            )
+            get_active_ranks_for_dp(reduced_dp_replica_id, tp_base, ntp_config, cp_rank=cp_rank)
             for cp_rank in range(cp_size)
         ]
         if any(active_ranks != active_ranks_for_cp[0] for active_ranks in active_ranks_for_cp):
