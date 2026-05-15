@@ -339,12 +339,20 @@ def test_save_and_load_checkpoint_vpp(
         num_floating_point_operations_so_far = 456
 
         with (
-            TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A,
-            TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B,
+            TempNamedDir(
+                tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A'
+            ) as ckpt_dir_A,
+            TempNamedDir(
+                tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B'
+            ) as ckpt_dir_B,
         ):
             set_ckpt_path(ckpt_dir_A)
             save_checkpoint(
-                iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+                iteration,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
             )
 
             expected_ckpt_path = args.save / "iter_0000123" / ".metadata"
