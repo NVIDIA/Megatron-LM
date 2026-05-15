@@ -264,7 +264,7 @@ class GPTModel(LanguageModule):
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
+                skip_weight_param_allocation=(self.pre_process or self.mtp_process)
                 and self.share_embeddings_and_output_weights,
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
