@@ -642,7 +642,6 @@ class TestLayerWiseOptimizer:
                     dist_opt=True,
                     optimizer='dist_muon',
                     use_param_layout=True,
-                    use_gloo_process_groups=False,
                 )
 
                 init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=True)
@@ -667,7 +666,6 @@ class TestLayerWiseOptimizer:
                     dist_opt=True,
                     optimizer='dist_muon',
                     use_param_layout=True,
-                    use_gloo_process_groups=False,
                 )
 
                 load_checkpoint_no_arg_checks(model, optimizer_B, None)
