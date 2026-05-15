@@ -19,13 +19,15 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -47,7 +49,7 @@ class HybridStackSubmodules:
     mtp_block_spec: Optional[ModuleSpec] = None
 
 
-class HybridStack(GraphableMegatronModule, MegatronModule):
+class HybridStack(MegatronModule):
     """
     Constructor for the HybridStack class.
 
@@ -206,39 +208,6 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 return layer.mamba_state_shapes_per_request()
         return None
 
-    def _should_call_local_cudagraph(self, *args, **kwargs):
-        """
-        Check if we should call the local cudagraph path.
-        """
-        if (
-            not self.training
-            and hasattr(self, 'cudagraph_manager')
-            and kwargs['attention_mask'] is None
-            and (
-                kwargs.get('inference_context') is not None
-                or kwargs.get('inference_params') is not None
-            )
-            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
-        ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
-            else:
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
-
-            if using_cuda_graph:
-                return True
-        return False
-
-    def __call__(self, *args, **kwargs):
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            kwargs['hidden_states'] = (
-                kwargs['hidden_states'].unwrap()
-                if isinstance(kwargs['hidden_states'], WrappedTensor)
-                else kwargs['hidden_states']
-            )
-            return super().__call__(*args, **kwargs)[0]
-        return super().__call__(*args, **kwargs)
-
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -295,7 +264,7 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             )
             and inference_context
             and inference_context.is_static_batching()
-            and not self.training
+            and InferenceMode.is_active()
         ):
             current_batch_size = hidden_states.shape[1]
             sequence_len_offset = torch.tensor(
@@ -332,33 +301,49 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 return nullcontext()
 
         with outer_fp8_context:
-            for layer in self.layers:
-                # Layers have 1-indexed layer numbers attribute.
-                inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
-                with inner_quant_context:
-                    if isinstance(layer, TransformerLayer):
-                        hidden_states, _ = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
-                            packed_seq_params=packed_seq_params,
-                            padding_mask=padding_mask,
-                        )
-                    else:  # MambaLayer, Expert, or MLP
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                        )
+            if self.config.recompute_granularity == 'full' and self.training:
+                hidden_states = checkpointed_forward(
+                    self,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    context=None,
+                    context_mask=None,
+                    rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=None,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                    use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                )
+            else:
+                for layer in self.layers:
+                    # Layers have 1-indexed layer numbers attribute.
+                    inner_quant_context = get_inner_quant_context(
+                        self.config, layer.layer_number - 1
+                    )
+                    with inner_quant_context:
+                        if isinstance(layer, TransformerLayer):
+                            hidden_states, _ = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                rotary_pos_emb=rotary_pos_emb,
+                                sequence_len_offset=sequence_len_offset,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                            )
+                        else:  # MambaLayer, Expert, or MLP
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                            )
 
-                # The attention layer (currently a simplified transformer layer)
-                # outputs a tuple of (hidden_states, context). Context is intended
-                # for cross-attention, and is not needed in our model.
-                if isinstance(hidden_states, tuple):
-                    hidden_states = hidden_states[0]
+                    # The attention layer (currently a simplified transformer layer)
+                    # outputs a tuple of (hidden_states, context). Context is intended
+                    # for cross-attention, and is not needed in our model.
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

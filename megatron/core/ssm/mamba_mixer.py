@@ -23,6 +23,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
     tensor_merge,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
@@ -32,6 +33,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
+    cat_with_oom_fallback,
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
@@ -347,6 +349,14 @@ class MambaMixer(MegatronModule):
             self.A_log = nn.Parameter(A_log)
             setattr(self.A_log, "tensor_model_parallel", True)
             setattr(self.A_log, "partition_dim", 0)
+            # Persistent inference cache for -exp(A_log.float()). Allocated
+            # here (outside any later CUDA-graph capture) so its address
+            # lives in the default memory pool and stays valid across every
+            # graph capture and replay, including across RL train/eval
+            # cycles. Never freed -- the memory cost is ``nheads * 4B`` per
+            # layer (a few KB across a full model).
+            self._A_neg_exp_cache = torch.empty_like(A_log, dtype=torch.float32)
+            self._A_neg_exp_cache_stale = True
         # D "skip" parameter
         self.D = nn.Parameter(
             torch.ones(
@@ -418,12 +428,12 @@ class MambaMixer(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = InferenceMode.is_active()
 
         _, batch, dim = hidden_states.shape
         conv_state, ssm_state = None, None
 
-        if in_inference_mode:
+        if in_inference_mode and inference_context is not None:
             if inference_context.is_dynamic_batching():
                 return self._dynamic_inference(hidden_states, inference_context)
             else:
@@ -964,21 +974,24 @@ class MambaMixer(MegatronModule):
             tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
 
             # Write intermediate states to pre-allocated output buffers
-            # All tensor ops, no Python loops, fully CUDA graph compatible
+            # All tensor ops, no Python loops, fully CUDA graph compatible.
+            # The destination buffers are sized to the global max_intermediate_count
+            # but we only fill the per-graph-bucket prefix; readers consult
+            # per_request_intermediate_counts to know the real count.
             if intermediate_chunk_indices is not None and intermediate_ssm_out is not None:
-                intermediate_ssm_out.copy_(intermediate_ssm_states)
+                n = intermediate_ssm_states.shape[0]
+                intermediate_ssm_out[:n].copy_(intermediate_ssm_states)
 
                 # Vectorized conv state extraction
-                # intermediate_abs_positions: [max_intermediate_count]
                 # conv_gather_offsets: [d_conv] = [-d_conv, ..., -1]
                 gather_positions = (
                     intermediate_abs_positions.unsqueeze(1).long()
                     + conv_gather_offsets.unsqueeze(0).long()
-                )  # [max_intermediate_count, d_conv]
+                )  # [n, d_conv]
                 intermediate_conv = xBC_pre_conv[0, gather_positions, :]
-                # [max_intermediate_count, d_conv, conv_dim]
-                intermediate_conv_out.copy_(intermediate_conv.transpose(1, 2))
-                # [max_intermediate_count, conv_dim, d_conv]
+                # [n, d_conv, conv_dim]
+                intermediate_conv_out[:n].copy_(intermediate_conv.transpose(1, 2))
+                # [n, conv_dim, d_conv]
         else:
             # Non-dynamic-batching path (static batching)
             initial_ssm_state = None
@@ -1014,6 +1027,32 @@ class MambaMixer(MegatronModule):
             y = self.norm(y, z)
 
         return y
+
+    def _get_decode_A_neg_exp(self) -> torch.Tensor:
+        """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
+
+        A_log is frozen during inference; recomputing it per token otherwise
+        launches three small elementwise kernels (float cast, exp, neg) that
+        rival ``selective_state_update`` itself in the decode profile. The
+        stride-0 expand view also triggers the kernel's TIE_HDIM fast path.
+        """
+        if self.training or torch.is_grad_enabled():
+            base = -torch.exp(self.A_log.float())
+            return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+        # Inference path. Refill when stale
+        if self._A_neg_exp_cache_stale:
+            with torch.no_grad():
+                self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
+            self._A_neg_exp_cache_stale = False
+        return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+
+    def train(self, mode: bool = True):
+        """Mark the decode cache stale; weights may have updated."""
+        if mode:
+            # only mark stale when switching to training mode.
+            # otherwise retain the staleness state.
+            self._A_neg_exp_cache_stale = True
+        return super().train(mode)
 
     def _ssm_decode(
         self,
@@ -1093,10 +1132,10 @@ class MambaMixer(MegatronModule):
             ],
             dim=-1,
         )
-        A = -torch.exp(self.A_log.float())
-
         # SSM step
         if selective_state_update is None:
+            # Fallback uses 1D A; the decode cache is pre-expanded for Triton.
+            A = -torch.exp(self.A_log.float())
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
 
@@ -1154,7 +1193,7 @@ class MambaMixer(MegatronModule):
 
             y = y.unsqueeze(1)  # Restore seq dimension
         else:
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+            A = self._get_decode_A_neg_exp()
 
             # Incorporate sequence dimension in einops rearrengements
             dt = repeat(dt, "b s h -> b s h p", p=self.headdim)
@@ -1165,11 +1204,6 @@ class MambaMixer(MegatronModule):
             x_reshaped = rearrange(x, "b s (h p) -> b s h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b s (h p) -> b s h p", p=self.headdim)
-
-            # Upcast the batch_indices to prevent integer overflow errors in the case of
-            # large max request counts.
-            if batch_indices is not None:
-                batch_indices = batch_indices.to(torch.int64)
 
             y = selective_state_update(
                 ssm_state,
@@ -1378,12 +1412,12 @@ def _split_tensor_factory(
         )
         return chunk_sh_tens
 
-    @torch.no_grad()
-    def sh_ten_merge_fn(sub_state_dict):
-        return torch.cat(sub_state_dict)
-
     return ShardedTensorFactory(
-        orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
+        orig_sh_ten.key,
+        orig_sh_ten.data,
+        sh_ten_build_fn,
+        cat_with_oom_fallback,
+        orig_sh_ten.replica_id,
     )
 
 

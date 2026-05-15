@@ -1,8 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
-import gc
-import logging
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,8 +23,10 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import cat_with_oom_fallback
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
@@ -40,9 +40,6 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
-
-
-logger = logging.getLogger(__name__)
 
 
 class LinearFc1Interface(Protocol):
@@ -366,6 +363,31 @@ class MLP(MegatronModule):
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
 
+    @classmethod
+    def as_mlp_submodule(
+        cls,
+        submodules: MLPSubmodules,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection,
+        is_mtp_layer: bool,
+        is_expert: bool = False,
+        input_size: int | None = None,
+        ffn_hidden_size: int | None = None,
+    ) -> MLP:
+        """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
+        del is_mtp_layer
+        assert hasattr(
+            pg_collection, 'tp'
+        ), 'TP process group is required for MLP in TransformerLayer'
+        return cls(
+            config=config,
+            submodules=submodules,
+            tp_group=pg_collection.tp,
+            is_expert=is_expert,
+            input_size=input_size,
+            ffn_hidden_size=ffn_hidden_size,
+        )
+
 
 # pylint: disable=missing-function-docstring
 def apply_swiglu_sharded_factory(
@@ -427,25 +449,11 @@ def apply_swiglu_sharded_factory(
             ),
         ]
 
-    def sh_ten_merge_fn(sub_state_dict):
-        with torch.no_grad():
-            try:
-                return torch.cat(sub_state_dict)
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                logger.warning(
-                    f"CUDA OutOfMemoryError encountered during tensors merging."
-                    f" Switching to CPU merge. (Error: {e})"
-                )
-                merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
-                gc.collect()
-                torch.cuda.empty_cache()
-                return merged_sub_state_dict
-
     return ShardedTensorFactory(
         original_sh_ten.key,
         original_sh_ten.data,
         sh_ten_build_fn,
-        sh_ten_merge_fn,
+        cat_with_oom_fallback,
         original_sh_ten.replica_id,
         flattened_range=original_sh_ten.flattened_range,
     )
