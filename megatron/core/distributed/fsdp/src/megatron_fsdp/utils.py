@@ -46,6 +46,13 @@ except (ImportError, ModuleNotFoundError):
     HAVE_TE = False
 
 
+try:
+    _torch_version = PkgVersion(torch.__version__)
+except Exception:
+    # This is a WAR for building docs, where torch is not actually imported
+    _torch_version = PkgVersion("0.0.0")
+
+
 _MODEL_PARALLEL_RNG_TRACKER_NAME = "model-parallel-rng"
 
 
@@ -76,6 +83,13 @@ def is_te_min_version(vers, check_equality=True):
     if check_equality:
         return te_version >= PkgVersion(vers)
     return te_version > PkgVersion(vers)
+
+
+def is_torch_min_version(version, check_equality=True):
+    """Check if minimum version of `torch` is installed."""
+    if check_equality:
+        return _torch_version >= PkgVersion(version)
+    return _torch_version > PkgVersion(version)
 
 
 def is_submodule(module, parent_module, strict=True):
