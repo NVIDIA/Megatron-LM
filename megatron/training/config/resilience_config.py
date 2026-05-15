@@ -2,6 +2,9 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from megatron.core.fault_injector import FaultInjectorConfig
+
+
 @dataclass(kw_only=True)
 class RerunStateMachineConfig:
     """Configuration for the rerun state machine used for result validation or stats."""
@@ -10,7 +13,9 @@ class RerunStateMachineConfig:
     """Rate at which to inject unexpected results, e.g. 1000 means
     once every 1000 result validations"""
 
-    error_injection_type: Literal["correct_result", "transient_error", "persistent_error"] = "transient_error"
+    error_injection_type: Literal["correct_result", "transient_error", "persistent_error"] = (
+        "transient_error"
+    )
     """Type of error to inject. """
 
     rerun_mode: Literal["disabled", "validate_results", "report_stats"] = "validate_results"
@@ -39,4 +44,3 @@ class StragglerDetectionConfig:
 
     disable_straggler_on_startup: bool = False
     """If set, StragglerDetector is disabled on startup."""
-

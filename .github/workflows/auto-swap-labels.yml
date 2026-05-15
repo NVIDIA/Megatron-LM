@@ -32,7 +32,7 @@ jobs:
         id: get-pr
         if: github.event_name == 'workflow_run'
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: pr-number
           path: pr-number
@@ -54,7 +54,7 @@ jobs:
 
       - name: Check out repository code
         if: steps.pr.outputs.number
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
         if: steps.pr.outputs.number

@@ -200,6 +200,7 @@ class TestMambaPrefixCachingE2E:
             enable_prefix_caching=enable_prefix_caching,
             unified_memory_level=0,
             num_cuda_graphs=num_cuda_graphs,
+            sampling_backend='torch',
         )
         if enable_prefix_caching:
             inference_config_kwargs.update(

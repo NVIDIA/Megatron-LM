@@ -191,7 +191,8 @@ class Partition(object):
                 self.print_processing_stats(i, proc_start, total_bytes_processed)
 
         fin.close()
-        builders[key].finalize(output_idx_files[key])
+        for key in self.args.json_keys:
+            builders[key].finalize(output_idx_files[key])
 
         pool.close()
         pool.join()

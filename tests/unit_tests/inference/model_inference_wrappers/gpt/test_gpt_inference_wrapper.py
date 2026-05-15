@@ -8,6 +8,7 @@ from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -49,7 +50,10 @@ class TestGPTInferenceWrapper:
 
         self.inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_context)
 
+        InferenceMode.set_active()
+
     def teardown_method(self, method):
+        InferenceMode.unset_active()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])

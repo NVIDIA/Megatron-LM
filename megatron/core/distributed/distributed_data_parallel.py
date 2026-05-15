@@ -165,6 +165,8 @@ class DistributedDataParallel(_BaseDataParallel):
                     param_indices == layout.param_indices
                 ), f"param_indices for {buffer_key} do not match between grouping and layout"
 
+        self.full_param_layout = full_param_layout
+
         # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
             assert (

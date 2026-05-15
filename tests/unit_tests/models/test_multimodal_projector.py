@@ -20,7 +20,7 @@ class TestMultimodalProjector:
         transformer_config = TransformerConfig(
             num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
         )
-        mlp_layer_spec = get_mlp_module_spec().submodules
+        mlp_layer_spec = get_mlp_module_spec().keywords['submodules']
 
         affine_layer_spec = MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=None)
         self.mlp = MultimodalProjector(

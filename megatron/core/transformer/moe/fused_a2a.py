@@ -3,6 +3,9 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import os
+from typing import Optional
+
 from megatron.core.utils import internal_api
 
 try:
@@ -266,6 +269,7 @@ else:
 
 
 try:
+    import hybrid_ep_cpp
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
@@ -273,16 +277,74 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
+_HYBRID_EP_TOKEN_ALIGNMENT = 16
+_HYBRID_EP_MIN_BUFFER_TOKENS = 512
+_HYBRID_EP_IB_QP_MAX_DEPTH = 65535
+_HYBRID_EP_IB_DISPATCH_DEPTH_PER_TOKEN = 3
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _hybrid_ep_num_nodes(group: torch.distributed.ProcessGroup) -> int:
+    """Mirror HybridEP's NVLink-domain detection without constructing the full buffer."""
+    ranks_per_nvlink_domain_env = os.getenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN")
+    if ranks_per_nvlink_domain_env is not None:
+        ranks_per_nvlink_domain = int(ranks_per_nvlink_domain_env)
+    else:
+        allocator = hybrid_ep_cpp.ExtendedMemoryAllocator()
+        ranks_per_nvlink_domain = allocator.detect_accessible_ranks(group)
+
+    assert group.size() % ranks_per_nvlink_domain == 0, (
+        f"The number of ranks {group.size()} should be divisible by the number of ranks per "
+        f"NVLink domain {ranks_per_nvlink_domain}."
+    )
+    return group.size() // ranks_per_nvlink_domain
+
+
+def _hybrid_ep_uses_internode_rdma(group: torch.distributed.ProcessGroup) -> bool:
+    if _hybrid_ep_buffer is not None and hasattr(_hybrid_ep_buffer, "num_of_nodes"):
+        return _hybrid_ep_buffer.num_of_nodes > 1
+    return _hybrid_ep_num_nodes(group) > 1
+
+
+def _validate_hybrid_ep_ib_tx_depth(num_tokens: int, group: torch.distributed.ProcessGroup) -> None:
+    buffer_tokens = max(
+        _round_up_to_multiple(num_tokens, _HYBRID_EP_TOKEN_ALIGNMENT), _HYBRID_EP_MIN_BUFFER_TOKENS
+    )
+    tx_depth = _HYBRID_EP_IB_DISPATCH_DEPTH_PER_TOKEN * buffer_tokens + 1
+    if tx_depth <= _HYBRID_EP_IB_QP_MAX_DEPTH:
+        return
+
+    if not _hybrid_ep_uses_internode_rdma(group):
+        return
+
+    max_supported_tokens = (
+        ((_HYBRID_EP_IB_QP_MAX_DEPTH - 1) // _HYBRID_EP_IB_DISPATCH_DEPTH_PER_TOKEN)
+        // _HYBRID_EP_TOKEN_ALIGNMENT
+        * _HYBRID_EP_TOKEN_ALIGNMENT
+    )
+    raise ValueError(
+        f"HybridEP InfiniBand dispatch queue pair depth ({tx_depth}) exceeds the hardware "
+        f"limit of {_HYBRID_EP_IB_QP_MAX_DEPTH}. DeepEP computes this depth from the "
+        f"tokens per rank rounded up to a {_HYBRID_EP_TOKEN_ALIGNMENT}-token buffer "
+        f"alignment ({buffer_tokens}). Reduce sequence length or micro-batch size, or "
+        f"increase Tensor Parallelism (TP) / Context Parallelism (CP), so tokens per rank "
+        f"are at most {max_supported_tokens} for multi-node HybridEP."
+    )
 
 
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
-    seq_len: int,
+    num_tokens: int,
     num_local_experts: int,
-    num_sms_dispatch_api: int,
-    num_sms_combine_api: int,
-    fp8_dispatch: bool,
+    num_sms_dispatch_api: Optional[int] = None,
+    num_sms_combine_api: Optional[int] = None,
+    num_blocks_permute: Optional[int] = None,
+    num_blocks_unpermute: Optional[int] = None,
+    fp8_dispatch: bool = False,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -297,27 +359,39 @@ def init_hybrid_ep_buffer(
             Process group for HybridEP all-to-all communication.
         hidden_dim (int):
             Hidden dimension of the input tensor.
-        seq_len (int):
-            Maximum sequence length of the input tensor.
+        num_tokens (int):
+            Maximum token count of the input tensor.
         num_local_experts (int):
             Number of local experts.
-        num_sms_dispatch_api (int):
+        num_sms_dispatch_api (Optional[int]):
             Number of SMs used by the dispatch API.
-        num_sms_combine_api (int):
+        num_sms_combine_api (Optional[int]):
             Number of SMs used by the combine API.
+        num_blocks_permute (Optional[int]):
+            Number of blocks used by the permute part.
+        num_blocks_unpermute (Optional[int]):
+            Number of blocks used by the unpermute part.
         fp8_dispatch (bool):
             Whether to use FP8 communication during the dispatch phase.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
+    kwargs = {}
+    if num_sms_dispatch_api is not None:
+        kwargs['num_sms_dispatch_api'] = num_sms_dispatch_api
+    if num_sms_combine_api is not None:
+        kwargs['num_sms_combine_api'] = num_sms_combine_api
+    if num_blocks_permute is not None:
+        kwargs['num_blocks_permute'] = num_blocks_permute
+    if num_blocks_unpermute is not None:
+        kwargs['num_blocks_unpermute'] = num_blocks_unpermute
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
-        max_num_of_tokens_per_rank=seq_len,
+        max_num_of_tokens_per_rank=num_tokens,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
-        num_sms_dispatch_api=num_sms_dispatch_api,
-        num_sms_combine_api=num_sms_combine_api,
+        **kwargs,
     )
 
 
@@ -342,24 +416,47 @@ class HybridEPDispatch(torch.autograd.Function):
         probs,
         group,
         num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
+        num_sms_dispatch_api=None,
+        num_sms_combine_api=None,
+        num_blocks_permute=None,
+        num_blocks_unpermute=None,
+        fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
+        if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
+            import inspect
+            import warnings
+
+            sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
+            if 'fuse_permute_dispatch' not in sig.parameters:
+                warnings.warn(
+                    "Current DeepEP version does not support fused permute dispatch or "
+                    "num_blocks_permute/num_blocks_unpermute. Falling back to unfused "
+                    "HybridEP dispatch.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                fused = False
+                num_blocks_permute = None
+                num_blocks_unpermute = None
+
+        num_tokens, hidden_dim = x.shape[-2:]
+        _validate_hybrid_ep_ib_tx_depth(num_tokens, group)
         if _hybrid_ep_buffer is None:
-            seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
                 hidden_dim,
-                seq_len,
+                num_tokens,
                 num_local_experts,
                 num_sms_dispatch_api,
                 num_sms_combine_api,
+                num_blocks_permute,
+                num_blocks_unpermute,
                 fp8_dispatch,
             )
         # If we provide the num_permuted_tokens, we do not need to use sync to
@@ -381,10 +478,12 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
+            **({"fuse_permute_dispatch": fused} if fused else {}),
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        ctx.fused = fused
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -400,9 +499,26 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+            hidden=grad_x,
+            probs=grad_probs,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
+            **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
         )
-        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
+        return (
+            combined_hidden,
+            None,
+            combined_probs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 @internal_api
@@ -412,16 +528,20 @@ class HybridEPCombine(torch.autograd.Function):
     '''
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
+    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, fused=False):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x, handle=handle, pad_multiple=pad_multiple
+            hidden=x,
+            handle=handle,
+            pad_multiple=pad_multiple,
+            **({"fuse_unpermute_combine": fused} if fused else {}),
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.fused = fused
         return combined_hidden
 
     @staticmethod
@@ -436,6 +556,7 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
         return dispatched_hidden, None, None, None, None
 
@@ -449,8 +570,11 @@ if HAVE_HYBRIDEP:
         probs,
         group,
         num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
+        num_sms_dispatch_api=None,
+        num_sms_combine_api=None,
+        num_blocks_permute=None,
+        num_blocks_unpermute=None,
+        fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
     ):
@@ -469,10 +593,14 @@ if HAVE_HYBRIDEP:
                 Process group used for communication.
             num_local_experts (int):
                 Number of local experts.
-            num_sms_dispatch_api (int):
+            num_sms_dispatch_api (Optional[int]):
                 Number of SMs used by the dispatch API.
-            num_sms_combine_api (int):
+            num_sms_combine_api (Optional[int]):
                 Number of SMs used by the combine API.
+            num_blocks_permute (Optional[int]):
+                Number of blocks used by the permute part.
+            num_blocks_unpermute (Optional[int]):
+                Number of blocks used by the unpermute part.
             num_permuted_tokens (int):
                 Number of tokens after permute. HybridEP uses this to allocate buffers.
                 If not provided, HybridEP obtains the size from a GPU tensor,
@@ -489,12 +617,15 @@ if HAVE_HYBRIDEP:
             num_local_experts,
             num_sms_dispatch_api,
             num_sms_combine_api,
+            num_blocks_permute,
+            num_blocks_unpermute,
+            fused,
             num_permuted_tokens,
             pad_multiple,
         )
 
     @internal_api
-    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple):
+    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple, fused=False):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
@@ -511,7 +642,7 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple)
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
 
 else:
     hybrid_ep_dispatch = None

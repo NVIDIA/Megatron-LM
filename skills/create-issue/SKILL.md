@@ -1,6 +1,7 @@
 ---
 name: create-issue
-description: Investigate a failing GitHub Actions run or job and create a GitHub issue for the failure. Use when the user shares a GitHub Actions URL and wants to file a bug report for the CI failure.
+description: Investigate a failing GitHub Actions run or job and create a GitHub issue for the failure.
+when_to_use: User shares a GitHub Actions URL and wants to file a bug report; 'create an issue for this failure', 'file a bug for this CI run', 'triage this GitHub Actions failure'.
 user_invocable: true
 argument: "<github-actions-run-or-job-url>"
 ---

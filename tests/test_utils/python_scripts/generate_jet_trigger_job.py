@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import pathlib
 from typing import Optional
 
@@ -58,6 +60,16 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
     type=bool,
     help="Run one job as dependency to others as to warm up cache",
 )
+@click.option(
+    "--cadence",
+    required=False,
+    type=str,
+    default=None,
+    help=(
+        "Trigger cadence to filter tests by (pr|nightly|mergegroup). "
+        "Empty/unset disables the cadence filter."
+    ),
+)
 def main(
     scope: str,
     environment: str,
@@ -78,7 +90,12 @@ def main(
     wandb_experiment: Optional[str] = None,
     enable_lightweight_mode: bool = False,
     enable_warmup: Optional[bool] = None,
+    cadence: Optional[str] = None,
 ):
+    # Treat empty string as "no cadence filter" so callers can wire shell
+    # variables in directly without conditional flag emission.
+    cadence_arg = cadence or None
+
     list_of_test_cases = [
         test_case
         for test_case in recipe_parser.load_workloads(
@@ -88,6 +105,7 @@ def main(
             test_cases=test_cases,
             platform=platform,
             tag=tag,
+            cadence=cadence_arg,
         )
         if test_case.type != "build"
     ]

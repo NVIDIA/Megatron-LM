@@ -10,7 +10,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
     start_text_gen_server,
     stop_text_gen_server,
 )
-from megatron.core.utils import trace_async_exceptions
+from megatron.core.utils import configure_nvtx_profiling, trace_async_exceptions
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args
@@ -83,10 +83,18 @@ if __name__ == "__main__":
         )
         initialize_megatron()
 
+        args = get_args()
+
+        # Match training's NVTX gating (training.py only flips this when both
+        # --profile and --nvtx-ranges are set). Otherwise the engine-side
+        # nvtx_range_push labels (bookkeeping, Decode, _ep_establish_consensus,
+        # etc.) are no-ops and the inter-step gap is unattributable in nsys.
+        if args.profile and args.nvtx_ranges:
+            configure_nvtx_profiling(True)
+
         # Enable return_log_probs to allow prompt logprobs computation for echo=True requests
         # This sets materialize_only_last_token_logits=False in the inference context,
         # which is required for lm-eval compatibility (loglikelihood evaluation tasks)
-        args = get_args()
         args.return_log_probs = True
 
         engine = get_dynamic_inference_engine()

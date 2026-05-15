@@ -153,6 +153,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "memory_efficient_layer_norm": False,
     "microbatch_group_size_per_vp_stage": 1,
     "mlp_chunks_for_prefill": 1,
+    "mlp_chunks_for_training": 1,
     "moe_apply_probs_on_input": False,
     "moe_aux_loss_coeff": 0.0,
     "moe_deepep_num_sms": 20,
@@ -161,7 +162,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
     "moe_grouped_gemm": True,
-    "moe_hybridep_num_sms": 16,
+    "moe_hybridep_num_sms": None,
+    "moe_hybridep_num_blocks_permute": None,
+    "moe_hybridep_num_blocks_unpermute": None,
     "moe_input_jitter_eps": None,
     "moe_latent_size": None,
     "moe_layer_freq": 1,
@@ -170,6 +173,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_pad_experts_for_cuda_graph_inference": False,
     "moe_per_layer_logging": False,
     "moe_permute_fusion": False,
+    "moe_permute_fusion_into_hybridep": False,
     "moe_router_bias_update_rate": 0.001,
     "moe_router_dtype": "fp64",
     "moe_router_enable_expert_bias": True,
@@ -286,8 +290,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "max_seqlen_per_dp_cp_rank": None,
     "inference_disable_triton_nvls_kernels": False,
     "moe_router_force_biased": None,
-    "inference_grouped_gemm_backend": "auto",
+    "inference_grouped_gemm_backend": "vllm",
     "inference_moe_disable_fused_quant_kernels": False,
+    "inference_moe_token_dispatcher_type": "nvls",
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

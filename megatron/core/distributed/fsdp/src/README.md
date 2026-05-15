@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🚀 Megatron-FSDP
+# Megatron-FSDP
 
 </div>
 
@@ -12,38 +12,16 @@
 
 ## ✨ What is Megatron-FSDP?
 
-**Megatron-FSDP** is an NVIDIA-developed PyTorch extension that provides a high-performance implementation of Fully Sharded Data Parallelism (FSDP). It offers seamless cross-compatibility with major deep learning frameworks and parallelism libraries, making it easy to scale your PyTorch models across multiple GPUs and nodes.
+**Megatron-FSDP** is an NVIDIA-developed distributed parallelism library written in native PyTorch that provides a high-performance implementation of **Fully Sharded Data Parallelism (FSDP)**. It offers seamless cross-compatibility with various deep learning frameworks and parallelism libraries such as Megatron-Core, and is performance-optimized to support training and inference of extremely large PyTorch models at data-center scale on NVIDIA GPUs.
 
-Megatron-FSDP can provide up to 25% speed up and 23% memory savings compared to FSDP2.
+For comprehensive information about Megatron-FSDP, refer to: [Megatron-FSDP | Megatron-Core Developer Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/)
 
-### Compatibility
+### 🧩 Compatibility
 
-- **[PyTorch DTensor](https://docs.pytorch.org/docs/stable/distributed.tensor.html)**
+- PyTorch **[DeviceMesh](https://docs.pytorch.org/docs/stable/distributed.html#devicemesh)**, **[DTensor](https://docs.pytorch.org/docs/stable/distributed.tensor.html)**, and **[Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)**
 - **[Megatron Core](https://github.com/NVIDIA/Megatron-LM)**
 - **[TransformerEngine](https://github.com/NVIDIA/TransformerEngine)**
-
-## ✨ Features
-
-- **Easy Integration**: Simple `fully_shard` function for quick model parallelization
-- **High Performance**: Optimized for NVIDIA GPUs with efficient memory management
-- **Cross-Framework**: Works seamlessly with PyTorch, Huggingface Transformers, Megatron-LM, Megatron Bridge and TransformerEngine
-- **Scalable**: Supports both single-node multi-GPU and multi-node distributed training
-- **Flexible Configuration**: Configurable sharding strategies and process groups
-
-## ⚡ Optimizations
-
-- **Advanced Bucketing**: Data-type aware bucketing system to minimize the overhead of collective operations
-- **Buffer Management**: Zero copy communication is achieved by reorganizing the storage of parameters and main grad with `ParamAndGradBuffer` class
-- **Communication Overlapping**: Improved communication overlap of paramter all-gather and gradient reduce-scatter
-- **FP8 Mixed Precision with Transformer Engine**: Compatibility with Transformer Engine enables efficient FP8 mixed precision training
-- **Gradient accumulate fusion support with Transformer Engine**: Remove the explicit gradient copy to the communication buffer in backwards pass
-
-### Advanced Collective Communication
-- **SM Usage Reduction with SHARP**: FSDP's `All-Gather` (AG) and `Reduce-Scatter` (RS) collectives are designed to overlap with compute kernels. However, standard NCCL communication kernels can consume a significant number of GPU SMs (e.g., 16-32 SMs), "stealing" resources from compute (GEMM) kernels and reducing overall TFLOPS.
-- **In-Switch Processing**: We leverage **SHARP** (Scalable Hierarchical Aggregation and Reduction Protocol) to offload these collective operations. SHARP performs aggregation and reduction computations directly on the network switches (InfiniBand or NVLink Switch) instead of on the GPU SMs. This dramatically reduces the SM consumption for communication to **1-6 SM** freeing up GPU resources for compute. It also provides lower communication latency, especially in large, scaled-out workloads.
-- **Symmetric Optimizations for MNNVL**: We support **symmetric-based optimizations**, introduced in NCCL v2.27, which enable switch offloading for **Multi-Node NVLink (MNNVL)** systems such as GB200/GB300. This allows the same SM-saving benefits over the high-bandwidth NVLink fabric itself.
-- **Hierarchical Collectives**: When an FSDP sharding domain spans both NVLink and InfiniBand, the library utilizes **hierarchical SHARP collectives** (e.g., NVL-SHARP + IB-SHARP) to optimize the communication path across the entire system topology.
-<!-- ## 📊 Performance  -->
+- **[NVIDIA NeMo Framework Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo)**
 
 ## 📦 Installation
 
@@ -56,10 +34,6 @@ pip install megatron-fsdp
 
 ## 🚀 Quick Start
 
-### Basic Usage
-
-Transform your PyTorch model to use Fully Sharded Data Parallelism with just a few lines:
-
 ```python
 import torch
 from megatron_fsdp import (
@@ -67,215 +41,50 @@ from megatron_fsdp import (
     fully_shard_optimizer,
 )
 
-"""
-Enable FSDP with Megatron-FSDP via the `fully_shard_*` API.
-"""
-# Shard your model.
-model = fully_shard_model(
-    model,
+# Initialize Torch Distributed.
+torch.distributed.init_process_group()
+torch.cuda.set_device(torch.distributed.get_rank())
+
+# Fully-shard the model.
+model = torch.nn.Transformer()
+fsdp_model = fully_shard_model(
+    module=model,
     fsdp_unit_modules=[
-        YourModelLayerClass,
-        "import.path.to.model.class.YourModelLayerClass",
-    ],
-    ...
-)
-# Shard your optimizer.
-optimizer = fully_shard_optimizer(
-    torch.optim.Adam(model.parameters(), lr=1e-3)
+        torch.nn.TransformerEncoder,
+        torch.nn.TransformerDecoder
+    ]
 )
 
-# Your model is now ready for distributed training!
-```
+# Fully-shard the optimizer.
+toy_adam = torch.optim.AdamW(params=fsdp_model.parameters(), lr=0.01)
+optimizer = fully_shard_optimizer(optimizer=toy_adam)
 
-### Comparison with FSDP-2
+# Forward pass.
+inp = torch.randn(1, 512, 512).to("cuda")
+tgt = torch.randn(1, 512, 512).to("cuda")
+output = fsdp_model(inp, inp)
 
-`fully_shard` / `fully_shard_model` / `fully_shard_optimizer` are simple entrypoints into `MegatronFSDP`.
+# Backward pass.
+torch.nn.functional.mse_loss(output, tgt).backward()
 
-- No need to call `fully_shard` on all the sub-modules, just pass your sub-module classes or import paths to `fully_shard`!
-- Seamlessly preserves the identity of your training loop with only a few lines of code and multiple options for initialization:
-  - `fully_shard_*` is a two-line change when sharding the model and optimizer separately.
-  - `fully_shard` is a one-line change for previously-initialized models and optimizers.
+# Optimizer step.
+optimizer.step()
+optimizer.zero_grad()
 
-Compare this with FSDP2:
+# Checkpoint the model and optimizer.
+torch.distributed.checkpoint.save({
+    "model": fsdp_model.state_dict(),
+    "optimizer": optimizer.state_dict(),
+}, checkpoint_id="ckpt/")
 
-```python
-import torch
-from torch.distributed.fsdp import fully_shard
-
-# Your existing model and optimizer.
-model = YourModel()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-# Enable FSDP with FSDP2.
-for module in model.modules():
-    # Sub-Modules to shard.
-    if isinstance(module, YourModelLayerClass):
-        fully_shard(module)
-fully_shard(model)
-
-# Your model is now ready for distributed training!
-```
-
-### `torch.compile` Compatibility
-
-Megatron-FSDP is compatible with `torch.compile`, but this feature is still experimental and may introduce performance regressions in some workloads.
-
-## 📖 Megatron-FSDP Comprehensive Walkthrough
-
-### Import `megatron_fsdp`.
-
-```python
-import torch
-from megatron_fsdp import (
-    fully_shard_model,
-    fully_shard_optimizer,
-    MixedPrecisionPolicy,
-)
-```
-
-### Set up a distributed environment using `DeviceMesh`.
-
-`DeviceMesh` simplifies the construction of complex arrangements of devices
-to support various parallelisms.
-
-```python
-from torch.distributed.device_mesh import DeviceMesh
-
-# Initialize DeviceMesh.
-device_mesh = torch.distributed.device_mesh.init_device_mesh(
-    "cuda",
-    mesh_shape=(dp_outer_size, dp_shard_size, cp_size, tp_size),
-    mesh_dim_names=("dp_outer", "dp_shard", "cp", "tp"),
-)
-# Only relevant when using HSDP, where we also need the full DP group for data parallelism,
-# This sub-mesh can be provided to distributed samplers or dataloaders.
-device_mesh[("dp_outer", "dp_shard")]._flatten("dp")
-# Only required if using CP. Otherwise, just pass dp_shard to FSDP.
-device_mesh[("dp_shard", "cp")]._flatten("dp_shard_cp")
-# Only required if using HSDP. Otherwise, don't pass hybrid_fsdp_group.
-device_mesh[("dp_outer", "dp_shard", "cp")]._flatten("hsdp")
-hsdp_group = device_mesh["hsdp"].get_group()
-
-# Initialize DeviceMesh for expert parallel (EP) modules when using FSDP + EP.
-expert_device_mesh = torch.distributed.device_mesh.init_device_mesh(
-    "cuda",
-    mesh_shape=(dp_outer_size, expt_dp_shard_size, expt_tp_size),
-    mesh_dim_names=("dp_outer", "dp_shard_cp", "tp"),
-)
-expert_device_mesh[("dp_outer", "dp_shard_cp")].flatten("hsdp")
-hsdp_expt_group = expert_device_mesh["hsdp"].get_group()
-```
-
-### Convert models into fully-sharded `MegatronFSDP` models with `fully_shard_model`.
-
-This wraps the model in a MegatronFSDP class that schedules the sharding
-lifecycle of the model parameters and gradients during training and inference.
-
-```python
-model = fully_shard_model(
-    # PyTorch (Root) Module
-    model,
-    # Sharded Modules
-    fsdp_unit_modules=[...],
-    # Device Mesh
-    device_mesh=device_mesh
-    # Always required for FSDP or HSDP.
-    dp_shard_dim="dp_shard_cp",
-    # Set this required argument to use HSDP instead of FSDP. Otherwise, set this to None.
-    dp_outer_dim="dp_outer",
-    # Only required for TP-sensitive models (i.e. Megatron-LM / TransformerEngine)
-    # or when using DTensor-based TP. Otherwise, set this to None.
-    tp_dim="tp",
-    # Only required when using HSDP. Otherwise, set this to None.
-    hybrid_fsdp_group=hsdp_group,
-    # Only required when using HSDP + EP. Otherwise, set this to None.
-    hybrid_fsdp_expt_group=hsdp_expt_group,
-    # Only required for FSDP + EP. Otherwise, set this to None.
-    expt_device_mesh=expt_device_mesh,
-    # FSDP Sharding Strategy: no_shard (0) / optim (1) / optim_grads (2) / optim_grads_params (3)
-    zero_dp_strategy=3,
-    outer_dp_sharding_strategy=1,
-    # Initialize the model on devices in shards to avoid OOM. Requires device("meta")-init for model.
-    init_model_with_meta_device=True,
-    # Mixed-Precision Policy for controlling compute and communication precision in Megatron-FSDP.
-    mixed_precision_policy=MixedPrecisionPolicy(),
-    # Sync parameters and gradients each step. Allows for gradient transformations after backward pass,
-    # and synchronizes parameters and gradients across HSDP groups, but deactivates compute-communication
-    # overlap going into the subsequent training step.
-    sync_model_each_microbatch=True,
-    # Preprocess state dict for DCP checkpointing. Required for Torch Distributed Checkpoint.
-    preproc_state_dict_for_dcp_ckpt=True,
-)
-```
-
-The original `torch.nn.Module` can be accessed at `MegatronFSDP.module`.
-
-### Initialize and fully-shard your optimizer on the `MegatronFSDP` model.
-
-Initialize your optimizer on the Megatron-FSDP model distributed `Parameter`(s).
-If your optimizer has already been initialized, either use the `fully_shard`
-entrypoint, or use `optimizer.add_param_group({"params": model.parameters()})`
-after resetting your optimizer state via `optimizer.param_groups.clear()`
-and `optimizer.state.clear()`.
-
-```python
-optimizer = torch.optim.Optimizer(model.parameters())
-```
-
-`fully_shard_optimizer` modifies your `optimizer.step()`, `optimizer.zero_grad()`,
-and distributed optimizer parameters to punctually trigger scheduled FSDP operations
-for Megatron-FSDP.
-
-```python
-fully_shard_optimizer(
-    # PyTorch Optimizer
-    optimizer,
-    # Preprocess state dict for DCP checkpointing.
-    # Required for Torch Distributed Checkpoint.
-    preproc_state_dict_for_dcp_ckpt=True,
-)
-```
-
-Extended arguments to `step()` and `zero_grad()` control these FSDP operations:
-
-```python
-    optimizer.step(
-        ...,
-        # Sync all gradients before the optimizer step. Alternatively enabled using
-        # `sync_model_each_microbatch=True` in MegatronFSDP.
-        sync_grad_before_optimizer_step=True,
-        # After `optimizer.step()`, install optimized weights into MegatronFSDP's buffers.
-        install_optimized_model_weights=True,
-    )
-
-    optimizer.zero_grad(
-        ...,
-        # Also zero out MegatronFSDP's gradient accumulation buffers.
-        zero_grad_buffer=True
-    )
-```
-
-### `MegatronFSDP` Distributed Checkpointing
-
-Distributed checkpoints can be saved and loaded using Torch DCP. Alternatively,
-you can load non-distributed checkpoints before fully-sharding your model with
-any existing checkpoint utility compatible with PyTorch Modules.
-
-```python
-# Save model and optimizer state.
-torch.distributed.checkpoint.save(
-    {"model": model.state_dict(), "optimizer": optimizer.state_dict()},
-    checkpoint_id=str(CKPT_DIR)
-)
-
-# Load model and optimizer state.
-ckpt_state_dict = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
-torch.distributed.checkpoint.load(state_dict=ckpt_state_dict, checkpoint_id=str(CKPT_DIR))
-# `model.load_state_dict(strict=False)` is only necessary to ignore TE FP8 extra state
-# that is missing from the DCP checkpoint but present in TEBaseModule.
-# Megatron-FSDP does not support TE FP8 extra state checkpointing with DCP.
-model.load_state_dict(ckpt_state_dict["model"], strict=False)
-optimizer.load_state_dict(ckpt_state_dict["optimizer"])
+# Load the saved checkpoint.
+ckpt = {
+    "model": fsdp_model.state_dict(),
+    "optimizer": optimizer.state_dict(),
+}
+torch.distributed.checkpoint.load(state_dict=ckpt, checkpoint_id="ckpt/")
+fsdp_model.load_state_dict(ckpt["model"], strict=False)
+optimizer.load_state_dict(ckpt["optimizer"])
 ```
 
 ## ⚙️ `fully_shard` / `MegatronFSDP` API - Advanced Features
@@ -305,17 +114,17 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - Defaults to `False`.
     - Note that the `device` argument which installs your model on a specific device or rank will be deactivated when `init_model_with_meta_device=True`.
 - `mixed_precision_policy` takes a `megatron_fsdp.MixedPrecisionPolicy` that configures mixed-precision compute and communication for Megatron-FSDP. Configuration options include:
-    - `main_params_dtype` controls the data-type for parameters used in distributed optimization or quantization. 
+    - `main_params_dtype` controls the data-type for parameters responsible for distributed checkpointing, distributed optimization, and quantization.
         - Defaults to `torch.float32`.
         - If set to `None`, the native model compute parameter data-type will be utilized.
-        - Requires specification (cannot be `None`) when using `FP8` parameters with Megatron-FSDP.
+        - Requires specification (cannot be `None`) when using quantized parameters with Megatron-FSDP.
     - `main_grads_dtype` controls the data-type for gradients used in distributed optimization.
-        - Defaults to `None`, the model native gradient data-type will be utilized.
+        - Defaults to `None`, in which the model native gradient data-type will be utilized.
         - While `torch.float32` (or higher) is recommended for accuracy at scale, as `main_grads_dtype` controls the data-type for gradient accumulation, `None` is more flexible and uses pre-determined parameter gradient logic in mixed-precision scenarios, such as `BF16` for `FP8`/`FP4` parameters quantized via TransformerEngine.
-    - `grad_comm_dtype` controls the data-type for gradient communications (RS / AR) when reducing gradients. Lower precision `grad_comm_dtype` improves (communication) performance, but may increase memory utilization or sacrifice gradient precision in certain cases.
-        - Defaults to `None`, the `main_grads_dtype` data-type will be utilized, and no additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
-        - If using HSDP (either DP-Replicate or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient communication buffers (per FSDP group) adds memory overhead of up to 10% or more, and users should consider the performance-memory trade-off when using this feature.
-        - If using NCCL UBR v2.27+ (`nccl_ub=True`), gradient reduction may be performed in high-precision depending on the network domain (NVLink or IB), and can enable mixed-precision communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support `FP32` reduction even though we have `BF16` input and output communication buffers. Otherwise, gradients will be reduced in `grad_comm_dtype` (and accumulated in `main_grads_dtype`) as usual.
+    - `grad_comm_dtype` controls the data-type for gradient communications when reducing gradients. Lower precision `grad_comm_dtype` improves (communication) performance, but may increase memory utilization or sacrifice gradient precision in certain cases.
+        - Defaults to `None`, in which the `main_grads_dtype` data-type will be utilized. No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
+        - If using HSDP (either DP-Replicate or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, or `optim`, allocating `dtype`-custom gradient communication buffers may increase per-unit memory overhead, so users should consider the performance-memory trade-off when using this feature.
+        - If using NCCL user buffer registration `v2.27+`, gradient reduction may be performed in high-precision depending on the network domain (NVLink or IB), and can enable mixed-precision communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support `FP32` reduction even though we have `BF16` input and output communication buffers. Otherwise, gradients will be reduced in `grad_comm_dtype` (and accumulated in `main_grads_dtype`) as usual.
 - `overlap_grad_reduce` and `overlap_param_gather` will overlap gradient [`reduce-scatter`](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#reducescatter) and parameter [`all-gather`](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allgather) group communications with backward and forward compute with asynchronous calls and pre-fetching. (In the case of `no_shard`, parameters are not gathered but gradient [`all-reduce`](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allreduce) is overlapped.)
     - Both default to `True`.
 - `sync_model_each_microbatch` will trigger a `wait` (`MegatronFSDP.finish_grad_sync()`) on gradient reduction, parameter de-allocation, and optimizer parameter / gradient installation (in preparation for `optimizer.step()`) after every forward-backward pass. When using HSDP, parameters and gradients will be all-gathered and reduced respectively on the "outer" DP group each training step instead of each optimization cycle. This behavior is desirable for a transparent and user-friendly sharded training loop where post-backward transformations on the gradient and a clean compute / memory state are necessary within and between training iterations, but damages performance in situations where optimization is delayed (e.g. gradient accumulation) when the communications of the previous training iteration can be overlapped with the compute of the next training iteration. Will also override `is_last_microbatch` / `microbatch_count` logic in `MegatronFSDP`.
@@ -362,7 +171,7 @@ Megatron-FSDP natively supports mixed-precision activations and parameter shardi
 
 - Within the [`transformer_engine.pytorch.autocast(recipe: transformer_engine.common.recipe.Recipe)`](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.autocast) context, model activations are converted based on the recipe.
 - Within the [`transformer_engine.pytorch.quantized_model_init(recipe: transformer_engine.common.recipe.Recipe)`](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.quantized_model_init) context, TransformerEngine native modules (e.g. [`transformer_engine.pytorch.TransformerLayer`](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.TransformerLayer)) have their parameters converted based on the recipe.
-    - Requires FP8 model activations, i.e. `transformer_engine.pytorch.autocast`.
+    - Requires quantized model activations, i.e. `transformer_engine.pytorch.autocast`.
 
 ```python
 # FP8 Recipe
@@ -397,4 +206,4 @@ with transformer_engine.pytorch.autocast(recipe=fp8_recipe):
     mfsdp_model(x).sum().backward()
 ```
 
-ℹ️ `TransformerEngine` kernels have a fair bit of configuration constraints when using FP8-quantized parameters, such as using fused QKV parameters or defining activations and parameters with shapes compatible to FP8 CuBLAS kernels on supported hardware from NVIDIA. To properly initialize `TransformerLayer`, you can refer to the toy model used in our FP8 unit tests: `Megatron-LM/tests/unit_tests/distributed/fsdp/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_fully_shard_te_quantized`.
+ℹ️ `TransformerEngine` kernels have various constraints related to quantized Tensors, such as using fused QKV parameters or defining activations and parameters with shapes compatible to CuBLAS kernels on supported hardware from NVIDIA. To properly initialize `TransformerLayer`, you can refer to the example model used in our unit tests: `Megatron-LM/tests/unit_tests/distributed/fsdp/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_fully_shard_te_quantized`.

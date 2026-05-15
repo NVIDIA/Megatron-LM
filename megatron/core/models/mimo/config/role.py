@@ -5,7 +5,7 @@
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch.distributed as dist
 
@@ -24,22 +24,17 @@ class ModuleLayout(Enum):
     Determines how modules are distributed across ranks and which
     forward path is used.
 
-    UNIFIED: No module_to_grid_map. All modules share same ranks and
-        parallelism. Uses the unified forward path (_forward_all_modules).
+    COLOCATED: All modules share the same ranks. Covers both legacy
+        (no grid map, global parallel_state) and heterogeneous TP/DP
+        (grid map with overlapping ranks). Uses _forward_all_modules.
 
     NON_COLOCATED: module_to_grid_map is set with non-overlapping rank
         ranges. Each rank runs EITHER encoder(s) OR the language model.
         Uses role-based dispatch with separate forward paths.
-
-    COLOCATED: (future) module_to_grid_map is set with overlapping rank
-        ranges. Encoder(s) and language model share ranks but have
-        different parallelism configs. Uses role-based dispatch but
-        allows both module types on the same rank.
     """
 
-    UNIFIED = "unified"
-    NON_COLOCATED = "non_colocated"
     COLOCATED = "colocated"
+    NON_COLOCATED = "non_colocated"
 
 
 @dataclass
@@ -70,50 +65,50 @@ class RankRole:
     """
 
     modules: Dict[str, ModuleStageInfo] = field(default_factory=dict)
-    mode: ModuleLayout = ModuleLayout.UNIFIED
+    mode: ModuleLayout = ModuleLayout.COLOCATED
 
     @classmethod
-    def unified(cls, module_names: List[str]) -> 'RankRole':
-        """Create a role for the unified case: every module, first+last stage."""
+    def build(
+        cls,
+        modality_module_names: List[str],
+        module_to_grid_map: Optional[Dict[str, 'HyperCommGrid']] = None,
+    ) -> 'RankRole':
+        """Build a RankRole, dispatching by whether grids share ranks.
+
+        No grid map or all grids span the same ranks → COLOCATED.
+        Grids differ → NON_COLOCATED with PP-stage info per module.
+        """
+        if module_to_grid_map is None or cls._all_grids_colocated(module_to_grid_map):
+            return cls._colocated(modality_module_names)
+        return cls._from_grid_map(module_to_grid_map)
+
+    @staticmethod
+    def _all_grids_colocated(module_to_grid_map: Dict[str, 'HyperCommGrid']) -> bool:
+        grids = list(module_to_grid_map.values())
+        first = grids[0]
+        return all(g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:])
+
+    @classmethod
+    def _colocated(cls, modality_module_names: List[str]) -> 'RankRole':
+        """Colocated layout: every module on every rank, PP=1."""
+        all_module_names = list(modality_module_names) + [MIMO_LANGUAGE_MODULE_KEY]
         return cls(
             modules={
                 name: ModuleStageInfo(is_first_stage=True, is_last_stage=True)
-                for name in module_names
+                for name in all_module_names
             },
-            mode=ModuleLayout.UNIFIED,
+            mode=ModuleLayout.COLOCATED,
         )
 
     @classmethod
-    def from_grid_map(
-        cls, module_to_grid_map: Dict[str, HyperCommGrid], modality_module_names: List[str]
-    ) -> 'RankRole':
-        """Create a role from a module-to-grid mapping for non-colocated PP.
+    def _from_grid_map(cls, module_to_grid_map: Dict[str, HyperCommGrid]) -> 'RankRole':
+        """Non-colocated role for this rank from a module-to-grid mapping.
 
-        Determines which modules the current rank participates in and its
-        pipeline stage position within each module.
-
-        Args:
-            module_to_grid_map: Dict mapping module names to HyperCommGrid objects.
-                Must contain keys matching modality_module_names + MIMO_LANGUAGE_MODULE_KEY.
-            modality_module_names: List of modality module names (e.g., ["images", "audio"]).
-
-        Returns:
-            RankRole for the current rank.
+        Grid map keys are validated by ``MimoModelConfig.__post_init__``.
 
         Raises:
-            ValueError: If grid map keys don't match expected module names.
             RuntimeError: If current rank is not in any module grid.
         """
-        # Validate keys
-        expected_keys = set(modality_module_names) | {MIMO_LANGUAGE_MODULE_KEY}
-        grid_keys = set(module_to_grid_map.keys())
-        if grid_keys != expected_keys:
-            raise ValueError(
-                f"module_to_grid_map keys must match modality module names + "
-                f"'{MIMO_LANGUAGE_MODULE_KEY}'. Missing: {expected_keys - grid_keys}, "
-                f"Extra: {grid_keys - expected_keys}"
-            )
-
         current_rank = dist.get_rank()
         modules = {}
 
@@ -131,7 +126,7 @@ class RankRole:
             is_first = pp_rank == 0
             is_last = pp_rank == pp_size - 1
             logger.info(
-                f"[RankRole.from_grid_map] Rank {current_rank}: module={module_name}, "
+                f"[RankRole._from_grid_map] Rank {current_rank}: module={module_name}, "
                 f"pp_rank={pp_rank}/{pp_size}, is_first_stage={is_first}, is_last_stage={is_last}"
             )
             modules[module_name] = ModuleStageInfo(is_first_stage=is_first, is_last_stage=is_last)

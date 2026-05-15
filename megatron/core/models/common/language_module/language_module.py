@@ -75,7 +75,7 @@ class LanguageModule(MegatronModule):
                 base_module=self,
                 function_name="compute_mtp_single_step",
                 need_backward=False,
-                is_mtp_inference=True,
+                inline_capture=True,
             )
 
     def _is_in_embd_group(self):
@@ -345,6 +345,8 @@ class LanguageModule(MegatronModule):
         next_token_ids: Tensor,
         position_ids: Tensor,
         depth: Optional[int] = None,
+        eager: bool = False,
+        cache_key=None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 
@@ -355,14 +357,19 @@ class LanguageModule(MegatronModule):
             hidden_states (Tensor): Hidden states at last accepted positions.
             next_token_ids (Tensor): Correct next token IDs [1, N].
             position_ids (Tensor): Position IDs for the next tokens [1, N].
-            depth (int, optional): MTP depth index. Only needed when
-                ``mtp_use_repeated_layer`` is False (each depth uses a
-                distinct layer). Omit for repeated-layer models so that a
+            depth (int, optional): MTP depth index. Only needed when `mtp_use_repeated_layer` is
+                False (each depth uses a distinct layer). Omit for repeated-layer models so that a
                 single CUDA graph can serve all depths.
+            eager, cache_key: The `CudaGraphManager` works by monkey-patching this argument onto the
+                function signature. Explictly including them removes the need for a monkey-patch,
+                and makes it straightforward to call the same method with and without eager mode.
+                These arguments are consumed by `CudaGraphManager`, if it exists.
 
         Returns:
             tuple: (new_hidden_states, logits [N, 1, vocab_size]).
         """
+        # CudaGraphManager consumes these args, if it exists
+        del eager, cache_key
         layer_idx = 0 if depth is None else depth
         mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
             hidden_states=hidden_states,
