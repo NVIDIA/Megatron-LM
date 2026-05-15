@@ -329,6 +329,18 @@ def validate_depth_mup_optimizer_support(args) -> None:
         )
 
 
+def validate_muon_scalar_optimizer_support(args) -> None:
+    """Keep CLI and YAML validation aligned for Muon scalar optimizer selection."""
+    muon_scalar_optimizer = _resolve_validation_attr(args, 'muon_scalar_optimizer')
+    if muon_scalar_optimizer is None:
+        return
+    if muon_scalar_optimizer not in ('adam', 'lion'):
+        raise ValueError(
+            "muon_scalar_optimizer must be one of ('adam', 'lion'). "
+            f"Got {muon_scalar_optimizer!r}."
+        )
+
+
 def _eval_pattern(pattern):
     """ Validate and evaluate a string containing a Python list expression """
     assert isinstance(pattern, str)
@@ -1839,6 +1851,7 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
     validate_depth_mup_optimizer_support(args)
+    validate_muon_scalar_optimizer_support(args)
     warn_deprecated_mup_aliases(args)
     sync_legacy_mup_fields(args, build_scaling_context(args))
 
