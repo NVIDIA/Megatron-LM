@@ -26,15 +26,20 @@ def pad_param_start(param_start_index: int) -> int:
     return pad_to_divisor(param_start_index, 64)
 
 
+def bucket_end_divisor(data_parallel_world_size: int, pad_for_high_nccl_busbw: bool) -> int:
+    """Divisor used to pad bucket ends for DP-divisibility (and optional NCCL busbw)."""
+    if pad_for_high_nccl_busbw:
+        return math.lcm(data_parallel_world_size, 128, 2**16)
+    return math.lcm(data_parallel_world_size, 128)
+
+
 def pad_bucket_end(
     bucket_end_index: int, data_parallel_world_size: int, pad_for_high_nccl_busbw: bool
 ) -> int:
     """Pad bucket end for DP-divisibility (and optionally high NCCL bus bandwidth)."""
-    if pad_for_high_nccl_busbw:
-        divisor = math.lcm(data_parallel_world_size, 128, 2**16)
-    else:
-        divisor = math.lcm(data_parallel_world_size, 128)
-    return pad_to_divisor(bucket_end_index, divisor)
+    return pad_to_divisor(
+        bucket_end_index, bucket_end_divisor(data_parallel_world_size, pad_for_high_nccl_busbw)
+    )
 
 
 @dataclass(frozen=True)
