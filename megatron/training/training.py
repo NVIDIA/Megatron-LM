@@ -1767,6 +1767,18 @@ def get_model(
                         )
                     )
 
+                # Under the layer-wise distributed optimizer (Muon and other non-Adam/SGD
+                # optimizers; arguments.py flips use_distributed_optimizer=False and sets
+                # use_layer_wise_distributed_optimizer=True), DDP doesn't get a pre-padded
+                # full_param_layout, so explicitly request per-param start padding here.
+                # Without it, cuBLAS MXFP8 wgrad on cuBLASLt 12.8.x rejects the heuristic
+                # for mid-bucket params whose main_grad slice is only 16-byte aligned.
+                if (
+                    DP is DDP
+                    and getattr(args, "use_layer_wise_distributed_optimizer", False)
+                ):
+                    chunk_kwargs["pad_param_starts"] = True
+
                 wrapped_model.append(
                     DP(
                         config=config,
