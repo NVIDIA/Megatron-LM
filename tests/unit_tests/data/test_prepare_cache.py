@@ -31,6 +31,7 @@ def _build_null_tokenizer(vocab_size: int = 2048):
             rank=0,
             make_vocab_size_divisible_by=128,
             tensor_model_parallel_size=1,
+            pad_vocab_size=True,
         )
     )
 
