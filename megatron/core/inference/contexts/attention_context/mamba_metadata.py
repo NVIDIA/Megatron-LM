@@ -348,7 +348,10 @@ class MambaMetadata:
             # This converts per-request token offsets to chunk indices and
             # absolute positions, padded to fixed size for CUDA graph compat.
             self._update_intermediate_metadata(
-                intermediate_offsets_gpu, intermediate_counts_gpu, real_prefill_count
+                intermediate_offsets_gpu,
+                intermediate_counts_gpu,
+                real_prefill_count,
+                padded_prefill_count,
             )
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
@@ -363,6 +366,7 @@ class MambaMetadata:
         intermediate_offsets_gpu: Optional[torch.Tensor],
         intermediate_counts_gpu: Optional[torch.Tensor],
         real_prefill_count: int,
+        padded_prefill_count: int,
         cu_seqlens_gpu: Optional[torch.Tensor] = None,
     ) -> None:
         """Precompute intermediate extraction metadata for CUDA graph compatibility.
@@ -383,7 +387,7 @@ class MambaMetadata:
                 shared ``ContextGPUView.mamba_cu_seqlens`` view.
         """
         chunk_size = self.mamba_chunk_size
-        max_count = self.max_intermediate_count
+        max_count = padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
         if cu_seqlens_gpu is None:
             cu_seqlens_gpu = self._cu_seqlens_buffer
 
@@ -444,15 +448,15 @@ class MambaMetadata:
                 # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1],
                 #   which are within bounds and produce a valid but unused state
                 if real_count < max_count:
-                    self._intermediate_chunk_indices_buffer[real_count:].fill_(0)
-                    self._intermediate_abs_positions_buffer[real_count:].fill_(self.d_conv)
+                    self._intermediate_chunk_indices_buffer[real_count:max_count].fill_(0)
+                    self._intermediate_abs_positions_buffer[real_count:max_count].fill_(self.d_conv)
 
                 self.intermediate_count = real_count
                 self.per_request_intermediate_counts = counts_list
             else:
                 # All counts are 0
-                self._intermediate_chunk_indices_buffer.fill_(0)
-                self._intermediate_abs_positions_buffer.fill_(self.d_conv)
+                self._intermediate_chunk_indices_buffer[:max_count] = 0
+                self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
                 self.intermediate_count = 0
                 self.per_request_intermediate_counts = counts_list
 
@@ -461,8 +465,8 @@ class MambaMetadata:
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
             # (same rationale as padding comment above)
-            self._intermediate_chunk_indices_buffer.fill_(0)
-            self._intermediate_abs_positions_buffer.fill_(self.d_conv)
+            self._intermediate_chunk_indices_buffer[:max_count] = 0
+            self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
             self.intermediate_count = 0
             self.per_request_intermediate_counts = []
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
@@ -677,6 +681,7 @@ class MambaMetadata:
                 d["intermediate_offsets_gpu"],
                 d["intermediate_counts_gpu"],
                 real_prefill_count,
+                padded_prefill_count,
                 cu_seqlens_gpu=v.mamba_cu_seqlens,
             )
 

@@ -21,6 +21,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.encoder_decoder_text_generation_controller import (
     EncoderDecoderTextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.T5.t5_model import T5Model
 from megatron.core.models.T5.t5_spec import (
     get_t5_decoder_with_transformer_engine_block_spec,
@@ -94,7 +95,10 @@ class TestEncoderDecoderTextGenerationController:
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
         )
 
+        InferenceMode.set_active()
+
     def teardown_method(self, method):
+        InferenceMode.unset_active()
         Utils.destroy_model_parallel()
 
     def test_generate_all_output_tokens_static_batch(self):

@@ -133,7 +133,7 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
 
   configure:
     runs-on: ubuntu-latest
@@ -148,11 +148,33 @@ jobs:
       dev:            ${{ steps.configure.outputs.dev }}
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
+      sha:            ${{ steps.resolve-sha.outputs.sha }}
     steps:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
+
+      # Resolve a single SHA used by the build, every test job, and every
+      # downstream checkout so that the container image, golden values, and
+      # test recipes always come from the same commit. For PR pushes this is
+      # the synthetic PR `merge_commit_sha`; for merge_group it is the merge
+      # queue head_sha; otherwise it falls back to github.sha.
+      - name: Resolve SHA
+        id: resolve-sha
+        shell: bash -x -e -u -o pipefail {0}
+        env:
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push' }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            SHA='${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}'
+          elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
+            SHA='${{ github.event.merge_group.head_sha }}'
+          else
+            SHA='${{ github.sha }}'
+          fi
+          echo "sha=${SHA}" | tee -a "$GITHUB_OUTPUT"
 
       - name: Configure
         id: configure
@@ -174,21 +196,21 @@ jobs:
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
 
           if [ "$IS_MERGE_GROUP" == "true" ]; then
-            SCOPE=mr-github; N_REPEAT=1; LIGHTWEIGHT=false
+            SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=false
           elif [ "$HAS_RUN_TESTS" == "true" ]; then
-            SCOPE=mr-github; N_REPEAT=1; LIGHTWEIGHT=true
+            SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=true
           elif [ "$HAS_RUN_FUNCTIONAL" == "true" ]; then
-            SCOPE=mr-github; N_REPEAT=5; LIGHTWEIGHT=false
+            SCOPE=L1; N_REPEAT=5; LIGHTWEIGHT=false
           elif [ "$IS_CI_WORKLOAD" == "true" ] || [ "$EVENT_NAME" == "workflow_dispatch" ]; then
             # Scheduled / dispatch / release have no PR labels; default to the
-            # full functional scope so cadence (set below) is the discriminator.
-            # `workflow_dispatch` is forced into this branch because upstream
-            # pre-flight reports is_ci_workload=false when dispatched from a
-            # `pull-request/*` branch, which would otherwise drop us into the
-            # slim scope.
-            SCOPE=mr-github; N_REPEAT=5; LIGHTWEIGHT=false
+            # full functional tier (L1) so cadence (set below) is the
+            # discriminator. `workflow_dispatch` is forced into this branch
+            # because upstream pre-flight reports is_ci_workload=false when
+            # dispatched from a `pull-request/*` branch, which would otherwise
+            # drop us into the slim tier.
+            SCOPE=L1; N_REPEAT=5; LIGHTWEIGHT=false
           else
-            SCOPE=mr-github-slim; N_REPEAT=5; LIGHTWEIGHT=false
+            SCOPE=L0; N_REPEAT=5; LIGHTWEIGHT=false
           fi
 
           if [ "$HAS_MBRIDGE" == "true" || $IS_MERGE_GROUP == "true" ]; then
@@ -233,7 +255,7 @@ jobs:
           _RT=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" == "true" ]                                        && echo "**→**" || echo "" )
           _RF=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" == "true" ]  && echo "**→**" || echo "" )
           _CI=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" != "true" ] && [ "$IS_CI_WORKLOAD" == "true" ] && echo "**→**" || echo "" )
-          _DF=$( [ "$SCOPE" == "mr-github-slim" ]                                                                          && echo "**→**" || echo "" )
+          _DF=$( [ "$SCOPE" == "L0" ]                                                                                      && echo "**→**" || echo "" )
           _LTS=$( [ "$HAS_LTS" == "true" ]                                                                                 && echo "**→**" || echo "" )
           _DEV=$( [ "$HAS_LTS" != "true" ]                                                                                 && echo "**→**" || echo "" )
           _CMG=$( [ "$CADENCE" == "mergegroup" ] && echo "**→**" || echo "" )
@@ -260,11 +282,11 @@ jobs:
 
           | | Trigger | \`scope\` | \`n_repeat\` | \`lightweight\` |
           |---|---|---|---|---|
-          | $_MG | Merge group | \`mr-github\` | \`1\` | \`false\` |
-          | $_RT | Label: _Run tests_ | \`mr-github\` | \`1\` | \`true\` |
-          | $_RF | Label: _Run functional tests_ | \`mr-github\` | \`5\` | \`false\` |
-          | $_CI | Schedule / dispatch (CI workload) | \`mr-github\` | \`5\` | \`false\` |
-          | $_DF | _(default)_ | \`mr-github-slim\` | \`5\` | \`false\` |
+          | $_MG | Merge group | \`L1\` | \`1\` | \`false\` |
+          | $_RT | Label: _Run tests_ | \`L1\` | \`1\` | \`true\` |
+          | $_RF | Label: _Run functional tests_ | \`L1\` | \`5\` | \`false\` |
+          | $_CI | Schedule / dispatch (CI workload) | \`L1\` | \`5\` | \`false\` |
+          | $_DF | _(default)_ | \`L0\` | \`5\` | \`false\` |
 
           **Cadence** _(filter bypassed when \`Run tests\` or \`Run functional tests\` label is set)_
 
@@ -307,7 +329,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           version: 0.7.2
 
@@ -376,10 +398,12 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - pre-flight
+      - configure
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
     if: |
       needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
       && (
@@ -412,22 +436,6 @@ jobs:
           git checkout -b ${{ env.MBRIDGE_BRANCH_NAME }} origin/main
           git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
 
-      - name: Get merge commit sha
-        shell: bash -x -e -u -o pipefail {0}
-        id: sha
-        env:
-          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
-          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
-        run: |
-          if [[ "$IS_PR" == "true" ]]; then
-            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
-          elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
-            SHA=${{ github.event.merge_group.head_sha }}
-          else
-            SHA=${GITHUB_SHA}
-          fi
-          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
-
       - name: Trigger MBridge tests
         uses: convictional/trigger-workflow-and-wait@v1.6.5
         env:
@@ -442,7 +450,7 @@ jobs:
           propagate_failure: true
           client_payload: |
             {
-              "mcore_ref": "${{ steps.sha.outputs.main }}",
+              "mcore_ref": "${{ needs.configure.outputs.sha }}",
               "test_suite": "${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}",
               "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
@@ -506,26 +514,10 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
-      - name: Get merge commit sha
-        shell: bash -x -e -u -o pipefail {0}
-        id: sha
-        env:
-          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
-          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
-        run: |
-          if [[ "$IS_PR" == "true" ]]; then
-            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
-          elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
-            SHA=${{ github.event.merge_group.head_sha }}
-          else
-            SHA=${GITHUB_SHA}
-          fi
-          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
-
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ steps.sha.outputs.main }}
+          ref: ${{ needs.configure.outputs.sha }}
 
       - name: Setup python
         uses: actions/setup-python@v6
@@ -588,10 +580,10 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4.0.0
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.1.0
         with:
           file: ./docker/Dockerfile.ci.dev
           push: true
@@ -609,7 +601,7 @@ jobs:
           no-cache: false
           tags: |
             ${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-            ${{ matrix.registry }}/megatron-lm:${{ github.sha }}
+            ${{ matrix.registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
 
@@ -619,10 +611,12 @@ jobs:
       unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
     needs:
       - pre-flight
+      - configure
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
       needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && (
@@ -635,6 +629,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
@@ -649,6 +645,7 @@ jobs:
     needs:
       - is-not-external-contributor
       - pre-flight
+      - configure
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
@@ -658,6 +655,7 @@ jobs:
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-parse-unit-tests.result != 'cancelled'
@@ -675,6 +673,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
       - name: main
         uses: ./.github/actions
         with:
@@ -683,7 +683,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
 
   cicd-parse-integration-tests-h100:
     runs-on: ubuntu-latest
@@ -711,6 +711,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
 
       - name: Parse functional tests
         id: main
@@ -784,6 +786,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
       - name: main
         uses: ./.github/actions
         with:
@@ -793,7 +797,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
@@ -827,6 +831,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
 
       - name: Parse functional tests
         id: main
@@ -901,6 +907,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
       - name: main
         uses: ./.github/actions
         with:
@@ -910,7 +918,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ github.sha }}
+          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
