@@ -182,6 +182,16 @@ class FullyShardMixedPrecisionPolicy:
             return tensor.dtype
         return ("quantized", type(tensor).__name__, self.fp8.recipe)
 
+    def validate_param_group(self, params: List[torch.Tensor]) -> None:
+        """Validate that one ParameterGroup has one mixed-precision storage kind."""
+        if len(params) == 0:
+            return
+        group_key = self.group_key_dtype(params[0])
+        assert all(self.group_key_dtype(param) == group_key for param in params), (
+            "Parameters with different mixed-precision storage kinds must not "
+            "share a ParameterGroup"
+        )
+
     def is_fp8_param(self, tensor: torch.Tensor) -> bool:
         """Return whether ``tensor`` is managed as an FP8 parameter."""
         return is_fp8_param(tensor)
@@ -197,15 +207,57 @@ class FullyShardMixedPrecisionPolicy:
             return get_fp8_raw_data(tensor, transpose=transpose)
         return tensor.detach()
 
-    def storage_tensors_to_free(self, tensor: torch.Tensor) -> List[torch.Tensor]:
+    def bind_unsharded_param(
+        self,
+        tensor: torch.Tensor,
+        data: torch.Tensor,
+        buffer_role: str,
+    ) -> None:
+        """Bind a parameter to an unsharded model-weight buffer view."""
+        if self.is_fp8_param(tensor):
+            self.set_unsharded_weight(
+                tensor,
+                data,
+                transpose=buffer_role == "transpose_weight",
+            )
+            return
+        tensor.data = data
+
+    def storage_tensors_to_free(
+        self,
+        tensor: torch.Tensor,
+        model_weight_buffer,
+        main_weight_buffer,
+    ) -> List[torch.Tensor]:
         """Return original parameter storages that FSDP buffers have replaced."""
+        # The buffers are ownership signals, not data sources: non-FP8 params can
+        # be backed by either model or main weight storage, while FP8 params are
+        # only safe to free after their raw payload is copied to the model buffer.
+        if model_weight_buffer is None and main_weight_buffer is None:
+            return []
+
         if not self.is_fp8_param(tensor):
             return [tensor.data]
+
+        if model_weight_buffer is None:
+            return []
 
         tensors = [get_fp8_raw_data(tensor)]
         if self.needs_transpose_weight_buffer(tensor):
             tensors.append(get_fp8_raw_data(tensor, transpose=True))
         return tensors
+
+    def weight_buffers_for_unshard(
+        self,
+        model_weight_buffer,
+        transpose_weight_buffer=None,
+        *,
+        is_bwd: bool = False,
+    ) -> List:
+        """Return the model-weight buffers needed for this unshard phase."""
+        if is_bwd and transpose_weight_buffer is not None:
+            return [transpose_weight_buffer]
+        return [model_weight_buffer]
 
     def needs_transpose_weight_buffer(self, tensor: torch.Tensor) -> bool:
         """Return whether ``tensor`` needs an extra transpose/columnwise buffer."""
@@ -285,7 +337,9 @@ class FullyShardMixedPrecisionPolicy:
         # TE rebuilds recipe-specific state after FSDP all-gather for recipes
         # where columnwise data is derived from the all-gathered rowwise data.
         self.create_transpose_cache(params)
-        self.set_weight_usage(params, rowwise=not is_bwd, columnwise=True)
+        for param in params:
+            if hasattr(param, "update_usage"):
+                param.update_usage(rowwise_usage=not is_bwd, columnwise_usage=True)
 
     def create_transpose_cache(self, params: List[torch.Tensor]) -> None:
         """Run TE post-all-gather processing for FP8 parameters."""
@@ -297,14 +351,6 @@ class FullyShardMixedPrecisionPolicy:
                 param._create_transpose()
             else:
                 param._create_columnwise()
-
-    def set_weight_usage(
-        self, params: List[torch.Tensor], *, rowwise: bool, columnwise: bool
-    ) -> None:
-        """Set FP8 rowwise/columnwise usage flags when TE exposes them."""
-        for param in params:
-            if self.is_fp8_param(param) and hasattr(param, "update_usage"):
-                param.update_usage(rowwise_usage=rowwise, columnwise_usage=columnwise)
 
     def post_reshard(self, params: List[torch.Tensor]) -> None:
         """Run post-reshard mixed precision processing for a parameter group."""

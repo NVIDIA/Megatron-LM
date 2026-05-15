@@ -71,13 +71,7 @@ class ParameterGroup:
         self.dtype = params[0].dtype
         self.requires_grad = params[0].requires_grad
         self.mp_policy = mp_policy
-        self.is_fp8_group = self.mp_policy.is_fp8_param(params[0])
-        self.needs_transpose_weight_buffer = self.mp_policy.needs_transpose_weight_buffer(
-            params[0]
-        )
-        assert all(self.mp_policy.is_fp8_param(p) == self.is_fp8_group for p in params), (
-            "FP8 and non-FP8 parameters must not share a ParameterGroup"
-        )
+        self.mp_policy.validate_param_group(params)
 
         # Setup device mesh and derived process group
         if mesh is None:
@@ -162,9 +156,8 @@ class ParameterGroup:
         shard_main_weights = s != "no_shard"
         shard_grads = s in ("optim_grads", "optim_grads_params")
 
-        # Create model weight buffer. FP8/MXFP8 parameters store their TE raw
-        # payload in the model buffer, so the buffer dtype is uint8 while the
-        # logical compute dtype remains on the parameter object.
+        # Create model weight buffers. The policy owns dtype-sensitive storage
+        # choices and exposes the tensor view that should be packed.
         if s != "no_shard":
             model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
             wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight")
@@ -173,7 +166,7 @@ class ParameterGroup:
                 wbuf.set_item(i, self.mp_policy.get_param_data(p))
             self.model_weight_buffer = wbuf
 
-            if self.needs_transpose_weight_buffer:
+            if self.mp_policy.needs_transpose_weight_buffer(self.params[0]):
                 tbuf = self._create_buffer(torch.uint8, shard_weights, "transpose_weight")
                 tbuf.init_data(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
                 for i, p in enumerate(self.params):
@@ -194,16 +187,15 @@ class ParameterGroup:
         # copied into the weight buffers. The module holds DTensor shard views and
         # unshard() rebinds .data to the all-gathered buffer, so the original
         # storage is never accessed again.
-        if self.is_fp8_group:
-            has_replacement_storage = self.model_weight_buffer is not None
-        else:
-            has_replacement_storage = (
-                self.model_weight_buffer is not None or self.main_weight_buffer is not None
-            )
-        if has_replacement_storage:
-            for p in self.params:
-                for tensor in self.mp_policy.storage_tensors_to_free(p):
-                    _free_storage(tensor)
+        for p in self.params:
+            # Pass the replacement buffers so the policy can tell whether this
+            # parameter's original storage has been copied into FSDP-owned storage.
+            for tensor in self.mp_policy.storage_tensors_to_free(
+                p,
+                self.model_weight_buffer,
+                self.main_weight_buffer,
+            ):
+                _free_storage(tensor)
 
         # Create gradient buffer
         if self.requires_grad:
