@@ -2800,14 +2800,6 @@ def _add_scaling_args(parser):
         help="Relative depth exponent for dense block output projection initialization.",
     )
     group.add_argument(
-        '--allow-depth-mup-eval',
-        action='store_true',
-        help=(
-            "Allow validation/eval loss for depth_mup by entering a validation-only runtime "
-            "context. This does not enable general inference support."
-        ),
-    )
-    group.add_argument(
         '--use-mup',
         action='store_true',
         help=f"Deprecated alias for --scaling-recipe {SCALING_RECIPE_MUP}.",

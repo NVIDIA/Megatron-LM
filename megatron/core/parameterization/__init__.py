@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from .eval_runtime import depth_mup_eval_context, is_depth_mup_eval_enabled
+from .eval_runtime import allow_scaling_policy_eval, is_scaling_policy_eval_allowed
 from .model_policy import ModelScalingPolicy, build_model_scaling_policy
 from .roles import (
     IS_OUTPUT_PARAMETER_ATTR,
@@ -77,14 +77,14 @@ __all__ = [
     'ScalingContext',
     'ScalingUserConfig',
     'TrainingScalingPolicy',
+    'allow_scaling_policy_eval',
     'build_legacy_mup_training_policy',
     'build_model_scaling_policy',
     'build_scaling_context',
     'build_scaling_user_config',
     'build_training_scaling_policy',
-    'depth_mup_eval_context',
     'get_parameterization_role',
-    'is_depth_mup_eval_enabled',
+    'is_scaling_policy_eval_allowed',
     'is_embedding_class_parameter',
     'is_embedding_or_output_parameter',
     'is_hidden_bias_parameter',

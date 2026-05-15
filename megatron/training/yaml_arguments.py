@@ -371,8 +371,6 @@ def validate_yaml(args, defaults={}):
     #TODO: Added as much of the global initialization requires the model parallel arguments
     args = SimpleNamespace(**args.__dict__, **args.model_parallel.__dict__)
     args = SimpleNamespace(**args.__dict__, **args.language_model.__dict__)
-    if not hasattr(args, 'allow_depth_mup_eval'):
-        args.allow_depth_mup_eval = False
     validate_depth_mup_optimizer_support(args)
     warn_deprecated_mup_aliases(args)
     sync_legacy_mup_fields(args, build_scaling_context(args))

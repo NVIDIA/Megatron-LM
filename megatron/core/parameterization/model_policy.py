@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Iterable, Optional
@@ -20,7 +21,7 @@ from .spec import ScalingContext, build_scaling_context
 
 @dataclass(frozen=True)
 class ModelScalingPolicy:
-    """Model-side policy for existing Megatron scaling behavior."""
+    """Model-side policy for Megatron scaling recipes."""
 
     context: ScalingContext
 
@@ -34,20 +35,18 @@ class ModelScalingPolicy:
 
     @property
     def residual_branch_multiplier(self) -> float:
-        return 1.0
+        return self.context.depth_mult**self.context.residual_branch_depth_power
 
     @property
     def dense_block_out_proj_init_multiplier(self) -> float:
-        return 1.0
+        return self.context.depth_mult**self.context.block_out_proj_init_depth_power
 
     def resolve_attention_softmax_scale(
         self, *, softmax_scale: Optional[float], kv_channels: int
     ) -> Optional[float]:
         if softmax_scale is not None or not self.uses_width_mup:
             return softmax_scale
-        base_head_scale = (
-            1.0 if self.context.base_head_dim is None else self.context.base_head_dim**0.5
-        )
+        base_head_scale = 1.0 if self.context.base_head_dim is None else self.context.base_head_dim**0.5
         return base_head_scale / (kv_channels**self.context.attention_scale_power)
 
     def build_hidden_init_method(self, *, init_method_std: float):
@@ -73,11 +72,19 @@ class ModelScalingPolicy:
         num_layers: int,
         is_hybrid_model: bool,
         output_layer_init_method_is_user_provided: bool,
+        apply_depth_hook: bool = True,
     ):
-        del init_method_std, num_layers, is_hybrid_model
         if output_layer_init_method_is_user_provided:
             return default_init_method
-        return default_init_method
+        if not apply_depth_hook or self.dense_block_out_proj_init_multiplier == 1.0:
+            return default_init_method
+
+        multiplier = 2.0 if not is_hybrid_model else 1.0
+        std = init_method_std / math.sqrt(multiplier * num_layers)
+        if self.uses_width_mup:
+            std = std / math.sqrt(self.context.width_mult)
+        std = std * self.dense_block_out_proj_init_multiplier
+        return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
     def output_layer_init_method(
         self,
@@ -109,7 +116,13 @@ class ModelScalingPolicy:
     def scale_residual_branch_output(
         self, output_with_bias: tuple[Tensor, Tensor | None]
     ) -> tuple[Tensor, Tensor | None]:
-        return output_with_bias
+        if self.residual_branch_multiplier == 1.0:
+            return output_with_bias
+
+        output, bias = output_with_bias
+        scaled_output = output * self.residual_branch_multiplier
+        scaled_bias = None if bias is None else bias * self.residual_branch_multiplier
+        return scaled_output, scaled_bias
 
 
 def build_model_scaling_policy(config) -> ModelScalingPolicy:
