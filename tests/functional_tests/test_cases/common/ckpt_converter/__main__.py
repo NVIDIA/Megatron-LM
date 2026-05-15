@@ -14,7 +14,6 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 from megatron.core.enums import ModelType
@@ -24,6 +23,7 @@ from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_para
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.training import get_args, get_tokenizer
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.builders import gpt_builder
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint
 from megatron.training.global_vars import set_global_variables, unset_global_variables

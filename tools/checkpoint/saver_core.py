@@ -2,13 +2,13 @@
 
 import os
 import sys
-import torch
 from functools import partial
 from importlib.metadata import version
-from packaging.version import Version as PkgVersion
 
-from schema_core import get_model_schema
+import torch
+from packaging.version import Version as PkgVersion
 from saver_base import MegatronCheckpointSaverBase
+from schema_core import get_model_schema
 
 
 def add_arguments(parser):
@@ -39,8 +39,8 @@ class MegatronCheckpointSaverLLM(MegatronCheckpointSaverBase):
             sys.exit(1)
 
         if self.md.model_type == 'GPT':
+            from megatron.training.builders import gpt_builder
             from model_provider import model_provider
-            from gpt_builders import gpt_builder
             self.model_provider = partial(model_provider, gpt_builder)
             self.margs.model_type = ModelType.encoder_or_decoder
         elif self.md.model_type == 'BERT':

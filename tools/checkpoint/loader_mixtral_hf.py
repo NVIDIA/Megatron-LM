@@ -3,10 +3,11 @@
 import json
 import os
 import sys
+import types
+
 import torch
 import transformers
 from tqdm import tqdm
-import types
 
 from tools.checkpoint.utils import _ConverterFakeProcessGroup
 
@@ -130,9 +131,10 @@ def set_layer_state(args, model, hf_model, layer_idx):
 def load_checkpoint_to_model(args):
     '''Set model params.'''
 
+    from transformers import MixtralConfig, MixtralForCausalLM
+
+    from megatron.training.builders import gpt_builder
     from model_provider import model_provider
-    from gpt_builders import gpt_builder
-    from transformers import MixtralForCausalLM, MixtralConfig
 
     # Load Huggingface model.
 
@@ -163,11 +165,11 @@ def _load_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.core.models.common.language_module.language_module import LanguageModule
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.global_vars import set_args, set_global_variables
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")

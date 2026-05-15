@@ -8,8 +8,6 @@ import time
 
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -26,7 +24,12 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine, get_model_for_inference
+from megatron.inference.utils import (
+    add_inference_args,
+    get_dynamic_inference_engine,
+    get_model_for_inference,
+)
+from megatron.training.builders import gpt_builder, hybrid_builder
 from model_provider import model_provider
 
 sys.path.append(
@@ -38,8 +41,8 @@ from typing import List
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
-from megatron.training.checkpointing import load_checkpoint
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
 REQUEST_ID = 0

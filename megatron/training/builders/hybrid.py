@@ -1,12 +1,20 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
-from model_provider import count_parameters_in_layer
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
+
+
+def _count_parameters_in_layer(model, layer_name):
+    num_params = 0
+    for name, param in model.named_parameters():
+        if layer_name in name:
+            num_params += param.numel()
+            print_rank_0(f" - {name}: {param.numel()}")
+    return num_params
 
 
 def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
@@ -43,7 +51,7 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):
-        layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
+        layer_params = _count_parameters_in_layer(model, f'decoder.layers.{l}.')
         print_rank_0(f" == params layer {l}: {layer_params}")
 
     return model

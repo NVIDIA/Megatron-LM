@@ -4,10 +4,9 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -30,6 +29,7 @@ from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
+from megatron.training.builders import gpt_builder, hybrid_builder
 from megatron.training.checkpointing import load_checkpoint
 from model_provider import model_provider
 

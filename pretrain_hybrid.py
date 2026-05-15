@@ -3,6 +3,7 @@
 
 # Capture the true program start time BEFORE any heavy imports.
 import time
+
 _PROGRAM_START_TIME = time.time()
 
 import json
@@ -10,6 +11,7 @@ import json
 # Suppress warnings on all ranks but rank 0.
 import os
 import warnings
+
 rank = int(os.environ.get('RANK', 0))
 if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
@@ -20,20 +22,16 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import (
-    get_context_parallel_rank,
-    get_context_parallel_world_size,
-)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import get_context_parallel_rank, get_context_parallel_world_size
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
+from megatron.core.utils import StragglerDetector, get_attr_wrapped_model, is_te_min_version
 from megatron.training import (
     get_args,
     get_timers,
@@ -42,8 +40,12 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
+from megatron.training.argument_utils import (
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.argument_utils import pretrain_cfg_container_from_args, hybrid_config_from_args
+from megatron.training.builders import hybrid_builder
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
