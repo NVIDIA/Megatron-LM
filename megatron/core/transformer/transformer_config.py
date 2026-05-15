@@ -1173,6 +1173,15 @@ class TransformerConfig(ModelParallelConfig):
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
+        if self.fp8_output_proj:
+            if not self.fp8:
+                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+            if self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    f"fp8_output_proj requires fp8_recipe='mxfp8', got "
+                    f"'{self.fp8_recipe}'."
+                )
+
         # FP4 validation
         if self.fp4_param and not self.fp4:
             raise ValueError("fp4_param must be used together with fp4 mode.")
