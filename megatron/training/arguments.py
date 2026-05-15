@@ -24,7 +24,14 @@ from megatron.core.quantization.utils import (
 )
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.cuda_graph_config import (
+    ALLOWED_INFERENCE_SCOPES,
+    get_deprecated_cuda_graph_modules_migration,
+    normalize_cuda_graph_modules,
+    normalize_inference_cuda_graph_scope,
+    validate_deprecated_cuda_graph_modules_migration_inputs,
+)
+from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
@@ -83,6 +90,8 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
 
+    parser = _add_fault_injector_args(parser)
+
     return parser
 
 
@@ -139,9 +148,6 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     if args.yaml_cfg is not None:
         from .yaml_arguments import load_yaml
 
-        assert (
-            args.yaml_cfg and not args.use_legacy_models
-        ), "Yaml config is not supported with legacy models."
         args = load_yaml(args.yaml_cfg)
 
     # Args from environment
@@ -245,6 +251,54 @@ def _eval_pattern(pattern):
         raise ValueError(f"Invalid pattern: {pattern}")
 
     return eval(pattern)
+
+
+def _parse_cuda_graph_modules_arg(scope):
+    """Parse CUDA graph module CLI values while preserving deprecated spellings for migration."""
+    if scope in {"full", "full_iteration", "full_iteration_inference"}:
+        return scope
+    return CudaGraphModule[scope]
+
+
+def _normalize_cuda_graph_modules_args(args):
+    """Normalize cuda_graph_modules to enums and apply deprecated scope migrations."""
+    normalized_scopes, deprecated_scopes, used_full_scope = normalize_cuda_graph_modules(
+        args.cuda_graph_modules
+    )
+    validate_deprecated_cuda_graph_modules_migration_inputs(
+        deprecated_scopes,
+        args.cuda_graph_impl,
+        args.inference_cuda_graph_scope,
+    )
+    if used_full_scope:
+        warn_rank_0('full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.')
+
+    for scope, attr, value in deprecated_scopes:
+        migration = get_deprecated_cuda_graph_modules_migration(
+            scope, attr, value, args.cuda_graph_impl
+        )
+        if migration is None:
+            warn_rank_0(
+                f"--cuda-graph-modules '{scope}' is deprecated and has no effect when "
+                "--cuda-graph-impl=none. Use --cuda-graph-impl=local with "
+                "--inference-cuda-graph-scope=block to enable inference CUDA graphs."
+            )
+            continue
+        migration_attr, migration_value = migration
+        warn_rank_0(
+            f"--cuda-graph-modules '{scope}' is deprecated. "
+            f"Setting --{migration_attr.replace('_', '-')}={migration_value} instead."
+        )
+        setattr(args, migration_attr, migration_value)
+
+    args.cuda_graph_modules = normalized_scopes
+
+
+def _normalize_inference_cuda_graph_scope_arg(args):
+    """Normalize inference_cuda_graph_scope and apply the impl-derived default."""
+    args.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
+        args.inference_cuda_graph_scope, args.cuda_graph_impl
+    )
 
 
 def no_rope_freq_type(x):
@@ -376,11 +430,6 @@ def validate_args(args, defaults={}):
     # validate model config args from heterogeneous config (if provided).
     validate_model_config_args_from_heterogeneous_config(args)
 
-    # Set args.use_dist_ckpt from args.ckpt_format.
-    if args.use_legacy_models:
-        assert (
-            args.ckpt_format == "torch"
-        ), "legacy model format only supports the 'torch' checkpoint format."
     update_use_dist_ckpt(args)
 
     total_model_size = (
@@ -626,6 +675,29 @@ def validate_args(args, defaults={}):
             args.cuda_graph_impl = "transformer_engine"
             del args.external_cuda_graph
 
+    if getattr(args, 'cuda_graph_scope_deprecated', None) is not None:
+        assert not args.cuda_graph_modules, (
+            "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
+        )
+        warn_rank_0(
+            '--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.'
+        )
+        args.cuda_graph_modules = args.cuda_graph_scope_deprecated
+    del args.cuda_graph_scope_deprecated
+
+    # Normalize cuda_graph_modules and inference_cuda_graph_scope early so that
+    # all subsequent validation sees fully-typed enum values.
+    _normalize_cuda_graph_modules_args(args)
+    _normalize_inference_cuda_graph_scope_arg(args)
+    assert (
+        args.inference_cuda_graph_scope
+        in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl]
+    ), (
+        "Invalid inference CUDA graph scope "
+        f"{args.inference_cuda_graph_scope.name!r} for "
+        f"--cuda-graph-impl={args.cuda_graph_impl!r}."
+    )
+
     # Set input defaults.
     for key in defaults:
         # For default to be valid, it should not be provided in the
@@ -747,7 +819,7 @@ def validate_args(args, defaults={}):
             args.rank,
         )
 
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    from megatron.core.models.hybrid.hybrid_layer_allocation import (
         Symbols,
         get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
@@ -867,9 +939,6 @@ def validate_args(args, defaults={}):
 
     # MTP validation
     if args.mtp_num_layers:
-        assert (
-            not args.use_legacy_models
-        ), "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
         assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
             f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
             + f"The supported position embedding types are rope and none."
@@ -1031,7 +1100,6 @@ def validate_args(args, defaults={}):
         assert (
             args.overlap_grad_reduce
         ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
-        assert not args.use_legacy_models, '--overlap-param-gather only supported with MCore models'
 
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), 'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
@@ -1143,6 +1211,16 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
+        try:
+            import flashinfer  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "--inference-dynamic-batching-sampling-backend=flashinfer requires "
+                "the flashinfer package; install it or pass "
+                "--inference-dynamic-batching-sampling-backend=torch."
+            ) from e
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -1230,23 +1308,20 @@ def validate_args(args, defaults={}):
         elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
-    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+    if args.cuda_graph_impl == "full_iteration":
         assert (
             not args.check_for_nan_in_loss_and_grad
-        ), "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
+        ), "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-impl=full_iteration for training."
 
-    if (
-        args.cuda_graph_impl == "local"
-        and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope
-    ):
+    if args.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
         if args.fp8 is not None:
             assert args.transformer_impl == "inference_optimized", (
-                "fp8 with full_iteration_inference CUDA graphs is only supported with "
+                "fp8 with --inference-cuda-graph-scope=block is only supported with "
                 "--transformer-impl=inference_optimized"
             )
             assert (
                 args.fp8_recipe == "mxfp8"
-            ), "Only --fp8-recipe=mxfp8 is supported with full_iteration_inference CUDA graphs"
+            ), "Only --fp8-recipe=mxfp8 is supported with --inference-cuda-graph-scope=block"
 
     if args.cuda_graph_impl == 'local':
         assert (
@@ -1552,16 +1627,9 @@ def validate_args(args, defaults={}):
             "2.9.0"
         ), '--log-max-attention-logit is only supported with TE >= 2.9.0.'
 
-    if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
-        assert (
-            not args.use_legacy_models
-        ), '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
-
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
-    if args.rotary_interleaved and args.use_legacy_models:
-        raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
     if args.position_embedding_type != 'rope':
         args.apply_rope_fusion = False
 
@@ -1589,10 +1657,6 @@ def validate_args(args, defaults={}):
         args.moe_ffn_hidden_size = args.ffn_hidden_size
         warn_rank_0("moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
-    # Context parallel
-    if args.context_parallel_size > 1:
-        assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
-
     # Expert parallelism check
     if args.expert_model_parallel_size > 1:
         assert (
@@ -1610,10 +1674,6 @@ def validate_args(args, defaults={}):
         args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
-
-    # Distributed checkpointing checks
-    if args.use_dist_ckpt and args.use_legacy_models:
-        raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
 
     # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
     if args.ckpt_format == "torch_dcp":
@@ -1773,6 +1833,9 @@ def validate_args(args, defaults={}):
             )
             args.async_save = False
 
+    if not args.async_save:
+        args.async_strategy = "mcore"
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert (
@@ -1854,8 +1917,8 @@ def validate_args(args, defaults={}):
             assert is_te_min_version(
                 "2.8.0"
             ), "overlap_grad_reduce is only supported with TE >= 2.8.0 when enabling delay_wgrad_compute"
-            wgrad_in_graph_scope = CudaGraphScope.attn in args.cuda_graph_scope or (
-                CudaGraphScope.moe_router in args.cuda_graph_scope
+            wgrad_in_graph_scope = CudaGraphModule.attn in args.cuda_graph_modules or (
+                CudaGraphModule.moe_router in args.cuda_graph_modules
                 and args.moe_shared_expert_intermediate_size is not None
                 and not args.moe_shared_expert_overlap
             )
@@ -1868,7 +1931,7 @@ def validate_args(args, defaults={}):
                     'to be enabled. This is because the default gradient accumulation does not '
                     'use static memory addresses, which breaks CUDA graph requirements.'
                 )
-                if CudaGraphScope.attn in args.cuda_graph_scope:
+                if CudaGraphModule.attn in args.cuda_graph_modules:
                     assert (
                         not args.add_bias_linear and not args.add_qkv_bias
                     ), "CUDA graph with delay_wgrad_compute doesn't support attn bias for now."
@@ -1889,9 +1952,6 @@ def validate_args(args, defaults={}):
             ), "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
 
     if args.mtp_num_layers:
-        assert (
-            not args.use_legacy_models
-        ), "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
         # MTP is compatible with position embedding types that use position_ids.
         supported_position_types = ["learned_absolute", "rope", "mrope", "none"]
         assert args.position_embedding_type in supported_position_types, (
@@ -1918,15 +1978,9 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
-    if args.cuda_graph_scope == "full" or (
-        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
-    ):
-        if isinstance(args.cuda_graph_scope, list):
-            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
-        args.cuda_graph_scope = []
-        warn_rank_0(
-            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
-        )
+    assert not (
+        args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
+    ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
 
     if args.multi_latent_attention:
         assert (
@@ -1946,30 +2000,6 @@ def validate_args(args, defaults={}):
         assert (
             args.num_experts is not None
         ), "MoE latent projections are applicable only for MoE models."
-        assert (
-            not args.use_legacy_models
-        ), "MoE latent projections are only supported for mcore models."
-
-    if args.tiktoken_special_tokens and not args.tokenizer_special_tokens:
-        warn_rank_0(
-            "--tiktoken-special-tokens argument is deprecated and will be removed soon. "
-            "Use --tokenizer-special-tokens instead."
-        )
-        args.tokenizer_special_tokens = args.tiktoken_special_tokens
-
-    if args.tokenizer_hf_use_fast:
-        warn_rank_0(
-            "--tokenizer-hf-use-fast argument is deprecated and will be removed soon. "
-            "`use_fast` is set to True by default for HF tokenizers."
-            "Use --tokenizer-hf-no-use-fast if you want to disable `use_fast`."
-        )
-
-    if args.tokenizer_hf_include_special_tokens:
-        warn_rank_0(
-            "--tokenizer-hf-include-special-tokens argument is deprecated and will be removed soon. "
-            "`include_special_tokens` is set to True by default for HF tokenizers."
-            "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
-        )
 
     # Print arguments.
     _print_args("arguments", args)
@@ -2059,7 +2089,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
@@ -2155,10 +2185,19 @@ def _add_inference_args(parser):
     group.add_argument(
         '--cuda-graph-scope',
         nargs='+',
-        type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope,
+        type=_parse_cuda_graph_modules_arg,
+        default=None,
+        dest='cuda_graph_scope_deprecated',
+        help=argparse.SUPPRESS,  # hidden; use --cuda-graph-modules instead
+    )
+    group.add_argument(
+        '--cuda-graph-modules',
+        nargs='+',
+        type=_parse_cuda_graph_modules_arg,
         default=[],
-        help='Determines the CUDA graphs capturing scope. '
-        'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
+        help='Selects training capture coverage within per-layer CUDA graphs '
+        '(local and transformer_engine implementations). '
+        'Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba": '
         '"attn": captures operations in TransformerLayer._forward_attention(). '
         '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
         '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
@@ -2166,11 +2205,12 @@ def _add_inference_args(parser):
         'including the shared experts if they are not overlapped with EP comm. '
         '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
         '"mamba": captures the mamba layer. '
-        '"full_iteration": captures a whole training iteration. '
-        '"full_iteration_inference": captures a whole inference iteration. '
-        'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
-        'If not specified, the default scope is to capture the whole Transformer layer. '
-        'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.',
+        'An empty list means capturing the whole Transformer layer. '
+        'This field is meaningless when --cuda-graph-impl=full_iteration and must be empty. '
+        'Backward compatibility: "full" is deprecated but kept for backward compatibility; '
+        'it is transformed to an empty list in validate_args. The deprecated values '
+        '"full_iteration" and "full_iteration_inference" are also accepted and migrated '
+        'to the new API in validate_args.',
     )
     group.add_argument(
         '--use-legacy-static-engine',
@@ -2371,6 +2411,15 @@ def _add_inference_args(parser):
         help='Number of mixed prefill requests to capture in a cuda graph.',
     )
     group.add_argument(
+        '--inference-dynamic-batching-sampling-backend',
+        type=str,
+        default='torch',
+        choices=['torch', 'flashinfer'],
+        help='Which sampling kernels to use during inference. '
+        'Falls back to "torch" with a warning if "flashinfer" '
+        'is requested but the package is not installed.',
+    )
+    group.add_argument(
         '--inference-logging-step-interval',
         type=int,
         default=0,
@@ -2417,6 +2466,15 @@ def _add_inference_args(parser):
         default=False,
         help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.',
     )
+    group.add_argument(
+        '--inference-disable-ep-consensus',
+        action=argparse.BooleanOptionalAction,
+        required=False,
+        default=False,
+        help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
+        'Pause/unpause take effect as soon as the signal is delivered to a rank. '
+        'Only safe when EP coordination is not required (e.g. ep_world_size == 1).',
+    )
     return parser
 
 
@@ -2445,7 +2503,8 @@ def _add_network_size_args(parser):
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
-        "cuda_graph_scope",
+        "cuda_graph_modules",
+        "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
         # no CLI argument exists for these
         "virtual_pipeline_model_parallel_size",
         "params_dtype",
@@ -2551,7 +2610,7 @@ def _add_network_size_args(parser):
         '--position-embedding-type',
         type=str,
         default='learned_absolute',
-        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
+        choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
         help='Position embedding type.',
     )
     group.add_argument(
@@ -3471,13 +3530,7 @@ def _add_training_args(parser):
         action='store_true',
         dest='deprecated_use_mcore_models',
         help='DEPRECATED. Use the implementation from megatron core.'
-        'Now ignored and mcore models are the default, use '
-        '--use-legacy-models to not use core models.',
-    )
-    group.add_argument(
-        '--use-legacy-models',
-        action='store_true',
-        help='Use the legacy Megatron models, not Megatron-Core models.',
+        'Now ignored and mcore models are the default.',
     )
 
     return parser
@@ -3930,120 +3983,11 @@ def _add_validation_args(parser):
 
 
 def _add_tokenizer_args(parser):
-    group = parser.add_argument_group(title='tokenizer')
-    group.add_argument(
-        '--vocab-size', type=int, default=None, help='Size of vocab before EOD or padding.'
-    )
-    group.add_argument(
-        '--padded-vocab-size',
-        type=int,
-        default=None,
-        help='Vocabulary size of the model (padded to be divisible by '
-        'tensor model parallel size). If not provided, it will be '
-        'automatically calculated from vocab-size.',
-    )
-    group.add_argument('--vocab-file', type=str, default=None, help='Path to the vocab file.')
-    group.add_argument('--merge-file', type=str, default=None, help='Path to the BPE merge file.')
-    group.add_argument(
-        '--vocab-extra-ids',
-        type=int,
-        default=0,
-        help='Number of additional vocabulary tokens. '
-        'They are used for span masking in the T5 model',
-    )
-    group.add_argument(
-        '--tokenizer-type',
-        type=str,
-        default=None,
-        choices=[
-            'BertWordPieceLowerCase',
-            'BertWordPieceCase',
-            'GPT2BPETokenizer',
-            'SentencePieceTokenizer',
-            'GPTSentencePieceTokenizer',
-            'HuggingFaceTokenizer',
-            'Llama2Tokenizer',
-            'TikTokenizer',
-            'MultimodalTokenizer',
-            'NullTokenizer',
-            'NullMultimodalTokenizer',
-            'SFTTokenizer',
-        ],
-        help='What type of tokenizer to use.',
-    )
-    group.add_argument(
-        '--tokenizer-model', type=str, default=None, help='Sentencepiece tokenizer model.'
-    )
-    group.add_argument(
-        '--tokenizer-metadata',
-        type=str,
-        default=None,
-        help='Path to tokenizer metadata in json format.',
-    )
-    group.add_argument(
-        '--tokenizer-special-tokens',
-        type=str,
-        nargs='+',
-        default=None,
-        help='List of special tokens. For TikTokenizer needs to have '
-        '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]',
-    )
-    group.add_argument(
-        '--tiktoken-pattern',
-        type=str,
-        default=None,
-        help='Which tiktoken pattern to use. Options: [v1, v2]',
-    )
-    group.add_argument(
-        '--tiktoken-num-special-tokens',
-        type=int,
-        default=1000,
-        help='Number of special tokens in tiktoken tokenizer',
-    )
-    group.add_argument(
-        '--tiktoken-special-tokens',
-        type=str,
-        nargs='+',
-        default=None,
-        help='List of tiktoken special tokens, needs to have '
-        '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]',
-    )
-    group.add_argument(
-        '--tokenizer-sentencepiece-legacy',
-        action='store_true',
-        default=False,
-        help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.',
-    )
-    group.add_argument(
-        '--tokenizer-hf-use-fast',
-        action='store_true',
-        default=True,
-        help='Whether to use fast HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        '--tokenizer-hf-include-special-tokens',
-        action='store_true',
-        default=True,
-        help='Converting text to ids will include special for HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        '--tokenizer-hf-no-use-fast',
-        action='store_true',
-        default=False,
-        help='Whether to use fast HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        '--tokenizer-hf-no-include-special-tokens',
-        action='store_true',
-        default=False,
-        help='Converting text to ids will not include special for HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        default=False,
-        help='Whether or not to allow PreTrainedTokenizer to execute remote code',
-    )
+    from megatron.training.config import TokenizerConfig
+
+    tokenizer_factory = ArgumentGroupFactory(TokenizerConfig)
+    group = tokenizer_factory.build_group(parser, "tokenizer")
+
     return parser
 
 
@@ -4587,6 +4531,12 @@ def _add_mla_args(parser):
         help="Rotary scaling factor for the rotary embeddings.",
     )
     group.add_argument(
+        '--original-max-position-embeddings',
+        type=int,
+        default=4096,
+        help="Original maximum position embeddings for the original model, used by yarn.",
+    )
+    group.add_argument(
         '--mscale', type=float, default=1.0, help="Mscale for YaRN RoPE in multi-latent attention."
     )
     group.add_argument(
@@ -4599,13 +4549,13 @@ def _add_mla_args(parser):
         '--o-groups',
         type=int,
         default=8,
-        help="Number of groups for grouped output (wo_a). 0 = single linear."
+        help="Number of groups for grouped output (wo_a). 0 = single linear.",
     )
     group.add_argument(
         '--o-lora-rank',
         type=int,
         default=1024,
-        help="Low-rank dimension per group for grouped output (wo_a). Used when o-groups > 0."
+        help="Low-rank dimension per group for grouped output (wo_a). Used when o-groups > 0.",
     )
     group.add_argument(
         '--cache-mla-latents',
@@ -4645,11 +4595,11 @@ def _add_experimental_attention_variant_args(parser):
         type=compress_ratios_type,
         default=None,
         help='Per-layer compress ratios for compressed sparse attention. '
-            'Accepts a string containing a Python list expression, e.g.: '
-            '"[0,0,4,128,4,128]" or "([0]+[4,128]*2)*3". '
-            'Each value is the compression ratio for the corresponding '
-            'transformer layer (valid values: 0, 4, 128). '
-            'The list length must equal num_layers.'
+        'Accepts a string containing a Python list expression, e.g.: '
+        '"[0,0,4,128,4,128]" or "([0]+[4,128]*2)*3". '
+        'Each value is the compression ratio for the corresponding '
+        'transformer layer (valid values: 0, 4, 128). '
+        'The list length must equal num_layers.',
     )
     return parser
 
@@ -4883,4 +4833,11 @@ def _add_sft_args(parser):
         'If not specified and --mock-data is set, defaults to a lognormal distribution with '
         'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
     )
+    return parser
+
+
+def _add_fault_injector_args(parser):
+    from megatron.training.config import FaultInjectorConfig
+
+    ArgumentGroupFactory(FaultInjectorConfig).build_group(parser, "fault injector")
     return parser

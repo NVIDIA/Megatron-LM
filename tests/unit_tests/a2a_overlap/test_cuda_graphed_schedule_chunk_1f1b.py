@@ -15,7 +15,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -118,7 +118,7 @@ class TestPartialCudaGraphedA2AOverlap:
         )
 
     def create_test_args(
-        self, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, ep_size, **kwargs
+        self, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, ep_size, **kwargs
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -163,7 +163,7 @@ class TestPartialCudaGraphedA2AOverlap:
 
         # CUDA graph settings
         args.cuda_graph_impl = cuda_graph_impl
-        args.cuda_graph_scope = cuda_graph_scope
+        args.cuda_graph_modules = cuda_graph_modules
         args.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         args.use_te_rng_tracker = cuda_graph_impl != "none"
 
@@ -247,7 +247,7 @@ class TestPartialCudaGraphedA2AOverlap:
         self,
         ep_size,
         cuda_graph_impl,
-        cuda_graph_scope,
+        cuda_graph_modules,
         cuda_graph_warmup_steps,
         ep_overlap=False,
         **kwargs,
@@ -255,7 +255,7 @@ class TestPartialCudaGraphedA2AOverlap:
         """Test fp8_param with gpt_model."""
         args = self.create_test_args(
             cuda_graph_impl,
-            cuda_graph_scope,
+            cuda_graph_modules,
             cuda_graph_warmup_steps,
             ep_size,
             overlap_moe_expert_parallel_comm=ep_overlap,
@@ -357,16 +357,16 @@ class TestPartialCudaGraphedA2AOverlap:
             extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
 
         loss_list_ref = self._run_test_helper(4, "none", None, 3, **extra_kwargs)
-        for cuda_graph_scope in [
-            [CudaGraphScope.attn],
-            [CudaGraphScope.attn, CudaGraphScope.moe_router],
-            [CudaGraphScope.attn, CudaGraphScope.moe_router, CudaGraphScope.moe_preprocess],
+        for cuda_graph_modules in [
+            [CudaGraphModule.attn],
+            [CudaGraphModule.attn, CudaGraphModule.moe_router],
+            [CudaGraphModule.attn, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
         ]:
             cuda_graph_warmup_steps = 3
             loss_list = self._run_test_helper(
                 4,
                 "transformer_engine",
-                cuda_graph_scope,
+                cuda_graph_modules,
                 cuda_graph_warmup_steps,
                 ep_overlap=True,
                 **extra_kwargs,
@@ -375,5 +375,5 @@ class TestPartialCudaGraphedA2AOverlap:
             for i in range(len(loss_list)):
                 assert torch.equal(
                     loss_list[i].mean(), loss_list_ref[i].mean()
-                ), f"scope={cuda_graph_scope}, i={i},loss_list={loss_list[i]}, loss_list_ref={loss_list_ref[i]}"
-            print(f"[DEBUG] Pass {cuda_graph_scope}")
+                ), f"scope={cuda_graph_modules}, i={i},loss_list={loss_list[i]}, loss_list_ref={loss_list_ref[i]}"
+            print(f"[DEBUG] Pass {cuda_graph_modules}")

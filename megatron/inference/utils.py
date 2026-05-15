@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 
 from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -26,6 +26,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_model
 from megatron.training import get_args
@@ -44,8 +45,16 @@ def get_model_for_inference() -> MegatronModule:
 
     if args.model_provider == "gpt":
         model_builder = gpt_builder
-    elif args.model_provider == "mamba":
-        model_builder = mamba_builder
+    elif args.model_provider in ("hybrid", "mamba"):
+        if args.model_provider == "mamba":
+            import warnings
+
+            warnings.warn(
+                '--model-provider "mamba" is deprecated. Use --model-provider "hybrid" instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        model_builder = hybrid_builder
     else:
         raise ValueError(f"Invalid model provider {args.model_provider}")
 
@@ -158,7 +167,11 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "total number of requests. Set to -1 to add all requests together.",
     )
     group.add_argument(
-        "--model-provider", choices=["mamba", "gpt"], default="gpt", help="Model provider"
+        "--model-provider",
+        choices=["hybrid", "mamba", "gpt"],
+        default="gpt",
+        help='Model provider. Use "hybrid" for HybridModel (formerly MambaModel). '
+        '"mamba" is accepted for backward compatibility but deprecated.',
     )
     group.add_argument(
         "--skip-prompt-log-probs", action='store_true', default=False, help='Skip prompt log probs.'
@@ -335,7 +348,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs
-            if args.cuda_graph_impl == "local"
+            if args.inference_cuda_graph_scope != InferenceCudaGraphScope.none
             else None
         ),
         max_requests=args.inference_dynamic_batching_max_requests,
@@ -370,6 +383,8 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         logging_step_interval=args.inference_logging_step_interval,
         num_speculative_tokens=args.num_speculative_tokens,
         use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
+        disable_ep_consensus=args.inference_disable_ep_consensus,
+        sampling_backend=args.inference_dynamic_batching_sampling_backend,
     )
 
 

@@ -957,7 +957,6 @@ class ChunkOffloadHandler:
     def bulk_offload_group(self, group_to_offload):
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
-        group_to_offload = self._groups_to_offload[-1]
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
@@ -971,7 +970,6 @@ class ChunkOffloadHandler:
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
-        self._groups_to_offload.pop()
         nvtx_range_pop(nvtx_msg)
         # Under full-iteration CG capture, the main stream may not wait on d2h
         # events; optional max-inflight enqueues each group's offload event and
@@ -1055,6 +1053,7 @@ class ChunkOffloadHandler:
             ), f"Group {name} not found in {self._groups_to_offload}"
             self._groups_to_reload.append(group_to_offload)
             self.bulk_offload_group(group_to_offload)
+            self._groups_to_offload.remove(group_to_offload)
             # Manually release tensors not auto-freed by torch GC
             if len(forced_released_tensors) > 0:
                 cur_stream = torch.cuda.current_stream()
@@ -1369,13 +1368,6 @@ class FineGrainedActivationOffloadingInterface:
                 tensor, self.name, forced_released_tensors, delay_offload
             )
         return tensor
-
-    @staticmethod
-    def group_commit(tensor, name, forced_released_tensors=None, delay_offload=False):
-        """Static variant of group_offload used by main's multi_latent_attention."""
-        return fine_grained_offloading_group_commit(
-            tensor, name, forced_released_tensors, delay_offload
-        )
 
     @staticmethod
     def mark_not_offload(tensor: torch.Tensor):

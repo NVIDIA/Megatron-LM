@@ -3,6 +3,15 @@
 
 :warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact the @mcore-oncall.
 
+## Issue tracking
+
+For PRs from open-source community contributors:
+
+- **New features**: a linked issue is **required**. Please open a [feature request](https://github.com/NVIDIA/Megatron-LM/issues/new?template=feature_request.md) and reference it here before submitting the PR.
+- **Small updates (bug fixes, minor improvements)**: a linked issue is **recommended** and will accelerate the PR review process.
+
+Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
+
 ## Contribution process
 
 ### Pre-checks
