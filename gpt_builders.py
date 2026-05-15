@@ -63,6 +63,13 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             # Get the decoder layer spec explicitly if no decoder layer in the last stage,
             # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
             transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
+        elif args.experimental_attention_variant is not None:
+            # get_gpt_decoder_layer_specs rejects experimental variants;
+            # build per-layer specs via the experimental entry point.
+            experimental_layer_specs = (
+                get_transformer_layer_with_experimental_attention_variant_spec(config=config)
+            )
+            transformer_layer_spec_for_mtp = experimental_layer_specs[-1]
         else:
             # Define the decoder block spec
             decoder_layer_specs = get_gpt_decoder_layer_specs(

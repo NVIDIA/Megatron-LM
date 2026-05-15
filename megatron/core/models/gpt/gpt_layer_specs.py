@@ -79,7 +79,6 @@ def get_gpt_layer_with_inference_submodules(
     qk_l2_norm: Optional[bool] = False,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for inference optimized linear layers.
     Args:
@@ -635,7 +634,6 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
         )
     else:
         dense_layer_spec = get_gpt_layer_local_spec(
@@ -788,16 +786,10 @@ def get_gpt_mtp_block_spec_for_backend(
 
     transformer_layer_spec.submodules = copy.copy(transformer_layer_spec.submodules)
 
-    # MTP does not support hyper connections yet; strip HC modules and
-    # downgrade the layer class to plain TransformerLayer.
-    transformer_layer_spec.submodules.self_attention_hyper_connection = IdentityOp
-    transformer_layer_spec.submodules.cross_attention_hyper_connection = IdentityOp
-    transformer_layer_spec.submodules.mlp_hyper_connection = IdentityOp
-    if transformer_layer_spec.module is HyperConnectionTransformerLayer:
-        transformer_layer_spec.module = TransformerLayer
-
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
-        mtp_model_layer_spec=transformer_layer_spec, backend=backend
+        mtp_model_layer_spec=transformer_layer_spec,
+        backend=backend,
+        enable_hyper_connections=config.enable_hyper_connections,
     )
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
     if config.mtp_use_repeated_layer:

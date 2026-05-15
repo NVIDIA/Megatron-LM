@@ -24,7 +24,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -416,13 +416,7 @@ class GPTModel(LanguageModule):
 
         if (
             in_inference_mode
-            and (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
+            and (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context.is_static_batching()
         ):
             current_batch_size = input_ids.shape[0]
@@ -557,7 +551,7 @@ class GPTModel(LanguageModule):
             decoder_extra_block_kwargs['input_ids'] = input_ids
 
         # Run decoder.
-        hidden_states = self.decoder(
+        decoder_output = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -570,6 +564,13 @@ class GPTModel(LanguageModule):
             padding_mask=padding_mask,
             **decoder_extra_block_kwargs,
         )
+        # When mHC + MTP, the decoder returns (contracted, multi-stream).
+        # MTP needs multi-stream; lm_head needs contracted.
+        if isinstance(decoder_output, tuple):
+            hidden_states, mhc_multistream = decoder_output
+        else:
+            hidden_states = decoder_output
+            mhc_multistream = None
 
         return self._postprocess(
             hidden_states=hidden_states,
@@ -589,6 +590,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            mhc_multistream=mhc_multistream,
         )
 
     def _postprocess(
@@ -610,6 +612,7 @@ class GPTModel(LanguageModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
+        mhc_multistream=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -638,6 +641,7 @@ class GPTModel(LanguageModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
+                mhc_multistream=mhc_multistream,
                 attention_mask=attention_mask,
                 inference_params=None,  # MTP layers don't use KV cache
                 rotary_pos_emb=rotary_pos_emb,

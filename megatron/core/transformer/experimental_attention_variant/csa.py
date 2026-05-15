@@ -120,6 +120,10 @@ def _apply_rope(
             ), "Fused MLA RoPE apply is not imported successfully"
         else:
             rotary_pos_emb, mscale = rotary_pos_emb_module(total_seq_len, packed_seq=False)
+            # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+            # concentration factor (mscale) is NOT part of the DSv4 model contract --
+            # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+            mscale = 1.0
     if rotary_pos_emb is not None and ratio > 1:
         rotary_pos_emb = rotary_pos_emb[:total_seq_len:ratio][:rotary_seq_len]
     if rotary_pos_cos is not None and ratio > 1:
@@ -571,6 +575,7 @@ class CompressedSparseAttention(MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         rotary_pos_emb: nn.Module = None,
         compress_ratio: int = 0,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(config=config)
 
@@ -579,6 +584,8 @@ class CompressedSparseAttention(MegatronModule):
         self.pg_collection = pg_collection
 
         self.layer_number = layer_number
+        if is_mtp_layer:
+            self.layer_number = self.layer_number + self.config.num_layers
         self.compress_ratio = compress_ratio
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
@@ -728,7 +735,8 @@ class CompressedSparseAttention(MegatronModule):
                             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                                 loss=indexer_loss,
                                 layer_number=self.layer_number,
-                                num_layers=self.config.num_layers,
+                                num_layers=self.config.num_layers
+                                + (self.config.mtp_num_layers or 0),
                             )
                     else:
                         _, topk_indices_compressed = self.indexer(
