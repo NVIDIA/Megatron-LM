@@ -992,6 +992,12 @@ class MultiTokenPredictionLayer(MegatronModule):
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
+        ############# begin for online mtp sft ############
+        # 3、stop grad flow of embedding layer from mtp
+        if self.config.online_mtp_sft:
+            decoder_input = decoder_input.detach()
+        ###################################################
+
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
         return input_ids, position_ids, decoder_input, hidden_states
@@ -1716,6 +1722,13 @@ class MultiTokenPredictionBlock(MegatronModule):
             hidden_states = mhc_chunks[offset]
         else:
             hidden_states = hidden_states_list[offset]
+        ############# for online mtp sft ######################
+        if self.config.online_mtp_sft:
+            # 1、stop grad flow of hidden_states from mtp to main model
+            hidden_states = hidden_states.detach()
+            # recompute only consider inputs for backward, if inputs requires no grad, backward will not be triggerred
+            hidden_states.requires_grad = True
+        ########################################################
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             (hidden_states, input_ids, position_ids) = self.layers[layer_idx](
