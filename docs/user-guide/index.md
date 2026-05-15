@@ -13,7 +13,7 @@ orphan: true
 
 # User Guide
 
-Comprehensive guides for using Megatron Core and Megatron-LM.
+Guides for using Megatron Core and Megatron-LM.
 
 ```{toctree}
 :maxdepth: 2

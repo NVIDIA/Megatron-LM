@@ -7,6 +7,7 @@ import torch.distributed as dist
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TELayerNormColumnParallelLinear,
+    TELinear,
     TERowParallelLinear,
 )
 from megatron.core.inference.communication.torch_symm_triton import (
@@ -19,6 +20,10 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
@@ -55,9 +60,53 @@ def _apply_linear(
     Helper to apply either MXFP8 or standard GEMM based on the configuration.
     """
     kwargs = {"out": out} if out is not None else {}
-    if config.fp8_recipe == "mxfp8":
+    if isinstance(weight, MXFP8Tensor):
         return mm_mxfp8(x, weight, **kwargs)
     return torch.matmul(x, weight.t(), **kwargs)
+
+
+class InferenceLinear(TELinear):
+    """Inference optimized version of TELinear."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        parallel_mode: Optional[str],
+        config: ModelParallelConfig,
+        init_method: Callable,
+        bias: bool,
+        skip_bias_add: bool,
+        skip_weight_param_allocation: bool,
+        tp_comm_buffer_name: Optional[str] = None,
+        is_expert: bool = False,
+        symmetric_ar_type: Optional[str] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
+        super().__init__(
+            input_size,
+            output_size,
+            parallel_mode=parallel_mode,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            is_expert=is_expert,
+            symmetric_ar_type=symmetric_ar_type,
+            tp_group=tp_group,
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        """Forward pass."""
+        if self.training:
+            return super().forward(x)
+
+        x = _apply_linear(x, self.weight, self.config)
+        return x, None
 
 
 class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
@@ -344,10 +393,10 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         and perform an NVLS multicast reduce-scatter. If that is not possible,
         it will revert to torch.dist (NCCL) reduce-scatter.
         """
-        use_mxfp8 = self.config.fp8_recipe == "mxfp8"
+        use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
-            # Remove batch dimension for FlashInfer mxfp8
+            # Remove seq_len dimension for MXFP8 (mm_mxfp8 squeezes internally)
             del symm_mem_buffer_dims[1]
         symm_mem_buffer_dims[-1] = self.weight.size(0)
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
@@ -428,3 +477,75 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         else:
             x = self._matmul_reduce_scatter(x)
             return x, None
+
+
+def inference_all_gather_from_tensor_model_parallel_region(
+    x: torch.Tensor, tp_group: torch.distributed.ProcessGroup, config: TransformerConfig
+) -> torch.Tensor:
+    """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
+
+    Replaces `gather_from_tensor_model_parallel_region` in inference paths
+    where autograd is not needed and NVLS symmetric-memory is available.
+
+    The NVLS path performs a flat all-gather into symmetric memory (concatenating
+    along dim-0), then rearranges the result to the last dimension — the same
+    semantics as `_gather_along_last_dim` but using hardware multicast when
+    possible.
+    """
+    tp_size = dist.get_world_size(tp_group)
+    if tp_size == 1:
+        return x
+
+    triton_nvls_kernels_allowed = not getattr(
+        config, 'inference_disable_triton_nvls_kernels', False
+    )
+
+    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+        ag_buffer_dims = list(x.size())
+        ag_buffer_dims[0] *= tp_size
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(ag_buffer_dims, dtype=x.dtype)
+
+        if are_tensors_nvls_eligible(x) and symm_mem_buffer["handle"] is not None:
+            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            tensor_list = symm_mem_buffer["tensor"].chunk(tp_size, dim=0)
+            return torch.cat(tensor_list, dim=-1).contiguous()
+
+    return gather_from_tensor_model_parallel_region(x, group=tp_group)
+
+
+def inference_reduce_scatter_to_sequence_parallel_region(
+    x: torch.Tensor, tp_group: torch.distributed.ProcessGroup, config: TransformerConfig
+) -> torch.Tensor:
+    """NVLS-optimized reduce-scatter along the first dimension, with NCCL fallback.
+
+    Replaces `reduce_scatter_to_sequence_parallel_region` in inference paths
+    where autograd is not needed and NVLS symmetric-memory is available.
+    """
+    # TODO(ksanthanam): Refactor InferenceRowParallelLinear._matmul_reduce_scatter
+    # to use this function for its non-fused NVLS reduce-scatter path.
+    tp_size = dist.get_world_size(tp_group)
+    if tp_size == 1:
+        return x
+
+    triton_nvls_kernels_allowed = not getattr(
+        config, 'inference_disable_triton_nvls_kernels', False
+    )
+
+    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
+
+        if (
+            x.dtype == torch.bfloat16
+            and are_tensors_nvls_eligible(x)
+            and symm_mem_buffer["handle"] is not None
+        ):
+            symm_mem_buffer["tensor"].copy_(x)
+            output_dims = list(x.size())
+            output_dims[0] = x.size(0) // tp_size
+            output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
+            multimem_reduce_scatter(output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"])
+            return output
+
+    return reduce_scatter_to_sequence_parallel_region(x, group=tp_group)

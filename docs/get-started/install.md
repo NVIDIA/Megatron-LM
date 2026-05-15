@@ -58,7 +58,7 @@ uv pip install --no-build-isolation "megatron-core[training,dev]"
 ```
 
 ```{warning}
-Building from source can consume a large amount of memory. By default the build runs one compiler job per CPU core, which may cause out-of-memory failures on machines with many cores. To limit parallel compilation jobs, set the `MAX_JOBS` environment variable before installing (e.g. `MAX_JOBS=4`).
+Building from source can consume a large amount of memory. By default the build runs one compiler job per CPU core, which can cause out-of-memory failures on machines with many cores. To limit parallel compilation jobs, set the `MAX_JOBS` environment variable before installing (for example, `MAX_JOBS=4`).
 ```
 
 ```{tip}
@@ -109,7 +109,7 @@ docker run --gpus all -it --rm \
 ```
 
 ```{note}
-The NGC PyTorch container constrains the Python environment globally via `PIP_CONSTRAINT`. The `-e PIP_CONSTRAINT=` flag above unsets this so that Megatron Core and its dependencies install correctly.
+The NGC PyTorch container constrains the Python environment globally using `PIP_CONSTRAINT`. The `-e PIP_CONSTRAINT=` flag above unsets this so that Megatron Core and its dependencies install correctly.
 ```
 
 Then install Megatron Core inside the container (torch is already available in the NGC image):
@@ -120,4 +120,4 @@ uv pip install --no-build-isolation "megatron-core[training,dev]"
 ```
 
 
-You are now ready to run training. See [Your First Training Run](quickstart.md) for next steps.
+You are now ready to run training. Refer to [Your First Training Run](quickstart.md) for next steps.
