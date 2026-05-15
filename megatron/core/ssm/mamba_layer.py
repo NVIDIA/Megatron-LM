@@ -16,7 +16,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -94,9 +94,14 @@ class MambaLayer(GraphableMegatronModule):
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the mamba layer for cudagraphs."""
+        assert self.config.cuda_graph_impl == "local"
+
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-        if not self.config.cuda_graph_scope or CudaGraphScope.mamba in self.config.cuda_graph_scope:
+        if (
+            not self.config.cuda_graph_modules
+            and self.config.inference_cuda_graph_scope != InferenceCudaGraphScope.block
+        ) or CudaGraphModule.mamba in self.config.cuda_graph_modules:
             self.cudagraph_manager = CudaGraphManager(config)
 
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
@@ -202,7 +207,7 @@ class MambaLayer(GraphableMegatronModule):
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None
-            and not self.config.cuda_graph_scope  # empty-list = per-layer CUDA graphs
+            and not self.config.cuda_graph_modules  # empty-list = per-layer CUDA graphs
         ):
             context = kwargs['inference_context']
             using_cuda_graph = (context.is_static_batching() and context.is_decode_only()) or (
