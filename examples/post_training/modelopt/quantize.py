@@ -21,6 +21,7 @@ import modelopt.torch.quantization as mtq
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
+from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
 
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
@@ -35,18 +36,15 @@ except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
+from utils import get_hf_tokenizer
+
 from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.post_training.utils import (
-    print_distributed_quant_summary,
-    report_current_memory_info,
-)
+from megatron.post_training.utils import print_distributed_quant_summary, report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
@@ -344,7 +342,7 @@ if __name__ == "__main__":
 
         for idx, prompt in tqdm(enumerate(all_prompts), disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=32)
+            generated_ids = megatron_generate(model, tokens.input_ids.cuda(), osl=32)
             generated_texts = tokenizer.batch_decode(generated_ids)
             print_rank_0("{}".format(generated_texts))
             if all_references[idx] is not None:
@@ -361,7 +359,7 @@ if __name__ == "__main__":
         )
         for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
             sample = get_batch_on_this_cp_rank(sample)
-            simple_generate(model, sample["input_ids"], osl=1, calibration_mode=True)
+            megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 
     unwrapped_model = unwrap_model(model)[0]
 
