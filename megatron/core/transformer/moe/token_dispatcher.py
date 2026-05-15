@@ -1057,16 +1057,21 @@ class _HybridEPManager(_DispatchManager):
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
-        nt = torch.tensor([num_tokens], device=routing_map.device, dtype=torch.long)
-        torch.distributed.all_reduce(nt, op=torch.distributed.ReduceOp.MAX, group=self.group)
-        padded_num_tokens = int(nt.item())
-        padded_num_tokens += -padded_num_tokens % 64
         self._original_num_tokens = num_tokens
+
+        padded_num_tokens = num_tokens
+        if self.config.sequence_packing_scheduler is not None:
+            # Use the actual tp_ep max so all ranks in the MoE communication
+            # group pass the same token count to HybridEP.
+            nt = torch.tensor([num_tokens], device=routing_map.device, dtype=torch.long)
+            torch.distributed.all_reduce(nt, op=torch.distributed.ReduceOp.MAX, group=self.group)
+            padded_num_tokens = int(nt.item())
+            padded_num_tokens += -padded_num_tokens % 64
         self._padded_num_tokens = padded_num_tokens
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
-        if padded_num_tokens > num_tokens:
+        if self.config.sequence_packing_scheduler is not None and padded_num_tokens > num_tokens:
             pad_rows = padded_num_tokens - num_tokens
             routing_map = torch.cat(
                 [routing_map, routing_map.new_zeros((pad_rows, self.num_experts))], dim=0
@@ -1116,14 +1121,10 @@ class _HybridEPManager(_DispatchManager):
             self.token_probs = self.token_probs.float()  # downcast or upcast
         if self.config.fp8 or self.config.fp4:
             self.pad_multiple = get_align_size_for_quantization(self.config)
-        if (
-            self._padded_num_tokens is not None
-            and hidden_states.shape[0] < self._padded_num_tokens
-        ):
+        if self._padded_num_tokens is not None and hidden_states.shape[0] < self._padded_num_tokens:
             pad_rows = self._padded_num_tokens - hidden_states.shape[0]
             hidden_states = torch.cat(
-                [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))],
-                dim=0,
+                [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))], dim=0
             )
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch(

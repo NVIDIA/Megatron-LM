@@ -10,6 +10,7 @@ from megatron.core.utils import internal_api
 try:
     from deep_ep import Buffer
     from deep_ep.utils import EventHandle, EventOverlap
+
     HAVE_DEEP_EP = True
 except ImportError:
     HAVE_DEEP_EP = False
