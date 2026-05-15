@@ -736,12 +736,21 @@ class TestMegatronFSDPE2E:
             train_iters=NUM_TRAINING_STEPS,
             **kwargs,
         )
-        if kwargs.get("use_megatron_fsdp", False) and kwargs.get(
+        megatron_fsdp_te_fused_adam = kwargs.get("use_megatron_fsdp", False) and kwargs.get(
             "use_precision_aware_optimizer", False
-        ):
+        )
+        if megatron_fsdp_te_fused_adam:
             assert (
                 not optim.optimizer.master_weights
             ), "Megatron-FSDP should not use FusedAdam master weights."
+            assert (
+                optim.optimizer.use_decoupled_grad
+            ), "Megatron-FSDP should be using a decoupled gradient with FusedAdam."
+            assert model_chunks[
+                0
+            ].module.param_and_grad_buffer.use_decoupled_grad, (
+                "Megatron-FSDP is installing gradients into param.decoupled_grad."
+            )
 
         # Prepare data iterator
         data_iterator = make_gpt_mock_data_iterator(
@@ -764,6 +773,17 @@ class TestMegatronFSDPE2E:
                 micro_batch_size=MICRO_BATCH_SIZE,
                 num_micro_batches=GLOBAL_BATCH_SIZE // MICRO_BATCH_SIZE // DP_GROUP.size(),
             )
+            # Check that at least one non-null / non-zero gradient
+            # exists when using Megatron-FSDP.
+            if kwargs.get("use_megatron_fsdp", False):
+                grad_attr = "decoupled_grad" if megatron_fsdp_te_fused_adam else "grad"
+                assert any(
+                    [
+                        getattr(p, grad_attr, None) is not None
+                        and getattr(p, grad_attr, None)._local_tensor.any()
+                        for p in model_chunks[0].parameters()
+                    ]
+                ), f"[Megatron-FSDP] Missing gradient in Parameter.{grad_attr}..."
             optim.step()
 
             # Collect loss
@@ -773,7 +793,6 @@ class TestMegatronFSDPE2E:
 
         return outputs
 
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
     )

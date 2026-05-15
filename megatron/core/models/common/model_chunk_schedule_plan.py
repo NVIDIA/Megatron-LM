@@ -14,7 +14,7 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
@@ -175,7 +175,7 @@ class TransformerLayerSchedulePlan:
             self.mtp_post_process = NoopScheduleNode()
 
         # mlp and combine may receive dgrad from attn, which is managed by cuda graph.
-        if CudaGraphScope.attn in self.config.cuda_graph_scope:
+        if CudaGraphModule.attn in self.config.cuda_graph_modules:
             self.mlp.manual_grads_release = False
             self.moe_combine.manual_grads_release = False
 
@@ -247,10 +247,13 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
-                f_input = f_layer.mtp_post_process.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
+
+        if f_layer is not None:
+            with f_layer.get_fp8_context():
+                f_input = f_layer.mtp_post_process.forward(f_input)
 
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
         # for overlapping with the p2p comm

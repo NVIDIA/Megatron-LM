@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
 try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
@@ -21,7 +22,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -62,6 +63,20 @@ class LanguageModule(MegatronModule):
         self.embd_group = pg_collection.embd
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
+
+    def _setup_mtp_cuda_graphs(self):
+        """Wrap `compute_mtp_single_step` with a CudaGraphManager.
+
+        Must be called by subclasses after `self.mtp` is created.
+        """
+        if self.config.cuda_graph_impl == "local":
+            self._mtp_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_single_step",
+                need_backward=False,
+                inline_capture=True,
+            )
 
     def _is_in_embd_group(self):
         if self.embd_group is None:
@@ -144,8 +159,8 @@ class LanguageModule(MegatronModule):
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
                     # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
                     is_cg_capturable = (
-                        hasattr(self.config, 'cuda_graph_scope')
-                        and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+                        hasattr(self.config, 'cuda_graph_impl')
+                        and self.config.cuda_graph_impl == "full_iteration"
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
                         from megatron.core.utils import get_te_version
@@ -154,7 +169,7 @@ class LanguageModule(MegatronModule):
                         raise AssertionError(
                             f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "
                             f"but found version {current_version}. Please upgrade TransformerEngine "
-                            f"or set cuda_graph_scope to a value other than 'full_iteration'."
+                            f"or set cuda_graph_impl to a value other than 'full_iteration'."
                         )
 
                     loss = te_parallel_cross_entropy(
@@ -325,7 +340,13 @@ class LanguageModule(MegatronModule):
 
     @torch.inference_mode()
     def compute_mtp_single_step(
-        self, hidden_states: Tensor, next_token_ids: Tensor, position_ids: Tensor, depth: int
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: Optional[int] = None,
+        eager: bool = False,
+        cache_key=None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 
@@ -336,13 +357,20 @@ class LanguageModule(MegatronModule):
             hidden_states (Tensor): Hidden states at last accepted positions.
             next_token_ids (Tensor): Correct next token IDs [1, N].
             position_ids (Tensor): Position IDs for the next tokens [1, N].
-            depth (int): MTP depth index (0-indexed).
+            depth (int, optional): MTP depth index. Only needed when `mtp_use_repeated_layer` is
+                False (each depth uses a distinct layer). Omit for repeated-layer models so that a
+                single CUDA graph can serve all depths.
+            eager, cache_key: The `CudaGraphManager` works by monkey-patching this argument onto the
+                function signature. Explictly including them removes the need for a monkey-patch,
+                and makes it straightforward to call the same method with and without eager mode.
+                These arguments are consumed by `CudaGraphManager`, if it exists.
 
         Returns:
             tuple: (new_hidden_states, logits [N, 1, vocab_size]).
         """
-        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
-
+        # CudaGraphManager consumes these args, if it exists
+        del eager, cache_key
+        layer_idx = 0 if depth is None else depth
         mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
             hidden_states=hidden_states,
             next_token_ids=next_token_ids,

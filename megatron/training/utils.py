@@ -12,6 +12,7 @@ from datetime import datetime
 import torch
 
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
 try:
@@ -39,7 +40,6 @@ from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
-    is_torch_min_version,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -284,8 +284,7 @@ def report_memory(name):
     string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
     string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
-    if args.log_device_memory_used and is_torch_min_version("2.6.0"):
-        # device usage is not supported in torch < 2.6.0
+    if args.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
@@ -564,7 +563,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
-            n_tensor = torch.empty(1, dtype=torch.int64, device=dev).fill_(n)
+            n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
             _broadcast(n_tensor)
 
             if n == 0:
@@ -772,3 +771,8 @@ def has_nvrx_installed():
         return True
     except (ImportError, ModuleNotFoundError):
         return False
+
+
+def has_nvrx_checkpointing_async_support():
+    """Checks whether the installed NVRx package exposes the async checkpointing API Megatron uses."""
+    return has_nvrx_async_support()

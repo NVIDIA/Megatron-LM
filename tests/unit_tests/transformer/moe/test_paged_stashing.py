@@ -136,11 +136,14 @@ class MoEModelTestContainer:
         quantization_context = get_fp8_context(self.config, layer_number, is_init=True)
         with quantization_context:
             moe_layer = (
-                MoELayer(self.config, transformer_layer_spec.submodules.mlp.submodules)
+                MoELayer(
+                    self.config,
+                    transformer_layer_spec.submodules.mlp.submodules,
+                    layer_number=layer_number,
+                )
                 .cuda()
                 .to(dtype=self.test_dtype)
             )
-            moe_layer.set_layer_number(layer_number)
             return moe_layer
 
     def zero_grad(self):
@@ -236,7 +239,6 @@ class TestPagedStashing:
             moe_flex_dispatcher_backend="hybridep",
             test_dtype=torch.bfloat16,
             moe_grouped_gemm=True,
-            moe_use_legacy_grouped_gemm=False,
             moe_paged_stash=True,
             moe_expert_rank_capacity_factor=1.5,
             use_transformer_engine_op_fuser=True,
@@ -326,7 +328,6 @@ class TestPagedStashingOverBudget:
             moe_flex_dispatcher_backend="hybridep",
             test_dtype=torch.bfloat16,
             moe_grouped_gemm=True,
-            moe_use_legacy_grouped_gemm=False,
             moe_paged_stash=True,
             moe_expert_rank_capacity_factor=1.5,
             use_transformer_engine_op_fuser=True,

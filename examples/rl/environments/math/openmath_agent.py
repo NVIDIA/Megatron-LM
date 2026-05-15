@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import random
 
 import datasets
@@ -34,5 +36,7 @@ class OpenMathInstructAgent(MathAgent):
         prompt = self.make_prefix(**golden)
         return prompt, golden
 
-    async def get_reward(self, response, golden: dict) -> float:
-        return self.compute_score(response, golden, golden_key="expected_answer")
+    async def get_reward(self, response, golden: dict, finish_reason: str) -> float:
+        return self.compute_score(
+            response, golden, golden_key="expected_answer", finish_reason=finish_reason
+        )

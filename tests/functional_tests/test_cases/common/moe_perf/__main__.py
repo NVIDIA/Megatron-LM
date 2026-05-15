@@ -23,7 +23,7 @@ from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import RandomSTE
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -211,10 +211,11 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
         nvtx_iter_msg = f"({case.name}) iteration {iteration}"
         nvtx_range_push(nvtx_iter_msg)
         # Use a long CUDA kernel to hide the router launch overhead
-        with torch.cuda.nvtx.range("(dummy GEMM)"):
-            dummy_tensor = torch.randn(8192, 8192, device="cuda")
-            torch.matmul(dummy_tensor, dummy_tensor)
-            del dummy_tensor
+        nvtx_range_push("(dummy GEMM)")
+        dummy_tensor = torch.randn(8192, 8192, device="cuda")
+        torch.matmul(dummy_tensor, dummy_tensor)
+        del dummy_tensor
+        nvtx_range_pop("(dummy GEMM)")
         input_tensor.grad = None
         layer.zero_grad(set_to_none=True)
         torch.cuda.reset_peak_memory_stats()
@@ -345,8 +346,9 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         torch.cuda.reset_peak_memory_stats()
         layer = _prepare_moe_layer(perf_case)
-        with torch.cuda.nvtx.range(f"({perf_case.name})"):
-            metrics = _benchmark_moe_layer(layer, perf_case)
+        nvtx_range_push(f"({perf_case.name})")
+        metrics = _benchmark_moe_layer(layer, perf_case)
+        nvtx_range_pop(f"({perf_case.name})")
 
         summary = (
             f"MoE layer performance ({perf_case.name}): forward {metrics['forward_ms']:.3f} ms "

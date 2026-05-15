@@ -47,7 +47,11 @@ from ..dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
-from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from ..distributed.param_and_grad_buffer import (
+    _ParamAndGradBuffer,
+    group_params_for_buffers,
+    partition_buckets,
+)
 from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
@@ -56,6 +60,7 @@ from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
+from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
 
@@ -219,10 +224,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_world_range = gbuf_world_all_ranges[data_parallel_rank]
 
         # Get each param's ranges.
-        # Use get_unpacked_index_map() which returns full-numel indices for NVFP4 params
-        # (from nvfp4_unpacked_param_index_map) and normal indices for other params.
         param_range_map = cls._build_model_gbuf_param_range_map(
-            param_and_grad_buffer.get_unpacked_index_map(), gbuf_world_range, bucket.offset
+            param_and_grad_buffer.param_index_map, gbuf_world_range, bucket.offset
         )
 
         # Group into dict.
@@ -475,6 +478,133 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             shard_fp32_groups,
             shard_fp32_from_float16_groups,
         )
+
+    @staticmethod
+    def _compute_per_buffer_param_layout(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+        param_indices: Optional[List[int]] = None,
+    ) -> 'PerBufferParamLayout':
+        """Compute how parameters should be laid out in the contiguous buffer.
+
+        Iterates params in reverse order (backprop order), applies 64-byte param
+        alignment, bucket-end padding for DP divisibility, and shared-embedding
+        bucket splitting.
+
+        Args:
+            params: List of parameters to lay out.
+            bucket_size: Approximate number of elements per bucket, or None for single bucket.
+            data_parallel_world_size: Size of the data-parallel group.
+            ddp_config: DistributedDataParallel config object.
+            param_indices: Optional indices for each param among same-dtype params.
+
+        Returns:
+            PerBufferParamLayout with the computed mapping.
+        """
+
+        def _does_param_require_new_bucket(param):
+            return getattr(param, "shared_embedding", False)
+
+        param_index_map = {}
+        bucket_indices = []
+        per_bucket_numel_unpadded = []
+
+        param_start_index = 0
+        bucket_start_index = 0
+        bucket_params = set()
+        bucket_id = 0
+
+        def _finalize_bucket(param_end_index, bucket_start_index, bucket_id):
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            bucket_end_index = pad_bucket_end(
+                param_end_index,
+                data_parallel_world_size,
+                ddp_config.pad_buckets_for_high_nccl_busbw,
+            )
+            bucket_indices.append((bucket_start_index, bucket_end_index))
+            return bucket_end_index, bucket_id + 1
+
+        for param in params[::-1]:
+            param_start_index = pad_param_start(param_start_index)
+
+            # Split shared embedding params into separate bucket.
+            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+                bucket_start_index, bucket_id = _finalize_bucket(
+                    param_start_index, bucket_start_index, bucket_id
+                )
+                bucket_params = set()
+                param_start_index = bucket_start_index
+
+            param_numel = param.data.nelement()
+            param_end_index = param_start_index + param_numel
+            param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+            bucket_params.add(param)
+
+            if (
+                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
+            ) or _does_param_require_new_bucket(param):
+                bucket_start_index, bucket_id = _finalize_bucket(
+                    param_end_index, bucket_start_index, bucket_id
+                )
+                bucket_params = set()
+                param_start_index = bucket_start_index
+            else:
+                param_start_index = param_end_index
+
+        if len(bucket_params) > 0:
+            _finalize_bucket(param_end_index, bucket_start_index, bucket_id)
+
+        return PerBufferParamLayout(
+            param_index_map=param_index_map,
+            bucket_indices=bucket_indices,
+            per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+            param_indices=param_indices if param_indices is not None else [],
+        )
+
+    @staticmethod
+    def compute_full_param_layout(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+        expert_data_parallel_world_size: Optional[int] = None,
+    ) -> 'FullParamLayout':
+        """Compute parameter layouts for all buffer groups.
+
+        Groups parameters by (param_dtype, grad_dtype, is_expert_parallel), then
+        computes a padded PerBufferParamLayout for each group. Expert-parallel groups use
+        expert_data_parallel_world_size for padding alignment.
+
+        Args:
+            params: List of all parameters to lay out.
+            bucket_size: Approximate number of elements per bucket, or None for single bucket.
+            data_parallel_world_size: Size of the data-parallel group for dense params.
+            ddp_config: DistributedDataParallel config object.
+            expert_data_parallel_world_size: Size of the expert data-parallel group.
+                Required if any expert-parallel params are present. Defaults to
+                data_parallel_world_size if not provided.
+
+        Returns:
+            FullParamLayout with a PerBufferParamLayout per buffer group.
+        """
+        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        layouts = {}
+        for buffer_key, (group_params, param_indices) in buffer_groups.items():
+            if buffer_key.is_expert_parallel:
+                dp_world_size = (
+                    expert_data_parallel_world_size
+                    if expert_data_parallel_world_size is not None
+                    else data_parallel_world_size
+                )
+            else:
+                dp_world_size = data_parallel_world_size
+            layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                group_params, bucket_size, dp_world_size, ddp_config, param_indices
+            )
+            layouts[buffer_key] = layout
+        return FullParamLayout(layouts=layouts)
 
     def __init__(
         self,
@@ -1577,6 +1707,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 world_tensors = dp_zero_state_dict[gbuf_idx][dtype]
                 world_tensor_keys = world_tensors.keys()
+                # Note: for NVFP4, param_index_map uses unpacked (full numel)
+                # offsets, which is correct here since optimizer states
+                # (fp32_param, exp_avg, exp_avg_sq) are in unpacked space.
                 for model_param, (
                     param_world_start,
                     param_world_end,
@@ -2685,6 +2818,66 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 shard_param_buffer.copy_(shard_main_param)
 
+    @staticmethod
+    def _normalize_state_dict_for_grouped_params(state_dict_flat, model_chunk):
+        """Normalize state dict keys when grouped/indexed parameter formats differ.
+
+        TEGroupedLinear modules can store weights as either a single grouped tensor
+        (single_grouped_weight=True, key "weight") or individually indexed tensors
+        (single_grouped_weight=False, keys "weight0", "weight1", ...).  When the
+        checkpoint was saved with a different setting, the keys won't match the
+        current model's parameters.  This mirrors the
+        normalize_grouped_parameter_keys hook registered in TEGroupedLinear.__init__
+        which only fires during load_state_dict and therefore does not cover the
+        optimizer reload_model_params path.
+        """
+        for module_name, module in model_chunk.named_modules():
+            if not (
+                hasattr(module, 'num_gemms') and hasattr(module, '_split_grouped_checkpoint_tensor')
+            ):
+                continue
+
+            clean_name = module_name
+            while clean_name.startswith("module."):
+                clean_name = clean_name[len("module.") :]
+
+            num_gemms = module.num_gemms
+
+            params_to_check = [("weight", getattr(module, "single_grouped_weight", False))]
+            if getattr(module, "use_bias", False):
+                params_to_check.append(("bias", getattr(module, "single_grouped_bias", False)))
+
+            for param_name, single_grouped in params_to_check:
+                grouped_suffix = f"{clean_name}.{param_name}" if clean_name else param_name
+                indexed_suffixes = [f"{grouped_suffix}{i}" for i in range(num_gemms)]
+
+                grouped_matches = [k for k in state_dict_flat if k.endswith(grouped_suffix)]
+                indexed_match_map = {}
+                for i, idx_suffix in enumerate(indexed_suffixes):
+                    matches = [k for k in state_dict_flat if k.endswith(idx_suffix)]
+                    if len(matches) == 1:
+                        indexed_match_map[i] = matches[0]
+
+                if single_grouped:
+                    if grouped_matches or len(indexed_match_map) != num_gemms:
+                        continue
+                    indexed_keys = [indexed_match_map[i] for i in range(num_gemms)]
+                    grouped_tensor = torch.stack(
+                        [state_dict_flat.pop(k) for k in indexed_keys], dim=0
+                    )
+                    key_prefix = indexed_keys[0][: len(indexed_keys[0]) - len(indexed_suffixes[0])]
+                    state_dict_flat[f"{key_prefix}{grouped_suffix}"] = grouped_tensor
+                else:
+                    if indexed_match_map or len(grouped_matches) != 1:
+                        continue
+                    grouped_key = grouped_matches[0]
+                    split_tensors = module._split_grouped_checkpoint_tensor(
+                        state_dict_flat.pop(grouped_key), grouped_key
+                    )
+                    key_prefix = grouped_key[: len(grouped_key) - len(grouped_suffix)]
+                    for i, tensor in enumerate(split_tensors):
+                        state_dict_flat[f"{key_prefix}{indexed_suffixes[i]}"] = tensor
+
     def _build_model_param_to_state_dict_param_map(self, state_dict):
         """Create a map from model params to tensors in state_dict based on their names."""
         state_dict_list = []
@@ -2706,6 +2899,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         model_param_to_state_dict_param_map = {}
         for chunk_idx, model_chunk in enumerate(self.model_chunks):
+            self._normalize_state_dict_for_grouped_params(state_dict_list[chunk_idx], model_chunk)
             names_in_state_dict = set(state_dict_list[chunk_idx].keys())
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):

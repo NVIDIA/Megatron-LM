@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import signal
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 
 @dataclass(kw_only=True)
@@ -28,12 +28,23 @@ class TrainingConfig:
     will start with global batch size 16 and over (1024 - 16) / 8 = 126 intervals will increase
     the batch size linearly to 1024. In each interval we will use approximately
     300000 / 126 = 2380 samples.
+    Deprecated. Use step_batch_size_schedule instead.
+    """
+
+    step_batch_size_schedule: str | None = None
+    """Step-wise batch size schedule in format "THRESHOLD:BS THRESHOLD:BS ...".
+    Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+    If sequence length is provided, thresholds are interpreted as tokens; otherwise as samples.
+    Example:
+        step_batch_size_schedule = "0:768 250B:1536 500B:3072 750B:6144"
+    Cannot be used together with decrease_batch_size_if_needed.
     """
 
     decrease_batch_size_if_needed: bool = False
     """If set, decrease batch size if microbatch_size * dp_size does not 
     divide batch_size. Old batch_size will be restored if training is re-started 
-    with dp_size that divides batch_size // microbatch_size."""
+    with dp_size that divides batch_size // microbatch_size. Not supported with
+    step-batch-size-schedule."""
 
     empty_unused_memory_level: Literal[0, 1, 2] = 0
     """Call torch.cuda.empty_cache() each iteration (training and eval), to reduce fragmentation.
@@ -42,6 +53,11 @@ class TrainingConfig:
 
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
+
+    gpu_sniff_test_interval: int | None = None
+    """Interval (in iterations) to run GPU performance sniff tests (GEMMs, all-to-all, send/recv).
+    Flags any rank whose throughput differs from the mean by more than one standard deviation.
+    If not specified, sniff tests are not run."""
 
     train_sync_interval: int | None = None
     """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""
@@ -134,8 +150,15 @@ class ValidationConfig:
 
     multiple_validation_sets: bool = False
     """If set, multiple datasets listed in the validation split are evaluated independently with a
-       separate loss for each dataset in the list. This argument requires that no weights are 
+       separate loss for each dataset in the list. This argument requires that no weights are
        included in the list.
+    """
+
+    validation_set_names: Optional[List[str]] = None
+    """Optional list of names for multiple validation sets. When provided with
+       --multiple-validation-sets, these names are used instead of numeric indices
+       (e.g. 'validation-wiki' instead of 'validation-0'). The number of names must
+       match the number of validation datasets.
     """
 
 
@@ -380,6 +403,15 @@ class CheckpointConfig:
     )
     """Number of iterations between persistent checkpoint saves."""
 
+    save_params_interval: int | None = None
+    """Number of iterations between param.name->param.data mapping saves."""
+
+    save_activations_interval: int | None = None
+    """Number of iterations between act.name->act.data mapping saves."""
+
+    save_tokens_per_expert_interval: int | None = None
+    """Number of iterations between tokens-per-expert routing metadata saves."""
+
     save_wgrads_interval: int | None = None
     """Number of iterations between wgrad (main_grad) saves."""
 
@@ -513,6 +545,12 @@ class CheckpointConfig:
     async_ckpt_io_priority: Optional[int] = 3
     """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
 
+    async_ckpt_use_cpu_shm: bool = False
+    """Copy GPU tensors to CPU shared-memory in the training process before handing off to
+    the async checkpoint worker. Avoids CUDA IPC / NVLink fabric handles in the worker
+    subprocess. Useful on MNNVL systems where fabric resources are exhausted.
+    Only applies with the nvrx async strategy."""
+
     fully_parallel_load: bool = field(
         default=False,
         metadata={
@@ -547,6 +585,11 @@ class CheckpointConfig:
 
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
+
+    ckpt_load_validate_sharding_integrity: bool = True
+    """Whether to validate sharding access integrity when loading a distributed checkpoint.
+    When True (default), each tensor shard is checked to be accessed exactly once as main
+    replica by some rank. Disabling skips this validation"""
 
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
@@ -593,16 +636,110 @@ class CheckpointConfig:
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
 
+    verify_integrity: bool = False
+    """Whether to hash checkpointing files during save and validate their integrity during load."""
+
     def __post_init__(self):
-        from megatron.training.utils import has_nvrx_installed
+        from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         assert self.async_strategy in [
             "nvrx",
             "mcore",
         ], f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
 
-        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
-            assert has_nvrx_installed(), (
-                "nvidia-resiliency-ext is not installed. "
-                "Please, install nvidia-resiliency-ext to enable async save."
+        if not self.async_save:
+            self.async_strategy = "mcore"
+
+        if (
+            self.async_save
+            and self.async_strategy == "nvrx"
+            and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
+        ):
+            assert has_nvrx_checkpointing_async_support(), (
+                "A compatible nvidia-resiliency-ext installation is required to enable "
+                "async save with async_strategy='nvrx'."
             )
+
+        if self.verify_integrity:
+            assert (
+                self.ckpt_format == "torch_dist"
+            ), f"`verify_integrity` is only supported with torch_dist checkpoint format."
+
+
+@dataclass(kw_only=True)
+class TokenizerConfig:
+    """Configuration settings for the tokenizers."""
+
+    vocab_size: int = None
+    """Size of vocab before EOD or padding."""
+
+    padded_vocab_size: int = None
+    """Vocabulary size of the model (padded to be divisible by tensor model parallel size). 
+    If not provided, it will be automatically calculated from vocab-size."""
+
+    vocab_file: str = None
+    """Path to the vocab file."""
+
+    merge_file: str = None
+    """Path to the BPE merge file."""
+
+    vocab_extra_ids: int = 0
+    """Number of additional vocabulary tokens. They are used for span masking in the T5 model."""
+
+    tokenizer_type: Literal[
+        "BertWordPieceLowerCase",
+        "BertWordPieceCase",
+        "GPT2BPETokenizer",
+        "SentencePieceTokenizer",
+        "GPTSentencePieceTokenizer",
+        "HuggingFaceTokenizer",
+        "Llama2Tokenizer",
+        "TikTokenizer",
+        "MultimodalTokenizer",
+        "NullTokenizer",
+        "NullMultimodalTokenizer",
+        "SFTTokenizer",
+    ] = None
+    """What type of tokenizer to use."""
+
+    tokenizer_model: str = None
+    """Path to the tokenizer model."""
+
+    metadata_path: str | None = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-metadata"]}}
+    )
+    """Path to the tokenizer metadata file in json format."""
+
+    special_tokens: Optional[list[str]] = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-special-tokens"]}}
+    )
+    """List of special tokens. For TikTokenizer needs to have 
+    ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]"""
+
+    tiktoken_pattern: Literal["v1", "v2"] = None
+    """Which tiktoken pattern to use. Options: [v1, v2]"""
+
+    tiktoken_num_special_tokens: int = 1000
+    """Number of special tokens in tiktoken tokenizer."""
+
+    tokenizer_sentencepiece_legacy: bool = False
+    """SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage."""
+
+    tokenizer_hf_no_use_fast: bool = False
+    """Whether to use fast HuggingFace tokenizer."""
+
+    tokenizer_hf_no_include_special_tokens: bool = False
+    """Converting text to ids will not include special for HuggingFace tokenizer."""
+
+    trust_remote_code: bool = False
+    """Whether or not to allow PreTrainedTokenizer to execute remote code."""
+
+    null_tokenizer_eod_id: int = None
+    """EOD token id for NullTokenizer. Defaults to `vocab_size - 1`."""
+
+    null_tokenizer_pad_id: int = -1
+    """Pad token id for NullTokenizer. Defaults to -1 (no pad token). 
+    Set to a value outside the dataset to avoid masking real tokens."""
+
+    chat_template: Optional[str] = None
+    """Custom chat template in jinja format for conversation formatting."""

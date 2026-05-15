@@ -35,7 +35,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
+from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -52,7 +52,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType, CudaGraphScope
+from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
 try:
@@ -82,6 +82,13 @@ if not HAVE_FA3:
         pass
 
 try:
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+
+    HAVE_FA4 = True
+except ImportError:
+    HAVE_FA4 = False
+
+try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
     HAVE_FMLA = True
@@ -102,10 +109,11 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         SplitAlongDim,
         TELinear,
+        TENorm,
         set_save_original_input,
     )
 else:
-    SplitAlongDim, TELinear, set_save_original_input = None, None, None
+    SplitAlongDim, TELinear, TENorm, set_save_original_input = None, None, None, None
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -250,12 +258,14 @@ class Attention(MegatronModule, ABC):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
         self._pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -378,6 +388,71 @@ class Attention(MegatronModule, ABC):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+        # Per-layer RotaryEmbedding (used when rotary_base_per_layer is set in config).
+        self.rotary_pos_emb = None
+        if getattr(self.config, 'rotary_base_per_layer', None):
+            rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
+            self._build_per_layer_rotary_pos_emb(rotary_base)
+
+    def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
+        """Build self.rotary_pos_emb using a layer-specific rotary base."""
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+        seq_len_interpolation_factor = self.config.rotary_scaling_factor
+        if self.config.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = RotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=self.config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                rope_scaling=self.config.rope_scaling,
+                rope_scaling_factor=self.config.rope_scaling_factor,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
+            )
+        elif self.config.position_embedding_type == 'yarn':
+            self.rotary_pos_emb = YarnRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=self.config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                original_max_position_embeddings=getattr(
+                    self.config, "yarn_original_max_position_embeddings"
+                ),
+                beta_fast=getattr(self.config, "yarn_beta_fast"),
+                beta_slow=getattr(self.config, "yarn_beta_slow"),
+                mscale=getattr(self.config, "yarn_mscale"),
+                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                correction_range_round_to_int=getattr(
+                    self.config, "yarn_correction_range_round_to_int"
+                ),
+                use_cpu_initialization=self.config.use_cpu_initialization,
+            )
+        elif (
+            self.config.position_embedding_type == 'mrope'
+            and not self.config.multi_latent_attention
+        ):
+            self.rotary_pos_emb = MultimodalRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=self.config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+            )
+            self.mrope_section = self.config.mrope_section
+            assert (
+                self.mrope_section is not None
+            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+        else:
+            raise NotImplementedError(
+                f"rotary_base_per_layer does not support "
+                f"position_embedding_type={self.config.position_embedding_type!r} "
+                f"(only 'rope' / 'yarn' / 'mrope' are supported)."
+            )
 
     def _checkpointed_attention_forward(
         self,
@@ -828,7 +903,21 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA3:
+            if HAVE_FA4:
+                output_total, _ = flash_attn4_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    seqused_k=seqlens_k,
+                    page_table=block_table,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    num_splits=1,
+                )
+            elif HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
                 output_total = self._flash_attention_3_forward_wrapper(
@@ -868,7 +957,9 @@ class Attention(MegatronModule, ABC):
             q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
 
             # If using MLA we use the FlashMLA kernel
-            if isinstance(self.config, MLATransformerConfig):
+            # The `softmax_scale` attribute check is to find out whether this is an MLA layer or
+            # standard Attention.
+            if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
@@ -896,22 +987,47 @@ class Attention(MegatronModule, ABC):
                     causal=True,
                 )
             else:
-                flash_attn_args = {
-                    "q": q,
-                    "k_cache": k,
-                    "v_cache": v,
-                    "cache_seqlens": seqlens_k,
-                    "causal": True,
-                    "page_table" if HAVE_FA3 else "block_table": block_table,
-                    "num_splits": 0 if not self.batch_invariant_mode else 1,
-                }
-                if HAVE_FA3:
-                    output_total = flash_attn3_with_kvcache(**flash_attn_args)
+                if HAVE_FA4:
+                    if getattr(self, "softmax_scale", None) is not None:
+                        softmax_scale = self.softmax_scale
+                    else:
+                        softmax_scale = q.shape[-1] ** -0.5
+                    # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
+                    q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
+                    output_total, _ = flash_attn4_varlen_func(
+                        q_varlen,
+                        k,
+                        v,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=tokens_per_request,
+                        max_seqlen_k=max_seqlen_k,
+                        seqused_k=seqlens_k,
+                        page_table=block_table,
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        num_splits=1,
+                    )
+                    # Reshape back to (B, S, H, D)
+                    output_total = output_total.reshape(
+                        num_requests, tokens_per_request, *output_total.shape[1:]
+                    )
                 else:
-                    assert (
-                        not self.batch_invariant_mode
-                    ), "Batch invariant mode is not supported for flash attention 2"
-                    output_total = flash_attn_with_kvcache(**flash_attn_args)
+                    flash_attn_args = {
+                        "q": q,
+                        "k_cache": k,
+                        "v_cache": v,
+                        "cache_seqlens": seqlens_k,
+                        "causal": True,
+                        "page_table" if HAVE_FA3 else "block_table": block_table,
+                        "num_splits": 0 if not self.batch_invariant_mode else 1,
+                    }
+                    if HAVE_FA3:
+                        output_total = flash_attn3_with_kvcache(**flash_attn_args)
+                    else:
+                        assert (
+                            not self.batch_invariant_mode
+                        ), "Batch invariant mode is not supported for flash attention 2"
+                        output_total = flash_attn_with_kvcache(**flash_attn_args)
 
             # Reshape back to (B*S, 1, H, D) for consistent output shape.
             output_total = output_total.reshape(
@@ -975,11 +1091,16 @@ class Attention(MegatronModule, ABC):
         if no_rope:
             rotary_pos_emb = None
 
+        # Per-layer theta: override the model-level RoPE with this layer's own embedding.
+        if self.rotary_pos_emb is not None and rotary_pos_emb is not None:
+            seq_len = rotary_pos_emb.shape[0]
+            rotary_pos_emb = self.rotary_pos_emb(seq_len)
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
-            assert HAVE_FA3 or is_fa_min_version(
-                "2.7.3"
+            assert (
+                HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
@@ -1100,7 +1221,6 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
@@ -1308,6 +1428,7 @@ class SelfAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(
             config=config,
@@ -1318,6 +1439,7 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
@@ -1336,23 +1458,51 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
         )
 
-        if submodules.q_layernorm is not None:
-            self.q_layernorm = submodules.q_layernorm(
-                hidden_size=self.hidden_size_per_attention_head,
-                config=self.config,
-                eps=self.config.layernorm_epsilon,
-            )
+        # Resolve which norm class to use for Q and K.
+        # Config selects the default norm class; spec overrides if set.
+        if self.config.qk_l2_norm:
+            q_norm_cls = submodules.q_layernorm or L2Norm
+            k_norm_cls = submodules.k_layernorm or L2Norm
+        elif self.config.qk_layernorm:
+            # TODO(yuzhongw, janpabloe): Support local backend.
+            q_norm_cls = submodules.q_layernorm or TENorm
+            k_norm_cls = submodules.k_layernorm or TENorm
+            if q_norm_cls is None or k_norm_cls is None:
+                raise ValueError(
+                    "qk_layernorm requires Transformer Engine (for TENorm) or "
+                    "q_layernorm/k_layernorm set in the spec."
+                )
         else:
-            self.q_layernorm = None
+            if submodules.q_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets q_layernorm={submodules.q_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            if submodules.k_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets k_layernorm={submodules.k_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            q_norm_cls = k_norm_cls = None
 
-        if submodules.k_layernorm is not None:
-            self.k_layernorm = submodules.k_layernorm(
+        self.q_layernorm = (
+            q_norm_cls(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
-        else:
-            self.k_layernorm = None
+            if q_norm_cls is not None
+            else None
+        )
+        self.k_layernorm = (
+            k_norm_cls(
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+            if k_norm_cls is not None
+            else None
+        )
 
     def run_realtime_tests(self):
         """Performs a consistency check.
@@ -1689,6 +1839,7 @@ class CrossAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(
             config=config,
@@ -1698,6 +1849,7 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
