@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Static throughput/latency benchmark against an OpenAI-compatible completions server.
 
 Fires --batch-size requests simultaneously via asyncio.gather, waits for all to
@@ -47,21 +48,18 @@ async def _single_request(
     actual_input = usage.get("prompt_tokens")
     actual_output = usage.get("completion_tokens")
     if actual_input is not None:
-        assert actual_input == expected_input_tokens, (
-            f"Expected {expected_input_tokens} prompt tokens, server saw {actual_input}."
-        )
+        assert (
+            actual_input == expected_input_tokens
+        ), f"Expected {expected_input_tokens} prompt tokens, server saw {actual_input}."
     if actual_output is not None:
-        assert actual_output == num_output_tokens, (
-            f"Expected {num_output_tokens} output tokens, got {actual_output}."
-        )
+        assert (
+            actual_output == num_output_tokens
+        ), f"Expected {num_output_tokens} output tokens, got {actual_output}."
     return actual_output or num_output_tokens, latency
 
 
 async def _run_batch(
-    session: aiohttp.ClientSession,
-    args: argparse.Namespace,
-    url: str,
-    prompt: str,
+    session: aiohttp.ClientSession, args: argparse.Namespace, url: str, prompt: str
 ) -> tuple[list[int], list[float], float]:
     t0 = time.perf_counter()
     results = await asyncio.gather(

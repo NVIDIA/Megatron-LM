@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Compare a perf test results.json against a checked-in baseline_values.json.
 
 Exit code:
@@ -20,15 +21,12 @@ from pathlib import Path
 import yaml
 
 THROUGHPUT_METRICS = {"throughput_tok_per_sec"}
-LATENCY_METRICS = {
-    "avg_latency_ms",
-    "p50_latency_ms",
-    "p99_latency_ms",
-    "tpot_ms_per_tok",
-}
+LATENCY_METRICS = {"avg_latency_ms", "p50_latency_ms", "p99_latency_ms", "tpot_ms_per_tok"}
 
 
-def _check(label: str, measured: float, baseline: float, tol: float, higher_is_better: bool) -> tuple[bool, str]:
+def _check(
+    label: str, measured: float, baseline: float, tol: float, higher_is_better: bool
+) -> tuple[bool, str]:
     if higher_is_better:
         floor = baseline * (1 - tol)
         ok = measured >= floor
@@ -51,7 +49,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True, help="Path to results.json from this run.")
     ap.add_argument("--baseline", required=True, help="Path to baseline_values.json.")
-    ap.add_argument("--config", required=True, help="Path to model_config.yaml (for tolerance + metrics list).")
+    ap.add_argument(
+        "--config", required=True, help="Path to model_config.yaml (for tolerance + metrics list)."
+    )
     args = ap.parse_args()
 
     results = json.loads(Path(args.results).read_text())
@@ -77,11 +77,7 @@ def main() -> int:
                 continue
             higher_is_better = metric in THROUGHPUT_METRICS
             ok, line = _check(
-                metric,
-                measured_entry[metric],
-                baseline_entry[metric],
-                tol,
-                higher_is_better,
+                metric, measured_entry[metric], baseline_entry[metric], tol, higher_is_better
             )
             all_ok = all_ok and ok
             print(line)
