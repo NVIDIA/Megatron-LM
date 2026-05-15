@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.parameterization import (
+    SCALING_RECIPE_DEPTH_MUP,
+    SCALING_RECIPE_MUP,
     build_model_scaling_policy,
     build_scaling_context,
     sync_legacy_mup_fields,
@@ -362,11 +364,11 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # MuP (Maximal Update Parameterization)
     ####################
-    scaling_recipe: Optional[Literal['none', 'mup']] = None
+    scaling_recipe: Optional[Literal['none', 'mup', 'depth_mup']] = None
     """
-    Canonical scaling recipe. ``none`` preserves standard parameterization, and ``mup``
-    enables width MuP. If unset, legacy ``use_mup`` selects ``mup`` for backward
-    compatibility.
+    Canonical scaling recipe. ``none`` preserves standard parameterization, ``mup``
+    enables width MuP, and ``depth_mup`` enables the narrow spectral width-depth
+    MuP recipe for dense GPT-style residual Transformer blocks.
     """
 
     scaling_base_hidden_size: Optional[int] = None
@@ -375,10 +377,33 @@ class TransformerConfig(ModelParallelConfig):
     derived as hidden_size / scaling_base_hidden_size.
     """
 
+    scaling_base_num_layers: Optional[int] = None
+    """
+    Canonical base transformer-layer count for depth-based scaling recipes.
+    Defaults to ``num_layers`` when omitted.
+    """
+
     scaling_base_head_dim: Optional[float] = None
     """
     Canonical base attention head dimension for MuP attention scaling. This aliases the
     deprecated mup_base_head_dim field.
+    """
+
+    scaling_residual_branch_depth_power: Optional[float] = None
+    """
+    Relative depth exponent for dense self-attention/MLP residual-branch outputs.
+    Under ``depth_mup``, the default is ``-1.0``.
+    """
+
+    scaling_hidden_lr_depth_power: Optional[float] = None
+    """
+    Relative depth exponent for hidden matrix-like LR overrides.
+    """
+
+    scaling_block_out_proj_init_depth_power: Optional[float] = None
+    """
+    Relative depth exponent for dense transformer block output projection
+    initialization. Under ``depth_mup``, the default is ``+0.5``.
     """
 
     use_mup: bool = False
@@ -1973,25 +1998,66 @@ class TransformerConfig(ModelParallelConfig):
 
         scaling_context = build_scaling_context(self)
         sync_legacy_mup_fields(self, scaling_context)
+        model_scaling_policy = build_model_scaling_policy(self)
+
+        if scaling_context.is_depth_mup:
+            if self.is_hybrid_model:
+                raise NotImplementedError(
+                    "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
+                    "Transformer blocks only. Hybrid/Mamba layer patterns are out of scope for v1."
+                )
+            if self.mtp_num_layers is not None and self.mtp_num_layers > 0:
+                raise NotImplementedError(
+                    "scaling_recipe='depth_mup' currently supports standard next-token "
+                    "training only. MTP depth transfer is out of scope for v1."
+                )
+            if self.multi_latent_attention:
+                raise NotImplementedError(
+                    "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
+                    "self-attention only. multi_latent_attention is out of scope for v1."
+                )
+            if self.experimental_attention_variant is not None:
+                raise NotImplementedError(
+                    "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
+                    "self-attention only. experimental attention variants are out of scope for v1."
+                )
+            if self.num_moe_experts is not None:
+                raise NotImplementedError(
+                    "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
+                    "Transformer blocks only. MoE depth transfer is out of scope for v1."
+                )
 
         # MuP (Maximal Update Parameterization) configuration
-        if scaling_context.uses_width_mup:
+        if scaling_context.recipe in (SCALING_RECIPE_MUP, SCALING_RECIPE_DEPTH_MUP):
             overridden_init_methods = []
             if self.init_method is not None:
                 overridden_init_methods.append("init_method")
+            if self.embedding_init_method is not None:
+                overridden_init_methods.append("embedding_init_method")
             if self.output_layer_init_method is not None:
                 overridden_init_methods.append("output_layer_init_method")
             if overridden_init_methods:
                 overridden_init_methods_text = " and ".join(overridden_init_methods)
                 verb = "is" if len(overridden_init_methods) == 1 else "are"
                 warnings.warn(
-                    "scaling recipe 'mup' is enabled, but custom "
+                    f"scaling recipe {scaling_context.recipe!r} is enabled, but custom "
                     + overridden_init_methods_text
-                    + f" {verb} set. This may break MuP initialization assumptions.",
+                    + f" {verb} set. This may break scaling initialization assumptions.",
                     UserWarning,
                 )
 
-        model_scaling_policy = build_model_scaling_policy(self)
+        self._parameterization_output_layer_init_method_user_provided = (
+            self.output_layer_init_method is not None
+        )
+        if (
+            self._parameterization_output_layer_init_method_user_provided
+            and model_scaling_policy.dense_block_out_proj_init_multiplier != 1.0
+        ):
+            warnings.warn(
+                "Custom output_layer_init_method is set, so dense block output projection "
+                "depth scaling will be ignored.",
+                UserWarning,
+            )
         self.softmax_scale = model_scaling_policy.resolve_attention_softmax_scale(
             softmax_scale=self.softmax_scale, kv_channels=self.kv_channels
         )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .spec import SCALING_RECIPE_MUP, ScalingContext
+from .spec import SCALING_RECIPE_MUP, ScalingContext, build_scaling_context
 
 
 @dataclass(frozen=True)
@@ -70,3 +70,7 @@ def build_legacy_mup_training_policy(
         context=ScalingContext(recipe=SCALING_RECIPE_MUP, width_mult=mup_width_mult),
         optimizer_type=optimizer_type,
     )
+
+
+def build_training_scaling_policy(config, optimizer_type: str = 'adam') -> TrainingScalingPolicy:
+    return TrainingScalingPolicy(context=build_scaling_context(config), optimizer_type=optimizer_type)

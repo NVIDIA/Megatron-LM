@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from megatron.core.parameterization import build_scaling_context, sync_legacy_mup_fields
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
-from megatron.training.arguments import warn_deprecated_mup_aliases
+from megatron.training.arguments import validate_depth_mup_optimizer_support, warn_deprecated_mup_aliases
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -43,7 +43,11 @@ str_dtype_to_torch = {
 DEFAULTABLE_SCALING_FIELDS = {
     'scaling_recipe',
     'scaling_base_hidden_size',
+    'scaling_base_num_layers',
     'scaling_base_head_dim',
+    'scaling_residual_branch_depth_power',
+    'scaling_hidden_lr_depth_power',
+    'scaling_block_out_proj_init_depth_power',
     'use_mup',
     'mup_width_mult',
     'mup_base_hidden_size',
@@ -367,6 +371,11 @@ def validate_yaml(args, defaults={}):
     #TODO: Added as much of the global initialization requires the model parallel arguments
     args = SimpleNamespace(**args.__dict__, **args.model_parallel.__dict__)
     args = SimpleNamespace(**args.__dict__, **args.language_model.__dict__)
+    if not hasattr(args, 'allow_depth_mup_eval'):
+        args.allow_depth_mup_eval = False
+    validate_depth_mup_optimizer_support(args)
+    warn_deprecated_mup_aliases(args)
+    sync_legacy_mup_fields(args, build_scaling_context(args))
     # For GPT Layer spec in pretrain_gpt
     args.num_experts = args.language_model.num_moe_experts
 
