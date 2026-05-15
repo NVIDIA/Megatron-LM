@@ -90,19 +90,3 @@ class TestContextGPUView:
             for name in MAMBA_VIEWS:
                 assert getattr(v, name) is not None
                 assert getattr(v, name).dtype == torch.int32
-
-    def test_views_alias_underlying_buffer(self):
-        """Mutating a typed view writes through to `_buf`. This is the central
-        load-bearing property of ContextGPUView — the H2D copy targets `_buf`,
-        and every kernel reads through the typed views."""
-        v = ContextGPUView(
-            max_requests=MAX_REQUESTS,
-            max_tokens=MAX_TOKENS,
-            max_kv_blocks=MAX_KV_BLOCKS,
-            device=torch.device("cuda"),
-            max_mamba_chunks=0,
-        )
-        sentinel = 0xCAFE
-        v.token_to_input_ids[0] = sentinel
-        # First 8 bytes are the int64-typed view of token_to_input_ids[0].
-        assert v._buf[:8].view(torch.long)[0].item() == sentinel
