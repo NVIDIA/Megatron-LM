@@ -1499,17 +1499,16 @@ def partition_buckets(
     if len(buffers) == 0:
         return []
 
-    # ``dtype_to_buffer_map`` is only used in Case 3 below to find *the* fp8
-    # (uint8) buffer. Other dtypes can legitimately appear in multiple buffers
-    # (e.g. LayerWise-managed bf16 weights + Adam-managed bf16 biases live in
-    # separate buffers but share the bf16 ``param_dtype``), so the uniqueness
-    # check is restricted to uint8.
-    dtype_to_buffer_map = {}
+    # At most one fp8 (uint8) buffer is allowed; Cases 2 and 3 below branch on
+    # whether one is present. Non-uint8 dtypes can legitimately appear in
+    # multiple buffers (e.g. LayerWise-managed bf16 weights + Adam-managed bf16
+    # biases share the bf16 ``param_dtype`` but live in separate buffers), so
+    # the uniqueness check is restricted to uint8.
+    fp8_buffer = None
     for buffer in buffers:
-        dtype = buffer.param_dtype
-        if dtype == torch.uint8:
-            assert dtype not in dtype_to_buffer_map
-        dtype_to_buffer_map[dtype] = buffer
+        if buffer.param_dtype == torch.uint8:
+            assert fp8_buffer is None
+            fp8_buffer = buffer
 
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
     if force_single_bucket_group:
@@ -1528,7 +1527,7 @@ def partition_buckets(
         )
         return [bucket_group]
 
-    if torch.uint8 not in dtype_to_buffer_map:
+    if fp8_buffer is None:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
         #         only one bucket.
         bucket_groups = []
@@ -1552,7 +1551,6 @@ def partition_buckets(
                     non_fp8_buckets.append(bucket)
 
         bucket_groups = []
-        fp8_buffer = dtype_to_buffer_map[torch.uint8]
         for bucket in fp8_buffer.buckets:
             if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
                 # reduce_scatter_with_fp32_accumulation requires exactly one bucket

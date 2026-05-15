@@ -185,7 +185,6 @@ def setup_model_and_optimizer(
     dist_opt=True,
     optimizer='adam',
     use_param_layout=False,
-    use_gloo_process_groups=True,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -231,9 +230,7 @@ def setup_model_and_optimizer(
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
-    optimizer = get_megatron_optimizer(
-        config, model, use_gloo_process_groups=use_gloo_process_groups
-    )
+    optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
