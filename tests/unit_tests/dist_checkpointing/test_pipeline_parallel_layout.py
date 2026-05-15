@@ -7,6 +7,9 @@ import pytest
 import torch
 
 from megatron.core import mpu
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
@@ -293,6 +296,10 @@ def test_save_and_load_checkpoint_vpp(
     args.async_strategy = "mcore"
     set_args(args)
 
+    # Cached metadata is mutated in-place by torch's load planner, so reusing it
+    # across loads of the same checkpoint dir corrupts subsequent reads.
+    CachedMetadataFileSystemReader.clear_metadata_cache()
+
     def set_tp_pp_vpp(tp, pp, vpp=None, pp_layout=None, destroy_first=True):
         if destroy_first:
             Utils.destroy_model_parallel()
@@ -306,45 +313,16 @@ def test_save_and_load_checkpoint_vpp(
         args.save = ckpt_path
         args.load = ckpt_path
 
-    set_tp_pp_vpp(*src_tp_pp_vpp, pp_layout=src_pp_layout, destroy_first=False)
-    init_num_microbatches_calculator(
-        rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
-    )
-
-    iteration = 123
-    layer_spec_fn = get_gpt_decoder_block_spec if is_moe else gpt_te_spec
-    model = initialize_gpt_model(
-        1,
-        layer_spec_fn=layer_spec_fn,
-        num_layers=args.num_layers,
-        hidden_size=args.hidden_size,
-        num_attention_heads=args.num_attention_heads,
-        tensor_model_parallel_size=args.tensor_model_parallel_size,
-        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-        virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
-        pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
-        is_moe=is_moe,
-    )
-    model = model if isinstance(model, list) else [model]
-    optimizer = None
-    opt_param_scheduler = None
-    num_floating_point_operations_so_far = 456
-
-    with (
-        TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A,
-        TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B,
-    ):
-        set_ckpt_path(ckpt_dir_A)
-        save_checkpoint(
-            iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+    try:
+        set_tp_pp_vpp(*src_tp_pp_vpp, pp_layout=src_pp_layout, destroy_first=False)
+        init_num_microbatches_calculator(
+            rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
         )
 
-        expected_ckpt_path = args.save / "iter_0000123" / ".metadata"
-        assert os.path.exists(expected_ckpt_path)
-
-        set_tp_pp_vpp(*dst_tp_pp_vpp, pp_layout=dst_pp_layout)
-        new_model = initialize_gpt_model(
-            2,
+        iteration = 123
+        layer_spec_fn = get_gpt_decoder_block_spec if is_moe else gpt_te_spec
+        model = initialize_gpt_model(
+            1,
             layer_spec_fn=layer_spec_fn,
             num_layers=args.num_layers,
             hidden_size=args.hidden_size,
@@ -355,57 +333,87 @@ def test_save_and_load_checkpoint_vpp(
             pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
             is_moe=is_moe,
         )
-        new_model = new_model if isinstance(new_model, list) else [new_model]
+        model = model if isinstance(model, list) else [model]
+        optimizer = None
+        opt_param_scheduler = None
+        num_floating_point_operations_so_far = 456
 
-        load_checkpoint(new_model, optimizer, opt_param_scheduler, strict=False)
-        set_ckpt_path(ckpt_dir_B)
-        save_checkpoint(
-            iteration,
-            new_model,
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-        )
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A,
+            TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B,
+        ):
+            set_ckpt_path(ckpt_dir_A)
+            save_checkpoint(
+                iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+            )
 
-        set_tp_pp_vpp(1, 1)
-        set_ckpt_path(ckpt_dir_A)
-        model_A = initialize_gpt_model(
-            123,
-            layer_spec_fn=layer_spec_fn,
-            num_layers=args.num_layers,
-            hidden_size=args.hidden_size,
-            num_attention_heads=args.num_attention_heads,
-            tensor_model_parallel_size=args.tensor_model_parallel_size,
-            pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-            virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
-            pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
-            is_moe=is_moe,
-        )
-        load_checkpoint([model_A], optimizer, opt_param_scheduler, strict=False)
+            expected_ckpt_path = args.save / "iter_0000123" / ".metadata"
+            assert os.path.exists(expected_ckpt_path)
 
-        set_ckpt_path(ckpt_dir_B)
-        model_B = initialize_gpt_model(
-            321,
-            layer_spec_fn=layer_spec_fn,
-            num_layers=args.num_layers,
-            hidden_size=args.hidden_size,
-            num_attention_heads=args.num_attention_heads,
-            tensor_model_parallel_size=args.tensor_model_parallel_size,
-            pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-            virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
-            pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
-            is_moe=is_moe,
-        )
-        load_checkpoint([model_B], optimizer, opt_param_scheduler, strict=False)
+            set_tp_pp_vpp(*dst_tp_pp_vpp, pp_layout=dst_pp_layout)
+            new_model = initialize_gpt_model(
+                2,
+                layer_spec_fn=layer_spec_fn,
+                num_layers=args.num_layers,
+                hidden_size=args.hidden_size,
+                num_attention_heads=args.num_attention_heads,
+                tensor_model_parallel_size=args.tensor_model_parallel_size,
+                pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
+                pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
+                is_moe=is_moe,
+            )
+            new_model = new_model if isinstance(new_model, list) else [new_model]
 
-        for k in model_A.state_dict():
-            if "_extra_state" in k:  # Ignore extra states
-                continue
-            tensor_a = model_A.state_dict()[k]
-            tensor_b = model_B.state_dict()[k]
-            assert tensor_a is not None, k
-            assert tensor_b is not None, k
-            assert torch.equal(tensor_a, tensor_b), k
+            load_checkpoint(new_model, optimizer, opt_param_scheduler, strict=False)
+            set_ckpt_path(ckpt_dir_B)
+            save_checkpoint(
+                iteration,
+                new_model,
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+            )
 
-    Utils.destroy_model_parallel()
-    unset_num_microbatches_calculator()
+            set_tp_pp_vpp(1, 1)
+            set_ckpt_path(ckpt_dir_A)
+            model_A = initialize_gpt_model(
+                123,
+                layer_spec_fn=layer_spec_fn,
+                num_layers=args.num_layers,
+                hidden_size=args.hidden_size,
+                num_attention_heads=args.num_attention_heads,
+                tensor_model_parallel_size=args.tensor_model_parallel_size,
+                pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
+                pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
+                is_moe=is_moe,
+            )
+            load_checkpoint([model_A], optimizer, opt_param_scheduler, strict=False)
+
+            set_ckpt_path(ckpt_dir_B)
+            model_B = initialize_gpt_model(
+                321,
+                layer_spec_fn=layer_spec_fn,
+                num_layers=args.num_layers,
+                hidden_size=args.hidden_size,
+                num_attention_heads=args.num_attention_heads,
+                tensor_model_parallel_size=args.tensor_model_parallel_size,
+                pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
+                pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
+                is_moe=is_moe,
+            )
+            load_checkpoint([model_B], optimizer, opt_param_scheduler, strict=False)
+
+            for k in model_A.state_dict():
+                if "_extra_state" in k:  # Ignore extra states
+                    continue
+                tensor_a = model_A.state_dict()[k]
+                tensor_b = model_B.state_dict()[k]
+                assert tensor_a is not None, k
+                assert tensor_b is not None, k
+                assert torch.equal(tensor_a, tensor_b), k
+    finally:
+        Utils.destroy_model_parallel()
+        unset_num_microbatches_calculator()
