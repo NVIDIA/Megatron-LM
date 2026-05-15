@@ -214,21 +214,19 @@ class ParameterGroup:
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        if is_bwd and self.transpose_weight_buffer is not None:
-            buffers = [self.transpose_weight_buffer]
-        else:
-            buffers = [self.model_weight_buffer]
-
         work = None
-        for weight_buffer in buffers:
+        for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
+            self.model_weight_buffer,
+            self.transpose_weight_buffer,
+            is_bwd=is_bwd,
+        ):
             _, weight_work = weight_buffer.unshard(
                 async_op=async_op,
             )
             if work is None:
                 work = weight_work
 
-        if self.is_fp8_group:
-            self.mp_policy.post_unshard(self.params, is_bwd=is_bwd)
+        self.mp_policy.post_unshard(self.params, is_bwd=is_bwd)
         return work
 
     def reshard(self):

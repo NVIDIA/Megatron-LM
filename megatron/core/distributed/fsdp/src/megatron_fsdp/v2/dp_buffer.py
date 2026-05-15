@@ -304,8 +304,9 @@ class DataParallelBuffer:
         gradient_scaling_factor: Optional[float] = None,
         chunk_size_factor: int = 1,
         sharding_strategy: str = "no_shard",
-        mp_policy: Optional[FullyShardMixedPrecisionPolicy] = None,
+        mp_policy: FullyShardMixedPrecisionPolicy,
     ):
+        assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
         self.params = params
         self.param_idx = param_idx
         self.dtype = dtype
@@ -506,14 +507,7 @@ class DataParallelBuffer:
             item_id = self.param_idx[p]
             offset, size = self.buffer_index._get_item_offset(item_id)
             param_data = full_buffer[offset : offset + size].view(p.shape)
-            if self.mp_policy is not None and self.mp_policy.is_fp8_param(p):
-                self.mp_policy.set_unsharded_weight(
-                    p,
-                    param_data,
-                    transpose=self.buffer_role == "transpose_weight",
-                )
-            else:
-                p.data = param_data
+            self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
 
         return (full_buffer, work)
 

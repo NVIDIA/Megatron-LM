@@ -215,11 +215,24 @@ class FullyShardMixedPrecisionPolicy:
     ) -> None:
         """Bind a parameter to an unsharded model-weight buffer view."""
         if self.is_fp8_param(tensor):
-            self.set_unsharded_weight(
-                tensor,
-                data,
-                transpose=buffer_role == "transpose_weight",
-            )
+            if buffer_role == "transpose_weight":
+                assert self.needs_transpose_weight_buffer(tensor), (
+                    f"Type {type(tensor)} has no transpose payload"
+                )
+                attr = "_columnwise_data"
+            else:
+                attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
+
+            # Rebind TE's raw uint8 payload to the all-gathered FSDP buffer view.
+            old_data = getattr(tensor, attr)
+            if old_data is not None:
+                assert old_data.dtype == data.dtype, (
+                    f"FP8 raw dtype mismatch: {old_data.dtype} vs {data.dtype}"
+                )
+                assert old_data.shape == data.shape, (
+                    f"FP8 raw shape mismatch: {old_data.shape} vs {data.shape}"
+                )
+            setattr(tensor, attr, data)
             return
         tensor.data = data
 
@@ -291,35 +304,6 @@ class FullyShardMixedPrecisionPolicy:
         ), "Transformer Engine >= 2.0 is required for FP8 dequantize"
         return tensor.dequantize()
 
-    def set_unsharded_weight(
-        self,
-        tensor: torch.Tensor,
-        data: torch.Tensor,
-        transpose: bool = False,
-    ) -> None:
-        """Attach an unsharded FP8 payload to an FP8 parameter."""
-        assert self.is_fp8_param(tensor), (
-            f"Type {type(tensor)} is not a Transformer Engine FP8 tensor"
-        )
-        if transpose:
-            assert self.needs_transpose_weight_buffer(tensor), (
-                f"Type {type(tensor)} has no transpose payload"
-            )
-            attr = "_columnwise_data"
-        else:
-            attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
-
-        # Rebind TE's raw uint8 payload to the all-gathered FSDP buffer view.
-        old_data = getattr(tensor, attr)
-        if old_data is not None:
-            assert old_data.dtype == data.dtype, (
-                f"FP8 raw dtype mismatch: {old_data.dtype} vs {data.dtype}"
-            )
-            assert old_data.shape == data.shape, (
-                f"FP8 raw shape mismatch: {old_data.shape} vs {data.shape}"
-            )
-        setattr(tensor, attr, data)
-
     def post_unshard(self, params: List[torch.Tensor], is_bwd: bool = False) -> None:
         """Run post-unshard mixed precision processing for a parameter group."""
         params = [param for param in params if self.is_fp8_param(param)]
@@ -331,26 +315,29 @@ class FullyShardMixedPrecisionPolicy:
             # MXFP8 columnwise payload unavailable since TE may request the
             # backward workspace from inside the forward call stack.
             if is_bwd:
-                self.create_transpose_cache(params)
+                if HAVE_TE_POST_ALL_GATHER_PROCESSING:
+                    post_all_gather_processing(params)
+                else:
+                    for param in params:
+                        if hasattr(param, "_create_transpose"):
+                            param._create_transpose()
+                        else:
+                            param._create_columnwise()
             return
 
         # TE rebuilds recipe-specific state after FSDP all-gather for recipes
         # where columnwise data is derived from the all-gathered rowwise data.
-        self.create_transpose_cache(params)
+        if HAVE_TE_POST_ALL_GATHER_PROCESSING:
+            post_all_gather_processing(params)
+        else:
+            for param in params:
+                if hasattr(param, "_create_transpose"):
+                    param._create_transpose()
+                else:
+                    param._create_columnwise()
         for param in params:
             if hasattr(param, "update_usage"):
                 param.update_usage(rowwise_usage=not is_bwd, columnwise_usage=True)
-
-    def create_transpose_cache(self, params: List[torch.Tensor]) -> None:
-        """Run TE post-all-gather processing for FP8 parameters."""
-        if HAVE_TE_POST_ALL_GATHER_PROCESSING:
-            post_all_gather_processing(params)
-            return
-        for param in params:
-            if hasattr(param, "_create_transpose"):
-                param._create_transpose()
-            else:
-                param._create_columnwise()
 
     def post_reshard(self, params: List[torch.Tensor]) -> None:
         """Run post-reshard mixed precision processing for a parameter group."""
