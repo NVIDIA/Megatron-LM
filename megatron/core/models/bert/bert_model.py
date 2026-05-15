@@ -135,10 +135,10 @@ class BertModel(LanguageModule):
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=(
-                    config.embedding_init_method
-                    if config.use_mup and not self.share_embeddings_and_output_weights
-                    else config.init_method
+                init_method=self.model_scaling_policy.output_layer_init_method(
+                    share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
+                    default_init_method=config.init_method,
+                    embedding_init_method=config.embedding_init_method,
                 ),
                 bias=True,
                 skip_bias_add=False,

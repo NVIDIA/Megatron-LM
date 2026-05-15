@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, nvtx_decorator
@@ -128,8 +129,9 @@ class LanguageModelEmbedding(MegatronModule):
             assert self.tokentype_embeddings is None
 
         # MuP: scale embeddings by alpha_input.
-        if self.config.use_mup and self.config.mup_embedding_mult != 1.0:
-            embeddings = embeddings * self.config.mup_embedding_mult
+        embeddings = build_resolved_model_policy(self.config).scale_embedding_activations(
+            embeddings
+        )
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
