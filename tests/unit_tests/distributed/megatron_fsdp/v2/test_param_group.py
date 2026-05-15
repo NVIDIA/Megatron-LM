@@ -263,7 +263,7 @@ def test_reduce_grad(strategy):
             gbuf.data.fill_(float(rank + 1))
             ref = torch.full_like(gbuf.data, float(rank + 1))
             Ref.all_reduce(ref, dp_group)
-            gbuf.reduce_grad(async_op=False)
+            gbuf.reduce_grad()
             assert torch.equal(gbuf.data, ref)
         else:
             # Distributed: fill a full-size temp buffer with (rank+1),
@@ -283,7 +283,7 @@ def test_reduce_grad(strategy):
             ref_shard = Ref.reduce_scatter(full.clone(), dp_group)
 
             gbuf.data.zero_()
-            gbuf.reduce_grad(async_op=False)
+            gbuf.reduce_grad()
 
             # Only compare the shard region of self.data
             sm = gbuf.buffer_index.shard_meta
