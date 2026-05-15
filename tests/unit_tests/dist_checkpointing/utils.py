@@ -185,6 +185,7 @@ def setup_model_and_optimizer(
     dist_opt=True,
     optimizer='adam',
     use_param_layout=False,
+    use_gloo_process_groups=True,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -230,17 +231,32 @@ def setup_model_and_optimizer(
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
-    optimizer = get_megatron_optimizer(config, model)
+    optimizer = get_megatron_optimizer(
+        config, model, use_gloo_process_groups=use_gloo_process_groups
+    )
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
+    def _init_states(optimizer):
+        # In hybrid LayerWise + DistOpt mode the top-level ChainedOptimizer
+        # wraps another ChainedOptimizer (LayerWise) alongside DistOpt; recurse
+        # so the Muon Float16 sub-optimizers inside LayerWise still get their
+        # state seeded. Optimizers without ``init_state_fn`` (DistOpt) seed
+        # their state elsewhere and are skipped here.
+        if isinstance(optimizer, ChainedOptimizer):
+            for child_optimizer in optimizer.chained_optimizers:
+                _init_states(child_optimizer)
+            return
+        if not hasattr(optimizer, 'init_state_fn'):
+            return
+        if not hasattr(optimizer, 'optimizer'):
+            optimizer.init_state_fn(optimizer)
+        else:
+            optimizer.init_state_fn(optimizer.optimizer)
+
     if isinstance(optimizer, ChainedOptimizer):
-        for opt in optimizer.chained_optimizers:
-            if not hasattr(opt, 'optimizer'):
-                opt.init_state_fn(opt)
-            else:
-                opt.init_state_fn(opt.optimizer)
+        _init_states(optimizer)
     else:
         for group in optimizer.optimizer.param_groups:
             for p in group['params']:

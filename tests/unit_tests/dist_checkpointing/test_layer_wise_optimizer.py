@@ -603,4 +603,77 @@ class TestLayerWiseOptimizer:
                 # Test both param state dicts are equal
                 check_equal(optim_param_state_A, optim_param_state_B)
 
+    @pytest.mark.parametrize('tp', [1, 2])
+    @pytest.mark.parametrize('pp', [1, 2])
+    def test_optimizer_common_state_dict_hybrid(self, tmp_path_dist_ckpt, tp, pp):
+        """End-to-end ``save_checkpoint``/``load_checkpoint`` roundtrip on the
+        hybrid LayerWise + DistributedOptimizer path.
+
+        Muon matrix params live in :class:`LayerWiseDistributedOptimizer`
+        while non-Muon params (embeddings, biases, layernorm) go through a
+        real :class:`DistributedOptimizer` sub-optimizer. Catches the case
+        where ``_build_sharded_state_dict_metadata`` skipped populating
+        ``distrib_optim_sharding_type`` because the arg parser flips
+        ``use_distributed_optimizer`` off in Muon mode -- the DistOpt
+        sub-optimizer then defaulted to the deprecated
+        ``fully_sharded_model_space`` save path which is incompatible with
+        the post-5ab481cb45 ShardedTensor validation.
+        """
+        if tp * pp > 8:
+            pytest.skip("TP*PP > 8 is larger than world size")
+
+        Utils.initialize_model_parallel(tp, pp)
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_optimizer_common_state_dict_hybrid', sync=True
+        ) as ckpt_dir:
+            mock_args = parse_args(ignore_unknown_args=True)
+            # Mirror the arg-parser's Muon path: ``use_distributed_optimizer``
+            # is flipped off and ``use_layer_wise_distributed_optimizer`` is
+            # the surviving flag.
+            mock_args.use_distributed_optimizer = False
+            mock_args.use_layer_wise_distributed_optimizer = True
+            with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
+                model, optimizer_A = setup_model_and_optimizer(
+                    seed=2,
+                    tp=tp,
+                    pp=pp,
+                    initialize_fn=initialize_gpt_model,
+                    dist_opt=True,
+                    optimizer='dist_muon',
+                    use_param_layout=True,
+                    use_gloo_process_groups=False,
+                )
+
+                init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=True)
+                from megatron.training.training import preprocess_common_state_dict
+
+                save_checkpoint(
+                    10,
+                    model,
+                    optimizer_A,
+                    None,
+                    0,
+                    preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                )
+
+                optim_param_state_A = optimizer_A.state_dict()
+
+                model, optimizer_B = setup_model_and_optimizer(
+                    seed=3,
+                    tp=tp,
+                    pp=pp,
+                    initialize_fn=initialize_gpt_model,
+                    dist_opt=True,
+                    optimizer='dist_muon',
+                    use_param_layout=True,
+                    use_gloo_process_groups=False,
+                )
+
+                load_checkpoint_no_arg_checks(model, optimizer_B, None)
+
+                optim_param_state_B = optimizer_B.state_dict()
+
+                check_equal(optim_param_state_A, optim_param_state_B)
+
         Utils.destroy_model_parallel()
