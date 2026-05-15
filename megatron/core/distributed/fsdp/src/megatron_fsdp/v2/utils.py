@@ -17,6 +17,8 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+from torch.distributed import distributed_c10d
+from torch.distributed.tensor import DeviceMesh, init_device_mesh
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,3 +62,14 @@ def _replace_module_parameter(module: nn.Module, name: str, new_param: nn.Parame
     for part in parts[:-1]:
         parent = getattr(parent, part)
     setattr(parent, parts[-1], new_param)
+
+
+def _init_default_fully_shard_mesh() -> DeviceMesh:
+    """Default to global CUDA mesh if possible else global CPU mesh."""
+    if not distributed_c10d.is_initialized():
+        distributed_c10d.init_process_group()
+
+    default_pg = distributed_c10d._get_default_group()  # still private
+    device = torch._C._get_accelerator()
+    mesh = init_device_mesh(device.type, mesh_shape=(default_pg.size(),))
+    return mesh

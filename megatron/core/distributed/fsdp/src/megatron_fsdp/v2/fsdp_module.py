@@ -14,8 +14,8 @@
 
 """FSDPModule implementation for Megatron-FSDP2."""
 
-from contextlib import nullcontext
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -283,7 +283,9 @@ class FSDPModule(nn.Module):
                 lambda t: torch.empty_like(t, device=materialization_device) if t.is_meta else t,
                 recurse=False,
             )
-            init_context = mp_policy.model_init_context() if mp_policy is not None else nullcontext()
+            init_context = (
+                mp_policy.model_init_context() if mp_policy is not None else nullcontext()
+            )
             with init_context:
                 if hasattr(m, "reset_parameters"):
                     m.reset_parameters()
@@ -303,13 +305,43 @@ class FSDPModule(nn.Module):
                 torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
 
     def _init_fsdp_state(
-        self,
-        enable_unshard_prefetch,
-        enable_async_reduce_grad,
-        bucket_allocator: BucketAllocator,
+        self, enable_unshard_prefetch, enable_async_reduce_grad, bucket_allocator: BucketAllocator
     ):
-        """Initialize FSDP state and mark nested FSDP modules as non-root."""
+        """Initialize FSDP state and mark nested FSDP modules as non-root.
+
+        Important: This must be called BEFORE any forward/backward pass runs.
+        Re-initializing while child FSDPModules are actively unsharded
+        (mid-forward or mid-backward) will corrupt their state.  The safety
+        check below enforces that constraint.
+        """
         forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
+
+        # Safety check: no child FSDPModule must be in an active state.
+        # - unshard_done_events[id(child)] non-None → unsharded, not yet resharded
+        # - reduce_grad_buckets[id(child)] non-empty → reduce-scatter in flight
+        # Re-initializing _fsdp_root_context while a child is in either state
+        # would overwrite its shared state mid-pass.
+        for child_module in forward_order:
+            if child_module is self:
+                continue
+            if not hasattr(child_module, "_fsdp_root_context"):
+                continue
+            ctx = child_module._fsdp_root_context
+            if ctx is None:
+                continue
+            if ctx.unshard_done_events.get(id(child_module)) is not None:
+                raise RuntimeError(
+                    "_init_fsdp_state cannot be called while a child FSDPModule "
+                    "is still unsharded. All children must be resharded before "
+                    "re-initializing FSDP state."
+                )
+            if ctx.reduce_grad_buckets.get(id(child_module)):
+                raise RuntimeError(
+                    "_init_fsdp_state cannot be called while a child FSDPModule "
+                    "has pending reduce-scatter operations. All children must have "
+                    "completed gradient reduction before re-initializing FSDP state."
+                )
+
         root_context = _FSDPRootContext(
             ag_stream=(
                 torch.cuda.Stream() if enable_unshard_prefetch else torch.cuda.current_stream()
@@ -454,9 +486,11 @@ class FSDPModule(nn.Module):
 
             # NaN check before reduction
             if getattr(self, "_enable_nan_checks", False):
-                for param in param_group.params:
+                for name, param in zip(param_names, param_group.params):
                     if param.grad is not None:
-                        assert not torch.isnan(param.grad).any(), "NaN in parameter grad"
+                        assert not torch.isnan(
+                            param.grad
+                        ).any(), f"NaN in parameter grad for {name}"
 
             # Copy .grad -> main grad buffer on main stream (fast memcpy).
             # When gradient_accumulation_fusion is active for FSDP params, the backward

@@ -310,6 +310,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
             for param_group in child._fsdp_param_groups:
                 for param, dist_param in zip(param_group.params, param_group.dist_params):
                     for attr_name in [
+                        # allreduce: expert params have allreduce=False set by
+                        # te layers.  Missing this causes is_expert_parallel
+                        # misclassification in _get_param_groups, which can
+                        # produce NaN gradients when wgrad fusion writes to
+                        # the wrong buffer or when expert gradient scaling is
+                        # incorrect.
+                        "allreduce",
                         "requires_grad",
                         "sequence_parallel",
                         "shared",

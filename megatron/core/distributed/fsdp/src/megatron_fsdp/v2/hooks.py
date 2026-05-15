@@ -97,6 +97,15 @@ def _register_backward_pre_hook(module: FSDPModule):
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
                 setattr(param, "grad_added_to_main_grad", False)
+                # When gradient_accumulation_fusion is active, the TE backward
+                # kernel writes weight gradients directly into param.main_grad.
+                # By default TE accumulates (adds) into main_grad, which silently
+                # doubles gradients when the buffer isn't zeroed between
+                # micro-batches.  Setting overwrite_main_grad tells TE to
+                # overwrite instead of accumulate, preventing NaN from corrupted
+                # gradient buffers.
+                if param_group.sharding_strategy in ["optim_grads_params", "optim_grads"]:
+                    setattr(param, "overwrite_main_grad", True)
         if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
             _register_post_backward_final_callback(module._fsdp_state, module)
         module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)

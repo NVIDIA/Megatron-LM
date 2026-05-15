@@ -111,6 +111,13 @@ for child in self.modules():
 `forward_order` is **static** (module tree topology, computed once). There is no first-pass
 dynamic recording phase.
 
+**Safety constraint.** `_init_fsdp_state()` must be called **before** any forward/backward pass
+runs.  The method includes a runtime guard that rejects re-initialization if any child
+FSDPModule is still unsharded (`unshard_done_events` live) or has pending reduce-scatter
+operations (`reduce_grad_buckets` non-empty).  Violating this constraint would overwrite a
+running module's `_fsdp_root_context` while its hooks are still firing, causing undefined
+behavior.
+
 ---
 
 ## Feature 1: Unshard Prefetch
@@ -293,12 +300,20 @@ The operation is inherently synchronous *within whatever stream is current* when
 "async" behavior is achieved entirely by the caller dispatching into `rs_stream` via
 `with torch.cuda.stream(stream)`. This avoids any API changes to `DataParallelBuffer`.
 
-**`grad_added_to_main_grad` flag:**
+**`grad_added_to_main_grad` and `overwrite_main_grad` flags:**
 When TransformerEngine's `gradient_accumulation_fusion` is active, the backward kernel writes
-directly into `param.main_grad` (bypassing `.grad`). The `pre_backward_hook` resets this flag
-to `False` before each backward pass; the kernel sets it to `True` after writing. In
-`reduce_grad`, the `zero_()` call is skipped when the flag is `True` to preserve the
-fused-gradient value.
+directly into `param.main_grad` (bypassing `.grad`). Two flags coordinate this:
+
+- **`grad_added_to_main_grad`**: Set to `False` in `pre_backward_hook` before each backward
+  pass; the kernel sets it to `True` after writing. In `reduce_grad`, the `zero_()` call is
+  skipped when `True` to preserve the fused-gradient value.
+
+- **`overwrite_main_grad`**: Set to `True` in `pre_backward_hook` for sharded parameters
+  (`optim_grads_params` / `optim_grads`). By default TE **accumulates** (adds) into
+  `main_grad` — useful for micro-batch gradient accumulation in non-FSDP settings. With FSDP
+  the gradient buffer is re-used across micro-batches; accumulation would silently **double**
+  gradients and produce NaN after the first step. This flag tells TE to **overwrite** instead
+  of accumulate.
 
 ### Sliding Drain: The `i-2` Rule
 
@@ -582,6 +597,41 @@ for dist_grad in param_group.dist_grads:
         continue   # skip zero-numel shards
     dist_grad._local_tensor.mul_(scaling_factor)
 ```
+
+---
+
+## Pitfall: Attribute Propagation from Original Params to DTensor Dist Params
+
+**Problem.**  `_init_buffers()` in `ParameterGroup` creates DTensor views (`dist_params`) into
+sharded buffers and `_replace_module_parameter` registers these DTensors on the module.
+However, critical metadata set on the **original** `nn.Parameter` objects by upstream layers
+(e.g. TE linear layers from `transformer_engine.py`) is **not** automatically transferred to
+the new DTensor wrappers.
+
+The adapter (`mcore_fsdp_adapter.py:310-330`) copies a fixed list of attributes from original
+params to dist_params.  If an attribute is missing from this list, downstream consumers that
+inspect the registered module parameters will see the wrong metadata.
+
+**Affected attributes and their consumers:**
+
+| Attribute | Set by | Consumer | Failure mode |
+|-----------|--------|----------|-------------|
+| `allreduce` | `transformer_engine.py:841` — set to `False` on expert MLP weights | `_get_param_groups` (`optimizer/__init__.py:348`) — classifies `is_expert_parallel` | Expert params misclassified as non-expert, causing wrong gradient scaling, clipping group assignment, and optimizer partition placement |
+| `is_embedding_parameter` | Various embedding layers | `_get_param_groups` — controls weight decay exclusion | Embeddings incorrectly decayed → convergence divergence |
+| `is_embedding_or_output_parameter` | Embedding / output layers | Same as above | Same |
+| `sequence_parallel` | TE layers | `parallel_state` / loss computation | Incorrect SP semantics |
+| `tensor_model_parallel`, `partition_dim`, `partition_stride` | TE layers | Distributed checkpointing / state dict | Incorrect checkpoint sharding |
+| `requires_grad` | All layers | Optimizer | Frozen params may receive updates |
+
+**Fix.**  When adding a new metadata attribute to TE layers or custom modules that are
+consumed by downstream code (optimizer, checkpointing, mixed precision), add its name to
+the `attr_name` list in `mcore_fsdp_adapter.py` to ensure it propagates to the DTensor
+dist_params.
+
+**Debugging.**  Misattributed params can be detected by dumping
+`model._log_parameter_groups()` output and verifying that expert params appear in the
+`is_expert_parallel` group.  NaN after a single step with `gradient_accumulation_fusion`
+is a strong indicator of missing `allreduce` propagation.
 
 ---
 

@@ -35,6 +35,7 @@ from .hooks import (
     _register_forward_pre_hook,
 )
 from .mixed_precision import FullyShardMixedPrecisionPolicy
+from .utils import _init_default_fully_shard_mesh
 
 __all__ = ["FSDPModule", "fully_shard"]
 
@@ -71,6 +72,8 @@ def fully_shard(
             "The input module has already been fully sharded. "
             "Please do not call fully_shard on the same module more than once."
         )
+    mesh = mesh or _init_default_fully_shard_mesh()
+
     if mp_policy is None:
         mp_policy = FullyShardMixedPrecisionPolicy()
 
