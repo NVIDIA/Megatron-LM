@@ -1009,9 +1009,7 @@ class TestFsdpHybridModelDoubleBuffer:
                 h, _ = self.transformer_layer(hidden_states=hidden_states, attention_mask=None)
                 return self.mamba_layer(hidden_states=h)
 
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["tp", "cp"]
-        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
 
         fsdp_model = FullyShardedDataParallel(
