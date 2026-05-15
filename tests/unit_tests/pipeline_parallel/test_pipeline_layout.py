@@ -135,6 +135,7 @@ def create_args():
     args.vocab_file = None
     args.add_position_embedding = False
     args.ckpt_assume_constant_structure = False
+    args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = "assume_ok_unexpected"
     args.fp16 = False
     args.bf16 = True
@@ -148,6 +149,7 @@ def create_args():
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
     args.async_strategy = "nvrx"
+    args.verify_integrity = False
 
     yield args
 
@@ -226,7 +228,9 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         args.pipeline_model_parallel_layout = pp_layout
 
     set_tp_pp_vpp(*tp_pp_vpp, pp_layout=pp_layout, destroy_first=False)
-    init_num_microbatches_calculator(0, None, 1, 1, 1)
+    init_num_microbatches_calculator(
+        rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+    )
 
     def forward_step_func(data_iterator, model: GPTModel):
         """Forward training step. Copied from `pretrain_gpt.py`"""
