@@ -6,13 +6,14 @@ Read more about ModelOpt pruning at https://github.com/NVIDIA/Model-Optimizer/tr
 """
 
 import functools
-import inspect
 import json
 import os
 import sys
 import warnings
+from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
@@ -79,6 +80,61 @@ def _gated_mlp_merging_war(self, module, *args, **kwargs):
 
 
 GPTModelImporter._gated_mlp_merging = _gated_mlp_merging_war
+
+
+def _load_fused_norms_from_hf_war(model, hf_path, dtype):
+    """WAR: modelopt <= 0.44 only loads `fused_norm` for Nemotron-H. For GPT models
+    (Qwen3, Llama, ...) under --export-default-te-spec, layer_norm_weight inside the
+    fused TELayerNormColumnParallelLinear stays at random init. Walk the model and
+    copy the HF norm weights into the fused linears."""
+
+    hf_path = Path(hf_path)
+    index_file = hf_path / "model.safetensors.index.json"
+    if index_file.exists():
+        weight_map = json.loads(index_file.read_text())["weight_map"]
+    else:
+        weight_map = {}
+        for stf in hf_path.glob("*.safetensors"):
+            with safe_open(str(stf), framework="pt") as f:
+                for k in f.keys():
+                    weight_map[k] = stf.name
+
+    def _maybe_load(key):
+        # Skip if the key isn't present — e.g. Nemotron-H uses `backbone.layers.{}.norm.weight`,
+        # and modelopt already handles those via its `fused_norm` rule. The WAR is a no-op there.
+        if key not in weight_map:
+            return None
+        with safe_open(str(hf_path / weight_map[key]), framework="pt") as f:
+            return f.get_tensor(key)
+
+    def _copy_into(param, key):
+        t = _maybe_load(key)
+        if t is None:
+            return
+        param.data.copy_(t.to(dtype=dtype, device=param.device))
+
+    for layer in model.decoder.layers:
+        i = layer.layer_number - 1
+        attn = getattr(layer, "self_attention", None)
+        if (
+            attn is not None
+            and hasattr(attn, "linear_qkv")
+            and getattr(attn.linear_qkv, "layer_norm_weight", None) is not None
+        ):
+            _copy_into(
+                attn.linear_qkv.layer_norm_weight,
+                f"model.layers.{i}.input_layernorm.weight",
+            )
+        mlp = getattr(layer, "mlp", None)
+        if (
+            mlp is not None
+            and hasattr(mlp, "linear_fc1")
+            and getattr(mlp.linear_fc1, "layer_norm_weight", None) is not None
+        ):
+            _copy_into(
+                mlp.linear_fc1.layer_norm_weight,
+                f"model.layers.{i}.post_attention_layernorm.weight",
+            )
 
 
 def add_prune_args(parser):
@@ -235,6 +291,9 @@ if __name__ == "__main__":
         }
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
+        )
+        _load_fused_norms_from_hf_war(
+            unwrapped_model, args.pretrained_model_path, import_dtype
         )
 
     def _custom_prompt_forward_loop_func(model):
