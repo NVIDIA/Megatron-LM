@@ -14,6 +14,7 @@ import yaml
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.instantiate_utils import InstantiationMode
+from megatron.training.models import Serializable
 
 
 @pytest.fixture(autouse=True)
@@ -203,7 +204,7 @@ class TestConfigContainer_FromYaml:
             TestConfigContainer.from_yaml("non_existent_file.yaml")
 
     @patch("megatron.training.config.container.MultiStorageClientFeature.is_enabled")
-    @patch("megatron.training.config.container.OmegaConf")
+    @patch("omegaconf.OmegaConf")
     @patch("builtins.open", new_callable=mock_open)
     @patch("os.path.exists")
     def test_from_yaml_success(self, mock_exists, mock_file, mock_omegaconf, mock_msc):
@@ -251,7 +252,7 @@ class TestConfigContainer_FromYaml:
 
         with patch("builtins.open", mock_open()):
             with patch("yaml.safe_load", return_value={}):
-                with patch("megatron.training.config.container.OmegaConf") as mock_omegaconf:
+                with patch("omegaconf.OmegaConf") as mock_omegaconf:
                     # Mock OmegaConf methods to return expected values
                     mock_conf = MagicMock()
                     mock_omegaconf.create.return_value = mock_conf
@@ -312,35 +313,34 @@ class TestConfigContainer_ToDict:
         assert result["items"] == ["a", "b", "c"]
         assert result["metadata"] == {"key1": 1, "key2": 2}
 
-    # TODO (@maanug): reenable after migrating model config+builder
-    # def test_convert_serializable_nested_in_config(self):
-    #     """Test that a Serializable nested inside a ConfigContainer is serialized via as_dict()."""
+    def test_convert_serializable_nested_in_config(self):
+        """Test that a Serializable nested inside a ConfigContainer is serialized via as_dict()."""
 
-    #     class NestedSerializable:
-    #         def __init__(self, value):
-    #             self.value = value
+        class NestedSerializable:
+            def __init__(self, value):
+                self.value = value
 
-    #         def as_dict(self) -> dict:
-    #             return {"_target_": "my.module.NestedSerializable", "value": self.value}
+            def as_dict(self) -> dict:
+                return {"_target_": "my.module.NestedSerializable", "value": self.value}
 
-    #         @classmethod
-    #         def from_dict(cls, data):
-    #             return cls(data["value"])
+            @classmethod
+            def from_dict(cls, data):
+                return cls(data["value"])
 
-    #     @dataclass
-    #     class ConfigWithSerializable(ConfigContainerBase):
-    #         name: str = "ser_test"
-    #         nested: object = None
+        @dataclass
+        class ConfigWithSerializable(ConfigContainerBase):
+            name: str = "ser_test"
+            nested: object = None
 
-    #         def __post_init__(self):
-    #             if self.nested is None:
-    #                 self.nested = NestedSerializable(99)
+            def __post_init__(self):
+                if self.nested is None:
+                    self.nested = NestedSerializable(99)
 
-    #     config = ConfigWithSerializable()
-    #     result = config.to_dict()
+        config = ConfigWithSerializable()
+        result = config.to_dict()
 
-    #     assert result["name"] == "ser_test"
-    #     assert result["nested"] == {"_target_": "my.module.NestedSerializable", "value": 99}
+        assert result["name"] == "ser_test"
+        assert result["nested"] == {"_target_": "my.module.NestedSerializable", "value": 99}
 
     def test_to_dict_excludes_private_fields(self):
         """Test that to_dict excludes fields starting with underscore."""
@@ -415,24 +415,23 @@ class TestConfigContainer_ConvertValueToDict:
         assert result["value"] == 123
         assert result["nested"]["inner"]["_target_"] == _target_qualname(SimpleDataclass)
 
-    # TODO (@maanug): reenable after migrating model config+builder
-    # def test_convert_serializable(self):
-    #     """Test converting a Serializable instance uses as_dict()."""
+    def test_convert_serializable(self):
+        """Test converting a Serializable instance uses as_dict()."""
 
-    #     class MySerializable:
-    #         def as_dict(self) -> dict:
-    #             return {"_target_": "my.module.MySerializable", "x": 42}
+        class MySerializable:
+            def as_dict(self) -> dict:
+                return {"_target_": "my.module.MySerializable", "x": 42}
 
-    #         @classmethod
-    #         def from_dict(cls, data):
-    #             return cls()
+            @classmethod
+            def from_dict(cls, data):
+                return cls()
 
-    #     obj = MySerializable()
-    #     assert isinstance(obj, Serializable)  # runtime_checkable sanity check
+        obj = MySerializable()
+        assert isinstance(obj, Serializable)  # runtime_checkable sanity check
 
-    #     result = TestConfigContainer._convert_value_to_dict(obj)
+        result = TestConfigContainer._convert_value_to_dict(obj)
 
-    #     assert result == {"_target_": "my.module.MySerializable", "x": 42}
+        assert result == {"_target_": "my.module.MySerializable", "x": 42}
 
     def test_convert_primitive_types(self):
         """Test converting primitive types."""
