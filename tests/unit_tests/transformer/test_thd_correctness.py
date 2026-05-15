@@ -30,9 +30,13 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.core import parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import SelfAttentionSubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
@@ -324,10 +328,12 @@ def build_gpt_layer(
         cp_comm_type="p2p" if cp_size > 1 else None,
         deterministic_mode=deterministic,
     )
-    spec = get_gpt_layer_with_transformer_engine_spec()
+    submodules = get_gpt_layer_with_transformer_engine_submodules()
     if use_mock_attention:
-        spec.submodules.self_attention.submodules.core_attention = MockCoreAttention
-    layer = TransformerLayer(config, spec.submodules)
+        self_attention_submodules = get_submodules(submodules.self_attention)
+        assert isinstance(self_attention_submodules, SelfAttentionSubmodules)
+        self_attention_submodules = MockCoreAttention
+    layer = TransformerLayer(config, submodules)
     layer.cuda()
     return layer
 
