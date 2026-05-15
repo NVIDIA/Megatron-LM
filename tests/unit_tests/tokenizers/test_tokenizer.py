@@ -634,7 +634,7 @@ class TestBuildTokenizer:
         config = TokenizerConfig(tokenizer_type="UnknownTokenizer")
 
         with pytest.raises(
-            AssertionError, match="tokenizer_type UnknownTokenizer is not supported"
+            ValueError, match="tokenizer_type UnknownTokenizer is not supported"
         ):
             tokenizer = build_tokenizer(config)
 
