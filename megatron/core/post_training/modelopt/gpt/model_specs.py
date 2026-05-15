@@ -154,11 +154,7 @@ def get_gpt_modelopt_spec(
         module=transformer_layer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=Norm,
-            self_attention=ModuleSpec(
-                module=attn_module,
-                params={"attn_mask_type": attn_mask_type},
-                submodules=attn_submodules,
-            ),
+            self_attention=self_attention,
             self_attn_bda=get_bias_dropout_add,
             pre_mlp_layernorm=Norm,
             mlp=moe_mlp_spec,
