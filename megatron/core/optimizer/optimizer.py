@@ -464,10 +464,10 @@ class MegatronOptimizer(ABC):
     def _filter_and_reorder_param_groups(
         current_groups: List[Dict], state_dict_groups: List[Dict]
     ) -> List[Dict]:
-        """Filter and reorder state_dict parameter groups to match current optimizer groups.
-        Keys used for matching are ``param_group_identifier_keys`` — the union of
-        every per-group field that influences scheduler or optimizer behavior
-        (sourced from ``ParamGroupOverride`` plus structural flags).
+        """Pair each current param_group with its saved counterpart by identifier tuple.
+
+        Construction order isn't part of the checkpoint, so we match by a tuple of
+        per-group config (``param_group_identifier_keys``) rather than by position.
 
         Args:
             current_groups (List[Dict]): Parameter groups from the current optimizer instance.
@@ -479,17 +479,15 @@ class MegatronOptimizer(ABC):
         Raises:
             ValueError: If parameter groups in state dict don't match current optimizer.
         """
-        # Sentinel for keys not present in a param_group. Some identifier keys
-        # (e.g. ``start_wd``/``end_wd``/``optimizer`` from ``ParamGroupOverride``) are
-        # only set on a param_group when explicitly overridden; they're absent on
-        # default groups. Using a fixed sentinel keeps such groups mutually
-        # matchable across save/load.
+        # Sentinel for identifier keys absent from a group (e.g. optional ParamGroupOverride
+        # fields like ``start_wd``). Same sentinel everywhere → groups missing the same keys
+        # still match each other.
         _PG_KEY_MISSING = "__mcore_pg_key_missing__"
 
         def _identifier_for(group: dict) -> tuple:
             out = []
             for key in param_group_identifier_keys:
-                # NeMo may rename fields, e.g. "wd_mult" -> "pre_wd_mult".
+                # NeMo aliases ``wd_mult``/``lr_mult`` as ``pre_wd_mult``/``pre_lr_mult``.
                 if key in group:
                     out.append(group[key])
                 elif f"pre_{key}" in group:
@@ -498,12 +496,14 @@ class MegatronOptimizer(ABC):
                     out.append(_PG_KEY_MISSING)
             return tuple(out)
 
-        # Define groups order that is needed in the current optimizer (coming from runtime)
         needed_groups = [_identifier_for(g) for g in current_groups]
-
-        # Keep state_dict param group order since groups are LocalNonpersistentObject
-        # and their order is determined at runtime, not from the checkpoint.
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
+        # Duplicate identifiers here silently clobber: two saved groups with the same tuple
+        # collapse to whichever was inserted last, and one current group inherits the wrong
+        # override state (``max_lr`` etc.). Params are unaffected — they come from the
+        # current optimizer below — but the next step runs at the wrong LR / WD. Adding the
+        # distinguishing field to ``param_group_identifier_keys`` is the fix. See
+        # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
         loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
         final_groups = []

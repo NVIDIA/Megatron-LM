@@ -79,6 +79,34 @@ def test_identifier_keys_invariant_to_totality():
     )
 
 
+def test_identifier_excludes_mutable_per_step_keys():
+    """REGRESSION: keys the scheduler / inner optimizer rewrite every step must NOT
+    appear in the identifier. If they did, the freshly-built optimizer (at step 0)
+    would have different values than the saved optimizer (at step N) for the same
+    logical group, and matching across save/load would fail.
+
+    Specifically:
+      - ``lr`` is rewritten by ``OptimizerParamScheduler.step`` every iter.
+      - ``weight_decay`` is rewritten by ``OptimizerParamScheduler.step`` every iter.
+      - ``step`` is incremented by the inner Adam each call.
+
+    None of these are on ``ParamGroupOverride`` today, so the current
+    ``param_group_identifier_keys`` derivation is safe. This test pins the assumption
+    so a future maintainer who (e.g.) adds ``lr`` to ``ParamGroupOverride`` for some
+    new use case will see the test fail immediately rather than silently regressing
+    save/load matching.
+    """
+    mutating = {"lr", "weight_decay", "step"}
+    overlap = mutating.intersection(param_group_identifier_keys)
+    assert not overlap, (
+        f"param_group_identifier_keys contains keys that mutate every optimizer step: "
+        f"{overlap}. These will differ between save (iter N) and the freshly-built "
+        f"optimizer (iter 0), causing the matcher to fail to pair saved groups with "
+        f"current groups. Either remove them from the identifier or, if they're "
+        f"declared on ParamGroupOverride, mask them out in _param_group_override_keys()."
+    )
+
+
 def test_identifier_keys_include_structural_flags():
     """``lr_mult`` / ``is_expert_parallel`` / ``is_decoupled_lr`` are set on every
     param_group at construction time and must remain in the identifier so saves

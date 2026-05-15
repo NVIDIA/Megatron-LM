@@ -883,32 +883,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   contains an integer ordering of parameters within each group, and
         #   the ordering of parameters within its flattened parameter state
         #   list.
-        # Sentinel for keys not present in a param_group (e.g., ``start_wd`` /
-        # ``end_wd`` / ``optimizer`` are only present when explicitly overridden via
-        # ParamGroupOverride). The sentinel is the same across all groups, so groups
-        # without an override remain matched to each other.
+
+        # Pair each current param_group with its saved counterpart by identifier tuple.
+        # Construction order isn't part of the checkpoint, so we match by a tuple of
+        # per-group config (``param_group_identifier_keys``) rather than by position.
+
+        # Sentinel for identifier keys absent from a group (e.g. optional ParamGroupOverride
+        # fields). Same sentinel everywhere → groups missing the same keys still match.
         _PG_KEY_MISSING = "__mcore_pg_key_missing__"
 
         def make_needed_groups(param_group):
             needed_groups = []
             for key in param_group_identifier_keys:
-                # NeMo changes these variable names from `lr_mult` and `wd_mult`
-                # to `pre_lr_mult` and `pre_wd_mult`, so we need to check both.
+                # NeMo aliases ``lr_mult``/``wd_mult`` as ``pre_lr_mult``/``pre_wd_mult``.
                 if key in param_group:
                     value = param_group[key]
                 elif f"pre_{key}" in param_group:
                     value = param_group[f"pre_{key}"]
                 else:
-                    # Per-group key not set on this group (and no NeMo pre-prefix
-                    # variant either). Use a sentinel so the resulting tuple is still
-                    # hashable and groups missing the same set of keys remain mutually
-                    # matchable. Only keys in ParamGroupOverride.__optional_keys__
-                    # fall through here in practice (start_wd, end_wd, optimizer).
                     value = _PG_KEY_MISSING
                 needed_groups.append(value)
-            needed_groups = tuple(needed_groups)
-            return needed_groups
+            return tuple(needed_groups)
 
+        # Duplicate identifiers here silently clobber: two saved groups with the same tuple
+        # collapse to whichever was inserted last, and one current group inherits the wrong
+        # override state (``max_lr`` etc.). Params are unaffected — they come from the
+        # inner optimizer below — but the next step runs at the wrong LR / WD. Adding the
+        # distinguishing field to ``param_group_identifier_keys`` is the fix. See
+        # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
         param_groups_map = {}
         for param_group in state_dict["optimizer"]["param_groups"]:
             needed_groups = make_needed_groups(param_group)
