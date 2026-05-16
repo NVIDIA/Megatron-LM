@@ -214,7 +214,6 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_double_buffer: bool = False,
         fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
         disable_symmetric_registration: bool = False,
-        enable_fine_grained_param_gather_hook: bool = False,
         report_nan_in_param_grad: bool = False,
     ):
         super().__init__()
@@ -266,7 +265,9 @@ class MegatronFSDP(torch.nn.Module):
         self.mp_policy = mixed_precision_policy
         self.calculate_per_token_loss = calculate_per_token_loss
         self.init_model_with_meta_device = init_model_with_meta_device
-        self.enable_fine_grained_param_gather_hook = enable_fine_grained_param_gather_hook
+        self.enable_fine_grained_param_gather_hook = (
+            self.ddp_config.megatron_fsdp_enable_fine_grained_param_gather
+        )
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
