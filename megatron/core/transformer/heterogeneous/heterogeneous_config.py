@@ -201,6 +201,12 @@ class HeterogeneousTransformerConfig(TransformerConfig):
     def __post_init__(self):
         super().__post_init__()
 
+        err_msg = (
+            "Cannot use inference optimized transformer implementation "
+            "with heterogeneous transformer layers."
+        )
+        assert not (self.transformer_impl == "inference_optimized"), err_msg
+
         self.heterogeneous_block_specs = True
 
         if self.heterogeneous_layers_config_encoded_json in ("", None):
