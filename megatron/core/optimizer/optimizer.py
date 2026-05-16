@@ -95,6 +95,12 @@ def _multi_tensor_copy_this_to_that(
 
 
 param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+param_group_identifier_defaults = {
+    'wd_mult': 1.0,
+    'lr_mult': 1.0,
+    'is_expert_parallel': False,
+    'is_decoupled_lr': False,
+}
 
 
 def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
@@ -106,7 +112,7 @@ def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
         elif f"pre_{key}" in param_group:
             values.append(param_group[f"pre_{key}"])
         else:
-            values.append(None)
+            values.append(param_group_identifier_defaults[key])
     return tuple(values)
 
 

@@ -94,6 +94,14 @@ def test_param_group_identifier_tuple_reads_pre_keys_and_optional_fields():
     assert ident == (0.0, 0.5, False, True)
 
 
+def test_param_group_identifier_tuple_defaults_missing_legacy_fields():
+    group = {}
+
+    ident = get_param_group_identifier_tuple(group)
+
+    assert ident == (1.0, 1.0, False, False)
+
+
 def test_param_group_matching_ignores_mutable_scheduler_values_on_resume():
     current_group = {
         "wd_mult": 1.0,
@@ -123,6 +131,29 @@ def test_param_group_matching_ignores_mutable_scheduler_values_on_resume():
     )
 
     assert reordered_groups == [checkpoint_group]
+
+
+def test_param_group_matching_normalizes_legacy_missing_identifier_fields():
+    current_group = {
+        "wd_mult": 1.0,
+        "lr_mult": 1.0,
+        "is_expert_parallel": False,
+        "is_decoupled_lr": False,
+        "params": [0],
+    }
+    legacy_checkpoint_group = {
+        "params": [7],
+    }
+
+    assert get_param_group_identifier_tuple(current_group) == get_param_group_identifier_tuple(
+        legacy_checkpoint_group
+    )
+
+    reordered_groups = MegatronOptimizer._filter_and_reorder_param_groups(
+        [current_group], [legacy_checkpoint_group]
+    )
+
+    assert reordered_groups == [legacy_checkpoint_group]
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
