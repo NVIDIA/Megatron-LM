@@ -383,7 +383,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         cls._is_distopt_quantized_param(model_param)
                         and config.fp8_recipe != "delayed"
                     ) or is_nvfp4tensor(model_param):
-                        # MXFP8Tensor, BlockwiseQTensor, NVFP4Tensor don't support view(-1)
+                        # MXFP8Tensor, BlockwiseQTensor, grouped quantized tensors, and NVFP4Tensor
+                        # don't support view(-1).
                         shard_model_param = None
                     else:
                         shard_model_param = model_param.detach().view(-1)[
@@ -402,7 +403,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # precision at the beginning of training (this problem will not occur if the
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
-                        if cls._is_distopt_quantized_param(model_param) or is_nvfp4tensor(
+                        if is_nvfp4tensor(model_param) or cls._is_distopt_quantized_param(
                             model_param
                         ):
                             if hasattr(model_param, 'get_high_precision_init_val'):
@@ -2732,36 +2733,41 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
 
-        if self.ddp_config.fp4_param_gather:
+        if self.ddp_config.fp8_param_gather:
+            # Grouped quantized tensors expose one logical parameter backed by multiple TE
+            # quantized members. Expand them so quantize_param_shard receives member-aligned
+            # master shards instead of a shard over the grouped wrapper.
+            fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
+                self._get_fp8_params_and_shard_fp32_from_fp8()
+            )
+            expanded_fp8_params = []
+            expanded_shard_fp32_from_fp8 = []
+            expanded_shard_offsets_in_fp8 = []
+            for model_param, shard_main_param, start_offset in zip(
+                fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
+            ):
+                sub_model_params, sub_shard_main_params, sub_start_offsets = (
+                    self._expand_quantized_param_shard_for_cast(
+                        model_param, shard_main_param, start_offset
+                    )
+                )
+                expanded_fp8_params.extend(sub_model_params)
+                expanded_shard_fp32_from_fp8.extend(sub_shard_main_params)
+                expanded_shard_offsets_in_fp8.extend(sub_start_offsets)
+
+            quantize_param_shard(
+                expanded_fp8_params,
+                expanded_shard_fp32_from_fp8,
+                expanded_shard_offsets_in_fp8,
+                self.data_parallel_group,
+            )
+        elif self.ddp_config.fp4_param_gather:
             # Quantize FP32 master shards back to NVFP4 model params (rowwise only)
             quantize_nvfp4_param_shard(
                 *self._get_nvfp4_params_and_shard_fp32_from_nvfp4(), self.data_parallel_group
             )
-
-        fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
-            self._get_fp8_params_and_shard_fp32_from_fp8()
-        )
-        expanded_fp8_params = []
-        expanded_shard_fp32_from_fp8 = []
-        expanded_shard_offsets_in_fp8 = []
-        for model_param, shard_main_param, start_offset in zip(
-            fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
-        ):
-            sub_model_params, sub_shard_main_params, sub_start_offsets = (
-                self._expand_quantized_param_shard_for_cast(
-                    model_param, shard_main_param, start_offset
-                )
-            )
-            expanded_fp8_params.extend(sub_model_params)
-            expanded_shard_fp32_from_fp8.extend(sub_shard_main_params)
-            expanded_shard_offsets_in_fp8.extend(sub_start_offsets)
-
-        quantize_param_shard(
-            expanded_fp8_params,
-            expanded_shard_fp32_from_fp8,
-            expanded_shard_offsets_in_fp8,
-            self.data_parallel_group,
-        )
+        else:
+            pass
 
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
@@ -2780,8 +2786,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         world_range.start : world_range.end
                     ]
 
-                    if self._is_distopt_quantized_param(model_param) or is_nvfp4tensor(model_param):
-                        # Quantized params are handled above.
+                    if self._is_distopt_quantized_param(model_param):
+                        # FP8 params are quantized in the above "quantize_param_shard" function.
+                        continue
+                    elif is_nvfp4tensor(model_param):
+                        # NVFP4 params are quantized in the above "quantize_nvfp4_param_shard"
+                        # function.
                         continue
                     else:
                         shard_model_param.data.copy_(shard_main_param)

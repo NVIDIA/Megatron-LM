@@ -52,6 +52,12 @@ from megatron.training.utils import (
     warn_rank_0,
 )
 
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
+
+from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """ "Add Megatron-LM arguments to the given parser."""
@@ -154,11 +160,27 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
-    # Args to disable MSC
-    if not args.enable_msc:
+    # Args to enable MSC (opt-in: disabled by default)
+    if args.disable_msc_deprecated:
+        warn_rank_0(
+            '--disable-msc is deprecated and will be removed in a future release. '
+            'MSC is now disabled by default; pass --enable-msc to opt in.'
+        )
+        # Preserve legacy semantics: --disable-msc forces MSC off, even if
+        # --enable-msc was also passed.
+        args.enable_msc = False
+
+    if args.enable_msc:
+        MultiStorageClientFeature.enable()
+        if not MultiStorageClientFeature.is_enabled():
+            raise RuntimeError(
+                "--enable-msc was passed but the multistorageclient package is not "
+                "installed. Install it with `pip install multi-storage-client`."
+            )
+        warn_rank_0('The MSC feature is enabled.')
+    else:
         MultiStorageClientFeature.disable()
         assert MultiStorageClientFeature.is_enabled() is False
-        warn_rank_0('The MSC feature is disabled.')
 
     return args
 
@@ -2026,102 +2048,6 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 
-def core_transformer_config_from_args(args, config_class=None):
-
-    # Config class.
-    config_class = config_class or TransformerConfig
-
-    if args.multi_latent_attention:
-        config_class = MLATransformerConfig
-
-    if args.heterogeneous_layers_config_path is not None:
-        assert (
-            not args.multi_latent_attention
-        ), "Multi latent attention with heterogeneous layers is not supported."
-        config_class = HeterogeneousTransformerConfig
-
-    # Translate args to core transformer configuration
-    kw_args = {}
-    for f in dataclasses.fields(config_class):
-        if hasattr(args, f.name):
-            kw_args[f.name] = getattr(args, f.name)
-    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
-    kw_args['deallocate_pipeline_outputs'] = True
-    kw_args['pipeline_dtype'] = args.params_dtype
-    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
-    kw_args['num_moe_experts'] = args.num_experts
-    kw_args['actual_vocab_size'] = args.padded_vocab_size
-    kw_args['rotary_interleaved'] = args.rotary_interleaved
-    kw_args['num_layers_in_first_pipeline_stage'] = args.decoder_first_pipeline_num_layers
-    kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
-    kw_args['fp8_param'] = args.fp8_param_gather
-    kw_args['fp4_param'] = args.fp4_param_gather
-    if args.swiglu:
-        kw_args['activation_func'] = F.silu
-        kw_args['gated_linear_unit'] = True
-        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
-    else:
-        kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
-    if args.squared_relu:
-        assert not args.swiglu
-        kw_args['activation_func'] = squared_relu
-    elif args.quick_geglu:
-        assert not args.swiglu
-        kw_args['gated_linear_unit'] = True
-        kw_args['activation_func'] = quick_gelu
-    if args.init_method_xavier_uniform:
-        kw_args['init_method'] = torch.nn.init.xavier_uniform_
-        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
-    if args.group_query_attention:
-        kw_args['num_query_groups'] = args.num_query_groups
-    else:
-        kw_args['num_query_groups'] = None
-    kw_args['config_logger_dir'] = args.config_logger_dir
-    if args.rope_type is None:
-        # Pop 'rope_type' to let the config class use the default value.
-        kw_args.pop('rope_type', None)
-    else:
-        assert (
-            args.multi_latent_attention or args.rope_type == 'rope'
-        ), f'Common attention only support rope_type="rope", but got {args.rope_type}.'
-
-    if len(args.cp_comm_type) == 1:
-        kw_args['cp_comm_type'] = args.cp_comm_type[0]
-    if args.hybrid_layer_pattern is not None:
-        kw_args['is_hybrid_model'] = True
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
-
-    kw_args['inference_sampling_seed'] = args.seed
-
-    # handle quantization config
-    # NOTE: Kitchen arguments are only added to the namespace when
-    # Kitchen library is available.
-    if hasattr(args, "kitchen_config_file") and args.kitchen_config_file is not None:
-        kw_args['use_kitchen'] = True
-        kw_args['quant_recipe'] = load_quantization_recipe(args.kitchen_config_file)
-    elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
-        kw_args['use_kitchen'] = True
-        kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
-
-    kw_args['moe_latent_size'] = args.moe_latent_size
-
-    if args.te_precision_config_file:
-        assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
-        # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
-        kw_args['quant_recipe'] = load_quantization_recipe(args.te_precision_config_file)
-
-    if hasattr(args, "use_kitchen_attention"):
-        kw_args['use_kitchen_attention'] = args.use_kitchen_attention
-    if hasattr(args, "kitchen_attention_backend"):
-        kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
-
-    # Return config.
-    return config_class(**kw_args)
-
-
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
 
@@ -2152,329 +2078,194 @@ def _add_transformer_engine_args(parser):
 def _add_inference_args(parser):
     group = parser.add_argument_group(title='inference')
 
-    group.add_argument(
-        '--inference-batch-times-seqlen-threshold',
-        type=int,
-        default=-1,
-        help='If (batch-size * sequence-length) is smaller than this threshold'
-        'then batches will not be split up for pipelining.'
-        'Requires setting --pipeline-model-parallel-size > 1.'
-        'Setting this to -1 indicates that batch pipelining is not used.',
-    )
-    group.add_argument(
-        '--max-tokens-to-oom',
-        type=int,
-        default=12000,
-        help='Maximum number of tokens during inference'
-        'tokens here is # in prompt + # to generate'
-        'Allows us to throw an error before OOM crashes server',
-    )
-    group.add_argument(
-        '--output-bert-embeddings',
-        action='store_true',
-        help='Output Bert embeddings (via mean pooling) from '
-        'model, rather than its binary head output or entire '
-        'hidden batch.',
-    )
-    group.add_argument(
-        '--bert-embedder-type',
-        default="megatron",
-        choices=["megatron", "huggingface"],
-        help='Select either Megatron or Huggingface as the ' 'Bert embedder.',
-    )
-    group.add_argument(
-        '--cuda-graph-scope',
-        nargs='+',
-        type=_parse_cuda_graph_modules_arg,
-        default=None,
-        dest='cuda_graph_scope_deprecated',
-        help=argparse.SUPPRESS,  # hidden; use --cuda-graph-modules instead
-    )
-    group.add_argument(
-        '--cuda-graph-modules',
-        nargs='+',
-        type=_parse_cuda_graph_modules_arg,
-        default=[],
-        help='Selects training capture coverage within per-layer CUDA graphs '
-        '(local and transformer_engine implementations). '
-        'Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba": '
-        '"attn": captures operations in TransformerLayer._forward_attention(). '
-        '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
-        '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
-        '"moe_router": captures operations in TransformerLayer._forward_mlp() up to MoELayer.router(), '
-        'including the shared experts if they are not overlapped with EP comm. '
-        '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
-        '"mamba": captures the mamba layer. '
-        'An empty list means capturing the whole Transformer layer. '
-        'This field is meaningless when --cuda-graph-impl=full_iteration and must be empty. '
-        'Backward compatibility: "full" is deprecated but kept for backward compatibility; '
-        'it is transformed to an empty list in validate_args. The deprecated values '
-        '"full_iteration" and "full_iteration_inference" are also accepted and migrated '
-        'to the new API in validate_args.',
-    )
-    group.add_argument(
-        '--use-legacy-static-engine',
-        action='store_true',
-        default=False,
-        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
-        dest='use_legacy_static_engine',
-    )
-    group.add_argument(
-        '--inference-max-requests',
-        type=int,
-        default=8,
-        help='Maximum number of requests for inference.',
-        dest='inference_max_requests',
-    )
-    group.add_argument(
-        '--inference-max-seq-length',
-        type=int,
-        default=2560,
-        help='Maximum sequence length expected for inference (prefill + decode).',
-        dest='inference_max_seq_length',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching',
-        action='store_true',
-        default=False,
-        help='Enable dynamic batching mode.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-buffer-size-gb',
-        type=float,
-        default=40.0,
-        help='Amount of on-GPU memory allocated for the KV cache. '
-        'The total amount of memory allocated for the KV cache '
-        '(CPU + GPU memory) depends on the value set for the '
-        'unified virtual memory (UVM) level (via '
-        '`--inference-dynamic-batching-unified-memory-level`).'
-        'If the UVM level is 0, then only GPU memory is used and '
-        'the total memory equals `buffer_size_gb`. If the UVM '
-        'level is 1, then additional memory is utilized on the '
-        'CPU and the total memory equals `buffer_size_gb + '
-        'paused_buffer_size_gb`.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-paused-buffer-size-gb',
-        type=float,
-        default=None,
-        help='Amount of memory reserved for paused requests in '
-        'the dynamic inference context. Active requests are '
-        'paused when there are not enough active blocks available '
-        'to continue generating a request.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-mamba-memory-ratio',
-        type=float,
-        default=None,
-        help='Percentage of memory buffer to allocate for Mamba states. '
-        'If not specified, allocates Mamba state tensors for each KV cache block. '
-        'Only used for hybrid models.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-block-size',
-        type=int,
-        default=256,
-        help='KV cache block size. ' 'It should be a multiple of 256',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-max-requests',
-        type=int,
-        default=None,
-        help='Override the inference context\'s `max_requests`. '
-        'By default, `max_requests` is set to the number of '
-        'blocks in the context\'s memory buffer.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-max-tokens',
-        type=int,
-        default=None,
-        help='Override the inference context\'s default `max_tokens`.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-num-cuda-graphs',
-        type=int,
-        default=16,
-        help='Maximum number of cuda graphs to capture, where the '
-        'cuda graph batch sizes range from 1 to `max_requests`. '
-        '(See `dynamic_context.py` for details on how '
-        '`max_requests` is computed). Due to rounding, the actual '
-        'number of cuda graphs may not equal this argument.'
-        'The user can also pass -1, in which case we automatically determine the number of graphs '
-        'to capture based on the `max_requests`.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-track-paused-request-events',
-        action='store_true',
-        help='Track paused request ids by adding \'paused\' events '
-        'to each request\'s event history. This has a very minor '
-        'impact on latency.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-track-generated-token-events',
-        action='store_true',
-        help='Track per-token events with timestamps for each generated token. '
-        'When enabled, each generated token creates a GENERATED_TOKEN event '
-        'with a timestamp, useful for per-token latency analysis.',
-    )
-    group.add_argument(
-        '--decode-only-cuda-graphs',
-        action='store_true',
-        default=False,
-        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-unified-memory-level',
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help='Set unified memory usage within the dynamic '
-        'inference context. The levels are: 0) no unified memory, '
-        '1) allocate `memory_buffer` in unified memory. '
-        'Eventually, additional levels will be included to '
-        'control other tensors within the context.',
-    )
-    group.add_argument(
-        '--enable-chunked-prefill',
-        dest='enable_chunked_prefill',
-        action='store_true',
-        default=False,
-        help="Enable chunked prefill (disabled by default)",
-    )
-    group.add_argument(
-        '--num-speculative-tokens',
-        type=int,
-        default=0,
-        help='Number of speculative tokens generated during decode',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-prefix-caching',
-        dest='inference_dynamic_batching_enable_prefix_caching',
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help='Enable/disable prefix caching for dynamic batching inference. '
-        'When disabled, KV cache blocks cannot be shared between '
-        'requests with identical prompt prefixes.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-prefix-caching-eviction-policy',
-        type=str,
-        default='ref_zero',
-        choices=['ref_zero', 'lru'],
-        dest='inference_dynamic_batching_prefix_caching_eviction_policy',
-        help='Eviction policy for prefix caching blocks. '
-        '"ref_zero" (default) immediately returns blocks to the '
-        'free pool when ref_count hits 0. "lru" keeps blocks '
-        'cached and evicts via LRU only when space is needed.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-prefix-caching-coordinator-policy',
-        type=str,
-        default='first_prefix_block',
-        choices=['longest_prefix', 'first_prefix_block', 'round_robin'],
-        dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
-        help='Coordinator routing policy for prefix caching. '
-        '"first_prefix_block" (default) routes based on the first '
-        'block hash only. "longest_prefix" routes to the rank with '
-        'the longest matching prefix. "round_robin" ignores prefix '
-        'affinity and cycles through ranks.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-prefix-caching-routing-alpha',
-        type=float,
-        default=0.5,
-        dest='inference_dynamic_batching_prefix_caching_routing_alpha',
-        help='Weight for prefix-aware routing score: '
-        'score = alpha * match + (1 - alpha) * normalized_load. '
-        'Higher alpha favors prefix cache hits; lower alpha '
-        'favors load balance. Default: 0.5.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-prefix-caching-mamba-gb',
-        type=float,
-        default=None,
-        dest='inference_dynamic_batching_prefix_caching_mamba_gb',
-        help='GPU memory budget (in GB) for the Mamba state cache '
-        'used by prefix caching on hybrid models. When set, Mamba '
-        'states at block boundaries are cached for reuse.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-cuda-graph-max-tokens',
-        type=int,
-        default=16384,
-        help='Maximum number of tokens to capture in a cuda graph.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
-        type=int,
-        default=16,
-        help='Number of mixed prefill requests to capture in a cuda graph.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-sampling-backend',
-        type=str,
-        default='torch',
-        choices=['torch', 'flashinfer'],
-        help='Which sampling kernels to use during inference. '
-        'Falls back to "torch" with a warning if "flashinfer" '
-        'is requested but the package is not installed.',
-    )
-    group.add_argument(
-        '--inference-logging-step-interval',
-        type=int,
-        default=0,
-        help='Step interval for logging inference metrics. '
-        'Default to 0 to disable inference logging.',
-    )
-    group.add_argument(
-        '--inference-text-gen-server-logging',
-        action=argparse.BooleanOptionalAction,
-        required=False,
-        default=False,
-        help='Enable per-request logging in the inference text generation server.',
-    )
-    group.add_argument(
-        '--inference-wandb-logging',
-        action=argparse.BooleanOptionalAction,
-        required=False,
-        default=False,
-        help='Enable inference wandb logging.',
-    )
-    group.add_argument(
-        "--inference-coordinator-port",
-        type=int,
-        help="This port will be used to setup the inference coordinator on node-0",
-    )
-    group.add_argument(
-        '--mamba-inference-conv-states-dtype',
-        type=str,
-        choices=['bf16', 'fp16', 'fp32'],
-        default='bf16',
-        help='Dtype for the Mamba inference conv states tensor',
-    )
-    group.add_argument(
-        '--mamba-inference-ssm-states-dtype',
-        type=str,
-        choices=['bf16', 'fp16', 'fp32'],
-        default='bf16',
-        help='Dtype for the Mamba inference SSM states tensor',
-    )
-    group.add_argument(
-        '--inference-use-synchronous-zmq-collectives',
-        action=argparse.BooleanOptionalAction,
-        required=False,
-        default=False,
-        help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.',
-    )
-    group.add_argument(
-        '--inference-disable-ep-consensus',
-        action=argparse.BooleanOptionalAction,
-        required=False,
-        default=False,
-        help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
-        'Pause/unpause take effect as soon as the signal is delivered to a rank. '
-        'Only safe when EP coordination is not required (e.g. ep_world_size == 1).',
-    )
+    group.add_argument('--inference-batch-times-seqlen-threshold',
+                       type=int, default=-1,
+                       help='If (batch-size * sequence-length) is smaller than this threshold'
+                       'then batches will not be split up for pipelining.'
+                       'Requires setting --pipeline-model-parallel-size > 1.'
+                       'Setting this to -1 indicates that batch pipelining is not used.')
+    group.add_argument('--max-tokens-to-oom',
+                       type=int, default=12000,
+                       help='Maximum number of tokens during inference'
+                       'tokens here is # in prompt + # to generate'
+                       'Allows us to throw an error before OOM crashes server')
+    group.add_argument('--output-bert-embeddings', action='store_true',
+                       help='Output Bert embeddings (via mean pooling) from '
+                       'model, rather than its binary head output or entire '
+                       'hidden batch.')
+    group.add_argument('--bert-embedder-type', default="megatron",
+                       choices=["megatron", "huggingface"],
+                       help='Select either Megatron or Huggingface as the '
+                       'Bert embedder.')
+    group.add_argument('--cuda-graph-scope', nargs='+', type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope, default=[],
+                       help='Determines the CUDA graphs capturing scope. '
+                       'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
+                       '"attn": captures operations in TransformerLayer._forward_attention(). '
+                       '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
+                       '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
+                       '"moe_router": captures operations in TransformerLayer._forward_mlp() up to MoELayer.router(), '
+                       'including the shared experts if they are not overlapped with EP comm. '
+                       '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
+                       '"mamba": captures the mamba layer. '
+                       '"full_iteration": captures a whole training iteration. '
+                       '"full_iteration_inference": captures a whole inference iteration. '
+                       'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
+                       'If not specified, the default scope is to capture the whole Transformer layer. '
+                       'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
+    group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
+                       help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
+                       dest='use_legacy_static_engine')
+    group.add_argument('--inference-max-requests', type=int, default=8,
+                       help='Maximum number of requests for inference.',
+                       dest='inference_max_requests')
+    group.add_argument('--inference-max-seq-length', type=int, default=2560,
+                       help='Maximum sequence length expected for inference (prefill + decode).',
+                       dest='inference_max_seq_length')
+    group.add_argument('--inference-dynamic-batching',
+                       action='store_true', default=False,
+                       help='Enable dynamic batching mode.')
+    group.add_argument('--inference-dynamic-batching-buffer-size-gb',
+                       type=float, default=40.,
+                       help='Amount of on-GPU memory allocated for the KV cache. '
+                       'The total amount of memory allocated for the KV cache '
+                       '(CPU + GPU memory) depends on the value set for the '
+                       'unified virtual memory (UVM) level (via '
+                       '`--inference-dynamic-batching-unified-memory-level`).'
+                       'If the UVM level is 0, then only GPU memory is used and '
+                       'the total memory equals `buffer_size_gb`. If the UVM '
+                       'level is 1, then additional memory is utilized on the '
+                       'CPU and the total memory equals `buffer_size_gb + '
+                       'paused_buffer_size_gb`.')
+    group.add_argument('--inference-dynamic-batching-paused-buffer-size-gb',
+                       type=float, default=None,
+                       help='Amount of memory reserved for paused requests in '
+                       'the dynamic inference context. Active requests are '
+                       'paused when there are not enough active blocks available '
+                       'to continue generating a request.')
+    group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float, default=None,
+                       help='Percentage of memory buffer to allocate for Mamba states. '
+                       'If not specified, allocates Mamba state tensors for each KV cache block. '
+                       'Only used for hybrid models.')
+    group.add_argument('--inference-dynamic-batching-block-size',
+                       type=int, default=256,
+                       help='KV cache block size. '
+                       'It should be a multiple of 256')
+    group.add_argument('--inference-dynamic-batching-max-requests',
+                       type=int, default=None,
+                       help='Override the inference context\'s `max_requests`. '
+                       'By default, `max_requests` is set to the number of '
+                       'blocks in the context\'s memory buffer.')
+    group.add_argument('--inference-dynamic-batching-max-tokens',
+                       type=int, default=None,
+                       help='Override the inference context\'s default `max_tokens`.')
+    group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
+                       type=int, default=16,
+                       help='Maximum number of cuda graphs to capture, where the '
+                       'cuda graph batch sizes range from 1 to `max_requests`. '
+                       '(See `dynamic_context.py` for details on how '
+                       '`max_requests` is computed). Due to rounding, the actual '
+                       'number of cuda graphs may not equal this argument.'
+                       'The user can also pass -1, in which case we automatically determine the number of graphs ' \
+                       'to capture based on the `max_requests`.')
+    group.add_argument('--inference-dynamic-batching-track-paused-request-events',
+                       action='store_true',
+                       help='Track paused request ids by adding \'paused\' events '
+                       'to each request\'s event history. This has a very minor '
+                       'impact on latency.')
+    group.add_argument('--inference-dynamic-batching-track-generated-token-events',
+                       action='store_true',
+                       help='Track per-token events with timestamps for each generated token. '
+                       'When enabled, each generated token creates a GENERATED_TOKEN event '
+                       'with a timestamp, useful for per-token latency analysis.')
+    group.add_argument('--decode-only-cuda-graphs',
+                       action='store_true', default=False,
+                       help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
+    group.add_argument('--inference-cuda-graph-all-prefills',
+                       action='store_true', default=False,
+                       help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
+                       'By default, all graphs are limited by the decode limit of '
+                       '`max_requests * (num_speculative_tokens + 1)`.')
+    group.add_argument('--inference-dynamic-batching-unified-memory-level',
+                       type=int, default=0, choices=[0, 1],
+                       help='Set unified memory usage within the dynamic '
+                       'inference context. The levels are: 0) no unified memory, '
+                       '1) allocate `memory_buffer` in unified memory. '
+                       'Eventually, additional levels will be included to '
+                       'control other tensors within the context.')
+    group.add_argument('--enable-chunked-prefill', dest='enable_chunked_prefill',
+                       action='store_true', default=False,
+                       help="Enable chunked prefill (disabled by default)")
+    group.add_argument('--num-speculative-tokens', type=int, default=0,
+                       help='Number of speculative tokens generated during decode')
+    group.add_argument('--inference-dynamic-batching-prefix-caching',
+                       dest='inference_dynamic_batching_enable_prefix_caching',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Enable/disable prefix caching for dynamic batching inference. '
+                       'When disabled, KV cache blocks cannot be shared between '
+                       'requests with identical prompt prefixes.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-eviction-policy',
+                       type=str, default='ref_zero',
+                       choices=['ref_zero', 'lru'],
+                       dest='inference_dynamic_batching_prefix_caching_eviction_policy',
+                       help='Eviction policy for prefix caching blocks. '
+                       '"ref_zero" (default) immediately returns blocks to the '
+                       'free pool when ref_count hits 0. "lru" keeps blocks '
+                       'cached and evicts via LRU only when space is needed.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
+                       type=str, default='first_prefix_block',
+                       choices=['longest_prefix', 'first_prefix_block', 'round_robin'],
+                       dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
+                       help='Coordinator routing policy for prefix caching. '
+                       '"first_prefix_block" (default) routes based on the first '
+                       'block hash only. "longest_prefix" routes to the rank with '
+                       'the longest matching prefix. "round_robin" ignores prefix '
+                       'affinity and cycles through ranks.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
+                       type=float, default=0.5,
+                       dest='inference_dynamic_batching_prefix_caching_routing_alpha',
+                       help='Weight for prefix-aware routing score: '
+                       'score = alpha * match + (1 - alpha) * normalized_load. '
+                       'Higher alpha favors prefix cache hits; lower alpha '
+                       'favors load balance. Default: 0.5.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
+                       type=float, default=None,
+                       dest='inference_dynamic_batching_prefix_caching_mamba_gb',
+                       help='GPU memory budget (in GB) for the Mamba state cache '
+                       'used by prefix caching on hybrid models. When set, Mamba '
+                       'states at block boundaries are cached for reuse.')
+    group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
+                       type=int, default=16,
+                       help='Number of mixed prefill requests to capture in a cuda graph.')
+    group.add_argument('--inference-dynamic-batching-sampling-backend',
+                       type=str, default='torch',
+                       choices=['torch', 'flashinfer'],
+                       help='Which sampling kernels to use during inference. '
+                            'Falls back to "torch" with a warning if "flashinfer" '
+                            'is requested but the package is not installed.')
+    group.add_argument('--inference-logging-step-interval', type=int, default=0,
+                       help='Step interval for logging inference metrics. '
+                            'Default to 0 to disable inference logging.')
+    group.add_argument('--inference-text-gen-server-logging', action=argparse.BooleanOptionalAction,
+                       required=False, default=False,
+                       help='Enable per-request logging in the inference text generation server.')
+    group.add_argument('--inference-wandb-logging', action=argparse.BooleanOptionalAction,
+                       required=False, default=False, help='Enable inference wandb logging.')
+    group.add_argument("--inference-coordinator-port", type=int,
+                       help="This port will be used to setup the inference coordinator on node-0")
+    group.add_argument('--mamba-inference-conv-states-dtype', type=str,
+                       choices=['bf16', 'fp16', 'fp32'], default='bf16',
+                       help='Dtype for the Mamba inference conv states tensor')
+    group.add_argument('--mamba-inference-ssm-states-dtype', type=str,
+                       choices=['bf16', 'fp16', 'fp32'], default='bf16',
+                       help='Dtype for the Mamba inference SSM states tensor')
+    group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
+                       required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
+    group.add_argument('--inference-disable-ep-consensus', action=argparse.BooleanOptionalAction,
+                       required=False, default=False,
+                       help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
+                            'Pause/unpause take effect as soon as the signal is delivered to a rank. '
+                            'Only safe when EP coordination is not required (e.g. ep_world_size == 1).')
     return parser
 
 
@@ -4775,13 +4566,13 @@ def _add_experimental_args(parser):
 
 def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
-    group.add_argument(
-        '--disable-msc',
-        default=True,
-        action='store_false',
-        dest='enable_msc',
-        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.',
-    )
+    group.add_argument('--enable-msc', default=False, action='store_true', dest='enable_msc',
+                       help='Enable the usage of Multi-Storage Client (MSC) in Megatron Core. '
+                            'Disabled by default; pass this flag to opt in.')
+    group.add_argument('--disable-msc', default=False, action='store_true',
+                       dest='disable_msc_deprecated',
+                       help='[DEPRECATED] MSC is disabled by default; this flag is a no-op '
+                            'and will be removed in a future release.')
     return parser
 
 
