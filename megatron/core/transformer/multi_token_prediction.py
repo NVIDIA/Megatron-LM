@@ -1077,22 +1077,31 @@ class MultiTokenPredictionLayer(MegatronModule):
         return hidden_states
 
     def _checkpointed_forward(self, forward_func, *args, **kwargs):
+        # `tensor_parallel.checkpoint` / `te_checkpoint` route every positional
+        # arg through `save_for_backward`, which only accepts tensors.
+        # See https://github.com/NVIDIA/Megatron-LM/issues/3643.
+        tensors = {k: v for k, v in kwargs.items() if v is None or torch.is_tensor(v)}
+        non_tensors = {k: v for k, v in kwargs.items() if k not in tensors}
+        tensor_keys = tuple(tensors.keys())
+
+        def custom_forward(*tensor_args):
+            return forward_func(*args, **dict(zip(tensor_keys, tensor_args)), **non_tensors)
+
         def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             if self.config.fp8:
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(
-                    forward_func,
+                    custom_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
-                    *args,
-                    **kwargs,
+                    *tensors.values(),
                 )
             else:
                 return tensor_parallel.checkpoint(
-                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
+                    custom_forward, self.config.distribute_saved_activations, *tensors.values()
                 )
 
         if self.config.recompute_method == 'uniform':
