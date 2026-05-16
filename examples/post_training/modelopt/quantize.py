@@ -342,7 +342,12 @@ if __name__ == "__main__":
 
         for idx, prompt in tqdm(enumerate(all_prompts), disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = megatron_generate(model, tokens.input_ids.cuda(), osl=32)
+            # enable_kv_cache=False to avoid pre-allocating the static KV cache: this is a
+            # sanity-check generation (32 tokens), and the KV-cache allocation can OOM tight
+            # quantization runs on large MoE models.
+            generated_ids = megatron_generate(
+                model, tokens.input_ids.cuda(), osl=32, enable_kv_cache=False
+            )
             generated_texts = tokenizer.batch_decode(generated_ids)
             print_rank_0("{}".format(generated_texts))
             if all_references[idx] is not None:

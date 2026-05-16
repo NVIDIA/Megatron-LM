@@ -164,8 +164,17 @@ def modelopt_gpt_hybrid_builder(
     vp_stage=None,
     config=None,
     pg_collection=None,
+    *,
+    disable_moe_grouped_gemm: bool = False,
 ) -> MCoreGPTModel | MCoreHybridModel:
     """Builds the model.
+
+    Args:
+        disable_moe_grouped_gemm: Force the export spec to use SequentialMLP (per-expert
+            linears) instead of the default TEGroupedMLP. Pruning sets this so
+            ``mtp.prune`` can operate on individual expert linears; quantize / generate /
+            finetune leave the default so MoE quantization (e.g. QuantTEGroupedMLP) works
+            and TP+EP > 1 doesn't trip the QuantSequentialMLP unsupported-combo check.
 
     Args:
         args (Namespace): The arguments namespace.
@@ -224,12 +233,13 @@ def modelopt_gpt_hybrid_builder(
                 use_te=args.transformer_impl == "transformer_engine",
             )
         elif args.export_default_te_spec:
-            # Use the canonical full Transformer Engine spec (mirrors gpt_builder)
-            # instead of the modelopt-customized spec. Required by pruning, which
-            # operates on the un-customized layer graph.
+            # Use the canonical full Transformer Engine spec (mirrors gpt_builder) instead
+            # of the modelopt-customized spec. Required by pruning, which operates on the
+            # un-customized layer graph. ``disable_moe_grouped_gemm`` (set by prune.py)
+            # forces SequentialMLP so mtp.prune can act on individual expert linears.
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
                 config.num_moe_experts,
-                config.moe_grouped_gemm,
+                not disable_moe_grouped_gemm,
                 config.qk_layernorm,
                 config.multi_latent_attention,
                 config.experimental_attention_variant,
@@ -284,10 +294,14 @@ def modelopt_gpt_hybrid_builder(
             )
             args.export_te_mcore_model = False
 
+        # Default to grouped MLP for the export spec (matches the pre-modernization
+        # behavior of get_hybrid_stack_modelopt_spec — its factory default is True).
+        # ``disable_moe_grouped_gemm`` (set by prune.py) forces SequentialMLP so
+        # mtp.prune can act on individual expert linears.
         hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model,
             use_default_te_spec=args.export_default_te_spec,
-            moe_grouped_gemm=args.moe_grouped_gemm,
+            moe_grouped_gemm=not disable_moe_grouped_gemm,
         )
         model_kwargs = {
             "hybrid_stack_spec": hybrid_stack_spec,

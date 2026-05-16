@@ -22,7 +22,10 @@ import modelopt.torch.prune as mtp
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.export.plugins.megatron_importer import GPTModelImporter
 from modelopt.torch.prune.plugins.mcore_minitron import SUPPORTED_HPARAMS
-from modelopt.torch.utils.dataset_utils import get_dataset_samples, get_supported_datasets
+from modelopt.torch.utils.dataset_utils import (
+    get_dataset_samples,
+    get_supported_datasets,
+)
 from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
 from utils import get_hf_tokenizer
 
@@ -218,13 +221,6 @@ def check_arguments(args):
             f"Supported: {sorted(SUPPORTED_HPARAMS)}"
         )
 
-    # Pruning runs with the default full TE spec (see --export-default-te-spec
-    # in prune.sh), which requires the non-grouped MoE GEMM. Matches the
-    # quantize.py / generate.py behaviour.
-    if hasattr(args, "moe_grouped_gemm") and args.moe_grouped_gemm:
-        print_rank_0("WARNING: Forcing moe_grouped_gemm to False for pruning.")
-        args.moe_grouped_gemm = False
-
     # Default the intermediate-checkpoint location to <save>/modelopt_pruning_scores
     # so that re-running on the same --save target reuses cached per-rank scores
     if args.prune_intermediate_ckpt is None and args.save is not None:
@@ -264,8 +260,13 @@ if __name__ == "__main__":
     check_arguments(args)
 
     tokenizer = get_hf_tokenizer()
+    # Pruning operates on per-expert linears (which only exist as separate modules under
+    # SequentialMLP, not the packed-tensor TEGroupedMLP). `disable_moe_grouped_gemm=True`
+    # forces the export spec to SequentialMLP so mtp.prune can act on individual experts.
+    # Other example scripts (quantize.py, generate.py, finetune.py) keep the default.
+    prune_builder = functools.partial(modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True)
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder),
+        functools.partial(model_provider, prune_builder),
         wrap_with_ddp=False,
     )
     unwrapped_model = unwrap_model(model)[0]
@@ -304,7 +305,11 @@ if __name__ == "__main__":
             enumerate(all_prompts), disable=torch.distributed.get_rank()
         ):
             tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = megatron_generate(model, tokens.input_ids.cuda(), osl=32)
+            # enable_kv_cache=False to skip the static KV-cache pre-allocation; this is a
+            # sanity-check generation (32 tokens) and skipping the cache keeps memory headroom.
+            generated_ids = megatron_generate(
+                model, tokens.input_ids.cuda(), osl=32, enable_kv_cache=False
+            )
             generated_texts = tokenizer.batch_decode(generated_ids)
             print_rank_0("{}".format(generated_texts))
             if all_references[idx] is not None:
@@ -324,7 +329,9 @@ if __name__ == "__main__":
         seq_len = args.calib_max_sequence_length
         # Pull extra raw samples so we have enough tokens to fill `calib_size` packed chunks.
         # cnn_dailymail articles are ~700-1000 tokens on average; 2x is a safe oversample.
-        samples = get_dataset_samples(args.calib_dataset, num_samples=args.calib_size * 2)
+        samples = get_dataset_samples(
+            args.calib_dataset, num_samples=args.calib_size * 2
+        )
         sep_id = tokenizer.eos_token_id
         token_stream: list[int] = []
         for s in samples:
