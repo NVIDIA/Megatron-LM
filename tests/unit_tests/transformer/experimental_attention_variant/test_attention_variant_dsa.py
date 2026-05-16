@@ -10,10 +10,8 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_dsa_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -24,10 +22,13 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     FusedDSAIndexerLoss,
     _compute_index_scores,
     compute_dsa_indexer_loss,
-    fused_qk_topk_naive,
     rotate_activation,
 )
-from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+from megatron.core.transformer.multi_latent_attention import (
+    MLASelfAttention,
+    MLASelfAttentionSubmodules,
+)
+from megatron.core.transformer.spec_utils import get_param, get_submodules, try_get_constructed_type
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -1611,14 +1612,6 @@ class TestDSAttentionTensorParallel:
 class TestDSAModuleSpecDispatch:
     """Tests for get_dsa_module_spec_for_backend and get_experimental_attention_variant_module_spec."""
 
-    @pytest.fixture(scope='class', autouse=True)
-    def setup_method(self):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-        )
-        yield
-        Utils.destroy_model_parallel()
-
     def _make_dsa_config(self, **kwargs):
         return MLATransformerConfig(
             num_layers=2,
@@ -1644,9 +1637,11 @@ class TestDSAModuleSpecDispatch:
     def test_get_experimental_attention_variant_module_spec_dsa(self):
         """get_experimental_attention_variant_module_spec dispatches to DSA for variant='dsa'."""
         config = self._make_dsa_config(experimental_attention_variant="dsa")
-        spec = get_experimental_attention_variant_module_spec(config)
-        assert spec.module == MLASelfAttention
-        assert spec.submodules.core_attention.module == DSAttention
+        spec, _ = get_experimental_attention_variant_module_spec(config)
+        assert try_get_constructed_type(spec) == MLASelfAttention
+        submodules = get_submodules(spec)
+        assert isinstance(submodules, MLASelfAttentionSubmodules)
+        assert try_get_constructed_type(submodules.core_attention) == DSAttention
 
     def test_get_dsa_module_spec_for_backend(self):
         """get_dsa_module_spec_for_backend returns the correct full spec structure."""
@@ -1654,11 +1649,15 @@ class TestDSAModuleSpecDispatch:
 
         config = self._make_dsa_config()
         backend = TESpecProvider()
-        spec = get_dsa_module_spec_for_backend(config, backend=backend)
-        assert spec.module == MLASelfAttention
-        assert spec.submodules.core_attention.module == DSAttention
-        assert spec.submodules.core_attention.submodules.indexer.module == DSAIndexer
-        assert spec.params["attn_mask_type"] == AttnMaskType.causal
+        spec, _ = get_dsa_module_spec_for_backend(config, backend=backend)
+        assert try_get_constructed_type(spec) == MLASelfAttention
+        submodules = get_submodules(spec)
+        assert isinstance(submodules, MLASelfAttentionSubmodules)
+        assert try_get_constructed_type(submodules.core_attention) == DSAttention
+        core_attn_submodules = get_submodules(submodules.core_attention)
+        assert isinstance(core_attn_submodules, DSAttentionSubmodules)
+        assert try_get_constructed_type(core_attn_submodules.indexer) == DSAIndexer
+        assert get_param(spec, "attn_mask_type") == AttnMaskType.causal
 
     def test_get_dsa_module_spec_requires_mla(self):
         """get_dsa_module_spec_for_backend rejects configs without MLA."""

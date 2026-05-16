@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import dataclasses
 from functools import partial
-from typing import Protocol
+from typing import Optional, Protocol, Union
 
 import pytest
 
@@ -11,6 +11,7 @@ from megatron.core.transformer.spec_utils import (
     get_param,
     get_submodules,
     set_param,
+    try_get_constructed_type,
 )
 
 
@@ -230,3 +231,151 @@ class TestSetParam:
         # Even for unsupported spec types, the submodules guard fires first.
         with pytest.raises(ValueError):
             set_param(dummy_method, 'submodules', submodules)
+
+
+# Helpers for try_get_constructed_type tests.
+def _func_returning_example_a() -> ExampleA:
+    return ExampleA(0, 'x')
+
+
+def _func_no_annotation():
+    pass
+
+
+def _func_returns_dict() -> dict:
+    return {}
+
+
+def _func_returns_string_forward_ref() -> 'ExampleA':  # noqa: F821 - intentional forward ref
+    return ExampleA(0, 'x')
+
+
+def _func_returning_union() -> Union[ExampleA, OtherChild]:
+    return ExampleA(0, 'x')
+
+
+def _func_returning_optional() -> Optional[ExampleA]:
+    return None
+
+
+class _CallableInstanceAnnotated:
+    """A callable instance with a concrete return-type annotation on `__call__`."""
+
+    def __call__(self) -> ExampleA:
+        return ExampleA(0, 'x')
+
+
+class _CallableInstanceUnannotated:
+    """A callable instance with no return-type annotation on `__call__`."""
+
+    def __call__(self):
+        return ExampleA(0, 'x')
+
+
+class _FactoryHost:
+    """Hosts classmethod factories with and without return-type annotations."""
+
+    @classmethod
+    def make_annotated(cls) -> ExampleA:
+        return ExampleA(0, 'x')
+
+    @classmethod
+    def make_unannotated(cls):
+        return ExampleA(0, 'x')
+
+
+class TestTryGetConstructedType:
+    """Tests for `try_get_constructed_type`."""
+
+    def test_returns_type_for_plain_class(self):
+        """A plain class is returned as the constructed type."""
+        assert try_get_constructed_type(ExampleA) is ExampleA
+
+    def test_unwraps_module_spec(self):
+        """A `ModuleSpec` wrapping a type unwraps to that type."""
+        assert try_get_constructed_type(ModuleSpec(module=ExampleA)) is ExampleA
+
+    def test_unwraps_partial_of_type(self):
+        """`partial(SomeType, ...)` unwraps to the underlying type."""
+        assert try_get_constructed_type(partial(ExampleA, x=1)) is ExampleA
+
+    def test_unwraps_partial_of_module_spec(self):
+        """A `partial` whose func is a `ModuleSpec` unwraps through both layers."""
+        spec = ModuleSpec(module=ExampleA, params={'y': 'hi'})
+        assert try_get_constructed_type(partial(spec, x=1)) is ExampleA
+
+    def test_unwraps_module_spec_of_partial(self):
+        """A `ModuleSpec` whose `module` is a `partial(SomeType)` unwraps to the type."""
+        assert try_get_constructed_type(ModuleSpec(module=partial(ExampleA, x=1))) is ExampleA
+
+    def test_unwraps_nested_partials(self):
+        """Multiple nested `partial`s unwrap recursively to the inner type."""
+        nested = partial(partial(partial(ExampleA, x=1), y='hi'))
+        assert try_get_constructed_type(nested) is ExampleA
+
+    def test_uses_return_annotation_for_function(self):
+        """A function with a concrete return-type annotation returns that annotation."""
+        assert try_get_constructed_type(_func_returning_example_a) is ExampleA
+
+    def test_function_without_annotation_raises(self):
+        """A function with no return annotation cannot be introspected → ValueError."""
+        with pytest.raises(ValueError, match="return type annotation"):
+            try_get_constructed_type(_func_no_annotation)
+
+    def test_function_with_non_type_annotation_returns_it_if_type(self):
+        """A function annotated `-> dict` returns `dict` (which IS a type)."""
+        assert try_get_constructed_type(_func_returns_dict) is dict
+
+    def test_function_with_string_forward_ref_raises(self):
+        """A stringified forward-ref return annotation is not a real type → ValueError."""
+        with pytest.raises(ValueError, match="is not a type"):
+            try_get_constructed_type(_func_returns_string_forward_ref)
+
+    def test_callable_instance_with_annotation_resolves(self):
+        """A callable instance with an annotated `__call__` resolves via its signature."""
+        assert try_get_constructed_type(_CallableInstanceAnnotated()) is ExampleA
+
+    def test_callable_instance_without_annotation_raises(self):
+        """A callable instance whose `__call__` lacks a return annotation → ValueError."""
+        with pytest.raises(ValueError, match="return type annotation"):
+            try_get_constructed_type(_CallableInstanceUnannotated())
+
+    def test_plain_non_callable_raises(self):
+        """A non-callable, non-type value (e.g. an int) raises."""
+        with pytest.raises(ValueError, match="not a callable or a type"):
+            try_get_constructed_type(42)  # type: ignore[arg-type]
+
+    def test_lambda_without_annotation_raises(self):
+        """A lambda has no return annotation → ValueError."""
+        with pytest.raises(ValueError, match="return type annotation"):
+            try_get_constructed_type(lambda: ExampleA(0, 'x'))
+
+    def test_builder_protocol_partial_unwraps(self):
+        """A realistic builder pattern: `partial(Type, **defaults)` resolves to `Type`."""
+        builder = partial(ExampleA, y='default')
+        assert try_get_constructed_type(builder) is ExampleA
+
+    def test_union_return_annotation_raises(self):
+        """`Union[A, B]` is not a single concrete type and cannot be resolved."""
+        with pytest.raises(ValueError, match="is not a type"):
+            try_get_constructed_type(_func_returning_union)
+
+    def test_optional_return_annotation_raises(self):
+        """`Optional[A]` is `Union[A, None]` — also rejected as not a single concrete type."""
+        with pytest.raises(ValueError, match="is not a type"):
+            try_get_constructed_type(_func_returning_optional)
+
+    def test_classmethod_factory_with_return_type(self):
+        """A classmethod factory annotated with a concrete return type resolves correctly."""
+        assert try_get_constructed_type(_FactoryHost.make_annotated) is ExampleA
+
+    def test_classmethod_factory_without_return_type_raises(self):
+        """A classmethod factory with no return annotation → ValueError."""
+        with pytest.raises(ValueError, match="return type annotation"):
+            try_get_constructed_type(_FactoryHost.make_unannotated)
+
+    def test_partial_wrapping_callable_instance(self):
+        """`partial` over a callable instance unwraps and resolves via the instance's `__call__`."""
+        instance = _CallableInstanceAnnotated()
+        # `partial(instance)` is unwrapped to `instance`, which is then introspected.
+        assert try_get_constructed_type(partial(instance)) is ExampleA

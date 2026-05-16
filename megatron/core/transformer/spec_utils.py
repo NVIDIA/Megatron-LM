@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import functools
+import inspect
 import logging
 import types
 from collections.abc import Callable
@@ -177,3 +178,43 @@ def set_param(spec: Callable[..., Any], param: str, value: object):
         spec.params[param] = value  # type: ignore
         return
     raise ValueError(f"Could not find `{param}` in the provided spec: {spec!r}")
+
+
+def try_get_constructed_type(spec: Callable[..., Any]) -> type:
+    """Gets the type that the provided spec constructs, if possible.
+
+    Avoid using this function when possible - it is not possible to get the constructed type in a
+    consistent way, since types can override the `__new__` method and generic callables can only
+    be queried through their return-type annotation (which may be inaccurate or missing).
+
+    Supports `type`, `ModuleSpec` and `functools.partial` (unwrapped recursively), as well as any
+    callable (functions, methods, classmethods, callable instances) that has a concrete return
+    type annotation. Returns the annotation if it is a `type`; otherwise raises `ValueError`.
+    """
+    unwrapped = spec
+    while True:
+        if isinstance(unwrapped, functools.partial):
+            unwrapped = unwrapped.func
+        elif isinstance(unwrapped, ModuleSpec):
+            unwrapped = unwrapped.module
+        else:
+            break
+    if isinstance(unwrapped, type):
+        return unwrapped
+    if not callable(unwrapped):
+        raise ValueError(
+            f"Could not introspect the return type of {spec!r} since it is not a callable or a type."
+        )
+    sig = inspect.signature(unwrapped)
+    if sig.return_annotation is inspect.Signature.empty:
+        raise ValueError(
+            f"Could not find return type annotation for {spec!r}, so cannot determine the type"
+            " it constructs."
+        )
+    annotation = sig.return_annotation
+    if not isinstance(annotation, type):
+        raise ValueError(
+            f"Return type annotation for {spec!r} is {annotation} of type {type(annotation)}, which"
+            " is not a type, so cannot determine the type it constructs."
+        )
+    return annotation
