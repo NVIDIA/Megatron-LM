@@ -223,9 +223,11 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
         else:
             adjusted_tokens = tokens
 
-        # Decode only if there are tokens left after filtering
+        # Use tiktoken's native decode which concatenates token bytes before
+        # UTF-8 decoding, correctly handling multi-byte characters that span
+        # multiple BPE tokens.
         if adjusted_tokens:
-            return "".join(self.ids_to_tokens(adjusted_tokens))
+            return self.tokenizer.decode(adjusted_tokens)
         else:
             return ""  # Return an empty string if all tokens were filtered out
 

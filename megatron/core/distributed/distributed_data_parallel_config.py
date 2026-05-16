@@ -5,6 +5,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from ..utils import is_torch_min_version
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -48,6 +50,11 @@ class DistributedDataParallelConfig:
        value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
        buckets to ensure collectives do not become latency-bound)."""
 
+    num_buckets: Optional[int] = None
+    """Number of buckets for data-parallel communication. Should only specify one of
+       `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`
+       will be determined at runtime."""
+
     pad_buckets_for_high_nccl_busbw: bool = False
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
        ensure NCCL collectives have high bus bandwidth at large DP counts, since NCCL
@@ -71,6 +78,10 @@ class DistributedDataParallelConfig:
     fp8_param_gather: bool = False
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
+
+    fp4_param_gather: bool = False
+    """If true, keep the compute param in fp4 (do not use any other intermediate dtype) and
+       perform the param all-gather in fp4."""
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
@@ -209,7 +220,7 @@ class DistributedDataParallelConfig:
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
-        if self.nccl_ub:
+        if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
@@ -221,3 +232,7 @@ class DistributedDataParallelConfig:
                 "Only need to explicitly specify param_name patterns for FP32 local accumulation "
                 "if .main_grads aren't already in FP32"
             )
+
+        if self.num_buckets is not None:
+            assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
+            assert self.num_buckets > 0, "num_buckets must be greater than 0"

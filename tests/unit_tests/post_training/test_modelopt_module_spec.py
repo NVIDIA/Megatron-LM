@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import inspect
 import tempfile
 
@@ -8,18 +8,19 @@ from packaging.version import Version
 
 from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
-from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
+from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -34,31 +35,36 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
     )
     prompt_length = model.max_sequence_length - 1
 
-    # load-context/first-output-token, step/generate
-    for offset in (0, prompt_length):
-        if offset == 0:
-            sequence_length = prompt_length
-        else:
-            sequence_length = 1
-        inference_context.sequence_len_offset = offset
+    with InferenceMode.active():
+        # load-context/first-output-token, step/generate
+        for offset in (0, prompt_length):
+            if offset == 0:
+                sequence_length = prompt_length
+            else:
+                sequence_length = 1
+            inference_context.sequence_len_offset = offset
 
-        data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        attention_mask = torch.ones(
-            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+            data = list(range(sequence_length))
+            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+            position_ids = (
+                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+            )
+            attention_mask = torch.ones(
+                (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+            ).cuda()
 
-        logits = model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-        )
+            logits = model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                runtime_gather_output=True,
+            )
 
-        assert logits.shape[0] == micro_batch_size
-        assert logits.shape[1] == sequence_length
-        assert logits.shape[2] == model.vocab_size
+            assert logits.shape[0] == micro_batch_size
+            # StaticInferenceContext always sets materialize_only_last_token_logits=True.
+            assert logits.shape[1] == 1
+            assert logits.shape[2] == model.vocab_size
 
 
 class TestModelOptGPTModel:
@@ -197,7 +203,7 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
         )
 
 
-class TestModelOptMambaModel(TestModelOptGPTModel):
+class TestModelOptHybridModel(TestModelOptGPTModel):
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -206,19 +212,19 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
             num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
         )
 
-        # A Hybrid MambaModel using fused-TE spec (default)
-        self.default_model = MambaModel(
+        # A Hybrid HybridModel using fused-TE spec (default)
+        self.default_model = HybridModel(
             config=transformer_config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
         )
 
-        # A Hybrid MambaModel using ModelOpt spec (local + TENorm).
-        self.modelopt_model = MambaModel(
+        # A Hybrid HybridModel using ModelOpt spec (local + TENorm).
+        self.modelopt_model = HybridModel(
             config=transformer_config,
-            mamba_stack_spec=get_mamba_stack_modelopt_spec(remap_te_layernorm=True),
+            hybrid_stack_spec=get_hybrid_stack_modelopt_spec(remap_te_layernorm=True),
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
@@ -264,9 +270,9 @@ def test_get_gpt_modelopt_spec_interface():
         ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."
 
 
-def test_get_mamba_stack_modelopt_spec_interface():
+def test_get_hybrid_stack_modelopt_spec_interface():
     # Get the function signature
-    sig = inspect.signature(get_mamba_stack_modelopt_spec)
+    sig = inspect.signature(get_hybrid_stack_modelopt_spec)
 
     # Define the expected signature
     expected_params = {
@@ -298,7 +304,7 @@ def test_get_mamba_stack_modelopt_spec_interface():
         ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."
 
 
-def test_get_mamba_stack_modelopt_spec_use_default_te_spec():
-    """Test that use_default_te_spec=True returns the standard mamba_stack_spec."""
-    spec = get_mamba_stack_modelopt_spec(use_default_te_spec=True)
-    assert spec is mamba_stack_spec
+def test_get_hybrid_stack_modelopt_spec_use_default_te_spec():
+    """Test that use_default_te_spec=True returns the standard hybrid_stack_spec."""
+    spec = get_hybrid_stack_modelopt_spec(use_default_te_spec=True)
+    assert spec is hybrid_stack_spec

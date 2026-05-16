@@ -8,7 +8,14 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank, make_viewless_tensor
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    log_single_rank,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -175,8 +182,6 @@ class ScheduleNode:
         self.free_input = free_input
         self.inputs = None
         self.outputs = None
-        self.delay_grads_release = False
-        self.manual_release_grads = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -256,12 +261,6 @@ class ScheduleNode:
             for g in output_grad:
                 if g is not None:
                     g.record_stream(self.stream)
-                    # Manually trigger the memory release of dgrad tensor
-                    # to avoid delayed garbage collection. If
-                    # delay_grads_release is True, dgrad is last used in
-                    # wgrad compute and skip the release here.
-                    if self.manual_release_grads and not self.delay_grads_release:
-                        g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
         self._release_state()
@@ -291,13 +290,13 @@ class ScheduleNode:
         """
         self.event.wait(self.stream)
         if name:
-            torch.cuda.nvtx.range_push(name)
+            nvtx_range_push(name)
         try:
             with torch.cuda.stream(self.stream):
                 yield
         finally:
             if name:
-                torch.cuda.nvtx.range_pop()
+                nvtx_range_pop(name)
             self.event.record(self.stream)
 
     def _release_state(self):

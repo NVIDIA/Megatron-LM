@@ -11,8 +11,13 @@ from megatron.training.config.training_config import (
     SchedulerConfig,
     LoggerConfig,
     CheckpointConfig,
+    TokenizerConfig,
 )
 from megatron.training.config.resilience_config import (
+    FaultInjectorConfig,
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
+
+from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.config.instantiate_utils import TargetAllowlist, target_allowlist

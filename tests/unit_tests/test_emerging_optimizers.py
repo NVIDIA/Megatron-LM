@@ -18,6 +18,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     get_supported_coefficient_types,
     validate_coefficient_type,
 )
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -152,6 +153,30 @@ class TestMuonOptimizerMultiRank:
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
 
+    def create_ddp_model_for_layerwise(self, model, use_param_layout=False):
+        """Wrap model in DDP for layer-wise distributed optimizer tests.
+
+        Args:
+            model: Model to wrap.
+            use_param_layout: If True, supply DDP a precomputed shard-aligned
+                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
+                + ``start_param_sync``). If False (default), build DDP without a layout
+                so ``LayerWiseDistributedOptimizer`` syncs via the legacy
+                flatten / ``all_gather_v`` / unflatten ``allgather_params()`` codepath.
+        """
+        if use_param_layout:
+            from megatron.training.training import wrap_model_chunks_with_ddp
+
+            ddp_config = DistributedDataParallelConfig()
+            wrapped = wrap_model_chunks_with_ddp(
+                [model],
+                TransformerConfig(num_attention_heads=1, num_layers=1),
+                ddp_config,
+                use_layer_wise_distributed_optimizer=True,
+            )
+            return wrapped[0]
+        return self.create_ddp_model(model)
+
     def test_get_megatron_optimizer_smoke(self):
         """Smoke test for get_megatron_optimizer function."""
         model = Net().bfloat16().cuda()
@@ -257,7 +282,7 @@ class TestMuonOptimizerMultiRank:
         """Test get_megatron_optimizer with layer-wise distributed optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
-        model = self.create_ddp_model(model)
+        model = self.create_ddp_model_for_layerwise(model)
 
         optimizer_config = OptimizerConfig(
             optimizer='muon',
@@ -276,6 +301,55 @@ class TestMuonOptimizerMultiRank:
         # use_layer_wise_distributed_optimizer=True triggers LayerWiseDistributedOptimizer
         optimizer = get_megatron_optimizer(
             config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+        )
+
+        # Verify it's a LayerWiseDistributedOptimizer
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        assert isinstance(
+            optimizer, LayerWiseDistributedOptimizer
+        ), "Should return LayerWiseDistributedOptimizer"
+
+        # Test forward and backward pass
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        output = model(input_tensor)
+        loss = output.sum()
+        loss.backward()
+
+        # Test optimizer step
+        update_successful, grad_norm, num_zeros = optimizer.step()
+
+        assert update_successful, "Optimizer step should be successful"
+        assert grad_norm is not None or grad_norm is None, "Grad norm should be returned"
+
+    def test_get_megatron_muon_optimizer_backward_compatible(self):
+        """Test get_megatron_muon_optimizer with backward compatible layer-wise distributed optimizer."""
+        model = Net().bfloat16().cuda()
+        model.requires_grad_(True)
+        model = self.create_ddp_model_for_layerwise(model)
+
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            use_layer_wise_distributed_optimizer=True,
+            muon_momentum=0.95,
+            muon_nesterov=True,
+            muon_fp32_matmul_prec="medium",
+            muon_num_ns_steps=5,
+            muon_scale_mode="spectral",
+            muon_tp_mode="duplicated",
+        )
+
+        with pytest.raises(ValueError, match="dist_ prefix"):
+            get_megatron_muon_optimizer(
+                config=optimizer_config, model_chunks=[model], layer_wise_distributed_optimizer=True
+            )
+
+        optimizer_config.optimizer = 'dist_muon'
+        optimizer = get_megatron_muon_optimizer(
+            config=optimizer_config, model_chunks=[model], layer_wise_distributed_optimizer=True
         )
 
         # Verify it's a LayerWiseDistributedOptimizer

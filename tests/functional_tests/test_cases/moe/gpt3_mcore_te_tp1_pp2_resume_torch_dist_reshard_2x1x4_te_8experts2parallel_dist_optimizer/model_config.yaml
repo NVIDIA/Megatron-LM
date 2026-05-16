@@ -56,4 +56,6 @@ MODEL_ARGS:
   --disable-bias-linear: true
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
+  --verify-integrity: true
 TEST_TYPE: ckpt-resume
+LAUNCHER: ft_launcher

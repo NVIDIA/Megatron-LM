@@ -17,7 +17,7 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=FutureWarning)
 
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -41,7 +41,8 @@ from megatron.training import (
 )
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -90,7 +91,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
           - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
             regardless of pipeline stage.
 
-        Difference from ``pretrain_mamba.py``:
+        Difference from ``pretrain_hybrid.py``:
           - Return format: GPT returns a 6-tuple
             ``(tokens, labels, loss_mask, attention_mask, position_ids,
             packed_seq_params)`` where ``packed_seq_params`` is a
@@ -249,20 +250,17 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers('batch-generator').stop()
 
     with stimer:
-        if args.use_legacy_models:
-            output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+        if return_schedule_plan:
+            assert args.overlap_moe_expert_parallel_comm, \
+                "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+            schedule_plan = model.build_schedule_plan(
+                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+            )
+            return schedule_plan, partial(loss_func, loss_mask, model=model)
         else:
-            if return_schedule_plan:
-                assert args.overlap_moe_expert_parallel_comm, \
-                    "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
-                schedule_plan = model.build_schedule_plan(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
-                )
-                return schedule_plan, partial(loss_func, loss_mask, model=model)
-            else:
-                output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
-                )
+            output_tensor = model(
+                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+            )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
@@ -281,7 +279,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     )
 
 
-def core_gpt_dataset_config_from_args(args):
+def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -318,7 +316,7 @@ def core_gpt_dataset_config_from_args(args):
         "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
-        "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
+        "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
     }
 
@@ -404,18 +402,21 @@ if __name__ == "__main__":
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
-    train_valid_test_datasets_provider.is_distributed = True
+    setattr(train_valid_test_datasets_provider, "is_distributed", True)
 
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
-    pretrain(
+    args = parse_and_validate_args(
+        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
+    full_config = pretrain_cfg_container_from_args(args)
+    pretrain(full_config,
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         store=store,
         get_embedding_ranks=get_embedding_ranks,
     )
