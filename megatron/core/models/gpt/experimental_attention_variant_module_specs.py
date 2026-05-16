@@ -418,7 +418,7 @@ def _get_self_attention_module_spec(
         attn_spec.metainfo["fuse_input_layernorm"] = False
     else:
         attn_spec.metainfo["fuse_input_layernorm"] = (
-            backend.column_parallel_layer_norm_linear() is None
+            backend.column_parallel_layer_norm_linear() is not None
         )
 
     return attn_spec
@@ -443,7 +443,7 @@ def _get_dense_mlp_module_spec(
 
     return (
         get_mlp_module_spec_for_backend(backend=backend, num_experts=None),
-        backend.column_parallel_layer_norm_linear() is None,
+        backend.column_parallel_layer_norm_linear() is not None,
     )
 
 
