@@ -120,7 +120,7 @@ class GPTModelConfig(ModelConfig):
 
     builder: ClassVar[str] = "megatron.training.models.gpt.GPTModelBuilder"
     transformer: TransformerConfig
-    transformer_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] = default_layer_spec
+    transformer_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] | None = None
 
     ### vocab padding related ###
     vocab_size: int | None = None
@@ -244,7 +244,9 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             The constructed model
         """
         transformer_layer_spec = self._model_config.transformer_layer_spec
-        if not isinstance(transformer_layer_spec, ModuleSpec):
+        if transformer_layer_spec is None:
+            transformer_layer_spec = default_layer_spec(self._model_config)
+        elif callable(transformer_layer_spec):
             # Check if the transformer_layer_spec function accepts vp_stage parameter
             if "vp_stage" in inspect.signature(transformer_layer_spec).parameters:
                 transformer_layer_spec = transformer_layer_spec(self._model_config, vp_stage=vp_stage)
