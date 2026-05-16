@@ -6,6 +6,7 @@ Read more about ModelOpt pruning at https://github.com/NVIDIA/Model-Optimizer/tr
 """
 
 import functools
+import gc
 import json
 import os
 import sys
@@ -180,6 +181,12 @@ def add_prune_args(parser):
         default=None,
         help="HuggingFace pretrained model",
     )
+    group.add_argument(
+        "--skip-generate",
+        action="store_true",
+        default=False,
+        help="Skip the post-pruning generate/validation step.",
+    )
     # Pruning targets
     group.add_argument(
         "--prune-export-config",
@@ -264,7 +271,9 @@ if __name__ == "__main__":
     # SequentialMLP, not the packed-tensor TEGroupedMLP). `disable_moe_grouped_gemm=True`
     # forces the export spec to SequentialMLP so mtp.prune can act on individual experts.
     # Other example scripts (quantize.py, generate.py, finetune.py) keep the default.
-    prune_builder = functools.partial(modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True)
+    prune_builder = functools.partial(
+        modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
+    )
     model = get_model(
         functools.partial(model_provider, prune_builder),
         wrap_with_ddp=False,
@@ -368,9 +377,13 @@ if __name__ == "__main__":
     print_rank_0(f"Pruned Model:\n {unwrapped_model}")
     print_rank_0(f"Pruned Model Params: {get_params(unwrapped_model) / 1e9:.2f}B")
 
-    _custom_prompt_forward_loop_func(unwrapped_model)
-
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0)
+
+    # Free pruning-side memory before the sanity-check generation (do this after saving in case it causes issues)
+    gc.collect()
+    torch.cuda.empty_cache()
+    if not args.skip_generate:
+        _custom_prompt_forward_loop_func(unwrapped_model)
 
     print_rank_0("Done")

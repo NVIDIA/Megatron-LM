@@ -3,6 +3,7 @@
 """Script for quantizing a HuggingFace or Megatron-LM checkpoint using ModelOpt."""
 
 import functools
+import gc
 import inspect
 import json
 import os
@@ -394,11 +395,9 @@ if __name__ == "__main__":
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0, release=True)
 
-    # Free calibration/quantization memory before generate
-    import gc
+    # Free calibration/quantization memory before generate (do this after saving in case it causes issues)
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Do this after saving in case it causes issues
     if not args.skip_generate:
         _custom_prompt_forward_loop_func(unwrapped_model)
