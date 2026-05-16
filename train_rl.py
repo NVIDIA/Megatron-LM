@@ -7,11 +7,10 @@ from functools import partial
 
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
@@ -21,14 +20,13 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
-from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.utils import is_hybrid_model
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from model_provider import model_provider
-
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.builders import gpt_builder, hybrid_builder
+from megatron.training.utils import is_hybrid_model
+from model_provider import model_provider
 
 stimer = StragglerDetector()
 

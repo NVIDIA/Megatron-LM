@@ -591,10 +591,10 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
     mock_args.qk_l2_norm = False
 
     with (
-        patch('gpt_builders.get_args', return_value=mock_args),
-        patch('gpt_builders.get_gpt_layer_with_transformer_engine_spec') as mock_spec_fn,
+        patch('megatron.training.builders.gpt.get_args', return_value=mock_args),
+        patch('megatron.training.builders.gpt.get_gpt_layer_with_transformer_engine_spec') as mock_spec_fn,
     ):
-        from gpt_builders import _get_transformer_layer_spec
+        from megatron.training.builders.gpt import _get_transformer_layer_spec
 
         _get_transformer_layer_spec(use_te=True, config=mock_config)
 

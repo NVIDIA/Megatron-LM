@@ -7,7 +7,6 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from gpt_builders import gpt_builder
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -15,6 +14,7 @@ from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.builders import gpt_builder
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.training import setup_model_and_optimizer
 from megatron.training.utils import is_first_or_last_pipeline_stage

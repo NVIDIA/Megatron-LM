@@ -14,8 +14,6 @@ from contextlib import nullcontext
 
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -31,6 +29,7 @@ from megatron.core.inference.text_generation_server.run_mcore_engine import run_
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
+from megatron.training.builders import gpt_builder, hybrid_builder
 from model_provider import model_provider
 
 sys.path.append(
@@ -39,8 +38,8 @@ sys.path.append(
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
-from megatron.training.checkpointing import load_checkpoint
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
 
