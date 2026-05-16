@@ -707,6 +707,7 @@ def _test_parallel_attention_correctness(
     tmp_path_dist_ckpt,
     atol,
     rtol,
+    cosine_similarity_threshold=None,
     tp=1,
     sp=False,
     cp=1,
@@ -863,27 +864,37 @@ def _test_parallel_attention_correctness(
                 ~torch.isinf(bias_hidden_states_parallel)
             ), "bias_hidden_states_parallel contains inf"
 
-        torch.testing.assert_close(
-            output_hidden_states_baseline,
-            output_hidden_states_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
+        def assert_close_or_cosine_similarity(baseline, parallel, tensor_name):
+            try:
+                torch.testing.assert_close(
+                    baseline,
+                    parallel,
+                    atol=atol,
+                    rtol=rtol,
+                    msg=lambda msg: f"Mismatch in {tensor_name}: {msg}",
+                )
+                return
+            except AssertionError as close_error:
+                if cosine_similarity_threshold is None:
+                    raise close_error
+                baseline_flat = baseline.flatten().float()
+                parallel_flat = parallel.flatten().float()
+                cosine_sim = torch.nn.functional.cosine_similarity(
+                    baseline_flat.unsqueeze(0), parallel_flat.unsqueeze(0)
+                ).item()
+                assert cosine_sim >= cosine_similarity_threshold, (
+                    f"Mismatch in {tensor_name}: cosine similarity "
+                    f"{cosine_sim} < {cosine_similarity_threshold}, "
+                    f"while assert_close failed: {close_error}"
+                )
+
+        assert_close_or_cosine_similarity(
+            output_hidden_states_baseline, output_hidden_states_parallel, "output_hidden_states"
         )
-        torch.testing.assert_close(
-            input_grad_baseline,
-            input_grad_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in input_grad: {msg}",
-        )
+        assert_close_or_cosine_similarity(input_grad_baseline, input_grad_parallel, "input_grad")
         if has_bias:
-            torch.testing.assert_close(
-                bias_hidden_states_baseline,
-                bias_hidden_states_parallel,
-                atol=atol,
-                rtol=rtol,
-                msg=lambda msg: f"Mismatch in bias_hidden_states: {msg}",
+            assert_close_or_cosine_similarity(
+                bias_hidden_states_baseline, bias_hidden_states_parallel, "bias_hidden_states"
             )
 
         Utils.destroy_model_parallel()
