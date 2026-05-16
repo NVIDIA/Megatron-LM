@@ -187,12 +187,30 @@ def check_checkpoint_args(checkpoint_args):
     )
 
 
+_CHECKPOINT_SCALING_ARG_DEFAULTS = {
+    'scaling_recipe': 'none',
+    'scaling_base_hidden_size': None,
+    'scaling_base_head_dim': None,
+    'use_mup': False,
+    'mup_width_mult': 1.0,
+    '_mup_width_mult_explicit': False,
+    'mup_base_hidden_size': None,
+    'mup_embedding_mult': 1.0,
+    'mup_output_mult': 1.0,
+    'mup_base_head_dim': None,
+    'mup_attn_scale_power': 1.0,
+}
+
+
 def _sync_checkpoint_scaling_args(checkpoint_args):
     """Populate canonical scaling fields on checkpoint args before force-copying them."""
 
     sync_legacy_mup_fields(
         checkpoint_args, build_scaling_context(checkpoint_args)
     )
+    for arg_name, default_value in _CHECKPOINT_SCALING_ARG_DEFAULTS.items():
+        if not hasattr(checkpoint_args, arg_name):
+            setattr(checkpoint_args, arg_name, default_value)
 
 
 def isfile(filename) -> bool:

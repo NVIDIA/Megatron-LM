@@ -443,7 +443,7 @@ class TestScalingRecipeSurfaces:
         assert runtime_args.mup_width_mult == pytest.approx(4.0)
 
     def test_load_non_mup_checkpoint_clears_width_mult_provenance(self, monkeypatch):
-        """Checkpoint args must also clear stale CLI explicit-width provenance."""
+        """Old no-scaling checkpoints must clear stale CLI scaling state."""
         from megatron.training import checkpointing
 
         checkpoint_args = SimpleNamespace(hidden_size=1024)
@@ -458,10 +458,15 @@ class TestScalingRecipeSurfaces:
             iteration=0,
             scaling_recipe='mup',
             scaling_base_hidden_size=256,
-            scaling_base_head_dim=None,
-            use_mup=False,
-            mup_width_mult=1.0,
+            scaling_base_head_dim=64,
+            use_mup=True,
+            mup_width_mult=4.0,
             _mup_width_mult_explicit=True,
+            mup_base_hidden_size=256,
+            mup_embedding_mult=2.0,
+            mup_output_mult=0.25,
+            mup_base_head_dim=64,
+            mup_attn_scale_power=-0.5,
             use_tokenizer_model_from_checkpoint_args=False,
             use_mp_args_from_checkpoint_args=False,
         )
@@ -470,8 +475,16 @@ class TestScalingRecipeSurfaces:
 
         assert runtime_args.iteration == 3
         assert runtime_args.scaling_recipe == 'none'
+        assert runtime_args.scaling_base_hidden_size is None
+        assert runtime_args.scaling_base_head_dim is None
+        assert runtime_args.use_mup is False
         assert runtime_args.mup_width_mult == 1.0
         assert runtime_args._mup_width_mult_explicit is False
+        assert runtime_args.mup_base_hidden_size is None
+        assert runtime_args.mup_embedding_mult == 1.0
+        assert runtime_args.mup_output_mult == 1.0
+        assert runtime_args.mup_base_head_dim is None
+        assert runtime_args.mup_attn_scale_power == 1.0
         assert build_scaling_context(runtime_args).recipe == 'none'
 
     def test_checkpoint_derived_width_mult_does_not_warn_as_deprecated_cli(self):
