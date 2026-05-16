@@ -91,6 +91,23 @@ def is_submodule(module, parent_module, strict=True):
     return False
 
 
+def find_megatron_fsdp(model):
+    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+    # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
+    # this module during its own initialization, so a top-level import of
+    # MegatronFSDP here would fail with a partially-initialized module error.
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
+    except (ImportError, ModuleNotFoundError):
+        return None
+    m = model
+    while m is not None:
+        if isinstance(m, MegatronFSDP):
+            return m
+        m = getattr(m, 'module', None)
+    return None
+
+
 def get_mesh_names(
     device_mesh: Optional[DeviceMesh] = None, only_submesh_dims: bool = False
 ) -> list[str]:
