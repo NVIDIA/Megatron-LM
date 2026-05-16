@@ -96,7 +96,7 @@ def test_param_group_identifier_tuple_defaults_missing_legacy_fields():
 
     ident = get_param_group_identifier_tuple(group)
 
-    assert ident == (1.0, 1.0, False, False)
+    assert ident == (1.0, 1.0, False, False, None, None)
 
 
 def test_param_group_matching_ignores_mutable_scheduler_values_on_resume():

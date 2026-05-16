@@ -1396,7 +1396,7 @@ class TestMuPOptimizerTypeHandling:
             mup_base_head_dim=None,
             mup_attn_scale_power=1.0,
         )
-        scaling_policy = build_resolved_training_policy(config_args, optimizer_type='adam')
+        scaling_policy = build_training_scaling_policy(config_args, optimizer_type='adam')
         optimizer_config = OptimizerConfig(
             optimizer='adam',
             lr=1e-3,
