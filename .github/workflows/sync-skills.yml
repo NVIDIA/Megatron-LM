@@ -22,6 +22,9 @@ on:
       - "skills/**"
       - "AGENTS.md"
 
+permissions:
+  contents: read
+
 jobs:
   sync:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_sync_skills.yml@v0.91.0
