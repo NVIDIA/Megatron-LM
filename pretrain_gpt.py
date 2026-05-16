@@ -51,6 +51,7 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -133,7 +134,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         )
 
     # TODO: this is pretty hacky, find a better way
-    is_packed_sequence = get_args().sft  # SFT always uses packed sequence
+    is_packed_sequence = args.sft or (
+        args.use_varlen_dataset and not args.varlen_bshd_validation
+    )
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
@@ -349,6 +352,8 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
+        "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
+        "varlen_bshd_validation": args.varlen_bshd_validation,
     }
 
     # add FIM args to the config
@@ -392,6 +397,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         else:
             dataset_type = SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
+    elif args.use_varlen_dataset:
+        # Variable-length packed (THD) dataset, independent of --sft.
+        # Reuses SFTDataset's THD/dynamic-cp packing internally but is gated
+        # by its own top-level flag.
+        if args.mock_data:
+            dataset_type = MockVarlenDataset
+        else:
+            dataset_type = VarlenDataset
+        # BSHD validation mode runs the SBHD non-packed pipeline; THD mode
+        # is the packed-sequence path.
+        is_packed_sequence = not args.varlen_bshd_validation
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset

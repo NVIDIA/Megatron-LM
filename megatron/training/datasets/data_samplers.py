@@ -106,7 +106,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
     # Torch dataloader.
-    if args.dynamic_context_parallel:
+    # All packing-scheduler paths (dynamic_cp + dp_balanced + future schedulers)
+    # consume variable-length per-sample tensors that the default stack-based
+    # collate_fn cannot batch. Use an identity collate so the scheduler sees
+    # a list of dicts and can pack them itself.
+    if args.sequence_packing_scheduler is not None:
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
