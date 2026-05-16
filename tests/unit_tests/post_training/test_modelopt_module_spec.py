@@ -305,6 +305,11 @@ def test_get_hybrid_stack_modelopt_spec_interface():
 
 
 def test_get_hybrid_stack_modelopt_spec_use_default_te_spec():
-    """Test that use_default_te_spec=True returns the standard hybrid_stack_spec."""
+    """Test that use_default_te_spec=True returns the standard hybrid_stack_spec.
+
+    Uses structural equality rather than `is` because the factory builds a fresh
+    ModuleSpec each call (so it can thread `moe_grouped_gemm`); the module-level
+    `hybrid_stack_spec` constant is just `get_hybrid_stack_spec()` with defaults.
+    """
     spec = get_hybrid_stack_modelopt_spec(use_default_te_spec=True)
-    assert spec is hybrid_stack_spec
+    assert spec == hybrid_stack_spec
