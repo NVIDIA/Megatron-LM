@@ -428,7 +428,13 @@ class Attention(MegatronModule, ABC):
 
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
         """Build self.rotary_pos_emb using a layer-specific rotary base."""
-        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+            MultimodalRotaryEmbedding,
+            RotaryEmbedding,
+        )
+        from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
+            YarnRotaryEmbedding,
+        )
 
         seq_len_interpolation_factor = self.config.rotary_scaling_factor
         if self.config.position_embedding_type == 'rope' and not self.config.multi_latent_attention:

@@ -495,10 +495,6 @@ class TransformerConfig(ModelParallelConfig):
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
-    use_transformer_engine_op_fuser: bool = False
-    """If True, submodules may use Transformer Engine's operation fuser
-    API to enable advanced fusions."""
-
     ####################
     # activation recomputation
     ####################

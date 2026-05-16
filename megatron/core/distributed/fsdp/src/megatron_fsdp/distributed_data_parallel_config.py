@@ -5,8 +5,6 @@ from typing import Optional
 
 import torch
 
-from megatron.core.utils import is_torch_min_version
-
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -157,7 +155,7 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
-        if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
+        if self.nccl_ub:
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
