@@ -305,11 +305,18 @@ def test_get_hybrid_stack_modelopt_spec_interface():
 
 
 def test_get_hybrid_stack_modelopt_spec_use_default_te_spec():
-    """Test that use_default_te_spec=True returns the standard hybrid_stack_spec.
+    """Test that use_default_te_spec=True returns the standard hybrid_stack_spec shape.
 
-    Uses structural equality rather than `is` because the factory builds a fresh
-    ModuleSpec each call (so it can thread `moe_grouped_gemm`); the module-level
-    `hybrid_stack_spec` constant is just `get_hybrid_stack_spec()` with defaults.
+    The factory builds a fresh ModuleSpec each call (so it can thread `moe_grouped_gemm`),
+    and the spec contains a `functools.partial` in the `mlp_layer.submodules.mlp` slot.
+    `functools.partial` doesn't implement `__eq__`, so neither `is` nor full structural
+    `==` works against the module-level `hybrid_stack_spec` constant. Compare the
+    structurally-stable fields (top-level module + key submodule types) instead.
     """
     spec = get_hybrid_stack_modelopt_spec(use_default_te_spec=True)
-    assert spec == hybrid_stack_spec
+    assert spec.module is hybrid_stack_spec.module
+    for slot in ("mamba_layer", "attention_layer", "mlp_layer", "moe_layer"):
+        assert (
+            getattr(spec.submodules, slot).module
+            is getattr(hybrid_stack_spec.submodules, slot).module
+        )
