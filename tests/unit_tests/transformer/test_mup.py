@@ -699,7 +699,11 @@ class TestScalingRecipeSurfaces:
             iteration=0,
             scaling_recipe='mup',
             scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
             scaling_base_head_dim=64,
+            scaling_residual_branch_depth_power=-1.0,
+            scaling_hidden_lr_depth_power=0.25,
+            scaling_block_out_proj_init_depth_power=0.5,
             use_mup=True,
             mup_width_mult=4.0,
             _mup_width_mult_explicit=True,
@@ -717,7 +721,11 @@ class TestScalingRecipeSurfaces:
         assert runtime_args.iteration == 3
         assert runtime_args.scaling_recipe == 'none'
         assert runtime_args.scaling_base_hidden_size is None
+        assert runtime_args.scaling_base_num_layers is None
         assert runtime_args.scaling_base_head_dim is None
+        assert runtime_args.scaling_residual_branch_depth_power is None
+        assert runtime_args.scaling_hidden_lr_depth_power is None
+        assert runtime_args.scaling_block_out_proj_init_depth_power is None
         assert runtime_args.use_mup is False
         assert runtime_args.mup_width_mult == 1.0
         assert runtime_args._mup_width_mult_explicit is False
@@ -1367,6 +1375,90 @@ class TestMuPConfigIntegration:
 
 class TestMuPOptimizerTypeHandling:
     """Tests for MuP optimizer-specific override behavior."""
+
+    def _depth_mup_adamw_overrides(self, *, apply_wd_to_qk_layernorm=False):
+        config_args = SimpleNamespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_base_head_dim=None,
+            scaling_residual_branch_depth_power=None,
+            scaling_hidden_lr_depth_power=None,
+            scaling_block_out_proj_init_depth_power=None,
+            use_mup=False,
+            mup_width_mult=1.0,
+            mup_base_hidden_size=None,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=None,
+            mup_attn_scale_power=1.0,
+        )
+        scaling_policy = build_resolved_training_policy(config_args, optimizer_type='adam')
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            lr=1e-3,
+            min_lr=1e-5,
+            weight_decay=0.1,
+            decoupled_weight_decay=True,
+            apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm,
+        )
+        standard_overrides = get_standard_config_overrides(
+            optimizer_config, scaling_policy=scaling_policy
+        )
+        scaling_overrides = get_scaling_config_overrides(optimizer_config, scaling_policy)
+        return {**standard_overrides, **scaling_overrides}
+
+    def test_depth_mup_adamw_keeps_norm_and_unknown_vectors_no_decay(self):
+        """Depth-MuP AdamW must not re-enable WD for norms or unclassified vectors."""
+        overrides = self._depth_mup_adamw_overrides()
+
+        hidden_matrix = torch.nn.Parameter(torch.zeros(4, 4))
+        hidden_bias = torch.nn.Parameter(torch.zeros(4))
+        norm_weight = torch.nn.Parameter(torch.zeros(4))
+        qk_norm_weight = torch.nn.Parameter(torch.zeros(4))
+        unknown_vector = torch.nn.Parameter(torch.zeros(4))
+
+        hidden_matrix_override = _combined_override_for_param(
+            overrides, hidden_matrix, 'decoder.layers.0.mlp.linear_fc2.weight'
+        )
+        hidden_bias_override = _combined_override_for_param(
+            overrides, hidden_bias, 'decoder.layers.0.mlp.linear_fc2.bias'
+        )
+        norm_override = _combined_override_for_param(
+            overrides, norm_weight, 'decoder.layers.0.input_layernorm.weight'
+        )
+        qk_norm_override = _combined_override_for_param(
+            overrides, qk_norm_weight, 'decoder.layers.0.self_attention.q_layernorm.weight'
+        )
+        unknown_vector_override = _combined_override_for_param(
+            overrides, unknown_vector, 'decoder.layers.0.unclassified_vector'
+        )
+
+        assert hidden_matrix_override['wd_mult'] == pytest.approx(4.0)
+        assert 'wd_mult' not in hidden_bias_override
+        assert norm_override['wd_mult'] == 0.0
+        assert qk_norm_override['wd_mult'] == 0.0
+        assert unknown_vector_override['wd_mult'] == 0.0
+
+    def test_depth_mup_adamw_qk_layernorm_wd_opt_in_is_narrow(self):
+        """The q/k layernorm WD opt-in must not affect ordinary norm no-decay skips."""
+        overrides = self._depth_mup_adamw_overrides(apply_wd_to_qk_layernorm=True)
+
+        qk_norm_weight = torch.nn.Parameter(torch.zeros(4))
+        norm_weight = torch.nn.Parameter(torch.zeros(4))
+
+        qk_norm_override = _combined_override_for_param(
+            overrides, qk_norm_weight, 'decoder.layers.0.self_attention.k_layernorm.weight'
+        )
+        norm_override = _combined_override_for_param(
+            overrides, norm_weight, 'decoder.layers.0.post_attention_layernorm.weight'
+        )
+
+        assert qk_norm_override.get('wd_mult') is None
+        assert norm_override['wd_mult'] == 0.0
 
     def test_sgd_scales_vector_like_lr_only(self):
         """SGD scales vector-like params by width_mult; hidden params keep base LR."""

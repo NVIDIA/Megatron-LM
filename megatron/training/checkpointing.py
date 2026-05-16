@@ -190,7 +190,11 @@ def check_checkpoint_args(checkpoint_args):
 _CHECKPOINT_SCALING_ARG_DEFAULTS = {
     'scaling_recipe': 'none',
     'scaling_base_hidden_size': None,
+    'scaling_base_num_layers': None,
     'scaling_base_head_dim': None,
+    'scaling_residual_branch_depth_power': None,
+    'scaling_hidden_lr_depth_power': None,
+    'scaling_block_out_proj_init_depth_power': None,
     'use_mup': False,
     'mup_width_mult': 1.0,
     '_mup_width_mult_explicit': False,

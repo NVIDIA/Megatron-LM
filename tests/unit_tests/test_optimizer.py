@@ -75,7 +75,7 @@ def test_param_group_identifier_tuple_tolerates_missing_optional_keys():
 
     ident = get_param_group_identifier_tuple(group)
 
-    assert ident == (1.0, 1.0, False, False)
+    assert ident == (1.0, 1.0, False, False, None, None)
 
 
 def test_param_group_identifier_tuple_reads_pre_keys_and_optional_fields():
@@ -88,7 +88,7 @@ def test_param_group_identifier_tuple_reads_pre_keys_and_optional_fields():
 
     ident = get_param_group_identifier_tuple(group)
 
-    assert ident == (0.0, 0.5, False, True)
+    assert ident == (0.0, 0.5, False, True, None, None)
 
 
 def test_param_group_identifier_tuple_defaults_missing_legacy_fields():
@@ -107,6 +107,8 @@ def test_param_group_matching_ignores_mutable_scheduler_values_on_resume():
         "is_decoupled_lr": False,
         "max_lr": 2e-4,
         "min_lr": 2e-6,
+        "eps": 1e-8,
+        "optimizer": "adam",
         "params": [0],
     }
     checkpoint_group = {
@@ -116,6 +118,8 @@ def test_param_group_matching_ignores_mutable_scheduler_values_on_resume():
         "is_decoupled_lr": False,
         "max_lr": 1e-4,
         "min_lr": 1e-6,
+        "eps": 1e-8,
+        "optimizer": "adam",
         "params": [7],
     }
 
