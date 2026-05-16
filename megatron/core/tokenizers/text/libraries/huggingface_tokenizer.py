@@ -215,7 +215,12 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         Returns a list of the additional special tokens (excluding bos, eos, pad, unk).
         Used to return sentinel tokens for e.g. T5.
         """
-        return [self.token_to_id(token) for token in self.additional_special_tokens]
+        # Delegate to the underlying HF tokenizer rather than reading the
+        # mirrored ``self.additional_special_tokens`` attribute: that mirror is
+        # only populated when ``additional_special_tokens`` is in HF's
+        # ``SPECIAL_TOKENS_ATTRIBUTES``, which is not guaranteed across
+        # transformers versions.
+        return self.tokenizer.additional_special_tokens_ids
 
     def text_to_tokens(self, text: str) -> List[str]:
         """Converts text to tokens."""
