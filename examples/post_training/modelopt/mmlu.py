@@ -9,7 +9,6 @@ instead of autoregressively generating tokens.
 
 import argparse
 import functools
-import importlib
 import os
 import sys
 import warnings
@@ -21,22 +20,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import modelopt.torch.quantization as mtq
 from modelopt.torch.utils.plugins import megatron_mmlu
 from utils import get_hf_tokenizer
-
-# WAR for modelopt <= 0.44: megatron_prefill's logits slice is non-contiguous when sequence
-# parallelism pads seq_length to a multiple of TP; broadcast_from_last_pipeline_stage asserts
-# contiguity. Fixed upstream for 0.45. The plugins package re-exports `megatron_generate` as a
-# function and shadows the submodule, so import the submodule explicitly via importlib.
-_mg_plugin = importlib.import_module("modelopt.torch.utils.plugins.megatron_generate")
-_orig_broadcast = _mg_plugin.broadcast_from_last_pipeline_stage
-
-
-def _broadcast_contiguous(size, dtype, tensor=None, pp_group=None):
-    if tensor is not None:
-        tensor = tensor.contiguous()
-    return _orig_broadcast(size, dtype, tensor, pp_group)
-
-
-_mg_plugin.broadcast_from_last_pipeline_stage = _broadcast_contiguous
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
