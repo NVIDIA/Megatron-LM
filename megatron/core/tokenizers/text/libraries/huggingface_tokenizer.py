@@ -141,6 +141,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         if additional_special_tokens is not None:
             special_tokens_dict["additional_special_tokens"] = additional_special_tokens
 
+        # Remember the requested list so we can return its IDs reliably even
+        # if the underlying HF tokenizer doesn't surface it via
+        # ``additional_special_tokens`` after ``add_special_tokens``.
+        self._additional_special_tokens = list(additional_special_tokens or [])
+
         new_tokens_in_vocab = []
         for token in [mask_token, bos_token, eos_token, pad_token, sep_token, cls_token, unk_token]:
             if token is not None and token not in self.tokenizer.get_vocab():
@@ -216,10 +221,14 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         Used to return sentinel tokens for e.g. T5.
         """
         # ``additional_special_tokens_ids`` was removed from HF's
-        # ``SpecialTokensMixin`` in recent transformers releases, so we
-        # compute it from the (still-present) ``additional_special_tokens``
-        # string list via ``convert_tokens_to_ids``.
-        tokens = getattr(self.tokenizer, "additional_special_tokens", None) or []
+        # ``SpecialTokensMixin`` in recent transformers releases, and the
+        # ``additional_special_tokens`` list on the underlying tokenizer is
+        # not reliably populated after ``add_special_tokens`` on those
+        # versions. Use the constructor-supplied list and convert via the
+        # tokenizer's own ``convert_tokens_to_ids``.
+        tokens = self._additional_special_tokens or getattr(
+            self.tokenizer, "additional_special_tokens", None
+        ) or []
         if not tokens:
             return []
         return self.tokenizer.convert_tokens_to_ids(tokens)
