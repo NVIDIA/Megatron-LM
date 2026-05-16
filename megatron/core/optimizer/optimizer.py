@@ -353,6 +353,13 @@ class MegatronOptimizer(ABC):
         for param_idx, param_state in state_dict['state'].items():
             param_state['step'] = copy.deepcopy(step)
 
+    @staticmethod
+    def _checkpoint_common_step(step: Union[int, torch.Tensor]) -> Union[int, torch.Tensor]:
+        """Keep shared optimizer step safe for checkpoint common-state broadcasts."""
+        if torch.is_tensor(step):
+            return step.detach().cpu().clone()
+        return copy.deepcopy(step)
+
     def offload_to_cpu(self):
         """Function used for RL training.
         Move optimizer state tensors to CPU to free GPU memory during inference."""
@@ -855,7 +862,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
         if step:
-            state_dict['optimizer']['state']['common_step'] = step
+            state_dict['optimizer']['state']['common_step'] = self._checkpoint_common_step(step)
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -1043,7 +1050,7 @@ class FP32Optimizer(MegatronOptimizer):
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
         if step:
-            state_dict['state']['common_step'] = step
+            state_dict['state']['common_step'] = self._checkpoint_common_step(step)
         return state_dict
 
 
