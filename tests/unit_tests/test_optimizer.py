@@ -24,7 +24,7 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.optimizer import (
-    get_param_group_identifier_sort_key,
+    MegatronOptimizer,
     get_param_group_identifier_tuple,
 )
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
@@ -78,8 +78,7 @@ def test_param_group_identifier_tuple_tolerates_missing_optional_keys():
 
     ident = get_param_group_identifier_tuple(group)
 
-    assert ident[:4] == (1.0, 1.0, False, False)
-    assert ident[4:] == (None, None, None, None)
+    assert ident == (1.0, 1.0, False, False)
 
 
 def test_param_group_identifier_tuple_reads_pre_keys_and_optional_fields():
@@ -92,38 +91,38 @@ def test_param_group_identifier_tuple_reads_pre_keys_and_optional_fields():
 
     ident = get_param_group_identifier_tuple(group)
 
-    assert ident[:4] == (0.0, 0.5, False, True)
-    assert ident[4:] == (None, None, None, None)
+    assert ident == (0.0, 0.5, False, True)
 
 
-def test_param_group_identifier_tuple_tolerates_and_sorts_optional_resume_fields():
+def test_param_group_matching_ignores_mutable_scheduler_values_on_resume():
     current_group = {
+        "wd_mult": 1.0,
+        "lr_mult": 1.0,
+        "is_expert_parallel": False,
+        "is_decoupled_lr": False,
+        "max_lr": 2e-4,
+        "min_lr": 2e-6,
+        "params": [0],
+    }
+    checkpoint_group = {
         "wd_mult": 1.0,
         "lr_mult": 1.0,
         "is_expert_parallel": False,
         "is_decoupled_lr": False,
         "max_lr": 1e-4,
         "min_lr": 1e-6,
-        "eps": 1e-8,
-        "optimizer": "adam",
+        "params": [7],
     }
-    older_checkpoint_group = {
-        "wd_mult": 1.0,
-        "lr_mult": 1.0,
-        "is_expert_parallel": False,
-        "is_decoupled_lr": False,
-    }
-    mixed_groups = [older_checkpoint_group, current_group]
 
-    current_ident = get_param_group_identifier_tuple(current_group)
-    older_ident = get_param_group_identifier_tuple(older_checkpoint_group)
+    assert get_param_group_identifier_tuple(current_group) == get_param_group_identifier_tuple(
+        checkpoint_group
+    )
 
-    assert current_ident[:4] == older_ident[:4]
-    assert current_ident[4:] == (1e-4, 1e-6, 1e-8, "adam")
-    assert older_ident[4:] == (None, None, None, None)
+    reordered_groups = MegatronOptimizer._filter_and_reorder_param_groups(
+        [current_group], [checkpoint_group]
+    )
 
-    mixed_groups.sort(key=get_param_group_identifier_sort_key)
-    assert mixed_groups == [older_checkpoint_group, current_group]
+    assert reordered_groups == [checkpoint_group]
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
