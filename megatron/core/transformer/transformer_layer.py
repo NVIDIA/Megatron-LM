@@ -305,6 +305,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
+        name: str = None,
     ):
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
@@ -358,6 +359,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             layer_number=self.layer_number,
             **attention_optional_kwargs,
+            name=(name + ".self_attention") if name is not None else None,
         )
 
         # [Module 3: BiasDropoutFusion]
@@ -376,6 +378,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             layer_number=self.layer_number,
             **attention_optional_kwargs,
+            name=(name + ".cross_attention") if name is not None else None,
         )
 
         # [Module 6: BiasDropoutFusion]
@@ -410,7 +413,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "`as_mlp_submodule` classmethod instead.",
             )
         self.mlp = submodules.mlp(
-            config=self.config, pg_collection=pg_collection, is_mtp_layer=self.is_mtp_layer
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=self.is_mtp_layer,
+            name=(name + ".mlp") if name is not None else None,
         )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)

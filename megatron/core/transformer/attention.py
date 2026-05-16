@@ -290,6 +290,7 @@ class Attention(MegatronModule, ABC):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        name: str = None,
     ):
         super().__init__(config=config)
 
@@ -397,6 +398,7 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            name=(name + ".linear_proj") if name is not None else None,
         )
 
         if (
@@ -1380,6 +1382,7 @@ class SelfAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        name: str = None,
     ):
         super().__init__(
             config=config,
@@ -1390,6 +1393,7 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            name=name,
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
@@ -1406,6 +1410,7 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            name=(name + ".linear_qkv") if name is not None else None,
         )
 
         # Resolve which norm class to use for Q and K.
@@ -1789,6 +1794,7 @@ class CrossAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        name: str = None,
     ):
         super().__init__(
             config=config,
@@ -1798,6 +1804,7 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            name=name,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
@@ -1813,6 +1820,7 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            name=(name + ".linear_q") if name is not None else None,
         )
 
         self.linear_kv = submodules.linear_kv(
@@ -1824,6 +1832,7 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            name=(name + ".linear_kv") if name is not None else None,
         )
 
     def get_query_key_value_tensors(
