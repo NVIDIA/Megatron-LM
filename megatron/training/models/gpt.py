@@ -23,7 +23,7 @@ from megatron.core.transformer.enums import AttnBackend
 
 from megatron.training.models.base import ModelConfig, ModelBuilder, compose_hooks
 from megatron.training.vocab_utils import calculate_padded_vocab_size
-from megatron.training.models.base import unimodal_build_distributed_models
+from megatron.training.models.dist_utils import unimodal_build_distributed_models
 
 from megatron.core.transformer.transformer_config import  TransformerConfig
 
@@ -242,9 +242,6 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
 
         Returns:
             The constructed model
-
-        Note:
-            Virtual pipeline model parallelism is not supported for Mamba models.
         """
         transformer_layer_spec = self._model_config.transformer_layer_spec
         if not isinstance(transformer_layer_spec, ModuleSpec):
