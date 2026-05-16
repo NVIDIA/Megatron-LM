@@ -43,7 +43,30 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
     Since each sub-sample may be routed to different DPxCP ranks,
     we unpack the sample here to avoid unnecessarily transferring
     the entire packed sample.
+
+    Two input shapes are accepted:
+
+      * **Pre-packed** (e.g. :class:`SFTDataset`): each sample carries a
+        ``cu_seqlens`` tensor and the tokens of multiple sub-samples
+        concatenated together. We slice them apart and synthesize
+        ``original_seq_len`` / ``padded_seq_len`` from the cu_seqlens deltas.
+
+      * **Already unpacked** (e.g. :class:`VarlenDataset`): each sample is a
+        single sub-sample that already carries ``padded_seq_len`` (and
+        usually ``original_seq_len``). We just normalize the leading batch
+        dimension introduced by the default collate_fn and return as-is.
     """
+    # Short-circuit for datasets that already emit one sub-sample per index.
+    if batch and "padded_seq_len" in batch[0]:
+        for sample in batch:
+            for key in sample.keys():
+                if sample[key].ndim == 2 and sample[key].shape[0] == 1:
+                    # Drop the redundant batch dim added by collate_fn.
+                    sample[key] = sample[key].squeeze(0)
+            if "original_seq_len" not in sample:
+                sample["original_seq_len"] = sample["padded_seq_len"].clone()
+        return batch
+
     batch_unpacked = []
     dev = batch[0]["tokens"].device
     original_seq_lens = []
