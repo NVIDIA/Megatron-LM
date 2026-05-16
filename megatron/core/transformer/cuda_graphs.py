@@ -25,7 +25,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     get_all_rng_states,
+    get_context_parallel_rng_tracker_name,
     get_cuda_rng_tracker,
+    get_model_and_context_parallel_rng_tracker_name,
     is_checkpointing,
 )
 from megatron.core.transformer.enums import CudaGraphScope
@@ -2360,7 +2362,11 @@ class TECudaGraphHelper:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
             sample_args, kwargs = self._get_cuda_graph_input_data()
             if self.config.sequence_parallel:
-                rng_context = get_cuda_rng_tracker().fork()
+                rng_context = get_cuda_rng_tracker().fork(
+                    get_model_and_context_parallel_rng_tracker_name()
+                )
+            elif self.config.context_parallel_size > 1:
+                rng_context = get_cuda_rng_tracker().fork(get_context_parallel_rng_tracker_name())
             else:
                 rng_context = nullcontext()
             with rng_context:

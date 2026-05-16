@@ -214,7 +214,9 @@ class DotProductAttention(MegatronModule):
         # seem a bit unusual, but is taken from the original Transformer paper.
 
         if not self.config.sequence_parallel:
-            with tensor_parallel.get_cuda_rng_tracker().fork():
+            with tensor_parallel.get_cuda_rng_tracker().fork(
+                tensor_parallel.get_model_and_context_parallel_rng_tracker_name()
+            ):
                 attention_probs = self.attention_dropout(attention_probs)
         else:
             attention_probs = self.attention_dropout(attention_probs)
