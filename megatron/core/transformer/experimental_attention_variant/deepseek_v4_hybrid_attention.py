@@ -114,17 +114,23 @@ class DSv4HybridAttention(Attention):
             compress_ratio = self.config.csa_compress_ratios[layer_idx]
         else:
             compress_ratio = self.config.csa_compress_ratios[layer_number - 1]
-        rope_base = self.config.rotary_base
-        if compress_ratio > 1:
-            rope_base = self.config.csa_compress_rotary_base
-        if self.config.rope_type == "rope":
+        use_compressed_yarn = compress_ratio > 1
+        rope_base = (
+            self.config.csa_compress_rotary_base
+            if use_compressed_yarn
+            else self.config.rotary_base
+        )
+        self._dsv4_compress_ratio = compress_ratio
+        self._dsv4_rope_base = rope_base
+        self._dsv4_uses_yarn_rope = use_compressed_yarn
+        if not use_compressed_yarn:
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
                 rotary_base=rope_base,
                 cp_group=self.pg_collection.cp,
             )
-        elif self.config.rope_type == "yarn":
+        else:
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_base=rope_base,
@@ -135,11 +141,6 @@ class DSv4HybridAttention(Attention):
                 mscale=self.config.mscale,
                 mscale_all_dim=self.config.mscale_all_dim,
                 cp_group=self.pg_collection.cp,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported RoPE type: {self.config.rope_type}, supported types are "
-                "'rope' and 'yarn'"
             )
 
         core_attn_extra_kwargs = {
@@ -317,7 +318,7 @@ class DSv4HybridAttention(Attention):
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
-        if self.config.rope_type == "rope":
+        if not self._dsv4_uses_yarn_rope:
             rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion:
@@ -518,7 +519,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
+        if not self._dsv4_uses_yarn_rope:
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion:
