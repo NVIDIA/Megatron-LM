@@ -540,7 +540,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         warnings.warn(
             "TransformerLayer._get_layer_offset is deprecated."
-            "Please use get_transformer_layer_offset instead."
+            "Please use get_transformer_layer_offset instead.",
+            DeprecationWarning,
+            stacklevel=2,
         )
         return get_transformer_layer_offset(config)
 
