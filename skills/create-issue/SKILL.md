@@ -137,7 +137,7 @@ Use the bug-report template body structure:
 **Describe the bug**
 
 CI test `<failed-test-node-id>` failed in job [`<job-name>`](<job-url>).
-Tag the [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall) to get oncall's attention to this issue.
+Tag @NVIDIA/mcore-oncall to get oncall's attention to this issue.
 
 **Failing run**
 

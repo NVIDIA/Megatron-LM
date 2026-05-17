@@ -10,7 +10,7 @@ assignees: ''
 **Is your feature request related to a problem? Please describe.**
 A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
 
-Tag the [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall) 
+Tag @NVIDIA/mcore-oncall
 to get oncall's attention to this issue.
 
 **Describe the solution you'd like**
