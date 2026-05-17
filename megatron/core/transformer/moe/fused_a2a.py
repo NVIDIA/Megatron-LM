@@ -10,11 +10,36 @@ from megatron.core.utils import internal_api
 
 try:
     from deep_ep import Buffer
-    from deep_ep.utils import EventHandle, EventOverlap
 
     HAVE_DEEP_EP = True
 except ImportError:
     HAVE_DEEP_EP = False
+
+# DeepEP V2 introduces `ElasticBuffer` in place of `Buffer`
+# (deepseek-ai/DeepEP PR #605, merged 2026-04-29). When installed, V2
+# is preferred automatically: the MoE call sites below branch on
+# `HAVE_DEEP_EP_V2` and translate the V1 5/6-tuple returns and layout
+# kwargs to V2's 5-tuple dispatch / 3-tuple combine contract. When V2
+# is absent, the legacy `Buffer` code path runs unchanged, so this is
+# a backwards-compatible addition (mirrors the `HybridEPBuffer` probe
+# already present below).
+try:
+    from deep_ep import ElasticBuffer
+
+    HAVE_DEEP_EP_V2 = True
+except ImportError:
+    HAVE_DEEP_EP_V2 = False
+
+# `EventHandle` / `EventOverlap` live in `deep_ep.utils` in V1. In V2
+# (PR #605 onwards) `EventOverlap` is defined in `deep_ep.utils.event`
+# but is not re-exported from the package `__init__`. Import with
+# graceful fall-through so the module loads under either flavour.
+if HAVE_DEEP_EP or HAVE_DEEP_EP_V2:
+    try:
+        from deep_ep.utils import EventHandle, EventOverlap  # noqa: F401
+    except ImportError:
+        from deep_ep.utils import EventHandle  # noqa: F401
+        from deep_ep.utils.event import EventOverlap  # noqa: F401
 
 import torch
 
@@ -33,17 +58,95 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
     return x.size(1) * max(x.element_size(), 2)
 
 
+# V2 MoE-shape ctor parameters. `num_max_tokens_per_rank` is baked into
+# V2's JIT kernel template instantiation (dispatch.hpp:138,150 in
+# DeepEP), so ranks that disagree compile incompatible binaries and
+# the cross-node Gin barrier (kHybridDispatchTag0) can hang with
+# `signal: 1, target: 2`. Pinning at construction ensures template
+# homogeneity across ranks (matches DeepEP `tests/elastic/test_ep.py`
+# reference harness; also used in the downstream reproduction at
+# https://github.com/antonai-work/nemo-rl-deepep-v2-efa).
+_V2_NUM_MAX_TOKENS_PER_RANK = int(
+    os.environ.get("MCORE_DEEPEP_V2_MAX_TOKENS_PER_RANK", "8192")
+)
+_V2_HIDDEN = int(os.environ.get("MCORE_DEEPEP_V2_HIDDEN", "7168"))
+_V2_NUM_TOPK = int(os.environ.get("MCORE_DEEPEP_V2_NUM_TOPK", "8"))
+
+
+def _is_efa_environment() -> bool:
+    """Detect AWS EFA fabric so we can prefer V2's MoE-shape ctor and
+    auto-cap the Queue-Pair budget. The byte-pool ctor has been
+    observed to hang the tag-6 Gin cross-node barrier on EFA; the
+    MoE-shape ctor does not (validated downstream at
+    https://github.com/antonai-work/nemo-rl-deepep-v2-efa)."""
+    return (
+        os.environ.get("FI_PROVIDER", "") == "efa"
+        or os.environ.get("DEEP_EP_BACKEND", "") == "nccl"
+    )
+
+
 def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     """Get or create a buffer for all-to-all communication.
+
+    Prefers DeepEP V2 `ElasticBuffer` when available, otherwise falls
+    back to the legacy `Buffer`. The returned object exposes
+    `.group`, `.num_nvl_bytes`, `.num_rdma_bytes` in both cases so
+    cache invalidation below is compatible.
 
     Args:
         group (torch.distributed.ProcessGroup): Process group for communication
         hidden_bytes (int): Number of hidden bytes needed
 
     Returns:
-        Buffer: Communication buffer
+        Buffer or ElasticBuffer: Communication buffer
     """
     global _buffer
+    if HAVE_DEEP_EP_V2:
+        # V2 collapses the dispatch/combine Config pair into a single
+        # hint call. Fall back gracefully if the hint itself fails.
+        num_nvl_bytes, num_rdma_bytes = 0, 0
+        try:
+            hint_bytes = ElasticBuffer.get_buffer_size_hint(
+                group=group,
+                num_max_tokens_per_rank=_V2_NUM_MAX_TOKENS_PER_RANK,
+                hidden=_V2_HIDDEN,
+                num_topk=_V2_NUM_TOPK,
+                use_fp8_dispatch=False,
+                allow_hybrid_mode=True,
+                allow_multiple_reduction=True,
+            )
+            # Book-keeping only; V2 doesn't split NVL / RDMA.
+            num_nvl_bytes = hint_bytes
+            num_rdma_bytes = hint_bytes
+        except Exception:
+            pass
+
+        if (
+            _buffer is None
+            or _buffer.group != group
+            or getattr(_buffer, "num_nvl_bytes", 0) < num_nvl_bytes
+            or getattr(_buffer, "num_rdma_bytes", 0) < num_rdma_bytes
+        ):
+            # EFA QP auto-cap: pass num_allocated_qps=0 so V2 clamps
+            # to the per-fabric safe ceiling. Explicit non-zero values
+            # over-subscribe the aws-ofi-nccl 128-slot shared GIN ring
+            # (CUDA 719 at dispatch.hpp:183).
+            num_qps = 0 if _is_efa_environment() else 0
+            _buffer = ElasticBuffer(
+                group=group,
+                num_max_tokens_per_rank=_V2_NUM_MAX_TOKENS_PER_RANK,
+                hidden=_V2_HIDDEN,
+                num_topk=_V2_NUM_TOPK,
+                use_fp8_dispatch=False,
+                allow_hybrid_mode=True,
+                num_allocated_qps=num_qps,
+            )
+            # Emulate the V1 attributes used by the cache-invalidation
+            # check above (ElasticBuffer doesn't expose them natively).
+            _buffer.num_nvl_bytes = num_nvl_bytes
+            _buffer.num_rdma_bytes = num_rdma_bytes
+        return _buffer
+
     num_nvl_bytes, num_rdma_bytes = 0, 0
     for config in (
         Buffer.get_dispatch_config(group.size()),
@@ -89,6 +192,71 @@ class FusedDispatch(torch.autograd.Function):
             previous_event = EventOverlap(EventHandle())
         # Calculate layout before actual dispatch
         buffer = get_buffer(group, get_hidden_bytes(x))
+
+        if HAVE_DEEP_EP_V2:
+            # V2 `ElasticBuffer.dispatch` infers layout internally from
+            # `topk_idx`, returns a 5-tuple `(recv_x, recv_topk_idx,
+            # recv_topk_weights, EPHandle, event)`, and carries
+            # `num_recv_tokens_per_expert_list` on the handle.
+            # `async_finish` is renamed `async_with_compute_stream`.
+            # V2 contract (buffer.hpp:483): `previous_event` requires
+            # `allocate_on_comm_stream=True`; seed via `capture()` if
+            # the caller didn't provide one.
+            _prev_evt = None
+            _alloc_on_comm = allocate_on_comm_stream
+            if async_finish:
+                try:
+                    _prev_evt = buffer.capture()
+                    _alloc_on_comm = True
+                except Exception:
+                    _prev_evt = None
+
+            recv_x, recv_token_indices, recv_token_probs, handle, after_event = (
+                buffer.dispatch(
+                    x,
+                    topk_idx=token_indices,
+                    topk_weights=token_probs,
+                    num_experts=num_experts,
+                    num_max_tokens_per_rank=_V2_NUM_MAX_TOKENS_PER_RANK,
+                    num_sms=0,
+                    num_qps=0,
+                    previous_event=_prev_evt,
+                    async_with_compute_stream=async_finish,
+                    allocate_on_comm_stream=_alloc_on_comm,
+                    do_expand=False,
+                )
+            )
+
+            if async_finish:
+                # V2 returns a raw cuda Event when `async_with_compute_stream`
+                # is set; wrap via EventOverlap for V1 stream-wait.
+                EventOverlap(after_event).current_stream_wait() \
+                    if after_event is not None else None
+
+            ctx.group = group
+            ctx.handle = handle
+            ctx.async_finish = async_finish
+            ctx.allocate_on_comm_stream = allocate_on_comm_stream
+
+            num_recv_tokens_per_expert_list = getattr(
+                handle, "num_recv_tokens_per_expert_list", None
+            )
+            if isinstance(num_recv_tokens_per_expert_list, torch.Tensor):
+                num_recv_tokens_per_expert_list = (
+                    num_recv_tokens_per_expert_list.tolist()
+                )
+            if num_recv_tokens_per_expert_list is None:
+                num_recv_tokens_per_expert_list = []
+            tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+
+            return (
+                recv_x,
+                recv_token_indices,
+                recv_token_probs,
+                tokens_per_expert,
+                handle,
+            )
+
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -146,6 +314,34 @@ class FusedDispatch(torch.autograd.Function):
         """Backward pass of fused dispatch."""
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
         handle = ctx.handle
+
+        if HAVE_DEEP_EP_V2:
+            # V2 combine returns `(grad_x, grad_topk_weights, event)`.
+            # `num_sms=0` tells V2 to reuse `handle.num_sms` from the
+            # forward dispatch — a mismatch triggers CUDA 719 at
+            # csrc/jit/handle.hpp:86.
+            _prev_evt = None
+            _alloc_on_comm = ctx.allocate_on_comm_stream
+            if ctx.async_finish:
+                try:
+                    _prev_evt = buffer.capture()
+                    _alloc_on_comm = True
+                except Exception:
+                    _prev_evt = None
+            grad_x, grad_token_probs, after_event = buffer.combine(
+                grad_output.contiguous(),
+                handle,
+                topk_weights=grad_token_probs.float(),
+                num_sms=0,
+                num_qps=0,
+                previous_event=_prev_evt,
+                async_with_compute_stream=ctx.async_finish,
+                allocate_on_comm_stream=_alloc_on_comm,
+            )
+            if ctx.async_finish and after_event is not None:
+                EventOverlap(after_event).current_stream_wait()
+            return grad_x, None, grad_token_probs, None, None, None, None
+
         previous_event = None
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
@@ -169,10 +365,37 @@ class FusedCombine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False):
         """Forward pass of fused combine."""
+        buffer = get_buffer(group, get_hidden_bytes(x))
+
+        if HAVE_DEEP_EP_V2:
+            _prev_evt = None
+            _alloc_on_comm = allocate_on_comm_stream
+            if async_finish:
+                try:
+                    _prev_evt = buffer.capture()
+                    _alloc_on_comm = True
+                except Exception:
+                    _prev_evt = None
+            combined_x, _, after_event = buffer.combine(
+                x,
+                handle=handle,
+                num_sms=0,
+                num_qps=0,
+                previous_event=_prev_evt,
+                async_with_compute_stream=async_finish,
+                allocate_on_comm_stream=_alloc_on_comm,
+            )
+            if async_finish and after_event is not None:
+                EventOverlap(after_event).current_stream_wait()
+            ctx.handle = handle
+            ctx.group = group
+            ctx.async_finish = async_finish
+            ctx.allocate_on_comm_stream = allocate_on_comm_stream
+            return combined_x, None
+
         previous_event = None
         if async_finish:
             previous_event = EventOverlap(EventHandle())
-        buffer = get_buffer(group, get_hidden_bytes(x))
         combined_x, _, after_event = buffer.combine(
             x,
             handle=handle,
@@ -193,10 +416,43 @@ class FusedCombine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, previous_event=None):
         """Backward pass of fused combine."""
+        buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
+
+        if HAVE_DEEP_EP_V2:
+            # V2 dispatch reuses the forward handle; backward receives a
+            # 5-tuple (recv_x, recv_topk_idx, recv_topk_weights, handle,
+            # event). We only need the first element (grad_x).
+            # V2 `ElasticBuffer.dispatch` at elastic.py:768 calls
+            # `get_theoretical_num_sms(num_experts, num_topk)` before
+            # resolving `num_experts` from the handle, so we must pass
+            # it explicitly when `num_sms=0`.
+            _prev_evt = None
+            _alloc_on_comm = ctx.allocate_on_comm_stream
+            if ctx.async_finish:
+                try:
+                    _prev_evt = buffer.capture()
+                    _alloc_on_comm = True
+                except Exception:
+                    _prev_evt = None
+            _handle_num_experts = getattr(ctx.handle, "num_experts", None)
+            grad_x, _, _, _, after_event = buffer.dispatch(
+                grad_output.contiguous(),
+                handle=ctx.handle,
+                num_experts=_handle_num_experts,
+                num_sms=0,
+                num_qps=0,
+                previous_event=_prev_evt,
+                async_with_compute_stream=ctx.async_finish,
+                allocate_on_comm_stream=_alloc_on_comm,
+                do_expand=False,
+            )
+            if ctx.async_finish and after_event is not None:
+                EventOverlap(after_event).current_stream_wait()
+            return grad_x, None, None, None, None
+
         previous_event = None
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
-        buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
         grad_x, _, _, _, _, after_event = buffer.dispatch(
             grad_output.contiguous(),
             handle=ctx.handle,
@@ -210,7 +466,7 @@ class FusedCombine(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
-if HAVE_DEEP_EP:
+if HAVE_DEEP_EP or HAVE_DEEP_EP_V2:
 
     def fused_dispatch(
         x,
@@ -259,8 +515,16 @@ if HAVE_DEEP_EP:
         return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
     def set_deepep_num_sms(num_sms):
-        """Sets the number of SMs to use for DeepEP"""
-        Buffer.set_num_sms(num_sms)
+        """Sets the number of SMs to use for DeepEP.
+
+        Routes to `ElasticBuffer.set_num_sms` when DeepEP V2 is
+        available (the V2 `Buffer` symbol may not exist), otherwise to
+        legacy `Buffer.set_num_sms`.
+        """
+        if HAVE_DEEP_EP_V2:
+            ElasticBuffer.set_num_sms(num_sms)
+        else:
+            Buffer.set_num_sms(num_sms)
 
 else:
     fused_dispatch = None
