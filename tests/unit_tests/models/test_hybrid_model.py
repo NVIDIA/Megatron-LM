@@ -3,6 +3,7 @@
 import os
 from datetime import timedelta
 from itertools import accumulate
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -18,7 +19,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -26,6 +27,26 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_hybrid_logging_process_groups_are_paired():
+    tp_group = object()
+    dp_cp_group = object()
+
+    assert _hybrid_logging_pg_kwargs(SimpleNamespace()) == {}
+    assert _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group, dp_cp=dp_cp_group)) == {
+        'tp_group': tp_group,
+        'dp_cp_group': dp_cp_group,
+    }
+
+    with pytest.raises(ValueError, match="tp.*dp_cp"):
+        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group))
+    with pytest.raises(ValueError, match="tp.*dp_cp"):
+        _hybrid_logging_pg_kwargs(SimpleNamespace(dp_cp=dp_cp_group))
+    with pytest.raises(ValueError, match="tp.*dp_cp"):
+        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group, dp_cp=None))
+    with pytest.raises(ValueError, match="tp.*dp_cp"):
+        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=None, dp_cp=dp_cp_group))
 
 
 class TestHybridModel:
