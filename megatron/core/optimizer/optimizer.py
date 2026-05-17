@@ -94,7 +94,60 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
-param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+# Per-group keys used to uniquely identify a param_group during save/load matching.
+# Used by ``DistributedOptimizer.load_state_dict`` and ``MegatronOptimizer._reorder_param_groups``
+# to map saved param_groups onto current param_groups by behavioral equivalence.
+#
+# This MUST cover every per-group field that influences scheduler or optimizer behavior;
+# otherwise two groups that differ only in a missing key (e.g. ``max_lr``) will collide
+# in the matching dict and one will silently overwrite the other on load. That's a
+# correctness bug — the load returns silently but the LR/WD applied at the next
+# optimizer step is wrong, leading to loss explosion on a converged-enough model.
+#
+# Source of truth for the user-overridable fields is
+# :class:`megatron.core.optimizer_param_scheduler.ParamGroupOverride` (the keys the
+# scheduler reads from each param_group via ``param_group.get(...)``):
+# ``max_lr``, ``min_lr``, ``start_wd``, ``end_wd``, ``wd_mult``, ``optimizer``.
+# We pull those keys directly from that TypedDict's ``__optional_keys__`` so future
+# additions to ``ParamGroupOverride`` automatically extend the identifier.
+#
+# The remaining keys (``lr_mult``, ``is_expert_parallel``, ``is_decoupled_lr``) are
+# structural flags set by ``_get_param_groups`` (in this module's ``__init__.py``)
+# on every param_group at construction time. They aren't part of ``ParamGroupOverride``
+# (users don't override them directly; they're implied by ``decoupled_lr`` config and
+# expert-parallel sharding), so we list them explicitly.
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
+
+
+def _param_group_override_keys() -> tuple[str, ...]:
+    """Return every field declared on ``ParamGroupOverride``.
+
+    For any TypedDict, ``__annotations__.keys() == __required_keys__ | __optional_keys__``
+    — the (required, optional) pair is just a *partition* of the declared set
+    based on the TypedDict's totality choice and any ``Required[]`` /
+    ``NotRequired[]`` wrappers. We want the whole declared set, regardless of
+    how it's partitioned, so we read ``__annotations__`` directly. Reading just
+    one side of the partition would silently miss fields if a future maintainer
+    flipped totality or introduced wrappers:
+
+        total=False (current):  optional={max_lr, min_lr, ...}, required=∅
+        total=True:             required={max_lr, min_lr, ...}, optional=∅
+        mixed Required/NotRequired:  fields split between the two sides
+    """
+    return tuple(sorted(_ParamGroupOverride.__annotations__.keys()))
+
+
+param_group_identifier_keys = (
+    # Per-group user-overridable keys (single source of truth: ParamGroupOverride).
+    # The scheduler reads ``max_lr``/``min_lr`` in ``get_lr`` and ``start_wd``/``end_wd``
+    # in ``get_wd``; ``wd_mult`` is multiplied into ``weight_decay`` in ``step``;
+    # ``optimizer`` selects per-group optimizer class.
+    *_param_group_override_keys(),
+    # Optimizer-side structural flags (not user-overridable via ParamGroupOverride):
+    'lr_mult',
+    'is_expert_parallel',
+    'is_decoupled_lr',
+)
 
 
 class MegatronOptimizer(ABC):
@@ -411,9 +464,10 @@ class MegatronOptimizer(ABC):
     def _filter_and_reorder_param_groups(
         current_groups: List[Dict], state_dict_groups: List[Dict]
     ) -> List[Dict]:
-        """Filter and reorder state_dict parameter groups to match current optimizer groups.
-        Keys used for matching align with those from _get_param_groups:
-        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
+        """Pair each current param_group with its saved counterpart by identifier tuple.
+
+        Construction order isn't part of the checkpoint, so we match by a tuple of
+        per-group config (``param_group_identifier_keys``) rather than by position.
 
         Args:
             current_groups (List[Dict]): Parameter groups from the current optimizer instance.
@@ -425,24 +479,32 @@ class MegatronOptimizer(ABC):
         Raises:
             ValueError: If parameter groups in state dict don't match current optimizer.
         """
-        # Define groups order that is needed in the current optimizer (coming from runtime)
-        needed_groups = [
-            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
-            for g in current_groups
-        ]
+        # Sentinel for identifier keys absent from a group (e.g. optional ParamGroupOverride
+        # fields like ``start_wd``). Same sentinel everywhere → groups missing the same keys
+        # still match each other.
+        _PG_KEY_MISSING = "__mcore_pg_key_missing__"
 
-        # Keep state_dict param group order since groups are LocalNonpersistentObject
-        # and their order is determined at runtime, not from the checkpoint.
+        def _identifier_for(group: dict) -> tuple:
+            out = []
+            for key in param_group_identifier_keys:
+                # NeMo aliases ``wd_mult``/``lr_mult`` as ``pre_wd_mult``/``pre_lr_mult``.
+                if key in group:
+                    out.append(group[key])
+                elif f"pre_{key}" in group:
+                    out.append(group[f"pre_{key}"])
+                else:
+                    out.append(_PG_KEY_MISSING)
+            return tuple(out)
+
+        needed_groups = [_identifier_for(g) for g in current_groups]
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
-        loaded_groups_map = {
-            tuple(
-                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-                group[key] if key in group else group[f"pre_{key}"]
-                for key in param_group_identifier_keys
-            ): group
-            for group in state_dict_groups
-        }
+        # Duplicate identifiers here silently clobber: two saved groups with the same tuple
+        # collapse to whichever was inserted last, and one current group inherits the wrong
+        # override state (``max_lr`` etc.). Params are unaffected — they come from the
+        # current optimizer below — but the next step runs at the wrong LR / WD. Adding the
+        # distinguishing field to ``param_group_identifier_keys`` is the fix. See
+        # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
+        loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):
