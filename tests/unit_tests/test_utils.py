@@ -9,12 +9,12 @@ from unittest.mock import patch
 import mock
 import numpy as np
 import pytest
-from megatron.core._rank_utils import safe_get_world_size
 import torch
 
 import megatron.core.utils as util
 import megatron.training.utils as training_util
 from megatron.core import config
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
