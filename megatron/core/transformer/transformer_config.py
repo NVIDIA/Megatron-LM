@@ -462,6 +462,10 @@ class TransformerConfig(ModelParallelConfig):
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
+    use_transformer_engine_op_fuser: bool = False
+    """If True, submodules may use Transformer Engine's operation fuser
+    API to enable advanced fusions."""
+
     ####################
     # activation recomputation
     ####################
@@ -744,6 +748,16 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
+    moe_single_grouped_weight: bool = False
+    """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``.
+    """
+
+    moe_single_grouped_bias: bool = False
+    """When using TE GroupedLinear for MoE experts, store expert biases as a single grouped
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``
+    and ``add_bias_linear=True``."""
+
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
@@ -832,6 +846,15 @@ class TransformerConfig(ModelParallelConfig):
     """Number of CUDA thread blocks for the unpermute part in HybridEP.
     When permute_fusion_into_hybridep is True, this sets the number
     of SMs for the unpermute part (only 1 block per SM)."""
+
+    moe_mlp_glu_interleave_size: Optional[int] = None
+    """When set, GLU activations in the MoE grouped MLP layer will use a
+    block interleaved format. Instead of interpreting the input tensor
+    as a concatenation of gates and linear units, it will be
+    interpreted as alternating blocks of gates and linear units.
+
+    This data format is experimental and primarily intended to enable
+    advanced fused kernels."""
 
     ##################
     # Context Parallel
@@ -1332,6 +1355,32 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_ffn_hidden_size is set but num_moe_experts is None. "
                     "Please set num_moe_experts or remove moe_ffn_hidden_size."
                 )
+
+        if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
+            if not self.moe_grouped_gemm:
+                raise ValueError(
+                    "moe_single_grouped_weight and moe_single_grouped_bias require "
+                    "moe_grouped_gemm=True."
+                )
+            if not is_te_min_version("2.14.0"):
+                raise ValueError(
+                    "moe_single_grouped_weight and moe_single_grouped_bias require "
+                    f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
+                )
+        if self.moe_single_grouped_weight:
+            # The dist-optimizer's quantized-param shard path on the single-grouped-weight
+            # storage is only validated for fp8 mode with the mxfp8 recipe today; other
+            # combinations have a known numerical issue tracked in upstream PR
+            # NVIDIA/Megatron-LM#4621. Reject at construction time so users don't silently
+            # train on a broken numerical path. (moe_single_grouped_bias is not gated:
+            # biases aren't quantized, so they don't enter the buggy code path.)
+            if self.fp4 or not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "moe_single_grouped_weight is currently supported only with fp8 mode "
+                    "and fp8_recipe='mxfp8'."
+                )
+        if self.moe_single_grouped_bias and not self.add_bias_linear:
+            raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":

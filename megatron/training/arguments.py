@@ -154,11 +154,27 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
-    # Args to disable MSC
-    if not args.enable_msc:
+    # Args to enable MSC (opt-in: disabled by default)
+    if args.disable_msc_deprecated:
+        warn_rank_0(
+            '--disable-msc is deprecated and will be removed in a future release. '
+            'MSC is now disabled by default; pass --enable-msc to opt in.'
+        )
+        # Preserve legacy semantics: --disable-msc forces MSC off, even if
+        # --enable-msc was also passed.
+        args.enable_msc = False
+
+    if args.enable_msc:
+        MultiStorageClientFeature.enable()
+        if not MultiStorageClientFeature.is_enabled():
+            raise RuntimeError(
+                "--enable-msc was passed but the multistorageclient package is not "
+                "installed. Install it with `pip install multi-storage-client`."
+            )
+        warn_rank_0('The MSC feature is enabled.')
+    else:
         MultiStorageClientFeature.disable()
         assert MultiStorageClientFeature.is_enabled() is False
-        warn_rank_0('The MSC feature is disabled.')
 
     return args
 
@@ -3274,8 +3290,13 @@ def _add_experimental_args(parser):
 
 def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
-    group.add_argument('--disable-msc', default=True, action='store_false', dest='enable_msc',
-                       help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
+    group.add_argument('--enable-msc', default=False, action='store_true', dest='enable_msc',
+                       help='Enable the usage of Multi-Storage Client (MSC) in Megatron Core. '
+                            'Disabled by default; pass this flag to opt in.')
+    group.add_argument('--disable-msc', default=False, action='store_true',
+                       dest='disable_msc_deprecated',
+                       help='[DEPRECATED] MSC is disabled by default; this flag is a no-op '
+                            'and will be removed in a future release.')
     return parser
 
 def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):

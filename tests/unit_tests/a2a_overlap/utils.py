@@ -242,6 +242,127 @@ def get_valid_flex_dispatcher_backend():
         return None
 
 
+def build_gpt_model(config, vocab_size=512, max_seq_len=300):
+    """Build and return a GPTModel on CUDA from the given config."""
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    layer_spec = get_gpt_decoder_block_spec(config=config, use_transformer_engine=True)
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=layer_spec,
+        vocab_size=vocab_size,
+        pre_process=True,
+        post_process=True,
+        max_sequence_length=max_seq_len,
+    )
+    model.cuda()
+    return model
+
+
+def build_input_data(seq_len=128, vocab_size=512):
+    """Build fixed input data for the model."""
+    return {
+        "input_ids": torch.randint(0, vocab_size, (1, seq_len), dtype=torch.int64).cuda(),
+        "labels": torch.randint(0, vocab_size, (1, seq_len), dtype=torch.int64).cuda(),
+        "position_ids": torch.arange(seq_len, dtype=torch.int64).unsqueeze(0).cuda(),
+        "attention_mask": torch.ones((1, 1, seq_len, seq_len), dtype=bool).cuda(),
+    }
+
+
+def loss_func(output_tensor):
+    """Sum per-token losses to produce a scalar suitable for backward."""
+    loss = output_tensor.float().sum()
+    return loss, {'lm loss': loss}
+
+
+def forward_step_func(data_iterator, model, return_schedule_plan=False):
+    """Forward step function compatible with combined_1f1b_schedule_for_no_pipelining.
+
+    When return_schedule_plan=True (used by the overlap scheduler), builds and
+    returns a TransformerModelChunkSchedulePlan instead of eagerly executing
+    the forward pass.
+    """
+    data = next(data_iterator)
+    if return_schedule_plan:
+        schedule_plan = model.build_schedule_plan(**data)
+        return schedule_plan, loss_func
+    output = model(**data)
+    return output, loss_func
+
+
+def overlap_train_step(model, optimizer, config, data):
+    """One overlap forward-backward-optimizer step. Return scalar loss."""
+    from contextlib import nullcontext
+
+    from megatron.core.pipeline_parallel.combined_1f1b import (
+        combined_1f1b_schedule_for_no_pipelining,
+    )
+
+    optimizer.zero_grad()
+    forward_data_store = []
+    combined_1f1b_schedule_for_no_pipelining(
+        forward_step_func=forward_step_func,
+        data_iterator=iter([data]),
+        model=model,
+        num_microbatches=1,
+        input_tensor=None,
+        output_tensor_grad=None,
+        forward_data_store=forward_data_store,
+        config=config,
+        collect_non_loss_data=False,
+        first_val_step=None,
+        forward_only=False,
+        no_sync_func=nullcontext,
+        total_num_tokens=torch.zeros([], dtype=torch.int, device="cuda"),
+        check_first_val_step=lambda cond: cond,
+    )
+    torch.cuda.synchronize()
+    loss = forward_data_store[0]['lm loss'].detach().clone()
+    optimizer.step()
+    return loss
+
+
+def fsdp_train_step(model, optimizer, data):
+    """One standard forward-backward-optimizer step through FSDP. Return scalar loss."""
+    from megatron.core.transformer.module import float16_to_fp32
+
+    optimizer.zero_grad()
+    loss = model(**data)
+    loss = float16_to_fp32(loss).sum()
+    loss.backward()
+    optimizer.step()
+    return loss.detach().clone()
+
+
+def assert_models_equal(ref_model, test_model):
+    """Assert that all parameters of two models are bit-identical."""
+    rank = torch.distributed.get_rank()
+    for (name_r, param_r), (_, param_t) in zip(
+        ref_model.named_parameters(), test_model.named_parameters()
+    ):
+        assert torch.equal(
+            param_r.data, param_t.data
+        ), f"[rank {rank}] Parameter mismatch after training: {name_r}"
+
+
+def build_expert_device_mesh():
+    """Build expert device mesh required by MegatronFSDP for expert parallelism."""
+    from torch.distributed import DeviceMesh
+
+    from megatron.core import parallel_state
+
+    expt_dp_group = parallel_state.get_expert_data_parallel_group()
+    expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
+    expt_tp_group = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+    return DeviceMesh.from_group(
+        [expt_dp_group, expt_tp_group],
+        device_type="cuda",
+        mesh=[[x] for x in expt_dp_ranks],
+        mesh_dim_names=("fsdp", "tp"),
+    )
+
+
 def get_valid_fp8_flags():
     from megatron.core.enums import Fp8Recipe
     from megatron.training.utils import get_device_arch_version
