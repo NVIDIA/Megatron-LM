@@ -3,6 +3,7 @@
 import gc
 import os
 import sys
+import weakref
 
 import pytest
 import torch
@@ -34,6 +35,7 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    delete_cuda_graphs,
 )
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -1257,6 +1259,267 @@ class TestInlineCaptureManager:
         assert (
             runner.num_warmup_steps == 0
         ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
+
+
+class TestMultiMempool:
+    """Tests for `new_mempool=True` and `share_mempool_with=` topologies."""
+
+    def _make_config(self):
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            inference_rng_tracker=True,
+        )
+
+    def _make_manager(self, **kwargs):
+        mgr, _ = self._make_manager_with_module(**kwargs)
+        return mgr
+
+    def _make_manager_with_module(self, **kwargs):
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+        mgr = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+            **kwargs,
+        )
+        return mgr, module
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        )
+
+    def teardown_method(self, method):
+        # Use `delete_cuda_graphs` so non-global pool handles created by `new_mempool=True`
+        # are dropped too — `CudaGraphManager.global_mempool = None` alone would leak them.
+        delete_cuda_graphs()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        Utils.destroy_model_parallel()
+
+    @torch.inference_mode()
+    def test_resolution_and_validation(self):
+        """Topology flags resolve to the right pool; constructor rejects the mutually
+        exclusive `new_mempool=True` + `share_mempool_with=...` combination."""
+        # Default → shared global pool.
+        mgr_default_a = self._make_manager()
+        mgr_default_b = self._make_manager()
+        assert mgr_default_a.mempool is not None
+        assert mgr_default_a.mempool == mgr_default_b.mempool
+        assert mgr_default_a.mempool == CudaGraphManager.global_mempool
+
+        # `new_mempool=True` → fresh pool, distinct from global and from other new pools.
+        mgr_new_a = self._make_manager(new_mempool=True)
+        mgr_new_b = self._make_manager(new_mempool=True)
+        assert mgr_new_a.mempool != mgr_default_a.mempool
+        assert mgr_new_b.mempool != mgr_default_a.mempool
+        assert mgr_new_a.mempool != mgr_new_b.mempool
+
+        # `share_mempool_with=` → reuse target's pool, including transitively through a sharer.
+        mgr_share = self._make_manager(share_mempool_with=mgr_new_a)
+        mgr_chain = self._make_manager(share_mempool_with=mgr_share)
+        assert mgr_share.mempool == mgr_new_a.mempool
+        assert mgr_chain.mempool == mgr_new_a.mempool
+
+        # Mutually exclusive constructor flags.
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            CudaGraphManager(
+                config,
+                base_module=module,
+                function_name="my_op",
+                inline_capture=True,
+                num_warmup_steps=0,
+                need_backward=False,
+                new_mempool=True,
+                share_mempool_with=mgr_new_a,
+            )
+
+    @pytest.mark.parametrize("case", ["garbage_collected", "cycle", "self_loop"])
+    @torch.inference_mode()
+    def test_resolve_mempool_error_paths(self, case):
+        """`_resolve_mempool` raises a clear RuntimeError for each broken share-chain
+        shape: GC'd target, A→B→A cycle, A→A self-loop. Cycles cannot be produced by
+        the constructor (a manager can't share with itself before it exists), so the
+        cycle/self-loop cases simulate post-construction misuse via direct rewiring."""
+        if case == "garbage_collected":
+            mgr_a = self._make_manager(new_mempool=True)
+            mgr_b = self._make_manager(share_mempool_with=mgr_a)
+            a_pool = mgr_a.mempool
+            # The weakref attribute itself must be a weak reference.
+            assert isinstance(mgr_b._share_with_ref, weakref.ref)
+            assert mgr_b._share_with_ref() is mgr_a
+            # Sharer holds only a weak ref, so the target is GC-able.
+            del mgr_a
+            gc.collect()
+            assert mgr_b._share_with_ref() is None
+            # Until `delete_cuda_graphs`, the cached pool short-circuits resolve.
+            assert mgr_b.mempool == a_pool
+            targets = [mgr_b]
+            match = "garbage collected"
+        elif case == "cycle":
+            mgr_a = self._make_manager(new_mempool=True)
+            mgr_b = self._make_manager(share_mempool_with=mgr_a)
+            # Rewire mgr_a → mgr_b to close the loop. _new_mempool doesn't matter: the
+            # cycle is detected during the walk before the root's flags would be consulted.
+            mgr_a._share_with_ref = weakref.ref(mgr_b)
+            targets = [mgr_a, mgr_b]
+            match = "Cycle"
+        elif case == "self_loop":
+            mgr = self._make_manager(new_mempool=True)
+            mgr._share_with_ref = weakref.ref(mgr)
+            targets = [mgr]
+            match = "Cycle"
+
+        delete_cuda_graphs()
+        for target in targets:
+            with pytest.raises(RuntimeError, match=match):
+                target._resolve_mempool()
+
+    @torch.inference_mode()
+    def test_delete_cuda_graphs_resets_all_pool_topologies(self):
+        """`delete_cuda_graphs` must drop refs to global, new, and shared pools, and the
+        topology must be preserved on re-resolve with fresh handles."""
+        mgr_global = self._make_manager()
+        mgr_new = self._make_manager(new_mempool=True)
+        mgr_shared = self._make_manager(share_mempool_with=mgr_new)
+
+        old_global = mgr_global.mempool
+        old_new = mgr_new.mempool
+        assert mgr_shared.mempool == old_new
+        assert old_global != old_new
+
+        delete_cuda_graphs()
+
+        # Every cached `self.mempool` is nulled, including the user-topology ones, and
+        # the class-level default is gone too.
+        assert mgr_global.mempool is None
+        assert mgr_new.mempool is None
+        assert mgr_shared.mempool is None
+        assert CudaGraphManager.global_mempool is None
+
+        # Re-resolution rebuilds with the same topology.
+        mgr_global._resolve_mempool()
+        mgr_new._resolve_mempool()
+        mgr_shared._resolve_mempool()
+
+        assert mgr_global.mempool is not None
+        assert mgr_new.mempool is not None
+        assert mgr_shared.mempool == mgr_new.mempool  # share preserved
+        assert mgr_global.mempool != mgr_new.mempool  # isolation preserved
+
+        # Handles are different from the pre-delete ones.
+        assert mgr_global.mempool != old_global
+        assert mgr_new.mempool != old_new
+
+    @torch.inference_mode()
+    def test_capture_replay_round_trip(self):
+        """A `new_mempool=True` manager captures correctly, tags outputs with its pool,
+        and after `delete_cuda_graphs` the same runner instance re-captures into a fresh
+        pool that the runner picks up via its `mempool` property."""
+        mgr, module = self._make_manager_with_module(new_mempool=True)
+        x = torch.randn(4, 32, device="cuda")
+        eager_out = module.my_op(x, eager=True).clone()
+
+        # First capture + replay matches eager.
+        out1 = module.my_op(x).clone()  # captures
+        out_replay = module.my_op(x).clone()  # replays
+        assert torch.equal(eager_out, out1)
+        assert torch.equal(eager_out, out_replay)
+        assert len(mgr.cudagraph_runners) == 1
+
+        runner = mgr.cudagraph_runners[0]
+        old_pool = mgr.mempool
+        # Runner reads its mempool through the manager.
+        assert runner.mempool is old_pool
+        assert old_pool != CudaGraphManager.global_mempool
+        # Outputs are tagged with the capture pool so cross-pool consumers can apply
+        # the pool-safe weak-ref filter.
+        assert runner.fwd_graph_output_surface, "expected at least one captured output"
+        for t in runner.fwd_graph_output_surface:
+            assert hasattr(t, "cg_mempool"), "captured output must carry a cg_mempool tag"
+            assert t.cg_mempool is old_pool
+
+        # Drop graphs and pool handles, then recapture through the same runner instance.
+        delete_cuda_graphs()
+        assert mgr.mempool is None
+        assert runner.fwd_graph is None  # cleared by delete_cuda_graphs
+
+        out2 = module.my_op(x).clone()
+        assert (
+            mgr.cudagraph_runners[0] is runner
+        ), "expected the cached runner to be reused after delete_cuda_graphs"
+        new_pool = mgr.mempool
+        assert new_pool is not None
+        assert new_pool != old_pool, "fresh pool must replace the deleted handle"
+        assert runner.mempool is new_pool, "runner.mempool must read through to the manager"
+        assert torch.equal(eager_out, out2)
+
+    @pytest.mark.parametrize("case", ["pinned", "no_pin", "shape_mismatch"])
+    @torch.inference_mode()
+    def test_pin_input_from(self, case):
+        """`pin_input_from`: at capture, a consumer input whose `data_ptr()` matches an
+        upstream producer's captured output is substituted with the producer's output
+        tensor and tagged `can_skip_replay_copy` so the per-replay input copy is skipped.
+        Cases:
+          pinned         -- substitution + flag set, replay matches eager.
+          no_pin         -- without the kwarg, no flag is set on the producer's output.
+          shape_mismatch -- a `data_ptr()` match with a shape mismatch must raise rather
+                            than silently capturing a graph that crashes at replay.
+        """
+        producer_mgr, producer = self._make_manager_with_module()
+        consumer_kwargs = (
+            {"pin_input_from": [producer_mgr]} if case in ("pinned", "shape_mismatch") else {}
+        )
+        consumer_mgr, consumer = self._make_manager_with_module(**consumer_kwargs)
+
+        x = torch.randn(4, 32, device="cuda")
+
+        if case == "shape_mismatch":
+            # `y[:2]` slices dim 0 from index 0, so `.data_ptr()` is preserved but the
+            # shape changes. The pin path must reject this rather than substituting a
+            # mismatched-shape tensor that crashes the captured graph at replay.
+            y = producer.my_op(x)
+            y_view = y[:2]
+            assert y_view.data_ptr() == y.data_ptr()
+            assert y_view.shape != y.shape
+            with pytest.raises(RuntimeError, match=r"shape"):
+                consumer.my_op(y_view)
+            return
+
+        eager_out = consumer.my_op(producer.my_op(x, eager=True), eager=True).clone()
+
+        # Capture pass.
+        y = producer.my_op(x)
+        z = consumer.my_op(y).clone()
+
+        producer_out = producer_mgr.cudagraph_runners[0].fwd_graph_output_surface[0]
+        is_pinned = case == "pinned"
+        assert (
+            getattr(producer_out, "can_skip_replay_copy", False) is is_pinned
+        ), f"`can_skip_replay_copy` mismatch for case={case!r}"
+
+        if is_pinned:
+            # Weak-ref invariant: consumer does not pin producer's lifetime.
+            assert isinstance(consumer_mgr._pin_input_from_refs[0], weakref.ref)
+            assert consumer_mgr._pin_input_from_refs[0]() is producer_mgr
+
+        # Replay matches eager.
+        y2 = producer.my_op(x)
+        z2 = consumer.my_op(y2).clone()
+        assert torch.equal(eager_out, z)
+        assert torch.equal(eager_out, z2)
 
 
 if __name__ == "__main__":

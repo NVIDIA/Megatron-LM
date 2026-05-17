@@ -42,7 +42,9 @@ class ContextGPUView:
         # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
         # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
         # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
+        # `request_query_lengths` and `active_request_last_token_idxs` reserve one extra slot.
         req_4byte_bytes = max_requests * 4
+        req_4byte_with_sentinel_bytes = (max_requests + 1) * 4
 
         # MHA section: 5 fields shared by both graphed and non-graphed MHAMetadata
         # (only one is active per step, so sharing storage is fine).
@@ -93,7 +95,8 @@ class ContextGPUView:
         total_bytes = (
             2 * tok_int64_bytes
             + 4 * tok_int32_bytes
-            + 7 * req_4byte_bytes
+            + 5 * req_4byte_bytes
+            + 2 * req_4byte_with_sentinel_bytes
             + mha_query_lengths_bytes
             + mha_cu_query_seq_lengths_bytes
             + mha_kv_seq_lengths_bytes
@@ -133,8 +136,11 @@ class ContextGPUView:
         # Request-level tensors (consumed by sampling, log-probs, speculative verification, MTP).
         self.request_in_prefill_status = self._buf[off : off + req_4byte_bytes].view(torch.int32)
         off += req_4byte_bytes
-        self.request_query_lengths = self._buf[off : off + req_4byte_bytes].view(torch.int32)
-        off += req_4byte_bytes
+        # `request_query_lengths` has a trailing zero slot at index `max_requests`.
+        self.request_query_lengths = self._buf[off : off + req_4byte_with_sentinel_bytes].view(
+            torch.int32
+        )
+        off += req_4byte_with_sentinel_bytes
         self.request_kv_length_offsets = self._buf[off : off + req_4byte_bytes].view(torch.int32)
         off += req_4byte_bytes
         # Sampling parameters (consumed by FlashInfer sampling).
@@ -149,10 +155,11 @@ class ContextGPUView:
         # Per-request last-token row indices (consumed by sampling kernels as `gather_indices`).
         # The CPU side of this slot IS `context.active_request_last_token_idxs`,
         # populated by `build_active_slices` and `pad_active_slices`.
-        self.active_request_last_token_idxs = self._buf[off : off + req_4byte_bytes].view(
-            torch.int32
-        )
-        off += req_4byte_bytes
+        # The trailing slot at index `max_requests` is the sentinel target for logprobs kernels.
+        self.active_request_last_token_idxs = self._buf[
+            off : off + req_4byte_with_sentinel_bytes
+        ].view(torch.int32)
+        off += req_4byte_with_sentinel_bytes
 
         # MHA flash-attention metadata (shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata — only one is active per step).

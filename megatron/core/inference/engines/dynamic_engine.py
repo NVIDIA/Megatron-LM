@@ -390,6 +390,18 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
 
+            # Force all dummy requests to request log probs so graphs cover
+            # the full padded shape.
+            active_request_count = context.total_request_count - context.paused_request_count
+            context.active_request_metadata["return_log_probs"][:active_request_count] = True
+
+            controller._dynamic_step_log_probs_bookkeeping()
+            controller._side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(controller._side_stream):
+                indexing_outputs = controller._dynamic_step_log_probs_indexing()
+
+            torch.cuda.current_stream().wait_event(controller._side_step_done_event)
+
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
             if model_config.moe_enable_routing_replay:
@@ -404,6 +416,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
                     else:
                         controller._dynamic_step_sample_logits()
+
+                controller._side_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(controller._side_stream):
+                    lse_outputs = controller._dynamic_step_log_probs_lse(indexing_outputs)
+
+                controller._side_pre_calc_event.record(controller._side_stream)
 
                 # MTP CUDA graph warmup for this batch dimension.
                 if mtp_warmup_enabled:
@@ -429,6 +447,11 @@ class DynamicInferenceEngine(AbstractEngine):
                                 depth=depth,
                                 cache_key=("mtp", n, depth),
                             )
+
+                # Capture remaining log-prob graphs (gather, extract).
+                torch.cuda.current_stream().wait_event(controller._side_pre_calc_event)
+                controller._dynamic_step_calculate_log_probs(indexing_outputs, lse_outputs)
+                controller._side_step_done_event.record(controller._side_stream)
 
                 context.reset()
 
@@ -1790,8 +1813,9 @@ class DynamicInferenceEngine(AbstractEngine):
             evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
             accepted_tokens = step_result["accepted_tokens"]
-            log_probs = step_result["log_probs"]
-            top_n_logprobs = step_result.get("top_n_logprobs", None)
+            log_probs, top_n_logprobs = await self.controller.run_log_probs_extract(
+                step_result.get("log_probs_extract")
+            )
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
