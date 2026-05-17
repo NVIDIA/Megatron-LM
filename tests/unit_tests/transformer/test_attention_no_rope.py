@@ -44,7 +44,7 @@ class TestParallelAttentionWithNoRope:
         """Test that integer no_rope value is correctly converted to pattern."""
         config = self.transformer_config
         config.no_rope_freq = 4  # Should convert to [0,0,0,1,0,0,0,1]
-        config.__post_init__()
+        config.finalize()
 
         # Verify the pattern conversion
         assert isinstance(config.no_rope_freq, list)
@@ -55,7 +55,7 @@ class TestParallelAttentionWithNoRope:
         """Test custom no_rope pattern."""
         config = self.transformer_config
         config.no_rope_freq = [0, 1, 0, 1, 0, 1, 0, 1]  # Custom pattern
-        config.__post_init__()
+        config.finalize()
 
         # Verify the pattern is preserved
         assert isinstance(config.no_rope_freq, list)
@@ -66,7 +66,7 @@ class TestParallelAttentionWithNoRope:
         """Test forward pass with no_rope pattern."""
         config = self.parallel_attention.config
         config.no_rope_freq = 4  # Use pattern [0,0,0,1,0,0,0,1]
-        config.__post_init__()  # Ensure pattern is converted
+        config.finalize()  # Ensure pattern is converted
 
         sequence_length = 32
         micro_batch_size = 1
@@ -124,18 +124,18 @@ class TestParallelAttentionWithNoRope:
         # Test invalid integer pattern
         with pytest.raises(AssertionError):
             config.no_rope_freq = 3  # Not divisible by num_layers=8
-            config.__post_init__()
+            config.finalize()
 
         # Test invalid list pattern
         with pytest.raises(AssertionError):
             config.no_rope_freq = [0, 1, 0, 1]  # Wrong length
-            config.__post_init__()
+            config.finalize()
 
     def test_gpu_forward_no_rope_freq_not_specified(self):
         """Test forward pass with no_rope pattern not provided."""
         config = self.parallel_attention.config
         config.no_rope_freq = None
-        config.__post_init__()  # Ensure pattern is converted
+        config.finalize()  # Ensure pattern is converted
 
         sequence_length = 32
         micro_batch_size = 1
@@ -174,7 +174,7 @@ class TestParallelAttentionWithNoRope:
         transformer_config = self.transformer_config
         transformer_config.recompute_granularity = 'selective'
         transformer_config.no_rope_freq = 4  # Use pattern [0,0,0,1,0,0,0,1]
-        transformer_config.__post_init__()
+        transformer_config.finalize()
 
         checkpointed_parallel_attention = SelfAttention(
             transformer_config,
@@ -218,4 +218,4 @@ class TestParallelAttentionWithNoRope:
 
         # Verify that setting both flash_decode and no_rope raises an assertion error
         with pytest.raises(AssertionError, match="flash_decode cannot be used with no_rope"):
-            config.__post_init__()
+            config.finalize()

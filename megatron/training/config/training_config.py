@@ -3,6 +3,7 @@ import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
+from megatron.training.utils import print_rank_0
 
 
 @dataclass(kw_only=True)
@@ -107,6 +108,22 @@ class TrainingConfig:
 
     iterations_to_skip: list[int] = field(default_factory=list)
     """List of 1-indexed iterations to skip during training, empty by default."""
+
+    def finalize(self) -> None:
+        """Validate training mode specification and calculate train_iters from train_samples if needed."""
+        has_train_iters = self.train_iters is not None
+        has_train_samples = self.train_samples is not None
+
+        assert has_train_iters or has_train_samples, "Either train_iters or train_samples must be provided"
+        assert not (has_train_iters and has_train_samples), "Cannot specify both train_iters and train_samples"
+        if has_train_samples:
+            assert self.train_samples > 0, "train_samples must be positive"
+            assert self.rampup_batch_size is None, "Batch size rampup not supported with sample-based training yet"
+
+            # Calculate train_iters from train_samples (rampup_batch_size already validated as None)
+            assert self.global_batch_size is not None, "global_batch_size must be set when using train_samples"
+            self.train_iters = self.train_samples // self.global_batch_size
+            print_rank_0(f"Setting training iterations to {self.train_iters} based on {self.train_samples} samples")
 
 
 @dataclass(kw_only=True)
@@ -239,6 +256,37 @@ class SchedulerConfig:
 
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
+
+    def finalize(self) -> None:
+        """Post-initialization checks for scheduler config."""
+        if self.start_weight_decay is not None:
+            assert self.start_weight_decay >= 0.0, "start_weight_decay should be positive."
+            assert self.end_weight_decay >= self.start_weight_decay
+
+        if self.override_opt_param_scheduler:
+            assert not self.use_checkpoint_opt_param_scheduler, "both override and use-checkpoint are set."
+
+        # Validate mutual exclusivity between iteration-based and sample-based scheduler fields
+        has_iter_fields = (
+            self.lr_decay_iters is not None or self.lr_warmup_iters != 0 or self.lr_wsd_decay_iters is not None
+        )
+        has_sample_fields = (
+            self.lr_decay_samples is not None or self.lr_warmup_samples != 0 or self.lr_wsd_decay_samples is not None
+        )
+
+        assert not (has_iter_fields and has_sample_fields), (
+            f"Cannot mix iteration-based and sample-based scheduler fields. "
+            f"Found iteration fields: lr_decay_iters={self.lr_decay_iters}, lr_warmup_iters={self.lr_warmup_iters}, lr_wsd_decay_iters={self.lr_wsd_decay_iters}. "
+            f"Found sample fields: lr_decay_samples={self.lr_decay_samples}, lr_warmup_samples={self.lr_warmup_samples}, lr_wsd_decay_samples={self.lr_wsd_decay_samples}. "
+            f"Use either iteration fields OR sample fields, not both."
+        )
+
+        # Validate mutual exclusivity between lr_warmup_fraction and specific warmup fields
+        if self.lr_warmup_fraction is not None:
+            assert self.lr_warmup_iters == 0 and self.lr_warmup_samples == 0, (
+                f"Cannot specify lr_warmup_fraction={self.lr_warmup_fraction} with lr_warmup_iters={self.lr_warmup_iters} or lr_warmup_samples={self.lr_warmup_samples}. "
+                f"Use either lr_warmup_fraction OR lr_warmup_iters OR lr_warmup_samples."
+            )
 
 
 @dataclass(kw_only=True)
@@ -596,15 +644,31 @@ class CheckpointConfig:
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
 
-    def __post_init__(self):
+    def finalize(self) -> None:
+        """Post-initialization checks for checkpoint config."""
         from megatron.training.utils import has_nvrx_checkpointing_async_support
+
+        if self.pretrained_checkpoint is not None:
+            from megatron.training.utils import file_exists
+
+            assert file_exists(self.pretrained_checkpoint), (
+                f"Pretrained checkpoint {self.pretrained_checkpoint} does not exist"
+            )
+
+        if self.load_main_params_from_ckpt:
+            assert not self.load_optim, "load_main_params_from_ckpt must be used with load_optim=False"
 
         assert self.async_strategy in ["nvrx", "mcore"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
 
         if not self.async_save:
             self.async_strategy = "mcore"
-
+        else:
+            assert self.save is not None, "async_save is enabled, but save is not set. Set save to a valid path."
+            assert self.use_persistent_ckpt_worker, "async_save requires use_persistent_ckpt_worker=True."
+            assert self.ckpt_format in ["torch_dist", "fsdp_dtensor"], (
+                "async_save is only supported with ckpt_format='torch_dist','fsdp_dtensor'"
+            )
         if (
             self.async_save
             and self.async_strategy == "nvrx"
@@ -618,6 +682,19 @@ class CheckpointConfig:
         if self.verify_integrity:
             assert self.ckpt_format == "torch_dist", \
                 f"`verify_integrity` is only supported with torch_dist checkpoint format."
+
+        # Validate ckpt_step if specified
+        if self.ckpt_step is not None:
+            if self.load is None:
+                raise ValueError(
+                    f"ckpt_step={self.ckpt_step} specified but checkpoint.load is None. "
+                    f"Please set checkpoint.load to the base checkpoint directory."
+                )
+
+        if self.dist_ckpt_optim_fully_reshardable:
+            assert not self.distrib_optim_fully_reshardable_mem_efficient, (
+                "distrib_optim_fully_reshardable_mem_efficient requires use_gloo_process_groups"
+            )
 
 
 @dataclass(kw_only=True)

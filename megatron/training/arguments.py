@@ -363,13 +363,6 @@ def validate_args(args, defaults={}):
 
     update_use_dist_ckpt(args)
 
-    total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
-
-    # Total model size.
-    assert args.world_size % total_model_size == 0, (
-        f"world size ({args.world_size}) is not divisible by total_model_size ({total_model_size=})"
-    )
-
     if args.attention_backend == AttnBackend.local:
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
 
@@ -519,13 +512,6 @@ def validate_args(args, defaults={}):
 
     # Checks.
 
-    if args.hierarchical_context_parallel_sizes:
-        from numpy import prod
-        assert args.context_parallel_size == prod(args.hierarchical_context_parallel_sizes)
-    if "a2a+p2p" in args.cp_comm_type:
-        assert args.hierarchical_context_parallel_sizes is not None, \
-        "--hierarchical-context-parallel-sizes must be set when a2a+p2p is used in cp comm"
-
     if args.expert_tensor_parallel_size is None:
         args.expert_tensor_parallel_size = args.tensor_model_parallel_size
 
@@ -622,15 +608,6 @@ def validate_args(args, defaults={}):
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
-
-    # Eval batch size defaults and validation.
-    if args.eval_global_batch_size is None:
-        args.eval_global_batch_size = args.global_batch_size
-    if args.eval_micro_batch_size is None:
-        args.eval_micro_batch_size = args.micro_batch_size
-    assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0, \
-        f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
-        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
 
     if args.perform_rl_step:
         num_generated_samples_per_inference_iteration = (
@@ -1053,16 +1030,6 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
 
-        if args.data_parallel_sharding_strategy == "optim_grads_params":
-            assert args.check_weight_hash_across_dp_replicas_interval is None, \
-                'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
-
-        assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
-            'FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.'
-
-        assert args.ckpt_format == "fsdp_dtensor", \
-            "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-    
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
         # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
@@ -1137,36 +1104,6 @@ def validate_args(args, defaults={}):
     # is constant during training.
     args.variable_seq_lengths = False
 
-    # Iteration-based training.
-    # Skip these checks when skip_train is set: LR config is irrelevant.
-    if args.train_iters and not args.skip_train:
-        # If we use iteration-based training, make sure the
-        # sample-based options are off.
-        assert args.train_samples is None, \
-            'expected iteration-based training'
-        assert args.lr_decay_samples is None, \
-            'expected iteration-based learning rate decay'
-        assert args.lr_warmup_samples == 0, \
-            'expected iteration-based learning rate warmup'
-        if args.lr_warmup_fraction is not None:
-            assert args.lr_warmup_iters == 0, \
-                'can only specify one of lr-warmup-fraction and lr-warmup-iters'
-
-    # Sample-based training.
-    if args.train_samples and not args.skip_train:
-        # If we use sample-based training, make sure the
-        # iteration-based options are off.
-        assert args.train_iters is None, \
-            'expected sample-based training'
-        assert args.lr_decay_iters is None, \
-            'expected sample-based learning rate decay'
-        assert args.lr_warmup_iters == 0, \
-            'expected sample-based learnig rate warmup'
-        if args.lr_warmup_fraction is not None:
-            assert args.lr_warmup_samples == 0, \
-                'can only specify one of lr-warmup-fraction ' \
-                'and lr-warmup-samples'
-
     if args.num_layers is not None:
         assert args.encoder_num_layers is None, \
             'cannot have both num-layers and encoder-num-layers specified'
@@ -1197,11 +1134,6 @@ def validate_args(args, defaults={}):
     if args.kv_channels is None:
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
-
-    if args.seq_length is not None and args.context_parallel_size > 1:
-        assert args.seq_length % (args.context_parallel_size * 2) == 0, \
-            'seq-length should be a multiple of 2 * context-parallel-size ' \
-            'if context-parallel-size > 1.'
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
@@ -1440,17 +1372,6 @@ def validate_args(args, defaults={}):
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
-    # Deterministic mode
-    if args.deterministic_mode:
-        assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
-        assert not args.cross_entropy_loss_fusion, "Cross Entropy Fusion is currently not deterministic."
-
-        all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
-        assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
-            f"NCCL_ALGO must be one of {all_reduce_choices}."
-
-        torch.use_deterministic_algorithms(True)
-
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
@@ -1626,13 +1547,6 @@ def validate_args(args, defaults={}):
                 "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
                 "when enabling delay_wgrad_compute"
             )
-
-    if args.fine_grained_activation_offloading:
-        assert args.transformer_impl == 'transformer_engine', \
-            "Fine-grained activation offloading is only supported with transformer_engine implementation"
-        if is_te_min_version("2.10.0"):
-            assert os.getenv("NVTE_CPU_OFFLOAD_V1", "0") == "1", \
-                "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
 
     if args.mtp_num_layers:
         # MTP is compatible with position embedding types that use position_ids.
