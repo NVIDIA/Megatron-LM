@@ -90,7 +90,9 @@ class TestFP8Param:
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
         config = core_transformer_config_from_args(args)
-        transformer_layer_spec = layer_spec_fn()
+        transformer_layer_spec = layer_spec_fn(
+            num_experts=args.num_experts, moe_grouped_gemm=args.moe_grouped_gemm
+        )
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
@@ -180,7 +182,7 @@ class TestFP8Param:
         use_cuda_graph: bool = False,
         **kwargs,
     ):
-        """Test fp8_param with gpt_model."""
+        """Test fp8_param with a small GPT model."""
         args = self.create_test_args(
             tp_size,
             recipe,
@@ -199,7 +201,10 @@ class TestFP8Param:
 
         set_args(args)
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=args.expert_model_parallel_size,
+        )
 
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
@@ -237,14 +242,21 @@ class TestFP8Param:
             if is_float8tensor(param):
                 num_fp8_params += 1
 
-        # Verify the number of fp8 params.
         fp8_layers = args.num_layers
         if kwargs.get("first_last_layers_bf16", False):
             fp8_layers -= kwargs["num_layers_at_start_in_bf16"]
             fp8_layers -= kwargs["num_layers_at_end_in_bf16"]
-        # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
-        if fp8_param_gather:
-            assert num_fp8_params == 4 * fp8_layers
+        if fp8_param_gather and fp8_layers > 0:
+            if args.num_experts is None:
+                # Each dense layer has 4 GEMM weights: qkv, proj, fc1, fc2.
+                assert num_fp8_params == 4 * fp8_layers
+            else:
+                assert num_fp8_params > 0
+                assert any(
+                    not getattr(param, 'allreduce', True) for param in gpt_model[0].parameters()
+                )
+                if not inference:
+                    assert len(optimizer.chained_optimizers) >= 2
 
         # Verify that bf16 params (embedding, LN, etc.) in the MXFP8 model are mapped
         # to the param buffer (shared with grad buffer) rather than allocated separately.
@@ -332,7 +344,7 @@ class TestFP8Param:
         return torch.tensor(loss_list)
 
     def run_test(self, tp_size, recipe, inference: bool = False, **kwargs):
-        """Test fp8_param with gpt_model."""
+        """Test fp8_param with a small GPT model."""
         if inference:
             with torch.inference_mode():
                 self._run_test_helper(tp_size, recipe, inference=True, **kwargs)
@@ -440,6 +452,36 @@ class TestFP8Param:
         dp_overlap: (overlap_param_gather, overlap_grad_reduce)
         """
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [1])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (False, True), (True, True)])
+    def test_mxfp8_moe(self, tp_size, dp_overlap):
+        """
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        kwargs = {
+            "overlap_param_gather": dp_overlap[0],
+            "overlap_grad_reduce": dp_overlap[1],
+            "num_layers": 4,
+            "vocal_size": 128800,
+            "hidden_size": 128,
+            "num_attention_heads": 8,
+            "expert_model_parallel_size": 2,
+            "num_experts": 2,
+            "moe_grouped_gemm": True,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_router_topk": 1,
+            "moe_router_pre_softmax": True,
+            "moe_router_load_balancing_type": "none",
+            "moe_aux_loss_coeff": 0.0,
+            "moe_ffn_hidden_size": 128,
+        }
         self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
 
     @pytest.mark.skipif(
