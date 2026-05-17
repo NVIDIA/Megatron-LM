@@ -652,6 +652,7 @@ def topk_softmax_with_capacity(
     use_pre_softmax: bool = False,
     num_groups: Optional[int] = None,
     group_topk: Optional[int] = None,
+    group_scoring_topk: int | None = None,
     scaling_factor: Optional[float] = None,
     deterministic_mode: bool = False,
     score_function: str = "softmax",
@@ -702,6 +703,7 @@ def topk_softmax_with_capacity(
                 num_experts=num_experts,
                 num_groups=num_groups,
                 group_topk=group_topk,
+                group_scoring_topk=group_scoring_topk,
             )
         else:
             return torch.topk(scores, k=topk, dim=1)
@@ -835,6 +837,7 @@ class FlextronTopKRouterElasticityManager:
                         use_pre_softmax=self.config.moe_router_pre_softmax,
                         num_groups=self.config.moe_router_num_groups,
                         group_topk=self.config.moe_router_group_topk,
+                        group_scoring_topk=self.config.moe_router_group_scoring_topk,
                         scaling_factor=self.config.moe_router_topk_scaling_factor,
                         deterministic_mode=self.config.deterministic_mode,
                         score_function=self.config.moe_router_score_function,
