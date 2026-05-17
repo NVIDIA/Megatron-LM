@@ -1,0 +1,42 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{environment}_{platforms}'
+  model: hybrid
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 1
+  n_repeat: 1
+  platforms: dgx_h100
+  time_limit: 3600
+  script_setup: |
+    unset https_proxy
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+  script: |-
+    cd /opt/megatron-lm
+
+    ARGUMENTS=(
+        "CONFIG_PATH=tests/performance_tests/test_cases/hybrid/{test_case}/model_config.yaml"
+        "CHECKPOINT_LOAD_PATH=/mnt/artifacts/"
+        "RESULTS_ROOT={assets_dir}/perf_results"
+    )
+
+    GPUS_PER_NODE=1 bash ./tests/performance_tests/shell_test_utils/run_perf_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - test_case: [hybrid_2b_perf]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]

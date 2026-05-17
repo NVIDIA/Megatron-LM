@@ -1,0 +1,35 @@
+{
+  "batch_1": {
+    "batch_size": 1,
+    "num_input_tokens": 512,
+    "num_output_tokens": 128,
+    "num_iters": 5,
+    "throughput_tok_per_sec": 13.152686708604776,
+    "avg_latency_ms": 9731.79145026952,
+    "p50_latency_ms": 9735.378561075777,
+    "p99_latency_ms": 9839.38425919041,
+    "tpot_ms_per_tok": 76.03009348240448
+  },
+  "batch_8": {
+    "batch_size": 8,
+    "num_input_tokens": 512,
+    "num_output_tokens": 128,
+    "num_iters": 5,
+    "throughput_tok_per_sec": 105.27781354701415,
+    "avg_latency_ms": 9723.71472279774,
+    "p50_latency_ms": 9772.013315930963,
+    "p99_latency_ms": 9786.92714497447,
+    "tpot_ms_per_tok": 75.98942009208258
+  },
+  "batch_32": {
+    "batch_size": 32,
+    "num_input_tokens": 512,
+    "num_output_tokens": 128,
+    "num_iters": 5,
+    "throughput_tok_per_sec": 421.6967532993737,
+    "avg_latency_ms": 9708.127347176196,
+    "p50_latency_ms": 9692.277582827955,
+    "p99_latency_ms": 9826.226894976571,
+    "tpot_ms_per_tok": 75.88391361714457
+  }
+}

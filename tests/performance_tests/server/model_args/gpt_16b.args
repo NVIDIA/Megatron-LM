@@ -1,0 +1,48 @@
+# Model-specific args for the deepseek-style 16B MoE checkpoint (TP=1 PP=1 — fits on 1 GPU).
+# Sourced from tests/functional_tests/test_cases/gpt/gpt_static_inference_tp1_pp1_16b_multiprompt_tokensmatch/model_config.yaml
+--load ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/checkpoints
+--tokenizer-model ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+--tokenizer-type TikTokenizer
+--tiktoken-pattern v2
+--use-mcore-models
+--expert-model-parallel-size 1
+--moe-token-dispatcher-type alltoall
+--moe-grouped-gemm
+--num-experts 64
+--moe-router-topk 6
+--moe-z-loss-coeff 0
+--moe-router-load-balancing-type seq_aux_loss
+--moe-aux-loss-coeff 1e-3
+--moe-router-score-function sigmoid
+--untie-embeddings-and-output-weights
+--disable-bias-linear
+--init-method-std 0.014
+--position-embedding-type rope
+--rotary-base 1000000
+--rotary-percent 1.0
+--num-layers 27
+--hidden-size 2048
+--moe-ffn-hidden-size 1408
+--moe-shared-expert-intermediate-size 2816
+--ffn-hidden-size 10944
+--num-attention-heads 16
+--kv-channels 128
+--normalization RMSNorm
+--swiglu
+--attention-dropout 0.0
+--hidden-dropout 0.0
+--seq-length 4096
+--max-position-embeddings 4096
+--ckpt-format torch_dist
+--ckpt-fully-parallel-load
+--ckpt-assume-constant-structure
+--dist-ckpt-strictness log_unexpected
+--bf16
+--attention-backend flash
+--no-create-attention-mask-in-dataloader
+--use-checkpoint-args
+--no-use-tokenizer-model-from-checkpoint-args
+--no-load-optim
+--inference-ckpt-non-strict
+--transformer-impl transformer_engine
+--distributed-backend nccl
