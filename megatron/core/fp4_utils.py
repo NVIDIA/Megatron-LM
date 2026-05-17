@@ -184,7 +184,11 @@ if HAVE_TE:
                         >= 2.7.0.dev0."""
                     )
             elif config.fp4_recipe == Fp4Recipe.custom:
-                fp4_recipe = _get_custom_recipe(config.fp4_quantizer_factory)
+                fp4_recipe = _get_custom_recipe(
+                    config.fp4_quantizer_factory,
+                    fp8_dpa=config.fp8_dot_product_attention,
+                    fp8_mha=config.fp8_multi_head_attention,
+                )
             else:
                 raise ValueError(
                     "NVFP4BlockScaling and custom are the only supported FP4 recipes. "
