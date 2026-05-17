@@ -54,6 +54,15 @@ from megatron.core.optimizer_param_scheduler import (
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
+from megatron.core.parameterization import (
+    ResolvedTrainingPolicy,
+    build_legacy_mup_training_policy,
+    is_embedding_class_parameter,
+    is_embedding_or_output_parameter,
+    is_hidden_matrix_parameter,
+    is_muon_managed_matrix_parameter,
+    is_vector_like_parameter,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
@@ -73,7 +82,6 @@ from .optimizer import (
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     MegatronOptimizer,
-    param_group_identifier_keys,
 )
 
 # Subclass aliases kept for backward compatibility; all are OptimizerConfig.
@@ -130,41 +138,23 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
 def get_mup_config_overrides(
     config: OptimizerConfig, mup_width_mult: float, optimizer_type: str = 'adam'
 ) -> Dict[ParamKey, ParamGroupOverride]:
-    """Get MuP config overrides for per-layer LR and Adam epsilon scaling.
+    """Compatibility wrapper for the existing MuP optimizer override surface."""
+    scaling_policy = build_legacy_mup_training_policy(
+        mup_width_mult=mup_width_mult, optimizer_type=optimizer_type
+    )
+    return get_scaling_config_overrides(config=config, scaling_policy=scaling_policy)
 
-    In MuP, optimizer learning rates are adjusted by parameter class to ensure
-    stable update scales across model widths and enable hyperparameter transfer.
 
-    MuP optimizer scaling rules (as implemented here):
-    - Adam/AdamW:
-      - hidden (matrix-like) lr = base_lr / width_mult
-      - hidden (matrix-like) eps = base_eps / width_mult
-      - vector-like params keep base lr and eps
-    - SGD:
-      - vector-like lr = base_lr * width_mult
-      - hidden (matrix-like) lr keeps base_lr in the current uniform-width setup
-      - no eps override is applied
-    - Non-Adam optimizers:
-      - hidden (matrix-like) lr = base_lr / width_mult
-      - no eps override is applied.
-      - for Muon optimizers, matrix-like params managed by Muon itself are
-        excluded from these Adam-style MuP overrides.
+def get_scaling_config_overrides(
+    config: OptimizerConfig, scaling_policy: ResolvedTrainingPolicy
+) -> Dict[ParamKey, ParamGroupOverride]:
+    """Get optimizer overrides from a resolved internal scaling policy.
 
-    With decoupled_lr enabled, embedding/output params continue using decoupled LR
-    and MuP will not override those explicit decoupled values.
-
-    Args:
-        config (OptimizerConfig): optimizer configuration object.
-        mup_width_mult (float): Width multiplier (hidden_size / base_hidden_size).
-        optimizer_type (str): Optimizer type string from config.optimizer.
-
-    Returns:
-        Dict[ParamKey, ParamGroupOverride]: MuP optimizer overrides.
+    PR1 keeps the public MuP surface unchanged and factors the existing per-parameter
+    MuP LR/epsilon behavior through this policy seam.
     """
-    optimizer_type_lower = optimizer_type.lower()
-    is_sgd_optimizer = optimizer_type_lower == 'sgd'
-    is_adam_optimizer = 'adam' in optimizer_type_lower
-    is_muon_optimizer = 'muon' in optimizer_type_lower
+    if not scaling_policy.enabled:
+        return {}
 
     decoupled_lr_enabled = config.decoupled_lr is not None
     if decoupled_lr_enabled:
@@ -173,11 +163,11 @@ def get_mup_config_overrides(
             "absolute LR for embedding+output params, and MuP LR scaling will not "
             "override those parameters."
         )
-        if is_adam_optimizer:
+        if scaling_policy.is_adam_optimizer:
             message += " MuP Adam epsilon scaling remains applied to hidden matrix-like parameters."
         log_single_rank(logger, logging.WARNING, message)
 
-    if is_muon_optimizer:
+    if scaling_policy.is_muon_optimizer:
         muon_scale_mode = getattr(config, 'muon_scale_mode', 'spectral')
         if muon_scale_mode == 'spectral':
             log_single_rank(
@@ -189,66 +179,43 @@ def get_mup_config_overrides(
                 "Muon-managed matrices with MuP.",
             )
 
-    if mup_width_mult == 1.0:
-        # No scaling needed when width_mult is 1
+    if scaling_policy.context.width_mult == 1.0:
         return {}
 
-    hidden_lr_mult = 1.0 / mup_width_mult
     base_lr = config.lr
     base_min_lr = config.min_lr
 
-    # Hidden matrix-like layers get scaled LR/eps; vector-like params keep base values.
-    # Prefer the explicit parameter attribute set by LanguageModule. Fall back to
-    # a conservative name check for older or non-language modules.
-    def is_embedding_parameter(param: torch.nn.Parameter, param_name: str) -> bool:
-        if getattr(param, 'shared_embedding', False):
-            return True
-        if hasattr(param, 'is_embedding_parameter'):
-            return bool(param.is_embedding_parameter)
-        return 'embedding' in param_name.lower()
-
-    def is_vector_like_parameter(param: torch.nn.Parameter, param_name: str) -> bool:
-        if is_embedding_parameter(param, param_name):
-            return True
-        if param.dim() <= 1:
-            return True
-        return False
-
-    def is_muon_managed_matrix_parameter(param: torch.nn.Parameter, _: str) -> bool:
-        if not is_muon_optimizer:
+    def should_scale_hidden_matrix(param: torch.nn.Parameter, param_name: str) -> bool:
+        if decoupled_lr_enabled and is_embedding_or_output_parameter(param):
             return False
-        return param.dim() == 2 and not getattr(param, 'is_embedding_or_output_parameter', False)
-
-    def should_scale_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
-        if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
+        if is_muon_managed_matrix_parameter(param, optimizer_type=scaling_policy.optimizer_type):
             return False
-        if is_muon_managed_matrix_parameter(param, param_name):
-            return False
-        return not is_vector_like_parameter(param, param_name)
+        return is_hidden_matrix_parameter(param, param_name)
 
     def should_scale_vector_like_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
-        if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
+        if decoupled_lr_enabled and is_embedding_or_output_parameter(param):
             return False
         return is_vector_like_parameter(param, param_name)
 
     def should_scale_eps_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
+        if is_embedding_class_parameter(param, param_name):
+            return False
         if is_vector_like_parameter(param, param_name):
             return False
-        if is_muon_managed_matrix_parameter(param, param_name):
+        if is_muon_managed_matrix_parameter(param, optimizer_type=scaling_policy.optimizer_type):
             return False
-        # MuP Appendix B.3: eps scales with fan_in when non-negligible.
-        # This implementation follows the common denominator form: sqrt(v) + eps.
         return True
 
     mup_overrides: Dict[ParamKey, ParamGroupOverride] = {}
 
-    if is_sgd_optimizer:
-        vector_like_lr_mult = mup_width_mult
+    if scaling_policy.is_sgd_optimizer:
         vector_like_lr_override: ParamGroupOverride = {}
         if base_lr is not None:
-            vector_like_lr_override["max_lr"] = base_lr * vector_like_lr_mult
+            vector_like_lr_override["max_lr"] = base_lr * scaling_policy.hidden_vector_lr_multiplier
         if base_min_lr is not None:
-            vector_like_lr_override["min_lr"] = base_min_lr * vector_like_lr_mult
+            vector_like_lr_override["min_lr"] = (
+                base_min_lr * scaling_policy.hidden_vector_lr_multiplier
+            )
 
         if vector_like_lr_override:
             vector_like_predicate = ParamWithNamePredicate(
@@ -263,18 +230,18 @@ def get_mup_config_overrides(
 
     lr_override: ParamGroupOverride = {}
     if base_lr is not None:
-        lr_override["max_lr"] = base_lr * hidden_lr_mult
+        lr_override["max_lr"] = base_lr * scaling_policy.hidden_lr_multiplier
     if base_min_lr is not None:
-        lr_override["min_lr"] = base_min_lr * hidden_lr_mult
+        lr_override["min_lr"] = base_min_lr * scaling_policy.hidden_lr_multiplier
 
     eps_override: ParamGroupOverride = {}
-    if is_adam_optimizer and config.adam_eps is not None:
-        eps_override["eps"] = config.adam_eps * hidden_lr_mult
+    if scaling_policy.is_adam_optimizer and config.adam_eps is not None:
+        eps_override["eps"] = config.adam_eps * scaling_policy.hidden_eps_multiplier
 
     if decoupled_lr_enabled:
         if lr_override:
             hidden_predicate = ParamWithNamePredicate(
-                name="mup_hidden_only_excluding_embedding_output", fn=should_scale_lr_with_mup
+                name="mup_hidden_only_excluding_embedding_output", fn=should_scale_hidden_matrix
             )
             mup_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
 

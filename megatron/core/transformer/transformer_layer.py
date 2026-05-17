@@ -17,6 +17,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
@@ -329,6 +330,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+        self.model_scaling_policy = build_resolved_model_policy(config)
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -662,6 +664,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = attention_output_with_bias[0]
         else:
             with self.bias_dropout_add_exec_handler():
+                attention_output_with_bias = self.model_scaling_policy.scale_residual_branch_output(
+                    attention_output_with_bias
+                )
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
                     attention_output_with_bias, residual, self.hidden_dropout
                 )
@@ -911,6 +916,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = mlp_output_with_bias[0]
         else:
             with self.bias_dropout_add_exec_handler():
+                mlp_output_with_bias = self.model_scaling_policy.scale_residual_branch_output(
+                    mlp_output_with_bias
+                )
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
                     mlp_output_with_bias, residual, self.hidden_dropout
                 )

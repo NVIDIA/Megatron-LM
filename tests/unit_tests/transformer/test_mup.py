@@ -16,9 +16,17 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer import (
+    get_mup_config_overrides,
+    get_scaling_config_overrides,
+    get_standard_config_overrides,
+)
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
+from megatron.core.parameterization import (
+    build_legacy_mup_training_policy,
+    build_resolved_model_policy,
+)
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal
@@ -195,6 +203,20 @@ class TestMuPWarnings:
 class TestMuPLRScaling:
     """Tests for MuP learning rate and Adam epsilon scaling."""
 
+    def test_mup_overrides_route_through_resolved_training_policy(self):
+        """The new policy seam preserves the legacy MuP override surface."""
+        optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
+        width_mult = 4.0
+
+        legacy_overrides = get_mup_config_overrides(optimizer_config, width_mult)
+        policy_overrides = get_scaling_config_overrides(
+            optimizer_config,
+            build_legacy_mup_training_policy(mup_width_mult=width_mult, optimizer_type='adam'),
+        )
+
+        assert legacy_overrides.keys() == policy_overrides.keys()
+        assert list(legacy_overrides.values()) == list(policy_overrides.values())
+
     def test_mup_lr_override_computation(self):
         """Hidden LR and Adam eps scale as 1/width_mult."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
@@ -354,6 +376,47 @@ class TestMuPLRScaling:
 
 class TestMuPConfigIntegration:
     """Integration tests for MuP config with init methods."""
+
+    def test_resolved_model_policy_matches_legacy_config_fields(self):
+        """Model policy exposes the same effective MuP values as TransformerConfig."""
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=8,
+            num_attention_heads=16,
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_embedding_mult=3.0,
+        )
+        policy = build_resolved_model_policy(config)
+
+        assert policy.enabled is True
+        assert policy.context.width_mult == pytest.approx(config.mup_width_mult)
+        assert policy.context.output_mult == pytest.approx(config.mup_output_mult)
+        assert policy.context.embedding_mult == pytest.approx(config.mup_embedding_mult)
+        assert config.softmax_scale == pytest.approx(
+            policy.resolve_attention_softmax_scale(
+                softmax_scale=None, kv_channels=config.kv_channels
+            )
+        )
+
+    def test_resolved_model_policy_tracks_post_init_multiplier_mutations(self):
+        """Policy resolution should preserve legacy live reads of mutable config fields."""
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=8,
+            num_attention_heads=16,
+            use_mup=True,
+            mup_base_hidden_size=256,
+        )
+        logits = torch.ones(2, 4)
+        embeddings = torch.ones(2, 4)
+
+        config.mup_output_mult = 0.25
+        config.mup_embedding_mult = 3.0
+        policy = build_resolved_model_policy(config)
+
+        assert torch.equal(policy.scale_output_logits(logits), logits * 0.25)
+        assert torch.equal(policy.scale_embedding_activations(embeddings), embeddings * 3.0)
 
     def test_mup_output_layer_init(self):
         """Output layer init should also scale with MuP."""

@@ -23,6 +23,10 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.optimizer import (
+    MegatronOptimizer,
+    get_param_group_identifier_tuple,
+)
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -67,6 +71,89 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+def test_param_group_identifier_tuple_tolerates_missing_optional_keys():
+    group = {"wd_mult": 1.0, "lr_mult": 1.0, "is_expert_parallel": False, "is_decoupled_lr": False}
+
+    ident = get_param_group_identifier_tuple(group)
+
+    assert ident == (1.0, 1.0, False, False)
+
+
+def test_param_group_identifier_tuple_reads_pre_keys_and_optional_fields():
+    group = {
+        "pre_wd_mult": 0.0,
+        "pre_lr_mult": 0.5,
+        "pre_is_expert_parallel": False,
+        "pre_is_decoupled_lr": True,
+    }
+
+    ident = get_param_group_identifier_tuple(group)
+
+    assert ident == (0.0, 0.5, False, True)
+
+
+def test_param_group_identifier_tuple_defaults_missing_legacy_fields():
+    group = {}
+
+    ident = get_param_group_identifier_tuple(group)
+
+    assert ident == (1.0, 1.0, False, False)
+
+
+def test_param_group_matching_ignores_mutable_scheduler_values_on_resume():
+    current_group = {
+        "wd_mult": 1.0,
+        "lr_mult": 1.0,
+        "is_expert_parallel": False,
+        "is_decoupled_lr": False,
+        "max_lr": 2e-4,
+        "min_lr": 2e-6,
+        "params": [0],
+    }
+    checkpoint_group = {
+        "wd_mult": 1.0,
+        "lr_mult": 1.0,
+        "is_expert_parallel": False,
+        "is_decoupled_lr": False,
+        "max_lr": 1e-4,
+        "min_lr": 1e-6,
+        "params": [7],
+    }
+
+    assert get_param_group_identifier_tuple(current_group) == get_param_group_identifier_tuple(
+        checkpoint_group
+    )
+
+    reordered_groups = MegatronOptimizer._filter_and_reorder_param_groups(
+        [current_group], [checkpoint_group]
+    )
+
+    assert reordered_groups == [checkpoint_group]
+
+
+def test_param_group_matching_normalizes_legacy_missing_identifier_fields():
+    current_group = {
+        "wd_mult": 1.0,
+        "lr_mult": 1.0,
+        "is_expert_parallel": False,
+        "is_decoupled_lr": False,
+        "params": [0],
+    }
+    legacy_checkpoint_group = {
+        "params": [7],
+    }
+
+    assert get_param_group_identifier_tuple(current_group) == get_param_group_identifier_tuple(
+        legacy_checkpoint_group
+    )
+
+    reordered_groups = MegatronOptimizer._filter_and_reorder_param_groups(
+        [current_group], [legacy_checkpoint_group]
+    )
+
+    assert reordered_groups == [legacy_checkpoint_group]
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
