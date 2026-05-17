@@ -1133,7 +1133,8 @@ class SequentialMLP(MegatronModule):
             tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert)
             probs_list = torch.split(permuted_probs, tokens_per_expert)
 
-            output_local_list = []
+            output_local = None
+            output_offset = 0
 
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
                 if self.config.fp8 or self.config.fp4:
@@ -1142,9 +1143,17 @@ class SequentialMLP(MegatronModule):
                     output = output[: tokens.shape[0]]
                 else:
                     output, output_bias = expert(tokens, probs)
-                output_local_list.append(output)
+                if output_local is None:
+                    output_local = output.new_empty(
+                        (permuted_local_hidden_states.shape[0], output.shape[-1])
+                    )
+                output_local[output_offset : output_offset + output.shape[0]].copy_(output)
+                output_offset += output.shape[0]
 
-            output_local = torch.cat(output_local_list, dim=0)
+            if output_local is None:
+                output_local = permuted_local_hidden_states.new_empty(
+                    (0, permuted_local_hidden_states.shape[-1])
+                )
             output_bias_local = None
             # Note: if bias is enabled on experts, it is already added to the output at this point
             return output_local, output_bias_local
