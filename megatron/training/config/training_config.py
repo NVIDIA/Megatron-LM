@@ -251,6 +251,9 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
+    log_per_param_norm: bool = False
+    """If set, log per-parameter norm with per-param granularity (requires --log-params-norm)."""
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 
