@@ -572,6 +572,41 @@ class DynamicInferenceContext(BaseInferenceContext):
             "to have consistency between cuda graph sizes and the block table size."
         )
 
+        # MoE dispatcher detection. Both the NCCL allgather and the legacy
+        # transformer-engine A2A dispatcher require every EP rank to run the
+        # same-sized cuda graph; NVLS does not. These flags drive both
+        # match_graph_config's match_ep_token_counts and the phantom-padding
+        # reservation below.
+        self._nccl_ep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and model_config.inference_moe_token_dispatcher_type == 'nccl'
+        )
+        self._training_ep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and model_config.transformer_impl == "transformer_engine"
+        )
+
+        # Phantom padding (intentionally opposes the eager-fallback policy
+        # added in #4587): keep mixed/prefill cuda graphs enabled on the
+        # NCCL/training EP paths, and absorb cross-rank batch-dim divergence
+        # by reserving cuda_graph_mixed_prefill_count request slots up front.
+        # The MHA-metadata fill below distributes the leftover phantom tokens
+        # across the reserved slots so sum(query_lengths) == padded_token_count
+        # for layers that walk a packed [token_count, H] buffer (Mamba SSM
+        # scan, MoE token dispatch).
+        # NVLS does not sync (match_ep_token_counts=False), so phantom padding
+        # is only needed when the dispatcher requires identical graph sizing
+        # across EP ranks.
+        self._enable_phantom_padding = (
+            self._nccl_ep_dispatcher or self._training_ep_dispatcher
+        ) and (self.is_hybrid_model or self.num_speculative_tokens > 0)
+        prefill_reservation = (
+            (inference_config.cuda_graph_mixed_prefill_count or 1)
+            if self._enable_phantom_padding
+            else 0
+        )
+        self.max_schedulable_requests = self.max_requests - prefill_reservation
+
         # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
 
         self.graph_attn_metadata = {}
@@ -600,27 +635,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
-        # are we using the inference_optimized nccl ep dispatcher for MoEs?
-        self._nccl_ep_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
-            and model_config.inference_moe_token_dispatcher_type == 'nccl'
-        )
-
-        # are we using the training a2a dispatcher for MoEs?
-        # Note that this is not optimal for speed.
-        self._training_ep_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
-            and model_config.transformer_impl == "transformer_engine"
-        )
-
-        # We only allow non-decode cuda graphs for the nvls dispatcher
-        force_disable_non_decode_cuda_graphs = (
-            self._nccl_ep_dispatcher or self._training_ep_dispatcher
-        )
-
+        # Honour the user's use_cuda_graphs_for_non_decode_steps verbatim —
+        # do NOT clamp it to False on the NCCL or training-EP path the way
+        # #4587 does. Phantom padding (above) is what guards the NCCL/training
+        # paths against synced batch dims overflowing max_requests; with that
+        # in place, non-decode cuda graphs are safe to keep enabled on every
+        # dispatcher. (#4587 takes the opposite trade-off — cheaper code but no
+        # mixed/prefill cuda graphs on NCCL/training EP. This PR is the
+        # backup if that trade-off proves too restrictive.)
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps
-            and not (force_disable_non_decode_cuda_graphs)
         )
 
         # CUDA graph token budget for prefill/mixed graphs. Decode graphs are always
@@ -2068,7 +2092,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     padded_decode_req_count = min(
                         self.max_requests, self.round_up_requests(self.num_decode_requests)
                     )
-                    padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
+                    padded_token_count = min(
+                        self.max_tokens,
+                        padded_decode_req_count * (self.num_speculative_tokens + 1),
+                    )
                 else:
                     padded_token_count = min(
                         self.max_tokens,
@@ -2078,7 +2105,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = min(
+                    self.max_tokens, self.round_up_tokens(self.active_token_count)
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
@@ -2184,6 +2213,39 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
         if real_bs < padded_bs:
             self._cpu_mha_block_table[real_bs:padded_bs] = -1
+
+        # Phantom padding: when EP-sync produces a graph dim larger than the
+        # real batch on this rank, fill phantom slots so sum(query_lengths)
+        # == padded_token_count. Layers that walk a packed [token_count, H]
+        # buffer (Mamba SSM scan, MoE token dispatch) read every token in
+        # the padded range; leaving phantom slots with q_len=0 leaves those
+        # token positions unowned. Recompute the cumulative sums over the
+        # phantom range and route phantom block-table rows at the dummy
+        # block so attention reads stay in-bounds.
+        if self._enable_phantom_padding and self.using_cuda_graph_this_step():
+            phantom_count = padded_bs - real_bs
+            phantom_tokens = self.padded_active_token_count - attn_dimensions.token_count
+            if phantom_count > 0 and phantom_tokens > 0:
+                per_phantom = phantom_tokens // phantom_count
+                rem_phantom = phantom_tokens % phantom_count
+                self._cpu_mha_query_lengths[real_bs:padded_bs] = per_phantom
+                if rem_phantom > 0:
+                    self._cpu_mha_query_lengths[real_bs : real_bs + rem_phantom] += 1
+                # Phantom requests have no prior KV: kv_seq_length = query_length.
+                self._cpu_mha_kv_seq_lengths[real_bs:padded_bs] = self._cpu_mha_query_lengths[
+                    real_bs:padded_bs
+                ]
+                self._cpu_mha_cu_query_seq_lengths[real_bs + 1 : padded_bs + 1] = (
+                    torch.cumsum(self._cpu_mha_query_lengths[real_bs:padded_bs], dim=0)
+                    + self._cpu_mha_cu_query_seq_lengths[real_bs]
+                )
+                self._cpu_mha_cu_kv_seq_lengths[real_bs + 1 : padded_bs + 1] = (
+                    torch.cumsum(self._cpu_mha_kv_seq_lengths[real_bs:padded_bs], dim=0)
+                    + self._cpu_mha_cu_kv_seq_lengths[real_bs]
+                )
+                self._cpu_mha_block_table[real_bs:padded_bs] = (
+                    self.kv_block_allocator.dummy_block_idx
+                )
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:
@@ -2612,9 +2674,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request
+        # because we allocate a single set of Mamba state tensors for each request.
+        # max_schedulable_requests reserves spare slots for phantom padding (see
+        # _enable_phantom_padding); equals max_requests when phantom padding is off.
         request_can_be_added = (
-            self.total_request_count < self.max_requests and self.paused_request_count == 0
+            self.total_request_count < self.max_schedulable_requests
+            and self.paused_request_count == 0
         )
 
         (_, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
