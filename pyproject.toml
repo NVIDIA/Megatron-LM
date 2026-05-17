@@ -112,21 +112,12 @@ dev = [
     "orjson",
 ]
 
-lts = [
-    "tqdm",
-    "einops~=0.8",
-    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
-    "megatron-energon[av_decode]~=6.0",
-    "av",
-    "flashinfer-python>=0.5.0,<0.7.0",
-    "wget",
-    "onnxscript",
-    "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
-    "datasets",
-    "emerging_optimizers",
-]
+### 'lts' extra is deprecated (AUT-479).                                       ###
+### LTS Python dependencies are now pinned directly in docker/Dockerfile.ci.lts ###
+### so this pyproject.toml can host meaningful module-level extras without      ###
+### colliding with the LTS pin set. Kept as an empty alias for one release      ###
+### cycle so `pip install megatron-core[lts]` does not error out.               ###
+lts = []
 
 te = [
     "transformer-engine[pytorch,core_cu13]",
@@ -191,7 +182,6 @@ no-build-isolation-package = [
     "transformer-engine-torch",
 ]
 link-mode = "copy"
-conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
 # We don't define override-dependencies globally but rather locally where we need it.
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.

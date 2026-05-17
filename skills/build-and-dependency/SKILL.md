@@ -29,13 +29,19 @@ dependency.
 
 ## dev vs lts
 
-Two image variants exist, controlled by the `IMAGE_TYPE` build arg and the
+Two image variants exist, each with its own Dockerfile, selected by the
 `container::lts` PR label:
 
-| Variant | Base image pin | uv group | When used |
-|---------|---------------|----------|-----------|
-| **`dev`** | `docker/.ngc_version.dev` | `dev` | Default — CI, local development, most PRs |
-| **`lts`** | `docker/.ngc_version.lts` | `lts` | Stability testing; excludes ModelOpt and other bleeding-edge extras |
+| Variant | Base image pin | Dockerfile | Where deps live | When used |
+|---------|---------------|------------|-----------------|-----------|
+| **`dev`** | `docker/.ngc_version.dev` | `docker/Dockerfile.ci.dev` | `pyproject.toml` `dev` extra (uv-resolved) | Default — CI, local development, most PRs |
+| **`lts`** | `docker/.ngc_version.lts` | `docker/Dockerfile.ci.lts` | Inline `uv pip install` list at the top of `Dockerfile.ci.lts` | Stability testing; excludes ModelOpt and other bleeding-edge extras |
+
+> LTS deps used to live in `[project.optional-dependencies].lts` in
+> `pyproject.toml`. They were moved into `Dockerfile.ci.lts` (AUT-479) so
+> `pyproject.toml` can host meaningful module-level extras without colliding
+> with the LTS pin set. To bump an LTS dependency, edit the `uv pip install`
+> block in `docker/Dockerfile.ci.lts`.
 
 **Use `dev` for everything unless you have a specific reason to test `lts`.**
 CI runs `dev` by default; attach `container::lts` to a PR only when verifying
@@ -78,12 +84,11 @@ docker build \
   -f docker/Dockerfile.ci.dev \
   -t megatron-lm:local .
 
-# lts image
+# lts image (uses a dedicated Dockerfile; no IMAGE_TYPE arg)
 docker build \
   --target main \
   --build-arg FROM_IMAGE_NAME=$(cat docker/.ngc_version.lts) \
-  --build-arg IMAGE_TYPE=lts \
-  -f docker/Dockerfile.ci.dev \
+  -f docker/Dockerfile.ci.lts \
   -t megatron-lm:local-lts .
 ```
 
@@ -146,23 +151,27 @@ inside the container (already on `PATH`).
 |-------|---------|
 | `training` | Runtime training extras |
 | `dev` | Full dev environment (TransformerEngine, ModelOpt, …) |
-| `lts` | LTS-safe subset (no ModelOpt) |
 | `test` | pytest, coverage, nemo-run |
 | `linting` | ruff, black, isort, pylint |
 | `build` | Cython, pybind11, nvidia-mathdx |
+
+> The previous `lts` extra has been emptied (AUT-479). LTS deps are pinned in
+> `docker/Dockerfile.ci.lts` rather than `pyproject.toml`. Do not add new
+> packages under `[project.optional-dependencies].lts`.
 
 Install commands (inside the container):
 
 ```bash
 # Full dev + test environment
-uv sync --locked --group dev --group test
+uv sync --locked --extra dev --group test
 
 # Linting only
 uv sync --locked --only-group linting
-
-# LTS environment
-uv sync --locked --group lts --group test
 ```
+
+The LTS environment is reproduced by building `docker/Dockerfile.ci.lts`
+end-to-end; there is no `uv sync`-only equivalent because the LTS deps no
+longer live in `pyproject.toml`.
 
 Several dependencies are sourced directly from git (TransformerEngine, nemo-run,
 FlashMLA, Emerging-Optimizers, nvidia-resiliency-ext). The locked `uv.lock` file
