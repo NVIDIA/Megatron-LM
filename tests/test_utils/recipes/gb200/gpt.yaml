@@ -366,3 +366,13 @@ products:
       - environment: [dev]
         scope: [weekly]
         platforms: [dgx_gb200]
+  - test_case: [gpt3_weekly_mcore_tp2_pp1_nvfp4_tp_sp]
+    products:
+      - environment: [dev]
+        scope: [weekly]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_weekly_mcore_tp2_pp1_native_nvfp4_tp_sp_overlap]
+    products:
+      - environment: [dev]
+        scope: [weekly]
+        platforms: [dgx_gb200]
