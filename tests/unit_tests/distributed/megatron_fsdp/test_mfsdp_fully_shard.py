@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import math
 import shutil
 from contextlib import nullcontext
 from copy import deepcopy
@@ -210,6 +211,14 @@ def build_distributed_environment(mesh_dim_config: tuple):
     Order of dimensions is (DP_OUTER, DP_SHARD, CP, TP).
     """
     from torch.distributed.device_mesh import init_device_mesh
+
+    required_world_size = math.prod(mesh_dim_config)
+    world_size = torch.distributed.get_world_size()
+    if world_size < required_world_size:
+        pytest.skip(
+            f"This test requires {required_world_size} GPUs for mesh "
+            f"{mesh_dim_config}, but only {world_size} are available"
+        )
 
     # Construct device mesh.
     device_mesh = init_device_mesh(
