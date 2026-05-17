@@ -4,6 +4,8 @@ import inspect
 import logging
 from typing import Any, Callable, ClassVar, Literal, override
 
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import get_gpt_heterogeneous_layer_spec
+from megatron.core.transformer.heterogeneous.heterogeneous_config import HeterogeneousTransformerConfig
 import torch
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -20,6 +22,9 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.dot_product_attention import DotProductAttention as MCoreDotProductAttention
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
 
 from megatron.training.models.base import ModelConfig, ModelBuilder, compose_hooks
 from megatron.training.vocab_utils import calculate_padded_vocab_size
@@ -34,6 +39,9 @@ logger = logging.getLogger(__name__)
 from dataclasses import dataclass
 
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_with_inference_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
@@ -47,10 +55,17 @@ def transformer_engine_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
     else:
         kwargs = {}
     return get_gpt_layer_with_transformer_engine_spec(
-        num_experts=config.transformer.num_moe_experts,
-        moe_grouped_gemm=config.transformer.moe_grouped_gemm,
-        qk_layernorm=config.transformer.qk_layernorm,
-        fp8=bool(config.transformer.num_moe_experts and (config.transformer.fp8 is not None)),
+        config.transformer.num_moe_experts,
+        config.transformer.moe_grouped_gemm,
+        config.transformer.qk_layernorm,
+        config.transformer.multi_latent_attention,
+        config.transformer.experimental_attention_variant,
+        qk_l2_norm=config.transformer.qk_l2_norm,
+        use_kitchen=config.transformer.use_kitchen,
+        use_te_activation_func=config.transformer.use_te_activation_func,
+        use_kitchen_attention=config.transformer.use_kitchen_attention,
+        kitchen_attention_backend=config.transformer.kitchen_attention_backend,
+        mla_down_proj_fusion=getattr(config.transformer, "mla_down_proj_fusion", False),
         **kwargs,
     )
 
@@ -92,15 +107,45 @@ def modelopt_transformer_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
     )
 
 
-def default_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
+def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
+    transformer_cfg = config.transformer
+    use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if config.restore_modelopt_state:
         return modelopt_transformer_layer_spec(config)
-    # TODO (@maanug): migrate this spec from Megatron-Bridge
-    # elif config.use_transformer_engine_full_layer_spec:
-    #     return transformer_engine_full_layer_spec(config.transformer)
-    else:
+    elif transformer_cfg.experimental_attention_variant is not None:
+        return get_transformer_block_with_experimental_attention_variant_spec(config=transformer_cfg, vp_stage=vp_stage)
+    elif transformer_cfg.num_moe_experts is not None:
+        return get_gpt_decoder_block_spec(
+            transformer_cfg,
+            use_transformer_engine=use_te,
+            normalization=transformer_cfg.normalization,
+            qk_l2_norm=transformer_cfg.qk_l2_norm,
+            vp_stage=vp_stage,
+        )
+    elif isinstance(transformer_cfg, HeterogeneousTransformerConfig):
+        return get_gpt_heterogeneous_layer_spec(transformer_cfg, use_te)
+    elif use_te:
         return transformer_engine_layer_spec(config)
+    elif transformer_cfg.transformer_impl == "inference_optimized":
+        return get_gpt_layer_with_inference_spec(
+            transformer_cfg.qk_layernorm,
+            transformer_cfg.multi_latent_attention,
+            qk_l2_norm=transformer_cfg.qk_l2_norm,
+        )
+    else:
+        return get_gpt_layer_local_spec(
+            transformer_cfg.num_moe_experts,
+            transformer_cfg.moe_grouped_gemm,
+            transformer_cfg.qk_layernorm,
+            transformer_cfg.multi_latent_attention,
+            transformer_cfg.experimental_attention_variant,
+            normalization=transformer_cfg.normalization,
+            use_kitchen=transformer_cfg.use_kitchen,
+            use_kitchen_attention=transformer_cfg.use_kitchen_attention,
+            kitchen_attention_backend=transformer_cfg.kitchen_attention_backend,
+        )
+
 
 
 @dataclass(kw_only=True)
@@ -368,16 +413,20 @@ def mtp_block_spec(
     Returns:
         ModuleSpec: The MTP module specification
     """
+    transformer_cfg = config.transformer
+    use_te = config.transformer.transformer_impl == "transformer_engine"
+
     if config.transformer.mtp_num_layers is not None:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
         if hasattr(transformer_layer_spec, "layer_specs") and len(transformer_layer_spec.layer_specs) == 0:
             # Get the decoder layer spec explicitly if no decoder layer in the last stage,
             # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-            spec = default_layer_spec(config)
+            spec = default_layer_spec(config, vp_stage)
         else:
-            spec = transformer_layer_spec
+            decoder_specs = get_gpt_decoder_layer_specs(transformer_cfg, use_transformer_engine=use_te, normalization=transformer_cfg.normalization, qk_l2_norm=transformer_cfg.qk_l2_norm, vp_stage=vp_stage)
+            spec = decoder_specs[-1]
 
-        return get_gpt_mtp_block_spec(config.transformer, spec, use_transformer_engine=True, vp_stage=vp_stage)
+        return get_gpt_mtp_block_spec(transformer_cfg, spec, use_transformer_engine=use_te, vp_stage=vp_stage)
     else:
         return None
