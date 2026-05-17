@@ -150,6 +150,7 @@ def create_args():
     args.phase_transition_iterations = None
     args.async_strategy = "nvrx"
     args.verify_integrity = False
+    args.dist_ckpt_use_dtensor_format = False
 
     yield args
 

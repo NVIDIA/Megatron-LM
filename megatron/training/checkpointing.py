@@ -443,6 +443,8 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
+    if getattr(args, 'dist_ckpt_use_dtensor_format', False):
+        metadata['use_dtensor_format'] = True
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -672,6 +674,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                                          preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                                                          content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
                                                          async_strategy=args.async_strategy,
+                                                         use_dtensor_format=args.dist_ckpt_use_dtensor_format,
                                                          verify_integrity=args.verify_integrity)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
@@ -1008,13 +1011,18 @@ def generate_state_dict(
             key = f"model{i}"
 
         if args.ckpt_format == "torch_dist":
-            model_sd = model[i].sharded_state_dict(
-                **(model_sd_kwargs or {
-                    "metadata": {
-                        "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)
-                    }
-                })
-            )
+            if model_sd_kwargs:
+                kwargs = model_sd_kwargs
+            else:
+                metadata = {
+                    "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)
+                }
+                kwargs = {"metadata": metadata}
+
+            if args.dist_ckpt_use_dtensor_format:
+                kwargs = {**kwargs, "metadata": {**kwargs["metadata"], "singleton_local_shards": True, "use_dtensor_format": True}}
+                
+            model_sd = model[i].sharded_state_dict(**kwargs)
         else:   # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
 
@@ -1248,6 +1256,7 @@ def _load_global_dist_base_checkpoint(
         load_strategy,
         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
         strict=args.dist_ckpt_strictness,
+        use_dtensor_format=args.dist_ckpt_use_dtensor_format,
         verify_integrity=args.verify_integrity,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL

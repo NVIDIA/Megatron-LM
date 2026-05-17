@@ -63,7 +63,7 @@ MODEL_ARGS:
   --muon-momentum: 0.9
   --muon-extra-scale-factor: 0.2
   --muon-scale-mode: spectral
-  --async-save: true
+  --dist-ckpt-use-dtensor-format: true
   --use-persistent-ckpt-worker: true
   --use-distributed-optimizer: true
 TEST_TYPE: ckpt-resume

@@ -165,6 +165,20 @@ Starting from mcore v0.17, asynchronous checkpoint saving is supported for `fsdp
 
 Note that async saving for these formats requires the `nvidia-resiliency-ext` package. As a result, the only supported `async_strategy` in this context is `nvrx`.
 
+## DTensor-Based Distributed Checkpointing
+
+Distributed checkpointing now supports saving and loading checkpoints using **DTensor-based state dicts**.
+
+When enabled, existing `ShardedTensor` objects are automatically converted to `DTensor` representations on the fly during the save process. The checkpoint is then written directly via `torch.distributed.checkpoint.save`, ensuring compatibility with DTensor-native workflows.
+
+Checkpoints saved in `DTensor` format can be loaded back and used seamlessly for training, allowing full round-trip support.
+
+To enable DTensor-based checkpointing, use the following flag:
+
+```bash
+--dist-ckpt-use-dtensor-format
+```
+
 ## Subpackages
 
 ```{toctree}

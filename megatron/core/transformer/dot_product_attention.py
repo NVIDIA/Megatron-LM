@@ -268,4 +268,5 @@ class DotProductAttention(MegatronModule):
             sharded_offsets,
             tp_group=self.tp_group,
             dp_cp_group=metadata['dp_cp_group'],
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )

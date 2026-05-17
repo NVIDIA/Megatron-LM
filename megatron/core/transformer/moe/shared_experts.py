@@ -205,6 +205,7 @@ class SharedExpertMLP(MLP):
                     prepend_offsets=sharded_offsets,
                     tp_group=self.tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
+                    use_dtensor_format=metadata.get("use_dtensor_format", False),
                 )
             }
             sharded_state_dict.update(sub_sd)

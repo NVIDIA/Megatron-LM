@@ -13,7 +13,11 @@ from .mapping import (
     StateDict,
     apply_factories,
 )
-from .utils import _clean_metadata_for_serialization, extract_nonpersistent, extract_sharded_base
+from .utils import (
+    _clean_metadata_for_serialization,
+    extract_nonpersistent,
+    extract_sharded_base_or_dtensor,
+)
 from .validation import determine_global_metadata, validate_sharding_integrity
 
 
@@ -39,7 +43,7 @@ def save_preprocess(
     """
     apply_factories(sharded_state_dict)
     _, sharded_state_dict = extract_nonpersistent(sharded_state_dict)
-    sharded_part, common_state_dict = extract_sharded_base(sharded_state_dict)
+    sharded_part, common_state_dict = extract_sharded_base_or_dtensor(sharded_state_dict)
     sharded_part = filter_out_empty_flatten_tensor(sharded_part)
     if validate_access_integrity:
         preprocessed_common_state_dict = common_state_dict
