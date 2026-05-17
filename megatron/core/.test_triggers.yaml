@@ -1,0 +1,3 @@
+# Core foundation modules (parallel_state.py, utils.py, enums.py, etc.)
+# are imported by virtually all source and test code.
+test_buckets: ALL

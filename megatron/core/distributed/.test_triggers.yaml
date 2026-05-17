@@ -1,0 +1,17 @@
+# Distributed module (DDP, FSDP, grad sync, param_and_grad_buffer).
+#
+# Test imports traced:
+#   fp8_param         → distributed.DistributedDataParallel
+#   transformer*      → distributed.DistributedDataParallel, config
+#   distributed       → distributed.* (non-fsdp test suite)
+#   distributed_fsdp  → distributed.* (fsdp.mcore_fsdp_adapter, fully_shard)
+#   rl                → distributed
+#   core_unit         → test_utils.py, test_optimizer.py, test_checkpointing.py
+test_buckets:
+  - fp8_param
+  - transformer
+  - transformer_moe
+  - distributed
+  - distributed_fsdp
+  - rl
+  - core_unit

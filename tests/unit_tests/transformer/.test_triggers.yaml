@@ -1,0 +1,4 @@
+# Transformer test files -- directly test the transformer bucket.
+test_buckets:
+  - transformer
+  - transformer_moe

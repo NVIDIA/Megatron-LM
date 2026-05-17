@@ -1,0 +1,6 @@
+# Dist checkpointing test files.
+test_buckets:
+  - ckpt
+  - ckpt_optimizer
+  - ckpt_models
+  - ckpt_moe_experts

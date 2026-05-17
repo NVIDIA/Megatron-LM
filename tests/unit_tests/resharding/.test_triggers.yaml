@@ -1,0 +1,3 @@
+# Resharding test files.
+test_buckets:
+  - resharding

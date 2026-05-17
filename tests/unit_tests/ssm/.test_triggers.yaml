@@ -1,0 +1,3 @@
+# SSM/Mamba test files.
+test_buckets:
+  - ssm
