@@ -31,7 +31,12 @@ from megatron.core.transformer.cuda_graph_config import (
     normalize_inference_cuda_graph_scope,
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
-from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.enums import (
+    AttnBackend,
+    CudaGraphModule,
+    CudaGraphScope,
+    InferenceCudaGraphScope,
+)
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
@@ -43,7 +48,7 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
@@ -154,11 +159,27 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
-    # Args to disable MSC
-    if not args.enable_msc:
+    # Args to enable MSC (opt-in: disabled by default)
+    if args.disable_msc_deprecated:
+        warn_rank_0(
+            '--disable-msc is deprecated and will be removed in a future release. '
+            'MSC is now disabled by default; pass --enable-msc to opt in.'
+        )
+        # Preserve legacy semantics: --disable-msc forces MSC off, even if
+        # --enable-msc was also passed.
+        args.enable_msc = False
+
+    if args.enable_msc:
+        MultiStorageClientFeature.enable()
+        if not MultiStorageClientFeature.is_enabled():
+            raise RuntimeError(
+                "--enable-msc was passed but the multistorageclient package is not "
+                "installed. Install it with `pip install multi-storage-client`."
+            )
+        warn_rank_0('The MSC feature is enabled.')
+    else:
         MultiStorageClientFeature.disable()
         assert MultiStorageClientFeature.is_enabled() is False
-        warn_rank_0('The MSC feature is disabled.')
 
     return args
 
@@ -266,12 +287,12 @@ def _normalize_cuda_graph_modules_args(args):
         args.cuda_graph_modules
     )
     validate_deprecated_cuda_graph_modules_migration_inputs(
-        deprecated_scopes,
-        args.cuda_graph_impl,
-        args.inference_cuda_graph_scope,
+        deprecated_scopes, args.cuda_graph_impl, args.inference_cuda_graph_scope
     )
     if used_full_scope:
-        warn_rank_0('full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.')
+        warn_rank_0(
+            'full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.'
+        )
 
     for scope, attr, value in deprecated_scopes:
         migration = get_deprecated_cuda_graph_modules_migration(
@@ -676,12 +697,10 @@ def validate_args(args, defaults={}):
             del args.external_cuda_graph
 
     if getattr(args, 'cuda_graph_scope_deprecated', None) is not None:
-        assert not args.cuda_graph_modules, (
-            "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
-        )
-        warn_rank_0(
-            '--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.'
-        )
+        assert (
+            not args.cuda_graph_modules
+        ), "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
+        warn_rank_0('--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.')
         args.cuda_graph_modules = args.cuda_graph_scope_deprecated
     del args.cuda_graph_scope_deprecated
 
@@ -689,10 +708,7 @@ def validate_args(args, defaults={}):
     # all subsequent validation sees fully-typed enum values.
     _normalize_cuda_graph_modules_args(args)
     _normalize_inference_cuda_graph_scope_arg(args)
-    assert (
-        args.inference_cuda_graph_scope
-        in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl]
-    ), (
+    assert args.inference_cuda_graph_scope in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl], (
         "Invalid inference CUDA graph scope "
         f"{args.inference_cuda_graph_scope.name!r} for "
         f"--cuda-graph-impl={args.cuda_graph_impl!r}."
@@ -2026,102 +2042,6 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 
-def core_transformer_config_from_args(args, config_class=None):
-
-    # Config class.
-    config_class = config_class or TransformerConfig
-
-    if args.multi_latent_attention:
-        config_class = MLATransformerConfig
-
-    if args.heterogeneous_layers_config_path is not None:
-        assert (
-            not args.multi_latent_attention
-        ), "Multi latent attention with heterogeneous layers is not supported."
-        config_class = HeterogeneousTransformerConfig
-
-    # Translate args to core transformer configuration
-    kw_args = {}
-    for f in dataclasses.fields(config_class):
-        if hasattr(args, f.name):
-            kw_args[f.name] = getattr(args, f.name)
-    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
-    kw_args['deallocate_pipeline_outputs'] = True
-    kw_args['pipeline_dtype'] = args.params_dtype
-    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
-    kw_args['num_moe_experts'] = args.num_experts
-    kw_args['actual_vocab_size'] = args.padded_vocab_size
-    kw_args['rotary_interleaved'] = args.rotary_interleaved
-    kw_args['num_layers_in_first_pipeline_stage'] = args.decoder_first_pipeline_num_layers
-    kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
-    kw_args['fp8_param'] = args.fp8_param_gather
-    kw_args['fp4_param'] = args.fp4_param_gather
-    if args.swiglu:
-        kw_args['activation_func'] = F.silu
-        kw_args['gated_linear_unit'] = True
-        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
-    else:
-        kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
-    if args.squared_relu:
-        assert not args.swiglu
-        kw_args['activation_func'] = squared_relu
-    elif args.quick_geglu:
-        assert not args.swiglu
-        kw_args['gated_linear_unit'] = True
-        kw_args['activation_func'] = quick_gelu
-    if args.init_method_xavier_uniform:
-        kw_args['init_method'] = torch.nn.init.xavier_uniform_
-        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
-    if args.group_query_attention:
-        kw_args['num_query_groups'] = args.num_query_groups
-    else:
-        kw_args['num_query_groups'] = None
-    kw_args['config_logger_dir'] = args.config_logger_dir
-    if args.rope_type is None:
-        # Pop 'rope_type' to let the config class use the default value.
-        kw_args.pop('rope_type', None)
-    else:
-        assert (
-            args.multi_latent_attention or args.rope_type == 'rope'
-        ), f'Common attention only support rope_type="rope", but got {args.rope_type}.'
-
-    if len(args.cp_comm_type) == 1:
-        kw_args['cp_comm_type'] = args.cp_comm_type[0]
-    if args.hybrid_layer_pattern is not None:
-        kw_args['is_hybrid_model'] = True
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
-
-    kw_args['inference_sampling_seed'] = args.seed
-
-    # handle quantization config
-    # NOTE: Kitchen arguments are only added to the namespace when
-    # Kitchen library is available.
-    if hasattr(args, "kitchen_config_file") and args.kitchen_config_file is not None:
-        kw_args['use_kitchen'] = True
-        kw_args['quant_recipe'] = load_quantization_recipe(args.kitchen_config_file)
-    elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
-        kw_args['use_kitchen'] = True
-        kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
-
-    kw_args['moe_latent_size'] = args.moe_latent_size
-
-    if args.te_precision_config_file:
-        assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
-        # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
-        kw_args['quant_recipe'] = load_quantization_recipe(args.te_precision_config_file)
-
-    if hasattr(args, "use_kitchen_attention"):
-        kw_args['use_kitchen_attention'] = args.use_kitchen_attention
-    if hasattr(args, "kitchen_attention_backend"):
-        kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
-
-    # Return config.
-    return config_class(**kw_args)
-
-
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
 
@@ -2185,19 +2105,10 @@ def _add_inference_args(parser):
     group.add_argument(
         '--cuda-graph-scope',
         nargs='+',
-        type=_parse_cuda_graph_modules_arg,
-        default=None,
-        dest='cuda_graph_scope_deprecated',
-        help=argparse.SUPPRESS,  # hidden; use --cuda-graph-modules instead
-    )
-    group.add_argument(
-        '--cuda-graph-modules',
-        nargs='+',
-        type=_parse_cuda_graph_modules_arg,
+        type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope,
         default=[],
-        help='Selects training capture coverage within per-layer CUDA graphs '
-        '(local and transformer_engine implementations). '
-        'Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba": '
+        help='Determines the CUDA graphs capturing scope. '
+        'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
         '"attn": captures operations in TransformerLayer._forward_attention(). '
         '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
         '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
@@ -2205,12 +2116,11 @@ def _add_inference_args(parser):
         'including the shared experts if they are not overlapped with EP comm. '
         '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
         '"mamba": captures the mamba layer. '
-        'An empty list means capturing the whole Transformer layer. '
-        'This field is meaningless when --cuda-graph-impl=full_iteration and must be empty. '
-        'Backward compatibility: "full" is deprecated but kept for backward compatibility; '
-        'it is transformed to an empty list in validate_args. The deprecated values '
-        '"full_iteration" and "full_iteration_inference" are also accepted and migrated '
-        'to the new API in validate_args.',
+        '"full_iteration": captures a whole training iteration. '
+        '"full_iteration_inference": captures a whole inference iteration. '
+        'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
+        'If not specified, the default scope is to capture the whole Transformer layer. '
+        'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.',
     )
     group.add_argument(
         '--use-legacy-static-engine',
@@ -2324,6 +2234,14 @@ def _add_inference_args(parser):
         help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.',
     )
     group.add_argument(
+        '--inference-cuda-graph-all-prefills',
+        action='store_true',
+        default=False,
+        help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
+        'By default, all graphs are limited by the decode limit of '
+        '`max_requests * (num_speculative_tokens + 1)`.',
+    )
+    group.add_argument(
         '--inference-dynamic-batching-unified-memory-level',
         type=int,
         default=0,
@@ -2397,12 +2315,6 @@ def _add_inference_args(parser):
         help='GPU memory budget (in GB) for the Mamba state cache '
         'used by prefix caching on hybrid models. When set, Mamba '
         'states at block boundaries are cached for reuse.',
-    )
-    group.add_argument(
-        '--inference-dynamic-batching-cuda-graph-max-tokens',
-        type=int,
-        default=16384,
-        help='Maximum number of tokens to capture in a cuda graph.',
     )
     group.add_argument(
         '--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
@@ -4776,11 +4688,20 @@ def _add_experimental_args(parser):
 def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
     group.add_argument(
-        '--disable-msc',
-        default=True,
-        action='store_false',
+        '--enable-msc',
+        default=False,
+        action='store_true',
         dest='enable_msc',
-        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.',
+        help='Enable the usage of Multi-Storage Client (MSC) in Megatron Core. '
+        'Disabled by default; pass this flag to opt in.',
+    )
+    group.add_argument(
+        '--disable-msc',
+        default=False,
+        action='store_true',
+        dest='disable_msc_deprecated',
+        help='[DEPRECATED] MSC is disabled by default; this flag is a no-op '
+        'and will be removed in a future release.',
     )
     return parser
 

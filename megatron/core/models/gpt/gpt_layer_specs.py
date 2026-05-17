@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import warnings
+from functools import partial
 from typing import Optional, Union
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -37,18 +38,19 @@ from megatron.core.transformer.transformer_block import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
+    MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
-from megatron.core.typed_torch import copy_signature
+from megatron.core.typed_torch import copy_signature, not_none
 from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TEFusedDenseMLP, TEFusedMLP, TENorm
+    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 else:
-    TEFusedDenseMLP, TEFusedMLP, TENorm, TESpecProvider = None, None, None, None
+    TEFusedMLP, TENorm, TESpecProvider = None, None, None
 
 try:
     from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
@@ -187,7 +189,6 @@ def get_gpt_layer_with_transformer_engine_submodules(
     kitchen_attention_backend: str = "sdpa",
     enable_hyper_connection: bool = False,
     mla_down_proj_fusion: bool = False,
-    dense_grouped_gemm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -238,7 +239,6 @@ def get_gpt_layer_with_transformer_engine_submodules(
         moe_grouped_gemm=moe_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
-        dense_grouped_gemm=dense_grouped_gemm,
     )
 
     hc_module = HyperConnectionModule if enable_hyper_connection else IdentityOp
@@ -512,7 +512,7 @@ def get_mlp_module_spec(
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     use_te_op_fuser: Optional[bool] = False,
-) -> ModuleSpec:
+) -> MlpBuilder:
     """Helper function to get module spec for MLP/MoE"""
     if fp8 is not None:
         warnings.warn(
@@ -543,8 +543,7 @@ def get_mlp_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
-    dense_grouped_gemm: bool = False,
-) -> ModuleSpec:
+) -> MlpBuilder:
     """Helper function to get module spec for MLP/MoE"""
 
     linear_fc2 = backend.row_parallel_linear()
@@ -552,19 +551,14 @@ def get_mlp_module_spec_for_backend(
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        if dense_grouped_gemm and use_te_op_fuser:
-            module = TEFusedDenseMLP
-        elif use_te_op_fuser:
-            module = TEFusedMLP
-        else:
-            module = MLP
+        module = not_none(TEFusedMLP).as_mlp_submodule if use_te_op_fuser else MLP.as_mlp_submodule
         if backend.fuse_layernorm_and_linear():
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
         else:
             linear_fc1 = backend.column_parallel_linear()
-        return ModuleSpec(
-            module=module,
+        return partial(
+            module,
             submodules=MLPSubmodules(
                 linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
             ),

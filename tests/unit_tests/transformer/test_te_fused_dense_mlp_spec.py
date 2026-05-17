@@ -16,7 +16,7 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 _SKIP_REASON = "TEFusedDenseMLP requires Transformer Engine >= 2.14.0"
-_SKIP = not HAVE_TE or not is_te_min_version("2.14.0")
+_SKIP = not HAVE_TE or not is_te_min_version("2.14.0") or TEFusedDenseMLP is None
 
 
 def _make_submodules():

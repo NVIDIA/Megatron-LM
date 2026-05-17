@@ -151,6 +151,11 @@ products:
       - environment: [dev]
         scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts_etp1_ep4]
     products:
       # - environment: [dev]

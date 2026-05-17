@@ -16,6 +16,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
@@ -958,6 +959,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         embedding: Callable,
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -989,12 +991,20 @@ class MultiTokenPredictionLayer(MegatronModule):
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
         )
+        if padding_mask is not None:
+            padding_mask, _ = roll_tensor(
+                padding_mask,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
-        return input_ids, position_ids, decoder_input, hidden_states
+        return input_ids, position_ids, padding_mask, decoder_input, hidden_states
 
     def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
         """
@@ -1002,31 +1012,18 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         decoder_input = apply_module(self.enorm)(decoder_input)
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
-
-        if self.mhc_enabled:
-            n = self.config.num_residual_streams
-            h = self.config.hidden_size
-            # hidden_states is [s, b, n*h] (multi-stream).
-            # hnorm operates per-stream on the h dimension.
-            s, b, _ = hidden_states.shape
-            hs_streams = hidden_states.view(s, b, n, h)
-            hs_streams = apply_module(self.hnorm)(hs_streams)
-            hs_streams = make_viewless_tensor(inp=hs_streams, requires_grad=True, keep_graph=True)
-            # e_proj: [s, b, h] -> [s, b, h], then broadcast to [s, b, n, h]
-            e_out, _ = self.e_proj(decoder_input)
-            e_out = gather_from_tensor_model_parallel_region(e_out, group=self.tp_group)
-            # h_proj: applied per-stream on the h dimension
-            h_out, _ = self.h_proj(hs_streams)
-            h_out = gather_from_tensor_model_parallel_region(h_out, group=self.tp_group)
-            # Sequence-parallel column projections gather the sequence dimension.
-            s, b, n, h = h_out.shape
-            e_out = e_out.unsqueeze(2).expand(s, b, n, h)
-            # Combine and flatten back to [s, b, n*h]
-            hidden_states = (e_out + h_out).reshape(s, b, n * h)
-            if self.sequence_parallel:
-                hidden_states = scatter_to_sequence_parallel_region(
-                    hidden_states, group=self.tp_group
-                )
+        hidden_states = apply_module(self.hnorm)(hidden_states)
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
+        # and the (i + K)-th token's embedding, and combine them with linear projection.
+        hidden_states = torch.cat((decoder_input, hidden_states), -1)
+        hidden_states, _ = self.eh_proj(hidden_states)
+        # For tensor parallel we need to gather the tensor across the model-parallel
+        # ranks after the linear projection.
+        if InferenceMode.is_active():
+            hidden_states = inference_all_gather_from_tensor_model_parallel_region(
+                hidden_states, self.tp_group, self.config
+            )
         else:
             hidden_states = apply_module(self.hnorm)(hidden_states)
             hidden_states = make_viewless_tensor(
@@ -1058,6 +1055,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states: Tensor,
         decoder_input: Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
@@ -1098,6 +1096,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
+                        padding_mask=padding_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
@@ -1116,6 +1115,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_params=inference_params,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
+                        padding_mask=padding_mask,
                     )
 
         if not self.mhc_enabled:
@@ -1355,6 +1355,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
+        padding_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -1389,12 +1390,10 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
-        _orig_cp_group = self.cp_group
-        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
-            self.cp_group = packed_seq_params.cp_group
-        input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
+        input_ids, position_ids, padding_mask, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
+            padding_mask=padding_mask,
             embedding=embedding,
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
@@ -1405,6 +1404,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1420,6 +1420,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1431,8 +1432,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
             )
 
-        self.cp_group = _orig_cp_group
-        return hidden_states, input_ids, position_ids
+        return hidden_states, input_ids, position_ids, padding_mask
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -1679,6 +1679,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
+        padding_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -1718,11 +1719,12 @@ class MultiTokenPredictionBlock(MegatronModule):
             hidden_states = hidden_states_list[offset]
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            (hidden_states, input_ids, position_ids) = self.layers[layer_idx](
+            (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
