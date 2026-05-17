@@ -77,7 +77,15 @@ runs:
 
     - name: Change ownership of /home/runner/
       shell: bash
-      run: sudo chown -R $(whoami) /home/runner/
+      # Tolerate vanishing `.git/objects/pack/.tmp-*` files: the prior
+      # `actions/checkout` may leave a background `git gc --auto` running,
+      # whose `git pack-objects` renames/deletes temp files while `chown`
+      # is walking the tree. On failure, wait 5 s for gc to settle, retry,
+      # then succeed unconditionally.
+      run: |
+        sudo chown -R $(whoami) /home/runner/ 2>/dev/null && exit 0
+        sleep 5
+        sudo chown -R $(whoami) /home/runner/ 2>/dev/null || true
 
     - name: Setup python
       uses: actions/setup-python@v5
