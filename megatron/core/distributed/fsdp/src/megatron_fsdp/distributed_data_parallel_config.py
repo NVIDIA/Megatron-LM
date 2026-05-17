@@ -4,8 +4,15 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from packaging.version import Version
 
-from megatron.core.utils import is_torch_min_version
+
+def is_torch_min_version(version: str) -> bool:
+    """
+    Check if the torch version is greater than or equal to the given version.
+    """
+    torch_version = torch.__version__.split("+")[0]
+    return Version(torch_version) >= Version(version)
 
 
 @dataclass
