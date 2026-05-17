@@ -910,6 +910,25 @@ class MegatronFSDP(torch.nn.Module):
                         ag_pipeline.bucket_can_be_released[
                             ag_pipeline.get_bucket_key(bucket_id, bwd=False)
                         ] = True
+
+            # Seed asynchronous backward prefetch from the last gradient-bearing bucket.
+            last_param = next(
+                (
+                    group.params[0]
+                    for group in reversed(self.param_and_grad_buffer.parameter_groups)
+                    if group.requires_grad
+                ),
+                None,
+            )
+            if last_param is not None:
+                self.all_gather_and_wait_parameters_ready(
+                    params=[last_param],
+                    prefetch=True,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    wait_bucket_ready=False,
+                    bwd=True,
+                )
+
             # Track parameters that require gradient reduction and optimization.
             self._params_require_handle_grad = set()
             for param_group in self.param_and_grad_buffer.parameter_groups:
