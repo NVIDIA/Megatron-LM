@@ -1,5 +1,4 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
-from functools import partial
 
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -113,8 +112,8 @@ def _get_hybrid_stack_local_spec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
             pre_mlp_layernorm=Norm,
-            mlp=partial(
-                MLP.as_mlp_submodule,
+            mlp=ModuleSpec(
+                module=MLP,
                 submodules=MLPSubmodules(
                     linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
                 ),
