@@ -18,7 +18,7 @@
 
 ### Software
 
-- **Python**: >= 3.10 (3.12 recommended)
+- **Python**: >= 3.12
 - **PyTorch**: >= 2.6.0
 - **CUDA Toolkit**: Latest stable version
 
@@ -49,7 +49,7 @@ uv pip install "megatron-core[training]"
 For all extras including [Transformer Engine](https://github.com/NVIDIA/TransformerEngine):
 
 ```bash
-uv pip install --group build
+uv sync --group build
 uv pip install --no-build-isolation "megatron-core[training,dev]"
 ```
 
@@ -85,7 +85,7 @@ uv pip install -e .
 To install with all development dependencies (includes Transformer Engine, requires pre-installed build deps):
 
 ```bash
-uv pip install --group build
+uv sync --group build
 uv pip install --no-build-isolation -e ".[training,dev]"
 ```
 
