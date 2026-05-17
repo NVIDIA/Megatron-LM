@@ -246,9 +246,12 @@ class GraphableMegatronModule(MegatronModule):
         )
 
         static_inputs = {}
+        params_dtype = (
+            self.config.params_dtype if self.config.params_dtype is not None else torch.bfloat16
+        )
         static_inputs["hidden_states"] = torch.ones(
             (slen_per_cptp, micro_batch_size, self.config.hidden_size),
-            dtype=torch.bfloat16,
+            dtype=params_dtype,
             requires_grad=True,
             device=torch.cuda.current_device(),
         )
@@ -285,7 +288,8 @@ class GraphableMegatronModule(MegatronModule):
         CUDA Graph capture for this layer using TE interface.
         Normally it's just a forward pass if we're capturing the entire layer.
         """
-        return self.forward(*args, **kwargs)
+        forward_func = getattr(self, '_original_forward', self.forward)
+        return forward_func(*args, **kwargs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """
@@ -346,13 +350,22 @@ class GraphableMegatronModule(MegatronModule):
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):
-            if not self.cuda_graphs:
-                # Do CUDA Graphs capture.
-                cuda_graph_func = self._te_cuda_graph_capture
-            else:
-                # Do CUDA Graphs replay.
-                cuda_graph_func = self._te_cuda_graph_replay
-            return cuda_graph_func(*args, **kwargs)
+            # Temporarily replace forward with cuda graph function
+            self._original_forward = self.forward
+            try:
+                if not self.cuda_graphs:
+                    # Do CUDA Graphs capture.
+                    self.forward = self._te_cuda_graph_capture
+                else:
+                    # Do CUDA Graphs replay.
+                    self.forward = self._te_cuda_graph_replay
+
+                return super().__call__(*args, **kwargs)
+            finally:
+                # Restore original forward and clean up temporary attribute
+                self.forward = self._original_forward
+                if hasattr(self, '_original_forward'):
+                    delattr(self, '_original_forward')
         return super().__call__(*args, **kwargs)
 
 
