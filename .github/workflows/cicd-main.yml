@@ -703,7 +703,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || startsWith(github.ref, 'refs/heads/bump-ci-container')
       )
       && !cancelled()
     outputs:
@@ -780,7 +780,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || startsWith(github.ref, 'refs/heads/bump-ci-container')
       )
       && !cancelled()
     steps:
@@ -823,7 +823,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || startsWith(github.ref, 'refs/heads/bump-ci-container')
       )
       && !cancelled()
     outputs:
@@ -901,7 +901,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || startsWith(github.ref, 'refs/heads/bump-ci-container')
       )
       && !cancelled()
     steps:
