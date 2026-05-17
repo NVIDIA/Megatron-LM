@@ -659,6 +659,109 @@ def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
     distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
 
 
+def test_distrib_optimizer_store_param_remainders_dp_zero_roundtrip():
+    """Test that dp_zero checkpoint save/load roundtrip works correctly
+    when store_param_remainders=True.
+
+    When store_param_remainders=True, the optimizer stores int16 remainders
+    instead of full fp32 master params. The dp_zero save path upcasts these
+    to float32, and the load path must convert them back to int16.
+    """
+    try:
+        from transformer_engine.pytorch.optimizers import FusedAdam
+    except ImportError:
+        pytest.skip("TE FusedAdam not available")
+
+    import inspect
+
+    adam_args = inspect.signature(FusedAdam).parameters
+    for name in [
+        "master_weight_dtype",
+        "exp_avg_dtype",
+        "exp_avg_sq_dtype",
+        "use_decoupled_grad",
+    ]:
+        if name not in adam_args:
+            pytest.skip("TE FusedAdam does not support precision-aware args")
+    if "store_param_remainders" not in adam_args:
+        pytest.skip("TE FusedAdam does not support store_param_remainders")
+
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+
+    optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        bf16=True,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=True,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        exp_avg_dtype=torch.float32,
+        exp_avg_sq_dtype=torch.float32,
+    )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Run a training step to populate optimizer state
+    input_data = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
+    output = model(input_data)
+    loss = output.sum()
+    loss.backward()
+    optim.step()
+
+    distrib_optim = optim.chained_optimizers[0]
+    assert distrib_optim.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+    assert getattr(distrib_optim.optimizer, 'store_param_remainders', False), \
+        "store_param_remainders should be True for this test"
+
+    # Capture original int16 remainder state before save
+    original_remainders = {}
+    for gbuf_range_maps in distrib_optim.gbuf_ranges:
+        for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+            for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                for model_param in gbuf_range_map["param_map"]:
+                    tensors = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    original_remainders[model_param] = tensors["param"].clone()
+
+    # Save via dp_zero path (forces float32 buffers)
+    saved_state = distrib_optim.get_parameter_state_dp_zero()
+
+    # Verify saved state is float32 (dp_zero always saves as float32)
+    if saved_state is not None:
+        for gbuf_idx in saved_state:
+            if isinstance(gbuf_idx, int):
+                for dtype, world_tensors in saved_state[gbuf_idx].items():
+                    if "param" in world_tensors:
+                        assert world_tensors["param"].dtype == torch.float32
+
+    # Load back via dp_zero path - this should NOT crash
+    distrib_optim.load_parameter_state_from_dp_zero(saved_state)
+
+    # Verify restored state matches original
+    for gbuf_range_maps in distrib_optim.gbuf_ranges:
+        for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+            for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                for model_param in gbuf_range_map["param_map"]:
+                    tensors = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    restored = tensors["param"]
+                    original = original_remainders[model_param]
+                    assert restored.dtype == original.dtype, \
+                        f"dtype mismatch: {restored.dtype} vs {original.dtype}"
+                    assert torch.equal(restored, original), \
+                        "param remainder not preserved after dp_zero roundtrip"
+
+
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("precision", ['bf16', 'fp32'])
 def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: str):
