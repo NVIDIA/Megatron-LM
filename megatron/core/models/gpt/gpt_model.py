@@ -31,6 +31,10 @@ from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank,
     process_mtp_loss,
 )
+from megatron.core.transformer.mxfp8_output_proj import (
+    TELinearCrossEntropyModule,
+    is_te_mxfp8_output_proj_active,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -244,7 +248,12 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            output_layer_cls = (
+                TELinearCrossEntropyModule
+                if is_te_mxfp8_output_proj_active(config)
+                else tensor_parallel.ColumnParallelLinear
+            )
+            self.output_layer = output_layer_cls(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
