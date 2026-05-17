@@ -841,7 +841,7 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
-    
+
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
     block interleaved format. Instead of interpreting the input tensor
