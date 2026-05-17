@@ -384,7 +384,22 @@ class DynamicInferenceRequest(InferenceRequest):
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
-            self.remaining_prompt_tokens = self.prompt_tokens
+            if isinstance(self.prompt_tokens, torch.Tensor):
+                if (
+                    self.prompt_tokens.dtype != torch.int64
+                    or self.prompt_tokens.device.type != "cpu"
+                ):
+                    self.prompt_tokens = self.prompt_tokens.detach().to(
+                        device="cpu", dtype=torch.int64
+                    )
+                self.remaining_prompt_tokens = self.prompt_tokens
+            elif not (
+                isinstance(self.prompt_tokens, (list, tuple))
+                and len(self.prompt_tokens) == 2
+                and self.prompt_tokens[0] == "tensor"
+            ):
+                self.prompt_tokens = torch.tensor(self.prompt_tokens, dtype=torch.int64)
+                self.remaining_prompt_tokens = self.prompt_tokens
 
         # Compute block hashes for prefix matching (skip if already provided, e.g. from `merge`).
         if (

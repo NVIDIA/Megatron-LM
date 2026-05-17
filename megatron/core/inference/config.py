@@ -252,6 +252,12 @@ class InferenceConfig:
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
 
+    enable_async_scheduling: bool = False
+    """Whether to speculatively launch eligible decode-only forward passes."""
+
+    enable_async_decode_graphs: bool = False
+    """Whether to capture fused async decode sample/H2D/forward CUDA graphs."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 

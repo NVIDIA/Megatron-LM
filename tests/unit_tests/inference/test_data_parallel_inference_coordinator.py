@@ -170,7 +170,9 @@ class DummyEngine(DynamicInferenceEngine):
 
         return self.requests[request_id].future
 
-    async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
+    async def async_step(
+        self, *, verbose: Optional[bool] = False, send_coordinator_replies: bool = True
+    ) -> Dict:
         """Dummy async_step."""
         await asyncio.sleep(0)
 
@@ -189,7 +191,7 @@ class DummyEngine(DynamicInferenceEngine):
                 entry.future.set_result(entry.record)
                 to_remove.append(request_id)
                 # Send signal to coordinator.
-                if self.is_mp_coordinator:
+                if send_coordinator_replies and self.is_mp_coordinator:
                     payload = msgpack.packb(
                         [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]],
                         use_bin_type=True,

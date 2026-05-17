@@ -2123,11 +2123,12 @@ def get_batch_on_this_hybrid_cp_rank(
 ######################
 
 _nvtx_enabled: bool = False  # Whether NVTX range profiling is enabled
-_nvtx_range_messages: list[str] = []  # Messages associated with active NVTX ranges
+_nvtx_range_messages = threading.local()  # Per-thread active NVTX range messages.
 # Permanently pin the string object representing the name of each NVTX range.
 # These string objects may be created during CUDA graph capture.
 # If they are not pinned, the NVTX range names will be garbage-collected and nsys profile crashes.
 _nvtx_range_msg_pool: dict[str, str] = {}
+_nvtx_range_msg_pool_lock = threading.Lock()
 
 
 def configure_nvtx_profiling(enabled: bool) -> None:
@@ -2154,6 +2155,15 @@ def _nvtx_range_get_func_path():
     return f"{module.__name__}.{caller_func}"
 
 
+def _nvtx_range_message_stack() -> list[str]:
+    """Return the calling thread's active NVTX range stack."""
+    stack = getattr(_nvtx_range_messages, "stack", None)
+    if stack is None:
+        stack = []
+        _nvtx_range_messages.stack = stack
+    return stack
+
+
 def nvtx_range_push(msg=None, suffix=None) -> None:
     """Push NVTX range onto stack. If msg is not provided, use the calling function's path.
 
@@ -2172,10 +2182,11 @@ def nvtx_range_push(msg=None, suffix=None) -> None:
     # If we have entered this range before, do not use the newly-created "msg" object.
     # But instead point to the original, first-created, "msg" object.
     # They may hold identical data, but they are different addresses; matters when CUDA-graphed.
-    msg = _nvtx_range_msg_pool.setdefault(msg, msg)
+    with _nvtx_range_msg_pool_lock:
+        msg = _nvtx_range_msg_pool.setdefault(msg, msg)
 
     # Track messages to ensure consistency when popping
-    _nvtx_range_messages.append(msg)
+    _nvtx_range_message_stack().append(msg)
 
     # Push NVTX range
     torch.cuda.nvtx.range_push(msg)
@@ -2197,9 +2208,10 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
         msg = f"{msg}.{suffix}"
 
     # Update list of NVTX range messages and check for consistency
-    if not _nvtx_range_messages:
+    stack = _nvtx_range_message_stack()
+    if not stack:
         raise RuntimeError("Attempted to pop NVTX range from empty stack")
-    last_msg = _nvtx_range_messages.pop()
+    last_msg = stack.pop()
     if msg is not None and msg != last_msg:
         raise ValueError(
             f"Attempted to pop NVTX range from stack with msg={msg}, "
