@@ -1057,6 +1057,14 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    fine_grained_offloading_max_inflight_offloads: Optional[int] = None
+    """Per fine-grained offloading group name, max number of inflight offloads for that name not
+    yet joined on the main stream (wait_event on D2H). The same cap applies to every name (e.g.,
+    ``moe_act`` and ``qkv_linear`` each have their own pending queue). 0 = wait after every
+    offload for that name. 1 = at most one not-yet-waited offload per name, etc. None = do not
+    insert these joins. This feature is particularly useful when using with full-iteration CUDA
+    graphs"""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -2153,6 +2161,28 @@ class TransformerConfig(ModelParallelConfig):
                         ) or "moe" not in self.recompute_modules, (
                             "moe_input_jitter_eps is not supported with graphed moe recomputation."
                         )
+
+            if self.fine_grained_activation_offloading:
+                assert self.cuda_graph_impl == "transformer_engine" or (
+                    self.cuda_graph_impl == "local"
+                    and self.cuda_graph_scope == [CudaGraphScope.full_iteration]
+                ), (
+                    "fine-grained activation offloading is only supported with "
+                    "transformer_engine CUDA graph implementation or local CUDA graph "
+                    "implementation with full_iteration scope."
+                )
+                assert (
+                    CudaGraphScope.moe not in self.cuda_graph_scope
+                ), "Token-drop MoE is temporarily not supported with activation offloading."
+                assert self.cuda_graph_warmup_steps > 0, (
+                    "cuda_graph_warmup_steps must be greater than 0 when enabling "
+                    "fine-grained activation offloading."
+                )
+                if CudaGraphScope.full_iteration in self.cuda_graph_scope:
+                    assert self.fine_grained_offloading_max_inflight_offloads is not None, (
+                        "fine_grained_offloading_max_inflight_offloads must be set when using "
+                        "fine-grained activation offloading with full-iteration CUDA graphs "
+                    )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
