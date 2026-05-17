@@ -25,6 +25,7 @@ from megatron.core.transformer.transformer_block import (
     get_num_layers_to_build,
 )
 from megatron.core.transformer.transformer_layer import (
+    SelfAttentionBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
@@ -99,21 +100,23 @@ def _get_qk_layernorm(use_te: bool, normalization: str):
 
 def _get_heterogenous_attention_spec(
     attn_config: AttentionConfig, use_te: bool, qk_layernorm: bool, normalization: str
-):
+) -> SelfAttentionBuilder | type[IdentityOp]:
     if attn_config.no_op:
-        self_attention = ModuleSpec(module=IdentityOp)
+        return IdentityOp
     elif attn_config.replace_with_linear:
-        self_attention = ModuleSpec(
-            module=(
-                TELayerNormColumnParallelLinearGathered if use_te else ColumnParallelLinearGathered
+        return partial(
+            (
+                not_none(TELayerNormColumnParallelLinearGathered)
+                if use_te
+                else ColumnParallelLinearGathered
             ),
-            params={"tp_comm_buffer_name": "linear_attn"},
+            tp_comm_buffer_name="linear_attn",
         )
     else:
         ln = _get_qk_layernorm(use_te, normalization) if qk_layernorm else IdentityOp
-        self_attention = ModuleSpec(
-            module=SelfAttention,
-            params={"attn_mask_type": AttnMaskType.causal},
+        return partial(
+            SelfAttention,
+            attn_mask_type=AttnMaskType.causal,
             submodules=SelfAttentionSubmodules(
                 linear_qkv=(
                     not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
@@ -124,7 +127,6 @@ def _get_heterogenous_attention_spec(
                 k_layernorm=ln,
             ),
         )
-    return self_attention
 
 
 def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):

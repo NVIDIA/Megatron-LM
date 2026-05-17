@@ -42,9 +42,9 @@ def get_vit_layer_with_transformer_engine_spec() -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.no_mask},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.no_mask,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
@@ -68,9 +68,9 @@ def get_vit_layer_with_local_spec() -> ModuleSpec:
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=LNImpl,
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.no_mask},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.no_mask,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,

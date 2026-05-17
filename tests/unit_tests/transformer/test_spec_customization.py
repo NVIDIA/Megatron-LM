@@ -255,7 +255,13 @@ class TestSpecCustomization:
         submodules = get_gpt_layer_local_submodules(qk_l2_norm=True)
 
         # Build the self-attention module from the spec
-        self_attention = build_module(submodules.self_attention, config=self.config, layer_number=1)
+        self_attention = submodules.self_attention(
+            config=self.config,
+            layer_number=1,
+            cp_comm_type=None,
+            pg_collection=self.pg_collection,
+            pp_layer_offset=None,
+        )
 
         assert isinstance(self_attention, SelfAttention)
         # Verify that q_layernorm and k_layernorm are L2Norm instances

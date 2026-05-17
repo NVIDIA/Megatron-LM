@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from typing import cast
+
 import pytest
 import torch
 
@@ -8,8 +10,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -64,7 +67,10 @@ class TestParallelAttentionWithPackedSequence:
         )
         self.parallel_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            cast(
+                SelfAttentionSubmodules,
+                get_submodules(get_gpt_layer_with_transformer_engine_submodules().self_attention),
+            ),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -140,7 +146,10 @@ class TestParallelAttentionWithPackedSequence:
         transformer_config.recompute_granularity = 'selective'
         checkpointed_parallel_attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            cast(
+                SelfAttentionSubmodules,
+                get_submodules(get_gpt_layer_with_transformer_engine_submodules().self_attention),
+            ),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )

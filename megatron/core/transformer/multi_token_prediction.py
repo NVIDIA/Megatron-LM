@@ -28,7 +28,7 @@ from megatron.core.tensor_parallel.inference_layers import (
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_param, get_submodules
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -713,6 +713,42 @@ def process_mtp_loss(
     return hidden_states
 
 
+def _validate_attn_mask_type(submodules: MultiTokenPredictionLayerSubmodules):
+    """Validates the attention mask type if using transformer inner layers."""
+    if submodules.mtp_model_layer is None:
+        return
+    try:
+        mtp_submodules = get_submodules(submodules.mtp_model_layer)
+    except KeyError | AttributeError:
+        return
+
+    from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
+    from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
+
+    layer_submodules = None
+    if isinstance(mtp_submodules, HybridStackSubmodules):
+        attention_layer_spec = mtp_submodules.attention_layer
+        try:
+            layer_submodules = get_submodules(attention_layer_spec)
+        except KeyError | AttributeError:
+            return
+        assert isinstance(layer_submodules, TransformerLayerSubmodules)
+    elif isinstance(mtp_submodules, TransformerLayerSubmodules):
+        layer_submodules = mtp_submodules
+    else:
+        raise ValueError(
+            "Unsupported mtp_model_layer submodules type for attention mask validation."
+        )
+    if not layer_submodules:
+        return
+    attn_mask_type = get_param(layer_submodules.self_attention, 'attn_mask_type')
+    assert attn_mask_type in SUPPORTED_ATTN_MASK, (
+        f"Multi-Token Prediction (MTP) is not yet supported with "
+        f"{attn_mask_type} attention mask type. "
+        f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+    )
+
+
 class MultiTokenPredictionLayer(MegatronModule):
     """The implementation for Multi-Token Prediction (MTP) which extends
     the prediction scope to multiple future tokens at each position.
@@ -766,33 +802,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
 
-        # Validate attention mask type if using transformer-based inner layers
-        if self.submodules.mtp_model_layer is not None and hasattr(
-            self.submodules.mtp_model_layer, 'submodules'
-        ):
-            from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
-            from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-
-            layer_submodules = None
-            if isinstance(self.submodules.mtp_model_layer.submodules, HybridStackSubmodules):
-                attention_layer_spec = self.submodules.mtp_model_layer.submodules.attention_layer
-                if hasattr(attention_layer_spec, 'submodules'):
-                    assert isinstance(attention_layer_spec.submodules, TransformerLayerSubmodules)
-                    layer_submodules = attention_layer_spec.submodules
-            elif isinstance(self.submodules.mtp_model_layer.submodules, TransformerLayerSubmodules):
-                layer_submodules = self.submodules.mtp_model_layer.submodules
-            else:
-                raise ValueError(
-                    "Unsupported mtp_model_layer submodules type for attention mask validation."
-                )
-            if layer_submodules:
-                self_attention_spec = layer_submodules.self_attention
-                attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-                assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-                    f"Multi-Token Prediction (MTP) is not yet supported with "
-                    f"{attn_mask_type} attention mask type. "
-                    f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-                )
+        _validate_attn_mask_type(self.submodules)
 
         self.enorm = self.submodules.enorm(
             config=self.config,

@@ -241,9 +241,9 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
         module=LayerScalingTransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=InternViTRMSNorm,
-            self_attention=ModuleSpec(
-                module=InternViTSelfAttention,
-                params={"attn_mask_type": AttnMaskType.no_mask},
+            self_attention=partial(
+                InternViTSelfAttention,
+                attn_mask_type=AttnMaskType.no_mask,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TEColumnParallelLinear if use_te else ColumnParallelLinear,
                     core_attention=TEDotProductAttention if use_te else DotProductAttention,
@@ -267,9 +267,9 @@ def get_internvit300M_layer_spec(use_te) -> ModuleSpec:
         module=LayerScalingTransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=LNImpl,
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.no_mask},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.no_mask,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TEColumnParallelLinear if use_te else ColumnParallelLinear,
                     core_attention=TEDotProductAttention if use_te else DotProductAttention,
