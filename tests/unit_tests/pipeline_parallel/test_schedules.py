@@ -14,7 +14,10 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
@@ -768,3 +771,421 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
         assert l['loss_reduced'] == expected['loss_reduced']
 
     Utils.destroy_model_parallel()
+
+
+class _NonInterleavedPipelineTestModel(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.model_type = 'unit-test'
+        self.config = config
+        self.input_tensor = None
+        self.proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False).cuda()
+        torch.nn.init.constant_(self.proj.weight, 0.01)
+
+    def set_input_tensor(self, input_tensor):
+        if isinstance(input_tensor, list):
+            input_tensor = input_tensor[0]
+        self.input_tensor = input_tensor
+
+    def forward(self):
+        if self.input_tensor is None:
+            x = torch.ones(
+                512,
+                8,
+                self.config.hidden_size,
+                device='cuda',
+                dtype=self.config.pipeline_dtype,
+                requires_grad=True,
+            )
+        else:
+            x = self.input_tensor
+        return self.proj(x)
+
+
+def _make_non_interleaved_test_model(config):
+    return _NonInterleavedPipelineTestModel(config)
+
+
+def _make_non_interleaved_test_config(**overrides):
+    defaults = dict(
+        pipeline_model_parallel_size=4,
+        sequence_parallel=False,
+        pipeline_dtype=torch.float,
+        batch_p2p_comm=False,
+    )
+    defaults.update(overrides)
+    config = ModelParallelConfig(**defaults)
+    config.hidden_size = 256
+    return config
+
+
+def _make_non_interleaved_forward_step_func():
+    def forward_step_func(data_iterator, model):
+        output_tensor = model()
+
+        def loss_func(loss_tensor):
+            reduced = loss_tensor.sum()
+            return reduced, {'loss_reduced': reduced.detach().clone()}
+
+        return output_tensor, loss_func
+
+    return forward_step_func
+
+
+@pytest.mark.internal
+class TestNonInterleavedOverlapGuards:
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=4
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def _call_kwargs(self, model, **overrides):
+        defaults = dict(
+            forward_step_func=_make_non_interleaved_forward_step_func(),
+            data_iterator=None,
+            model=[model],
+            num_microbatches=8,
+            seq_length=512,
+            micro_batch_size=8,
+            forward_only=False,
+        )
+        defaults.update(overrides)
+        return defaults
+
+    def test_rejects_forward_only(self):
+        config = _make_non_interleaved_test_config(overlap_p2p_comm=True)
+        model = _make_non_interleaved_test_model(config)
+        with pytest.raises(NotImplementedError, match="forward_only"):
+            schedule.forward_backward_pipelining_without_interleaving(
+                **self._call_kwargs(model, forward_only=True)
+            )
+
+    def test_rejects_adjust_tensor_shapes_fn(self):
+        config = _make_non_interleaved_test_config(overlap_p2p_comm=True)
+        model = _make_non_interleaved_test_model(config)
+        with pytest.raises(NotImplementedError, match="adjust_tensor_shapes_fn"):
+            schedule.forward_backward_pipelining_without_interleaving(
+                **self._call_kwargs(model, adjust_tensor_shapes_fn=lambda r, s: (r, s))
+            )
+
+    def test_rejects_multimodule(self):
+        config = _make_non_interleaved_test_config(overlap_p2p_comm=True)
+        model = _make_non_interleaved_test_model(config)
+        multimodule_pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"llm": ProcessGroupCollection()}, language_model_module_name="llm"
+        )
+        with pytest.raises(NotImplementedError, match="multimodule"):
+            schedule.forward_backward_pipelining_without_interleaving(
+                **self._call_kwargs(model, pg_collection=multimodule_pg_collection)
+            )
+
+    def test_rejects_batch_p2p_comm(self):
+        config = _make_non_interleaved_test_config(overlap_p2p_comm=True, batch_p2p_comm=True)
+        model = _make_non_interleaved_test_model(config)
+        with pytest.raises(ValueError, match="batch_p2p_comm"):
+            schedule.forward_backward_pipelining_without_interleaving(**self._call_kwargs(model))
+
+    def test_rejects_ring_exchange(self):
+        config = _make_non_interleaved_test_config(
+            overlap_p2p_comm=True, use_ring_exchange_p2p=True
+        )
+        model = _make_non_interleaved_test_model(config)
+        with pytest.raises(NotImplementedError, match="use_ring_exchange_p2p"):
+            schedule.forward_backward_pipelining_without_interleaving(**self._call_kwargs(model))
+
+    def test_rejects_warmup_flush(self):
+        config = _make_non_interleaved_test_config(
+            overlap_p2p_comm=True, overlap_p2p_comm_warmup_flush=True
+        )
+        model = _make_non_interleaved_test_model(config)
+        with pytest.raises(NotImplementedError, match="overlap_p2p_comm_warmup_flush"):
+            schedule.forward_backward_pipelining_without_interleaving(**self._call_kwargs(model))
+
+    def test_rejects_variable_seq_lengths(self):
+        config = _make_non_interleaved_test_config(overlap_p2p_comm=True)
+        config.variable_seq_lengths = True
+        model = _make_non_interleaved_test_model(config)
+        with pytest.raises(NotImplementedError, match="variable_seq_lengths"):
+            schedule.forward_backward_pipelining_without_interleaving(**self._call_kwargs(model))
+
+    def test_rejects_mtp_standalone(self):
+        config = _make_non_interleaved_test_config(overlap_p2p_comm=True)
+        config.mtp_standalone = True
+        model = _make_non_interleaved_test_model(config)
+        with pytest.raises(NotImplementedError, match="mtp_standalone"):
+            schedule.forward_backward_pipelining_without_interleaving(**self._call_kwargs(model))
+
+    def test_rejects_shape_count_mismatch(self, mocker):
+        config = _make_non_interleaved_test_config(overlap_p2p_comm=True)
+        model = _make_non_interleaved_test_model(config)
+        mocker.patch(
+            "megatron.core.pipeline_parallel.schedules.get_tensor_shapes",
+            side_effect=[[(512, 8, 256)], [(512, 8, 256), (512, 8, 256)]],
+        )
+        with pytest.raises(NotImplementedError, match="matching recv/send tensor shape counts"):
+            schedule.forward_backward_pipelining_without_interleaving(**self._call_kwargs(model))
+
+
+@pytest.mark.internal
+class TestNonInterleavedOverlapExecution:
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=4
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def _run_overlap_vs_baseline_training(self, deallocate_pipeline_outputs):
+        baseline_config = _make_non_interleaved_test_config(
+            overlap_p2p_comm=False, deallocate_pipeline_outputs=deallocate_pipeline_outputs
+        )
+        baseline_model = _make_non_interleaved_test_model(baseline_config)
+
+        overlap_config = _make_non_interleaved_test_config(
+            overlap_p2p_comm=True,
+            batch_p2p_comm=False,
+            deallocate_pipeline_outputs=deallocate_pipeline_outputs,
+        )
+        overlap_model = _make_non_interleaved_test_model(overlap_config)
+        overlap_model.load_state_dict(baseline_model.state_dict())
+
+        baseline_losses = schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=_make_non_interleaved_forward_step_func(),
+            data_iterator=None,
+            model=[baseline_model],
+            num_microbatches=8,
+            seq_length=512,
+            micro_batch_size=8,
+            forward_only=False,
+        )
+
+        overlap_losses = schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=_make_non_interleaved_forward_step_func(),
+            data_iterator=None,
+            model=[overlap_model],
+            num_microbatches=8,
+            seq_length=512,
+            micro_batch_size=8,
+            forward_only=False,
+        )
+
+        assert isinstance(baseline_losses, list)
+        assert isinstance(overlap_losses, list)
+        assert len(baseline_losses) == len(overlap_losses)
+        for baseline_loss, overlap_loss in zip(baseline_losses, overlap_losses):
+            assert baseline_loss.keys() == overlap_loss.keys()
+            assert torch.equal(baseline_loss['loss_reduced'], overlap_loss['loss_reduced'])
+
+    def _run_overlap_vs_baseline_gradients(self, deallocate_pipeline_outputs):
+        baseline_config = _make_non_interleaved_test_config(
+            overlap_p2p_comm=False, deallocate_pipeline_outputs=deallocate_pipeline_outputs
+        )
+        baseline_model = _make_non_interleaved_test_model(baseline_config)
+
+        overlap_config = _make_non_interleaved_test_config(
+            overlap_p2p_comm=True,
+            batch_p2p_comm=False,
+            deallocate_pipeline_outputs=deallocate_pipeline_outputs,
+        )
+        overlap_model = _make_non_interleaved_test_model(overlap_config)
+        overlap_model.load_state_dict(baseline_model.state_dict())
+
+        schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=_make_non_interleaved_forward_step_func(),
+            data_iterator=None,
+            model=[baseline_model],
+            num_microbatches=8,
+            seq_length=512,
+            micro_batch_size=8,
+            forward_only=False,
+        )
+
+        schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=_make_non_interleaved_forward_step_func(),
+            data_iterator=None,
+            model=[overlap_model],
+            num_microbatches=8,
+            seq_length=512,
+            micro_batch_size=8,
+            forward_only=False,
+        )
+
+        baseline_grads = {}
+        for name, param in baseline_model.named_parameters():
+            assert param.grad is not None, f"Expected baseline gradient for {name}"
+            baseline_grads[name] = param.grad.detach().clone()
+
+        overlap_grads = {}
+        for name, param in overlap_model.named_parameters():
+            assert param.grad is not None, f"Expected overlap gradient for {name}"
+            overlap_grads[name] = param.grad.detach().clone()
+
+        assert baseline_grads.keys() == overlap_grads.keys()
+        for name in baseline_grads:
+            assert torch.allclose(
+                baseline_grads[name], overlap_grads[name]
+            ), f"Gradient mismatch for {name}"
+
+    def test_overlap_matches_baseline_training(self):
+        self._run_overlap_vs_baseline_training(deallocate_pipeline_outputs=False)
+
+    def test_overlap_matches_baseline_training_with_deallocate_pipeline_outputs(self):
+        self._run_overlap_vs_baseline_training(deallocate_pipeline_outputs=True)
+
+    def test_overlap_matches_baseline_gradients(self):
+        self._run_overlap_vs_baseline_gradients(deallocate_pipeline_outputs=False)
+
+    def test_overlap_matches_baseline_gradients_with_deallocate_pipeline_outputs(self):
+        self._run_overlap_vs_baseline_gradients(deallocate_pipeline_outputs=True)
+
+    def test_wait_send_next_before_deallocate(self, mocker):
+        from megatron.core.pipeline_parallel.p2p_communication import P2PAsyncHandleSet
+
+        events = []
+        tracked_pairs = []
+        waited_output_seqs = set()
+        original_deallocate = schedule.deallocate_output_tensor
+        original_wait_send_next = P2PAsyncHandleSet.wait_send_next
+        original_send_forward_recv_backward = P2PCommunicator.send_forward_recv_backward
+
+        def _find_output_entry(output_tensor):
+            for entry in tracked_pairs:
+                if entry["output_tensor"] is output_tensor:
+                    return entry
+            return None
+
+        def _find_handle_entry(handle_set):
+            for entry in tracked_pairs:
+                if entry["handle_set"] is handle_set:
+                    return entry
+            return None
+
+        def tracking_send_forward_recv_backward(
+            self, output_tensors, tensor_shapes, is_last_stage, overlap_p2p_comm=False
+        ):
+            result = original_send_forward_recv_backward(
+                self, output_tensors, tensor_shapes, is_last_stage, overlap_p2p_comm
+            )
+            if overlap_p2p_comm:
+                _, handle_set = result
+                tracked_pairs.append(
+                    {
+                        "seq": len(tracked_pairs),
+                        "output_tensor": output_tensors,
+                        "handle_set": handle_set,
+                    }
+                )
+            return result
+
+        def tracking_deallocate(out, deallocate=False):
+            entry = _find_output_entry(out)
+            if deallocate and entry is not None:
+                events.append(("deallocate", entry["seq"]))
+            return original_deallocate(out, deallocate)
+
+        def tracking_wait_send_next(self):
+            entry = _find_handle_entry(self)
+            if entry is not None and entry["seq"] not in waited_output_seqs:
+                waited_output_seqs.add(entry["seq"])
+                events.append(("wait_send_next", entry["seq"]))
+            return original_wait_send_next(self)
+
+        mocker.patch.object(
+            P2PCommunicator, "send_forward_recv_backward", tracking_send_forward_recv_backward
+        )
+        mocker.patch(
+            "megatron.core.pipeline_parallel.schedules.deallocate_output_tensor",
+            side_effect=tracking_deallocate,
+        )
+        mocker.patch.object(P2PAsyncHandleSet, "wait_send_next", tracking_wait_send_next)
+
+        config = _make_non_interleaved_test_config(
+            overlap_p2p_comm=True, batch_p2p_comm=False, deallocate_pipeline_outputs=True
+        )
+        model = _make_non_interleaved_test_model(config)
+
+        schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=_make_non_interleaved_forward_step_func(),
+            data_iterator=None,
+            model=[model],
+            num_microbatches=8,
+            seq_length=512,
+            micro_batch_size=8,
+            forward_only=False,
+        )
+
+        deallocate_events = [event for event in events if event[0] == "deallocate"]
+        assert deallocate_events, "Expected at least one steady-state overlap deallocation event."
+        for deallocate_event in deallocate_events:
+            wait_event = ("wait_send_next", deallocate_event[1])
+            assert wait_event in events, (
+                f"Missing wait_send_next for overlap output seq={deallocate_event[1]}. "
+                f"Events: {events}"
+            )
+            wait_index = events.index(wait_event)
+            deallocate_index = events.index(deallocate_event)
+            assert wait_index <= deallocate_index, (
+                f"wait_send_next (at {wait_index}) must happen before or at "
+                f"deallocate (at {deallocate_index}) for output seq={deallocate_event[1]}. "
+                f"Events: {events}"
+            )
+
+    def test_all_warmup_no_steady_state(self):
+        config = _make_non_interleaved_test_config(overlap_p2p_comm=True, batch_p2p_comm=False)
+        model = _make_non_interleaved_test_model(config)
+
+        losses = schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=_make_non_interleaved_forward_step_func(),
+            data_iterator=None,
+            model=[model],
+            num_microbatches=1,
+            seq_length=512,
+            micro_batch_size=8,
+            forward_only=False,
+        )
+
+        assert isinstance(losses, list)
+
+    def test_single_steady_state_completes_and_waits_send_handles(self, mocker):
+        from megatron.core.pipeline_parallel.p2p_communication import P2PAsyncHandleSet
+
+        wait_events = []
+        original_wait_send_next = P2PAsyncHandleSet.wait_send_next
+        original_wait_send_prev = P2PAsyncHandleSet.wait_send_prev
+
+        def tracking_wait_send_next(self):
+            wait_events.append("wait_send_next")
+            return original_wait_send_next(self)
+
+        def tracking_wait_send_prev(self):
+            wait_events.append("wait_send_prev")
+            return original_wait_send_prev(self)
+
+        mocker.patch.object(P2PAsyncHandleSet, "wait_send_next", tracking_wait_send_next)
+        mocker.patch.object(P2PAsyncHandleSet, "wait_send_prev", tracking_wait_send_prev)
+
+        config = _make_non_interleaved_test_config(overlap_p2p_comm=True, batch_p2p_comm=False)
+        model = _make_non_interleaved_test_model(config)
+
+        losses = schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=_make_non_interleaved_forward_step_func(),
+            data_iterator=None,
+            model=[model],
+            num_microbatches=4,
+            seq_length=512,
+            micro_batch_size=8,
+            forward_only=False,
+        )
+
+        assert isinstance(losses, list)
+        assert (
+            wait_events
+        ), "Expected at least one send-handle wait in the single steady-state case."
