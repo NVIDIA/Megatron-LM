@@ -18,6 +18,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -1370,6 +1371,62 @@ class TestDynamicContext:
         assert (
             len(unique_counts) == 1
         ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
+
+        self._restore_model_parallel()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_uneven_decoder_pp_layer_map_matches_get_num_layers_to_build(self):
+        """Uneven PP (num_layers_in_first/last): KV layer_map length matches this rank's layer count.
+
+        Using ``num_layers // pipeline_model_parallel_size`` for the identity ``layer_map`` would
+        mis-size KV bookkeeping for non-uniform pipeline splits and can surface as ``KeyError`` in
+        ``append_key_value_cache``. ``DynamicInferenceContext`` must match
+        ``get_num_layers_to_build`` for the current PP rank.
+        """
+        pp_size = 2
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+
+        num_layers = 10
+        num_first = 4
+        num_last = 6
+        assert (
+            num_first + num_last == num_layers
+        ), "PP=2 with both ends set: all layers must live on first+last stages (no middle ranks)."
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=num_layers,
+            kv_channels=64,
+            num_attention_heads=8,
+            pipeline_model_parallel_size=pp_size,
+            tensor_model_parallel_size=1,
+            pipeline_dtype=torch.float32,
+            num_layers_in_first_pipeline_stage=num_first,
+            num_layers_in_last_pipeline_stage=num_last,
+        )
+
+        expected_local = num_first if pp_rank == 0 else num_last
+        wrong_uniform = num_layers // pp_size  # 5 on each rank; true counts are 4 and 6
+
+        assert get_num_layers_to_build(model_config) == expected_local
+        assert wrong_uniform != expected_local
+
+        context = DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                buffer_size_gb=0.1,
+                block_size_tokens=16,
+                max_tokens=1024,
+                unified_memory_level=0,
+            ),
+        )
+
+        assert context.num_attention_layers == expected_local
+        assert len(context.layer_map) == expected_local
+        assert context.layer_map == {i: i for i in range(expected_local)}
 
         self._restore_model_parallel()
 
