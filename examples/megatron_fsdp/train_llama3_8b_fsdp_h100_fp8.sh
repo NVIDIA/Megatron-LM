@@ -4,6 +4,8 @@ CHECKPOINT_PATH=${1:-"checkpoints/llama3_8b_fsdp_fp8"}
 TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama3_8b_fsdp_fp8"}
 TOKENIZER_ARG=${3:-"MOCK"} # Path to tokenizer model, or "MOCK"
 DATA_ARG=${4:-"MOCK"}     # Data prefix, or "MOCK"
+PROFILE=${PROFILE:-0}
+EMPTY_UNUSED_MEMORY_LEVEL=${EMPTY_UNUSED_MEMORY_LEVEL:-0}
 
 # Create directories if they don't exist
 mkdir -p "$(dirname "$CHECKPOINT_PATH")"
@@ -24,10 +26,9 @@ PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 # Model & Training Parameters
 USE_MEGATRON_FSDP=${USE_MEGATRON_FSDP:-1}
 SHARDING_STRATEGY=${SHARDING_STRATEGY:-"optim_grads_params"}
-OUTER_SHARDING_STRATEGY=${OUTER_SHARDING_STRATEGY:-"no_shard"}
+OUTER_SHARDING_STRATEGY=${OUTER_SHARDING_STRATEGY:-"optim"}
 TP_SIZE=1
 CP_SIZE=1
-PP_SIZE=1
 MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=128
 NUM_LAYERS=32
@@ -84,13 +85,14 @@ TRAINING_ARGS=(
     --decoupled-min-lr 4.5e-5
     --lr-decay-style cosine
     --clip-grad 1.0
+    --optimizer adam
     --weight-decay 0.1
     --adam-beta1 0.9
     --adam-beta2 0.95
     --bf16
     --cross-entropy-loss-fusion
     --manual-gc
-    --empty-unused-memory-level 1
+    --empty-unused-memory-level ${EMPTY_UNUSED_MEMORY_LEVEL}
     --exit-duration-in-mins 235
 )
 
@@ -183,14 +185,28 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-interval 100
     --save-interval 1000
     --log-throughput
-    --profile
-    --profile-step-start 4
-    --profile-step-end 6
     --distributed-timeout-minutes 60
     --save "$CHECKPOINT_PATH"
     --load "$CHECKPOINT_PATH" 
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
 )
+
+# Profiling (PROFILE=1 bash ...)
+if [ "${PROFILE}" = 1 ]; then
+    EVAL_AND_LOGGING_ARGS+=(
+        --profile
+        --profile-step-start 4
+        --profile-step-end 6
+        --profile-ranks 0
+    )
+    PROFILE_CMD="nsys profile --sample=none --cpuctxsw=none \
+        --trace=cuda,nvtx,cublas,cudnn \
+        --capture-range=cudaProfilerApi --capture-range-end=stop \
+        --cuda-graph-trace=node --cuda-memory-usage=true \
+        -f true -x true"
+else
+    PROFILE_CMD=""
+fi
 
 # Ensure pretrain_gpt.py is found
 if [ ! -f "$PRETRAIN_SCRIPT_PATH" ]; then
@@ -200,7 +216,7 @@ if [ ! -f "$PRETRAIN_SCRIPT_PATH" ]; then
 fi
 
 # Run the training command
-torchrun ${DISTRIBUTED_ARGS[@]} \
+${PROFILE_CMD} torchrun ${DISTRIBUTED_ARGS[@]} \
     "$PRETRAIN_SCRIPT_PATH" \
     ${MODEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \

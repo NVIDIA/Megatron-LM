@@ -57,6 +57,7 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
+from ..distributed.fsdp import FullyShardedDataParallel
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
@@ -64,7 +65,9 @@ from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
+    FSDPTensorParallelMuon,
     _create_emerging_optimizer,
+    _is_nonlinear_or_embedding,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -721,6 +724,182 @@ def check_config_overrides_consistency(
     return True
 
 
+def _get_mfsdp_models(model_chunks):
+    """Extract list of MegatronFSDP instances from FSDP-wrapped model chunks."""
+    mfsdp_models = []
+    for chunk in model_chunks:
+        if isinstance(chunk, FullyShardedDataParallel):
+            mfsdp_models.append(chunk.module)
+    if not mfsdp_models:
+        raise RuntimeError(
+            "Could not find any MegatronFSDP instances in model_chunks. "
+            "Ensure the model is wrapped with FullyShardedDataParallel."
+        )
+    return mfsdp_models
+
+
+def _build_megatron_fsdp_emerging_optimizer(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    config_overrides: Dict[ParamKey, ParamGroupOverride],
+    pg_collection: ProcessGroupCollection,
+    eopt_name: str,
+) -> ChainedOptimizer:
+    """Build an emerging optimizer (currently only Muon) for Megatron-FSDP.
+
+    M-FSDP shards parameters unevenly across DP ranks; params split at rank
+    boundaries must be gathered before Newton-Schulz orthogonalization.
+    Linear params go to Muon (``FSDPTensorParallelMuon`` for sharded
+    strategies, plain ``TensorParallelMuon`` for ``no_shard``); non-linear
+    params fall back to Adam via the standard Megatron-FSDP path.
+    """
+    # Lazy import to avoid pulling Muon-specific symbols when emerging_optimizers
+    # is unavailable; entry already validated upstream.
+    entry = _EMERGING_OPTIMIZERS[eopt_name]
+    init_state_fn = entry.init_state_fn
+
+    # Choose Muon variant based on the inner-DP sharding strategy.
+    # - "no_shard" (ZeRO-0): params/grads are full Replicate DTensors, so the
+    #   plain TensorParallelMuon works without any DP communication.
+    # - Sharded strategies (ZeRO-1/2/3): FSDPTensorParallelMuon gathers
+    #   only split boundary parameters across the DP group before NS and
+    #   re-shards the result.
+    fsdp_strategy = getattr(
+        model_chunks[0].ddp_config, "data_parallel_sharding_strategy", "no_shard"
+    )
+    use_fsdp_zero_muon = fsdp_strategy != "no_shard"
+    optimizer_cls = FSDPTensorParallelMuon if use_fsdp_zero_muon else entry.optimizer_cls
+
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"Setting up Megatron-FSDP emerging optimizer ({eopt_name}) with config {config}",
+    )
+
+    # Ensure Megatron-FSDP module parameters are the (sharded) DTensor main weights,
+    # not the raw/unsharded compute params, before optimizer initialization as a
+    # safety precaution against Megatron-FSDP state changes.
+    for mfsdp in _get_mfsdp_models(model_chunks):
+        mfsdp._replace_param_with_distributed_if_needed()
+
+    # Sort parameters into linear (Muon-managed) vs nonlinear (Adam-managed).
+    linear_params: List[torch.nn.Parameter] = []
+    nonlinear_params: List[torch.nn.Parameter] = []
+    for model_chunk in model_chunks:
+        for _, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if _is_nonlinear_or_embedding(param):
+                nonlinear_params.append(param)
+            else:
+                linear_params.append(param)
+
+    # Build the Muon optimizer for linear params.
+    for p in nonlinear_params:
+        p.requires_grad = False
+    linear_param_groups = _get_param_groups(model_chunks, config, config_overrides)
+
+    # Distinguish expert and non-expert parameter groups.
+    expert_param_groups: List[Dict[str, Any]] = []
+    non_expert_groups: List[Dict[str, Any]] = []
+    for group in linear_param_groups:
+        if group["is_expert_parallel"]:
+            expert_param_groups.append(group)
+        else:
+            non_expert_groups.append(group)
+    linear_param_groups = non_expert_groups
+
+    eopt_kwargs: Dict[str, Any] = {}
+    if entry.config_to_kwargs is not None:
+        eopt_kwargs = entry.config_to_kwargs(config, model_chunks, pg_collection)
+
+    optimizers: List[Any] = []
+    if linear_param_groups:
+        # ZeRO-1/2/3: split dense boundary params are sharded over `dp_cp`, so
+        # the FSDPZero variant must gather over the same group.
+        dense_kwargs = dict(eopt_kwargs)
+        if use_fsdp_zero_muon:
+            dense_kwargs["dp_group"] = pg_collection.dp_cp
+            dense_kwargs["fsdp_batched_all_gather"] = getattr(
+                config, "muon_fsdp_batched_all_gather", False
+            )
+        muon_base = optimizer_cls(linear_param_groups, **dense_kwargs)
+        muon_opt = DistributedOptimizer(
+            muon_base,
+            config,
+            None,  # grad_scaler: None for bf16, Muon carries no loss scale
+            init_state_fn,
+            model_chunks=model_chunks,
+            per_model_buffers={},
+            data_parallel_group=pg_collection.dp_cp,
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=get_pg_rank(pg_collection.mp),
+            distributed_optimizer_instance_id=0,
+        )
+        setattr(muon_opt, "grad_stats_parallel_group", pg_collection.mp)
+        setattr(muon_opt, "tp_group", pg_collection.tp)
+        optimizers.append(muon_opt)
+
+    if expert_param_groups:
+        # Expert params reduce-scatter over `expt_dp` (the expert
+        # data-parallel group), not `dp_cp`.
+        expert_kwargs = dict(eopt_kwargs)
+        if use_fsdp_zero_muon:
+            expert_kwargs["dp_group"] = pg_collection.expt_dp
+            expert_kwargs["fsdp_batched_all_gather"] = getattr(
+                config, "muon_fsdp_batched_all_gather", False
+            )
+        expert_muon_base = optimizer_cls(expert_param_groups, **expert_kwargs)
+        expert_muon_opt = DistributedOptimizer(
+            expert_muon_base,
+            config,
+            None,  # grad_scaler: None for bf16
+            init_state_fn,
+            model_chunks=model_chunks,
+            per_model_buffers={},
+            data_parallel_group=pg_collection.expt_dp,
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=get_pg_rank(pg_collection.tp_ep_pp),
+            distributed_optimizer_instance_id=0,
+        )
+        setattr(expert_muon_opt, "grad_stats_parallel_group", pg_collection.tp_ep_pp)
+        setattr(expert_muon_opt, "tp_group", pg_collection.tp)
+        optimizers.append(expert_muon_opt)
+
+    # Build Adam for non-linear params via the standard FSDP path.
+    for p in nonlinear_params:
+        p.requires_grad = True
+    for p in linear_params:
+        p.requires_grad = False
+    # DRY-reuse get_megatron_optimizer to build (Fused)Adam.
+    saved_optimizer = config.optimizer
+    saved_use_lwd = config.use_layer_wise_distributed_optimizer
+    config.optimizer = "adam"
+    config.use_layer_wise_distributed_optimizer = False
+    try:
+        # `pg_collection` is always provided here, so Gloo process groups
+        # must be disabled on the recursive call (setup_process_groups_for_optimizer
+        # rejects the combination).
+        chained_adam = get_megatron_optimizer(
+            config,
+            model_chunks,
+            config_overrides=config_overrides,
+            pg_collection=pg_collection,
+            use_gloo_process_groups=False,
+        )
+    finally:
+        config.optimizer = saved_optimizer
+        config.use_layer_wise_distributed_optimizer = saved_use_lwd
+
+    for p in linear_params:
+        p.requires_grad = True
+
+    adam_optimizers = list(getattr(chained_adam, "chained_optimizers", [chained_adam]))
+    optimizers += adam_optimizers
+
+    return ChainedOptimizer(optimizers)
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -778,7 +957,23 @@ def _get_megatron_emerging_optimizer(
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
 
-    # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
+    if getattr(model_chunks[0].ddp_config, 'use_megatron_fsdp', False):
+        if use_layer_wise:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"use_layer_wise_distributed_optimizer is ignored for {eopt_name} + Megatron-FSDP: "
+                f"parameter sharding is already built into M-FSDP's DTensor layout.",
+            )
+        return _build_megatron_fsdp_emerging_optimizer(
+            config=config,
+            model_chunks=model_chunks,
+            config_overrides=config_overrides,
+            pg_collection=pg_collection,
+            eopt_name=eopt_name,
+        )
+
+    # Apply optimizer-specific default param overrides (e.g., muon: non-linear -> adam).
     config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).

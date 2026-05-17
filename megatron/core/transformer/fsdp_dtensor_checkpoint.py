@@ -359,30 +359,44 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             f"skipped {_swiglu_skip_count} keys in non-GLU layers (e.g. vision encoder)."
         )
 
+    def _split_swiglu_in_single_opt_state(opt_sd):
+        """Apply swiglu splitting to a single optimizer's state dict (has a 'state' key)."""
+        if len(opt_sd["state"]) == 0:
+            return
+        opt_state = opt_sd["state"]
+        new_opt_state = {}
+        for key in list(opt_state.keys()):
+            if not is_swiglu_key(key) or not _key_in_glu_layer(key):
+                new_opt_state[key] = opt_state[key]
+                continue
+            new_opt_state[f"{key}_w"] = opt_state[key].copy()
+            new_opt_state[f"{key}_v"] = opt_state[key].copy()
+            tensor_subkeys = [
+                sk for sk, sv in opt_state[key].items() if isinstance(sv, torch.Tensor)
+            ]
+            for subkey in tensor_subkeys:
+                dist_param = model.get_parameter(
+                    expert_param_local_key(key[len("module.") :], num_experts)
+                )
+                weight_w, weight_v = split_swiglu_linear_fc1(
+                    opt_state[key][subkey],
+                    dist_param,
+                    swiglu_shard_axis=0,
+                    is_expert_param="mlp.experts" in key,
+                )
+                new_opt_state[f"{key}_w"][subkey] = weight_w
+                new_opt_state[f"{key}_v"][subkey] = weight_v
+        opt_sd["state"] = new_opt_state
+
     if optimizer_state_dict is not None:
         optimizer_state_dict = optimizer_state_dict.copy()
-        if len(optimizer_state_dict["state"]) != 0:
-            opt_state_dict = optimizer_state_dict["state"]
-            new_opt_state_dict = {}
-            for key in list(opt_state_dict.keys()):
-                if not is_swiglu_key(key) or not _key_in_glu_layer(key):
-                    new_opt_state_dict[key] = opt_state_dict[key]
-                    continue
-                new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
-                new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
-                    )
-                    weight_w, weight_v = split_swiglu_linear_fc1(
-                        opt_state_dict[key][subkey],
-                        dist_param,
-                        swiglu_shard_axis=0,
-                        is_expert_param="mlp.experts" in key,
-                    )
-                    new_opt_state_dict[f"{key}_w"][subkey] = weight_w
-                    new_opt_state_dict[f"{key}_v"][subkey] = weight_v
-            optimizer_state_dict["state"] = new_opt_state_dict
+        # Megatron Optimizer vs. Megatron ChainedOptimizer
+        if "state" in optimizer_state_dict:
+            _split_swiglu_in_single_opt_state(optimizer_state_dict)
+        else:
+            for sub_sd in optimizer_state_dict.values():
+                if isinstance(sub_sd, dict) and "state" in sub_sd:
+                    _split_swiglu_in_single_opt_state(sub_sd)
 
     return model_state_dict, optimizer_state_dict
 
@@ -532,26 +546,40 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             f"(in_proj/conv1d → query/key/value/...)."
         )
 
+    def _split_gdn_in_single_opt_state(opt_sd):
+        """Apply GDN splitting to a single optimizer's state dict (has a 'state' key)."""
+        if len(opt_sd["state"]) == 0:
+            return
+        opt_state = opt_sd["state"]
+        new_opt_state = {}
+        for key in list(opt_state.keys()):
+            match = _match_gdn_key(key)
+            if match is None:
+                new_opt_state[key] = opt_state[key]
+                continue
+            sizes, names, dim = match
+            for sub_name in names:
+                new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
+            tensor_subkeys = [
+                sk for sk, sv in opt_state[key].items() if isinstance(sv, torch.Tensor)
+            ]
+            for subkey in tensor_subkeys:
+                dist_param = model.get_parameter(key[len("module.") :])
+                sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
+                for sub_name, tensor in zip(names, sub_tensors):
+                    new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
+        opt_sd["state"] = new_opt_state
+
     # ---- Optimizer state dict --------------------------------------------
     if optimizer_state_dict is not None:
         optimizer_state_dict = optimizer_state_dict.copy()
-        if len(optimizer_state_dict["state"]) != 0:
-            opt_state = optimizer_state_dict["state"]
-            new_opt_state = {}
-            for key in list(opt_state.keys()):
-                match = _match_gdn_key(key)
-                if match is None:
-                    new_opt_state[key] = opt_state[key]
-                    continue
-                sizes, names, dim = match
-                for sub_name in names:
-                    new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key[len("module.") :])
-                    sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
-                    for sub_name, tensor in zip(names, sub_tensors):
-                        new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
-            optimizer_state_dict["state"] = new_opt_state
+        # Megatron Optimizer vs. Megatron ChainedOptimizer
+        if "state" in optimizer_state_dict:
+            _split_gdn_in_single_opt_state(optimizer_state_dict)
+        else:
+            for sub_sd in optimizer_state_dict.values():
+                if isinstance(sub_sd, dict) and "state" in sub_sd:
+                    _split_gdn_in_single_opt_state(sub_sd)
 
     return model_state_dict, optimizer_state_dict
 
