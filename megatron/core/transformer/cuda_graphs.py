@@ -660,9 +660,15 @@ class _CudagraphReplayNode(torch.autograd.Function):
             param.grad_added_to_main_grad = grad_added
 
         # Replaying the next bwd graph destroys the data held in static_grad_inputs, so clone
-        # wgrads as autograd may launch the next graph before wgrads are accumulated
+        # wgrads as autograd may launch the next graph before wgrads are accumulated.
+        # Wgrad slots may legitimately be None for parameters whose wgrad was accumulated
+        # directly into ``main_grad`` (fused wgrad accumulation: TE / Megatron TP linear
+        # signal this by returning None and setting ``param.grad_added_to_main_grad``).
         dgrads = runner.static_grad_inputs[: runner.num_dgrads]
-        wgrads = (g.clone() for g in runner.static_grad_inputs[runner.num_dgrads :])
+        wgrads = (
+            g.clone() if g is not None else None
+            for g in runner.static_grad_inputs[runner.num_dgrads :]
+        )
 
         return None, None, *dgrads, *wgrads
 

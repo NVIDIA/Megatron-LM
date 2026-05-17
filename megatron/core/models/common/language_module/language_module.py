@@ -237,9 +237,23 @@ class LanguageModule(MegatronModule):
             return
 
         if self.config.pipeline_model_parallel_size == 1:
-            # Zero out wgrad if sharing embeddings between two layers on same
-            # pipeline stage to make sure grad accumulation into main_grad is
-            # correct and does not include garbage values (e.g., from torch.empty).
+            # When the input embedding and the output projection share the same
+            # weight tensor on the same pipeline stage, that weight is touched by
+            # two different backward producers:
+            #   1. The output projection (TE / Megatron TP linear with fused
+            #      wgrad accumulation), which writes its wgrad directly into
+            #      ``weight.main_grad`` and signals so via
+            #      ``weight.grad_added_to_main_grad = True``.
+            #   2. ``torch.nn.Embedding`` backward, which produces a real
+            #      gradient that flows into ``weight.grad`` via AccumulateGrad.
+            #
+            # Setting ``zero_out_wgrad`` here tells the DDP post-acc-grad hook
+            # in ``DistributedDataParallel._make_backward_post_hook`` to *also*
+            # add ``weight.grad`` (the embedding contribution) into
+            # ``weight.main_grad`` before the all-reduce, so the two paths are
+            # combined exactly once. Without this flag the hook would skip the
+            # add for ``grad_added_to_main_grad=True`` params, dropping the
+            # embedding's contribution.
             self.shared_embedding_or_output_weight().zero_out_wgrad = True
             return
 

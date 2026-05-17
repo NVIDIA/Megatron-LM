@@ -51,7 +51,6 @@ except ImportError:
 
 try:
     import transformer_engine  # pylint: disable=unused-import
-    from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
     HAVE_TE = True
 except ImportError:
@@ -608,35 +607,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                         )
 
             if hasattr(weight, "grad_added_to_main_grad"):
-                # When overlap_grad_reduce is True, need to ensure that backward hooks
-                # are all run on the main backprop thread to prevent deadlocks. Setup
-                # dummy grad_weight tensor to prevent backward hooks from being run
-                # in a background thread.
-                if getattr(weight, "zero_out_wgrad", False):
-                    if HAVE_TE:
-                        # get_dummy_wgrad function in TE enables reuse of single dummy wgrad buffer
-                        # across different layers/microbatches. The function accepts shape as list.
-                        grad_weight = get_dummy_wgrad(
-                            list(weight.main_grad.shape), input.dtype, zero=True
-                        )
-                    else:
-                        grad_weight = torch.zeros(
-                            weight.main_grad.shape,
-                            dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
-                else:
-                    if HAVE_TE:
-                        grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)
-                    else:
-                        grad_weight = torch.empty(
-                            weight.main_grad.shape,
-                            dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
                 weight.grad_added_to_main_grad = True
+                grad_weight = None
             else:
                 grad_weight = None
         else:

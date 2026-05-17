@@ -444,9 +444,11 @@ class DistributedDataParallel(_BaseDataParallel):
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                    assert param.grad is not None or param.grad_added_to_main_grad, (
+                        'param.grad must not be None when overlap_grad_reduce is True '
+                        'unless the gradient has already been accumulated into main_grad '
+                        '(i.e. param.grad_added_to_main_grad is True).'
+                    )
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
