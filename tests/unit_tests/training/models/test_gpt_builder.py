@@ -4,6 +4,7 @@ import inspect
 from unittest.mock import Mock, call, patch
 
 import pytest
+import torch
 
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
@@ -396,7 +397,10 @@ class TestGPTModelConfigFinalize:
     def test_vp_size_assertion_fails_on_indivisible_layers(self):
         # 6 layers, pp=2 → 3 per stage, vp=2 → 3 % 2 != 0 → AssertionError
         transformer = _make_transformer(
-            num_layers=6, pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
+            num_layers=6,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
         )
         config = GPTModelConfig(transformer=transformer, vocab_size=32000)
         with pytest.raises(AssertionError, match="number of model chunks"):
@@ -405,7 +409,10 @@ class TestGPTModelConfigFinalize:
     def test_vp_size_assertion_passes_on_divisible_layers(self):
         # 8 layers, pp=2 → 4 per stage, vp=2 → 4 % 2 == 0 → OK
         transformer = _make_transformer(
-            num_layers=8, pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
+            num_layers=8,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
         )
         config = GPTModelConfig(transformer=transformer, vocab_size=32000)
         # Should not raise
@@ -419,6 +426,7 @@ class TestGPTModelConfigFinalize:
             pipeline_model_parallel_size=2,
             virtual_pipeline_model_parallel_size=2,
             account_for_embedding_in_pipeline_split=True,
+            pipeline_dtype=torch.bfloat16,
         )
         config = GPTModelConfig(transformer=transformer, vocab_size=32000)
         # Should not raise
