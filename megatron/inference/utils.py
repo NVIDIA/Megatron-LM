@@ -25,6 +25,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_model
 from megatron.training import get_args
@@ -347,7 +348,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs
-            if args.cuda_graph_impl == "local"
+            if args.inference_cuda_graph_scope != InferenceCudaGraphScope.none
             else None
         ),
         max_requests=args.inference_dynamic_batching_max_requests,
