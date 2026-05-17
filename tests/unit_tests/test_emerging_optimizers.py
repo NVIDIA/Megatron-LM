@@ -15,6 +15,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
+    _get_qkv_split_shapes,
     get_supported_coefficient_types,
     validate_coefficient_type,
 )
@@ -63,6 +64,22 @@ class Net(nn.Module):
 # ===========================================================================
 # Muon optimizer tests
 # ===========================================================================
+
+
+def test_muon_qkv_split_shapes():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=1024, num_attention_heads=16, num_query_groups=8
+    )
+    gated_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=1024,
+        num_attention_heads=16,
+        num_query_groups=8,
+        attention_output_gate=True,
+    )
+
+    assert _get_qkv_split_shapes(config) == [128, 64, 64]
+    assert _get_qkv_split_shapes(gated_config) == [128, 128, 64, 64]
 
 
 def test_muon_optimizer_smoke():

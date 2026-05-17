@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
+    _get_qkv_split_shapes,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -769,6 +770,7 @@ def _get_megatron_emerging_optimizer(
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
+        qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -776,7 +778,19 @@ def _get_megatron_emerging_optimizer(
                 param.expert_tp = True
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                param.is_qkv = True
+                if qkv_split_shapes is None:
+                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
+                if param.shape[0] % sum(qkv_split_shapes) == 0:
+                    param.is_qkv = True
+                    param.qkv_split_shapes = qkv_split_shapes
+                    param.muon_param_name = name
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.DEBUG,
+                        f"Emerging optimizer QKV split skipped for {name}: "
+                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
+                    )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
     config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
