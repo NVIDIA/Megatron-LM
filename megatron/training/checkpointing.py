@@ -524,6 +524,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Monitor for the checkpointing timeout (no-op if FT is not enabled)
     ft_integration.on_checkpointing_start()
 
+    # Start draining buffered logits now so the sidecar write can overlap with
+    # async checkpoint I/O. Async checkpoints wait on the returned dependency.
+    from megatron.training.logits_saver import get_logits_saver
+    logits_saver = get_logits_saver()
+    logits_flush_future = None
+    if logits_saver is not None:
+        logits_flush_future = logits_saver.begin_flush()
+
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
 
@@ -772,6 +780,16 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 # Save.
                 ensure_directory_exists(checkpoint_name)
                 torch.save(state_dict, checkpoint_name)
+
+    if logits_saver is not None:
+        if args.async_save and logits_flush_future is not None:
+            assert async_save_request is not None
+            async_save_request = async_save_request.with_finalize_dependencies(
+                [logits_flush_future]
+            )
+        elif not args.async_save:
+            logits_saver.finish_flush()
+
     start_misc = time()
     if ckpt_type != CheckpointType.LOCAL:
         if not args.async_save:

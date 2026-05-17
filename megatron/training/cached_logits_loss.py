@@ -9,22 +9,20 @@ and computes forward KL divergence against live student logits.
 
 Design highlights
 -----------------
-* **Sparse KL** – only the *K/tp_size* positions in this rank's saved shard are
-  used, avoiding a full-vocab-sized dense teacher tensor.
+* **Sparse KL** – each rank uses only the teacher top-K positions that fall in
+  its local vocab shard, avoiding a full-vocab-sized dense teacher tensor.
 * **TP-aware custom autograd** – a ``torch.autograd.Function`` computes the
   TP-aware student softmax in the forward pass (two all-reduces) and
   provides an **analytical backward** that requires **no TP communication**:
   ``∂L/∂z_j = (1/N) · (p_S(j)·C − p_T(j))`` where *C* is the total teacher
   probability mass in the top-K.
-* **Map-style dataset + DataLoader** – :class:`_TeacherDataset` is a
-  standard ``torch.utils.data.Dataset`` whose ``__getitem__`` accepts an
-  iteration number directly.  A :class:`torch.utils.data.DataLoader` with
-  ``pin_memory=True`` and background workers prefetches upcoming iterations
-  so that disk I/O overlaps with GPU compute, and the CPU→GPU copy can be
-  issued with ``non_blocking=True``.
-* **Own-rank loading only** – each rank loads only saved shard files matching
-  its parallelism coordinates (no cross-rank file I/O beyond DP resharding).
-* **Multi-threaded decode pipeline** – the WebDataset ``IterableDataset`` runs
+* **Custom tar streaming + DataLoader** – a :class:`torch.utils.data.DataLoader`
+  with ``pin_memory=True`` streams batched tar shards so that disk I/O overlaps
+  with GPU compute, and the CPU→GPU copy can be issued with
+  ``non_blocking=True``.
+* **Own-rank loading only** – each rank loads only cp-dp shards matching its
+  parallelism coordinates (no cross-rank file I/O beyond DP resharding).
+* **Multi-threaded decode pipeline** – the tar ``IterableDataset`` runs
   inside a single DataLoader worker (to preserve shard iteration order) and
   parallelises the CPU-bound zstd decompression + ``torch.load`` + index
   unpacking across an internal ``ThreadPoolExecutor``.  This removes the
@@ -36,9 +34,9 @@ Assumptions
 * The student run uses the **same random seed** and data pipeline as the
   teacher run that produced the cached log-probs, so the microbatch ordering
   matches.
-* **Same TP/CP layout** (``tp_size``, ``cp_rank``) as the teacher run.
-  The DP size may differ: both upscaling (saved < current) and downscaling
-  (saved > current) are supported provided one evenly divides the other.
+* **Same CP layout** (``cp_rank``) as the teacher run.  The DP size may differ:
+  both upscaling (saved < current) and downscaling (saved > current) are
+  supported provided one evenly divides the other.
 * **Same micro-batch size** as the teacher run.
 * Teacher log-probs were saved by ``LogitsSaverHooks`` (see ``logits_saver.py``).
 
@@ -59,74 +57,99 @@ Usage example
 """
 
 import concurrent.futures
-import functools
 import logging
-import os
-import re
 from collections import deque
-from typing import Iterator, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.distributed.nn as dist_nn
 import torch.utils.data
 
-try:
-  import webdataset as wds
-except ImportError:
-  wds = None
-
 from megatron.core import parallel_state
-from megatron.core.models.gpt import GPTModel
-from megatron.core.utils import unwrap_model
-from megatron.training.logits_saver import (
-  _BATCHED_TAR_RE,
-  _FOLDER_NAMES_PREFIX,
-  _batched_tar_prefix,
-  _sorted_batched_tars,
-  compute_dataset_hash,
-  decode_logprobs_sample,
-  get_current_iteration,
-  load_log_probs_by_rank,
-)
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.training.utils import print_rank_0
 from megatron.training.utils_logits import (
+  BATCHED_TAR_RE,
+  LogprobsTarEntry,
   TarShardPrefetcher,
+  batched_tar_prefix,
+  compute_dataset_hash,
+  decode_logprobs_payload,
+  detect_saved_dp_size,
+  get_current_iteration,
+  iter_logprobs_tar_entries,
   is_remote_storage_path,
-  register_msc_webdataset_handler,
   storage_basename,
-  storage_glob,
-  storage_join,
+  storage_glob_from_listing,
+  sorted_batched_tars,
 )
 
 logger = logging.getLogger(__name__)
 
-def _detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
-    """Scan *logprobs_dir* for batched tars and return the saved DP world size.
+# Module-level reference so the training loss can consume logits captured
+# from the model's output layer without requiring model-specific attributes.
+_ACTIVE_STUDENT_LOGITS_CAPTURE: Optional["StudentLogitsCapture"] = None
 
-    Matches both unsharded (``cp{C}_dp{D}__{B}.tar``) and TP-sharded
-    (``tp{T}_cp{C}_dp{D}__{B}.tar``) filenames and returns
-    ``max(D) + 1``, or ``None`` if no batched tars are found.
-    """
-    dp_ranks_found: set[int] = set()
-    remote_logprobs = is_remote_storage_path(logprobs_dir)
-    for path in storage_glob(storage_join(logprobs_dir, "*.tar")):
-        fname = storage_basename(path)
-        if m := _BATCHED_TAR_RE.match(fname):
-            if remote_logprobs and m.group("tp") is not None:
-                continue
-            dp_ranks_found.add(int(m.group("dp")))
-    if not dp_ranks_found:
-        return None
-    return max(dp_ranks_found) + 1
+
+def get_student_logits_capture() -> Optional["StudentLogitsCapture"]:
+    """Return the active :class:`StudentLogitsCapture` instance, or *None*."""
+    return _ACTIVE_STUDENT_LOGITS_CAPTURE
+
+
+class StudentLogitsCapture:
+    """Forward-hook helper that keeps the latest differentiable student logits."""
+
+    def __init__(self):
+        self._logits: Optional[torch.Tensor] = None
+        self._hook_handles: List[Any] = []
+
+    def attach_hooks(self, module: torch.nn.Module) -> None:
+        """Attach a forward hook to the model output layer."""
+        handle = module.register_forward_hook(self._capture_logits)
+        self._hook_handles.append(handle)
+
+        global _ACTIVE_STUDENT_LOGITS_CAPTURE
+        _ACTIVE_STUDENT_LOGITS_CAPTURE = self
+
+    def _capture_logits(
+        self,
+        module: torch.nn.Module,
+        input: Any,
+        output: Any,
+    ) -> None:
+        if not module.training:
+            return
+        self._logits = output[0] if isinstance(output, tuple) else output
+
+    def pop(self) -> torch.Tensor:
+        """Return captured logits and clear the reference for the next forward."""
+        if self._logits is None:
+            raise RuntimeError(
+                "No student logits were captured for cached-logits KD. "
+                "Attach StudentLogitsCapture to the model output layer during setup."
+            )
+        logits = self._logits
+        self._logits = None
+        return logits
+
+    def remove_hooks(self) -> None:
+        """Remove all registered hooks and clear captured state."""
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles.clear()
+        self._logits = None
 
 
 def _compute_dp_remapping(
-    logprobs_dir: str, dp_rank: int, dp_size: int,
+    logprobs_dir: str,
+    dp_rank: int,
+    dp_size: int,
+    tar_paths: Optional[Sequence[str]] = None,
 ) -> Tuple[List[int], int, int, int]:
     """Compute the DP rank remapping when loading data saved with a different DP size.
 
-    Scans *logprobs_dir* via :func:`_detect_saved_dp_size` to infer the
+    Scans *logprobs_dir* via :func:`detect_saved_dp_size` to infer the
     saved DP world size.  When no batched tars are found, returns the
     identity mapping ``([dp_rank], 0, 1, dp_size)``.
 
@@ -157,7 +180,7 @@ def _compute_dp_remapping(
         - *dp_size_saved* is the DP world size used when the data was
           written.
     """
-    dp_size_saved = _detect_saved_dp_size(logprobs_dir)
+    dp_size_saved = detect_saved_dp_size(logprobs_dir, tar_paths)
 
     if dp_size_saved is None:
         return [dp_rank], 0, 1, dp_size
@@ -189,64 +212,15 @@ def _compute_dp_remapping(
 
 
 # ---------------------------------------------------------------------------
-#  Dataset – one item per iteration, indexed by iteration number
+#  Dataset – streaming batched tar shards
 # ---------------------------------------------------------------------------
 
-class _TeacherDataset(torch.utils.data.Dataset):
-    """Map-style dataset mapping iteration number → ``(values_list, indices_list)``.
+class TeacherTarDataset(torch.utils.data.IterableDataset):
+    """Streaming dataset that reads teacher log-probs from batched tar shards.
 
-    ``__getitem__(iteration)`` loads this rank's saved shard file for the
-    requested iteration via :func:`load_log_probs_by_rank`.
-
-    ``__len__`` returns the iteration number one greater than the largest ``logprobs_iter*`` sub-folder detected
-    in *logprobs_dir*. This ensures correct indexing even if not all iterations are present, as it reflects
-    the true range of iteration numbers with available teacher log-prob data.
-    """
-
-    def __init__(
-        self,
-        logprobs_dir: str,
-        tp_rank: int,
-        cp_rank: int,
-        dp_rank: int,
-    ):
-        self.logprobs_dir = logprobs_dir
-        self.tp_rank = tp_rank
-        self.cp_rank = cp_rank
-        self.dp_rank = dp_rank
-
-        # Set length to largest iteration number from legacy per-iteration
-        # folders/tars.  (Batched tars are handled by _TeacherWebDataset.)
-        iter_numbers = []
-        for fname in os.listdir(self.logprobs_dir):
-            if match := re.match(rf"{_FOLDER_NAMES_PREFIX}(\d+)", fname):
-                iter_numbers.append(int(match.group(1)))
-        if not iter_numbers:
-            raise ValueError(f"No iteration folders found in {self.logprobs_dir}")
-        self._len = max(iter_numbers) + 1
-
-    def __len__(self) -> int:
-        return self._len
-
-    def __getitem__(self, iteration: int):
-        return load_log_probs_by_rank(
-            self.logprobs_dir,
-            iteration,
-            self.tp_rank,
-            self.cp_rank,
-            self.dp_rank,
-        )
-
-
-class _TeacherWebDataset(torch.utils.data.IterableDataset):
-    """Streaming dataset that reads teacher log-probs from batched tar shards via WebDataset.
-
-    Supports two on-disk layouts, auto-detected at iteration time:
-
-    * **Unsharded** (current) — ``cp{C}_dp{D}__{B}.tar``.  Saved by TP rank 0
-      with the full top-K; every TP rank loads the same file.
-    * **TP-sharded** (legacy) — ``tp{T}_cp{C}_dp{D}__{B}.tar``.  Each TP rank
-      loads its own shard containing K/tp_size entries.
+    Supports a single on-disk layout: ``cp{C}_dp{D}__{B}.tar``.  Shards are
+    saved by TP rank 0 with the full top-K; every TP rank loads the same
+    cp-dp tar.
 
     **DP resharding** is supported in both directions:
 
@@ -256,21 +230,17 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
       from multiple saved files and interleaves their microbatches to
       reconstruct its share of the global microbatch ordering.
 
-    **Dynamic shard discovery**: instead of globbing once, the iterator
-    processes known shards and, when they are exhausted, re-globs the
-    directory to pick up newly-written shards (e.g. from a concurrent
-    training job).  If no new shards are found the iterator ends normally.
+    **Shard discovery**: after known shards are exhausted, discovery refreshes
+    the directory listing so a concurrent writer can publish more data. Remote
+    refreshes are issued by rank 0 and broadcast to avoid object-store list
+    storms.
 
-    Yields ``(values_list, indices_list)`` — the same pair returned by
-    ``_TeacherDataset.__getitem__``.
-
-    Requires the ``webdataset`` package (``pip install webdataset``).
+    Yields ``(values_list, indices_list)``.
     """
 
     def __init__(
         self,
         logprobs_dir: str,
-        tp_rank: int,
         cp_rank: int,
         dp_rank: int,
         dp_size: int,
@@ -278,27 +248,20 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         decode_threads: int = 1,
         decode_lookahead: Optional[int] = None,
         msc_prefetch_depth: int = 2,
+        tar_paths: Optional[Sequence[str]] = None,
     ):
-        if wds is None:
-            raise ImportError("The 'webdataset' package is required for _TeacherWebDataset.")
-
         self.logprobs_dir = logprobs_dir
-        self.tp_rank = tp_rank
         self.cp_rank = cp_rank
         self.dp_rank = dp_rank
         self.start_iteration = start_iteration
+        self._tar_paths = list(tar_paths) if tar_paths is not None else None
 
         self._remote_logprobs = is_remote_storage_path(logprobs_dir)
         self._msc_prefetch_depth = max(0, msc_prefetch_depth)
 
-        # Per-tar dataset-identity verification: pass the student-side
-        # hash into every decode_logprobs_sample call so it raises
-        # RuntimeError when a tar's _meta.json hash doesn't match.
-        student_hash, _ = compute_dataset_hash()
-        self._decode = functools.partial(
-            decode_logprobs_sample,
-            expected_hash=student_hash,
-        )
+        # Per-tar dataset-identity verification: each tar stream validates its
+        # leading _meta.json before yielding any payload data.
+        self._expected_hash, _ = compute_dataset_hash()
 
         self._decode_threads = max(1, decode_threads)
         if decode_lookahead is None:
@@ -307,7 +270,7 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         if self._decode_threads > 1:
             print_rank_0(
                 f"Teacher logits decode: using {self._decode_threads} decode threads "
-                f"(lookahead={self._decode_lookahead}) in the WebDataset loader worker"
+                f"(lookahead={self._decode_lookahead}) in the logits loader worker"
             )
         if self._remote_logprobs and self._msc_prefetch_depth > 0:
             print_rank_0(
@@ -317,7 +280,7 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
 
         # DP remapping: detect saved DP size and compute mapping
         self._source_dp_ranks, self._sub_rank, self._dp_ratio, dp_size_saved = (
-            _compute_dp_remapping(logprobs_dir, dp_rank, dp_size)
+            _compute_dp_remapping(logprobs_dir, dp_rank, dp_size, self._tar_paths)
         )
         if len(self._source_dp_ranks) > 1:
             print_rank_0(
@@ -333,30 +296,28 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
             )
 
     def _discover_shards(self, already_processed: set, dp_rank: int) -> list:
-        """Glob for new shards (current unsharded layout for remote paths).
+        """Glob for new cp-dp batched tar shards.
 
         Args:
             already_processed: Set of URLs already processed (to skip).
             dp_rank: Saved DP rank to discover shards for.
         """
-        prefixes = [_batched_tar_prefix(self.cp_rank, dp_rank)]
-        if not self._remote_logprobs:
-            prefixes.append(_batched_tar_prefix(self.cp_rank, dp_rank, tp_rank=self.tp_rank))
-
-        for prefix in prefixes:
-            all_urls = _sorted_batched_tars(
-                storage_glob(storage_join(self.logprobs_dir, f"{prefix}*.tar"))
+        prefix = batched_tar_prefix(self.cp_rank, dp_rank)
+        all_urls = sorted_batched_tars(
+            storage_glob_from_listing(
+                self.logprobs_dir,
+                f"{prefix}*.tar",
+                cached=False,
             )
-            new_urls = []
-            for url in all_urls:
-                if url in already_processed:
-                    continue
-                m = _BATCHED_TAR_RE.match(storage_basename(url))
-                if m and int(m.group("iter")) >= self.start_iteration:
-                    new_urls.append(url)
-            if new_urls:
-                return new_urls
-        return []
+        )
+        new_urls = []
+        for url in all_urls:
+            if url in already_processed:
+                continue
+            m = BATCHED_TAR_RE.match(storage_basename(url))
+            if m and int(m.group("iter")) >= self.start_iteration:
+                new_urls.append(url)
+        return new_urls
 
     def _slice_microbatches(
         self,
@@ -402,7 +363,7 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         return merged_values, merged_indices
 
     # ------------------------------------------------------------------
-    #  Shard discovery and pipeline creation
+    #  Shard discovery
     # ------------------------------------------------------------------
 
     def _not_found_error(self) -> FileNotFoundError:
@@ -410,10 +371,9 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
         dp_ranks = self._source_dp_ranks
         if len(dp_ranks) == 1:
             dp = dp_ranks[0]
-            legacy_hint = "" if self._remote_logprobs else f" (or tp{self.tp_rank}_cp{self.cp_rank}_dp{dp})"
             return FileNotFoundError(
                 f"No batched tar shards for "
-                f"cp{self.cp_rank}_dp{dp}{legacy_hint} "
+                f"cp{self.cp_rank}_dp{dp} "
                 f"found at or after iteration {self.start_iteration} "
                 f"in '{self.logprobs_dir}'"
             )
@@ -424,18 +384,17 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
             f"in '{self.logprobs_dir}'"
         )
 
-    def _shard_pipelines(
+    def _shard_groups(
         self,
         processed: set,
         prefetcher: TarShardPrefetcher,
-    ) -> Iterator[List]:
-        """Yield lists of WebDataset pipelines as new shards are discovered.
+    ) -> Iterator[Tuple[str, ...]]:
+        """Yield source-DP shard URL groups as new shards are discovered.
 
-        Each yielded list has one pipeline per source DP rank.  Handles
-        dynamic re-discovery: when all current pipelines are exhausted,
-        re-globs for new shards and yields the next batch.  Raises
-        :class:`FileNotFoundError` if no shards exist at all; returns
-        normally when no *new* shards appear.
+        Each yielded tuple has one URL per source DP rank.  Handles dynamic
+        re-discovery: when all current groups are exhausted, re-globs for new
+        shards and yields the next batch.  Raises :class:`FileNotFoundError` if
+        no shards exist at all; returns normally when no *new* shards appear.
         """
         while True:
             urls_per_src = [
@@ -449,41 +408,32 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
             groups = list(zip(*urls_per_src))
             for group in prefetcher.iter_prefetched(groups):
                 processed.update(group)
-                yield [
-                    wds.WebDataset([url], nodesplitter=lambda urls: urls, shardshuffle=False)
-                    for url in group
-                ]
+                yield group
 
     # ------------------------------------------------------------------
-    #  Pipeline iteration helpers (serial and multi-threaded)
+    #  Tar decode and DP resharding helpers
     # ------------------------------------------------------------------
 
-    def _iter_pipeline_serial(self, pipeline) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
-        """Yield decoded, DP-sliced microbatches from a single pipeline."""
-        for sample in pipeline:
-            decoded = self._decode(sample)
-            if decoded is None:
-                continue  # per-tar metadata sample (verified inside decode_logprobs_sample)
-            iteration, values_list, indices_list = decoded
-            if iteration < self.start_iteration:
-                continue
-            yield self._slice_microbatches(values_list, indices_list)
+    def _decode_entry(
+        self,
+        entry: LogprobsTarEntry,
+    ) -> Tuple[int, List[torch.Tensor], List[torch.Tensor]]:
+        """Decode one raw tar payload into logical iteration tensors."""
+        values_list, indices_list = decode_logprobs_payload(entry.data)
+        return entry.iteration, values_list, indices_list
 
-    def _iter_pipeline_parallel(
+    def _iter_entries_parallel(
         self,
         pool: concurrent.futures.ThreadPoolExecutor,
-        pipeline,
-    ) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
-        """Yield decoded, DP-sliced microbatches using a decode thread pool.
+        entries: Iterator[LogprobsTarEntry],
+    ) -> Iterator[Tuple[int, List[torch.Tensor], List[torch.Tensor]]]:
+        """Yield decoded entries using a decode thread pool.
 
-        The main thread pulls raw tar members from *pipeline* one at a time
-        (WebDataset's iterator is not thread-safe) and submits the CPU-heavy
-        ``decode_logprobs_sample`` call to *pool*.  Results are yielded in the
-        original pipeline order via a FIFO of futures, preserving the same
-        iteration ordering that the training loop expects.
+        The main thread streams raw tar members one at a time and submits the
+        CPU-heavy zstd + ``torch.load`` + index unpacking work to *pool*.
+        Results are yielded in tar order via a FIFO of futures.
         """
         pending: "deque[concurrent.futures.Future]" = deque()
-        pipeline_iter = iter(pipeline)
         exhausted = False
 
         def submit_next() -> None:
@@ -491,11 +441,11 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
             if exhausted:
                 return
             try:
-                sample = next(pipeline_iter)
+                entry = next(entries)
             except StopIteration:
                 exhausted = True
                 return
-            pending.append(pool.submit(self._decode, sample))
+            pending.append(pool.submit(self._decode_entry, entry))
 
         for _ in range(self._decode_lookahead):
             submit_next()
@@ -504,36 +454,36 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
 
         while pending:
             fut = pending.popleft()
-            try:
-                decoded = fut.result()
-            finally:
-                submit_next()
-            if decoded is None:
-                continue  # per-tar metadata sample (verified inside decode_logprobs_sample)
-            iteration, values_list, indices_list = decoded
-            if iteration < self.start_iteration:
-                continue
-            yield self._slice_microbatches(values_list, indices_list)
+            decoded = fut.result()
+            submit_next()
+            yield decoded
 
-    def _decode_group(
-        self, samples: tuple,
-    ) -> Optional[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
-        """Decode a tuple of samples from multiple sources and interleave.
+    def _iter_decoded_entries(
+        self,
+        pool: Optional[concurrent.futures.ThreadPoolExecutor],
+        url: str,
+    ) -> Iterator[Tuple[int, List[torch.Tensor], List[torch.Tensor]]]:
+        """Yield decoded iteration payloads from one tar URL."""
+        entries = iter_logprobs_tar_entries(
+            url,
+            start_iteration=self.start_iteration,
+            expected_hash=self._expected_hash,
+        )
+        if pool is None:
+            for entry in entries:
+                yield self._decode_entry(entry)
+        else:
+            yield from self._iter_entries_parallel(pool, entries)
 
-        Returns ``None`` when the iteration is below *start_iteration*
-        (caller should skip), otherwise the interleaved
-        ``(values_list, indices_list)``.
-        """
+    def _interleave_decoded_group(
+        self,
+        decoded_group: Tuple[Tuple[int, List[torch.Tensor], List[torch.Tensor]], ...],
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Interleave matching iterations from multiple source DP ranks."""
         all_values: List[List[torch.Tensor]] = []
         all_indices: List[List[torch.Tensor]] = []
         ref_iteration: Optional[int] = None
-        for sample in samples:
-            decoded = self._decode(sample)
-            if decoded is None:
-                # Per-tar metadata sample (verified inside decode_logprobs_sample).
-                # Because the saver writes _meta first in every tar and pipelines
-                # advance in lockstep, the meta samples align across sources.
-                continue
+        for decoded in decoded_group:
             iteration, vals, inds = decoded
             if ref_iteration is None:
                 ref_iteration = iteration
@@ -545,51 +495,37 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
                 )
             all_values.append(vals)
             all_indices.append(inds)
-        if ref_iteration is None or ref_iteration < self.start_iteration:
-            return None
         return self._interleave_microbatches(all_values, all_indices)
 
-    def _iter_zipped_serial(self, pipelines: List) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
-        """Yield interleaved microbatches from lockstep pipelines (serial)."""
-        for samples in zip(*[iter(p) for p in pipelines]):
-            result = self._decode_group(samples)
-            if result is not None:
-                yield result
-
-    def _iter_zipped_parallel(
+    def _iter_single_source_group(
         self,
-        pool: concurrent.futures.ThreadPoolExecutor,
-        pipelines: List,
+        pool: Optional[concurrent.futures.ThreadPoolExecutor],
+        url: str,
     ) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
-        """Yield interleaved microbatches from lockstep pipelines with threaded lookahead."""
-        zipped_iter = iter(zip(*[iter(p) for p in pipelines]))
-        pending: "deque[concurrent.futures.Future]" = deque()
-        exhausted = False
+        """Yield DP-sliced microbatches from one source DP tar stream."""
+        for _, values_list, indices_list in self._iter_decoded_entries(pool, url):
+            yield self._slice_microbatches(values_list, indices_list)
 
-        def submit_next() -> None:
-            nonlocal exhausted
-            if exhausted:
-                return
-            try:
-                samples = next(zipped_iter)
-            except StopIteration:
-                exhausted = True
-                return
-            pending.append(pool.submit(self._decode_group, samples))
+    def _iter_downscaled_group(
+        self,
+        pool: Optional[concurrent.futures.ThreadPoolExecutor],
+        urls: Tuple[str, ...],
+    ) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+        """Yield interleaved microbatches from source DP tar streams in lockstep."""
+        decoded_iters = [self._iter_decoded_entries(pool, url) for url in urls]
+        for decoded_group in zip(*decoded_iters):
+            yield self._interleave_decoded_group(decoded_group)
 
-        for _ in range(self._decode_lookahead):
-            submit_next()
-            if exhausted:
-                break
-
-        while pending:
-            fut = pending.popleft()
-            try:
-                result = fut.result()
-            finally:
-                submit_next()
-            if result is not None:
-                yield result
+    def _iter_group(
+        self,
+        pool: Optional[concurrent.futures.ThreadPoolExecutor],
+        group: Tuple[str, ...],
+    ) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+        """Yield logical training iterations from one shard group."""
+        if len(self._source_dp_ranks) > 1:
+            yield from self._iter_downscaled_group(pool, group)
+        else:
+            yield from self._iter_single_source_group(pool, group[0])
 
     # ------------------------------------------------------------------
     #  Main iteration entry point
@@ -597,32 +533,21 @@ class _TeacherWebDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         processed: set = set()
-        if self._remote_logprobs:
-            # DataLoader workers may use spawn/forkserver, so register the
-            # WebDataset opener in the process that actually consumes shards.
-            register_msc_webdataset_handler(wds)
-
         with TarShardPrefetcher(
             enabled=self._remote_logprobs,
             depth=self._msc_prefetch_depth,
             max_workers=max(1, self._msc_prefetch_depth * len(self._source_dp_ranks)),
         ) as prefetcher:
             if self._decode_threads == 1:
-                for pipelines in self._shard_pipelines(processed, prefetcher):
-                    if len(self._source_dp_ranks) > 1:
-                        yield from self._iter_zipped_serial(pipelines)
-                    else:
-                        yield from self._iter_pipeline_serial(pipelines[0])
+                for group in self._shard_groups(processed, prefetcher):
+                    yield from self._iter_group(None, group)
             else:
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=self._decode_threads,
                     thread_name_prefix="teacher-decode",
                 ) as pool:
-                    for pipelines in self._shard_pipelines(processed, prefetcher):
-                        if len(self._source_dp_ranks) > 1:
-                            yield from self._iter_zipped_parallel(pool, pipelines)
-                        else:
-                            yield from self._iter_pipeline_parallel(pool, pipelines[0])
+                    for group in self._shard_groups(processed, prefetcher):
+                        yield from self._iter_group(pool, group)
 
 
 # ---------------------------------------------------------------------------
@@ -692,27 +617,23 @@ class CachedLogitsKDLoss:
 
     For each microbatch the loss function:
 
-    1. Retrieves (or prefetches via the DataLoader) this rank's saved shard of
-       the teacher's top-K log-probabilities and global vocab indices.
+    1. Retrieves (or prefetches via the DataLoader) this rank's cp-dp tar shard
+       containing the teacher's full top-K log-probabilities and global vocab
+       indices.
     2. Computes the student's globally-normalised log-probabilities via a
        TP-aware softmax, gathers them at the teacher's top-K positions, and
        returns the **forward KL divergence**
        ``KL(teacher ‖ student) = Σ_k p_T(k)·[log p_T(k) − log p_S(k)]``
        averaged over all token positions.
 
-    A :class:`torch.utils.data.DataLoader` with ``pin_memory=True`` and
-    background workers prefetches upcoming iterations from disk so that I/O
-    overlaps with GPU compute.  Because the tensors arrive in pinned host
-    memory, the subsequent ``tensor.to(device, non_blocking=True)`` call can
-    overlap the DMA transfer with ongoing GPU kernels.
+    A :class:`torch.utils.data.DataLoader` with ``pin_memory=True`` streams
+    batched tar shards from disk so that I/O overlaps with GPU compute.
+    Because the tensors arrive in pinned host memory, the subsequent
+    ``tensor.to(device, non_blocking=True)`` call can overlap the DMA transfer
+    with ongoing GPU kernels.
 
-    Two dataset backends are supported and auto-detected:
-
-    * **WebDataset** (:class:`_TeacherWebDataset`) – sequential streaming of
-      batched tar shards.  Used when unsharded (``cp{C}_dp{D}__{B}.tar``)
-      or legacy TP-sharded (``tp{T}_cp{C}_dp{D}__{B}.tar``) tars are found.
-    * **Map-style** (:class:`_TeacherDataset`) – random-access by iteration
-      number.  Fallback for legacy per-iteration folders/tars.
+    A custom tar reader sequentially streams ``cp{C}_dp{D}__{B}.tar`` shards
+    through the same storage layer used by the writer.
 
     The DataLoader is initialised lazily on the first ``__call__`` because the
     starting iteration is not known at construction time.
@@ -720,29 +641,25 @@ class CachedLogitsKDLoss:
     Args:
         logprobs_dir: Root directory containing log-probs data written by
             :class:`LogitsSaverHooks`.
-        num_workers: For the map-style backend, the number of DataLoader
-            background worker processes (0 = main process).  For the
-            WebDataset backend, the DataLoader is always restricted to a
-            single worker (to keep shard iteration deterministic) and this
-            value instead controls the number of **decode threads** inside
-            that worker used to parallelise zstd decompression and
-            ``torch.load`` across in-flight samples.
-        prefetch_factor: How many iterations each DataLoader worker
-            pre-loads ahead (ignored when ``num_workers == 0``).
+        decode_threads: Number of decode threads inside the single DataLoader
+            worker used to parallelise zstd decompression and ``torch.load``
+            across in-flight samples.
+        prefetch_factor: How many decoded iterations the PyTorch DataLoader
+            worker pre-loads ahead.
         msc_prefetch_depth: For remote MSC tar shards, how many whole
             shard objects to materialize into the MSC cache ahead of
-            WebDataset consumption.
+            sequential tar consumption.
     """
 
     def __init__(
         self,
         logprobs_dir: str,
-        num_workers: int = 1,
+        decode_threads: int = 1,
         prefetch_factor: int = 2,
         msc_prefetch_depth: int = 2,
     ):
         self.logprobs_dir = logprobs_dir
-        self._num_workers = num_workers
+        self._decode_threads = decode_threads
         self._prefetch_factor = prefetch_factor
         self._msc_prefetch_depth = msc_prefetch_depth
 
@@ -754,8 +671,9 @@ class CachedLogitsKDLoss:
         self.dp_rank = parallel_state.get_data_parallel_rank()
         self.dp_size = parallel_state.get_data_parallel_world_size()
 
-        # ---- backend selection ----
-        self._use_webdataset, self._teacher_is_sharded = self._resolve_backend()
+        # Startup-only snapshot used for DP remapping. Runtime shard discovery
+        # refreshes separately so concurrent writers can publish new tar files.
+        self._tar_paths = storage_glob_from_listing(self.logprobs_dir, "*.tar")
 
         # ---- DataLoader (lazy-initialised on first call) ----
         self._dataloader_iter: Optional[Iterator] = None
@@ -768,68 +686,36 @@ class CachedLogitsKDLoss:
         self._current_values: Optional[List[torch.Tensor]] = None
         self._current_indices: Optional[List[torch.Tensor]] = None
 
-    def _resolve_backend(self) -> tuple:
-        """Auto-detect dataset backend and whether teacher data is TP-sharded.
-
-        Scans filenames with :data:`_BATCHED_TAR_RE` to decide the backend.
-
-        Returns:
-            ``(use_webdataset, teacher_is_sharded)``.
-        """
-        remote_logprobs = is_remote_storage_path(self.logprobs_dir)
-        for path in storage_glob(storage_join(self.logprobs_dir, "*.tar")):
-            fname = storage_basename(path)
-            m = _BATCHED_TAR_RE.match(fname)
-            if not m:
-                continue
-            if remote_logprobs and m.group("tp") is not None:
-                continue
-            if m.group("tp") is not None:
-                return True, True
-            else:
-                return True, False
-        if remote_logprobs:
-            return True, False  # remote paths only support current batched tars
-        return False, True  # map-style fallback ⇒ legacy sharded
-
     def _init_dataloader(self, start_iteration: int) -> None:
         """Create the DataLoader starting from *start_iteration*."""
-        if self._use_webdataset:
-            dataset = _TeacherWebDataset(
-                self.logprobs_dir,
-                self.tp_rank,
-                self.cp_rank,
-                self.dp_rank,
-                self.dp_size,
-                start_iteration=start_iteration,
-                decode_threads=self._num_workers,
-                msc_prefetch_depth=self._msc_prefetch_depth,
-            )
-            sampler = None
-        else:
-            dataset = _TeacherDataset(
-                self.logprobs_dir, self.tp_rank, self.cp_rank, self.dp_rank,
-            )
-            if len(dataset) <= start_iteration:
-                raise ValueError(
-                    f"Start iteration {start_iteration} greater than "
-                    f"dataset length {len(dataset)}"
-                )
-            sampler = range(start_iteration, len(dataset))
-        # WebDataset yields a single ordered stream, so multiple DataLoader
+        # TeacherTarDataset yields a single ordered stream, so multiple DataLoader
         # workers would split shards and interleave results non-deterministically.
         # Cap at 1 DataLoader worker; intra-worker parallelism is obtained via
-        # the ThreadPoolExecutor inside _TeacherWebDataset (see decode_threads).
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            sampler=sampler,
+        # the ThreadPoolExecutor inside TeacherTarDataset.
+        dataset = TeacherTarDataset(
+            self.logprobs_dir,
+            self.cp_rank,
+            self.dp_rank,
+            self.dp_size,
+            start_iteration=start_iteration,
+            decode_threads=self._decode_threads,
+            msc_prefetch_depth=self._msc_prefetch_depth,
+            tar_paths=self._tar_paths,
+        )
+        # Remote shard discovery uses rank-0 collectives, so it must run in the
+        # main training process rather than a DataLoader worker.
+        dataloader_workers = 0 if is_remote_storage_path(self.logprobs_dir) else 1
+        loader_kwargs = dict(
+            dataset=dataset,
             batch_size=None,
             collate_fn=lambda x: x,
             pin_memory=True,
-            num_workers=1 if self._use_webdataset else self._num_workers,
-            prefetch_factor=self._prefetch_factor,
-            persistent_workers=True,
+            num_workers=dataloader_workers,
         )
+        if dataloader_workers > 0:
+            loader_kwargs["prefetch_factor"] = self._prefetch_factor
+            loader_kwargs["persistent_workers"] = True
+        loader = torch.utils.data.DataLoader(**loader_kwargs)
         self._dataloader_iter = iter(loader)
 
     def _advance_iteration(self) -> None:
@@ -899,27 +785,14 @@ class CachedLogitsKDLoss:
             student_logits.device, non_blocking=True
         )
 
-        if self._teacher_is_sharded and self.tp_size > 1:
-            # Legacy TP-sharded: each rank loaded K/tp_size entries, reassemble.
-            teacher_values_list = [torch.empty_like(teacher_values) for _ in range(self.tp_size)]
-            teacher_indices_list = [torch.empty_like(teacher_indices) for _ in range(self.tp_size)]
-            torch.distributed.all_gather(teacher_values_list, teacher_values, group=self.tp_group)
-            torch.distributed.all_gather(teacher_indices_list, teacher_indices, group=self.tp_group)
-            teacher_values_full = torch.cat(teacher_values_list, dim=-1)
-            teacher_indices_full = torch.cat(teacher_indices_list, dim=-1)
-        else:
-            # Unsharded: every rank already has the full top-K.
-            teacher_values_full = teacher_values
-            teacher_indices_full = teacher_indices
-
         logger.debug("[TP%s-CP%s-DP%s]: Iter_%s Batch_%s",
                      self.tp_rank, self.cp_rank, self.dp_rank, iteration, microbatch_idx)
 
         # ---- compute loss ----
         return topk_kl_div(
             student_logits,
-            teacher_values_full,
-            teacher_indices_full,
+            teacher_values,
+            teacher_indices,
             self.tp_size,
             self.tp_rank,
             self.tp_group,
@@ -934,14 +807,14 @@ class LossFuncCallable:
     def __init__(
         self,
         logprobs_dir: str,
-        num_workers: int = 1,
+        decode_threads: int = 1,
         prefetch_factor: int = 2,
         kd_loss_alpha: float = 0.5,
         ignore_errors: bool = False,
         msc_prefetch_depth: int = 2,
     ):
         self.logprobs_dir = logprobs_dir
-        self.num_workers = num_workers
+        self.decode_threads = decode_threads
         self.prefetch_factor = prefetch_factor
         self.msc_prefetch_depth = msc_prefetch_depth
         self.kd_func = None
@@ -955,19 +828,19 @@ class LossFuncCallable:
         loss_mask = loss_mask.reshape(-1).float()
         return torch.sum(losses * loss_mask)
 
-    def __call__(self, loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTModel):
+    def __call__(self, loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: LanguageModule):
         """Loss function wrapper for compatibility with Megatron LM training loop.
 
         Args:
             loss_mask (Tensor): Used to mask out some portions of the loss
             output_tensor (Tensor): The tensor with the losses
-            model (GPTModel): The model (can be wrapped)
+            model (LanguageModule): The model (can be wrapped)
         """
         if self.kd_func is None:
             # Construct here so parallel_state is initialized by now
             self.kd_func = CachedLogitsKDLoss(
                 logprobs_dir=self.logprobs_dir,
-                num_workers=self.num_workers,
+                decode_threads=self.decode_threads,
                 prefetch_factor=self.prefetch_factor,
                 msc_prefetch_depth=self.msc_prefetch_depth,
             )
@@ -984,9 +857,13 @@ class LossFuncCallable:
 
         # KD loss
         try:
-            unwrapped_model = unwrap_model(model)
-            logits = unwrapped_model.logits
-            del unwrapped_model.logits  # free memory during next fwd step
+            logits_capture = get_student_logits_capture()
+            if logits_capture is None:
+                raise RuntimeError(
+                    "Cached-logits KD requires StudentLogitsCapture to be attached "
+                    "to the model output layer during setup."
+                )
+            logits = logits_capture.pop()
 
             loss_kd = self.kd_func(logits)
             loss_kd = self._mask_loss(loss_kd, loss_mask)

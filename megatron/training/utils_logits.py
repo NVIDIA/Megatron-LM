@@ -2,25 +2,56 @@
 
 """Storage helpers for cached-logit tar shards.
 
-This module keeps object-storage and WebDataset plumbing out of the cached
+This module keeps object-storage and tar-format plumbing out of the cached
 logits writer/reader code paths.  The helpers are intentionally small and
 focused on the current batched tar layout.
 """
 
 import concurrent.futures
+import hashlib
 import fnmatch
 import glob
-import importlib
+import io
+import json
 import logging
 import os
+import re
+import tarfile
 import time
-from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
+from collections import OrderedDict
+from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
+
+import torch
+import torch.distributed as dist
+from torch.utils.data import get_worker_info
+import zstandard
 
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.training import get_args
+from megatron.training.utils import get_blend_and_blend_per_split
 
 logger = logging.getLogger(__name__)
 
 MSC_PREFIX = "msc://"
+
+# Matches batched tar filenames (``cp{C}_dp{D}__{B}.tar``).  Named groups:
+#   cp   – CP rank
+#   dp   – DP rank
+#   iter – trailing iteration number *B*
+BATCHED_TAR_RE = re.compile(
+    r"^cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
+)
+
+# Name of the metadata member written as the first entry of every batched
+# tar. Contains the dataset-identity hash and the fields that produced it.
+META_TAR_MEMBER = "_meta.json"
+
+LOGPROBS_TAR_MEMBER_SUFFIX = ".pt.zst"
+
+# Matches compressed iteration payload members inside a batched tar archive.
+LOGPROBS_TAR_MEMBER_RE = re.compile(
+    rf"^(?P<iter>\d+){re.escape(LOGPROBS_TAR_MEMBER_SUFFIX)}$"
+)
 
 _MSC_OPEN_KWARGS = {
     "attributes",
@@ -29,6 +60,7 @@ _MSC_OPEN_KWARGS = {
     "memory_load_limit",
     "prefetch_file",
 }
+_STORAGE_GLOB_CACHE: dict[str, List[str]] = {}
 
 
 def is_msc_path(path: str) -> bool:
@@ -59,27 +91,6 @@ def storage_basename(path: str) -> str:
     return os.path.basename(str(path).rstrip("/"))
 
 
-def storage_dirname(path: str) -> str:
-    """Return the parent path while preserving URL schemes."""
-    path = str(path).rstrip("/")
-    if "://" not in path:
-        return os.path.dirname(path)
-    head, sep, _ = path.rpartition("/")
-    return head if sep else ""
-
-
-def storage_join(root: str, *parts: str) -> str:
-    """Join path components without letting URL schemes confuse ``os.path``."""
-    if not parts:
-        return root
-    if "://" not in str(root):
-        return os.path.join(root, *parts)
-    path = str(root).rstrip("/")
-    for part in parts:
-        path += "/" + str(part).strip("/")
-    return path
-
-
 def storage_makedirs(path: str, exist_ok: bool = True) -> None:
     """Create a local or MSC directory/prefix."""
     if not path:
@@ -89,6 +100,164 @@ def storage_makedirs(path: str, exist_ok: bool = True) -> None:
         msc.os.makedirs(path, exist_ok=exist_ok)
     else:
         os.makedirs(path, exist_ok=exist_ok)
+
+
+def storage_move(src: str, dst: str) -> None:
+    """Atomically publish a local temporary file."""
+    if is_msc_path(src) or is_msc_path(dst):
+        raise ValueError("storage_move is local-only; write MSC objects directly")
+
+    os.replace(src, dst)
+
+
+def storage_glob(pattern: str) -> List[str]:
+    """Return paths matching *pattern* for local files or MSC URLs."""
+    if is_msc_path(pattern):
+        msc = _require_msc()
+        return list(msc.glob(pattern))
+
+    return glob.glob(pattern)
+
+
+def storage_glob_rank0(pattern: str, cached: bool = False) -> List[str]:
+    """Run ``storage_glob`` on rank 0 and broadcast the result."""
+    if cached:
+        if (paths := _STORAGE_GLOB_CACHE.get(pattern)) is not None:
+            return paths
+
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        payload = [storage_glob(pattern) if dist.get_rank() == 0 else None]
+        dist.broadcast_object_list(payload, src=0)
+        paths = payload[0]
+    else:
+        paths = storage_glob(pattern)
+
+    paths = list(paths or [])
+    _STORAGE_GLOB_CACHE[pattern] = paths
+    return paths
+
+
+def storage_glob_from_listing(
+    root: str,
+    name_pattern: str,
+    listing: Optional[Sequence[str]] = None,
+    cached: bool = True,
+) -> List[str]:
+    """Glob under *root*, or filter a precomputed listing by basename."""
+    if listing is None:
+        if not is_remote_storage_path(root):
+            return storage_glob(os.path.join(root, name_pattern))
+        if get_worker_info() is not None:
+            raise RuntimeError(
+                "Remote cached-logits shard listing must run in the main "
+                "training process, not a DataLoader worker."
+            )
+        listing = storage_glob_rank0(os.path.join(root, "*.tar"), cached=cached)
+
+    return [
+        str(path)
+        for path in listing
+        if fnmatch.fnmatch(storage_basename(str(path)), name_pattern)
+    ]
+
+
+def get_current_iteration() -> int:
+    """Return the current training iteration from ``get_args()``."""
+    args = get_args()
+    iteration = getattr(args, 'curr_iteration', None)
+    if iteration is None:
+        iteration = getattr(args, 'iteration')
+    return iteration
+
+
+def _blend_identifiers(args: Any) -> Dict[str, Any]:
+    """Build a path-agnostic representation of the training data blend."""
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
+
+    def _normalise(blend_tuple) -> Optional[List[List[Any]]]:
+        if blend_tuple is None:
+            return None
+        prefixes, weights = blend_tuple
+        if weights is None:
+            weights = [1.0] * len(prefixes)
+        return [
+            [float(w), os.path.splitext(os.path.basename(str(p)))[0]]
+            for w, p in zip(weights, prefixes)
+        ]
+
+    if blend is not None:
+        return {"kind": "blend", "blend": _normalise(blend)}
+    if blend_per_split is not None:
+        # Index 0 is the train split (see ``megatron.core.datasets.utils.Split``).
+        return {"kind": "blend_per_split", "train": _normalise(blend_per_split[0])}
+    return {"kind": "mock", "mock": True}
+
+
+def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
+    """Compute the dataset-identity hash for the current training run.
+
+    The fields included are exactly those that determine the global sample
+    stream itself: ``seed``, ``sequence_length``, ``train_samples`` (with a
+    fall-back to ``train_iters * global_batch_size``), and the data ``blend``.
+    """
+    args = get_args()
+    train_samples = getattr(args, 'train_samples', None)
+    if train_samples is None:
+        train_iters = getattr(args, 'train_iters', None)
+        global_batch_size = getattr(args, 'global_batch_size', None)
+        if train_iters is not None and global_batch_size is not None:
+            train_samples = int(train_iters) * int(global_batch_size)
+
+    identifiers = OrderedDict()
+    identifiers["seed"] = getattr(args, 'seed', None)
+    identifiers["sequence_length"] = getattr(args, 'seq_length', None)
+    identifiers["train_samples"] = train_samples
+    identifiers["blend"] = _blend_identifiers(args)
+
+    description = json.dumps(identifiers, sort_keys=False, separators=(',', ':'))
+    md5_hex = hashlib.md5(
+        description.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
+    return md5_hex, dict(identifiers)
+
+
+def batched_tar_filename(cp_rank: int, dp_rank: int, last_iter: int) -> str:
+    """Return the filename for a cp-dp batched tar shard."""
+    return f"cp{cp_rank}_dp{dp_rank}__{last_iter}.tar"
+
+
+def batched_tar_prefix(cp_rank: int, dp_rank: int) -> str:
+    """Return the glob prefix for cp-dp batched tar shards."""
+    return f"cp{cp_rank}_dp{dp_rank}__"
+
+
+def sorted_batched_tars(paths: List[str]) -> List[str]:
+    """Sort batched tar paths by their iteration number (numeric, ascending)."""
+    keyed = []
+    for path in paths:
+        if match := BATCHED_TAR_RE.match(storage_basename(path)):
+            keyed.append((int(match.group("iter")), path))
+    keyed.sort()
+    return [path for _, path in keyed]
+
+
+def pack_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split 17-bit global indices into uint16 lower bits + bool 17th bit."""
+    low_bits = (indices & 0xFFFF).to(torch.uint16)
+    bit_17 = (indices >> 16).to(torch.bool)
+    return low_bits, bit_17
+
+
+def unpack_indices(low_bits: torch.Tensor, bit_17: torch.Tensor) -> torch.Tensor:
+    """Reconstruct indices from uint16 lower bits + bool 17th bit."""
+    return (bit_17.long() << 16) | low_bits.long()
+
+
+class LogprobsTarEntry(NamedTuple):
+    """Raw cached-logits payload read from one batched tar member."""
+
+    iteration: int
+    data: bytes
 
 
 def open_logit_file(path: str, mode: str = "rb", **kwargs):
@@ -101,63 +270,132 @@ def open_logit_file(path: str, mode: str = "rb", **kwargs):
     return open(path, mode, **local_kwargs)
 
 
-def _split_simple_glob(pattern: str) -> Tuple[str, str]:
-    parent, sep, name_pattern = str(pattern).rpartition("/")
-    if not sep:
-        return ".", name_pattern
-    return parent, name_pattern
-
-
-def storage_glob(pattern: str) -> List[str]:
-    """Return paths matching *pattern* for local files or MSC URLs."""
-    if is_msc_path(pattern):
-        msc = _require_msc()
-        if hasattr(msc, "glob"):
-            return list(msc.glob(pattern))
-
-        parent, name_pattern = _split_simple_glob(pattern)
-        return [
-            str(entry)
-            for entry in msc.Path(parent).iterdir()
-            if fnmatch.fnmatch(storage_basename(str(entry)), name_pattern)
-        ]
-
-    return glob.glob(pattern)
-
-
-def storage_move(src: str, dst: str) -> None:
-    """Atomically publish a local temporary file."""
-    if is_msc_path(src) or is_msc_path(dst):
-        raise ValueError("storage_move is local-only; write MSC objects directly")
-
-    os.replace(src, dst)
-
-
-def register_msc_webdataset_handler(wds_module) -> None:
-    """Register a WebDataset opener for ``msc://`` shard URLs if possible."""
-    if wds_module is None:
+def _verify_logprobs_metadata(
+    data: bytes,
+    *,
+    tar_path: str,
+    expected_hash: Optional[str],
+) -> None:
+    """Validate the per-tar dataset hash stored in ``_meta.json``."""
+    if expected_hash is None:
         return
-
-    schemes = getattr(wds_module, "gopen_schemes", None)
-    if schemes is None:
-        try:
-            gopen_module = importlib.import_module("webdataset.gopen")
-
-            schemes = getattr(gopen_module, "gopen_schemes", None)
-        except Exception:
-            schemes = None
-    if schemes is None or schemes.get("msc") is _gopen_msc:
-        return
-
-    schemes["msc"] = _gopen_msc
+    saved_hash = json.loads(data).get("hash")
+    if saved_hash != expected_hash:
+        raise RuntimeError(
+            f"Teacher tar {tar_path} was saved with hash {saved_hash} "
+            f"but the current student run has hash {expected_hash}. "
+            "Data does not align!"
+        )
 
 
-def _gopen_msc(url: str, mode: str = "rb", bufsize: int = 8192, **kwargs):
-    if "r" not in mode:
-        raise ValueError("WebDataset MSC handler only supports reading")
-    # ``bufsize`` is part of WebDataset's opener signature; MSC manages buffering.
-    kwargs.setdefault("prefetch_file", True)
-    return open_logit_file(url, "rb", **kwargs)
+def iter_logprobs_tar_entries(
+    tar_path: str,
+    *,
+    start_iteration: int = 0,
+    expected_hash: Optional[str] = None,
+) -> Iterator[LogprobsTarEntry]:
+    """Stream cached-logits payload members from a batched tar archive.
+
+    The tar format is written by :class:`LogitsSaverHooks`: a leading
+    ``_meta.json`` member followed by ``{iteration}.pt.zst`` payloads.
+    Members before *start_iteration* are skipped before their payload bytes
+    are materialized in Python.
+    """
+    metadata_seen = False
+
+    with open_logit_file(tar_path, "rb", prefetch_file=True) as stream:
+        with tarfile.open(fileobj=stream, mode="r|*") as tar:
+            for member in tar:
+                if not member.isreg():
+                    continue
+
+                name = member.name
+                if name == META_TAR_MEMBER:
+                    extracted = tar.extractfile(member)
+                    if extracted is None:
+                        raise RuntimeError(f"Could not read metadata member in '{tar_path}'")
+                    _verify_logprobs_metadata(
+                        extracted.read(),
+                        tar_path=tar_path,
+                        expected_hash=expected_hash,
+                    )
+                    metadata_seen = True
+                    continue
+
+                match = LOGPROBS_TAR_MEMBER_RE.match(name)
+                if match is None:
+                    continue
+
+                if expected_hash is not None and not metadata_seen:
+                    raise RuntimeError(
+                        f"Teacher tar {tar_path} does not contain leading "
+                        f"{META_TAR_MEMBER}; cannot verify data alignment."
+                    )
+
+                iteration = int(match.group("iter"))
+                if iteration < start_iteration:
+                    continue
+
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    raise RuntimeError(
+                        f"Could not read log-probs member '{name}' in '{tar_path}'"
+                    )
+                yield LogprobsTarEntry(
+                    iteration=iteration,
+                    data=extracted.read(),
+                )
+
+    if expected_hash is not None and not metadata_seen:
+        raise RuntimeError(
+            f"Teacher tar {tar_path} does not contain {META_TAR_MEMBER}; "
+            "cannot verify data alignment."
+        )
+
+
+def decode_logprobs_payload(
+    data: bytes,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Decode one zstd-compressed cached-logits payload."""
+    data = zstandard.ZstdDecompressor().decompress(data)
+    tensors = torch.load(io.BytesIO(data), weights_only=True)
+    indices_list = [
+        unpack_indices(low, bit17)
+        for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
+    ]
+    return tensors["values"], indices_list
+
+
+def detect_saved_dp_size(
+    logprobs_dir: str,
+    tar_paths: Optional[Sequence[str]] = None,
+) -> Optional[int]:
+    """Scan *logprobs_dir* for batched tars and return the saved DP world size."""
+    dp_ranks_found: set[int] = set()
+    for path in storage_glob_from_listing(logprobs_dir, "*.tar", tar_paths):
+        fname = storage_basename(path)
+        if match := BATCHED_TAR_RE.match(fname):
+            dp_ranks_found.add(int(match.group("dp")))
+    if not dp_ranks_found:
+        return None
+    return max(dp_ranks_found) + 1
+
+
+def load_log_probs_from_tar(
+    tar_path: str,
+    iteration: int,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Load one iteration from a specific batched tar shard."""
+    # NOTE: This function is for interactive debugging purposes
+    for entry in iter_logprobs_tar_entries(tar_path, start_iteration=iteration):
+        if entry.iteration == iteration:
+            return decode_logprobs_payload(entry.data)
+        if entry.iteration > iteration:
+            break
+
+    raise FileNotFoundError(
+        f"No log-probs member found for iteration {iteration} in '{tar_path}'"
+    )
 
 
 class TarShardPrefetcher:
@@ -241,6 +479,6 @@ class TarShardPrefetcher:
 
     def _prefetch_url(self, url: str) -> None:
         # Whole-object caching avoids tar-member range bookkeeping while still
-        # keeping the object download ahead of WebDataset's sequential reader.
+        # keeping the object download ahead of the sequential tar reader.
         with open_logit_file(url, "rb", prefetch_file=True) as stream:
             stream.read()

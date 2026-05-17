@@ -78,6 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_logits_distillation_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
@@ -2355,47 +2356,6 @@ def _add_logging_args(parser):
                        help='Path to save the wandb results locally.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
-    group.add_argument('--logits-save-top-k', type=int, default=None,
-                       help='Number of top logits to save.')
-    group.add_argument('--logits-save-top-p', type=float, default=None,
-                       help='Top-P (nucleus) threshold applied after top-K '
-                            'selection when saving logits. Only the smallest '
-                            'set of entries whose cumulative probability mass '
-                            'reaches this threshold is kept; the rest are '
-                            'masked with sentinels. Must be in (0, 1].')
-    group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
-                       help='Minimum number of entries kept per token when '
-                            'top-P masking is active, regardless of '
-                            'cumulative mass. Default: 1.')
-    group.add_argument('--logits-save-dir', type=str, default=None,
-                       help='Directory to save logits.')
-    group.add_argument('--logits-save-compress', action='store_true', default=False,
-                       help='Use zstd compression for logits.')
-    group.add_argument('--logits-save-flush-interval', type=int, default=1,
-                       help='Number of iterations to buffer in memory before '
-                            'flushing as a single tar archive. 1 (default) '
-                            'preserves the legacy one-file-per-iteration behaviour. '
-                            'Higher values reduce inode usage.')
-    group.add_argument('--logits-save-dtype', type=str, default='fp16',
-                       choices=['fp16', 'bf16', 'fp32'],
-                       help='Dtype for on-disk top-K log-probabilities.')
-    group.add_argument('--logits-load-dir', type=str, default=None,
-                       help='Directory to load logits.')
-    group.add_argument('--logits-load-num-workers', type=int, default=4,
-                       help='Number of workers for loading logits.')
-    group.add_argument('--logits-load-prefetch-factor', type=int, default=4,
-                       help='Prefetch factor for loading logits.')
-    group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
-                       help='For MSC/object-storage logits tar shards, number '
-                            'of whole tar shards to prefetch into the MSC '
-                            'cache ahead of WebDataset consumption.')
-    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=0.65,
-                       help='KD loss alpha for loading logits.')
-    group.add_argument('--logits-load-ignore-errors', action='store_true',
-                       default=False,
-                       help='When set, KD loss errors are logged as warnings '
-                            'and training falls back to LM-only loss instead '
-                            'of crashing.')
     return parser
 
 
@@ -2732,8 +2692,6 @@ def _add_initialization_args(parser):
 
     group.add_argument('--init-method-xavier-uniform', action='store_true',
                        help='Enable Xavier uniform parameter initialization')
-    group.add_argument('--freeze-all-layers', action='store_true',
-                       help='Freeze all layers of the model.')
 
     return parser
 
@@ -2759,6 +2717,8 @@ def _add_learning_rate_args(parser):
     group.add_argument('--decoupled-min-lr', type=float, default=None,
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
+    group.add_argument('--freeze-all-layers', action='store_true',
+                       help='Freeze all layers of the model.')
 
     return parser
 
@@ -3487,6 +3447,52 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    return parser
+
+def _add_logits_distillation_args(parser):
+    group = parser.add_argument_group(title='Logits Distillation')
+
+    group.add_argument('--logits-save-top-k', type=int, default=None,
+                       help='Number of top logits to save.')
+    group.add_argument('--logits-save-top-p', type=float, default=None,
+                       help='Top-P (nucleus) threshold applied after top-K '
+                            'selection when saving logits. Only the smallest '
+                            'set of entries whose cumulative probability mass '
+                            'reaches this threshold is kept; the rest are '
+                            'masked with sentinels. Must be in (0, 1].')
+    group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
+                       help='Minimum number of entries kept per token when '
+                            'top-P masking is active, regardless of '
+                            'cumulative mass. Default: 1.')
+    group.add_argument('--logits-save-dir', type=str, default=None,
+                       help='Directory to save logits.')
+    group.add_argument('--logits-save-flush-interval', type=int, default=1,
+                       help='Number of iterations to buffer in memory before '
+                            'flushing as a single tar archive. 1 (default) '
+                            'writes one tar per CP-DP rank per iteration. '
+                            'Higher values batch multiple iterations into each tar.')
+    group.add_argument('--logits-save-dtype', type=str, default='fp16',
+                       choices=['fp16', 'bf16', 'fp32'],
+                       help='Dtype for on-disk top-K log-probabilities.')
+    group.add_argument('--logits-load-dir', type=str, default=None,
+                       help='Directory to load logits.')
+    group.add_argument('--logits-load-decode-threads', type=int, default=4,
+                       help='Number of decode threads for cached-logits zstd '
+                            'decompression and torch.load processing.')
+    group.add_argument('--logits-load-prefetch-factor', type=int, default=4,
+                       help='PyTorch DataLoader prefetch factor for decoded '
+                            'cached-logits iterations.')
+    group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
+                       help='For MSC/object-storage logits tar shards, number '
+                            'of whole tar shards to prefetch into the MSC '
+                            'cache ahead of sequential tar consumption.')
+    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=0.65,
+                       help='KD loss alpha for loading logits.')
+    group.add_argument('--logits-load-ignore-errors', action='store_true',
+                       default=False,
+                       help='When set, KD loss errors are logged as warnings '
+                            'and training falls back to LM-only loss instead '
+                            'of crashing.')
     return parser
 
 

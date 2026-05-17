@@ -1973,11 +1973,18 @@ def setup_model_and_optimizer(
             k=args.logits_save_top_k,
             p=args.logits_save_top_p,
             min_k=args.logits_save_top_p_min_k,
-            compress_zstd=args.logits_save_compress,
             flush_interval=args.logits_save_flush_interval,
             save_dtype=args.logits_save_dtype,
         )
         logits_saver.attach_hooks(unwrapped_model[0].output_layer)
+
+    if args.logits_load_dir is not None:
+        from megatron.training.cached_logits_loss import StudentLogitsCapture
+
+        student_logits_capture = StudentLogitsCapture()
+        for model_chunk in unwrapped_model:
+            if hasattr(model_chunk, 'output_layer'):
+                student_logits_capture.attach_hooks(model_chunk.output_layer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:
@@ -2835,11 +2842,6 @@ def save_checkpoint_and_time(
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
-
-    # Flush any buffered logits data before checkpointing
-    from megatron.training.logits_saver import get_logits_saver
-    if (logits_saver := get_logits_saver()) is not None:
-        logits_saver.flush()
 
     if should_report_memory:
         # Track memory before checkpoint save.

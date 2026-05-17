@@ -25,36 +25,32 @@ Index storage optimization:
 """
 
 import concurrent.futures
-import hashlib
 import io
 import json
 import logging
 import os
-import re
 import tarfile
-import warnings
+import threading
 from collections import OrderedDict
-from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
-try:
-  import zstandard
-except ImportError:
-  zstandard = None
+import zstandard
 
 from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
-from megatron.training.utils import get_blend_and_blend_per_split, print_rank_0
+from megatron.training.utils import print_rank_0
 from megatron.training.utils_logits import (
+    LOGPROBS_TAR_MEMBER_SUFFIX,
+    META_TAR_MEMBER,
+    batched_tar_filename,
+    compute_dataset_hash,
+    get_current_iteration,
     is_remote_storage_path,
     open_logit_file,
-    storage_dirname,
-    storage_glob,
-    storage_join,
+    pack_indices,
     storage_makedirs,
     storage_move,
 )
@@ -71,200 +67,6 @@ def get_logits_saver() -> Optional["LogitsSaverHooks"]:
 
 
 _MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
-
-_FOLDER_NAMES_PREFIX = "logprobs_iter"
-
-# Matches both unsharded (``cp{C}_dp{D}__{B}.tar``) and legacy TP-sharded
-# (``tp{T}_cp{C}_dp{D}__{B}.tar``) batched tar filenames.  Named groups:
-#   tp   – TP rank (None when unsharded)
-#   cp   – CP rank
-#   dp   – DP rank
-#   iter – trailing iteration number *B*
-_BATCHED_TAR_RE = re.compile(
-    r"^(?:tp(?P<tp>\d+)_)?cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
-)
-
-# Name of the metadata member written as the first entry of every batched
-# tar.  Contains the dataset-identity hash and the fields that produced it,
-# so the student-side loader can verify alignment per-tar via WebDataset.
-META_TAR_MEMBER = "_meta.json"
-
-
-def get_current_iteration() -> int:
-    """Return the current training iteration from ``get_args()``.
-
-    Prefers ``args.curr_iteration`` (set during forward/backward) and
-    falls back to ``args.iteration``.
-    """
-    args = get_args()
-    iteration = getattr(args, 'curr_iteration', None)
-    if iteration is None:
-        iteration = getattr(args, 'iteration')
-    return iteration
-
-
-def _blend_identifiers(args: Any) -> Dict[str, Any]:
-    """Build a path-agnostic representation of the training data blend.
-
-    Reuses :func:`megatron.training.utils.get_blend_and_blend_per_split`
-    to resolve all of Megatron's blend-source variants (``data_path``,
-    ``data_args_path``, ``train_data_path`` / ``valid_data_path`` /
-    ``test_data_path``, ``per_split_data_args_path``) into the canonical
-    ``(prefixes, weights)`` shape, then normalises each prefix to its
-    basename (without extension) so the same teacher cache can be reused
-    across machines that mount the data at different locations.
-
-    Returns ``{"mock": True}`` when no blend is configured (e.g. mock
-    data runs).
-    """
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
-
-    def _normalise(blend_tuple) -> Optional[List[List[Any]]]:
-        if blend_tuple is None:
-            return None
-        prefixes, weights = blend_tuple
-        if weights is None:
-            weights = [1.0] * len(prefixes)
-        return [
-            [float(w), os.path.splitext(os.path.basename(str(p)))[0]]
-            for w, p in zip(weights, prefixes)
-        ]
-
-    if blend is not None:
-        return {"kind": "blend", "blend": _normalise(blend)}
-    if blend_per_split is not None:
-        # Index 0 is the train split (see ``megatron.core.datasets.utils.Split``).
-        # Only the train blend influences which teacher logits are produced.
-        return {"kind": "blend_per_split", "train": _normalise(blend_per_split[0])}
-    return {"kind": "mock", "mock": True}
-
-
-def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
-    """Compute the dataset-identity hash for the current training run.
-
-    Modeled after Megatron's ``unique_description_hash`` mechanism in
-    :mod:`megatron.core.datasets.megatron_dataset`: build a deterministic
-    ``OrderedDict`` of identifying fields, JSON-serialise it, and MD5-hash
-    the result.  Reads the current run configuration via :func:`get_args`.
-
-    The fields included are exactly those that determine the global
-    sample stream itself: ``seed``, ``sequence_length``, ``train_samples``
-    (with a fall-back to ``train_iters * global_batch_size``), and the
-    data ``blend``.  Tokenizer name, split string, and ``global_batch_size``
-    are intentionally excluded — none of them change the underlying
-    sample stream; leaving GBS out in particular keeps the cache valid
-    for future GBS-rescaling on the loader side.
-
-    Returns:
-        ``(md5_hex, identifiers_dict)`` – the hash and the dict it was
-        computed from (useful for diagnostics on mismatch).
-    """
-    args = get_args()
-    train_samples = getattr(args, 'train_samples', None)
-    if train_samples is None:
-        train_iters = getattr(args, 'train_iters', None)
-        global_batch_size = getattr(args, 'global_batch_size', None)
-        if train_iters is not None and global_batch_size is not None:
-            train_samples = int(train_iters) * int(global_batch_size)
-
-    identifiers = OrderedDict()
-    identifiers["seed"] = getattr(args, 'seed', None)
-    identifiers["sequence_length"] = getattr(args, 'seq_length', None)
-    identifiers["train_samples"] = train_samples
-    identifiers["blend"] = _blend_identifiers(args)
-
-    description = json.dumps(identifiers, sort_keys=False, separators=(',', ':'))
-    md5_hex = hashlib.md5(
-        description.encode("utf-8"), usedforsecurity=False
-    ).hexdigest()
-    return md5_hex, dict(identifiers)
-
-
-def _batched_tar_filename(
-    cp_rank: int, dp_rank: int, last_iter: int,
-    tp_rank: Optional[int] = None,
-) -> str:
-    """Return the filename for a batched tar shard.
-
-    When *tp_rank* is ``None`` (default), returns the unsharded format
-    ``cp{C}_dp{D}__{B}.tar``.  When *tp_rank* is given, returns the
-    legacy TP-sharded format ``tp{T}_cp{C}_dp{D}__{B}.tar``.
-    """
-    if tp_rank is not None:
-        return f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}__{last_iter}.tar"
-    return f"cp{cp_rank}_dp{dp_rank}__{last_iter}.tar"
-
-
-def _batched_tar_prefix(
-    cp_rank: int, dp_rank: int,
-    tp_rank: Optional[int] = None,
-) -> str:
-    """Return the glob prefix for batched tar shards.
-
-    When *tp_rank* is ``None`` (default), returns the unsharded prefix
-    ``cp{C}_dp{D}__``.  When *tp_rank* is given, returns the legacy
-    TP-sharded prefix ``tp{T}_cp{C}_dp{D}__``.
-    """
-    if tp_rank is not None:
-        return f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}__"
-    return f"cp{cp_rank}_dp{dp_rank}__"
-
-
-def _sorted_batched_tars(paths: List[str]) -> List[str]:
-    """Sort batched tar paths by their iteration number (numeric, ascending).
-
-    Filenames are not zero-padded, so a plain lexicographic sort would be
-    wrong (e.g. ``...10.tar`` before ``...9.tar``).  Works with both
-    TP-sharded and unsharded naming conventions.
-    """
-    keyed = []
-    for p in paths:
-        if m := _BATCHED_TAR_RE.match(os.path.basename(p)):
-            keyed.append((int(m.group("iter")), p))
-    keyed.sort()
-    return [p for _, p in keyed]
-
-
-def _pack_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split 17-bit global indices into uint16 lower bits + bool 17th bit.
-
-    Args:
-        indices: Global indices tensor, values must fit in 17 bits
-
-    Returns:
-        Tuple of (low_16_bits as uint16, bit_17 as bool)
-    """
-    low_bits = (indices & 0xFFFF).to(torch.uint16)
-    bit_17 = (indices >> 16).to(torch.bool)
-    return low_bits, bit_17
-
-
-def _unpack_indices(low_bits: torch.Tensor, bit_17: torch.Tensor) -> torch.Tensor:
-    """Reconstruct indices from uint16 lower bits + bool 17th bit.
-
-    Args:
-        low_bits: Lower 16 bits as uint16
-        bit_17: 17th bit as bool
-
-    Returns:
-        Reconstructed global indices as int64
-    """
-    return (bit_17.long() << 16) | low_bits.long()
-
-
-def _format_folder_and_filename(
-    save_dir: str,
-    iteration: int,
-    tp_rank: int,
-    cp_rank: int,
-    dp_rank: int,
-    suffix: str = "",
-) -> Tuple[str, str]:
-    """Generate a unique folder and filename for log-prob data."""
-    folder = os.path.join(save_dir, f"{_FOLDER_NAMES_PREFIX}{iteration}")
-    filename = f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}{suffix}"
-    return folder, filename
-
 
 class LogitsSaverHooks:
     """
@@ -284,7 +86,7 @@ class LogitsSaverHooks:
     - Computing local top-K on fp32 logits to reduce memory and communication
     - Concatenating values and indices before all_gather
     - Computing global top-K from gathered results
-    - Having each rank save only its K/N slice (evenly divisible)
+    - Having TP rank 0 save the full top-K for each CP/DP rank
 
     When ``p`` is set, a top-P (nucleus) mask is applied after global top-K
     selection.  The K dimension is truncated to the maximum per-token nucleus
@@ -298,13 +100,13 @@ class LogitsSaverHooks:
     kept per token.
 
     Indices are stored efficiently: uint16 for lower 16 bits + separate high bit tensor.
-    tp_rank and dp_rank are stored in the filename for flexibility with multi-digit values.
+    CP and DP ranks are stored in the tar filename for flexibility with multi-digit values.
 
-    When ``flush_interval`` > 1, iteration data is accumulated in memory and
-    flushed as a single tar archive every *flush_interval* iterations via a
-    background thread, reducing inode usage and avoiding blocking the training
-    loop.  Call :meth:`flush` at checkpoint / shutdown to write any remaining
-    buffered data.
+    Iteration data is accumulated in memory and flushed as a tar archive every
+    *flush_interval* iterations via a background thread, reducing inode usage
+    and avoiding blocking the training loop.  A ``flush_interval`` of 1 writes
+    one tar per iteration.  Call :meth:`flush` at checkpoint / shutdown to write
+    any remaining buffered data.
 
     Args:
         save_dir: Directory to save log-prob files
@@ -316,9 +118,8 @@ class LogitsSaverHooks:
             sentinel and ``-1`` index sentinel.
         min_k: Minimum number of entries kept per token when top-P masking
             is active, regardless of cumulative mass.  Defaults to 1.
-        compress_zstd: Whether to use zstd compression (requires zstandard package)
-        flush_interval: Number of iterations to batch before writing a single tar
-            archive.  1 (default) preserves the legacy one-file-per-iteration behaviour.
+        flush_interval: Number of iterations to batch before writing a single
+            tar archive.  1 (default) writes one tar per iteration.
         save_dtype: String name of the dtype for top-K log-probabilities on
             disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
     """
@@ -336,7 +137,6 @@ class LogitsSaverHooks:
         *,
         p: Optional[float] = None,
         min_k: int = 1,
-        compress_zstd: bool = False,
         flush_interval: int = 1,
         save_dtype: str = 'fp16',
     ):
@@ -389,7 +189,6 @@ class LogitsSaverHooks:
                 "p": self.p,
                 "min_k": self.min_k,
                 "save_dtype": save_dtype,
-                "compress_zstd": bool(compress_zstd),
                 "flush_interval": self.flush_interval,
             },
         }
@@ -401,71 +200,56 @@ class LogitsSaverHooks:
         self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self._hook_handles: List[Any] = []
 
-        # Zstd compression setup
-        if compress_zstd and zstandard is not None:
-            self._zstd_compressor = zstandard.ZstdCompressor(level=3)
-        else:
-            self._zstd_compressor = None
-            if compress_zstd:
-                warnings.warn(
-                    "zstandard package not found; disabling zstd compression for log-probs."
-                )
-
-        # Batched tar state (active when flush_interval > 1)
-        self._pending_writes: OrderedDict[int, Tuple[bytes, str]] = OrderedDict()
+        # Batched tar state.
+        self._pending_writes: OrderedDict[int, bytes] = OrderedDict()
         self._flush_executor: Optional[concurrent.futures.ThreadPoolExecutor] = (
             concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            if self.flush_interval > 1
-            else None
         )
         self._flush_futures: List[concurrent.futures.Future] = []
+        self._flush_lock = threading.Lock()
 
         # Top-P logging: per-microbatch kept counts (populated by _apply_topp_truncation)
         self._topp_kept_counts: List[float] = []
 
         # Create save directory if needed
-        os.makedirs(self.save_dir, exist_ok=True)
+        storage_makedirs(self.save_dir, exist_ok=True)
 
         # Register as the active saver so checkpoint code can flush
         global _ACTIVE_LOGITS_SAVER
         _ACTIVE_LOGITS_SAVER = self
 
-    def get_forward_hook(self) -> Callable:
-        """Returns the forward hook to capture top-K log-probs per microbatch.
+    def _forward_hook(
+        self,
+        module: torch.nn.Module,
+        input: Any,
+        output: Tuple[torch.Tensor, ...],
+    ) -> None:
+        """Capture top-K log-probs for one output-layer forward.
 
         This hook should be registered on the module that outputs logits.
         Each microbatch is processed immediately to extract only the small
         top-K values and indices, avoiding storage of full vocab-sized logits
         across microbatches.
         """
-        def forward_hook(
-            module: torch.nn.Module,
-            input: Any,
-            output: Tuple[torch.Tensor, ...],
-        ) -> None:
-            # Skip if not in training mode
-            if not module.training:
-                return
+        if not module.training:
+            return
 
-            # Store logits and maybe save to disk
-            if self._curr_mtp_passes == self._mtp_num_layers:
-                # Main output logits come after MTP logits
-                logits = output[0] if isinstance(output, tuple) else output
+        if self._curr_mtp_passes == self._mtp_num_layers:
+            # Main output logits come after MTP logits.
+            logits = output[0] if isinstance(output, tuple) else output
 
-                with torch.no_grad():
-                    result = self._process_single_microbatch(logits)
-                if result is not None:
-                    self._accumulated_results.append(result)
+            with torch.no_grad():
+                result = self._process_single_microbatch(logits)
+            if result is not None:
+                self._accumulated_results.append(result)
 
-                if len(self._accumulated_results) == get_num_microbatches():
-                    self._save_accumulated_log_probs()
-                    self._accumulated_results.clear()
+            if len(self._accumulated_results) == get_num_microbatches():
+                self._save_accumulated_log_probs()
+                self._accumulated_results.clear()
 
-                self._curr_mtp_passes = 0
-            else:
-                self._curr_mtp_passes += 1
-
-        return forward_hook
+            self._curr_mtp_passes = 0
+        else:
+            self._curr_mtp_passes += 1
 
     def attach_hooks(self, module: torch.nn.Module) -> None:
         """Convenience method to attach hooks to a module.
@@ -473,7 +257,7 @@ class LogitsSaverHooks:
         Args:
             module: The module that outputs logits (e.g., the output layer)
         """
-        fwd_handle = module.register_forward_hook(self.get_forward_hook())
+        fwd_handle = module.register_forward_hook(self._forward_hook)
         self._hook_handles.extend([fwd_handle])
 
     def remove_hooks(self) -> None:
@@ -584,7 +368,7 @@ class LogitsSaverHooks:
             )
 
         global_values = global_values.to(self._save_dtype)
-        indices_low, high_bit = _pack_indices(global_indices)
+        indices_low, high_bit = pack_indices(global_indices)
 
         return global_values, indices_low, high_bit
 
@@ -727,8 +511,9 @@ class LogitsSaverHooks:
         - indices_low: list of uint16 tensors (lower 16 bits of vocab indices)
         - bit_17: list of bool tensors (17th bit, same shape as indices_low)
 
-        When ``flush_interval > 1``, the serialised bytes are buffered in
-        memory and flushed as a tar archive every *flush_interval* iterations.
+        The serialised bytes are buffered in memory and flushed as a tar
+        archive every *flush_interval* iterations.  A ``flush_interval`` of 1
+        writes a single-iteration tar.
         """
         # Serialize all tensors together
         buffer = io.BytesIO()
@@ -739,86 +524,78 @@ class LogitsSaverHooks:
         }, buffer)
         data = buffer.getvalue()
 
-        # Optional per-entry compression
-        entry_suffix = ".pt"
-        if self._zstd_compressor is not None:
-            data = self._zstd_compressor.compress(data)
-            entry_suffix += ".zst"
-
         iteration = get_current_iteration()
 
-        if self.flush_interval <= 1:
-            # Legacy: one file per iteration in a per-iteration folder
-            folder, filename = _format_folder_and_filename(
-                self.save_dir, iteration, self.tp_rank, self.cp_rank, self.dp_rank, entry_suffix
-            )
-            storage_makedirs(folder, exist_ok=True)
-            with open_logit_file(os.path.join(folder, filename), "wb") as f:
-                f.write(data)
-        else:
-            # Batched: accumulate in memory, flush when the iteration
-            # is a multiple of the flush interval.
-            self._pending_writes[iteration] = (data, entry_suffix)
-            if (iteration + 1) % self.flush_interval == 0:
-                self._flush_pending()
+        self._pending_writes[iteration] = data
+        if (iteration + 1) % self.flush_interval == 0:
+            self._flush_pending()
 
     # ------------------------------------------------------------------
     #  Batched-tar flush helpers
     # ------------------------------------------------------------------
 
-    def _flush_pending(self) -> None:
+    def _flush_pending(self) -> Optional[concurrent.futures.Future]:
         """Flush buffered iteration data as a single tar archive (async)."""
-        if not self._pending_writes:
-            return
+        with self._flush_lock:
+            if not self._pending_writes:
+                if self._flush_futures:
+                    return self._flush_futures[-1]
+                future = concurrent.futures.Future()
+                future.set_result(None)
+                return future
 
-        # Wait for any prior background flush to finish before handing off
-        # new data, bounding peak memory to one batch of pending writes.
-        self._wait_for_pending_flushes()
+            # Wait for any prior background flush to finish before handing off
+            # new data, bounding peak memory to one batch of pending writes.
+            for future in self._flush_futures:
+                future.result()
+            self._flush_futures.clear()
 
-        # Take ownership of the current pending buffer
-        writes = self._pending_writes
-        self._pending_writes = OrderedDict()
+            # Take ownership of the current pending buffer
+            writes = self._pending_writes
+            self._pending_writes = OrderedDict()
 
-        last_iter = max(writes.keys())
-        tar_filename = _batched_tar_filename(
-            self.cp_rank, self.dp_rank, last_iter,
-        )
-        tar_path = storage_join(self.save_dir, tar_filename)
+            last_iter = max(writes.keys())
+            tar_filename = batched_tar_filename(
+                self.cp_rank, self.dp_rank, last_iter,
+            )
+            tar_path = os.path.join(self.save_dir, tar_filename)
 
-        future = self._flush_executor.submit(
-            LogitsSaverHooks._write_batched_tar, tar_path, writes, self._meta_bytes,
-        )
-        self._flush_futures.append(future)
+            future = self._flush_executor.submit(
+                LogitsSaverHooks._write_batched_tar, tar_path, writes, self._meta_bytes,
+            )
+            self._flush_futures.append(future)
 
         print_rank_0(f"Flushing {len(writes)} logit iterations to disk")
+        return future
 
     @staticmethod
     def _write_batched_tar(
         tar_path: str,
-        writes: "OrderedDict[int, Tuple[bytes, str]]",
+        writes: "OrderedDict[int, bytes]",
         meta_bytes: bytes,
     ) -> None:
         """Write a tar archive containing multiple iterations (runs in background thread).
 
         The dataset-identity metadata is written as the **first** member
-        (named :data:`META_TAR_MEMBER`) so the student-side WebDataset
-        loader sees it as the very first sample of the shard and can
+        (named :data:`META_TAR_MEMBER`) so the student-side tar reader
+        sees it before any payload members and can
         verify alignment before any iteration data is decoded.
 
-        Each subsequent member is named ``{iteration}{suffix}`` so that
-        WebDataset groups them as individual samples keyed by iteration
-        number.
+        Each subsequent member is named ``{iteration}.pt.zst`` so that
+        the student-side tar reader can stream iterations by member name.
         """
-        storage_makedirs(storage_dirname(tar_path), exist_ok=True)
+        storage_makedirs(os.path.dirname(tar_path), exist_ok=True)
         write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"
+        compressor = zstandard.ZstdCompressor(level=3)
         with open_logit_file(write_path, "wb") as stream:
             with tarfile.open(fileobj=stream, mode="w") as tar:
                 info = tarfile.TarInfo(name=META_TAR_MEMBER)
                 info.size = len(meta_bytes)
                 tar.addfile(info, io.BytesIO(meta_bytes))
 
-                for iteration, (data, entry_suffix) in writes.items():
-                    member_name = f"{iteration}{entry_suffix}"
+                for iteration, data in writes.items():
+                    data = compressor.compress(data)
+                    member_name = f"{iteration}{LOGPROBS_TAR_MEMBER_SUFFIX}"
                     info = tarfile.TarInfo(name=member_name)
                     info.size = len(data)
                     tar.addfile(info, io.BytesIO(data))
@@ -827,20 +604,23 @@ class LogitsSaverHooks:
 
     def _wait_for_pending_flushes(self) -> None:
         """Block until all background flush futures have completed."""
-        for future in self._flush_futures:
-            future.result()
-        self._flush_futures.clear()
+        with self._flush_lock:
+            for future in self._flush_futures:
+                future.result()
+            self._flush_futures.clear()
+
+    def begin_flush(self) -> Optional[concurrent.futures.Future]:
+        """Hand off buffered data and return a future for checkpoint finalization."""
+        return self._flush_pending()
+
+    def finish_flush(self) -> None:
+        """Block until all background flush work has completed."""
+        self._wait_for_pending_flushes()
 
     def flush(self) -> None:
-        """Flush any remaining buffered data to disk.
-
-        Must be called at checkpoint / shutdown when ``flush_interval > 1``
-        to ensure no iteration data is lost.  Safe to call when there is
-        nothing pending (no-op).
-        """
-        if self.flush_interval > 1 and self._pending_writes:
-            self._flush_pending()
-        self._wait_for_pending_flushes()
+        """Flush any remaining buffered data to disk."""
+        self.begin_flush()
+        self.finish_flush()
 
     def shutdown(self) -> None:
         """Flush remaining data and shut down the background executor."""
@@ -848,221 +628,3 @@ class LogitsSaverHooks:
         if self._flush_executor is not None:
             self._flush_executor.shutdown(wait=True)
             self._flush_executor = None
-
-
-#################################################
-# Loading utilities
-#################################################
-
-
-def _decompress_zstd(data: bytes) -> bytes:
-    """Decompress zstd-compressed bytes."""
-    if zstandard is None:
-        raise RuntimeError("zstandard package required to read compressed log-probs files")
-    return zstandard.ZstdDecompressor().decompress(data)
-
-
-def _read_logprobs_data(folder: str, base_filename: str) -> Optional[bytes]:
-    """Read a log-probs file from an iteration folder or its tar archive."""
-    tar_path = folder + ".tar"
-    folder_name = os.path.basename(folder)
-
-    if os.path.isdir(folder):
-        archive_ctx = nullcontext()
-
-        def resolve(name: str) -> Optional[bytes]:
-            path = os.path.join(folder, name)
-            if not os.path.exists(path):
-                return None
-            with open_logit_file(path, 'rb') as f:
-                return f.read()
-
-    elif os.path.isfile(tar_path):
-        archive = tarfile.open(tar_path, "r")
-        archive_ctx = archive
-
-        def resolve(name: str) -> Optional[bytes]:
-            try:
-                member = archive.extractfile(f"{folder_name}/{name}")
-            except KeyError:
-                return None
-            return member.read() if member is not None else None
-
-    else:
-        return None
-
-    with archive_ctx:
-        for suffix in [".pt.zst", ".pt"]:
-            raw = resolve(base_filename + suffix)
-            if raw is None:
-                continue
-            return _decompress_zstd(raw) if suffix == ".pt.zst" else raw
-
-
-def _read_from_batched_tar(
-    save_dir: str,
-    iteration: int,
-    tp_rank: int,
-    cp_rank: int,
-    dp_rank: int,
-) -> Optional[bytes]:
-    """Read a single iteration's data from a batched tar archive.
-
-    Supports the current unsharded tars (``cp{C}_dp{D}__{B}.tar``).
-    For local filesystems, legacy TP-sharded tars are still tried as a
-    fallback; remote MSC paths intentionally use only the current layout.
-    """
-    prefixes = [_batched_tar_prefix(cp_rank, dp_rank)]
-    if not is_remote_storage_path(save_dir):
-        prefixes.append(_batched_tar_prefix(cp_rank, dp_rank, tp_rank=tp_rank))
-
-    for prefix in prefixes:
-        pattern = storage_join(save_dir, f"{prefix}*.tar")
-        for tar_path in _sorted_batched_tars(storage_glob(pattern)):
-            basename = os.path.basename(tar_path)
-            m = _BATCHED_TAR_RE.match(basename)
-            if not m:
-                continue
-            if int(m.group("iter")) < iteration:
-                continue
-            try:
-                with open_logit_file(tar_path, "rb", prefetch_file=True) as stream:
-                    with tarfile.open(fileobj=stream, mode="r:*") as tar:
-                        for suffix in (".pt.zst", ".pt"):
-                            member_name = f"{iteration}{suffix}"
-                            try:
-                                member = tar.extractfile(member_name)
-                                if member is not None:
-                                    raw = member.read()
-                                    return _decompress_zstd(raw) if suffix == ".pt.zst" else raw
-                            except KeyError:
-                                continue
-            except (tarfile.TarError, OSError):
-                continue
-    return None
-
-
-def load_log_probs_by_rank(
-    save_dir: str,
-    iteration: int,
-    tp_rank: int,
-    cp_rank: int,
-    dp_rank: int,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """Load a saved log-probs file by specifying the root folder, iteration, and parallel ranks.
-
-    Supports four on-disk layouts (tried in order):
-
-    1. **Legacy folder** – ``logprobs_iter{iter}/tp{tp}_cp{cp}_dp{dp}.pt[.zst]``
-    2. **Legacy folder tar** – ``logprobs_iter{iter}.tar`` containing the folder
-    3. **Unsharded batched tar** – ``cp{cp}_dp{dp}__{B}.tar``
-       containing ``{iter}.pt[.zst]`` (full top-K, saved by TP rank 0)
-    4. **TP-sharded batched tar** (legacy) – ``tp{tp}_cp{cp}_dp{dp}__{B}.tar``
-       containing ``{iter}.pt[.zst]`` (K/tp_size slice per TP rank)
-
-    Args:
-        save_dir: Root path containing all log-probs data
-        iteration: Training iteration number
-        tp_rank: Tensor parallel rank
-        cp_rank: Context parallel rank
-        dp_rank: Data parallel rank
-
-    Returns:
-        Tuple of (log_prob_values_list, indices_list)
-        where each list contains one tensor per microbatch (in order).
-        Values are log-probabilities; indices are reconstructed full int64 global indices.
-
-    Raises:
-        FileNotFoundError: If no matching data is found in any layout
-    """
-    # 1 & 2: Legacy folder / folder.tar
-    folder, base_filename = _format_folder_and_filename(
-        save_dir, iteration, tp_rank, cp_rank, dp_rank,
-    )
-    data = _read_logprobs_data(folder, base_filename)
-
-    # 3: Batched tar
-    if data is None:
-        data = _read_from_batched_tar(save_dir, iteration, tp_rank, cp_rank, dp_rank)
-
-    if data is None:
-        raise FileNotFoundError(
-            f"No log-probs file found for tp_rank={tp_rank}, cp_rank={cp_rank}, "
-            f"dp_rank={dp_rank} at iteration {iteration} "
-            f"(checked folder '{folder}', tar '{folder}.tar', "
-            f"and batched tars in '{save_dir}')"
-        )
-
-    # Load tensors
-    tensors = torch.load(io.BytesIO(data), weights_only=True)
-
-    # Reconstruct full indices for each microbatch
-    indices_list = [
-        _unpack_indices(low, bit17)
-        for low, bit17 in zip(tensors['indices_low'], tensors['bit_17'])
-    ]
-
-    return tensors['values'], indices_list
-
-
-#################################################
-# WebDataset-based streaming loader
-#################################################
-
-
-def decode_logprobs_sample(
-    sample: dict,
-    expected_hash: Optional[str] = None,
-) -> Optional[Tuple[int, List[torch.Tensor], List[torch.Tensor]]]:
-    """WebDataset map function: decode a single tar member into tensors.
-
-    Handles both ``.pt`` and ``.pt.zst`` extensions produced by
-    :class:`LogitsSaverHooks` when ``flush_interval > 1``.
-
-    The first member of every batched tar is the :data:`META_TAR_MEMBER`
-    sample (see :meth:`LogitsSaverHooks._write_batched_tar`).  When that
-    sample is encountered, its parsed contents are compared against
-    *expected_hash* (if provided) and the function returns ``None`` to
-    signal the caller to skip it.  This makes per-tar dataset-identity
-    verification automatic for any consumer of the WebDataset pipeline
-    without requiring an extra filter step.
-
-    Args:
-        sample: WebDataset sample dict with ``__key__`` and one data field.
-        expected_hash: Dataset-identity hash the student run expects every
-            tar to advertise in its ``_meta.json`` member.  When ``None``,
-            verification is skipped (legacy data, debugging).
-
-    Returns:
-        ``(iteration, values_list, indices_list)`` for iteration samples,
-        or ``None`` for the per-tar metadata sample (caller should skip).
-    """
-    key: str = sample["__key__"]
-
-    if key == META_TAR_MEMBER.split(".")[0]:
-        saved_hash = json.loads(sample["json"]).get("hash")
-        if expected_hash is not None and saved_hash != expected_hash:
-            raise RuntimeError(
-                f"Teacher tar {sample.get('__url__')} was saved with hash "
-                f"{saved_hash} but the current student run has hash "
-                f"{expected_hash}. Data does not align!"
-            )
-        return None
-
-    iteration = int(key)
-
-    if "pt.zst" in sample:
-        data = _decompress_zstd(sample["pt.zst"])
-    elif "pt" in sample:
-        data = sample["pt"]
-    else:
-        raise ValueError(
-            f"Sample '{key}' contains neither .pt nor .pt.zst data"
-        )
-
-    tensors = torch.load(io.BytesIO(data), weights_only=True)
-    indices_list = [
-        _unpack_indices(low, bit17)
-        for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
-    ]
-    return iteration, tensors["values"], indices_list

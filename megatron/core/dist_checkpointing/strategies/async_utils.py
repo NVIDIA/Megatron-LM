@@ -5,6 +5,7 @@ This module provides an async utilities which allow to start
 a checkpoint save process in the background.
 """
 import gc
+import concurrent.futures
 import logging
 import os
 import subprocess
@@ -110,6 +111,8 @@ class AsyncRequest(NamedTuple):
         is_frozen (Bool): a flag to indicate this async request can be modified or not.
         call_idx (int): index variable used to order async requests for synchronization
                         in preloading and writing tensors on the async caller
+        finalize_dependencies (List[Future]): optional futures that must complete before
+            finalization functions run.
 
     """
 
@@ -120,6 +123,7 @@ class AsyncRequest(NamedTuple):
     preload_fn: Optional[Callable] = None
     is_frozen: bool = False
     call_idx: int = 0
+    finalize_dependencies: Optional[List[concurrent.futures.Future]] = None
 
     def add_finalize_fn(self, fn: Callable) -> None:
         """Adds a new finalize function to the request.
@@ -134,6 +138,16 @@ class AsyncRequest(NamedTuple):
         if self.is_frozen:
             raise RuntimeError('Cannot add finalization functions to a frozen AsyncRequest')
         self.finalize_fns.append(fn)
+
+    def with_finalize_dependencies(
+        self, futures: List[concurrent.futures.Future]
+    ) -> 'AsyncRequest':
+        """Returns a request that waits for ``futures`` before finalization."""
+        if self.is_frozen:
+            raise RuntimeError('Cannot set finalization dependencies on a frozen AsyncRequest')
+        dependencies = list(self.finalize_dependencies or [])
+        dependencies.extend(futures)
+        return self._replace(finalize_dependencies=dependencies)
 
     def execute_sync(self) -> None:
         """Helper to synchronously execute the request.
@@ -156,6 +170,9 @@ class AsyncRequest(NamedTuple):
 
         # This utility implements a sync cp save. Hence the barrier.
         torch.distributed.barrier()
+
+        for dependency in self.finalize_dependencies or []:
+            dependency.result()
 
         # Finalize the CP state
         for finalize_fn in self.finalize_fns:
@@ -602,11 +619,13 @@ class _ActiveAsyncRequest(NamedTuple):
         async_caller (DistributedAsyncCaller): async caller instance that represents
             the async process handling the async request
         async_request (AsyncRequest):  async request that is being called
+        async_done (bool): whether the async checkpoint writer has already completed.
     """
 
     idx: int
     async_caller: AsyncCaller
     async_request: AsyncRequest
+    async_done: bool = False
 
 
 class AsyncCallsQueue:
@@ -660,10 +679,54 @@ class AsyncCallsQueue:
             async_request = AsyncRequest(**async_request._asdict())
         async_request = async_request.freeze()
         async_caller.schedule_async_call(
-            async_request._replace(call_idx=self.call_idx, finalize_fns=[])
+            async_request._replace(
+                call_idx=self.call_idx,
+                finalize_fns=[],
+                finalize_dependencies=None,
+            )
         )
         self.async_calls.append(_ActiveAsyncRequest(self.call_idx, async_caller, async_request))
         return self.call_idx
+
+    def _dependencies_complete(
+        self, async_request: AsyncRequest, blocking: bool, no_dist: bool
+    ) -> bool:
+        dependencies = async_request.finalize_dependencies or []
+        if not dependencies:
+            return True
+
+        if blocking:
+            for dependency in dependencies:
+                dependency.result()
+            return True
+
+        local_done = all(dependency.done() for dependency in dependencies)
+        if not no_dist and torch.distributed.is_initialized():
+            done = torch.tensor(
+                [int(local_done)],
+                dtype=torch.int,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(done, op=torch.distributed.ReduceOp.MIN)
+            dependencies_done = bool(done.item())
+        else:
+            dependencies_done = local_done
+        if not dependencies_done:
+            return False
+
+        for dependency in dependencies:
+            dependency.result()
+        return True
+
+    def _finalize_request(self, call_idx: int, async_request: AsyncRequest) -> None:
+        for finalize_fn in async_request.finalize_fns:
+            finalize_fn()
+        ten = torch.tensor([call_idx], dtype=torch.int, device=torch.cuda.current_device())
+        torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
+        assert ten.item() == call_idx, (
+            "Unmatched async calls. That probably means not all ranks are "
+            "participating in async finalization"
+        )
 
     def maybe_finalize_async_calls(self, blocking=False, no_dist=False) -> List[int]:
         """Finalizes all available calls.
@@ -686,19 +749,22 @@ class AsyncCallsQueue:
         """
         call_idx_finalized = []
         while self.async_calls:
-            next_async_done = self.async_calls[0].async_caller.is_current_async_call_done(
-                blocking, no_dist
-            )
+            active_request = self.async_calls[0]
+            next_async_done = active_request.async_done
+            if not next_async_done:
+                next_async_done = active_request.async_caller.is_current_async_call_done(
+                    blocking, no_dist
+                )
+                if next_async_done:
+                    active_request = active_request._replace(async_done=True)
+                    self.async_calls[0] = active_request
             if not next_async_done:
                 break
+            if not self._dependencies_complete(active_request.async_request, blocking, no_dist):
+                break
             with debug_time("finalize", logger):
-                call_idx, _, async_request = self.async_calls.popleft()
-                for finalize_fn in async_request.finalize_fns:
-                    finalize_fn()
-                ten = torch.tensor([call_idx], dtype=torch.int, device=torch.cuda.current_device())
-                torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
-                assert ten.item() == call_idx, "Unmatched async calls. "
-                "That probably means not all ranks are participating in async finalization"
+                call_idx, _, async_request, _ = self.async_calls.popleft()
+                self._finalize_request(call_idx, async_request)
                 call_idx_finalized.append(call_idx)
         return call_idx_finalized
 

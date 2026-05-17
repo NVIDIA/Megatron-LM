@@ -140,7 +140,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             from megatron.training.cached_logits_loss import LossFuncCallable
             loss_func_cached_logits = LossFuncCallable(
                 logprobs_dir=args.logits_load_dir,
-                num_workers=args.logits_load_num_workers,
+                decode_threads=args.logits_load_decode_threads,
                 prefetch_factor=args.logits_load_prefetch_factor,
                 msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
                 kd_loss_alpha=args.logits_load_kd_loss_alpha,
