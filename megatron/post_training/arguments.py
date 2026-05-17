@@ -94,6 +94,16 @@ def add_modelopt_args(parser):
         "--finetune-data-split", type=str, default="train", help="HF dataset split used for finetuning."
     )
 
+    # MTP on frozen base
+    group.add_argument(
+        '--freeze-base-for-mtp',
+        action='store_true',
+        default=False,
+        help='Freeze all base model parameters and only train MTP heads. '
+        'Used after QAD: load a quantized checkpoint, add MTP heads, '
+        'and train them with lm_loss while keeping the base model frozen.',
+    )
+
     # Special model architecture option
     group.add_argument(
         '--export-qk-l2-norm',
