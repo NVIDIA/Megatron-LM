@@ -11,6 +11,7 @@ from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -943,3 +944,125 @@ def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
         better = "equal"
 
     return {"abs_diff": abs_diff, "rel_diff": rel_diff, "better": better}
+
+
+class TestFsdpNonUnitBucketPreservation:
+    """Regression test for the non-FSDP-unit bucket preservation fix.
+
+    Non-FSDP-unit buckets must remain persistently allocated: cross-module
+    readers (e.g. MambaMixer.forward, which reads self.conv1d.weight as a
+    raw tensor via causal_conv1d_fn(weight=...) instead of self.conv1d(...))
+    can dereference them at any time. Before the fix, AllGatherPipeline.reset()
+    freed every bucket's gather scratch — including the non-unit one — and
+    because nn.Module.__call__ is never invoked on conv1d, no hook ever fires
+    to refresh conv1d.weight's wbuf.data (set_param_data=True) afterwards.
+    The next forward then dereferences freed storage.
+
+    A small bucket_size is required so conv1d.weight lands in a different
+    non-unit bucket from MambaMixer's recurse=False params (A_log/D/dt_bias);
+    otherwise MambaMixer's own pre-forward hook gathers the shared bucket
+    and incidentally refreshes conv1d.weight, masking the bug.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_non_unit_bucket_preserved_across_param_sync(self):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if Utils.world_size != 2:
+            pytest.skip("Requires exactly 2 GPUs (DP=2).")
+        pytest.importorskip("mamba_ssm")
+        pytest.importorskip("causal_conv1d")
+        pytest.importorskip("einops")
+
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.ssm.mamba_layer import MambaLayer
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.
+        model_parallel_cuda_manual_seed(0)
+
+        # HIDDEN=256 is the floor: mamba's d_inner = 2*HIDDEN = 512, nheads =
+        # d_inner / mamba_head_dim(64) = 8, and nheads % mamba_num_groups(8) == 0.
+        HIDDEN = 256
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+
+        class HybridStack(torch.nn.Module):
+            def __init__(self, config, pg_collection):
+                super().__init__()
+                self.attn_layer = TransformerLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.attention_layer.submodules,
+                    layer_number=1,
+                    pg_collection=pg_collection,
+                    add_layer_offset=False,
+                )
+                self.mamba_layer = MambaLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.mamba_layer.submodules,
+                    layer_number=2,
+                    pg_collection=pg_collection,
+                )
+
+            def forward(self, hidden_states):
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
+                return self.mamba_layer(hidden_states=h)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
+
+        # bucket_size=4096 forces conv1d.weight into a separate non-unit bucket
+        # from MambaMixer's recurse=False params; fsdp_unit_modules=[TransformerLayer]
+        # matches the production default in mcore_fsdp_adapter.py.
+        fsdp_model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                data_parallel_sharding_strategy="optim_grads_params",
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                bucket_size=4096,
+                use_megatron_fsdp=True,
+            ),
+            module=model,
+            fsdp_unit_modules=[TransformerLayer],
+        )
+
+        # Guard against future bucketing changes silently masking the bug.
+        non_unit_buckets = [
+            pg
+            for pg in fsdp_model.param_and_grad_buffer.parameter_groups
+            if pg.fsdp_unit_id is None
+        ]
+        assert len(non_unit_buckets) >= 2, (
+            f"Expected non-unit params to split across multiple buckets, "
+            f"got {len(non_unit_buckets)}. bucket_size may be too large."
+        )
+
+        x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        out = fsdp_model(x)
+        out.sum().backward()
+        # Mirrors what the pipeline schedule does after backward: finalize_model_grads
+        # calls fsdp_model.finish_grad_sync(), which calls synchronize_param_gather()
+        # (because overlap_param_gather=True), which calls AllGatherPipeline.reset() —
+        # the buggy entry point that frees non-unit buckets.
+        finalize_model_grads([fsdp_model])
+        fsdp_model(x)
+
+        # Surface any deferred CUDA errors before teardown.
+        torch.cuda.synchronize()

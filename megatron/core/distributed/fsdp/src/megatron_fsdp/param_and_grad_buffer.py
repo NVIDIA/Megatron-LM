@@ -3921,9 +3921,22 @@ class AllGatherPipeline:
             while len(self.param_gather_event_map) > 0:
                 (bucket_id, bwd) = next(iter(self.param_gather_event_map))
                 self.wait_bucket_ready(bucket_id, bwd)
+        # Unit buckets follow the normal release path: mark can_be_released and let
+        # recycle_unused_buckets free the gather scratch. Non-unit buckets keep their
+        # storage pinned per the release_bucket contract (cross-module readers such
+        # as fused kernels that bypass nn.Module.forward may dereference them), but
+        # we still transition them back to EMPTY so the next async_bucket_gather
+        # refreshes wbuf.data from the (post-optimizer-step) shard in place. The
+        # underlying TemporaryBucketAllocator.allocate() is idempotent for an
+        # already-allocated bucket_id, so no new memory is allocated.
         for bucket_id in range(self.num_buckets):
+            is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
             for bwd in [False, True]:
-                self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = True
+                bucket_key = self.get_bucket_key(bucket_id, bwd)
+                if is_unit_bucket:
+                    self.bucket_can_be_released[bucket_key] = True
+                else:
+                    self.bucket_status[bucket_key] = BucketStatus.EMPTY
         self.recycle_unused_buckets()
 
         assert all([status is BucketStatus.EMPTY for status in self.bucket_status.values()]), (
