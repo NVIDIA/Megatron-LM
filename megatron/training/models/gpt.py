@@ -47,72 +47,29 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 
 
-
-def transformer_engine_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
-    """Create a Transformer Engine layer specification based on the provided config."""
-    if "use_te_op_fuser" in inspect.signature(get_gpt_layer_with_transformer_engine_spec).parameters:
-        kwargs = {"use_te_op_fuser": config.use_transformer_engine_op_fuser}
-    else:
-        kwargs = {}
-    return get_gpt_layer_with_transformer_engine_spec(
-        config.transformer.num_moe_experts,
-        config.transformer.moe_grouped_gemm,
-        config.transformer.qk_layernorm,
-        config.transformer.multi_latent_attention,
-        config.transformer.experimental_attention_variant,
-        qk_l2_norm=config.transformer.qk_l2_norm,
-        use_kitchen=config.transformer.use_kitchen,
-        use_te_activation_func=config.transformer.use_te_activation_func,
-        use_kitchen_attention=config.transformer.use_kitchen_attention,
-        kitchen_attention_backend=config.transformer.kitchen_attention_backend,
-        mla_down_proj_fusion=getattr(config.transformer, "mla_down_proj_fusion", False),
-        **kwargs,
-    )
-
-
-def local_layer_spec(config: TransformerConfig) -> ModuleSpec:
-    """Create a local layer specification without Transformer Engine.
-
-    Args:
-        config: GPT configuration object
-
-    Returns:
-        ModuleSpec: Module specification for local implementation layers
-    """
-    return get_gpt_layer_local_spec(
-        num_experts=config.num_moe_experts,
-        moe_grouped_gemm=config.moe_grouped_gemm,
-        qk_layernorm=config.qk_layernorm,
-        normalization=config.normalization,
-    )
-
-
-def modelopt_transformer_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
-    """Layer specification for quantization with ModelOpt."""
-    # arbitrary attention mask is used for speculative decoding training
-    # When context parallel > 1, only causal mask type is supported
-    from megatron.core import parallel_state
-
-    use_arbitrary_attention_mask = (
-        config.use_arbitrary_attention_mask
-        if config.use_arbitrary_attention_mask is not None
-        else parallel_state.get_context_parallel_world_size() == 1
-    )
-    return get_gpt_modelopt_spec(
-        config=config.transformer,
-        local_core_attention=False,
-        remap_te_layernorm=True,
-        real_quant_cfg="None",
-        use_arbitrary_attention_mask=use_arbitrary_attention_mask,
-    )
-
-
 def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if config.restore_modelopt_state:
-        return modelopt_transformer_layer_spec(config)
+        ## Layer specification for quantization with ModelOpt. ##
+
+        # arbitrary attention mask is used for speculative decoding training
+        # When context parallel > 1, only causal mask type is supported
+        from megatron.core import parallel_state
+
+        use_arbitrary_attention_mask = (
+            config.use_arbitrary_attention_mask
+            if config.use_arbitrary_attention_mask is not None
+            else parallel_state.get_context_parallel_world_size() == 1
+        )
+        return get_gpt_modelopt_spec(
+            config=config.transformer,
+            local_core_attention=False,
+            remap_te_layernorm=True,
+            real_quant_cfg="None",
+            use_arbitrary_attention_mask=use_arbitrary_attention_mask,
+        )
     elif transformer_cfg.experimental_attention_variant is not None:
         return get_transformer_block_with_experimental_attention_variant_spec(config=transformer_cfg, vp_stage=vp_stage)
     elif transformer_cfg.num_moe_experts is not None:
@@ -126,7 +83,24 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     elif isinstance(transformer_cfg, HeterogeneousTransformerConfig):
         return get_gpt_heterogeneous_layer_spec(transformer_cfg, use_te)
     elif use_te:
-        return transformer_engine_layer_spec(config)
+        if "use_te_op_fuser" in inspect.signature(get_gpt_layer_with_transformer_engine_spec).parameters:
+            kwargs = {"use_te_op_fuser": config.use_transformer_engine_op_fuser}
+        else:
+            kwargs = {}
+        return get_gpt_layer_with_transformer_engine_spec(
+            config.transformer.num_moe_experts,
+            config.transformer.moe_grouped_gemm,
+            config.transformer.qk_layernorm,
+            config.transformer.multi_latent_attention,
+            config.transformer.experimental_attention_variant,
+            qk_l2_norm=config.transformer.qk_l2_norm,
+            use_kitchen=config.transformer.use_kitchen,
+            use_te_activation_func=config.transformer.use_te_activation_func,
+            use_kitchen_attention=config.transformer.use_kitchen_attention,
+            kitchen_attention_backend=config.transformer.kitchen_attention_backend,
+            mla_down_proj_fusion=getattr(config.transformer, "mla_down_proj_fusion", False),
+            **kwargs,
+        )
     elif transformer_cfg.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
             transformer_cfg.qk_layernorm,
