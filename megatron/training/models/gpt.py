@@ -264,7 +264,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         """
         transformer_layer_spec = self._model_config.transformer_layer_spec
         if transformer_layer_spec is None:
-            transformer_layer_spec = default_layer_spec(self._model_config)
+            transformer_layer_spec = default_layer_spec(self._model_config, vp_stage)
         elif callable(transformer_layer_spec):
             # Check if the transformer_layer_spec function accepts vp_stage parameter
             if "vp_stage" in inspect.signature(transformer_layer_spec).parameters:
