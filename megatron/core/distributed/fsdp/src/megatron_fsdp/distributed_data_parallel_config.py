@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from megatron.core.utils import is_torch_min_version
+from .utils import is_torch_min_version
 
 
 @dataclass
