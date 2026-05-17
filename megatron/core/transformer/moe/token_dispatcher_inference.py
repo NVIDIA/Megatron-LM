@@ -338,7 +338,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         per_rank_worst_case_token_count: int,
         topk: int,
         hidden_size: int,
-        ep_group: torch.distributed.ProcessGroup,
+        tp_ep_group: torch.distributed.ProcessGroup,
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
@@ -351,11 +351,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 computed by the context as round_up_tokens(max_tokens) // tp_size.
             topk: MoE router top-k value.
             hidden_size: Model hidden dimension.
-            ep_group: Expert parallel process group.
+            tp_ep_group: Expert tensor and model parallel process group.
         """
-        ep_size = get_pg_size(ep_group)
+        tp_ep_size = get_pg_size(tp_ep_group)
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
-        global_max = per_rank_worst_case_token_count * ep_size
+        global_max = per_rank_worst_case_token_count * tp_ep_size
         device = torch.cuda.current_device()
 
         # Each buffer self-sizes from its exact tensor footprint so non-default
@@ -371,27 +371,27 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         agv_r_shape = [global_max, topk]
         agv_p_shape = [global_max, topk]
         rsv_shape = [global_max, hidden_size]
-        meta_shape = [ep_size]
+        meta_shape = [tp_ep_size]
 
         cls._symm_agv_hidden = SymmetricMemoryManager.get_buffer(
-            "ep_agv_h", process_group=ep_group, size_mb=_size_mb(agv_h_shape, torch.bfloat16)
+            "ep_agv_h", process_group=tp_ep_group, size_mb=_size_mb(agv_h_shape, torch.bfloat16)
         ).maybe_get_tensor(agv_h_shape, dtype=torch.bfloat16)
 
         cls._symm_agv_routing = SymmetricMemoryManager.get_buffer(
-            "ep_agv_r", process_group=ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
+            "ep_agv_r", process_group=tp_ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
         ).maybe_get_tensor(agv_r_shape, dtype=torch.int64)
 
         cls._symm_agv_probs = SymmetricMemoryManager.get_buffer(
-            "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
+            "ep_agv_p", process_group=tp_ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
         ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
+            "ep_rsv", process_group=tp_ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
         ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(
-            "ep_meta", process_group=ep_group, size_mb=_size_mb(meta_shape, torch.int32)
+            "ep_meta", process_group=tp_ep_group, size_mb=_size_mb(meta_shape, torch.int32)
         ).maybe_get_tensor(meta_shape, dtype=torch.int32)
 
         failed = [
@@ -434,7 +434,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
-        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
+        InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.tp_size * self.ep_size
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             cls._symm_agv_routing["tensor"].fill_(-1)
 
@@ -504,7 +504,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             (hidden_states, probs) gathered to [global_max, *] shape.
             Also updates self.routing_map to [global_max, topk] int64.
         """
-        if self.ep_size == 1:
+        if self.tp_size * self.ep_size == 1:
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -515,7 +515,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         agv_p = self.__class__._symm_agv_probs
 
         per_rank_max = self._per_rank_worst_case_token_count
-        global_max = per_rank_max * self.ep_size
+        global_max = per_rank_max * self.ep_size * self.tp_size
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
@@ -561,7 +561,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
         """
-        if self.ep_size == 1:
+        if self.tp_size * self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
         rsv = self.__class__._symm_rsv

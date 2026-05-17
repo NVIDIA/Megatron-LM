@@ -1213,10 +1213,10 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
-            if self.expert_tensor_parallel_size > 1:
-                raise ValueError(
-                    "Inference-optimized MoE layers does not support expert tensor parallelism."
-                )
+            # if self.expert_tensor_parallel_size > 1:
+            #     raise ValueError(
+            #         "Inference-optimized MoE layers does not support expert tensor parallelism."
+            #     )
             if self.moe_expert_capacity_factor is not None:
                 raise ValueError("Inference-optimized MoE layers only support dropless MoE ")
             if self.moe_router_padding_for_quantization:
