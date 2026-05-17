@@ -69,7 +69,9 @@ def test_compute_block_hashes_batched():
     prompt_b = torch.arange(8, dtype=torch.int64)
     prompt_b[0] = 99
     h_b = compute_block_hashes_batched(prompt_b, block_size=4)
-    assert compute_block_hashes_batched(torch.arange(8, dtype=torch.int64), block_size=4)[1] != h_b[1]
+    assert (
+        compute_block_hashes_batched(torch.arange(8, dtype=torch.int64), block_size=4)[1] != h_b[1]
+    )
 
 
 def test_inference_parameters_alias_warns_and_copies():
@@ -173,7 +175,9 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
 
     # checkpoint() inherits event_add_engine when present.
     req = DynamicInferenceRequest(
-        request_id=1, prompt_tokens=torch.tensor([1, 2, 3]), sampling_params=sp,
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=sp,
         generated_tokens=[10, 11],
     )
     original_event = req.add_event_add_engine()
@@ -187,7 +191,9 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
 
     # checkpoint() creates a new event_add_engine when the previous request had none.
     req2 = DynamicInferenceRequest(
-        request_id=2, prompt_tokens=torch.tensor([1, 2, 3]), sampling_params=sp,
+        request_id=2,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=sp,
         generated_tokens=[10],
     )
     record2 = DynamicInferenceRequestRecord.from_request(req2)
@@ -196,15 +202,21 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
 
     # merge() concatenates tokens, text, and ndarray routing_indices; falls back to None.
     a = DynamicInferenceRequest(
-        request_id=3, prompt_tokens=torch.tensor([1, 2, 3]), sampling_params=sp,
+        request_id=3,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=sp,
         generated_tokens=[10, 11],
     )
     b = DynamicInferenceRequest(
-        request_id=3, prompt_tokens=torch.tensor([1, 2, 3]), sampling_params=sp,
+        request_id=3,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=sp,
         generated_tokens=[12],
     )
-    a.generated_text = "foo"; b.generated_text = "bar"
-    a.routing_indices = np.array([[1, 2]]); b.routing_indices = np.array([[3, 4]])
+    a.generated_text = "foo"
+    b.generated_text = "bar"
+    a.routing_indices = np.array([[1, 2]])
+    b.routing_indices = np.array([[3, 4]])
     rec = DynamicInferenceRequestRecord(requests=[a, b])
     rec.latency = 4.2
     merged = rec.merge()
@@ -215,11 +227,15 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
 
     # merge() with both generated_text=None propagates None (rather than "None"+"None").
     c = DynamicInferenceRequest(
-        request_id=4, prompt_tokens=torch.tensor([1, 2, 3]), sampling_params=sp,
+        request_id=4,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=sp,
         generated_tokens=[10],
     )
     d = DynamicInferenceRequest(
-        request_id=4, prompt_tokens=torch.tensor([1, 2, 3]), sampling_params=sp,
+        request_id=4,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=sp,
         generated_tokens=[12],
     )
     assert DynamicInferenceRequestRecord(requests=[c, d]).merge().generated_text is None
