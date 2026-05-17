@@ -202,7 +202,9 @@ class LanguageModule(MegatronModule):
 
         # Mark embedding and output layer for decoupled_lr and other features.
         # This is the original Megatron attribute used by decoupled_lr, Muon, FSDP, etc.
-        if self.pre_process and hasattr(self, 'embedding'):
+        if (self.pre_process or getattr(self, 'mtp_process', False)) and hasattr(
+            self, 'embedding'
+        ):
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
         if (
             self.post_process
