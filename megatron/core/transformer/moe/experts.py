@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
@@ -40,6 +41,11 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NVLSAllGatherVDispatcher,
+)
+from megatron.core.transformer.moe.paged_stash import (
+    get_paged_stash_context,
+    paged_stash_group_commit,
+    paged_stash_group_start,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
