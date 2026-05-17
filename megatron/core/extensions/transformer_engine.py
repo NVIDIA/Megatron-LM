@@ -662,6 +662,7 @@ class TENorm:
             **_get_extra_te_kwargs(config),
         )
 
+        instance.returns_residual = use_fused_residual
         return cast(LayerNormInterface, instance)
 
 
