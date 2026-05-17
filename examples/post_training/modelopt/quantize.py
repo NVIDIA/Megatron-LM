@@ -413,6 +413,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
     )
 
     use_gradient = args.auto_quantize_method == "gradient"
+    pad_token_id = tokenizer.pad_token_id
 
     def _build_inputs(tokens):
         bsz, seq_len = tokens.shape
@@ -430,18 +431,30 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         )
         return position_ids, attention_mask
 
+    def _build_labels(tokens):
+        # Next-token labels with the (synthetic) final position set to pad so
+        # loss_func masks it out — we only have seq_len input tokens, not seq_len+1.
+        labels = torch.empty_like(tokens)
+        labels[:, :-1] = tokens[:, 1:]
+        labels[:, -1] = pad_token_id
+        return labels
+
     def forward_step(model, batch):
         tokens = batch["input_ids"]
         position_ids, attention_mask = _build_inputs(tokens)
         if use_gradient:
-            labels = torch.empty_like(tokens)
-            labels[:, :-1] = tokens[:, 1:]
-            labels[:, -1] = tokens[:, -1]
+            labels = _build_labels(tokens)
             return model(tokens, position_ids, attention_mask, labels=labels)
         return model(tokens, position_ids, attention_mask)
 
     def loss_func(output, batch):
-        return output.mean()
+        # Mirror pretrain_gpt.loss_func: mask padding/EOS label positions and
+        # average over valid tokens. `output` is per-token CE [bsz, seq_len].
+        labels = _build_labels(batch["input_ids"])
+        loss_mask = (labels != pad_token_id).to(output.dtype)
+        losses = output.float() * loss_mask
+        num_tokens = loss_mask.sum()
+        return losses.sum() / torch.clamp(num_tokens, min=1)
 
     quantization_formats = [QUANT_CFG_CHOICES[fmt] for fmt in args.auto_quantize_formats]
     disabled_layers = [
