@@ -831,6 +831,14 @@ def _get_filesystem_reader(
 ) -> FileSystemReader:
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
+        if cache_metadata:
+            warnings.warn(
+                "MSC is enabled: returning msc.torch.MultiStorageFileSystemReader instead of "
+                "CachedMetadataFileSystemReader. The cache_metadata=True request "
+                "(e.g. ckpt_assume_constant_structure=True) will be ignored and metadata "
+                "will be re-read on every load. Pass --enable-msc only when this is intended.",
+                stacklevel=2,
+            )
         return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
 
     if cache_metadata:
