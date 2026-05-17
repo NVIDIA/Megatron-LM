@@ -419,10 +419,12 @@ class TestGPTModelConfigFinalize:
         config.finalize()
 
     def test_vp_size_check_skipped_for_flexible_pp_layout(self):
-        # Indivisible layers, but account_for_embedding_in_pipeline_split=True makes
-        # the layout flexible, so the assertion is skipped.
+        # num_layers=3, pp=2, vp=2: (3 // 2) % 2 = 1 ≠ 0, so the gpt.py vp-size
+        # assertion would fail. But account_for_embedding_in_pipeline_split=True
+        # marks the layout as flexible, so the check is skipped.
+        # (num_layers + 1 = 4 is divisible by pp_size=2, so TransformerConfig accepts.)
         transformer = _make_transformer(
-            num_layers=6,
+            num_layers=3,
             pipeline_model_parallel_size=2,
             virtual_pipeline_model_parallel_size=2,
             account_for_embedding_in_pipeline_split=True,
