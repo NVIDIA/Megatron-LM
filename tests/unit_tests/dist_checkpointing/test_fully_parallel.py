@@ -40,6 +40,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 )
 from megatron.core.dist_checkpointing.strategies.torch import (
     MCoreLoadPlanner,
+    TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
 )
 from megatron.core.utils import get_pg_rank
@@ -571,12 +572,61 @@ class TestCrossRanksReads:
         else:
             assert not cross_rank_reads
 
+    def test_cross_dp_access_with_local_replica(self, tmp_path_dist_ckpt):
+        """``replicate_local_replicas=True`` eliminates every cross-DP read.
+
+        Reuses the fixture of ``test_cross_dp_access_does_not_disturb_the_distribution``
+        — TP=2, DP=4, several tensors with replication patterns that
+        produce cross-reads under the legacy save/load path. With the
+        feature on, the load picker for each shard is also a writer
+        (either of the original FQN or of its per-rank shadow), so the
+        ``cross_rank_reads`` accumulator must be empty for every rank.
+
+        ``same_rank_reads`` is *not* asserted shard-by-shard here because
+        the redirect intentionally rewrites which file the picker opens
+        (it now opens its own ``__<rank>_*.distcp`` for shadowed shards
+        instead of the main saver's file). That's exactly what the
+        feature is supposed to do; the fact that no cross-read happens
+        is the meaningful invariant.
+        """
+        ranks_placement = {
+            'a': [(0, 0)],
+            'b': [(tp, dp) for tp in range(2) for dp in range(4)],
+            'c': [(0, dp) for dp in range(3)],
+            'd': [(1, 0), (0, 0), (1, 3)],
+            'e': [(1, 0), (1, 2)],
+            'f': [(1, 0), (0, 0), (1, 2)],
+            'g': [(1, 3)],
+        }
+        cross_rank_reads, _ = self.determine_cross_rank_reads(
+            2, ranks_placement, tmp_path_dist_ckpt, replicate_local_replicas=True
+        )
+
+        # The feature's contract: every rank reads only from its own file.
+        assert not cross_rank_reads, (Utils.rank, cross_rank_reads)
+
+    def test_full_dp_reads_with_local_replica(self, tmp_path_dist_ckpt):
+        """Sanity-check the feature on the no-cross-read fixture.
+
+        ``test_full_dp_reads`` already has zero cross-reads under the
+        legacy path (every replicated tensor has a main in the single DP
+        group covering the world). Turning the feature on must keep the
+        invariant — i.e. it should not introduce regressions on the easy
+        cases where save and load pickers already agree.
+        """
+        ranks_placement = {'a': [(0, 0)], 'b': [(0, 1)], 'c': [(0, i) for i in range(8)]}
+        cross_rank_reads, _ = self.determine_cross_rank_reads(
+            1, ranks_placement, tmp_path_dist_ckpt, replicate_local_replicas=True
+        )
+        assert not cross_rank_reads, (Utils.rank, cross_rank_reads)
+
     def determine_cross_rank_reads(
         self,
         tp_size: int,
         ranks_placement: RanksPlacementT,
         tmp_path_dist_ckpt: Path,
         parallel_within_dp: bool = True,
+        replicate_local_replicas: bool = False,
     ):
         Utils.initialize_model_parallel(tp_size, 1)
         parallelization_group = (
@@ -584,15 +634,32 @@ class TestCrossRanksReads:
             if parallel_within_dp
             else torch.distributed.group.WORLD
         )
-        state_dict = self.get_sharded_state_dict(ranks_placement)
+        save_state_dict = self.get_sharded_state_dict(ranks_placement)
         with TempNamedDir(tmp_path_dist_ckpt / 'determine_cross_rank_reads') as ckpt_dir:
             save_strategy = FullyParallelSaveStrategyWrapper(
-                TorchDistSaveShardedStrategy(), parallelization_group
+                TorchDistSaveShardedStrategy(),
+                parallelization_group,
+                replicate_local_replicas=replicate_local_replicas,
             )
-            save_strategy.save(state_dict, ckpt_dir)
+            save_strategy.save(save_state_dict, ckpt_dir)
 
+            # Build a *fresh* state dict for the load. When
+            # ``replicate_local_replicas=True`` the save step mutates
+            # ``sh.key`` / ``sh.replica_id`` in place (the shadow
+            # rename), so reusing ``save_state_dict`` would feed the
+            # load picker a topology that no longer matches the on-disk
+            # checkpoint and would shift the picker to a different rank
+            # — exactly the cross-read regression this helper is
+            # supposed to detect. In production this can't happen
+            # because the load receives a freshly-built sharded state
+            # dict from the model.
+            state_dict = self.get_sharded_state_dict(ranks_placement)
+
+            # Construct the base strategy directly (instead of via
+            # ``get_default_strategy``) so we can pass the
+            # ``replicate_local_replicas`` flag to the load constructor.
             load_strategy = FullyParallelLoadStrategyWrapper(
-                get_default_strategy(StrategyAction.LOAD_SHARDED, 'torch_dist', 1),
+                TorchDistLoadShardedStrategy(replicate_local_replicas=replicate_local_replicas),
                 parallelization_group,
                 do_cache_distribution=True,
                 exchange_algo='broadcast',
@@ -612,15 +679,27 @@ class TestCrossRanksReads:
                 cross_rank_reads = defaultdict(list)
                 same_rank_reads = defaultdict(list)
 
-                # Debug cross-reads
+                # Debug cross-reads. ``read_item.dest_index.fqn`` may be a
+                # shadow key (``__shadow_<rank>__<orig>``) when load was
+                # opted into the replicate_local_replicas redirect — strip
+                # the prefix so the assertions below stay keyed by the
+                # user's original FQN.
+                from megatron.core.dist_checkpointing.strategies.local_replica import (
+                    parse_shadow_key,
+                )
+
                 for read_item in local_plan.items:
                     item_md = self.metadata.storage_data[read_item.storage_index]
 
                     read_rank = int(item_md.relative_path.split('_')[2])
+                    fqn = read_item.dest_index.fqn
+                    parsed = parse_shadow_key(fqn)
+                    if parsed is not None:
+                        fqn = parsed[1]
                     if read_rank == torch.distributed.get_rank():
-                        same_rank_reads[read_item.dest_index.fqn].append(read_rank)
+                        same_rank_reads[fqn].append(read_rank)
                     else:
-                        cross_rank_reads[read_item.dest_index.fqn].append(read_rank)
+                        cross_rank_reads[fqn].append(read_rank)
 
                 return local_plan
 
@@ -630,3 +709,232 @@ class TestCrossRanksReads:
         Utils.destroy_model_parallel()
 
         return cross_rank_reads, same_rank_reads
+
+
+class TestLocalReplicaSaveLoad:
+    """End-to-end save+load round-trip for the ``replicate_local_replicas`` knob.
+
+    The feature has two independent boolean toggles (one per direction;
+    see design-doc §4 compatibility matrix). For correctness we must make
+    sure that every combination produces tensor-identical loaded state:
+
+    | save | load | what's on disk                                | what load does               |
+    |------|------|-----------------------------------------------|------------------------------|
+    | off  | off  | legacy single-saver-per-shard layout          | reads the metadata's primary |
+    | on   | off  | shadow keys present alongside primary entries | ignores shadows → primary    |
+    | off  | on   | no shadow keys                                | redirect lookup misses → primary |
+    | on   | on   | shadow keys present                           | every rank reads its own file |
+
+    The test exercises both meaningful parallelization-group choices,
+    matching the public knob ``ckpt_fully_parallel_save_process_group:
+    Literal["dp", "ep_dp"]``:
+
+    * ``"dp"`` — Megatron's data-parallel + context-parallel combined
+      group, looked up via ``get_data_parallel_group(with_context_parallel=True)``.
+      Size 4 with TP=2 on 8 ranks. The replicated ``rmsnorm.weight``
+      gets a single global save main on the rank with
+      ``replica_id == (0, 0, 0)``; the other ``dp`` group has no save
+      main → the legacy load forces a cross-read, the new load
+      redirects to a per-rank shadow.
+    * ``"ep_dp"`` — size 2 with TP=2, EP=2 on 8 ranks. The same
+      pattern applies inside each ep_dp group: only the group that
+      contains the world's lone main has a save winner; the remaining
+      three groups have no save main and need a shadow reader to avoid
+      cross-reads.
+
+    Cross-reads themselves are *not* asserted here — that lives in
+    ``TestCrossRanksReads.test_cross_dp_access_with_local_replica``. The
+    contract this class verifies is purely "loaded values equal saved
+    values", which is what the user actually depends on.
+    """
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _make_state_dict():
+        """Build a state dict with a replicated and a TP-sharded tensor.
+
+        Uses Megatron's production ``replica_id`` convention
+        ``(0, tp_rank, dp_cp_rank)`` so that:
+
+        * ``rmsnorm.weight`` (1D, fully replicated) has a single global
+          save main on the rank where ``(tp_rank, dp_cp_rank) == (0, 0)``.
+          Every other rank holds the same data as a non-main replica —
+          this is the topology that produces cross-reads under the
+          legacy save and is the primary target of the local-replica
+          shadow rename.
+        * ``linear.weight`` (2D, TP-sharded along axis 0) is owned per
+          ``tp_rank`` and replicated across ``dp_cp_rank``. There is one
+          save main per tp-domain (the rank with ``dp_cp_rank == 0``),
+          which mirrors the production layout for column/row-parallel
+          linear weights.
+
+        The returned ``expected`` dict has the *global* values for
+        verification: a 1D ground truth for the replicated tensor and a
+        ``(2*tp_size, 4)`` matrix whose tp-rank slice each rank should
+        end up holding after the load.
+        """
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+        replicated = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        rmsnorm = ShardedTensor.from_rank_offsets(
+            'rmsnorm.weight', replicated.clone(), replica_id=(0, tp_rank, dp_cp_rank)
+        )
+
+        full = torch.arange(8 * tp_size, dtype=torch.float32).reshape(2 * tp_size, 4)
+        local = full[2 * tp_rank : 2 * (tp_rank + 1)].clone()
+        linear = ShardedTensor.from_rank_offsets(
+            'linear.weight', local, (0, tp_rank, tp_size), replica_id=(0, 0, dp_cp_rank)
+        )
+        sd = {'rmsnorm.weight': rmsnorm, 'linear.weight': linear}
+        expected = {'rmsnorm.weight': replicated, 'linear.weight': full}
+        return sd, expected
+
+    @pytest.mark.parametrize("group_kind", ["dp", "ep_dp"])
+    @pytest.mark.parametrize(
+        "save_replicate, load_replicate",
+        [(False, False), (True, False), (False, True), (True, True)],
+    )
+    def test_compatibility_matrix(
+        self, tmp_path_dist_ckpt, group_kind, save_replicate, load_replicate
+    ):
+        """Run save and load over each cell of the compat matrix on each group.
+
+        The flow is intentionally minimal so any value mismatch is
+        easy to attribute: build the state dict, save with the FP wrapper
+        configured per the cell, build a *fresh* state dict with zeroed
+        local data, load through the FP wrapper, then assert each tensor
+        equals the per-rank slice of the ground-truth.
+
+        We rebuild the load-side state dict from scratch (rather than
+        reusing the saved one) so we don't accidentally validate the
+        pre-load values still in memory.
+        """
+        if group_kind == "ep_dp":
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=2,
+                pipeline_model_parallel_size=1,
+                expert_model_parallel_size=2,
+            )
+            parallelization_group = parallel_state.get_expert_data_parallel_group()
+        else:
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+            )
+            parallelization_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True
+            )
+
+        save_state_dict, expected = self._make_state_dict()
+        with TempNamedDir(tmp_path_dist_ckpt / 'local_replica_compat_matrix') as ckpt_dir:
+            save_strategy = FullyParallelSaveStrategyWrapper(
+                TorchDistSaveShardedStrategy(),
+                parallelization_group,
+                replicate_local_replicas=save_replicate,
+            )
+            save_strategy.save(save_state_dict, ckpt_dir)
+
+            # Fresh state dict for the load: zeroed local data so we
+            # detect any silently-skipped fill-in.
+            load_state_dict, _ = self._make_state_dict()
+            for sh in load_state_dict.values():
+                sh.data = torch.zeros_like(sh.data)
+
+            load_strategy = FullyParallelLoadStrategyWrapper(
+                TorchDistLoadShardedStrategy(replicate_local_replicas=load_replicate),
+                parallelization_group,
+            )
+            loaded = load_strategy.load(load_state_dict, ckpt_dir)
+
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        expected_local_linear = expected['linear.weight'][2 * tp_rank : 2 * (tp_rank + 1)]
+
+        # The replicated tensor should round-trip bit-exactly on every
+        # rank, regardless of which combination of knobs we used. This
+        # is the load-correctness guarantee the design-doc claims.
+        assert torch.equal(loaded['rmsnorm.weight'], expected['rmsnorm.weight']), (
+            Utils.rank,
+            group_kind,
+            save_replicate,
+            load_replicate,
+            loaded['rmsnorm.weight'],
+            expected['rmsnorm.weight'],
+        )
+        assert torch.equal(loaded['linear.weight'], expected_local_linear), (
+            Utils.rank,
+            group_kind,
+            save_replicate,
+            load_replicate,
+            loaded['linear.weight'],
+            expected_local_linear,
+        )
+
+    def test_save_off_no_shadow_keys_in_metadata(self, tmp_path_dist_ckpt):
+        """``replicate_local_replicas=False`` must leave the metadata
+        bit-identical to today's layout — no shadow keys on disk.
+
+        Why this matters: it's the "legacy invariant" half of the compat
+        matrix. If a future refactor accidentally leaks a shadow rename
+        when the knob is off, every checkpoint-consuming tool downstream
+        that walks ``state_dict_metadata`` will see unexpected keys.
+        """
+        import pickle
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+        )
+        parallelization_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+        state_dict, _ = self._make_state_dict()
+        with TempNamedDir(tmp_path_dist_ckpt / 'local_replica_off_metadata') as ckpt_dir:
+            save_strategy = FullyParallelSaveStrategyWrapper(
+                TorchDistSaveShardedStrategy(),
+                parallelization_group,
+                replicate_local_replicas=False,
+            )
+            save_strategy.save(state_dict, ckpt_dir)
+
+            torch.distributed.barrier()
+            if Utils.rank == 0:
+                with (ckpt_dir / '.metadata').open('rb') as f:
+                    md = pickle.load(f)
+                shadow_keys = [k for k in md.state_dict_metadata if k.startswith('__shadow_')]
+                assert not shadow_keys, shadow_keys
+            torch.distributed.barrier()
+
+    def test_save_on_produces_shadow_keys_in_metadata(self, tmp_path_dist_ckpt):
+        """When the save knob is on AND the topology actually cross-reads,
+        at least one ``__shadow_*`` entry must appear in the metadata.
+
+        The fixture (TP=2, dp_cp_size=4 with replicated tensor whose only
+        global main is on the (0, 0, 0) rank) is exactly the cross-read
+        topology described in design-doc §3.0, so the filter must
+        produce at least one shadow.
+        """
+        import pickle
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+        )
+        parallelization_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+        state_dict, _ = self._make_state_dict()
+        with TempNamedDir(tmp_path_dist_ckpt / 'local_replica_on_metadata') as ckpt_dir:
+            save_strategy = FullyParallelSaveStrategyWrapper(
+                TorchDistSaveShardedStrategy(), parallelization_group, replicate_local_replicas=True
+            )
+            save_strategy.save(state_dict, ckpt_dir)
+
+            torch.distributed.barrier()
+            if Utils.rank == 0:
+                with (ckpt_dir / '.metadata').open('rb') as f:
+                    md = pickle.load(f)
+                shadow_keys = [k for k in md.state_dict_metadata if k.startswith('__shadow_')]
+                # The replicated rmsnorm.weight has a save-main-less
+                # dp_cp group (tp_rank=1) — its load picker should be
+                # promoted to a shadow saver.
+                assert any('rmsnorm.weight' in k for k in shadow_keys), shadow_keys
+            torch.distributed.barrier()

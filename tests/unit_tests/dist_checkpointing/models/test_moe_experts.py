@@ -113,25 +113,37 @@ class TestExpertLayerReconfiguration:
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
-        "use_fpsl,src_tp_pp_ep_etp,dest_tp_pp_ep_etp,use_glu",
+        "use_fpsl,src_tp_pp_ep_etp,dest_tp_pp_ep_etp,use_glu,replicate_local_replicas,parallelization_group_kind",
         [
             # changing PP is impossible because the number of layers must be the same
-            (False, (2, 4, 1, 2), (2, 4, 1, 2), False),
-            (True, (2, 4, 1, 2), (2, 4, 1, 2), False),
-            (False, (2, 4, 1, 2), (1, 4, 1, 2), False),
-            (True, (2, 1, 1, 2), (1, 1, 1, 2), False),
-            (False, (1, 1, 1, 1), (1, 1, 1, 1), False),
-            (True, (1, 1, 1, 1), (1, 1, 4, 1), False),
-            (False, (1, 1, 8, 1), (1, 1, 2, 1), False),
-            (False, (2, 2, 2, 2), (4, 2, 1, 4), False),
-            (True, (1, 1, 4, 1), (8, 1, 1, 1), False),
-            (False, (1, 8, 1, 1), (1, 8, 1, 1), False),
-            (False, (1, 1, 4, 1), (2, 1, 1, 2), False),
-            (False, (2, 1, 4, 1), (2, 1, 1, 4), False),
-            (False, (1, 1, 1, 1), (1, 1, 1, 1), True),
-            (False, (1, 1, 1, 1), (1, 1, 4, 1), True),
-            (True, (1, 1, 1, 1), (2, 1, 1, 1), True),
-            (False, (1, 1, 4, 1), (8, 1, 1, 8), True),
+            (False, (2, 4, 1, 2), (2, 4, 1, 2), False, False, "dp"),
+            (True, (2, 4, 1, 2), (2, 4, 1, 2), False, False, "dp"),
+            (False, (2, 4, 1, 2), (1, 4, 1, 2), False, False, "dp"),
+            (True, (2, 1, 1, 2), (1, 1, 1, 2), False, False, "dp"),
+            (False, (1, 1, 1, 1), (1, 1, 1, 1), False, False, "dp"),
+            (True, (1, 1, 1, 1), (1, 1, 4, 1), False, False, "dp"),
+            (False, (1, 1, 8, 1), (1, 1, 2, 1), False, False, "dp"),
+            (False, (2, 2, 2, 2), (4, 2, 1, 4), False, False, "dp"),
+            (True, (1, 1, 4, 1), (8, 1, 1, 1), False, False, "dp"),
+            (False, (1, 8, 1, 1), (1, 8, 1, 1), False, False, "dp"),
+            (False, (1, 1, 4, 1), (2, 1, 1, 2), False, False, "dp"),
+            (False, (2, 1, 4, 1), (2, 1, 1, 4), False, False, "dp"),
+            (False, (1, 1, 1, 1), (1, 1, 1, 1), True, False, "dp"),
+            (False, (1, 1, 1, 1), (1, 1, 4, 1), True, False, "dp"),
+            (True, (1, 1, 1, 1), (2, 1, 1, 1), True, False, "dp"),
+            (False, (1, 1, 4, 1), (8, 1, 1, 8), True, False, "dp"),
+            # ----- replicate_local_replicas coverage -----
+            # The two values mirror the public knob
+            # ``ckpt_fully_parallel_save_process_group: Literal["dp",
+            # "ep_dp"]``: ``"dp"`` covers Megatron's RMSNorm/router-style
+            # replicas (the dp+cp combined group internally), while
+            # ``"ep_dp"`` is the production-realistic group for the MoE
+            # checkpointing hot path. Both must round-trip correctly.
+            # Configs are kept tiny (TP=2, EP=2) so we hit the
+            # save-main-less-group cross-read pattern that the feature
+            # is designed to neutralize.
+            (True, (2, 1, 2, 2), (2, 1, 2, 2), False, True, "dp"),
+            (True, (2, 1, 2, 2), (2, 1, 2, 2), False, True, "ep_dp"),
         ],
     )
     @pytest.mark.parametrize("expert_type", expert_type)
@@ -156,8 +168,24 @@ class TestExpertLayerReconfiguration:
         load_order,
         store_order,
         singleton_local_shards,
+        replicate_local_replicas,
+        parallelization_group_kind,
     ):
-        """Test model saving and loading with different TP/PP/EP/ETP(expert-tensor-parallel)"""
+        """Test model saving and loading with different TP/PP/EP/ETP(expert-tensor-parallel).
+
+        Two extra dimensions on top of the historical sweep:
+
+        * ``replicate_local_replicas`` toggles the local-replica save +
+          load path. Off keeps today's behaviour; on writes and reads
+          shadow keys.
+        * ``parallelization_group_kind`` selects which process group
+          drives save/load distribution. The two production-meaningful
+          options match the public knob (``"dp"`` or ``"ep_dp"``):
+          ``"dp"`` covers all replicated-on-DP parameters and ``"ep_dp"``
+          is the production hot path for MoE checkpoints. For
+          ``replicate_local_replicas=False`` we keep the historical
+          ``"dp"`` choice for backwards-compat with the existing sweep.
+        """
         src_tp, src_pp, src_ep, src_etp = src_tp_pp_ep_etp
         dest_tp, dest_pp, dest_ep, dest_etp = dest_tp_pp_ep_etp
         metadata = {'singleton_local_shards': singleton_local_shards}
@@ -169,6 +197,18 @@ class TestExpertLayerReconfiguration:
             expert_tensor_parallel_size=src_etp,
             order=store_order,
         )
+
+        def _get_parallelization_group():
+            """Pick the FP wrapper's parallelization group from the test param.
+
+            Encapsulated as a closure because the test reinitialises
+            ``parallel_state`` between save and load — the same kind
+            string must look up the *current* group on each side.
+            """
+            if parallelization_group_kind == "ep_dp":
+                return parallel_state.get_expert_data_parallel_group()
+            return parallel_state.get_data_parallel_group(with_context_parallel=True)
+
         with (
             TempNamedDir(
                 tmp_path_dist_ckpt / 'test_expert_layer_reconfiguration_model_A'
@@ -185,8 +225,9 @@ class TestExpertLayerReconfiguration:
             if use_fpsl:
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    _get_parallelization_group(),
                     True,
+                    replicate_local_replicas=replicate_local_replicas,
                 )
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
@@ -205,10 +246,11 @@ class TestExpertLayerReconfiguration:
             )
             model_B = initialize_expert_layer(1, use_glu, expert_type)
             if use_fpsl:
-                load_strategy = TorchDistLoadShardedStrategy()
+                load_strategy = TorchDistLoadShardedStrategy(
+                    replicate_local_replicas=replicate_local_replicas
+                )
                 load_strategy = FullyParallelLoadStrategyWrapper(
-                    load_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    load_strategy, _get_parallelization_group()
                 )
             else:
                 load_strategy = None
