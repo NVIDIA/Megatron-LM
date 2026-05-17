@@ -280,6 +280,26 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     return (0, pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
+def _module_has_trainable_parameters(module) -> bool:
+    """Return whether this rank owns any trainable parameters for a module."""
+    return module is not None and any(param.requires_grad for param in module.parameters())
+
+
+def _module_has_any_trainable_parameters(module, pg_collection: ProcessGroupCollection) -> bool:
+    """Return whether any rank in the module optimizer group has trainable parameters."""
+    local_has_params = torch.tensor(
+        [int(_module_has_trainable_parameters(module))],
+        device=torch.cuda.current_device(),
+        dtype=torch.int,
+    )
+    torch.distributed.all_reduce(
+        local_has_params,
+        op=torch.distributed.ReduceOp.MAX,
+        group=pg_collection.intra_dist_opt,
+    )
+    return bool(local_has_params.item())
+
+
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
 
@@ -354,7 +374,10 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
             else:
                 module = mimo_model.modality_submodules[module_name]
 
-            if module is not None:
+            module_has_trainable_params = _module_has_any_trainable_parameters(
+                module, pg_collection
+            )
+            if module is not None and module_has_trainable_params:
                 assert (
                     not hasattr(module, 'ddp_config')
                     or module.ddp_config is None
