@@ -243,6 +243,11 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    rotary_base_per_layer: Optional[List[float]] = None
+    """Per-layer RoPE theta values. Length must equal num_layers. When set, each
+    SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
+    the shared model-level rotary_pos_emb is not created."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -2319,6 +2324,12 @@ class TransformerConfig(ModelParallelConfig):
                     f"Length of no_rope list ({len(self.no_rope_freq)}) must match "
                     f"the number of layers ({self.num_layers})"
                 )
+
+        if self.rotary_base_per_layer is not None:
+            assert len(self.rotary_base_per_layer) == self.num_layers, (
+                f"rotary_base_per_layer length ({len(self.rotary_base_per_layer)}) "
+                f"must equal num_layers ({self.num_layers})"
+            )
 
         if self.transformer_impl == "inference_optimized":
             assert self.normalization == "RMSNorm"
