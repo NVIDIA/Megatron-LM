@@ -169,6 +169,50 @@ class TestMultiTokenPredictionLayer:
         assert torch.equal(rolled_position_ids, expected_position_ids)
         assert torch.equal(rolled_padding_mask, expected_padding_mask)
 
+    def test_checkpointed_forward_with_packed_seq_params(self):
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        config.recompute_granularity = 'full'
+        config.recompute_method = 'uniform'
+        config.recompute_num_layers = 1
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+        mtp_layer = mtp.layers[0]
+        mtp_layer.train()
+
+        seq_len, batch_size = 8, 1
+        hidden_states = torch.randn(
+            seq_len, batch_size, config.hidden_size, device='cuda', requires_grad=True
+        )
+        decoder_input = torch.randn(
+            seq_len, batch_size, config.hidden_size, device='cuda', requires_grad=True
+        )
+        cu_seqlens = torch.tensor([0, 5, 8], dtype=torch.int32, device='cuda')
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=5,
+            max_seqlen_kv=5,
+            qkv_format='thd',
+        )
+
+        captured = {}
+
+        def fake_forward(hidden_states, decoder_input, packed_seq_params=None, **_):
+            captured['packed_seq_params'] = packed_seq_params
+            return hidden_states + decoder_input
+
+        output = mtp_layer._checkpointed_forward(
+            fake_forward,
+            hidden_states=hidden_states,
+            decoder_input=decoder_input,
+            packed_seq_params=packed_seq_params,
+        )
+        output.sum().backward()
+
+        assert captured['packed_seq_params'] is packed_seq_params
+        assert hidden_states.grad is not None
+        assert decoder_input.grad is not None
+
     def test_forward_propagates_rolled_padding_mask(self, monkeypatch):
         """Test forward passes rolled padding_mask to transformer path."""
         torch.manual_seed(_SEED)
@@ -568,14 +612,16 @@ class TestMultiTokenPrediction:
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
     )
+    @pytest.mark.parametrize("full_recompute", [False, True])
     @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1), (2, 2)])
-    def test_packed_sequences(self, tp, cp):
-        """Test MTP with packed sequences."""
+    def test_packed_sequences(self, tp, cp, full_recompute):
         # Create args with packed sequences support
         seq_lengths = [16, 24, 12]  # Three sequences of different lengths
         total_seq_length = sum(seq_lengths)
 
-        args = self.create_test_args(tp, cp, total_seq_length, micro_batch_size=1)
+        args = self.create_test_args(
+            tp, cp, total_seq_length, micro_batch_size=1, full_recompute=full_recompute
+        )
         set_args(args)
 
         torch.manual_seed(_SEED)
