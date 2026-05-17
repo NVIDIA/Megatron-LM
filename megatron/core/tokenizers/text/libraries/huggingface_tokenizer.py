@@ -226,9 +226,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         # not reliably populated after ``add_special_tokens`` on those
         # versions. Use the constructor-supplied list and convert via the
         # tokenizer's own ``convert_tokens_to_ids``.
-        tokens = self._additional_special_tokens or getattr(
-            self.tokenizer, "additional_special_tokens", None
-        ) or []
+        tokens = (
+            self._additional_special_tokens
+            or getattr(self.tokenizer, "additional_special_tokens", None)
+            or []
+        )
         if not tokens:
             return []
         return self.tokenizer.convert_tokens_to_ids(tokens)
