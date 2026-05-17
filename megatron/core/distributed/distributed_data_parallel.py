@@ -152,26 +152,57 @@ class DistributedDataParallel(_BaseDataParallel):
         # When a full_param_layout is provided, verify that the grouping is consistent
         # with the layout (same buffer keys, same params per key, same param_indices).
         if full_param_layout is not None:
-            assert set(buffer_groups.keys()) == set(full_param_layout.layouts.keys()), (
-                f"Buffer keys from param grouping {set(buffer_groups.keys())} do not match "
-                f"full_param_layout keys {set(full_param_layout.layouts.keys())}"
-            )
+            buffer_group_keys = set(buffer_groups.keys())
+            layout_keys = set(full_param_layout.layouts.keys())
+            if buffer_group_keys != layout_keys:
+                missing_in_layout = buffer_group_keys - layout_keys
+                extra_in_layout = layout_keys - buffer_group_keys
+                raise RuntimeError(
+                    f"DistributedDataParallel: Buffer key mismatch between param grouping and "
+                    f"full_param_layout. This usually occurs when using pre-computed layouts that "
+                    f"don't match the current model structure.\n"
+                    f"  Expected buffer keys (from model): {sorted(buffer_group_keys)}\n"
+                    f"  Got from layout: {sorted(layout_keys)}\n"
+                    f"  Missing in layout: {missing_in_layout}\n"
+                    f"  Extra in layout: {extra_in_layout}\n"
+                    f"Fix: Either pass matching full_param_layout or set full_param_layout=None "
+                    f"to auto-compute from current model."
+                )
             for buffer_key, (params, param_indices) in buffer_groups.items():
                 layout = full_param_layout.layouts[buffer_key]
-                assert set(params) == set(
-                    layout.param_index_map.keys()
-                ), f"Params for {buffer_key} do not match between grouping and layout"
-                assert (
-                    param_indices == layout.param_indices
-                ), f"param_indices for {buffer_key} do not match between grouping and layout"
+                layout_params = set(layout.param_index_map.keys())
+                group_params = set(params)
+                if group_params != layout_params:
+                    raise RuntimeError(
+                        f"DistributedDataParallel: Parameter mismatch for buffer '{buffer_key}'. "
+                        f"The parameters in the layout don't match the current model parameters.\n"
+                        f"  Expected parameters: {len(group_params)} params\n"
+                        f"  Got in layout: {len(layout_params)} params\n"
+                        f"Fix: Recompute full_param_layout using "
+                        f"DistributedOptimizer.compute_full_param_layout() with current model."
+                    )
+                if param_indices != layout.param_indices:
+                    raise RuntimeError(
+                        f"DistributedDataParallel: Parameter indices mismatch for buffer "
+                        f"'{buffer_key}'. The parameter ordering in the layout doesn't match "
+                        f"the current model ordering. This can happen if model structure changed "
+                        f"between checkpoint creation and loading.\n"
+                        f"  Expected param indices: {param_indices}\n"
+                        f"  Got in layout: {layout.param_indices}\n"
+                        f"Fix: Ensure model structure is identical to when layout was computed."
+                    )
 
         self.full_param_layout = full_param_layout
 
         # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
-            assert (
-                not self.ddp_config.average_in_collective
-            ), "Cannot average in collective when calculating per-token loss!"
+            if self.ddp_config.average_in_collective:
+                raise ValueError(
+                    "DistributedDataParallel: Cannot use average_in_collective=True with "
+                    "calculate_per_token_loss=True. Per-token loss calculation requires "
+                    "precise gradient scaling, which is incompatible with averaging in collective "
+                    "operations. Set average_in_collective=False when using per-token loss."
+                )
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
         else:
