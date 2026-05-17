@@ -41,6 +41,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
+    get_model_and_context_parallel_rng_tracker_name,
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
@@ -1360,6 +1361,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
     cp_stream: torch.cuda.Stream = None
 
+    @staticmethod
+    def _get_model_and_context_parallel_dropout_ctx():
+        """Return a dropout context bound to the TPxCP RNG tracker."""
+        return get_cuda_rng_tracker().fork(get_model_and_context_parallel_rng_tracker_name())
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1545,6 +1551,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             layer_number=layer_number,
             **extra_kwargs,
         )
+        if not self.config.sequence_parallel and get_cuda_rng_tracker().is_initialized():
+            attention_dropout_ctx = self._get_model_and_context_parallel_dropout_ctx
+            self.flash_attention.attention_dropout_ctx = attention_dropout_ctx
+            self.fused_attention.attention_dropout_ctx = attention_dropout_ctx
+            self.unfused_attention.attention_dropout_ctx = attention_dropout_ctx
 
     def forward(
         self,

@@ -590,7 +590,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
         if self.config.sequence_parallel:
-            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork(
+                tensor_parallel.get_model_and_context_parallel_rng_tracker_name()
+            )
+        elif self.config.context_parallel_size > 1:
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork(
+                tensor_parallel.get_context_parallel_rng_tracker_name()
+            )
         else:
             rng_context = nullcontext()
 

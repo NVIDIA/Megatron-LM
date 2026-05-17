@@ -613,4 +613,16 @@ def _load_rng_state_dict(rng_state_dict):
     np.random.set_state(rng_state_dict['np_rng_state'])
     torch.set_rng_state(rng_state_dict['torch_rng_state'])
     torch.cuda.set_rng_state(rng_state_dict['cuda_rng_state'])
-    tensor_parallel.get_cuda_rng_tracker().set_states(rng_state_dict['rng_tracker_states'])
+    converted_cuda_rng_state = tensor_parallel.convert_cuda_rng_state(
+        rng_state_dict['cuda_rng_state'],
+        to_graphable=tensor_parallel.is_graph_safe_cuda_rng_tracker(
+            tensor_parallel.get_cuda_rng_tracker()
+        ),
+    )
+    rng_tracker_states = tensor_parallel.ensure_context_parallel_rng_tracker_states(
+        rng_state_dict['rng_tracker_states'], fallback_state=converted_cuda_rng_state
+    )
+    rng_tracker_states = tensor_parallel.ensure_model_and_context_parallel_rng_tracker_states(
+        rng_tracker_states
+    )
+    tensor_parallel.get_cuda_rng_tracker().set_states(rng_tracker_states)

@@ -18,9 +18,13 @@ from torch.utils.cpp_extension import load_inline
 from typing_extensions import TypeVarTuple, Unpack
 
 from megatron.core.parallel_state import (
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
     get_expert_model_parallel_rank,
     get_expert_tensor_parallel_rank,
+    get_tensor_and_context_parallel_rank,
     get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
@@ -89,6 +93,8 @@ except ModuleNotFoundError:
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
+_CONTEXT_PARALLEL_RNG_TRACKER_NAME = 'context-parallel-rng'
+_MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME = 'model-and-context-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 
@@ -201,6 +207,35 @@ def convert_cuda_rng_state(
             raise ValueError(f"Invalid state type: {type(state)}")
 
 
+def clone_cuda_rng_state(
+    state: Union[torch.Tensor, torch.Generator],
+) -> Union[torch.Tensor, torch.Generator]:
+    """Clone a CUDA RNG state tensor or graph-safe generator."""
+    if isinstance(state, torch.Tensor):
+        return state.clone()
+    if isinstance(state, torch.Generator):
+        return state.clone_state()
+    raise ValueError(f"Invalid state type: {type(state)}")
+
+
+def get_model_parallel_rng_tracker_name():
+    """Get the model parallel rng tracker name."""
+    global _MODEL_PARALLEL_RNG_TRACKER_NAME
+    return _MODEL_PARALLEL_RNG_TRACKER_NAME
+
+
+def get_context_parallel_rng_tracker_name():
+    """Get the context-parallel rng tracker name."""
+    global _CONTEXT_PARALLEL_RNG_TRACKER_NAME
+    return _CONTEXT_PARALLEL_RNG_TRACKER_NAME
+
+
+def get_model_and_context_parallel_rng_tracker_name():
+    """Get the tensor+context parallel rng tracker name."""
+    global _MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME
+    return _MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME
+
+
 def get_expert_parallel_rng_tracker_name():
     """Get the expert parallel rng tracker name"""
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
@@ -211,6 +246,57 @@ def get_data_parallel_rng_tracker_name():
     """Get the data parallel rng tracker name"""
     global _DATA_PARALLEL_RNG_TRACKER_NAME
     return _DATA_PARALLEL_RNG_TRACKER_NAME
+
+
+def ensure_context_parallel_rng_tracker_states(
+    states: dict[str, Union[torch.Tensor, torch.Generator]],
+    fallback_state: Optional[Union[torch.Tensor, torch.Generator]] = None,
+) -> dict[str, Union[torch.Tensor, torch.Generator]]:
+    """Backfill the CP-only RNG tracker state when it is missing."""
+    if _CONTEXT_PARALLEL_RNG_TRACKER_NAME in states:
+        return states
+
+    source_state = fallback_state
+    if source_state is None:
+        source_state = states.get(_DATA_PARALLEL_RNG_TRACKER_NAME)
+    if source_state is None:
+        return states
+
+    states = dict(states)
+    states[_CONTEXT_PARALLEL_RNG_TRACKER_NAME] = clone_cuda_rng_state(source_state)
+    return states
+
+
+def ensure_model_and_context_parallel_rng_tracker_states(
+    states: dict[str, Union[torch.Tensor, torch.Generator]],
+) -> dict[str, Union[torch.Tensor, torch.Generator]]:
+    """Backfill the TPxCP RNG tracker state when loading older checkpoints."""
+    if (
+        _MODEL_PARALLEL_RNG_TRACKER_NAME in states
+        and _MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME not in states
+    ):
+        states = dict(states)
+        states[_MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME] = clone_cuda_rng_state(
+            states[_MODEL_PARALLEL_RNG_TRACKER_NAME]
+        )
+    return states
+
+
+def _initialize_rng_tracker_state(
+    tracker: "CudaRNGStatesTracker",
+    name: str,
+    seed: Optional[int],
+    clone_from_name: Optional[str] = None,
+) -> None:
+    """Initialize a tracker state from a seed or by cloning an existing state."""
+    if seed is not None:
+        tracker.add(name, seed)
+        return
+
+    assert clone_from_name is not None
+    states = tracker.get_states()
+    states[name] = clone_cuda_rng_state(states[clone_from_name])
+    tracker.set_states(states)
 
 
 class CudaRNGStatesTracker:
@@ -472,13 +558,41 @@ def model_parallel_cuda_manual_seed(
     initialize_rng_tracker(
         te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng, force_reset=force_reset_rng
     )
-    _CUDA_RNG_STATE_TRACKER.reset()
+    assert _CUDA_RNG_STATE_TRACKER is not None
+    rng_tracker = _CUDA_RNG_STATE_TRACKER
+    rng_tracker.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
-    _CUDA_RNG_STATE_TRACKER.add(_DATA_PARALLEL_RNG_TRACKER_NAME, data_parallel_seed)
+    rng_tracker.add(_DATA_PARALLEL_RNG_TRACKER_NAME, data_parallel_seed)
 
     # and model parallel state.
-    _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
+    rng_tracker.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
+
+    context_parallel_world_size = get_context_parallel_world_size()
+    context_parallel_seed = (
+        offset + 2048 + get_context_parallel_rank()
+        if context_parallel_world_size > 1
+        else None
+    )
+    _initialize_rng_tracker_state(
+        rng_tracker,
+        _CONTEXT_PARALLEL_RNG_TRACKER_NAME,
+        context_parallel_seed,
+        clone_from_name=_DATA_PARALLEL_RNG_TRACKER_NAME,
+    )
+
+    # TPxCP forward/dropout state.
+    tensor_and_context_parallel_seed = (
+        offset + get_tensor_model_parallel_world_size() + get_tensor_and_context_parallel_rank()
+        if context_parallel_world_size > 1
+        else None
+    )
+    _initialize_rng_tracker_state(
+        rng_tracker,
+        _MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME,
+        tensor_and_context_parallel_seed,
+        clone_from_name=_MODEL_PARALLEL_RNG_TRACKER_NAME,
+    )
 
     expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
