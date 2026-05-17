@@ -1,11 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import hashlib
 import itertools
 import json
 import random
 import time
 from argparse import ArgumentParser, Namespace
+from collections import defaultdict
 from functools import partial
 from typing import Any, List, Optional
 
@@ -324,3 +326,109 @@ def get_global_peak_memory_stats_bytes() -> dict:
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
         peak_alloc = int(t[0].item())
     return {"mem-max-allocated-bytes": peak_alloc}
+
+
+def escape_str(s: str) -> str:
+    return s.replace("\n", "\\n")
+
+
+def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -> None:
+    """Print unique prompts and their outputs in legacy gpt_dynamic_inference.py format.
+
+    Reads from the high-level API's ``DynamicInferenceRequest`` records returned
+    by ``MegatronLLM.generate`` / ``MegatronAsyncLLM.generate``.
+    """
+    print("~~~~ Unique prompts + outputs. ~~~~")
+
+    unique_prompt_map = defaultdict(list)
+    for idx, req in enumerate(results):
+        unique_prompt_map[req.prompt].append(idx)
+
+    for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
+        prompt_len = len(results[request_idxs[0]].prompt_tokens)
+        print(
+            f"\n{unique_idx+1}/{len(unique_prompt_map)}"
+            f"[n {len(request_idxs)}, l {prompt_len}] {escape_str(prompt_text)}"
+        )
+
+        output_map = defaultdict(list)
+        for idx in request_idxs:
+            output_map[results[idx].generated_text].append(idx)
+
+        for output_text, output_request_idxs in output_map.items():
+            evicted = any(
+                event.type.name == "EVICT"
+                for idx in output_request_idxs
+                for event in results[idx].events
+            )
+            if output_text is not None:
+                o_hash = hashlib.sha256((prompt_text + output_text).encode()).hexdigest()[:6]
+                o_len = len(results[output_request_idxs[0]].generated_tokens)
+                escaped_output_text = escape_str(output_text)
+            else:
+                o_hash = "--"
+                o_len = 0
+                escaped_output_text = "--"
+            print(
+                f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}"
+                f"{', <evicted>' if evicted else ''}] {escaped_output_text}"
+            )
+
+
+def dump_inference_results_to_json(
+    args: Namespace,
+    results: List["DynamicInferenceRequest"],
+    throughputs: List[float],
+    peak_mem_stats: dict,
+    step_count: int,
+    lifetime_prefill_token_count: int,
+) -> None:
+    """JSON dump of per-request results matching legacy gpt_dynamic_inference.py shape.
+
+    Reads from the high-level API's ``DynamicInferenceRequest`` records.
+    Note: ``latency`` is currently always ``None`` in direct mode because the
+    low-level engine doesn't populate it on ``DynamicInferenceRequest.merge()``;
+    will be populated once that field is wired up upstream.
+    """
+    if not args.output_path:
+        return
+
+    json_results = {}
+    for i, req in enumerate(results):
+        if i % args.output_every_n_results == 0 or i == len(results) - 1:
+            # cuda_graph_request_count_map is only populated by the legacy
+            # add_request/step_modern loop and is not surfaced through the
+            # high-level API; omitting it here.
+            result_dict = {
+                "input_prompt": req.prompt,
+                "generated_text": req.generated_text,
+                "generated_tokens": req.generated_tokens,
+                "latency": req.latency,
+                "ttft": req.ttft,
+                "step_count": step_count,
+                "top_n_logprobs": getattr(req, 'generated_top_n_logprobs', None),
+                "prompt_top_n_logprobs": getattr(req, 'prompt_top_n_logprobs', None),
+            }
+            if req.sampling_params.return_log_probs:
+                prompt_lp = getattr(req, 'prompt_log_probs', None)
+                generated_lp = getattr(req, 'generated_log_probs', None)
+                result_dict["prompt_logprobs"] = prompt_lp
+                result_dict["generated_logprobs"] = generated_lp
+                # Synthesize the legacy "logprobs" field as the concatenation,
+                # since DynamicInferenceRequest doesn't carry a single combined list.
+                if prompt_lp is not None or generated_lp is not None:
+                    result_dict["logprobs"] = (prompt_lp or []) + (generated_lp or [])
+                else:
+                    result_dict["logprobs"] = None
+            if args.output_request_events:
+                result_dict["events"] = [e.serialize() for e in req.events]
+            json_results[req.request_id] = result_dict
+
+    if args.record_throughput:
+        json_results["throughput"] = throughputs
+    json_results.update(peak_mem_stats)
+    json_results["lifetime_prefill_token_count"] = lifetime_prefill_token_count
+
+    print(f' Saving results to {args.output_path}')
+    with open(args.output_path, "w") as fp:
+        json.dump(json_results, fp, indent=1)
