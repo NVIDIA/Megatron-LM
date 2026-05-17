@@ -3025,9 +3025,17 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=args.cuda_graph_use_single_mempool,
+        )
     if args.optimizer_cuda_graph:
-        optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        optimizer.step = OptimizerCudaGraphWrapper(
+            optimizer.step,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=args.cuda_graph_use_single_mempool,
+        )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3549,7 +3557,11 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=args.cuda_graph_use_single_mempool,
+        )
 
     if has_nvidia_modelopt:
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
