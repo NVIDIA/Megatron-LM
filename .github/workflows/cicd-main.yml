@@ -1134,23 +1134,3 @@ jobs:
               issue_number: prNumber,
               body: `🔄 Merge queue validation started!\n\nYou can track the progress here: ${runUrl}`
             });
-
-  cleanup-taint-node:
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-    needs:
-      - is-not-external-contributor
-      - cicd-container-build
-      - cicd-unit-tests-latest
-      - cicd-integration-tests-latest-h100
-      - cicd-integration-tests-latest-gb200
-      - Coverage
-      - Coverage_Fake
-    if: |
-      always()
-      && !cancelled()
-      && contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
-      && !needs.pre-flight.outputs.is_deployment_workflow == 'true'
-    steps:
-      - name: Taint node for cleanup
-        shell: bash
-        run: taint-node.sh
