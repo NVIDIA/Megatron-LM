@@ -77,7 +77,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
     if args.engine_type == "static":
         tokenizer = get_tokenizer()
         context = StaticInferenceContext(
-            args.inference_max_requests, args.inference_max_sequence_length
+            args.inference_max_requests, args.inference_max_seq_length
         )
         inference_wrapped_model = GPTInferenceWrapper(model, context)
         inference_wrapped_model.model_is_pipeline_parallel = not (
