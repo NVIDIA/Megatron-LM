@@ -33,6 +33,15 @@ import re
 import pytest
 import torch
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
+    get_mcore_tensor_parallel_partition_dim,
+    is_mcore_tensor_model_parallel,
+    is_mcore_tensor_parallel_duplicated,
+)
+from megatron.core.tensor_parallel.layers import (
+    copy_tensor_model_parallel_attributes,
+    set_tensor_model_parallel_attributes,
+)
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     flatten_state_dict,
     get_expert_index_from_key,
@@ -513,6 +522,35 @@ class TestGDNKeyMatching:
         # TP=2 should halve the split sizes
         assert r1[0][0] == 64 and r2[0][0] == 32
         assert r1[0][2] == 128 and r2[0][2] == 64
+
+
+class TestGDNFSDPTensorParallelMetadata:
+    """Regression coverage for GDN conv1d FSDP checkpoint splitting.
+
+    GDN conv1d parameters are manually annotated with the legacy Megatron
+    tensor-parallel attrs.  The GDN FSDP splitter copies those attrs to meta
+    tensors before calling make_fsdp_dtensor, so the FSDP utility must still
+    recognize them as tensor-parallel.
+    """
+
+    def test_legacy_tp_attrs_are_recognized_after_copy(self):
+        source = torch.nn.Parameter(torch.empty(8, 1, 4))
+        set_tensor_model_parallel_attributes(source, True, 0, 1)
+
+        meta = torch.empty(4, 1, 4, device="meta")
+        copy_tensor_model_parallel_attributes(meta, source)
+
+        assert get_mcore_tensor_parallel_partition_dim(meta) == 0
+        assert is_mcore_tensor_model_parallel(meta)
+        assert not is_mcore_tensor_parallel_duplicated(meta)
+
+    def test_replicated_legacy_attrs_are_not_tp_sharded(self):
+        source = torch.nn.Parameter(torch.empty(8))
+        set_tensor_model_parallel_attributes(source, False, -1, 1)
+
+        assert get_mcore_tensor_parallel_partition_dim(source) is None
+        assert not is_mcore_tensor_model_parallel(source)
+        assert is_mcore_tensor_parallel_duplicated(source)
 
 
 # ============================================================================

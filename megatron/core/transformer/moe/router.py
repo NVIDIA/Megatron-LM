@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -917,7 +918,7 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
-        if self.training:
-            return super().forward(input, padding_mask, input_ids)
+        if not InferenceMode.is_active():
+            return super().forward(input, padding_mask)
 
         return self._forward(input, padding_mask)

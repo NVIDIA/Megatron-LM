@@ -4,7 +4,6 @@ import gc
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -89,7 +88,6 @@ class TestFSDP1F1BOverlap:
         shared_expert_intermediate_size=None,
         recompute_modules=None,
         offload_modules=None,
-        **kwargs,
     ):
         """Verify multi-step FSDP training with overlap produces identical
         per-step loss and final weights as standard FSDP training.
@@ -100,7 +98,6 @@ class TestFSDP1F1BOverlap:
         """
         num_layers = 2
         extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
-        extra_kwargs.update(kwargs)
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
         if fp8_flag is not None:

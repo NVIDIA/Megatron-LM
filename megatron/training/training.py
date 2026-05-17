@@ -53,6 +53,7 @@ from typing import Any, Dict, Optional
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 
 from .log_handler import CustomHandler
@@ -129,7 +130,7 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -155,6 +156,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import (
     StragglerDetector,
@@ -180,7 +182,7 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
-from megatron.core.datasets.data_schedule import wrap_data_iterator
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -564,68 +566,42 @@ def num_floating_point_operations(args, batch_size):
             https://arxiv.org/abs/2305.10403
             https://arxiv.org/abs/2205.05198
             '''
-            if args.experimental_attention_variant == "dsv4_hybrid":
-                ## DSv4 hybrid MLA projections (per layer, per token).
-                ## In dsv4_hybrid mode, qk_head_dim + qk_pos_emb_head_dim == v_head_dim
-                ## (qk_head_dim is derived as v_head_dim - qk_pos_emb_head_dim), and the
-                ## joint KV is produced by a single hidden -> v_head_dim projection.
-                ## Full core attention is replaced by sparse attention and is accounted
-                ## for in the dsv4_hybrid branch below.
+            ## MLA
+            if args.q_lora_rank is None:
+                q_term = (
+                    args.hidden_size
+                    * args.num_attention_heads
+                    * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                )
+            else:
                 q_term = args.q_lora_rank * (
                     args.hidden_size
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
-                    + 1  # q norm
+                    + 1
                 )
-                kv_term = args.hidden_size * args.v_head_dim + args.v_head_dim  # kv proj + kv norm
-                ## Grouped low-rank output projection:
-                ##  wo_a:        (n_head * v_head_dim) -> (o_groups * o_lora_rank)
-                ##  linear_proj: (o_groups * o_lora_rank) -> hidden
-                o_term = (
-                    args.num_attention_heads * args.v_head_dim * args.o_lora_rank
-                    + args.o_groups * args.o_lora_rank * args.hidden_size
-                )
-                standard_self_attn_term = (
-                    forward_backward_expansion_factor
-                    * fma_expansion_factor
-                    * (q_term + kv_term + o_term)
-                )
-            else:
-                ## MLA
-                if args.q_lora_rank is None:
-                    q_term = (
+            standard_self_attn_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * (
+                    ## q lora + rope + q norm
+                    q_term
+                    ## kv lora + rope + kv norm
+                    + args.kv_lora_rank
+                    * (
                         args.hidden_size
-                        * args.num_attention_heads
-                        * (args.qk_head_dim + args.qk_pos_emb_head_dim)
-                    )
-                else:
-                    q_term = args.q_lora_rank * (
-                        args.hidden_size
-                        + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                        + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
                         + 1
                     )
-                standard_self_attn_term = (
-                    forward_backward_expansion_factor
-                    * fma_expansion_factor
-                    * (
-                        ## q lora + rope + q norm
-                        q_term
-                        ## kv lora + rope + kv norm
-                        + args.kv_lora_rank
-                        * (
-                            args.hidden_size
-                            + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
-                            + 1
-                        )
-                        + args.hidden_size * args.qk_pos_emb_head_dim
-                        ## o proj
-                        + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
-                        ## core attn
-                        + args.seq_length
-                        * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                        / 2  # causal mask (only half of the mask is non-zero)
-                        + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
-                    )
+                    + args.hidden_size * args.qk_pos_emb_head_dim
+                    ## o proj
+                    + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                    ## core attn
+                    + args.seq_length
+                    * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
+                    / 2  # causal mask (only half of the mask is non-zero)
+                    + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
                 )
+            )
 
         else:
             ## MHA or GQA
@@ -655,7 +631,6 @@ def num_floating_point_operations(args, batch_size):
                 )
             )
 
-        dsv4_hybrid_extra_term = 0
         if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
@@ -713,91 +688,6 @@ def num_floating_point_operations(args, batch_size):
                     "Invalid experimental_attention_variant: "
                     f"{args.experimental_attention_variant}"
                 )
-        elif args.experimental_attention_variant == "dsv4_hybrid":
-            # DSv4 hybrid: full core attention is replaced by sparse attention (CSA),
-            # and selected layers additionally run a learned indexer (DSA).
-            # The MLA-style projection cost per layer is captured in
-            # ``standard_self_attn_term`` above; here we add the extra per-layer FLOPs
-            # for sparse attention, the main compressor, and the indexer.
-            num_linear_attention_layers = 0
-            linear_self_attn_term = 0
-            num_standard_attention_layers = num_layers
-
-            compress_ratios = args.csa_compress_ratios
-            assert compress_ratios is not None, (
-                "csa_compress_ratios must be set for dsv4_hybrid"
-            )
-            assert len(compress_ratios) == num_layers, (
-                f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
-                f"expected num_layers + mtp_num_layers ({num_layers})."
-            )
-            # ratio == 0: window-only (no compressor, no indexer)
-            # ratio == 4: window + learned-topk over compressed KV (compressor + indexer)
-            # ratio == 128: window + all compressed KV (compressor only)
-            n_layers_r0 = sum(1 for r in compress_ratios if r == 0)
-            n_layers_r4 = sum(1 for r in compress_ratios if r == 4)
-            n_layers_r128 = sum(1 for r in compress_ratios if r == 128)
-
-            n_head = args.num_attention_heads
-            v_head_dim = args.v_head_dim
-            window = args.csa_window_size
-            seq_len = args.seq_length
-
-            # ---- Sparse attention (replaces full core attention) ----
-            # Per token per layer: n_head * (positions_attended) * v_head_dim, ×2 for
-            # QK^T and softmax @ V. Average valid positions account for the causal mask.
-            sparse_attn_r0 = n_layers_r0 * n_head * window * v_head_dim * 2
-            avg_comp_128 = (seq_len // 128) / 2
-            sparse_attn_r128 = n_layers_r128 * n_head * (window + avg_comp_128) * v_head_dim * 2
-
-            # ---- Main compressor (ratio > 0 layers) ----
-            # Two projections per layer (wkv + wgate): hidden -> coff * v_head_dim.
-            #   ratio == 4:   coff = 2 (overlapping windows)
-            #   ratio == 128: coff = 1 (non-overlapping)
-            main_compressor_term = (
-                n_layers_r4 * args.hidden_size * (2 * v_head_dim) * 2
-                + n_layers_r128 * args.hidden_size * (1 * v_head_dim) * 2
-            )
-
-            # ---- r=4 layers: sparse attention + indexer ----
-            # Indexer parameters are only required when at least one ratio==4 layer exists.
-            if n_layers_r4 > 0:
-                assert args.dsa_indexer_n_heads is not None, (
-                    "dsa_indexer_n_heads must be set for dsv4_hybrid with ratio==4 layers."
-                )
-                assert args.dsa_indexer_head_dim is not None, (
-                    "dsa_indexer_head_dim must be set for dsv4_hybrid with ratio==4 layers."
-                )
-                assert args.dsa_indexer_topk is not None, (
-                    "dsa_indexer_topk must be set for dsv4_hybrid with ratio==4 layers."
-                )
-                idx_n_heads = args.dsa_indexer_n_heads
-                idx_head_dim = args.dsa_indexer_head_dim
-                idx_topk = args.dsa_indexer_topk
-
-                effective_topk_4 = min(idx_topk, seq_len // 4)
-                avg_comp_4 = effective_topk_4 * (1 - effective_topk_4 * 4 / (2 * seq_len))
-                sparse_attn_r4 = n_layers_r4 * n_head * (window + avg_comp_4) * v_head_dim * 2
-
-                # Indexer's own compressor (coff=2, wkv + wgate), Q proj, weights proj,
-                # and scoring each query against the seq_len // 4 compressed positions.
-                indexer_term = (
-                    n_layers_r4 * args.hidden_size * (2 * idx_head_dim) * 2
-                    + n_layers_r4 * args.q_lora_rank * idx_n_heads * idx_head_dim
-                    + n_layers_r4 * args.hidden_size * idx_n_heads
-                    + n_layers_r4 * idx_n_heads * idx_head_dim * (seq_len // 4)
-                )
-            else:
-                sparse_attn_r4 = 0
-                indexer_term = 0
-
-            sparse_attn_term = sparse_attn_r0 + sparse_attn_r4 + sparse_attn_r128
-
-            dsv4_hybrid_extra_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (sparse_attn_term + main_compressor_term + indexer_term)
-            )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -806,7 +696,6 @@ def num_floating_point_operations(args, batch_size):
         self_attn_term = (
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers
-            + dsv4_hybrid_extra_term
         )
 
         total_floating_point_operations = (
@@ -1547,6 +1436,112 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def wrap_model_chunks_with_ddp(
+    model_chunks,
+    config,
+    ddp_config,
+    *,
+    use_layer_wise_distributed_optimizer=False,
+    use_layer_wise_param_layout=True,
+    DP=DDP,
+    pg_collection=None,
+    bucket_sizes=None,
+    disable_bucketing_per_chunk=None,
+):
+    """Wrap each model chunk in DDP, pre-computing per-chunk param layouts as needed.
+
+    Centralises the DDP-wrapping wiring shared between :func:`get_model` and
+    unit tests.
+
+    For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
+    forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
+    for reduce-scatter), and computes per-chunk shard-aligned layouts via
+    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
+    ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
+    to its legacy ``allgather_params`` sync path.
+
+    For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
+    computes per-chunk byte-level layouts via
+    :meth:`DistributedOptimizer.compute_full_param_layout`.
+
+    Otherwise: no layouts are computed.
+
+    Layouts are only computed when ``DP is DDP`` (i.e. the standard
+    ``DistributedDataParallel``); FSDP variants don't accept
+    ``full_param_layout``.
+
+    Args:
+        model_chunks: List of model chunks to wrap (un-DDP-wrapped).
+        config: :class:`TransformerConfig`.
+        ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
+            ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``.
+        use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+            controls whether to compute and supply a shard-aligned param layout
+            to DDP. ``False`` keeps LayerWise on its legacy sync path.
+        DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
+            variant).
+        pg_collection: Optional :class:`ProcessGroupCollection`. Forwarded to
+            FSDP-style DPs only.
+        bucket_sizes: Optional per-chunk bucket size override; defaults to
+            ``[ddp_config.bucket_size] * len(model_chunks)``.
+        disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
+            defaults to ``[False] * len(model_chunks)``.
+
+    Returns:
+        List of DDP-wrapped chunks.
+    """
+    n = len(model_chunks)
+    if bucket_sizes is None:
+        bucket_sizes = [ddp_config.bucket_size] * n
+    if disable_bucketing_per_chunk is None:
+        disable_bucketing_per_chunk = [False] * n
+
+    # Compute per-chunk layouts (DDP only).
+    per_chunk_layouts = [None] * n
+    if DP is DDP:
+        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
+            ddp_config.use_distributed_optimizer = True
+            compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+        elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
+            compute_layout = DistributedOptimizer.compute_full_param_layout
+        else:
+            compute_layout = None
+        if compute_layout is not None:
+            data_parallel_world_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+            expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+            for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
+                all_params = [p for p in chunk.parameters() if p.requires_grad]
+                per_chunk_layouts[i] = compute_layout(
+                    all_params,
+                    bucket_size,
+                    data_parallel_world_size,
+                    ddp_config,
+                    expert_data_parallel_world_size=expert_data_parallel_world_size,
+                )
+
+    # Wrap each chunk.
+    wrapped = []
+    for chunk, layout, disable_bucketing in zip(
+        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+    ):
+        chunk_kwargs = {}
+        if pg_collection is not None and DP is not DDP:
+            chunk_kwargs["pg_collection"] = pg_collection
+        if layout is not None:
+            chunk_kwargs["full_param_layout"] = layout
+        wrapped.append(
+            DP(
+                config=config,
+                ddp_config=ddp_config,
+                module=chunk,
+                disable_bucketing=disable_bucketing,
+                **chunk_kwargs,
+            )
+        )
+    return wrapped
+
+
 def get_model(
     model_provider_func,
     model_type=ModelType.encoder_or_decoder,
@@ -1696,24 +1691,10 @@ def get_model(
 
         config = get_model_config(model[0])
 
-        if getattr(args, "use_torch_fsdp2", False):
-            reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-            ddp_config = TorchFullyShardedDataParallelConfig(
-                reshard_after_forward=reshard_after_forward
-            )
-        else:
-            if args.ddp_num_buckets is not None:
-                assert (
-                    args.ddp_bucket_size is None
-                ), "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
-                assert args.ddp_num_buckets > 0, "--ddp-num-buckets must be greater than 0"
-                bucket_size = num_parameters // args.ddp_num_buckets
-            else:
-                bucket_size = args.ddp_bucket_size
-
-            # Initialize DDPConfig.
-            ddp_config = get_megatron_ddp_config(args)
-            ddp_config.bucket_size = bucket_size
+        ddp_config = get_megatron_ddp_config(args)
+        if not getattr(args, "use_torch_fsdp2", False):
+            if ddp_config.num_buckets is not None:
+                ddp_config.bucket_size = num_parameters // ddp_config.num_buckets
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             # If bucket_size is not provided as an input, use sane default.
@@ -1728,6 +1709,19 @@ def get_model(
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
 
+        # Compute per-chunk bucket sizes / disable_bucketing flags. Bucketing is
+        # disabled for non-first chunks, when overlap_param_gather_with_optimizer_step
+        # is on, or for non-zero pipeline-parallel ranks.
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        per_chunk_disable_bucketing = [
+            (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
+            for chunk_idx in range(len(model))
+        ]
+        per_chunk_bucket_sizes = [
+            None if (disable or pp_rank > 0) else ddp_config.bucket_size
+            for disable in per_chunk_disable_bucketing
+        ]
+
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
         ddp_stream = torch.cuda.Stream()
@@ -1735,48 +1729,19 @@ def get_model(
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
-            # Megatron-FSDP reads dtypes from ddp_config; pass pg_collection for AG/RS overlap.
-            dp_init_kwargs = {}
-            if args.use_megatron_fsdp:
-                dp_init_kwargs["pg_collection"] = pg_collection
-
-            wrapped_model = []
-            for model_chunk_idx, model_chunk in enumerate(model):
-                chunk_kwargs = dict(dp_init_kwargs)
-                disable_bucketing = (
-                    model_chunk_idx > 0
-                ) or args.overlap_param_gather_with_optimizer_step
-
-                # Pre-compute parameter layouts for the distributed optimizer.
-                # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if args.use_distributed_optimizer and DP is DDP:
-                    all_params = [p for p in model_chunk.parameters() if p.requires_grad]
-                    pp_rank = mpu.get_pipeline_model_parallel_rank()
-                    effective_bucket_size = (
-                        None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
-                    )
-                    chunk_kwargs["full_param_layout"] = (
-                        DistributedOptimizer.compute_full_param_layout(
-                            all_params,
-                            effective_bucket_size,
-                            mpu.get_data_parallel_world_size(with_context_parallel=True),
-                            ddp_config,
-                            expert_data_parallel_world_size=(
-                                mpu.get_expert_data_parallel_world_size()
-                            ),
-                        )
-                    )
-
-                wrapped_model.append(
-                    DP(
-                        config=config,
-                        ddp_config=ddp_config,
-                        module=model_chunk,
-                        disable_bucketing=disable_bucketing,
-                        **chunk_kwargs,
-                    )
-                )
-            model = wrapped_model
+            model = wrap_model_chunks_with_ddp(
+                model,
+                config,
+                ddp_config,
+                use_layer_wise_distributed_optimizer=getattr(
+                    args, 'use_layer_wise_distributed_optimizer', False
+                ),
+                use_layer_wise_param_layout=False,
+                DP=DP,
+                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                bucket_sizes=per_chunk_bucket_sizes,
+                disable_bucketing_per_chunk=per_chunk_disable_bucketing,
+            )
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
@@ -1864,26 +1829,34 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
     """Return an MCore DDPConfig from the argparse arguments."""
 
-    kwargs = {}
-    for f in dataclasses.fields(DistributedDataParallelConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
-    kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
-    kwargs["check_for_large_grads"] = args.check_for_large_grads
-    kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
-    kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
-    kwargs["param_name_patterns_for_fp32_local_accumulation"] = tuple(
-        args.ddp_param_name_patterns_for_fp32_local_accumulation
-    )
-    kwargs["average_in_collective"] = args.ddp_average_in_collective
-    # Megatron-FSDP arguments.
-    kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-    kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-    kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-    kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+    if getattr(args, "use_torch_fsdp2", False):
+        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+    else:
+        kwargs = {}
+        for f in dataclasses.fields(DistributedDataParallelConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
+        kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
+        kwargs["check_for_large_grads"] = args.check_for_large_grads
+        kwargs["num_buckets"] = args.ddp_num_buckets
+        kwargs["bucket_size"] = args.ddp_bucket_size
+        kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
+        kwargs["reduce_scatter_with_fp32_accumulation"] = (
+            args.ddp_reduce_scatter_with_fp32_accumulation
+        )
+        kwargs["param_name_patterns_for_fp32_local_accumulation"] = tuple(
+            args.ddp_param_name_patterns_for_fp32_local_accumulation
+        )
+        kwargs["average_in_collective"] = args.ddp_average_in_collective
+        # Megatron-FSDP arguments.
+        kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+        kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+        kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+        kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
 
-    return DistributedDataParallelConfig(**kwargs)
+        return DistributedDataParallelConfig(**kwargs)
 
 
 def setup_model_and_optimizer(model_provider_func, model_type, checkpointing_context=None):
@@ -2142,27 +2115,6 @@ def train_step(
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
-        if config.sequence_packing_scheduler is not None:
-            # This wrapper is designed to support DP-balanced THD and dynamic-CP.
-            # Before wrapping, the data_iterator returns either a single sequence per get_item call, or a list where each element is a sequence.
-            # The wrapper is responsible for:
-            # 1. scheduling the sequences across ranks
-            # 2. packing them into THD format
-            # 3. broadcast flops parametes and num_microbatches to TP ranks to support unfixed num_microbatches
-            # 4. broadcast metadata(cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) to PP ranks to
-            # 5. returning the packed data iterator and the FLOPs parameters
-            (
-                data_iterator,
-                num_microbatches,
-                seqlen_sum_this_global_batch,
-                seqlen_squared_sum_this_global_batch,
-            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
-        else:
-            # data_iterator unchanged
-            num_microbatches = get_num_microbatches()
-            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
-            seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
-
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -2174,7 +2126,7 @@ def train_step(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
-            num_microbatches=num_microbatches,
+            num_microbatches=get_num_microbatches(),
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
@@ -2554,8 +2506,6 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
-            num_layers=args.num_layers + (args.mtp_num_layers or 0),
-            csa_compress_ratios=args.csa_compress_ratios,
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -3132,6 +3082,9 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
+    if args.hybrid_context_parallel:
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+
     if args.run_workload_inspector_server:
         try:
             import threading
@@ -3249,7 +3202,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "full_iteration":
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
         )
@@ -3756,6 +3709,18 @@ def train(
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
+        # Deregister NCCL user-buffer memory pools before exit.
+        # Without this, ProcessGroupNCCL's destructor calls abort() which uses
+        # ncclCommDeregister on handles created by ncclCommWindowRegister,
+        # causing "NCCL WARN Deregister: Could not find handle" and a crash.
+        torch.distributed.barrier()
+        for model_module in model:
+            if isinstance(model_module, DDP):
+                for buf in model_module.buffers + model_module.expert_parallel_buffers:
+                    if getattr(buf, 'nccl_mem_pool', None) is not None:
+                        nccl_allocator.deregister_mem_pool(
+                            buf.nccl_mem_pool, buf.data_parallel_group
+                        )
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
@@ -3800,7 +3765,7 @@ def evaluate(
     eval_micro_batch_size = args.eval_micro_batch_size
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "full_iteration":
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
         )
@@ -3831,30 +3796,11 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
-            if config.sequence_packing_scheduler is not None:
-                # This wrapper is designed to support DP-balanced THD and dynamic-CP.
-                # Before wrapping, the data_iterator returns either a single sequence per get_item call, or a list where each element is a sequence.
-                # The wrapper is responsible for:
-                # 1. scheduling the sequences across ranks
-                # 2. packing them into THD format
-                # 3. broadcast flops parametes and num_microbatches to TP ranks to support unfixed num_microbatches
-                # 4. broadcast metadata(cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) to PP ranks to
-                # 5. returning the packed data iterator and the FLOPs parameters
-                try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
-                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
-                    )
-                except StopIteration:
-                    # Validation data iterator exhausted, stop evaluation early.
-                    break
-            else:
-                packed_data_iterator = data_iterator
-                scheduled_eval_num_microbatches = eval_num_microbatches
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=packed_data_iterator,
+                data_iterator=data_iterator,
                 model=model,
-                num_microbatches=scheduled_eval_num_microbatches,
+                num_microbatches=eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -4334,6 +4280,9 @@ def should_disable_forward_pre_hook(args):
     return (
         not args.use_megatron_fsdp
         and has_optimizer
-        and (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
+        and (
+            args.use_distributed_optimizer
+            or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+        )
         and args.overlap_param_gather
     )
