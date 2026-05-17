@@ -51,13 +51,6 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 
-# This should be private and should not be used outside of this file.
-moe = get_moe_module_spec(
-    use_te=True,
-    num_experts=8,  # Can be any positive integer (must not be None).
-    moe_grouped_gemm=True,
-)
-
 # Inference-optimized MoE spec
 moe_inference = get_inference_optimized_moe_spec()
 
@@ -83,112 +76,131 @@ _hybrid_mtp_block_spec = ModuleSpec(
 )
 
 
-hybrid_stack_spec = ModuleSpec(
-    module=HybridStack,
-    submodules=HybridStackSubmodules(
-        mamba_layer=ModuleSpec(
-            module=MambaLayer,
-            submodules=MambaLayerSubmodules(
-                mixer=ModuleSpec(
-                    module=MambaMixer,
-                    submodules=MambaMixerSubmodules(
-                        in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
-                    ),
-                ),
-                mamba_bda=get_bias_dropout_add,
-            ),
-        ),
-        gdn_layer=ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                self_attention=ModuleSpec(
-                    module=GatedDeltaNet,
-                    submodules=GatedDeltaNetSubmodules(
-                        in_proj=TELayerNormColumnParallelLinear,
-                        out_norm=TENorm,
-                        out_proj=TERowParallelLinear,
-                    ),
-                ),
-                self_attn_bda=get_bias_dropout_add,
-            ),
-        ),
-        # Started with spec from gpt_layer_specs.py (with MLP removed)
-        # Using the TE spec because we had problems getting the non-TE spec
-        # working
-        attention_layer=ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                self_attention=ModuleSpec(
-                    module=SelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=SelfAttentionSubmodules(
-                        linear_qkv=TELayerNormColumnParallelLinear,
-                        core_attention=TEDotProductAttention,
-                        linear_proj=TERowParallelLinear,
-                    ),
-                ),
-                self_attn_bda=get_bias_dropout_add,
-            ),
-        ),
-        dsa_layer=ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
-                self_attention=ModuleSpec(
-                    module=MLASelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=MLASelfAttentionSubmodules(
-                        linear_q_proj=TEColumnParallelLinear,
-                        linear_q_down_proj=TELinear,
-                        linear_q_up_proj=TEColumnParallelLinear,
-                        linear_kv_down_proj=TELinear,
-                        linear_kv_up_proj=TEColumnParallelLinear,
-                        core_attention=ModuleSpec(
-                            module=DSAttention,
-                            submodules=DSAttentionSubmodules(
-                                indexer=ModuleSpec(
-                                    module=DSAIndexer,
-                                    submodules=DSAIndexerSubmodules(
-                                        linear_wq_b=TELinear,
-                                        linear_wk=TELinear,
-                                        k_norm=TENorm,
-                                        linear_weights_proj=TELinear,
-                                    ),
-                                )
-                            ),
+def get_hybrid_stack_spec(moe_grouped_gemm: bool = True) -> ModuleSpec:
+    """Build the default full-TE hybrid stack spec.
+
+    Args:
+        moe_grouped_gemm: when True (default), MoE experts are fused into TEGroupedMLP
+            via grouped GEMM. Set to False for use cases that need per-expert linears
+            (e.g. pruning, where TEGroupedMLP's `weight0`/`weight1`/... layout isn't
+            supported).
+    """
+    moe = get_moe_module_spec(
+        use_te=True,
+        num_experts=8,  # Can be any positive integer (must not be None).
+        moe_grouped_gemm=moe_grouped_gemm,
+    )
+
+    return ModuleSpec(
+        module=HybridStack,
+        submodules=HybridStackSubmodules(
+            mamba_layer=ModuleSpec(
+                module=MambaLayer,
+                submodules=MambaLayerSubmodules(
+                    mixer=ModuleSpec(
+                        module=MambaMixer,
+                        submodules=MambaMixerSubmodules(
+                            in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
                         ),
-                        linear_proj=TERowParallelLinear,
-                        q_layernorm=IdentityOp,
-                        kv_layernorm=IdentityOp,
                     ),
+                    mamba_bda=get_bias_dropout_add,
                 ),
-                self_attn_bda=get_bias_dropout_add,
             ),
-        ),
-        # Started with spec from gpt_layer_specs.py
-        # Using the TE spec because we had problems getting the non-TE spec
-        # working
-        mlp_layer=ModuleSpec(
-            module=MLPLayer,
-            submodules=TransformerLayerSubmodules(
-                mlp=partial(
-                    MLP.as_mlp_submodule,
-                    submodules=MLPSubmodules(
-                        linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            gdn_layer=ModuleSpec(
+                module=TransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    self_attention=ModuleSpec(
+                        module=GatedDeltaNet,
+                        submodules=GatedDeltaNetSubmodules(
+                            in_proj=TELayerNormColumnParallelLinear,
+                            out_norm=TENorm,
+                            out_proj=TERowParallelLinear,
+                        ),
                     ),
+                    self_attn_bda=get_bias_dropout_add,
                 ),
-                mlp_bda=get_bias_dropout_add,
             ),
-        ),
-        moe_layer=ModuleSpec(
-            module=MoETransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
+            # Started with spec from gpt_layer_specs.py (with MLP removed)
+            # Using the TE spec because we had problems getting the non-TE spec
+            # working
+            attention_layer=ModuleSpec(
+                module=TransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    self_attention=ModuleSpec(
+                        module=SelfAttention,
+                        params={"attn_mask_type": AttnMaskType.causal},
+                        submodules=SelfAttentionSubmodules(
+                            linear_qkv=TELayerNormColumnParallelLinear,
+                            core_attention=TEDotProductAttention,
+                            linear_proj=TERowParallelLinear,
+                        ),
+                    ),
+                    self_attn_bda=get_bias_dropout_add,
+                ),
             ),
+            dsa_layer=ModuleSpec(
+                module=TransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    input_layernorm=TENorm,
+                    self_attention=ModuleSpec(
+                        module=MLASelfAttention,
+                        params={"attn_mask_type": AttnMaskType.causal},
+                        submodules=MLASelfAttentionSubmodules(
+                            linear_q_proj=TEColumnParallelLinear,
+                            linear_q_down_proj=TELinear,
+                            linear_q_up_proj=TEColumnParallelLinear,
+                            linear_kv_down_proj=TELinear,
+                            linear_kv_up_proj=TEColumnParallelLinear,
+                            core_attention=ModuleSpec(
+                                module=DSAttention,
+                                submodules=DSAttentionSubmodules(
+                                    indexer=ModuleSpec(
+                                        module=DSAIndexer,
+                                        submodules=DSAIndexerSubmodules(
+                                            linear_wq_b=TELinear,
+                                            linear_wk=TELinear,
+                                            k_norm=TENorm,
+                                            linear_weights_proj=TELinear,
+                                        ),
+                                    )
+                                ),
+                            ),
+                            linear_proj=TERowParallelLinear,
+                            q_layernorm=IdentityOp,
+                            kv_layernorm=IdentityOp,
+                        ),
+                    ),
+                    self_attn_bda=get_bias_dropout_add,
+                ),
+            ),
+            # Started with spec from gpt_layer_specs.py
+            # Using the TE spec because we had problems getting the non-TE spec
+            # working
+            mlp_layer=ModuleSpec(
+                module=MLPLayer,
+                submodules=TransformerLayerSubmodules(
+                    mlp=partial(
+                        MLP.as_mlp_submodule,
+                        submodules=MLPSubmodules(
+                            linear_fc1=TELayerNormColumnParallelLinear,
+                            linear_fc2=TERowParallelLinear,
+                        ),
+                    ),
+                    mlp_bda=get_bias_dropout_add,
+                ),
+            ),
+            moe_layer=ModuleSpec(
+                module=MoETransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
+                ),
+            ),
+            mtp_block_spec=_hybrid_mtp_block_spec,
         ),
-        mtp_block_spec=_hybrid_mtp_block_spec,
-    ),
-)
+    )
+
+
+hybrid_stack_spec = get_hybrid_stack_spec()
 
 
 hybrid_inference_stack_spec = ModuleSpec(

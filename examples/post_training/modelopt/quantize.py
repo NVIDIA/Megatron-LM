@@ -3,6 +3,7 @@
 """Script for quantizing a HuggingFace or Megatron-LM checkpoint using ModelOpt."""
 
 import functools
+import gc
 import inspect
 import json
 import os
@@ -21,6 +22,7 @@ import modelopt.torch.quantization as mtq
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
+from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
 
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
@@ -35,18 +37,15 @@ except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
+from utils import get_hf_tokenizer
+
 from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.post_training.utils import (
-    print_distributed_quant_summary,
-    report_current_memory_info,
-)
+from megatron.post_training.utils import print_distributed_quant_summary, report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
@@ -84,7 +83,7 @@ def add_text_generate_ptq_args(parser):
     group.add_argument(
         "--calib-dataset-path-or-name",
         type=str,
-        default="cnn_dailymail",
+        default="nemotron-post-training-dataset-v2",
         help="Path to local calibration dataset file (.jsonl) or HuggingFace dataset name.",
     )
     group.add_argument(
@@ -344,7 +343,12 @@ if __name__ == "__main__":
 
         for idx, prompt in tqdm(enumerate(all_prompts), disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=32)
+            # enable_kv_cache=False to avoid pre-allocating the static KV cache: this is a
+            # sanity-check generation (32 tokens), and the KV-cache allocation can OOM tight
+            # quantization runs on large MoE models.
+            generated_ids = megatron_generate(
+                model, tokens.input_ids.cuda(), osl=32, enable_kv_cache=False
+            )
             generated_texts = tokenizer.batch_decode(generated_ids)
             print_rank_0("{}".format(generated_texts))
             if all_references[idx] is not None:
@@ -361,7 +365,7 @@ if __name__ == "__main__":
         )
         for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
             sample = get_batch_on_this_cp_rank(sample)
-            simple_generate(model, sample["input_ids"], osl=1, calibration_mode=True)
+            megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 
     unwrapped_model = unwrap_model(model)[0]
 
@@ -391,11 +395,9 @@ if __name__ == "__main__":
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0, release=True)
 
-    # Free calibration/quantization memory before generate
-    import gc
+    # Free calibration/quantization memory before generate (do this after saving in case it causes issues)
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Do this after saving in case it causes issues
     if not args.skip_generate:
         _custom_prompt_forward_loop_func(unwrapped_model)
