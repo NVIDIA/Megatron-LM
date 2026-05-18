@@ -2130,7 +2130,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"num_requests ({len(env.requests)})."
             )
             assert context.max_requests == 4
-            assert step_count == 35
+            assert step_count == 34
         assert context.kv_block_allocator.active_count == 655
 
     @pytest.mark.internal

@@ -38,6 +38,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel, toggle_cuda_graphs
@@ -914,6 +915,21 @@ class TextGenerationController:
                 torch.tensor(indices, device=device, dtype=torch.long)
                 for indices, *_ in self._torch_sampling_buckets
             ]
+            self._torch_sampling_bucket_active_request_count = active_request_count
+
+    def _ensure_torch_sampling_bookkeeping(self) -> None:
+        """Build torch sampling buckets if this helper was entered directly."""
+        if self._sampling_backend != "torch":
+            return
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if (
+            not hasattr(self, "_torch_sampling_buckets")
+            or not hasattr(self, "_torch_sampling_bucket_index_tensors")
+            or getattr(self, "_torch_sampling_bucket_active_request_count", None)
+            != (active_request_count)
+        ):
+            self._dynamic_step_sample_bookkeeping()
 
     def _sampling_generator_for_request_id(self, request_id: int) -> torch.Generator:
         """Return the per-request generator used for dynamic non-greedy sampling."""
@@ -1034,6 +1050,7 @@ class TextGenerationController:
             Tensor: Sampled tokens of shape [num_requests].
         """
         if self._sampling_backend == "torch":
+            self._ensure_torch_sampling_bookkeeping()
             spec_token_list = []
             for idx_tensor, (_, temp, top_k, top_p) in zip(
                 self._torch_sampling_bucket_index_tensors, self._torch_sampling_buckets
@@ -1170,8 +1187,12 @@ class TextGenerationController:
                 )
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
 
-                # Strip padding from logits only. Hidden states stay padded+SP
+                # Gather logits for sampling. Hidden states stay padded+SP
                 # between depths to avoid redundant gather/scatter round-trips.
+                if self._sp_enabled:
+                    mtp_logits = gather_from_sequence_parallel_region(
+                        mtp_logits, group=self.inference_wrapped_model.tp_group
+                    )
                 mtp_logits = mtp_logits[:active_request_count]
 
                 # mtp_logits: [active_request_count, 1, vocab_size]
@@ -1239,6 +1260,7 @@ class TextGenerationController:
         output_tokens_jumbled_list = []
         token_order_list = []
 
+        self._ensure_torch_sampling_bookkeeping()
         for idx_tensor, (_, temp, top_k, top_p) in zip(
             self._torch_sampling_bucket_index_tensors, self._torch_sampling_buckets
         ):
@@ -1452,6 +1474,7 @@ class TextGenerationController:
         )
 
         if self._sampling_backend == "torch":
+            self._ensure_torch_sampling_bookkeeping()
             required_token_logits = self._dynamic_step_required_token_logits(
                 row_indices=row_indices
             )[:active_request_count]
@@ -2825,6 +2848,10 @@ class TextGenerationController:
                         else None
                     ),
                 )
+                if self._sp_enabled:
+                    mtp_logits = gather_from_sequence_parallel_region(
+                        mtp_logits, group=self.inference_wrapped_model.tp_group
+                    )
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 
             # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
