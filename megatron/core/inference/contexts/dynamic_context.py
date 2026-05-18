@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -623,12 +623,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             and not (force_disable_non_decode_cuda_graphs)
         )
 
+        # CUDA graph token budget for prefill/mixed graphs. Decode graphs are always
+        # capped at max_requests * (num_speculative_tokens + 1) inside the helper; this
+        # only widens the prefill/mixed range when `cuda_graph_all_prefills` is set.
+        cuda_graph_max_tokens = (
+            self.max_tokens
+            if inference_config.cuda_graph_all_prefills
+            else self.max_requests * (self.num_speculative_tokens + 1)
+        )
+
         # CUDA graph config list.
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=inference_config.num_cuda_graphs,
-                cuda_graph_max_tokens=self.max_requests * (self.num_speculative_tokens + 1),
+                cuda_graph_max_tokens=cuda_graph_max_tokens,
                 cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
@@ -1181,6 +1190,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+
+        # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
+        # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
+        # we fix the underlying storage so views are reusable across steps. The number of entries
+        # is bounded by the graph sizes plus eager-mode token counts, which are rounded up to
+        # multiples of TOKEN_ROUNDER and capped at max_tokens / TOKEN_ROUNDER distinct values.
+        self._input_position_views: Dict[int, Tuple[Tensor, Tensor]] = {}
 
         # Bind the shared MHA GPU views to both graph and non-graph metadata;
         # only one is active per step, so sharing storage is safe.
@@ -2432,10 +2448,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert num_tokens >= self.padded_batch_dimensions.decode_req_count * (
             self.num_speculative_tokens + 1
         )
-        return (
-            self.gpu_view.token_to_input_ids[:num_tokens].unsqueeze(0),
-            self.gpu_view.token_to_pos_ids[:num_tokens].unsqueeze(0),
-        )
+        cached = self._input_position_views.get(num_tokens)
+        if cached is not None:
+            return cached
+        input_ids = self.gpu_view.token_to_input_ids[:num_tokens].unsqueeze(0)
+        pos_ids = self.gpu_view.token_to_pos_ids[:num_tokens].unsqueeze(0)
+        cached = (input_ids, pos_ids)
+        self._input_position_views[num_tokens] = cached
+        return cached
 
     def speculative_required_logit_indices(self) -> Tensor:
         """Token-level indices needed for speculative decode verification.
