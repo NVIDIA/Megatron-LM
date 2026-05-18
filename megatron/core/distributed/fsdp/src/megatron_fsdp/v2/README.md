@@ -119,6 +119,7 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 ## Gotchas / Pitfalls
 
 - **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design.md) for details and the fix in `param_group.py`.
+- **Temporary communication buckets must record their CUDA stream.** `DataParallelBuffer.reshard()` and `release_grad_buffer()` can return temporary all-gather / reduce-scatter bucket storage to the allocator while side-stream CUDA work is still queued. A CUDA event wait orders streams, but it does not tell PyTorch's caching allocator that the freed storage is still used by `ag_stream` or `rs_stream`. If the block is recycled on another stream, the communication payload can be silently corrupted. Call `record_stream()` on any temporary CUDA tensor that participates in side-stream communication before it may be freed; a full synchronization only masks the bug and hurts overlap.
 
 ## Unit Tests
 

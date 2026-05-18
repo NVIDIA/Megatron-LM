@@ -203,11 +203,11 @@ class TestMegatronFSDPE2E:
             reference_spec_configs = copy.deepcopy(spec_configs)
             if reference_kind == "fsdp_v1":
                 reference_spec_configs["use_fully_shard_api"] = False
+                reference_spec_configs.setdefault("gradient_accumulation_fusion", False)
                 ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
                     use_megatron_fsdp=True,
                     init_model_with_meta_device=True,
                     ckpt_format="fsdp_dtensor",
-                    gradient_accumulation_fusion=False,
                     **nd_topology,
                     **reference_spec_configs,
                 )
@@ -217,13 +217,14 @@ class TestMegatronFSDPE2E:
                     use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
                 )
 
+        fsdp_spec_configs = copy.deepcopy(spec_configs)
+        fsdp_spec_configs.setdefault("gradient_accumulation_fusion", False)
         outputs = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
-            gradient_accumulation_fusion=False,
             **nd_topology,
-            **spec_configs,
+            **fsdp_spec_configs,
         )
         reference_outputs = ref_cache[ref_cache_key]
 
