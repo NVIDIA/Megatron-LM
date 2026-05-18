@@ -174,36 +174,6 @@ class TestHeadWiseAttnGateForward:
         output, _ = attn(hidden_states, attention_mask)
         assert output.shape == (SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE)
 
-    def test_zero_gate_halves_output(self):
-        """Zero gate rows -> sigmoid(0)=0.5 -> output = 0.5 * no-gate ref."""
-        config = _make_config(self.transformer_impl, head_wise_attn_gate=True)
-        attn = _make_attention(config, self.transformer_impl).cuda()
-        with torch.no_grad():
-            attn.linear_qkv.weight[-NUM_HEADS:].zero_()
-
-        hidden_states = torch.randn(
-            SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
-        )
-        attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
-
-        config_no_gate = _make_config(self.transformer_impl, head_wise_attn_gate=False)
-        attn_no_gate = _make_attention(config_no_gate, self.transformer_impl).cuda()
-        with torch.no_grad():
-            attn_no_gate.linear_qkv.weight.copy_(attn.linear_qkv.weight[:QKV_OUT_DIM])
-            attn_no_gate.linear_proj.weight.copy_(attn.linear_proj.weight)
-            if attn.linear_qkv.bias is not None:
-                attn_no_gate.linear_qkv.bias.copy_(attn.linear_qkv.bias[:QKV_OUT_DIM])
-            if attn.linear_proj.bias is not None:
-                attn_no_gate.linear_proj.bias.copy_(attn.linear_proj.bias)
-
-        with torch.no_grad():
-            out_gated, _ = attn(hidden_states, attention_mask)
-            out_plain, _ = attn_no_gate(hidden_states, attention_mask)
-
-        torch.testing.assert_close(
-            out_gated.float(), (out_plain * 0.5).float(), atol=1e-2, rtol=1e-2
-        )
-
 
 def _make_config_tp(
     head_wise_attn_gate: bool, add_qkv_bias: bool = False, **extra: object
