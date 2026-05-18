@@ -1158,9 +1158,7 @@ class Attention(MegatronModule, ABC):
         )
         output_gate = self.config.attention_output_gate
         # head_wise_attn_gate is self-attention only (gate rows live in linear_qkv).
-        head_wise_gate_enabled = (
-            self.config.head_wise_attn_gate and self.attention_type != "cross"
-        )
+        head_wise_gate_enabled = self.config.head_wise_attn_gate and self.attention_type != "cross"
         # Check if fused_single_qkv_rope is requested but either unavailable or not
         # supported for the current use case.
         if self.attention_type != "cross":
@@ -1170,9 +1168,7 @@ class Attention(MegatronModule, ABC):
         if output_gate:
             assert split_qkv, "output_gate is not supported for unsplit mixed_qkv tensor."
         if head_wise_gate_enabled:
-            assert split_qkv, (
-                "head_wise_attn_gate is not supported for unsplit mixed_qkv tensor."
-            )
+            assert split_qkv, "head_wise_attn_gate is not supported for unsplit mixed_qkv tensor."
 
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
         with qkv_linear_manager as hidden_states:
@@ -1401,8 +1397,8 @@ class Attention(MegatronModule, ABC):
             nvtx_range_push(suffix="head_wise_attn_gate")
             gate_states = head_wise_gate.view(*head_wise_gate.shape[:2], -1, 1)
             core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)
-            core_attn_out = (
-                core_attn_out * torch.sigmoid(gate_states.float()).to(core_attn_out.dtype)
+            core_attn_out = core_attn_out * torch.sigmoid(gate_states.float()).to(
+                core_attn_out.dtype
             )
             core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)
             nvtx_range_pop(suffix="head_wise_attn_gate")
@@ -1908,10 +1904,7 @@ class SelfAttention(Attention):
         return weight_updated
 
     def sharded_state_dict(
-        self,
-        prefix: str = "",
-        sharded_offsets: tuple = (),
-        metadata: Optional[dict] = None,
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """Wrap linear_qkv.{weight,bias} with a factory that reshards QKV and
         gate sub-blocks independently, analogous to apply_swiglu_sharded_factory."""
@@ -1930,10 +1923,7 @@ class SelfAttention(Attention):
 
 # pylint: disable=missing-function-docstring
 def apply_head_wise_attn_gate_sharded_factory(
-    original_sh_ten,
-    sharded_offsets,
-    qkv_size: int,
-    gate_size: int,
+    original_sh_ten, sharded_offsets, qkv_size: int, gate_size: int
 ):
     """Split linear_qkv.{weight,bias} into QKV and gate sub-tensors with
     distinct keys so each is resharded independently along axis 0 across TP.
@@ -1953,17 +1943,13 @@ def apply_head_wise_attn_gate_sharded_factory(
         f"({gate_size}) divisible by TP world_size ({axis_frag})."
     )
     assert local_axis_size == qkv_local_size + gate_local_size
-    rank_offset = (
-        original_sh_ten.global_offset[shard_axis + prepend_axis_num] // local_axis_size
-    )
+    rank_offset = original_sh_ten.global_offset[shard_axis + prepend_axis_num] // local_axis_size
 
     @torch.no_grad()
     def sh_ten_build_fn(
         key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
-        tensor_qkv, tensor_gate = torch.split(
-            t, [qkv_local_size, gate_local_size], dim=shard_axis
-        )
+        tensor_qkv, tensor_gate = torch.split(t, [qkv_local_size, gate_local_size], dim=shard_axis)
         offset_qkv = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
         offset_gate = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
         return [

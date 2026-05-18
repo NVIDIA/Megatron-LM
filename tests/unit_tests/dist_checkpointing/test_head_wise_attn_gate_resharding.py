@@ -96,9 +96,7 @@ class TestHeadWiseAttnGateTPResharding:
                 seed=999, num_query_groups=num_query_groups, add_qkv_bias=add_qkv_bias
             )
             state_dict, missing_keys, unexpected_keys = load(
-                attn_dst.sharded_state_dict(prefix=""),
-                ckpt_dir,
-                strict=StrictHandling.RETURN_ALL,
+                attn_dst.sharded_state_dict(prefix=""), ckpt_dir, strict=StrictHandling.RETURN_ALL
             )
             assert all('_extra_state' in k for k in missing_keys), missing_keys
             assert all('_extra_state' in k for k in unexpected_keys), unexpected_keys
@@ -110,6 +108,4 @@ class TestHeadWiseAttnGateTPResharding:
             output_dst_cpu = output_dst.detach().to(torch.float32).cpu()
 
         if torch.distributed.get_rank() == 0:
-            torch.testing.assert_close(
-                output_dst_cpu, output_src_cpu, atol=1e-4, rtol=1e-4
-            )
+            torch.testing.assert_close(output_dst_cpu, output_src_cpu, atol=1e-4, rtol=1e-4)

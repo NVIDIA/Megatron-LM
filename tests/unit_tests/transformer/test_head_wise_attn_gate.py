@@ -142,10 +142,7 @@ class TestHeadWiseAttnGateInit:
         attn = _make_attention(config, self.transformer_impl)
         # linear_qkv output dim = Q+K+V + num_attention_heads (gate rows).
         assert attn.linear_qkv_out_dim == QKV_OUT_DIM + NUM_HEADS
-        assert attn.linear_qkv.weight.shape == (
-            QKV_OUT_DIM + NUM_HEADS,
-            HIDDEN_SIZE,
-        )
+        assert attn.linear_qkv.weight.shape == (QKV_OUT_DIM + NUM_HEADS, HIDDEN_SIZE)
 
     def test_linear_qkv_unchanged_when_disabled(self):
         config = _make_config(self.transformer_impl, head_wise_attn_gate=False)
@@ -208,12 +205,8 @@ class TestHeadWiseAttnGateForward:
         )
 
 
-
-
 def _make_config_tp(
-    head_wise_attn_gate: bool,
-    add_qkv_bias: bool = False,
-    **extra: object,
+    head_wise_attn_gate: bool, add_qkv_bias: bool = False, **extra: object
 ) -> TransformerConfig:
     """Float32 config for TP correctness tests; local-spec backend, no dropout.
 
@@ -264,15 +257,14 @@ class TestHeadWiseAttnGateUnderTP2:
     def setup_teardown(self):
         if Utils.world_size < 2:
             pytest.skip(f"need world_size >= 2 (got {Utils.world_size})")
-        Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(42)
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize(
-        "gate_value,expected_scale",
-        [(0.0, 0.5), (1e4, 1.0), (-1e4, 0.0)],
-    )
+    @pytest.mark.parametrize("gate_value,expected_scale", [(0.0, 0.5), (1e4, 1.0), (-1e4, 0.0)])
     def test_saturated_gate_under_tp2(self, gate_value: float, expected_scale: float):
         """Zero gate weight rows + fill gate bias rows with gate_value, then
         verify out_gated == sigmoid(gate_value) * out_no_gate. Catches layout
@@ -298,9 +290,7 @@ class TestHeadWiseAttnGateUnderTP2:
             out_gated, _ = attn(hidden_states, attention_mask)
             out_plain, _ = attn_ref(hidden_states, attention_mask)
 
-        torch.testing.assert_close(
-            out_gated, out_plain * expected_scale, atol=1e-4, rtol=1e-4
-        )
+        torch.testing.assert_close(out_gated, out_plain * expected_scale, atol=1e-4, rtol=1e-4)
 
 
 class TestHeadWiseAttnGateInitMagnitude:
@@ -337,9 +327,7 @@ class TestHeadWiseAttnGateInitMagnitude:
         expected_scale = torch.sigmoid(
             torch.tensor(gated_config.head_wise_attn_gate_init_bias)
         ).item()
-        torch.testing.assert_close(
-            out_gated, out_plain * expected_scale, atol=5e-2, rtol=5e-2
-        )
+        torch.testing.assert_close(out_gated, out_plain * expected_scale, atol=5e-2, rtol=5e-2)
         near_id_err = (out_gated - out_plain * expected_scale).abs().mean().item()
         half_err = (out_gated - out_plain * 0.5).abs().mean().item()
         assert near_id_err < half_err
@@ -359,7 +347,7 @@ class TestHeadWiseAttnGateInitMagnitude:
         """gate_std ~ 0.1 * qkv_std (no zero-init, no FP8 underflow risk)."""
         gated_config = _make_config_tp(head_wise_attn_gate=True, add_qkv_bias=True)
         attn = _make_attention_local(gated_config)
-        gate_rows = attn.linear_qkv.weight[-attn.num_attention_heads_per_partition:]
+        gate_rows = attn.linear_qkv.weight[-attn.num_attention_heads_per_partition :]
         qkv_rows = attn.linear_qkv.weight[: -attn.num_attention_heads_per_partition]
         ratio = gate_rows.float().std().item() / qkv_rows.float().std().item()
         assert 0.05 < ratio < 0.5
