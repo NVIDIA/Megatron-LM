@@ -490,21 +490,22 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             split_dim: Dimension along which to split.
         """
         total_split = sum(split_sizes)
+        if isinstance(data, DTensor) and data.shape[split_dim] == total_split:
+            # GDN tensors are already TP-local here (fast-path from #4799).
+            return list(
+                split_dtensor(
+                    data, split_sizes, dim=split_dim, update_uneven_dtensor_chunk_meta=True
+                )
+            )
+
         # Use dist_param (always a DTensor) for global shape/numel,
         # as data may be a regular Tensor (e.g., optimizer states).
         global_shape = dist_param.shape
         if isinstance(data, DTensor):
-            if data.shape[split_dim] == total_split:
-                return list(
-                    split_dtensor(
-                        data, split_sizes, dim=split_dim, update_uneven_dtensor_chunk_meta=True
-                    )
-                )
-              
-             else:
-                assert data.shape == global_shape, (
-                    f"DTensor shape mismatch: data.shape={data.shape} vs "
-                    f"dist_param.shape={global_shape}"
+            assert data.shape == global_shape, (
+                f"DTensor shape mismatch: data.shape={data.shape} vs "
+                f"dist_param.shape={global_shape}"
+            )
 
         fsdp_slice = dist_param.megatron_fsdp_slice
         dist_index = dist_param.megatron_fsdp_dist_index
