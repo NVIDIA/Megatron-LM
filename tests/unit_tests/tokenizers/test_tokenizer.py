@@ -633,9 +633,7 @@ class TestBuildTokenizer:
     def test_tokenizer_failure(self):
         config = TokenizerConfig(tokenizer_type="UnknownTokenizer")
 
-        with pytest.raises(
-            ValueError, match="tokenizer_type UnknownTokenizer is not supported"
-        ):
+        with pytest.raises(ValueError, match="tokenizer_type UnknownTokenizer is not supported"):
             tokenizer = build_tokenizer(config)
 
 
