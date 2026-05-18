@@ -18,7 +18,7 @@ import torch
 from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
@@ -65,7 +65,7 @@ NANOV3_BASE = dict(
     use_cpu_initialization=True,
     attention_backend=AttnBackend.local,
     cuda_graph_impl="local",
-    cuda_graph_scope="full_iteration_inference",
+    inference_cuda_graph_scope=InferenceCudaGraphScope.block,
     moe_pad_experts_for_cuda_graph_inference=False,
     mamba_state_dim=128,
     mamba_head_dim=64,
