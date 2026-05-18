@@ -51,14 +51,15 @@ class TestHeadWiseAttnGateConfigValidation:
     """TransformerConfig.__post_init__ rejects misconfigurations at config time."""
 
     def _config(self, **extra) -> TransformerConfig:
-        return TransformerConfig(
+        kwargs = dict(
             num_layers=1,
             hidden_size=HIDDEN_SIZE,
             num_attention_heads=NUM_HEADS,
             use_cpu_initialization=True,
             params_dtype=torch.float32,
-            **extra,
         )
+        kwargs.update(extra)
+        return TransformerConfig(**kwargs)
 
     def test_rejects_combination_with_attention_output_gate(self):
         with pytest.raises(ValueError, match="cannot both be enabled"):
