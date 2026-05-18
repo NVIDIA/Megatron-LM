@@ -77,10 +77,17 @@ class TestHeadWiseAttnGateInit:
         assert attn.linear_qkv_out_dim == QKV_OUT_DIM
         assert attn.linear_qkv.weight.shape == (QKV_OUT_DIM, HIDDEN_SIZE)
 
-    def test_gate_buffer_initialized_to_none(self):
+    def test_no_gate_side_channel_attribute(self):
+        """Regression guard: gate states must be threaded through the
+        get_query_key_value_tensors return tuple, not via a module-level
+        attribute. A stale gate attribute breaks cross-attention layers,
+        overlapped microbatches, and selective recompute paths."""
         config = _make_config(self.transformer_impl, use_head_wise_attn_gate=True)
         attn = _make_attention(config, self.transformer_impl)
-        assert attn._head_wise_gate_states is None
+        assert not hasattr(attn, "_head_wise_gate_states"), (
+            "SelfAttention should not stash gate states on the module; "
+            "thread them through the qkv_output tuple instead."
+        )
 
 
 @pytest.mark.parametrize("transformer_impl", ["transformer_engine", "native"])
@@ -113,7 +120,10 @@ class TestHeadWiseAttnGateForward:
         output, _ = self._run_forward(use_gate=False)
         assert output.shape == (SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE)
 
-    def test_gate_buffer_cleared_after_forward(self):
+    def test_no_gate_side_channel_after_forward(self):
+        """Regression guard: even after a forward pass, no per-instance gate
+        attribute should be left dangling on the module. This protects
+        recompute / overlapped-microbatch paths from picking up stale state."""
         config = _make_config(self.transformer_impl, use_head_wise_attn_gate=True)
         attn = _make_attention(config, self.transformer_impl).cuda()
         hidden_states = torch.randn(
@@ -121,7 +131,7 @@ class TestHeadWiseAttnGateForward:
         )
         attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
         _ = attn(hidden_states, attention_mask)
-        assert attn._head_wise_gate_states is None
+        assert not hasattr(attn, "_head_wise_gate_states")
 
     def test_zero_gate_halves_output(self):
         """Zeroing the trailing gate rows of linear_qkv makes pre-sigmoid 0,
