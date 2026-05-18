@@ -267,14 +267,19 @@ class TransformerConfig(ModelParallelConfig):
     """Apply a per-head scalar output gate (e.g., Step-3.5-Flash g_proj).
     The gate weights are fused into linear_qkv as the trailing
     num_attention_heads rows; the sigmoid of those scalars gates each
-    attention head independently. Distinct from attention_output_gate,
-    which fuses a full head_dim gate into linear_qkv. Distributed checkpoint
-    TP resharding is handled via a ShardedTensorFactory in
-    SelfAttention.sharded_state_dict that splits linear_qkv.{weight,bias}
-    into independent [QKV, gate] sub-tensors (analogous to
-    apply_swiglu_sharded_factory). Both query_projection_size + 2 *
-    kv_projection_size and num_attention_heads must be divisible by every TP
-    world_size used for save/load."""
+    attention head independently. Self-attention only: cross-attention
+    layers do not own linear_qkv, so the gate path does not apply there
+    (CrossAttention.get_query_key_value_tensors rejects the flag with an
+    explicit assertion). Distinct from attention_output_gate, which fuses
+    a full head_dim gate into linear_qkv with an inline per-group layout;
+    the two flags are mutually exclusive (validated in __post_init__).
+    Distributed checkpoint TP resharding is handled via a
+    ShardedTensorFactory in SelfAttention.sharded_state_dict that splits
+    linear_qkv.{weight,bias} into independent [QKV, gate] sub-tensors
+    (analogous to apply_swiglu_sharded_factory). Requires
+    num_attention_heads % tensor_model_parallel_size == 0 and
+    num_query_groups >= tensor_model_parallel_size; both are validated in
+    __post_init__."""
 
     head_wise_attn_gate_init_weight_scale: float = 0.1
     """Multiplicative scale applied to the gate rows of linear_qkv.weight right
@@ -1354,6 +1359,54 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        # use_head_wise_attn_gate layout/compose validation. Fails fast at
+        # config time (before any layer is built) so users do not hit obscure
+        # asserts deep inside the forward path.
+        if self.use_head_wise_attn_gate:
+            # (1) Mutual exclusion with attention_output_gate. Both flags
+            #     append rows to linear_qkv: attention_output_gate uses an
+            #     inline per-group (q, gate, k, v) layout, while
+            #     use_head_wise_attn_gate appends a trailing-rows block.
+            #     The forward-time slicing paths assume each layout in
+            #     isolation; their joint behavior is not currently tested
+            #     or documented, so we refuse the combination outright.
+            if self.attention_output_gate:
+                raise ValueError(
+                    "use_head_wise_attn_gate and attention_output_gate cannot both be "
+                    "enabled: each appends rows to linear_qkv with an incompatible "
+                    "layout (per-group inline gate vs trailing-rows gate). Enable at "
+                    "most one."
+                )
+            # (2) Per-rank gate-row count must be an integer. The
+            #     num_attention_heads % tensor_model_parallel_size == 0 check
+            #     above already enforces this globally, but re-state it here
+            #     with a gate-specific message so the failure mode is obvious.
+            if self.num_attention_heads % self.tensor_model_parallel_size != 0:
+                raise ValueError(
+                    f"use_head_wise_attn_gate requires num_attention_heads "
+                    f"({self.num_attention_heads}) to be divisible by "
+                    f"tensor_model_parallel_size ({self.tensor_model_parallel_size}); "
+                    f"otherwise the trailing num_attention_heads gate rows cannot be "
+                    f"sharded into integer per-rank counts."
+                )
+            # (3) num_query_groups >= tensor_model_parallel_size. The gate
+            #     peel-off in SelfAttention.get_query_key_value_tensors runs
+            #     BEFORE the num_query_groups < world_size AllGather + reslice
+            #     fallback path; under that fallback
+            #     num_attention_heads_per_partition is inflated to
+            #     num_attention_heads / num_query_groups (the pre-AG count),
+            #     so the slice over-takes and pulls V/K rows in as gate rows.
+            #     Disallow the combination here.
+            if self.num_query_groups < self.tensor_model_parallel_size:
+                raise ValueError(
+                    f"use_head_wise_attn_gate requires num_query_groups "
+                    f"({self.num_query_groups}) >= tensor_model_parallel_size "
+                    f"({self.tensor_model_parallel_size}). The head-wise gate "
+                    f"peel-off runs before the num_query_groups < world_size "
+                    f"AllGather + reslice fallback; under that fallback the gate "
+                    f"slice would over-take and pick up V/K rows as gate rows."
+                )
 
         if self.linear_attention_type is not None:
             warnings.warn(

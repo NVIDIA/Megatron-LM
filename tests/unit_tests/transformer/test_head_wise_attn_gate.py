@@ -49,6 +49,85 @@ def _make_attention(config: TransformerConfig, transformer_impl: str) -> SelfAtt
     return SelfAttention(config, submodules, layer_number=1)
 
 
+class TestHeadWiseAttnGateConfigValidation:
+    """TransformerConfig.__post_init__ should reject misconfigurations up
+    front so users don't hit obscure asserts deep inside the forward path.
+
+    Three invariants are validated at config-creation time:
+
+      (a) Mutual exclusion with attention_output_gate (both append rows to
+          linear_qkv with incompatible layouts).
+      (b) num_attention_heads % tensor_model_parallel_size == 0.
+      (c) num_query_groups >= tensor_model_parallel_size (otherwise the
+          forward-time gate slice over-takes through the AG+reslice
+          fallback).
+    """
+
+    def _config(self, **extra) -> TransformerConfig:
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN_SIZE,
+            num_attention_heads=NUM_HEADS,
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
+            **extra,
+        )
+
+    def test_rejects_combination_with_attention_output_gate(self):
+        with pytest.raises(ValueError, match="cannot both be enabled"):
+            self._config(use_head_wise_attn_gate=True, attention_output_gate=True)
+
+    def test_rejects_num_heads_indivisible_by_tp(self):
+        """Cross-check against the global num_attention_heads % tp check: the
+        gate-specific message is what we want users to see. The global check
+        fires first (line 1334-ish of transformer_config.py), but it carries
+        the same TP-divisibility wording, so either error is acceptable for
+        users; we accept either by matching the shared substring."""
+        with pytest.raises(ValueError, match="num_attention_heads"):
+            self._config(
+                num_attention_heads=3,  # not divisible by 2
+                num_query_groups=3,
+                hidden_size=24,  # divisible by 3 for head_dim
+                tensor_model_parallel_size=2,
+                use_head_wise_attn_gate=True,
+            )
+
+    def test_rejects_num_query_groups_below_tp(self):
+        """num_query_groups=1 < tensor_model_parallel_size=2 must fail at
+        config time, not silently produce a wrong forward."""
+        with pytest.raises(ValueError, match="num_query_groups"):
+            self._config(
+                num_attention_heads=4,
+                num_query_groups=1,
+                tensor_model_parallel_size=2,
+                use_head_wise_attn_gate=True,
+            )
+
+    def test_accepts_well_formed_config(self):
+        """Sanity: a config that satisfies all three invariants does not
+        raise. (TP=2, num_heads=4 divisible by 2, num_query_groups=4 >= 2.)"""
+        self._config(
+            num_attention_heads=4,
+            num_query_groups=4,
+            tensor_model_parallel_size=2,
+            use_head_wise_attn_gate=True,
+        )
+
+    def test_disabled_does_not_constrain_other_flags(self):
+        """When the gate is off, the gate-specific validations must not fire
+        even if attention_output_gate is on or num_query_groups < tp.
+        Otherwise the validations would regress unrelated configs."""
+        # attention_output_gate on, head-wise off -- must NOT raise.
+        self._config(use_head_wise_attn_gate=False, attention_output_gate=True)
+        # num_query_groups < tp, head-wise off -- must NOT raise.
+        self._config(
+            num_attention_heads=4,
+            num_query_groups=1,
+            tensor_model_parallel_size=2,
+            use_head_wise_attn_gate=False,
+        )
+
+
 @pytest.mark.parametrize("transformer_impl", ["transformer_engine", "native"])
 class TestHeadWiseAttnGateInit:
     """Verify linear_qkv is sized to include the fused gate rows iff enabled."""
