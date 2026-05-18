@@ -5,6 +5,29 @@
 The gate weights are fused into linear_qkv as the trailing num_attention_heads
 rows; in the forward pass those scalars are sliced out, passed through sigmoid,
 and used to scale each attention head's output independently.
+
+Coverage summary across this file plus
+tests/unit_tests/dist_checkpointing/test_head_wise_attn_gate_resharding.py:
+
+  - Config-time validation (mutual exclusion, TP / num_query_groups
+    divisibility): TestHeadWiseAttnGateConfigValidation.
+  - linear_qkv shape with/without gate: TestHeadWiseAttnGateInit.
+  - TP=1 forward sanity, output shape, half/no-side-channel guards:
+    TestHeadWiseAttnGateForward.
+  - Pure-tensor reshape and sigmoid saturation: TestHeadWiseAttnGateNumerics.
+  - TP=2 layout correctness (saturated gate, per-rank gate independence,
+    init-time rejection of misaligned configs):
+    TestHeadWiseAttnGateUnderTP2.
+  - Init-time gate magnitude (sigmoid~=1 at start, knob propagation,
+    FP8-friendly weight std): TestHeadWiseAttnGateInitMagnitude.
+  - dist-ckpt save TP=N -> load TP=M logits equality, parametrized over
+    MHA/GQA and bias presence: test_head_wise_attn_gate_resharding.py.
+
+Known unverified paths (filed as follow-ups, see resharding test
+docstring for details): context_parallel_size > 1, fp8 (linear_qkv shared
+tensor scale across QKV and gate blocks; set_save_original_input
+interaction), explicit backward-grad-to-gate-rows assertion, and
+packed_seq_params.qkv_format == 'thd' reshape composition.
 """
 
 import pytest
