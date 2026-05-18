@@ -53,8 +53,8 @@ MODEL_ARGS:
   --inference-dynamic-batching-max-requests: 32
   --inference-max-seq-length: 4096
   --enable-chunked-prefill: true
-  --cuda-graph-scope: full_iteration_inference
   --cuda-graph-impl: local
+  --inference-cuda-graph-scope: block
   --inference-dynamic-batching-num-cuda-graphs: -1
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --prompts: 'Artificial intelligence has transformed numerous industries over the past decade. From healthcare to finance, manufacturing to education, AI systems are now capable of performing tasks that once required significant human expertise. Machine learning models can diagnose diseases from medical images, detect fraud in financial transactions, optimize supply chains, and personalize educational content for individual students. Large language models in particular have demonstrated remarkable capabilities in understanding and generating human language, enabling applications such as code generation, document summarization, question answering, and creative writing assistance. As these systems continue to improve, researchers and practitioners are working to address challenges around reliability, fairness, and interpretability. The next generation of AI systems will likely be even more capable, but also require careful consideration of their societal implications. In summary, the field of artificial intelligence is'
