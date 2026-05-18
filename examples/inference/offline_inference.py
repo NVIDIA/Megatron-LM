@@ -41,9 +41,9 @@ from examples.inference.utils import (
     get_global_peak_memory_stats_bytes,
     print_unique_prompts_and_outputs,
 )
+from megatron.core.inference.apis import MegatronAsyncLLM, MegatronLLM
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
-from megatron.inference import MegatronAsyncLLM, MegatronLLM
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,

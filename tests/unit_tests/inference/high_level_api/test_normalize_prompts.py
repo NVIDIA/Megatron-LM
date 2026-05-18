@@ -2,7 +2,7 @@
 
 import pytest
 
-from megatron.inference._llm_base import _MegatronLLMBase
+from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 
 
 def _normalize(prompts):

@@ -16,7 +16,7 @@ manual `add_request` / `step_modern` control or step-level scheduling.
 ### Offline batch (sync)
 
 ```python
-from megatron.inference import MegatronLLM, SamplingParams
+from megatron.core.inference.apis import MegatronLLM, SamplingParams
 
 # Caller owns initialize_megatron(...), model construction, and model.eval().
 # See examples/inference/offline_inference.py for a runnable end-to-end script.
@@ -38,7 +38,7 @@ with MegatronLLM(
 
 ```python
 import asyncio
-from megatron.inference import MegatronAsyncLLM, ServeConfig
+from megatron.core.inference.apis import MegatronAsyncLLM, ServeConfig
 
 async def main():
     async with MegatronAsyncLLM(

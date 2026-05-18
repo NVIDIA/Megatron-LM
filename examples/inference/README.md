@@ -11,10 +11,10 @@ This guide provides an example for Megatron Core for running model inference.
 
 ### What's in here
 
-These examples drive the high-level inference API in `megatron/inference/`
+These examples drive the high-level inference API in `megatron/core/inference/apis/`
 (`MegatronLLM` for sync, `MegatronAsyncLLM` for async + HTTP serving). For
 the API surface and mental model see
-[`megatron/inference/README.md`](../../megatron/inference/README.md).
+[`megatron/core/inference/README.md`](../../megatron/core/inference/README.md).
 
 The two top-level Python entrypoints cover all common workflows:
 
@@ -63,7 +63,7 @@ bash examples/inference/run_offline_inference.sh \
 All four modes produce numerically identical generated text. The high-level
 API rejects `--use-coordinator` with `--inference-repeat-n > 1` (engine
 reset is unsafe in coordinator mode — see
-[`megatron/inference/README.md`](../../megatron/inference/README.md)).
+[`megatron/core/inference/README.md`](../../megatron/core/inference/README.md)).
 
 ### OpenAI-compatible inference server
 
@@ -109,7 +109,7 @@ still target these scripts.
 
 ### See also
 
-- API reference: [`megatron/inference/README.md`](../../megatron/inference/README.md)
+- API reference: [`megatron/core/inference/README.md`](../../megatron/core/inference/README.md)
 - Low-level engine: [`megatron/core/inference/`](../../megatron/core/inference/)
 - Functional tests: `tests/functional_tests/test_cases/gpt/gpt_offline_inference_*` + `gpt_inference_server_smoke_*`
 - Unit tests: `tests/unit_tests/inference/high_level_api/`

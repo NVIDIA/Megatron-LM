@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import megatron.inference._llm_base as base_mod
-from megatron.inference.async_llm import MegatronAsyncLLM
+import megatron.core.inference.apis._llm_base as base_mod
+from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 
 
 @pytest.fixture

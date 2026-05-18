@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from megatron.inference.serve_config import ServeConfig
+from megatron.core.inference.apis.serve_config import ServeConfig
 
 
 class TestServeConfig:

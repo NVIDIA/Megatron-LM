@@ -53,9 +53,7 @@ class _EventLoopManager:
         # mapping is set on the main thread only.
         import torch
 
-        parent_device = (
-            torch.cuda.current_device() if torch.cuda.is_available() else None
-        )
+        parent_device = torch.cuda.current_device() if torch.cuda.is_available() else None
 
         loop_ready = threading.Event()
 
@@ -399,9 +397,7 @@ class _MegatronLLMBase:
     # loop to our runtime loop
 
     async def _generate_impl(
-        self,
-        prompts: Union[List[str], List[List[int]]],
-        sp: SamplingParams,
+        self, prompts: Union[List[str], List[List[int]]], sp: SamplingParams
     ) -> List["DynamicInferenceRequest"]:
         """Run inference for a non-empty list of prompts; returns input-ordered list.
 
@@ -465,4 +461,3 @@ class _MegatronLLMBase:
 
     async def _wait_for_shutdown_impl(self) -> None:
         await self._engine.engine_loop_task
-

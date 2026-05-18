@@ -4,11 +4,11 @@
 
 from typing import List, Optional, Union
 
+from megatron.core.inference.apis._llm_base import _MegatronLLMBase
+from megatron.core.inference.apis.serve_config import ServeConfig
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.inference._llm_base import _MegatronLLMBase
-from megatron.inference.serve_config import ServeConfig
 
 
 class MegatronAsyncLLM(_MegatronLLMBase):
@@ -166,12 +166,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         await self._loop_manager.run_async(self._shutdown_impl())
         self._loop_manager.stop()
 
-    async def serve(
-        self,
-        serve_config: ServeConfig,
-        *,
-        blocking: bool = True,
-    ) -> None:
+    async def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
         """Start the OpenAI-compatible HTTP frontend.
 
         Coordinator mode only. The HTTP frontend runs only on the primary
@@ -190,16 +185,14 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 the coordinator path).
         """
         if not self._use_coordinator:
-            raise ValueError(
-                "MegatronAsyncLLM.serve() requires use_coordinator=True"
-            )
+            raise ValueError("MegatronAsyncLLM.serve() requires use_coordinator=True")
 
         if self._is_primary_rank:
             # Lazy import: keep the module importable in environments where
             # the HTTP server backend (Quart/Hypercorn) isn't installed.
             import torch.distributed as dist
 
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (  # pylint: disable=line-too-long
                 start_text_gen_server,
             )
 

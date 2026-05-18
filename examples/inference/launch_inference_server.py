@@ -20,9 +20,9 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
+from megatron.core.inference.apis import MegatronAsyncLLM, ServeConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
-from megatron.inference import MegatronAsyncLLM, ServeConfig
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,

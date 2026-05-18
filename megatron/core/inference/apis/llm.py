@@ -4,10 +4,10 @@
 
 from typing import List, Optional, Union
 
+from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.inference._llm_base import _MegatronLLMBase
 
 
 class MegatronLLM(_MegatronLLMBase):
