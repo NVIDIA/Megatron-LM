@@ -1883,10 +1883,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             cur_param_end = bucket_state[i]['gbuf_local_end']
                         world_param_end = data_parallel_rank * gbuf_local_numel + cur_param_end
                         # Insert padding if there is a gap between next param,
-                        # but not exceeding unpadded gbuf size
-                        if (
-                            next_param_start != cur_param_end
-                            and world_param_end < gbuf_world_numel_unpadded
+                        # but not exceeding unpadded gbuf size.
+                        # For `use_dtensor_format`, the unpadded-boundary check is dropped so that
+                        # every DP rank's merged_data is exactly `gbuf_local_numel`. DTensor.from_local
+                        # with Shard(0) derives the global size as local_shape * dp_size on each rank,
+                        # so non-uniform local shapes (which happen on the last DP rank when the
+                        # unpadded boundary falls mid-slice) produce inconsistent global metadata and
+                        # trip DCP's `_validate_global_plan`.
+                        if next_param_start != cur_param_end and (
+                            use_dtensor_format or world_param_end < gbuf_world_numel_unpadded
                         ):
                             pad_tensors = {
                                 k: torch.empty(
