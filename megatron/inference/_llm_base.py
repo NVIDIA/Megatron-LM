@@ -36,8 +36,8 @@ class _EventLoopManager:
     """
 
     def __init__(self) -> None:
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
         self._started: bool = False
         self._stopped: bool = False
 
@@ -151,7 +151,7 @@ class _CoordinatorRuntime:
         self._is_primary = is_primary
         self._coordinator_host = coordinator_host
         self._coordinator_port = coordinator_port
-        self._client: "InferenceClient | None" = None
+        self._client: "Optional[InferenceClient]" = None
         self._coord_addr: Optional[str] = None
 
     async def setup(self, *, loop: asyncio.AbstractEventLoop) -> None:
@@ -213,7 +213,7 @@ class _CoordinatorRuntime:
                 proc.join(timeout=2)
 
     @property
-    def client(self) -> "InferenceClient | None":
+    def client(self) -> "Optional[InferenceClient]":
         """The :class:`InferenceClient` on the primary rank; ``None`` on workers."""
         return self._client
 
@@ -268,7 +268,6 @@ class _MegatronLLMBase:
 
         # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
         context = DynamicInferenceContext(model.config, inference_config)
-        # TODO: extend for non-GPT models in a future iteration.
         wrapper = GPTInferenceWrapper(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
         engine = DynamicInferenceEngine(controller=controller, context=context)
