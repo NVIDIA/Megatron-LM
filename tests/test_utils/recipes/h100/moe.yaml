@@ -151,6 +151,11 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts_etp1_ep4]
     products:
       # - environment: [dev]
@@ -204,6 +209,11 @@ products:
     products:
       - environment: [dev]
         scope: [mr-broken]
+        platforms: [dgx_h100]
+  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2_ep_overlap]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   #######################################################################
   # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
