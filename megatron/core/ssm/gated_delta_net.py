@@ -482,30 +482,13 @@ class GatedDeltaNet(MegatronModule):
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
-        # RMSNorm
-        nvtx_range_push(suffix="gated_norm")
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
-
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()
-
-        # CP all to all: HP to CP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
-            outputs = []
-            for norm_out_i in unpacked_norm_out:
-                norm_out_i = tensor_a2a_hp2cp(
-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                )
-                outputs.append(norm_out_i)
-            norm_out = torch.cat(outputs, dim=0)
-        else:
-            norm_out = tensor_a2a_hp2cp(
-                norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            norm_out = self.norm_out_checkpoint.checkpoint(
+                self._run_gated_norm_and_a2a, core_attn_out, gate, packed_seq_params
             )
+        else:
+            norm_out = self._run_gated_norm_and_a2a(core_attn_out, gate, packed_seq_params)
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
@@ -529,17 +512,35 @@ class GatedDeltaNet(MegatronModule):
         y = y.to(x_dtype)
         return y
 
-    def _run_gated_norm_and_a2a(self, core_attn_out: Tensor, gate: Tensor) -> Tensor:
+    def _run_gated_norm_and_a2a(
+        self, core_attn_out: Tensor, gate: Tensor, packed_seq_params
+    ) -> Tensor:
         nvtx_range_push(suffix="gated_norm")
         norm_out = self._apply_gated_norm(core_attn_out, gate)
         nvtx_range_pop(suffix="gated_norm")
 
-        batch, seq_len = gate.shape[:2]
-        norm_out = norm_out.reshape(batch, seq_len, -1).transpose(0, 1).contiguous()
+        batch, seq_len = norm_out.shape[:2]
 
-        norm_out = tensor_a2a_hp2cp(
-            norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-        )
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out = norm_out.reshape(batch, seq_len, -1)
+        norm_out = norm_out.transpose(0, 1).contiguous()
+
+        # CP all to all: HP to CP
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
+            outputs = []
+            for norm_out_i in unpacked_norm_out:
+                norm_out_i = tensor_a2a_hp2cp(
+                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+                )
+                outputs.append(norm_out_i)
+            norm_out = torch.cat(outputs, dim=0)
+        else:
+            norm_out = tensor_a2a_hp2cp(
+                norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+            )
+
         return norm_out
 
     @jit_fuser
