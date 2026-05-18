@@ -256,27 +256,46 @@ class TransformerConfig(ModelParallelConfig):
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
     attention_output_gate: bool = False
-    """Whether to apply output gate to the attention layers."""
+    """Whether to apply a full head_dim output gate to the attention layers.
+    The gate is fused into linear_qkv with an inline per-group [q, gate, k, v]
+    layout, contributing num_attention_heads * head_dim extra rows. The
+    sigmoid of the gate (head_dim values per head) is broadcast-multiplied
+    onto each head's attention output. Mutually exclusive with the related
+    `head_wise_attn_gate` flag, which fuses only a single SCALAR gate per
+    head (num_attention_heads rows) as trailing rows of linear_qkv; see
+    `head_wise_attn_gate` for the contrast."""
 
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
     SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
     the shared model-level rotary_pos_emb is not created."""
 
-    use_head_wise_attn_gate: bool = False
-    """Apply a per-head scalar output gate (e.g., Step-3.5-Flash g_proj).
+    head_wise_attn_gate: bool = False
+    """Apply a per-head SCALAR output gate (e.g., Step-3.5-Flash g_proj).
     The gate weights are fused into linear_qkv as the trailing
-    num_attention_heads rows; the sigmoid of those scalars gates each
-    attention head independently. Self-attention only: cross-attention
-    layers do not own linear_qkv, so the gate path does not apply there
+    num_attention_heads rows; the sigmoid of those scalars (one per
+    attention head) is broadcast-multiplied onto each head's attention
+    output, so head i is scaled uniformly across all head_dim positions.
+
+    Contrast with `attention_output_gate`:
+
+        attention_output_gate:
+            Full head_dim gate per head -> num_attention_heads * head_dim
+            extra rows, inline per-group [q, gate, k, v] layout. Each head's
+            output is element-wise gated across head_dim.
+        head_wise_attn_gate (this flag):
+            Single scalar gate per head -> num_attention_heads extra rows,
+            trailing-rows layout. Each head's output is scaled by one
+            sigmoid(gate) value.
+
+    The two flags are mutually exclusive (validated in __post_init__).
+    Self-attention only: cross-attention layers do not own linear_qkv, so
+    the gate path does not apply there
     (CrossAttention.get_query_key_value_tensors rejects the flag with an
-    explicit assertion). Distinct from attention_output_gate, which fuses
-    a full head_dim gate into linear_qkv with an inline per-group layout;
-    the two flags are mutually exclusive (validated in __post_init__).
-    Distributed checkpoint TP resharding is handled via a
-    ShardedTensorFactory in SelfAttention.sharded_state_dict that splits
-    linear_qkv.{weight,bias} into independent [QKV, gate] sub-tensors
-    (analogous to apply_swiglu_sharded_factory). Requires
+    explicit assertion). Distributed checkpoint TP resharding is handled
+    via a ShardedTensorFactory in SelfAttention.sharded_state_dict that
+    splits linear_qkv.{weight,bias} into independent [QKV, gate]
+    sub-tensors (analogous to apply_swiglu_sharded_factory). Requires
     num_attention_heads % tensor_model_parallel_size == 0 and
     num_query_groups >= tensor_model_parallel_size; both are validated in
     __post_init__."""
@@ -290,7 +309,7 @@ class TransformerConfig(ModelParallelConfig):
     identity once head_wise_attn_gate_init_bias is set. Kept on the same
     order of magnitude as QKV so the FP8 tensor-level scale on
     linear_qkv.weight isn't dominated by an under/over-scaled gate sub-block.
-    Only relevant when use_head_wise_attn_gate=True."""
+    Only relevant when head_wise_attn_gate=True."""
 
     head_wise_attn_gate_init_bias: float = 2.0
     """Constant value written to the gate rows of linear_qkv.bias right after
@@ -298,7 +317,7 @@ class TransformerConfig(ModelParallelConfig):
     sigmoid(2.0) ~= 0.88 at init -- approximately identity, so the gate
     does not halve every head's output from step 0 and add an extra
     optimization burden during warmup. Only relevant when
-    use_head_wise_attn_gate=True and the linear_qkv layer has a bias
+    head_wise_attn_gate=True and the linear_qkv layer has a bias
     (add_bias_linear=True or add_qkv_bias=True)."""
 
     test_mode: bool = False
@@ -1360,20 +1379,20 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        # use_head_wise_attn_gate layout/compose validation. Fails fast at
+        # head_wise_attn_gate layout/compose validation. Fails fast at
         # config time (before any layer is built) so users do not hit obscure
         # asserts deep inside the forward path.
-        if self.use_head_wise_attn_gate:
+        if self.head_wise_attn_gate:
             # (1) Mutual exclusion with attention_output_gate. Both flags
             #     append rows to linear_qkv: attention_output_gate uses an
             #     inline per-group (q, gate, k, v) layout, while
-            #     use_head_wise_attn_gate appends a trailing-rows block.
+            #     head_wise_attn_gate appends a trailing-rows block.
             #     The forward-time slicing paths assume each layout in
             #     isolation; their joint behavior is not currently tested
             #     or documented, so we refuse the combination outright.
             if self.attention_output_gate:
                 raise ValueError(
-                    "use_head_wise_attn_gate and attention_output_gate cannot both be "
+                    "head_wise_attn_gate and attention_output_gate cannot both be "
                     "enabled: each appends rows to linear_qkv with an incompatible "
                     "layout (per-group inline gate vs trailing-rows gate). Enable at "
                     "most one."
@@ -1384,7 +1403,7 @@ class TransformerConfig(ModelParallelConfig):
             #     with a gate-specific message so the failure mode is obvious.
             if self.num_attention_heads % self.tensor_model_parallel_size != 0:
                 raise ValueError(
-                    f"use_head_wise_attn_gate requires num_attention_heads "
+                    f"head_wise_attn_gate requires num_attention_heads "
                     f"({self.num_attention_heads}) to be divisible by "
                     f"tensor_model_parallel_size ({self.tensor_model_parallel_size}); "
                     f"otherwise the trailing num_attention_heads gate rows cannot be "
@@ -1400,7 +1419,7 @@ class TransformerConfig(ModelParallelConfig):
             #     Disallow the combination here.
             if self.num_query_groups < self.tensor_model_parallel_size:
                 raise ValueError(
-                    f"use_head_wise_attn_gate requires num_query_groups "
+                    f"head_wise_attn_gate requires num_query_groups "
                     f"({self.num_query_groups}) >= tensor_model_parallel_size "
                     f"({self.tensor_model_parallel_size}). The head-wise gate "
                     f"peel-off runs before the num_query_groups < world_size "

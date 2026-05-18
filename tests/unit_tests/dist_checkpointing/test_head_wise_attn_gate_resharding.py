@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""End-to-end dist-ckpt regression test for use_head_wise_attn_gate.
+"""End-to-end dist-ckpt regression test for head_wise_attn_gate.
 
 The forward path of SelfAttention peels the trailing
 num_attention_heads_per_partition rows off each rank's local linear_qkv tensor
@@ -48,7 +48,7 @@ def _make_config() -> TransformerConfig:
         # across the two TP configs.
         attention_dropout=0.0,
         hidden_dropout=0.0,
-        use_head_wise_attn_gate=True,
+        head_wise_attn_gate=True,
     )
 
 
