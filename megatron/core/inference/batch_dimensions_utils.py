@@ -244,9 +244,7 @@ class CUDAGraphBatchDimensionBuilder:
             # ~log2(max_tokens) steps with an extra +2 to leave headroom for dedup/trim.
             auto_n = max(4, int(math.log2(max(2, cuda_graph_max_tokens))) + 2)
             return CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
-                tp_size=tp_size,
-                num_cuda_graphs=auto_n,
-                cuda_graph_max_tokens=cuda_graph_max_tokens,
+                tp_size=tp_size, num_cuda_graphs=auto_n, cuda_graph_max_tokens=cuda_graph_max_tokens
             )
 
         assert num_cuda_graphs >= 1, f"num_cuda_graphs must be >= 1, got {num_cuda_graphs}"
@@ -274,7 +272,6 @@ class CUDAGraphBatchDimensionBuilder:
 
         # Exponentially decreasing, stops after num_cuda_graphs entries
         # or when below the minimum size.
-        # TODO(helenn/lmcafee): Extend upper range of distribution to be linearly-spaced.
         cuda_graph_token_counts = []
         val = cuda_graph_max_tokens
         for _ in range(num_cuda_graphs):
@@ -448,29 +445,45 @@ class CUDAGraphBatchDimensionBuilder:
                     token_count=token_count, prefill_req_count=0, decode_req_count=decode_req_count
                 )
         else:
-            # Mixed prefill and decode mode
+            # Mixed prefill and decode mode.
+            #
+            # Generate mixed CGs across a geometric P-grid rather than a single fixed P
+            # value. A captured graph at P=k bakes in a token layout for k prefill slots;
+            # a real batch with P != k pays for unused slot padding, which can overshoot
+            # the captured token_count and make the graph unusable. Geometric spacing
+            # bounds the relative overhead per real batch (worst case ~2x P slack) while
+            # keeping the total CG count log-bounded.
+            #
+            # `cuda_graph_mixed_prefill_request_count` is now used only as an on/off
+            # toggle for mixed CGs (>0 enables, <=0 routes to decode-only above). The
+            # P value it used to specify is superseded by the grid.
+            p_values = []
+            p = 1
+            while p < max_requests:
+                p_values.append(p)
+                p *= 2
+            if not p_values or p_values[-1] != max_requests:
+                p_values.append(max_requests)
+
             # Create prefill and mixed dimensions with full token counts
             for size in cuda_graph_prefill_token_counts:
                 assert size % tp_size == 0
-                prefill_req_count = min(cuda_graph_mixed_prefill_request_count, max_requests)
-                decode_req_count = max(
-                    0,
-                    min(
-                        (size - prefill_req_count) // (num_speculative_tokens + 1),
-                        max_requests - prefill_req_count,
-                    ),
-                )
-                add_if_valid(
-                    token_count=size,
-                    prefill_req_count=prefill_req_count,
-                    decode_req_count=decode_req_count,
-                )
+                for prefill_req_count in p_values:
+                    decode_req_count = max(
+                        0,
+                        min(
+                            (size - prefill_req_count) // (num_speculative_tokens + 1),
+                            max_requests - prefill_req_count,
+                        ),
+                    )
+                    add_if_valid(
+                        token_count=size,
+                        prefill_req_count=prefill_req_count,
+                        decode_req_count=decode_req_count,
+                    )
                 # We need to ensure the prefill requests are shorter than the max sequence length,
                 # considering the one decode token is used for prefill request construction
-                prefill_only_minimal_num = max(
-                    cuda_graph_mixed_prefill_request_count,
-                    math.ceil(size / max(1, max_sequence_length - 1)),
-                )
+                prefill_only_minimal_num = max(1, math.ceil(size / max(1, max_sequence_length - 1)))
                 if prefill_only_minimal_num < max_requests:
                     add_if_valid(
                         token_count=size,

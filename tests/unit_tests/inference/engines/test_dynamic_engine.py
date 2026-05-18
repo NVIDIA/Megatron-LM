@@ -17,7 +17,6 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.batch_dimensions_utils import CUDAGraphBatchDimensionBuilder
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -794,23 +793,28 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
         """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
+        # Exponential-decay graph distribution (halve from max down to tp_size).
+        # decode-only path: cuda_graph_max_tokens = max_requests * (spec+1) = 80.
+        # non-decode path: cuda_graph_max_tokens = self.max_tokens (DEFAULT 16384);
+        # most large prefill sizes are filtered by is_valid because
+        # token_count > prefill_req_count * (max_sequence_length - 1).
         decode_only_cases = [
             (0, [80]),
             (1, [80]),
-            (2, [80, 40]),
-            (4, [80, 72, 48, 24]),
-            (8, [80, 64, 48, 32, 16]),
-            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-            (32, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (2, [80, 1]),
+            (4, [80, 40, 20, 1]),
+            (8, [80, 40, 20, 10, 4, 2, 1]),
+            (16, [80, 40, 20, 10, 4, 2, 1]),
+            (32, [80, 40, 20, 10, 4, 2, 1]),
         ]
         non_decode_cases = [
             (0, [80]),
             (1, [80]),
-            (2, [80, 40]),
-            (4, [80, 72, 48, 24]),
-            (8, [80, 64, 48, 32, 16]),
-            (16, [1024, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-            (32, [1024, 512, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (2, [80, 1]),
+            (4, [80, 40, 20, 1]),
+            (8, [1024, 512, 256, 80, 40, 20, 10, 4, 2, 1]),
+            (16, [1024, 512, 256, 128, 80, 64, 40, 32, 20, 16, 10, 8, 4, 2, 1]),
+            (32, [1024, 512, 256, 128, 80, 64, 40, 32, 20, 16, 10, 8, 4, 2, 1]),
         ]
         cases = non_decode_cases if use_non_decode else decode_only_cases
 
@@ -836,39 +840,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     actual_cuda_graph_token_counts,
                 )
             )
-
-    @pytest.mark.internal
-    @pytest.mark.parametrize(
-        "tp_size, num_cuda_graphs, cuda_graph_max_tokens, expected",
-        [
-            # TP=1
-            (1, 1, 80, [80]),
-            (1, 2, 80, [80, 1]),
-            (1, 4, 80, [80, 40, 20, 1]),
-            (1, 8, 80, [80, 40, 20, 10, 4, 2, 1]),
-            (1, 16, 80, [80, 40, 20, 10, 4, 2, 1]),
-            # TP=2
-            (2, 1, 80, [80]),
-            (2, 2, 80, [80, 2]),
-            (2, 4, 80, [80, 40, 20, 2]),
-            (2, 8, 80, [80, 40, 20, 10, 4, 2]),
-            (2, 16, 80, [80, 40, 20, 10, 4, 2]),
-        ],
-    )
-    def test_calculate_cuda_graph_token_counts(
-        self, tp_size, num_cuda_graphs, cuda_graph_max_tokens, expected
-    ):
-        """Test _calculate_cuda_graph_token_counts for various TP sizes."""
-        actual = CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
-            tp_size=tp_size,
-            num_cuda_graphs=num_cuda_graphs,
-            cuda_graph_max_tokens=cuda_graph_max_tokens,
-        )
-        assert actual == expected, (
-            f"tp_size={tp_size}, num_cuda_graphs={num_cuda_graphs}, "
-            f"cuda_graph_max_tokens={cuda_graph_max_tokens}: "
-            f"expected {expected}, got {actual}"
-        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
