@@ -95,4 +95,5 @@ torchrun --nproc-per-node "$NPROC" \
     --inference-logging-step-interval 50 \
     --inference-dynamic-batching-num-cuda-graphs -1 \
     --cuda-graph-scope full_iteration_inference \
-    --inference-dynamic-batching-max-requests 256
+    --inference-dynamic-batching-max-requests 256 \
+    --return-log-probs

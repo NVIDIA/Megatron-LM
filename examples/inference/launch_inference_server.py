@@ -84,11 +84,6 @@ def main():
     if args.profile and args.nvtx_ranges:
         configure_nvtx_profiling(True)
 
-    # Required for lm-eval loglikelihood compatibility: keeps prompt logits
-    # materialized so echo=True / logprob requests work end-to-end. Matches
-    # tools/run_dynamic_text_generation_server.py.
-    args.return_log_probs = True
-
     tokenizer = build_tokenizer(args)
     model = get_model_for_inference()
     inference_config = get_inference_config_from_model_and_args(model, args)
