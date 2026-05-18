@@ -376,12 +376,12 @@ class DynamicInferenceEngine(AbstractEngine):
         time_start = time.time()
         torch.cuda.reset_peak_memory_stats()
         mem_stats_start = torch.cuda.memory_stats()
-        # Snapshot of process-wide stats for the "total memory used by capture"
-        # summary printed at the end of the loop.
+
+        # Snapshot of process-wide stats for the "total memory used by capture" summary.
         start_proc_reserved = mem_stats_start["reserved_bytes.all.current"]
         start_proc_alloc = mem_stats_start["allocated_bytes.all.current"]
-        # Pool-scoped baselines for the per-iteration deltas. These isolate
-        # actual CUDA-graph-mempool growth from unrelated scratch churn.
+
+        # Pool-scoped baselines for the per-iteration deltas.
         prev_pool_reserved, prev_pool_alloc = _cuda_graph_mempool_bytes()
 
         logging.info("> dynamic_engine.py: building cuda graphs for ")
