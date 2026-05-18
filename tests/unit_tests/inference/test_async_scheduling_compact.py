@@ -806,6 +806,7 @@ def test_dummy_async_handoff_mirrors_real_rank_launch(
         ("eligibility", reason)
     )
     controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
+    controller._wait_for_dummy_context_h2d = lambda: events.append("wait_h2d")
     controller._decide_ep_async_handoff = lambda **kwargs: events.append(
         ("handoff", kwargs)
     ) or EPAsyncHandoffDecision(
@@ -824,9 +825,25 @@ def test_dummy_async_handoff_mirrors_real_rank_launch(
     assert controller._try_launch_dummy_async_handoff() is expected_ok
     assert context.reset_count == expected_reset
     assert events.count("forward") == expected_forwards
+    assert events.count("wait_h2d") == expected_reset
     assert controller._async_forward_launch_count == expected_forwards
     if case == "handoff_skipped":
         assert ("disable", "ep async handoff skipped") in events
+
+
+@pytest.mark.internal
+def test_wait_for_dummy_context_h2d_synchronizes_once():
+    controller = object.__new__(TextGenerationController)
+    events = []
+    controller._dummy_context_h2d_done_event = SimpleNamespace(
+        synchronize=lambda: events.append("sync")
+    )
+
+    controller._wait_for_dummy_context_h2d()
+    controller._wait_for_dummy_context_h2d()
+
+    assert events == ["sync"]
+    assert controller._dummy_context_h2d_done_event is None
 
 
 @pytest.mark.internal

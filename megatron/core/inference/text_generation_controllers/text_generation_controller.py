@@ -209,6 +209,7 @@ class TextGenerationController:
         self._async_pending_h2d_done_event = None
         self._async_pending_sample_cuda_graph_request_count = None
         self._async_pending_forward_request_ids = None
+        self._dummy_context_h2d_done_event = None
         self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
@@ -773,7 +774,9 @@ class TextGenerationController:
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
         range_push("transfer_bookkeeping_to_gpu")
-        context.transfer_bookkeeping_to_gpu()
+        h2d_done_event = context.transfer_bookkeeping_to_gpu(record_done_event=is_dummy_forward)
+        if is_dummy_forward:
+            self._dummy_context_h2d_done_event = h2d_done_event
         range_pop()
 
         set_moe_metadata_sync(unwrapped_model)
@@ -1747,6 +1750,14 @@ class TextGenerationController:
             return
         self._decide_ep_async_handoff(has_real_work=has_real_work, can_launch_async_handoff=False)
 
+    def _wait_for_dummy_context_h2d(self) -> None:
+        """Wait for dummy metadata H2D before reusing its pinned CPU source buffer."""
+        h2d_done_event = self._dummy_context_h2d_done_event
+        if h2d_done_event is None:
+            return
+        h2d_done_event.synchronize()
+        self._dummy_context_h2d_done_event = None
+
     def _try_launch_dummy_async_handoff(self) -> bool:
         """Mirror the real-rank async forward handoff on an EP dummy rank."""
         context = self.inference_wrapped_model.inference_context
@@ -1762,6 +1773,7 @@ class TextGenerationController:
             self._record_async_disable_reason(self._async_disable_reason)
             return False
 
+        self._wait_for_dummy_context_h2d()
         context.reset()
         range_push("ep_dummy_async_handoff")
         try:
@@ -2736,10 +2748,7 @@ class TextGenerationController:
 
         self._try_launch_dummy_async_handoff()
 
-        # EP step completion is a protocol boundary. Dummy ranks have no CPU
-        # bookkeeping to naturally wait on GPU progress, so wait here before
-        # they advertise the work step as complete.
-        torch.cuda.current_stream().synchronize()
+        self._wait_for_dummy_context_h2d()
 
         # clear the context of any temporary state from the dummy forward
         context.reset()
