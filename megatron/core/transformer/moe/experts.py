@@ -175,6 +175,10 @@ class TEGroupedMLP(MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size

@@ -292,6 +292,10 @@ class Attention(MegatronModule, ABC):
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
 
         self.config = config
@@ -1383,6 +1387,10 @@ class SelfAttention(Attention):
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(
             config=config,
             submodules=submodules,
@@ -1795,6 +1803,10 @@ class CrossAttention(Attention):
         pg_collection: ProcessGroupCollection | None = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(
             config=config,
             submodules=submodules,

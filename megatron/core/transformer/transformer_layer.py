@@ -307,6 +307,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
 

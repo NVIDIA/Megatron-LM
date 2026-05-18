@@ -99,6 +99,7 @@ class GatedDeltaNet(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            name (str | None): module instance name passed top-down from its paranet module
         """
 
         if not HAVE_FLA:

@@ -110,6 +110,10 @@ class SharedExpertMLP(MLP):
         pg_collection: Optional[ProcessGroupCollection] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."

@@ -171,6 +171,10 @@ class MLP(MegatronModule):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
 
         self.config: TransformerConfig = config

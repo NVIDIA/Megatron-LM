@@ -746,6 +746,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         mamba_submodules: Optional[HybridStackSubmodules] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
@@ -1315,6 +1319,10 @@ class MultiTokenPredictionBlock(MegatronModule):
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:

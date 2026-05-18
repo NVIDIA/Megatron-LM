@@ -179,6 +179,10 @@ class MambaMixer(MegatronModule):
         pp_layer_offset: int = 0,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_MAMBA_SSM:
             raise ImportError(
                 "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."

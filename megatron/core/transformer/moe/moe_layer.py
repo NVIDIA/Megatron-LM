@@ -221,6 +221,10 @@ class MoELayer(BaseMoELayer):
         is_mtp_layer: bool = False,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         self.submodules = not_none(submodules)
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Initialize process groups with the global parallel_state.

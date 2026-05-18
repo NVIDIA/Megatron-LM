@@ -88,6 +88,10 @@ class HybridStack(MegatronModule):
         is_mtp_layer: bool = False,
         name: str | None = None,
     ) -> None:
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm

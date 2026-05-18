@@ -761,6 +761,10 @@ class TELinear(te.pytorch.Linear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1001,6 +1005,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         stride: int = 1,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1236,6 +1244,10 @@ class TEColumnParallelLinear(TELinear):
         stride: int = 1,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1346,6 +1358,10 @@ class TERowParallelLinear(TELinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1781,6 +1797,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             pg_collection: Optional[ProcessGroupCollection] = None,
             name: str | None = None,
         ):
+            """
+            Args:
+                name (str | None): module instance name passed top-down from its paranet module
+            """
             self.config = config
 
             # TE returns a zero length Tensor when bias=False and
@@ -2261,6 +2281,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             pg_collection: Optional[ProcessGroupCollection] = None,
             name: str | None = None,
         ):
+            """
+            Args:
+                name (str | None): module instance name passed top-down from its paranet module
+            """
             super().__init__(
                 num_gemms=num_gemms,
                 input_size=input_size,
@@ -2309,6 +2333,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             pg_collection: Optional[ProcessGroupCollection] = None,
             name: str | None = None,
         ):
+            """
+            Args:
+                name (str | None): module instance name passed top-down from its paranet module
+            """
             super().__init__(
                 num_gemms=num_gemms,
                 input_size=input_size,

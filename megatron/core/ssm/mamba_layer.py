@@ -74,7 +74,11 @@ class MambaLayer(GraphableMegatronModule):
         pp_layer_offset: int = 0,
         name: str | None = None,
     ):
-        """Initialize Mamba Layer."""
+        """Initialize Mamba Layer.
+
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config)
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
 
