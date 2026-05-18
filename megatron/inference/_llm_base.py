@@ -12,7 +12,6 @@ helpers, and the private ``_<method>_impl`` coroutines.
 import asyncio
 import concurrent.futures
 import threading
-import time
 from typing import Coroutine, List, Optional, Tuple, Union
 
 from megatron.core.inference.config import InferenceConfig
@@ -58,23 +57,23 @@ class _EventLoopManager:
             torch.cuda.current_device() if torch.cuda.is_available() else None
         )
 
+        loop_ready = threading.Event()
+
         def _run_loop() -> None:
             if parent_device is not None:
                 torch.cuda.set_device(parent_device)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             self._loop = loop
+            # Fires once run_forever() starts dispatching callbacks, so
+            # callers blocked on loop_ready.wait() resume only after the
+            # loop is actually running.
+            loop.call_soon(loop_ready.set)
             loop.run_forever()
 
         self._thread = threading.Thread(target=_run_loop, daemon=True)
         self._thread.start()
-
-        # Wait for the loop to be created and running before returning so
-        # callers can use ``submit`` immediately. Mirrors NeMo RL's polling
-        # approach.
-        while self._loop is None or not self._loop.is_running():
-            time.sleep(0.001)
-
+        loop_ready.wait()
         self._started = True
 
     @property
