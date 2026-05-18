@@ -1,15 +1,6 @@
-# Megatron Inference (High-Level API)
+# Megatron Inference
 
-High-level entry points over the `megatron.core.inference` dynamic
-engine. Hides `DynamicInferenceContext` + `GPTInferenceWrapper` +
-`TextGenerationController` + `DynamicInferenceEngine` construction,
-coordinator startup, and the per-instance background asyncio runtime behind
-two top-level classes: `MegatronLLM` (sync) and `MegatronAsyncLLM` (async,
-with HTTP serving via `serve()`).
-
-Use this package when you want the typical `llm.generate(prompts, ...)`
-ergonomic. Drop down to `megatron.core.inference` directly when you need
-manual `add_request` / `step_modern` control or step-level scheduling.
+Use `MegatronLLM` (sync) or `MegatronAsyncLLM` (async, with HTTP serving via `serve()`) for typical inference workflows. Both classes hide the underlying engine pipeline (`DynamicInferenceContext` + `GPTInferenceWrapper` + `TextGenerationController` + `DynamicInferenceEngine`) and provide a vLLM-style `generate(prompts, sampling_params)` API. Choose **direct mode** (`use_coordinator=False`) when you manage data sharding yourself; **coordinator mode** (`use_coordinator=True`) when you want the engine to route requests across data-parallel replicas (required for HTTP serving).
 
 ## Quickstart
 
@@ -51,15 +42,6 @@ async def main():
 
 asyncio.run(main())
 ```
-
-## Mental model
-
-| Class × `use_coordinator` | Use case |
-|---|---|
-| `MegatronLLM`, direct (default) | Offline batch on ranks the caller manages (DP sharding owned by user). Blocking. |
-| `MegatronLLM`, coordinator | Same offline workload with engine-managed DP routing + `pause`/`suspend`/`resume` lifecycle. |
-| `MegatronAsyncLLM`, direct | Same as sync direct but `await`-able. Single-caller in direct mode (concurrent `generate` raises). |
-| `MegatronAsyncLLM`, coordinator | Required for `serve()` and for RL-style persistent generators. |
 
 ## Public API
 
@@ -103,7 +85,10 @@ Planned new features:
 
 - **Server returns `"model": "EMPTY"`.** The HTTP frontend doesn't expose a `ServeConfig.model_name` to echo in `/v1/completions` / `/v1/chat/completions` responses, doesn't validate the request `model` field against a configured name, and exposes no `GET /v1/models` discovery endpoint. Clients can still pass any `model` in their request body — the dynamic server ignores it.
 
+## Low-level APIs
+
+For step-level control, custom forward-step integration, or migration from existing pipelines, drop down to the building blocks in this directory: `DynamicInferenceEngine` (manual `add_request` / `step_modern` stepping), `DynamicInferenceContext`, `TextGenerationController`, and the model inference wrappers under `model_inference_wrappers/`. Runnable examples live in [`examples/inference/advanced/`](../../examples/inference/advanced/): `gpt_dynamic_inference.py` (manual stepping), `gpt_dynamic_inference_with_coordinator.py` (explicit coordinator + `InferenceClient` lifecycle), `gpt_static_inference.py` (static engine), and `simple_t5_batch_inference.py` (T5).
+
 ## See also
 
 - Examples: [`examples/inference/offline_inference.py`](../../examples/inference/offline_inference.py) (4 modes via `--mode` / `--use-coordinator`), [`examples/inference/launch_inference_server.py`](../../examples/inference/launch_inference_server.py) (HTTP server).
-- Low-level engine: [`megatron/core/inference/`](../core/inference/).
