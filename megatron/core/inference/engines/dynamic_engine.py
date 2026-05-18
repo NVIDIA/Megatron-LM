@@ -44,7 +44,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.utils import Counter, InferenceMode, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
@@ -469,8 +469,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # NCCL workspaces, etc.) that pollutes `torch.cuda.memory_stats()`.
             pool_reserved, pool_alloc = _cuda_graph_mempool_bytes()
             logging.info(
-                "  [graph %d/%d] %s | pool reserved=%s (Δiter=%s) "
-                "pool allocated=%s (Δiter=%s)",
+                "  [graph %d/%d] %s | pool reserved=%s (Δiter=%s) " "pool allocated=%s (Δiter=%s)",
                 tbar_idx + 1,
                 len(context.cuda_graph_batch_dimensions_list),
                 cuda_graph_batch_dimension,
@@ -491,12 +490,8 @@ class DynamicInferenceEngine(AbstractEngine):
         final_pool_reserved, final_pool_alloc = _cuda_graph_mempool_bytes()
         capture_stats = {
             "time": time_end - time_start,
-            "allocated_bytes": (
-                mem_stats_end["allocated_bytes.all.current"] - start_proc_alloc
-            ),
-            "reserved_bytes": (
-                mem_stats_end["reserved_bytes.all.current"] - start_proc_reserved
-            ),
+            "allocated_bytes": (mem_stats_end["allocated_bytes.all.current"] - start_proc_alloc),
+            "reserved_bytes": (mem_stats_end["reserved_bytes.all.current"] - start_proc_reserved),
             "pool_reserved_bytes": final_pool_reserved,
             "pool_allocated_bytes": final_pool_alloc,
         }
