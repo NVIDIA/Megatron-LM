@@ -432,8 +432,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         return position_ids, attention_mask
 
     def _build_labels(tokens):
-        # Next-token labels with the (synthetic) final position set to pad so
-        # loss_func masks it out — we only have seq_len input tokens, not seq_len+1.
+        # Shift labels left and mask the synthetic final token as padding.
         labels = torch.empty_like(tokens)
         labels[:, :-1] = tokens[:, 1:]
         labels[:, -1] = pad_token_id
@@ -447,9 +446,10 @@ def auto_quantize_model(unwrapped_model, tokenizer):
             return model(tokens, position_ids, attention_mask, labels=labels)
         return model(tokens, position_ids, attention_mask)
 
+    # TODO(asma): use Megatron's dataset-provided loss mask here. The current
+    # label-based mask also drops real EOS tokens when pad_token == eos_token.
     def loss_func(output, batch):
-        # Mirror pretrain_gpt.loss_func: mask padding/EOS label positions and
-        # average over valid tokens. `output` is per-token CE [bsz, seq_len].
+        # Average per-token CE over non-padding next-token labels.
         labels = _build_labels(batch["input_ids"])
         loss_mask = (labels != pad_token_id).to(output.dtype)
         losses = output.float() * loss_mask
