@@ -5,6 +5,7 @@ import sys
 
 import pytest
 import torch
+from torch import Tensor
 
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -21,11 +22,13 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     roll_tensor,
 )
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -527,6 +530,53 @@ class TestMultiTokenPrediction:
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
 
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    def test_packed_sequences_with_full_recompute(self):
+        """MTP + packed sequences + full activation recomputation.
+
+        Regression: MTP._checkpointed_forward used to forward
+        ``packed_seq_params`` (a non-tensor PackedSeqParams object) directly
+        to ``tensor_parallel.checkpoint``. CheckpointFunction.save_for_backward
+        only accepts tensors and ``None``, so this raised
+        ``TypeError: save_for_backward can only save variables, but argument
+        N is of type PackedSeqParams``. Non-tensor kwargs must be captured
+        by closure, not forwarded as args.
+        """
+        seq_lengths = [16, 24, 12]
+        total_seq_length = sum(seq_lengths)
+
+        args = self.create_test_args(
+            tp=1, cp=1, sequence_length=total_seq_length, micro_batch_size=1, full_recompute=True
+        )
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+
+        batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+        gpt_model, _, _ = setup_model_and_optimizer(
+            self.model_provider, ModelType.encoder_or_decoder
+        )
+
+        output = gpt_model[0].forward(
+            input_ids=batch['tokens'],
+            position_ids=batch['position_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels'],
+            loss_mask=batch['loss_mask'],
+            packed_seq_params=batch['packed_seq_params'],
+        )
+
+        # Backward must run end-to-end through the recomputed MTP layer.
+        loss = output.mean()
+        loss.backward()
+
+        for name, param in gpt_model[0].named_parameters():
+            assert param.main_grad is not None, f"Gradient missing for {name}"
+
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp):
         """Test roll_tensor function with packed sequences, with and without CP.
@@ -606,6 +656,104 @@ class TestMultiTokenPrediction:
             ), f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n{rolled - expected}"
 
             # Verify sum is correct
+            assert sum_val.numel() == 1, "Sum should be a scalar"
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("cp", [1, 2])
+    def test_roll_tensor_with_packed_sequences_odd_seqlen(self, cp):
+        """Test roll_tensor with ODD packed seqlens.
+
+        For CP=1: per-sequence rolling on contiguous packed tensor — odd seqlens are fine
+                  with cu_seqlens_q alone (no padding required).
+        For CP=2: each per-sequence padded length must be a multiple of 2*cp_size, so odd
+                  seqlens require padding. The local THD-CP layout is determined by
+                  cu_seqlens_q_padded; the roll function must use the padded boundaries to
+                  index local chunks correctly. Without the padded boundaries, real tokens
+                  leak across sequence boundaries.
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group() if cp > 1 else None
+        cp_rank = torch.distributed.get_rank(group=cp_group) if cp_group is not None else 0
+
+        if cp == 1:
+            # Two odd-length sequences: [3, 5]. Total = 8.
+            tensor = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.float32).cuda()
+            cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32).cuda()
+
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=5,
+                max_seqlen_kv=5,
+                qkv_format='thd',
+            )
+
+            rolled, sum_val = roll_tensor(
+                tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+
+            # seq1 [1,2,3] -> [2,3,0]; seq2 [4,5,6,7,8] -> [5,6,7,8,0]
+            expected = torch.tensor([2, 3, 0, 5, 6, 7, 8, 0], dtype=torch.float32).cuda()
+            assert torch.equal(rolled, expected), f"Expected {expected}, got {rolled}"
+        else:
+            # Two ODD sequences padded up to multiples of 2*cp_size = 4:
+            #   seq1: real=[1..7] (len 7), padded with 0 -> [1,2,3,4,5,6,7,0] (len 8)
+            #   seq2: real=[11..21] (len 11), padded with 0 ->
+            #         [11,12,13,14,15,16,17,18,19,20,21,0] (len 12)
+            # Zigzag (4 chunks per padded seq, rank r owns chunks (r, 3-r)):
+            #   seq1 chunks: [1,2], [3,4], [5,6], [7,0]
+            #     rank 0 -> [1,2, 7,0];  rank 1 -> [3,4, 5,6]
+            #   seq2 chunks: [11,12,13], [14,15,16], [17,18,19], [20,21,0]
+            #     rank 0 -> [11,12,13, 20,21,0]; rank 1 -> [14,15,16, 17,18,19]
+            # Expected after roll(-1) within unpadded region (last real -> 0; pad stays 0):
+            #   seq1 rolled real: [2,3,4,5,6,7,0]; padded last -> 0
+            #   seq2 rolled real: [12,13,14,15,16,17,18,19,20,21,0]; padded last -> 0
+            # Re-zigzag the rolled+padded seqs:
+            #   seq1: [2,3], [4,5], [6,7], [0,0]
+            #     rank 0 -> [2,3, 0,0];  rank 1 -> [4,5, 6,7]
+            #   seq2: [12,13,14], [15,16,17], [18,19,20], [21,0,0]
+            #     rank 0 -> [12,13,14, 21,0,0]; rank 1 -> [15,16,17, 18,19,20]
+            if cp_rank == 0:
+                tensor = torch.tensor(
+                    [1, 2, 7, 0, 11, 12, 13, 20, 21, 0], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [2, 3, 0, 0, 12, 13, 14, 21, 0, 0], dtype=torch.float32
+                ).cuda()
+            else:
+                tensor = torch.tensor(
+                    [3, 4, 5, 6, 14, 15, 16, 17, 18, 19], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [4, 5, 6, 7, 15, 16, 17, 18, 19, 20], dtype=torch.float32
+                ).cuda()
+
+            # Unpadded cu_seqlens_q = [0, 7, 18]; padded = [0, 8, 20].
+            cu_seqlens = torch.tensor([0, 7, 18], dtype=torch.int32).cuda()
+            cu_seqlens_padded = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                cu_seqlens_kv_padded=cu_seqlens_padded,
+                max_seqlen_q=11,
+                max_seqlen_kv=11,
+                qkv_format='thd',
+            )
+
+            rolled, sum_val = roll_tensor(
+                tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+
+            assert (
+                rolled.shape == expected.shape
+            ), f"Shape mismatch: expected {expected.shape}, got {rolled.shape}"
+            assert torch.equal(
+                rolled, expected
+            ), f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n{rolled - expected}"
+
             assert sum_val.numel() == 1, "Sum should be a scalar"
 
         Utils.destroy_model_parallel()
@@ -926,3 +1074,282 @@ class TestMultiTokenPredictionHybrid:
                 pytest.fail(f"Attention mask validation failed for Mamba hybrid model: {e}")
             else:
                 raise
+
+
+class TestLearnedOutputContract:
+    """Tests for learned_output_contract: shape, dtype, gradient, and numerical correctness."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(_SEED)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_shape_and_dtype(self):
+        """Output shape is [*, h] from [*, n*h]; dtype matches input after fp32 round-trip."""
+        seq_len, batch_size, hidden_size, n_streams = 16, 2, 64, 4
+        head_fn = torch.randn(n_streams, n_streams * hidden_size, device='cuda')
+        base = torch.zeros(n_streams, device='cuda')
+        scale = torch.ones(1, device='cuda')
+
+        for dtype in [torch.bfloat16, torch.float16]:
+            hidden_states = torch.randn(
+                seq_len, batch_size, n_streams * hidden_size, device='cuda', dtype=dtype
+            )
+            output = learned_output_contract(
+                hidden_states, head_fn, base, scale, n_streams, eps=1e-6
+            )
+            assert output.shape == (seq_len, batch_size, hidden_size)
+            assert output.dtype == dtype
+
+    def test_gradient_and_numerical_correctness(self):
+        """Gradients flow to all inputs; output matches reference implementation."""
+        torch.manual_seed(_SEED)
+        seq_len, batch_size, hidden_size, n_streams = 2, 1, 8, 2
+        eps = 1e-6
+        hidden_states = torch.randn(
+            seq_len,
+            batch_size,
+            n_streams * hidden_size,
+            device='cuda',
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        head_fn = torch.randn(n_streams, n_streams * hidden_size, device='cuda', requires_grad=True)
+        base = torch.zeros(n_streams, device='cuda', requires_grad=True)
+        scale = torch.ones(1, device='cuda', requires_grad=True)
+
+        output = learned_output_contract(hidden_states, head_fn, base, scale, n_streams, eps)
+
+        # Numerical reference
+        hs_fp32 = hidden_states.detach().clone()
+        rsqrt_ref = torch.rsqrt(hs_fp32.square().mean(-1, keepdim=True) + eps)
+        mixes_ref = torch.nn.functional.linear(hs_fp32, head_fn.detach()) * rsqrt_ref
+        pre_ref = torch.sigmoid(mixes_ref * scale.detach() + base.detach()) + 1e-6
+        y_ref = torch.sum(
+            pre_ref.unsqueeze(-1) * hs_fp32.view(*hs_fp32.shape[:-1], n_streams, -1), dim=-2
+        )
+        torch.testing.assert_close(output, y_ref, rtol=1e-4, atol=1e-4)
+
+        # Gradient flow
+        output.sum().backward()
+        for name, tensor in [
+            ("hidden_states", hidden_states),
+            ("head_fn", head_fn),
+            ("base", base),
+            ("scale", scale),
+        ]:
+            assert tensor.grad is not None, f"No gradient for {name}"
+            assert not torch.all(tensor.grad == 0), f"Zero gradient for {name}"
+
+
+class TestMHCMTPIntegration:
+    """Integration tests for mHC + MTP: constructor, TransformerBlock output, E2E."""
+
+    def setup_method(self, method):
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        MTPLossLoggingHelper.tracker = {}
+
+    @pytest.mark.parametrize('tp', [1, 2])
+    def test_mtp_constructor_with_mhc(self, tp):
+        """MTP layers have e_proj/h_proj (not eh_proj) and learned contraction params."""
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            num_residual_streams=4,
+            enable_hyper_connections=True,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=True if tp > 1 else False,
+        )
+        spec = get_gpt_layer_local_spec(enable_hyper_connection=True)
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=spec, use_transformer_engine=False
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        n, h = config.num_residual_streams, config.hidden_size
+        for i in range(config.mtp_num_layers):
+            layer = mtp.layers[i]
+            assert layer.e_proj is not None and layer.h_proj is not None
+            assert layer.eh_proj is None
+            assert layer.e_proj.weight.shape == (h // tp, h)
+            assert layer.h_proj.weight.shape == (h // tp, h)
+            assert layer.hc_head_fn.shape == (n, n * h)
+            assert layer.hc_head_base.shape == (n,)
+            assert layer.hc_head_scale.shape == (1,)
+            if tp > 1:
+                assert getattr(layer.hc_head_fn, 'sequence_parallel', False)
+
+    def test_transformer_block_returns_tuple(self):
+        """With mHC+MTP the block returns (contracted, multistream); without MTP just a tensor."""
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(_SEED)
+        spec = get_gpt_layer_local_spec(enable_hyper_connection=True)
+
+        seq_len, batch_size, h, n = 16, 2, 64, 4
+
+        # With MTP: should return tuple
+        config_mtp = TransformerConfig(
+            num_layers=2,
+            hidden_size=h,
+            num_attention_heads=4,
+            enable_hyper_connections=True,
+            num_residual_streams=n,
+            use_cpu_initialization=True,
+            mtp_num_layers=2,
+        )
+        block_mtp = TransformerBlock(config_mtp, spec).cuda()
+        hidden_states = torch.randn(seq_len, batch_size, h, device='cuda', requires_grad=True)
+        output = block_mtp(hidden_states=hidden_states, attention_mask=None)
+
+        assert isinstance(output, tuple)
+        contracted, multistream = output
+        assert contracted.shape == (seq_len, batch_size, h)
+        assert multistream.shape == (seq_len, batch_size, n * h)
+
+        (contracted.sum() + multistream.sum()).backward()
+        assert hidden_states.grad is not None
+
+        # Without MTP: should return single tensor
+        config_no_mtp = TransformerConfig(
+            num_layers=2,
+            hidden_size=h,
+            num_attention_heads=4,
+            enable_hyper_connections=True,
+            num_residual_streams=n,
+            use_cpu_initialization=True,
+            mtp_num_layers=None,
+        )
+        block_no_mtp = TransformerBlock(config_no_mtp, spec).cuda()
+        hs2 = torch.randn(seq_len, batch_size, h, device='cuda')
+        output2 = block_no_mtp(hidden_states=hs2, attention_mask=None)
+        assert isinstance(output2, Tensor)
+        assert output2.shape == (seq_len, batch_size, h)
+
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("1.7.0"), reason="TransformerEngine >= 1.7.0 required"
+    )
+    @pytest.mark.parametrize('tp', [1, 2])
+    def test_e2e_forward_backward(self, tp):
+        """GPTModel E2E with mHC + MTP: finite output, MTP loss logged, gradients on HC params."""
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+
+        seq_length, micro_batch_size = 32, 2
+
+        sys.argv = ['test_multi_token_prediction.py']
+        args = parse_args()
+        args.num_layers = 2
+        args.mtp_num_layers = 2
+        args.mtp_loss_scaling_factor = 0.1
+        args.vocab_size = 128800
+        args.hidden_size = 128
+        args.num_attention_heads = 8
+        args.max_position_embeddings = 256
+        args.micro_batch_size = micro_batch_size
+        args.create_attention_mask_in_dataloader = True
+        args.seq_length = seq_length
+        args.tensor_model_parallel_size = tp
+        args.sequence_parallel = tp > 1
+        args.context_parallel_size = 1
+        args.position_embedding_type = 'rope'
+        args.num_experts = None
+        args.moe_grouped_gemm = False
+        args.train_iters = 1
+        args.lr = 3e-5
+        args.attention_dropout = 0.0
+        args.hidden_dropout = 0.0
+        args.add_bias_linear = False
+        args.swiglu = True
+        args.bf16 = True
+        args.enable_hyper_connections = True
+        args.num_residual_streams = 4
+        args.recompute_granularity = None
+
+        validate_args(args)
+        set_global_variables(args, False)
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+
+        def model_provider(
+            pre_process=True,
+            post_process=True,
+            layer_spec_fn=get_gpt_layer_with_transformer_engine_spec,
+            config=None,
+            pg_collection=None,
+            vp_stage=None,
+            **kwargs,
+        ):
+            model_parallel_cuda_manual_seed(_SEED)
+            a = get_args()
+            if config is None:
+                config = core_transformer_config_from_args(a)
+            layer_spec = layer_spec_fn(
+                a.num_experts,
+                a.moe_grouped_gemm,
+                a.qk_layernorm,
+                enable_hyper_connection=config.enable_hyper_connections,
+            )
+            mtp_spec = get_gpt_mtp_block_spec(
+                config=config, spec=layer_spec, use_transformer_engine=True
+            )
+            return GPTModel(
+                config=config,
+                transformer_layer_spec=layer_spec,
+                mtp_block_spec=mtp_spec,
+                vocab_size=a.vocab_size,
+                max_sequence_length=a.max_position_embeddings,
+                pre_process=pre_process,
+                post_process=post_process,
+                fp16_lm_cross_entropy=a.fp16_lm_cross_entropy,
+                parallel_output=True,
+                share_embeddings_and_output_weights=not a.untie_embeddings_and_output_weights,
+                position_embedding_type=a.position_embedding_type,
+                rotary_percent=a.rotary_percent,
+                pg_collection=pg_collection,
+                vp_stage=vp_stage,
+            )
+
+        gpt_model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
+
+        data = list(range(seq_length))
+        tokens = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = (1 + torch.tensor(data, dtype=torch.int64)).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, seq_length, seq_length), dtype=bool
+        ).cuda()
+        loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
+
+        output = gpt_model[0].forward(
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
+        assert torch.isfinite(output).all(), f"Non-finite output (TP={tp})"
+
+        tracker = MTPLossLoggingHelper.tracker
+        assert "values" in tracker, f"MTP loss not logged (TP={tp})"
+        assert torch.isfinite(tracker['values']).all()
+        MTPLossLoggingHelper.clean_loss_in_tracker()
+
+        output.mean().backward()
+        hc_param_names = ['hc_head_fn', 'hc_head_base', 'hc_head_scale']
+        for name, param in gpt_model[0].named_parameters():
+            assert param.main_grad is not None, f"No gradient for {name}"
+            if any(n in name for n in hc_param_names):
+                assert not torch.all(param.main_grad == 0), f"Zero gradient for {name}"
