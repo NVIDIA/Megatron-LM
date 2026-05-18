@@ -52,7 +52,7 @@ def test_userbuffer_tp_domains_overrides_and_restores_subgroup_enumeration():
     assert [group["ranks"] for group in groups] == [(0, 1), (4, 5, 6, 7)]
     assert groups[0]["kwargs"] == {"backend": "nccl", "group_desc": "UB_ntp_0"}
     assert groups[1]["kwargs"] == {"backend": "nccl", "group_desc": "UB_ntp_1"}
-    assert fake_dist.new_subgroups_by_enumeration is original_new_subgroups
+    assert fake_dist.new_subgroups_by_enumeration == original_new_subgroups
 
 
 def test_userbuffer_tp_domains_redirects_default_group_to_current_tp_group():
@@ -67,7 +67,7 @@ def test_userbuffer_tp_domains_redirects_default_group_to_current_tp_group():
         explicit_group = fake_dist.new_group(ranks=[0, 1], backend="nccl")
 
     assert explicit_group == {"ranks": (0, 1), "kwargs": {"backend": "nccl"}}
-    assert fake_dist.new_group is original_new_group
+    assert fake_dist.new_group == original_new_group
 
 
 def test_userbuffer_tp_domains_requires_current_rank_to_be_in_a_domain():
