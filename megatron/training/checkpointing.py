@@ -691,8 +691,13 @@ def save_checkpoint(
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     # Collect args, model, RNG.
+    # For LEGACY checkpoints, every unique (tp_rank, ep_rank) shard must be written by
+    # exactly one rank. Neither dp_rank==0 nor edp_rank==0 alone covers all shards when
+    # the dense and expert parallelism layouts disagree (e.g. TP > EP*ETP); the union
+    # does, with at most one rank per (tp_rank, ep_rank) inside any DP group.
     if (
         not torch.distributed.is_initialized()
+        or mpu.get_data_parallel_rank() == 0
         or mpu.get_expert_data_parallel_rank() == 0
         or ckpt_type != CheckpointType.LEGACY
     ):
@@ -1591,23 +1596,6 @@ def _load_base_checkpoint(
             )
         try:
             state_dict = torch.load(checkpoint_name, map_location='cpu')
-        except ModuleNotFoundError:
-            from megatron.legacy.fp16_deprecated import loss_scaler
-
-            # For backward compatibility.
-            if not rank0:
-                print_rank_0(' > deserializing using the old code structure ...')
-            sys.modules['fp16.loss_scaler'] = sys.modules[
-                'megatron.legacy.fp16_deprecated.loss_scaler'
-            ]
-            sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
-                'megatron.legacy.fp16_deprecated.loss_scaler'
-            ]
-            sys.modules['megatron.model'] = sys.modules['megatron.legacy.model']
-            state_dict = torch.load(checkpoint_name, map_location='cpu')
-            sys.modules.pop('fp16.loss_scaler', None)
-            sys.modules.pop('megatron.fp16.loss_scaler', None)
-            sys.modules.pop('megatron.model', None)
         except Exception as e:
             print('could not load the checkpoint')
             print(e)

@@ -26,7 +26,6 @@ from wandb import wandb_run
 
 from megatron.core import mpu
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,

@@ -167,9 +167,10 @@ eager mode. Example using `transformer_engine` (`local` works the same way):
 --cuda-graph-modules attn moe_router moe_preprocess
 ```
 
-With [paged stash](paged_stash.md), expert dispatch shapes become static (pre-sized via
-`--moe-expert-rank-capacity-factor`), which allows full-iteration CUDA graphs to be used on MoE
-models as well:
+With paged stash (currently available only on `dev`; see
+`docs/user-guide/features/paged_stash.md` on the `dev` branch), expert dispatch shapes become
+static (pre-sized via `--moe-expert-rank-capacity-factor`), which allows full-iteration CUDA
+graphs to be used on MoE models as well:
 
 ```bash
 --cuda-graph-impl full_iteration \
