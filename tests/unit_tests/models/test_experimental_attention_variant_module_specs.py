@@ -78,7 +78,6 @@ def _make_config(**overrides):
         moe_layer_freq=1,
         num_moe_experts=None,
         moe_grouped_gemm=False,
-        moe_use_legacy_grouped_gemm=False,
         use_te_activation_func=False,
         pipeline_model_parallel_size=1,
         pipeline_model_parallel_layout=None,

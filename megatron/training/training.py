@@ -155,7 +155,6 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import (
     StragglerDetector,
@@ -565,42 +564,68 @@ def num_floating_point_operations(args, batch_size):
             https://arxiv.org/abs/2305.10403
             https://arxiv.org/abs/2205.05198
             '''
-            ## MLA
-            if args.q_lora_rank is None:
-                q_term = (
-                    args.hidden_size
-                    * args.num_attention_heads
-                    * (args.qk_head_dim + args.qk_pos_emb_head_dim)
-                )
-            else:
+            if args.experimental_attention_variant == "dsv4_hybrid":
+                ## DSv4 hybrid MLA projections (per layer, per token).
+                ## In dsv4_hybrid mode, qk_head_dim + qk_pos_emb_head_dim == v_head_dim
+                ## (qk_head_dim is derived as v_head_dim - qk_pos_emb_head_dim), and the
+                ## joint KV is produced by a single hidden -> v_head_dim projection.
+                ## Full core attention is replaced by sparse attention and is accounted
+                ## for in the dsv4_hybrid branch below.
                 q_term = args.q_lora_rank * (
                     args.hidden_size
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
-                    + 1
+                    + 1  # q norm
                 )
-            standard_self_attn_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (
-                    ## q lora + rope + q norm
-                    q_term
-                    ## kv lora + rope + kv norm
-                    + args.kv_lora_rank
-                    * (
+                kv_term = args.hidden_size * args.v_head_dim + args.v_head_dim  # kv proj + kv norm
+                ## Grouped low-rank output projection:
+                ##  wo_a:        (n_head * v_head_dim) -> (o_groups * o_lora_rank)
+                ##  linear_proj: (o_groups * o_lora_rank) -> hidden
+                o_term = (
+                    args.num_attention_heads * args.v_head_dim * args.o_lora_rank
+                    + args.o_groups * args.o_lora_rank * args.hidden_size
+                )
+                standard_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (q_term + kv_term + o_term)
+                )
+            else:
+                ## MLA
+                if args.q_lora_rank is None:
+                    q_term = (
                         args.hidden_size
-                        + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
+                        * args.num_attention_heads
+                        * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                    )
+                else:
+                    q_term = args.q_lora_rank * (
+                        args.hidden_size
+                        + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                         + 1
                     )
-                    + args.hidden_size * args.qk_pos_emb_head_dim
-                    ## o proj
-                    + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
-                    ## core attn
-                    + args.seq_length
-                    * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2  # causal mask (only half of the mask is non-zero)
-                    + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                standard_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## q lora + rope + q norm
+                        q_term
+                        ## kv lora + rope + kv norm
+                        + args.kv_lora_rank
+                        * (
+                            args.hidden_size
+                            + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
+                            + 1
+                        )
+                        + args.hidden_size * args.qk_pos_emb_head_dim
+                        ## o proj
+                        + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                        ## core attn
+                        + args.seq_length
+                        * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
+                        / 2  # causal mask (only half of the mask is non-zero)
+                        + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                    )
                 )
-            )
 
         else:
             ## MHA or GQA
@@ -630,6 +655,7 @@ def num_floating_point_operations(args, batch_size):
                 )
             )
 
+        dsv4_hybrid_extra_term = 0
         if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
@@ -687,6 +713,91 @@ def num_floating_point_operations(args, batch_size):
                     "Invalid experimental_attention_variant: "
                     f"{args.experimental_attention_variant}"
                 )
+        elif args.experimental_attention_variant == "dsv4_hybrid":
+            # DSv4 hybrid: full core attention is replaced by sparse attention (CSA),
+            # and selected layers additionally run a learned indexer (DSA).
+            # The MLA-style projection cost per layer is captured in
+            # ``standard_self_attn_term`` above; here we add the extra per-layer FLOPs
+            # for sparse attention, the main compressor, and the indexer.
+            num_linear_attention_layers = 0
+            linear_self_attn_term = 0
+            num_standard_attention_layers = num_layers
+
+            compress_ratios = args.csa_compress_ratios
+            assert compress_ratios is not None, (
+                "csa_compress_ratios must be set for dsv4_hybrid"
+            )
+            assert len(compress_ratios) == num_layers, (
+                f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
+                f"expected num_layers + mtp_num_layers ({num_layers})."
+            )
+            # ratio == 0: window-only (no compressor, no indexer)
+            # ratio == 4: window + learned-topk over compressed KV (compressor + indexer)
+            # ratio == 128: window + all compressed KV (compressor only)
+            n_layers_r0 = sum(1 for r in compress_ratios if r == 0)
+            n_layers_r4 = sum(1 for r in compress_ratios if r == 4)
+            n_layers_r128 = sum(1 for r in compress_ratios if r == 128)
+
+            n_head = args.num_attention_heads
+            v_head_dim = args.v_head_dim
+            window = args.csa_window_size
+            seq_len = args.seq_length
+
+            # ---- Sparse attention (replaces full core attention) ----
+            # Per token per layer: n_head * (positions_attended) * v_head_dim, ×2 for
+            # QK^T and softmax @ V. Average valid positions account for the causal mask.
+            sparse_attn_r0 = n_layers_r0 * n_head * window * v_head_dim * 2
+            avg_comp_128 = (seq_len // 128) / 2
+            sparse_attn_r128 = n_layers_r128 * n_head * (window + avg_comp_128) * v_head_dim * 2
+
+            # ---- Main compressor (ratio > 0 layers) ----
+            # Two projections per layer (wkv + wgate): hidden -> coff * v_head_dim.
+            #   ratio == 4:   coff = 2 (overlapping windows)
+            #   ratio == 128: coff = 1 (non-overlapping)
+            main_compressor_term = (
+                n_layers_r4 * args.hidden_size * (2 * v_head_dim) * 2
+                + n_layers_r128 * args.hidden_size * (1 * v_head_dim) * 2
+            )
+
+            # ---- r=4 layers: sparse attention + indexer ----
+            # Indexer parameters are only required when at least one ratio==4 layer exists.
+            if n_layers_r4 > 0:
+                assert args.dsa_indexer_n_heads is not None, (
+                    "dsa_indexer_n_heads must be set for dsv4_hybrid with ratio==4 layers."
+                )
+                assert args.dsa_indexer_head_dim is not None, (
+                    "dsa_indexer_head_dim must be set for dsv4_hybrid with ratio==4 layers."
+                )
+                assert args.dsa_indexer_topk is not None, (
+                    "dsa_indexer_topk must be set for dsv4_hybrid with ratio==4 layers."
+                )
+                idx_n_heads = args.dsa_indexer_n_heads
+                idx_head_dim = args.dsa_indexer_head_dim
+                idx_topk = args.dsa_indexer_topk
+
+                effective_topk_4 = min(idx_topk, seq_len // 4)
+                avg_comp_4 = effective_topk_4 * (1 - effective_topk_4 * 4 / (2 * seq_len))
+                sparse_attn_r4 = n_layers_r4 * n_head * (window + avg_comp_4) * v_head_dim * 2
+
+                # Indexer's own compressor (coff=2, wkv + wgate), Q proj, weights proj,
+                # and scoring each query against the seq_len // 4 compressed positions.
+                indexer_term = (
+                    n_layers_r4 * args.hidden_size * (2 * idx_head_dim) * 2
+                    + n_layers_r4 * args.q_lora_rank * idx_n_heads * idx_head_dim
+                    + n_layers_r4 * args.hidden_size * idx_n_heads
+                    + n_layers_r4 * idx_n_heads * idx_head_dim * (seq_len // 4)
+                )
+            else:
+                sparse_attn_r4 = 0
+                indexer_term = 0
+
+            sparse_attn_term = sparse_attn_r0 + sparse_attn_r4 + sparse_attn_r128
+
+            dsv4_hybrid_extra_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * (sparse_attn_term + main_compressor_term + indexer_term)
+            )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -695,6 +806,7 @@ def num_floating_point_operations(args, batch_size):
         self_attn_term = (
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers
+            + dsv4_hybrid_extra_term
         )
 
         total_floating_point_operations = (
@@ -2442,6 +2554,8 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=args.num_layers + (args.mtp_num_layers or 0),
+            csa_compress_ratios=args.csa_compress_ratios,
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -3135,7 +3249,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+    if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
         )
@@ -3686,7 +3800,7 @@ def evaluate(
     eval_micro_batch_size = args.eval_micro_batch_size
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+    if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
         )
