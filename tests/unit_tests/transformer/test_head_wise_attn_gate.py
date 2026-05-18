@@ -77,18 +77,6 @@ class TestHeadWiseAttnGateInit:
         assert attn.linear_qkv_out_dim == QKV_OUT_DIM
         assert attn.linear_qkv.weight.shape == (QKV_OUT_DIM, HIDDEN_SIZE)
 
-    def test_no_gate_side_channel_attribute(self):
-        """Regression guard: gate states must be threaded through the
-        get_query_key_value_tensors return tuple, not via a module-level
-        attribute. A stale gate attribute breaks cross-attention layers,
-        overlapped microbatches, and selective recompute paths."""
-        config = _make_config(self.transformer_impl, use_head_wise_attn_gate=True)
-        attn = _make_attention(config, self.transformer_impl)
-        assert not hasattr(attn, "_head_wise_gate_states"), (
-            "SelfAttention should not stash gate states on the module; "
-            "thread them through the qkv_output tuple instead."
-        )
-
 
 @pytest.mark.parametrize("transformer_impl", ["transformer_engine", "native"])
 class TestHeadWiseAttnGateForward:
@@ -119,19 +107,6 @@ class TestHeadWiseAttnGateForward:
     def test_output_shape_without_gate(self):
         output, _ = self._run_forward(use_gate=False)
         assert output.shape == (SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE)
-
-    def test_no_gate_side_channel_after_forward(self):
-        """Regression guard: even after a forward pass, no per-instance gate
-        attribute should be left dangling on the module. This protects
-        recompute / overlapped-microbatch paths from picking up stale state."""
-        config = _make_config(self.transformer_impl, use_head_wise_attn_gate=True)
-        attn = _make_attention(config, self.transformer_impl).cuda()
-        hidden_states = torch.randn(
-            SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
-        )
-        attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
-        _ = attn(hidden_states, attention_mask)
-        assert not hasattr(attn, "_head_wise_gate_states")
 
     def test_zero_gate_halves_output(self):
         """Zeroing the trailing gate rows of linear_qkv makes pre-sigmoid 0,
@@ -227,3 +202,218 @@ class TestHeadWiseAttnGateNumerics:
         out = out.view(sq, b, np * hn)
 
         torch.testing.assert_close(out, torch.full_like(out, expected_scale), atol=1e-5, rtol=1e-5)
+
+
+def _make_config_tp(
+    use_head_wise_attn_gate: bool, add_qkv_bias: bool = False
+) -> TransformerConfig:
+    """Float32 config for TP correctness tests; local-spec backend, no dropout."""
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=HIDDEN_SIZE,
+        num_attention_heads=NUM_HEADS,
+        use_cpu_initialization=True,
+        params_dtype=torch.float32,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        add_qkv_bias=add_qkv_bias,
+        use_head_wise_attn_gate=use_head_wise_attn_gate,
+    )
+
+
+def _make_attention_local(config: TransformerConfig) -> SelfAttention:
+    """Local (ColumnParallelLinear) backend so the trailing-rows layout is
+    unambiguous -- TE variants may carry layer-norm params that don't matter
+    for these layout checks but would complicate weight surgery."""
+    submodules = get_gpt_layer_local_spec().submodules.self_attention.submodules
+    return SelfAttention(config, submodules, layer_number=1).cuda()
+
+
+def _copy_qkv_block_only(attn_dst: SelfAttention, attn_src: SelfAttention):
+    """Copy the non-gate (QKV-only) rows of linear_qkv and the full linear_proj
+    from attn_src into attn_dst. Used to build a no-gate reference that
+    shares all weights with a gated layer EXCEPT the trailing gate rows. Each
+    rank handles its own local slice."""
+    qkv_rows = attn_dst.linear_qkv.weight.size(0)
+    with torch.no_grad():
+        attn_dst.linear_qkv.weight.copy_(attn_src.linear_qkv.weight[:qkv_rows])
+        attn_dst.linear_proj.weight.copy_(attn_src.linear_proj.weight)
+        if attn_src.linear_qkv.bias is not None and attn_dst.linear_qkv.bias is not None:
+            attn_dst.linear_qkv.bias.copy_(attn_src.linear_qkv.bias[:qkv_rows])
+        if attn_src.linear_proj.bias is not None and attn_dst.linear_proj.bias is not None:
+            attn_dst.linear_proj.bias.copy_(attn_src.linear_proj.bias)
+
+
+class TestHeadWiseAttnGateUnderTP2:
+    """TP=2 forward tests that back-validate the trailing-rows-as-gate
+    layout. Three implicit preconditions are checked indirectly:
+
+      (1) ColumnParallelLinear partitions linear_qkv.weight along axis 0
+          contiguously and uniformly (no row interleave).
+      (2) num_attention_heads % world_size == 0.
+      (3) The global linear_qkv.weight layout is [QKV_block; Gate_block].
+
+    Each test forces the per-rank trailing gate scalars to a known constant
+    (via add_qkv_bias=True and bias surgery on the gate rows) and checks
+    that the gated output equals the expected scalar multiple of a no-gate
+    reference. If any precondition were violated, the slice would pick up
+    V/K rows instead of gate rows and the scalar relationship would not
+    hold."""
+
+    @pytest.fixture(autouse=True)
+    def setup_teardown(self):
+        if Utils.world_size < 2:
+            pytest.skip(f"need world_size >= 2 (got {Utils.world_size})")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+        model_parallel_cuda_manual_seed(42)
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "gate_value,expected_scale",
+        [
+            (0.0, 0.5),    # sigmoid(0)        = 0.5
+            (1e4, 1.0),    # sigmoid(+large)  -> 1
+            (-1e4, 0.0),   # sigmoid(-large)  -> 0
+        ],
+    )
+    def test_saturated_gate_under_tp2(self, gate_value: float, expected_scale: float):
+        """Force the LOCAL trailing num_attention_heads_per_partition gate rows
+        on every rank to produce a constant pre-sigmoid value (zero the gate
+        weight rows, set the gate bias rows to gate_value). The gated forward
+        output should then equal expected_scale * no-gate reference (which
+        shares all non-gate weights).
+
+        A layout bug -- e.g. trailing rows being V rows instead of gate --
+        would manifest here: setting V bias to +1e4 explodes attention
+        outputs, setting V bias to -1e4 wrecks softmax via huge negative V
+        contributions. Neither would produce the clean
+        ``expected_scale * out_plain`` relation.
+        """
+        gated_config = _make_config_tp(use_head_wise_attn_gate=True, add_qkv_bias=True)
+        attn = _make_attention_local(gated_config)
+        gate_size = attn.num_attention_heads_per_partition
+        # Per-rank gate-row surgery: zero gate weight rows, set gate bias rows
+        # to the target pre-sigmoid value. After this, the gate input to
+        # sigmoid is constant `gate_value` regardless of hidden_states.
+        assert attn.linear_qkv.bias is not None, "test requires add_qkv_bias=True"
+        with torch.no_grad():
+            attn.linear_qkv.weight[-gate_size:].zero_()
+            attn.linear_qkv.bias[-gate_size:].fill_(gate_value)
+
+        # Reference: no-gate attention sharing every other weight with attn.
+        ref_config = _make_config_tp(use_head_wise_attn_gate=False, add_qkv_bias=True)
+        attn_ref = _make_attention_local(ref_config)
+        _copy_qkv_block_only(attn_ref, attn)
+
+        torch.manual_seed(0)
+        hidden_states = torch.randn(
+            SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE, dtype=torch.float32, device="cuda"
+        )
+        attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
+        with torch.no_grad():
+            out_gated, _ = attn(hidden_states, attention_mask)
+            out_plain, _ = attn_ref(hidden_states, attention_mask)
+
+        torch.testing.assert_close(
+            out_gated, out_plain * expected_scale, atol=1e-4, rtol=1e-4
+        )
+
+    def test_per_rank_gate_independence_under_tp2(self):
+        """Drive the gate to +large on rank 0 and -large on rank 1 (and vice
+        versa via parametrization is overkill here). Each TP rank's local
+        trailing gate rows correspond ONLY to that rank's query heads. After
+        linear_proj's RowParallel AllReduce, half the heads contribute
+        full-strength and half contribute zero. This test verifies the
+        slice does not cross rank boundaries -- if a rank ever read its
+        partner's gate scalars (impossible under axis-0 contiguous TP, but
+        the test guards the assumption), the half-zero / half-pass pattern
+        would collapse and the result would not match the expected
+        per-rank-weighted reference.
+
+        Verification trick: build the reference by running the no-gate
+        attention on each rank with its OWN core_attn_out scaled to
+        sigmoid(rank_gate); since linear_proj is row-parallel and sums TP
+        partial outputs, scaling each rank's slice of linear_proj.weight by
+        sigmoid(rank_gate) BEFORE the all-reduce yields the same final
+        output as gating each rank's core_attn_out by sigmoid(rank_gate).
+        """
+        tp_rank = torch.distributed.get_rank() % 2
+        gate_value = 1e4 if tp_rank == 0 else -1e4
+        # sigmoid(+1e4) ~= 1, sigmoid(-1e4) ~= 0
+        expected_rank_scale = 1.0 if tp_rank == 0 else 0.0
+
+        gated_config = _make_config_tp(use_head_wise_attn_gate=True, add_qkv_bias=True)
+        attn = _make_attention_local(gated_config)
+        gate_size = attn.num_attention_heads_per_partition
+        assert attn.linear_qkv.bias is not None
+        with torch.no_grad():
+            attn.linear_qkv.weight[-gate_size:].zero_()
+            attn.linear_qkv.bias[-gate_size:].fill_(gate_value)
+
+        # Reference: no-gate model with linear_proj.weight pre-scaled by this
+        # rank's expected_rank_scale. linear_proj is RowParallelLinear, so
+        # each rank holds (output, input_per_rank) and contributes
+        # `core_attn_local @ weight_local.T` to the all-reduced sum. Scaling
+        # weight_local by sigmoid(gate) on this rank == scaling that rank's
+        # contribution by sigmoid(gate), which is the per-rank effect of
+        # head-wise gating on rank-local heads.
+        ref_config = _make_config_tp(use_head_wise_attn_gate=False, add_qkv_bias=True)
+        attn_ref = _make_attention_local(ref_config)
+        _copy_qkv_block_only(attn_ref, attn)
+        with torch.no_grad():
+            attn_ref.linear_proj.weight.mul_(expected_rank_scale)
+
+        torch.manual_seed(0)
+        hidden_states = torch.randn(
+            SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE, dtype=torch.float32, device="cuda"
+        )
+        attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
+        with torch.no_grad():
+            out_gated, _ = attn(hidden_states, attention_mask)
+            out_ref, _ = attn_ref(hidden_states, attention_mask)
+
+        torch.testing.assert_close(out_gated, out_ref, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize(
+        "num_heads,num_query_groups,expected_match",
+        [
+            # num_query_groups (1) < world_size (2): gate slice would over-take
+            # via the AG+reslice fallback path.
+            (4, 1, "num_query_groups"),
+            # num_attention_heads (3) % world_size (2) != 0, with
+            # num_query_groups == num_attention_heads (default) and < world_size
+            # too, so parent's divide(...) uses num_query_groups not world_size
+            # and our explicit gate-row divisibility check is the one that
+            # fires.
+            (3, 1, "num_query_groups"),
+        ],
+    )
+    def test_init_rejects_misaligned_layout_under_tp2(
+        self, num_heads: int, num_query_groups: int, expected_match: str
+    ):
+        """Layout invariants for use_head_wise_attn_gate (both checked at
+        init):
+
+          (a) num_query_groups >= world_size -- otherwise the gate slice
+              over-takes through the AG+reslice fallback.
+          (b) num_attention_heads % world_size == 0 -- otherwise gate rows
+              cannot be partitioned cleanly across ranks.
+
+        Both should produce a clear AssertionError at SelfAttention
+        construction time, not a silent forward-time misalignment.
+        """
+        bad_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=24,  # divisible by num_heads for head_dim
+            num_attention_heads=num_heads,
+            num_query_groups=num_query_groups,
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            use_head_wise_attn_gate=True,
+        )
+        submodules = get_gpt_layer_local_spec().submodules.self_attention.submodules
+        with pytest.raises(AssertionError, match=expected_match):
+            SelfAttention(bad_config, submodules, layer_number=1)

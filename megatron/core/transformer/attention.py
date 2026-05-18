@@ -1516,7 +1516,40 @@ class SelfAttention(Attention):
         if self.config.use_head_wise_attn_gate:
             # Fuse per-head scalar gate (Step-3.5-Flash g_proj) into linear_qkv.
             # Gate rows are appended after the QKV block, so the trailing
-            # num_attention_heads rows of linear_qkv.weight are the gate weights.
+            # num_attention_heads rows of linear_qkv.weight are the gate
+            # weights. Two layout invariants must hold for the forward-time
+            # peel-off (in get_query_key_value_tensors) to pick up actual gate
+            # rows on every rank; enforce both at init so the failure mode is
+            # a clear constructor error rather than a silent "wrong rows =
+            # gate" misalignment during training.
+            tp_world_size = get_pg_size(self.pg_collection.tp)
+            # (a) num_query_groups >= world_size: the head-wise gate slice
+            #     runs BEFORE the num_query_groups < world_size AllGather +
+            #     reslice fallback in get_query_key_value_tensors. Under that
+            #     fallback, num_attention_heads_per_partition is inflated to
+            #     num_attention_heads / num_query_groups (the pre-AG count),
+            #     which is larger than the actual per-rank gate scalar count
+            #     (num_attention_heads / world_size). The slice would then
+            #     take V/K rows as gate. Disallow the combination outright.
+            assert self.config.num_query_groups >= tp_world_size, (
+                f"use_head_wise_attn_gate requires num_query_groups "
+                f"({self.config.num_query_groups}) >= tensor-model-parallel "
+                f"world_size ({tp_world_size}). The gate peel-off happens "
+                f"before the num_query_groups < world_size AllGather + "
+                f"reslice path; under that fallback the gate slice would "
+                f"over-take and pick up V/K rows instead of gate rows."
+            )
+            # (b) num_attention_heads % world_size == 0: each rank must
+            #     carry an integer number of gate scalars. (Redundant with
+            #     parent's divide(num_attention_heads, world_size) under
+            #     invariant (a), but kept for an explicit error message.)
+            assert self.config.num_attention_heads % tp_world_size == 0, (
+                f"use_head_wise_attn_gate requires num_attention_heads "
+                f"({self.config.num_attention_heads}) to be divisible by the "
+                f"tensor-model-parallel world_size ({tp_world_size}); the "
+                f"trailing-rows-as-gate layout cannot place an integer number "
+                f"of gate rows on every rank otherwise."
+            )
             self.linear_qkv_out_dim += self.config.num_attention_heads
         self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
@@ -1682,15 +1715,39 @@ class SelfAttention(Attention):
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
 
-        # Peel off the fused per-head gate (use_head_wise_attn_gate). Under TP,
-        # ColumnParallelLinear splits the trailing num_attention_heads rows
-        # uniformly, so each rank gets num_attention_heads_per_partition gate
-        # scalars at the tail of mixed_qkv's last dim. Requires that both
-        # num_query_groups and num_attention_heads be divisible by tp world_size
-        # so the QKV and gate sub-ranges stay aligned per rank. The gate
-        # tensor is returned through the tuple at the end of this function;
-        # we slice it before any further reshape/AG so the trailing-dim
-        # arithmetic for the QKV path stays unchanged.
+        # Peel off the fused per-head gate (use_head_wise_attn_gate). The slice
+        # takes the trailing num_attention_heads_per_partition columns of the
+        # local mixed_qkv and treats them as one scalar gate per local query
+        # head. This is only correct when ALL THREE of the following hold:
+        #
+        #   1. The linear_qkv backend (ColumnParallelLinear /
+        #      TELayerNormColumnParallelLinear / TEColumnParallelLinear)
+        #      partitions weight axis 0 contiguously and uniformly across TP
+        #      with no row interleave or stride reordering. If a backend ever
+        #      adds row interleave, the trailing columns of the local
+        #      activation are NOT the trailing rows of linear_qkv.weight, and
+        #      the slice silently picks V/K rows instead -- no shape error.
+        #   2. num_attention_heads % tp_world_size == 0, so every rank carries
+        #      an integer number of gate scalars. Enforced at init time in
+        #      SelfAttention.__init__; see the assert there.
+        #   3. The global linear_qkv.weight layout is [QKV_block; Gate_block]
+        #      (gate strictly after QKV). The dist-ckpt path preserves this
+        #      under TP resharding via apply_head_wise_attn_gate_sharded_factory
+        #      in SelfAttention.sharded_state_dict; without that factory, save
+        #      TP=N -> load TP=M would re-balance the QKV/gate boundary and
+        #      break precondition (3) on the loaded ranks.
+        #
+        # The peel runs BEFORE the num_query_groups < world_size AllGather +
+        # reslice branch below, so the gate does not participate in that
+        # fallback. That is safe because the gate has exactly
+        # num_attention_heads scalars (matches the partition count under
+        # precondition 2), not a per-group head_dim block; the per-rank
+        # alignment for the gate is independent of the kv-group reshuffle the
+        # AllGather path performs for the QKV block.
+        #
+        # The gate tensor is returned through the tuple at the end of this
+        # function; we slice it before any further reshape/AG so the
+        # trailing-dim arithmetic for the QKV path stays unchanged.
         head_wise_gate_states = None
         if head_wise_gate:
             gate_size = self.num_attention_heads_per_partition
