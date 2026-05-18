@@ -57,5 +57,5 @@ products:
   - test_case: [gpt_grpo_tp8tp4_pp1_ep8ep2_dp8_throughputtest]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L1]
         platforms: [dgx_h100]

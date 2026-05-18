@@ -48,5 +48,5 @@ products:
   - test_case: [moe_perf]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [L1]
         platforms: [dgx_h100]

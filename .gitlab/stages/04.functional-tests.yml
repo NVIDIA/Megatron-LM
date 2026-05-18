@@ -69,13 +69,15 @@ functional:configure:
       # NOTE: $FUNCTIONAL_TEST_SCOPE is supplied by external scheduled-pipeline
       # configurations and uses the GitLab-side legacy values: `mr`, `mr-slim`,
       # `nightly`, `weekly`, `unit-tests`, `release`.
-      #   - `mr` / `mr-slim` / `unit-tests` / `release` pass through verbatim
-      #     and match recipe rows tagged with the same string. They are
-      #     intentionally NOT aliased (see LEGACY_SCOPE_ALIASES in
-      #     tests/test_utils/python_scripts/recipe_parser.py) so the GitLab
-      #     and GitHub matrices stay decoupled.
-      #   - `nightly` / `weekly` are aliased to L2 / L3 by the parser and also
-      #     inject a default cadence when the recipe has no explicit one.
+      #
+      # Recipes have been rewritten to the unified L-tier vocabulary
+      # (`L0`/`L1`/`L2`/`L3`); the parser's LEGACY_SCOPE_ALIASES map
+      # (tests/test_utils/python_scripts/recipe_parser.py) transparently
+      # resolves these legacy values:
+      #   - `mr-slim` -> `L0`, `mr` -> `L1`
+      #   - `nightly` -> `L2`, `weekly` -> `L3`
+      # `unit-tests` and `release` are not aliased and continue to match recipe
+      # rows tagged with the same string verbatim.
       ARGS=(
         "--scope $FUNCTIONAL_TEST_SCOPE"
         "--n-repeat $FUNCTIONAL_TEST_REPEAT"

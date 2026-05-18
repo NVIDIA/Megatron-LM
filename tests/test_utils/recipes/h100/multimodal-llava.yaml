@@ -61,10 +61,10 @@ products:
   - test_case: [multimodal_llava_mcore_te_tp1_pp1]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L1]
         platforms: [dgx_h100]
   - test_case: [multimodal_llava_mcore_te_tp4_sp_cp2]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L1]
         platforms: [dgx_h100]

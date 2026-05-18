@@ -63,5 +63,5 @@ products:
   - test_case: [gpt_dynamic_inference_cuda_graphs_pad_tp4_pp1_ep4_16B_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L1]
         platforms: [dgx_h100]

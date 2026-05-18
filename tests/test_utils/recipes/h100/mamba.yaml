@@ -58,7 +58,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [L1]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -66,7 +66,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp1_pp4_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [L1]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -74,7 +74,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp1_pp2_vpp2_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [L1]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -82,7 +82,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [L1]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -90,7 +90,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp4_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [L1]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]

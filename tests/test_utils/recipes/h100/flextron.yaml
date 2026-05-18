@@ -58,5 +58,6 @@ products:
   - test_case: [hybrid_flextron_nightly_tp2_pp1_ep2_dgx_h100_1N8G]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [L2]
+        cadence: [nightly]
         platforms: [dgx_h100]

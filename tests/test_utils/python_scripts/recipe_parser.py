@@ -20,18 +20,18 @@ ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE) | {"weekly"}
 # trigger, a default cadence. The tier acts purely as a suite/cost label;
 # cadence remains the trigger axis.
 #
-# Only GitHub-side scopes (`mr-github-slim`, `mr-github`) are aliased onto the
-# L-tier names. GitLab-only scopes (`mr`, `mr-slim`, `unit-tests`) are
-# intentionally left as pass-through so GitLab `--scope mr*` / `--scope
-# unit-tests` continue to match recipes verbatim and don't bleed into the
-# GitHub L0 / L1 matrix.
+# Both GitHub-side (`mr-github`, `mr-github-slim`) and GitLab-side (`mr`,
+# `mr-slim`) legacy scope names are aliased onto the unified L-tier vocabulary
+# so a single recipe row tagged `scope: [L1]` is matched by both GitHub's
+# `--scope L1` filter and GitLab's `--scope mr` filter (the latter via this
+# alias). `unit-tests` is left as a pass-through value so the GitLab unit-test
+# stage continues to match `scope: [unit-tests]` verbatim. `*-broken`,
+# `deprecated`, and `flaky` are not aliased — they exist solely as
+# documentation markers on disabled tests.
 LEGACY_SCOPE_ALIASES = {
-    # GitHub-only scopes are aliased onto the L-tier vocabulary so the GH CI
-    # workflow can filter on `L0` / `L1`. GitLab-only scopes (`mr`, `mr-slim`)
-    # are intentionally NOT aliased: they pass through to recipe rows verbatim
-    # and remain matchable by GitLab's `--scope mr-slim` / `--scope mr` calls,
-    # without bleeding into the GitHub `L0` / `L1` matrix.
+    "mr-slim": ("L0", None),
     "mr-github-slim": ("L0", None),
+    "mr": ("L1", None),
     "mr-github": ("L1", None),
     "nightly": ("L2", ["nightly"]),
     "weekly": ("L3", ["weekly"]),
