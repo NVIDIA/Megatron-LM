@@ -744,9 +744,17 @@ class TorchDistSaveShardedStrategy:
     ):
         """Each async strategy can be trivially used as a sync strategy."""
         if use_dtensor_format:
+            # `inject_placeholders` returns a *flat* dict keyed by each ShardedBase/DTensor's
+            # `.key`. Saving that flat dict directly makes DCP record FQNs that are equal to
+            # mcore `.key` strings, which is what `_determine_missing_and_unexpected_keys`
+            # compares against on load. If we instead re-nested via `fill_placeholders` and
+            # let DCP's `DefaultSavePlanner(flatten_state_dict=True)` join dict-paths with
+            # dots, the FQNs would diverge from mcore keys (e.g. `model.decoder...` vs
+            # `decoder...`, numeric-index optimizer paths vs explicit `dp_group_idx_/gbuf_idx_/
+            # bucket_idx_/dtype_` names), every key would be flagged unexpected, and
+            # `adjust_non_strict_load` would prune the entire state dict.
             values_to_save = inject_placeholders(sharded_state_dict)
             values_to_save = convert_state_dict_to_dcp_compatible(values_to_save)
-            fill_placeholders(sharded_state_dict, values_to_save)
             # With PP > 1 different pipeline stages hold different parameters that
             # share the same local optimizer-state index (e.g. "state.1.exp_avg_sq").
             # Wrapping each stage's dict under a "ppN" key gives every stage a unique
@@ -756,9 +764,9 @@ class TorchDistSaveShardedStrategy:
             pp_size = mpu.get_pipeline_model_parallel_world_size()
             if pp_size > 1:
                 pp_rank = mpu.get_pipeline_model_parallel_rank()
-                dcp_state_dict = {f"pp{pp_rank}": sharded_state_dict}
+                dcp_state_dict = {f"pp{pp_rank}": values_to_save}
             else:
-                dcp_state_dict = sharded_state_dict
+                dcp_state_dict = values_to_save
             return torch.distributed.checkpoint.save(dcp_state_dict, checkpoint_id=checkpoint_dir)
         else:
             async_request = self.async_save(
@@ -984,21 +992,26 @@ class TorchDistLoadShardedStrategy:
         Returns: loaded state dict
         """
         if use_dtensor_format:
+            # Mirror the save side: pass DCP a flat dict keyed by mcore `.key`. DCP's
+            # metadata FQNs were written that way, so the lookup matches. After DCP load
+            # populates the DTensors (which alias the original ShardedTensor `.data`),
+            # `fill_placeholders` restores the user-visible nested structure and
+            # `unwrap_dtensors_and_sh_ten` collapses DTensors back to local tensors.
             values_to_load = inject_placeholders(sharded_state_dict)
             values_to_load = convert_state_dict_to_dcp_compatible(values_to_load)
-            fill_placeholders(sharded_state_dict, values_to_load)
 
             from megatron.core import parallel_state as mpu
 
             pp_size = mpu.get_pipeline_model_parallel_world_size()
             if pp_size > 1:
                 pp_rank = mpu.get_pipeline_model_parallel_rank()
-                dcp_state_dict = {f"pp{pp_rank}": sharded_state_dict}
+                dcp_state_dict = {f"pp{pp_rank}": values_to_load}
             else:
-                dcp_state_dict = sharded_state_dict
+                dcp_state_dict = values_to_load
             torch.distributed.checkpoint.load(
                 state_dict=dcp_state_dict, checkpoint_id=checkpoint_dir
             )
+            fill_placeholders(sharded_state_dict, values_to_load)
             unwrap_dtensors_and_sh_ten(sharded_state_dict)
 
             return sharded_state_dict
