@@ -67,7 +67,7 @@ models/index
 
 user-guide/features/moe
 user-guide/features/context_parallel
-user-guide/features/custom_fsdp
+user-guide/features/megatron_fsdp
 user-guide/features/dist_optimizer
 user-guide/features/optimizer_cpu_offload
 user-guide/features/pipeline_parallel_layout

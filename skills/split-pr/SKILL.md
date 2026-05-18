@@ -1,6 +1,7 @@
 ---
 name: split-pr
-description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups. Use when the user asks to split a PR, reduce reviewer groups, or break up a large PR.
+description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups.
+when_to_use: User asks to split a PR, reduce reviewer groups, or break up a large PR; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed'.
 user_invocable: true
 argument: "<pr-url-or-number>"
 ---

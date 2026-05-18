@@ -25,6 +25,7 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.core.utils import configure_nvtx_profiling
 
 # pylint: disable=line-too-long
 
@@ -208,6 +209,7 @@ if __name__ == "__main__":
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
         initialize_megatron()
+        configure_nvtx_profiling(True)
 
         tokenizer = get_tokenizer()
 

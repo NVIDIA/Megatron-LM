@@ -19,7 +19,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1339,12 +1339,31 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
+    # CUTLASS kernel for grouped GEMM assumes 256 alignment.
+    if config.use_transformer_engine_op_fuser:
+        return 256
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
-    elif config.fp4:
+    if config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
     # Only FP8 or FP4 requires padding. Defaults to 0.
     return 0
+
+
+def skip_routed_expert_padding(config: TransformerConfig) -> bool:
+    """Whether the expert module should skip quantization padding.
+
+    Returns True when padding is already applied by the router or the
+    HybridEP dispatcher.
+    """
+    if config.moe_router_padding_for_quantization:
+        return True
+    if (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+    ):
+        return True
+    return False
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -1515,13 +1534,13 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         ):
             if (
                 step_condition == "route"
-                and CudaGraphScope.moe_router in moe_layer.config.cuda_graph_scope
-                and CudaGraphScope.moe_preprocess not in moe_layer.config.cuda_graph_scope
+                and CudaGraphModule.moe_router in moe_layer.config.cuda_graph_modules
+                and CudaGraphModule.moe_preprocess not in moe_layer.config.cuda_graph_modules
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "route", **kwargs)
             elif (
                 step_condition == "preprocess"
-                and CudaGraphScope.moe_preprocess in moe_layer.config.cuda_graph_scope
+                and CudaGraphModule.moe_preprocess in moe_layer.config.cuda_graph_modules
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "preprocess", **kwargs)
 
