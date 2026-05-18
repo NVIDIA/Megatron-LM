@@ -205,9 +205,15 @@ class TestHeadWiseAttnGateNumerics:
 
 
 def _make_config_tp(
-    use_head_wise_attn_gate: bool, add_qkv_bias: bool = False
+    use_head_wise_attn_gate: bool,
+    add_qkv_bias: bool = False,
+    **extra: object,
 ) -> TransformerConfig:
-    """Float32 config for TP correctness tests; local-spec backend, no dropout."""
+    """Float32 config for TP correctness tests; local-spec backend, no dropout.
+
+    Extra TransformerConfig kwargs (e.g. head_wise_attn_gate_init_*) can be
+    passed through ``extra``.
+    """
     return TransformerConfig(
         num_layers=1,
         hidden_size=HIDDEN_SIZE,
@@ -218,6 +224,7 @@ def _make_config_tp(
         hidden_dropout=0.0,
         add_qkv_bias=add_qkv_bias,
         use_head_wise_attn_gate=use_head_wise_attn_gate,
+        **extra,
     )
 
 
@@ -417,3 +424,110 @@ class TestHeadWiseAttnGateUnderTP2:
         submodules = get_gpt_layer_local_spec().submodules.self_attention.submodules
         with pytest.raises(AssertionError, match=expected_match):
             SelfAttention(bad_config, submodules, layer_number=1)
+
+
+class TestHeadWiseAttnGateInitMagnitude:
+    """Verify the init-time surgery on the gate sub-block:
+
+      - With default knobs and a bias-enabled linear_qkv, sigmoid(gate)
+        sits near 1 at init (approximate identity) -- NOT 0.5, which
+        was the previous behavior and halved every head's output during
+        warmup.
+      - The two TransformerConfig knobs
+        (head_wise_attn_gate_init_weight_scale,
+        head_wise_attn_gate_init_bias) actually flow into the surgery:
+        setting both to 0 reproduces the old sigmoid(0)=0.5 behavior.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(42)
+        yield
+        Utils.destroy_model_parallel()
+
+    def _run_pair(self, gated_config: TransformerConfig) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build a gated attention with `gated_config`, a no-gate reference
+        sharing all QKV weights, and run both forwards on a fixed input."""
+        attn = _make_attention_local(gated_config)
+        ref_config = _make_config_tp(use_head_wise_attn_gate=False, add_qkv_bias=True)
+        attn_ref = _make_attention_local(ref_config)
+        _copy_qkv_block_only(attn_ref, attn)
+
+        torch.manual_seed(0)
+        hidden_states = torch.randn(
+            SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE, dtype=torch.float32, device="cuda"
+        )
+        attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
+        with torch.no_grad():
+            out_gated, _ = attn(hidden_states, attention_mask)
+            out_plain, _ = attn_ref(hidden_states, attention_mask)
+        return out_gated, out_plain
+
+    def test_default_init_is_near_identity(self):
+        """Default knobs (weight_scale=0.1, bias=2.0) drive sigmoid(gate) to
+        sigmoid(2.0) ~= 0.88 at init, so the gated output is ~0.88 * no-gate
+        reference -- NOT the 0.5 halving that the shared init_method would
+        give. Also assert the near-identity scaling is closer to the truth
+        than the half-scaling, so a regression that drops the init surgery
+        (e.g. someone reverts the if-block in SelfAttention.__init__) is
+        caught even if the absolute tolerance is loose."""
+        gated_config = _make_config_tp(use_head_wise_attn_gate=True, add_qkv_bias=True)
+        out_gated, out_plain = self._run_pair(gated_config)
+
+        expected_scale = torch.sigmoid(
+            torch.tensor(gated_config.head_wise_attn_gate_init_bias)
+        ).item()
+        # Loose tolerance: the gate weight contribution (gate_weight @ hidden)
+        # is not literally zero, just small after the 0.1 scale, so
+        # sigmoid(2.0 + small) deviates slightly from sigmoid(2.0) per
+        # position/head.
+        torch.testing.assert_close(
+            out_gated, out_plain * expected_scale, atol=5e-2, rtol=5e-2
+        )
+        near_id_err = (out_gated - out_plain * expected_scale).abs().mean().item()
+        half_err = (out_gated - out_plain * 0.5).abs().mean().item()
+        assert near_id_err < half_err, (
+            f"Default gate init is no longer near identity: "
+            f"|gated - sigmoid({gated_config.head_wise_attn_gate_init_bias})*plain|="
+            f"{near_id_err:.4g} >= |gated - 0.5*plain|={half_err:.4g}. Did the "
+            f"init-time surgery in SelfAttention.__init__ get dropped?"
+        )
+
+    def test_init_knobs_reproduce_half_scaling(self):
+        """Setting both knobs to 0 should reproduce the old sigmoid(0)=0.5
+        behavior, confirming both flow into the init surgery (not silently
+        ignored)."""
+        gated_config = _make_config_tp(
+            use_head_wise_attn_gate=True,
+            add_qkv_bias=True,
+            head_wise_attn_gate_init_weight_scale=0.0,
+            head_wise_attn_gate_init_bias=0.0,
+        )
+        out_gated, out_plain = self._run_pair(gated_config)
+        torch.testing.assert_close(out_gated, out_plain * 0.5, atol=1e-4, rtol=1e-4)
+
+    def test_init_preserves_fp8_friendly_gate_magnitude(self):
+        """Gate weight rows should stay on the same order of magnitude as QKV
+        weight rows after the init surgery, so the shared FP8 tensor-level
+        scale on linear_qkv.weight isn't dominated by the gate sub-block.
+
+        With weight_scale=0.1 default, the gate rows are ~10x smaller than
+        QKV but still within the same dynamic range (FP8 E4M3 / E5M2 cover
+        ~6 decades of magnitude, so a 1-decade gap is harmless).
+        """
+        gated_config = _make_config_tp(use_head_wise_attn_gate=True, add_qkv_bias=True)
+        attn = _make_attention_local(gated_config)
+        gate_rows = attn.linear_qkv.weight[-attn.num_attention_heads_per_partition:]
+        qkv_rows = attn.linear_qkv.weight[: -attn.num_attention_heads_per_partition]
+        gate_std = gate_rows.float().std().item()
+        qkv_std = qkv_rows.float().std().item()
+        # Gate std should be ~0.1 * qkv std (because we mul_'d by 0.1) and
+        # definitely not 0 (which would zero the gate sub-block in FP8).
+        assert gate_std > 0, "gate weight rows zero-initialized -- FP8 underflow risk"
+        ratio = gate_std / qkv_std
+        assert 0.05 < ratio < 0.5, (
+            f"gate_std / qkv_std = {ratio:.3f}, expected close to "
+            f"head_wise_attn_gate_init_weight_scale (0.1). Gate magnitudes "
+            f"too far from QKV may break the FP8 shared tensor scale."
+        )

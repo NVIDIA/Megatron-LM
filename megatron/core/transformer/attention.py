@@ -1564,6 +1564,37 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
         )
 
+        if self.config.use_head_wise_attn_gate:
+            # Re-initialize the gate sub-block of linear_qkv so sigmoid(gate)
+            # is near 1 at init (approximate identity), instead of the
+            # sigmoid(0)=0.5 that the default shared init_method gives. With
+            # a half-strength gate from step 0, every head's output is
+            # halved during warmup and the optimizer carries an extra burden
+            # to recover identity. Scale the gate rows by a small factor
+            # (default 0.1) rather than zero-init so:
+            #   - gate weight magnitudes stay on the same order as QKV,
+            #     keeping the shared FP8 tensor-level scale on
+            #     linear_qkv.weight from being dominated by a near-zero
+            #     gate sub-block;
+            #   - the gate is not literally constant at init (some signal
+            #     from the linear part still flows).
+            # The bias rows (when present) are filled with a positive
+            # constant (default 2.0, sigmoid(2.0)~=0.88) to bias the
+            # sigmoid toward 1 at init. When linear_qkv has no bias, only
+            # the weight scaling applies and the gate sits near 0.5 (still
+            # better than the bias-free default in expectation, though not
+            # identity).
+            # Both knobs are exposed on TransformerConfig:
+            # head_wise_attn_gate_init_weight_scale,
+            # head_wise_attn_gate_init_bias.
+            num_heads_per_partition = self.num_attention_heads_per_partition
+            with torch.no_grad():
+                gate_weight = self.linear_qkv.weight[-num_heads_per_partition:]
+                gate_weight.mul_(self.config.head_wise_attn_gate_init_weight_scale)
+                if self.linear_qkv.bias is not None:
+                    gate_bias = self.linear_qkv.bias[-num_heads_per_partition:]
+                    gate_bias.fill_(self.config.head_wise_attn_gate_init_bias)
+
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.
         if self.config.qk_l2_norm:

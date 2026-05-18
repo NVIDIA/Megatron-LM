@@ -276,6 +276,26 @@ class TransformerConfig(ModelParallelConfig):
     kv_projection_size and num_attention_heads must be divisible by every TP
     world_size used for save/load."""
 
+    head_wise_attn_gate_init_weight_scale: float = 0.1
+    """Multiplicative scale applied to the gate rows of linear_qkv.weight right
+    after construction, on top of the shared init_method (which is normal
+    init for QKV). Defaults to 0.1 so the gate's pre-sigmoid contribution
+    from the linear part is small at init (~10x smaller than QKV's), making
+    sigmoid(gate*x + bias) dominated by the gate bias term and so close to
+    identity once head_wise_attn_gate_init_bias is set. Kept on the same
+    order of magnitude as QKV so the FP8 tensor-level scale on
+    linear_qkv.weight isn't dominated by an under/over-scaled gate sub-block.
+    Only relevant when use_head_wise_attn_gate=True."""
+
+    head_wise_attn_gate_init_bias: float = 2.0
+    """Constant value written to the gate rows of linear_qkv.bias right after
+    construction (no-op when linear_qkv has no bias). Defaults to 2.0 so
+    sigmoid(2.0) ~= 0.88 at init -- approximately identity, so the gate
+    does not halve every head's output from step 0 and add an extra
+    optimization burden during warmup. Only relevant when
+    use_head_wise_attn_gate=True and the linear_qkv layer has a bias
+    (add_bias_linear=True or add_qkv_bias=True)."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
