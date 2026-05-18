@@ -948,7 +948,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # then int32 token fields, then int32/float32 request-staging fields.
         #   token_to_input_ids                         (int64,   max_tokens)
         #   token_to_pos_ids                           (int64,   max_tokens)
-        #   token_to_block_idx                         (int32,   max_tokens)
+        #   token_to_block_idx                         (int64,   max_tokens)
         #   token_to_local_position_within_kv_block    (int32,   max_tokens)
         #   token_to_request_idx                       (int32,   max_tokens)
         #   token_to_position_in_request               (int32,   max_tokens)
@@ -1004,8 +1004,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_conv_seq_idx_bytes = 0
             _mamba_conv_seq_start_bytes = 0
         _total_bytes = (
-            2 * _tok_int64_bytes
-            + 4 * _tok_int32_bytes
+            3 * _tok_int64_bytes
+            + 3 * _tok_int32_bytes
             + 7 * _req_4byte_bytes
             + _mha_query_lengths_bytes
             + _mha_cu_query_seq_lengths_bytes
@@ -1042,10 +1042,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             torch.long
         )
         _off += _tok_int64_bytes
-        self.token_to_block_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int32_bytes].view(
-            torch.int32
+        self.token_to_block_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int64_bytes].view(
+            torch.int64
         )
-        _off += _tok_int32_bytes
+        _off += _tok_int64_bytes
         # i.e For a set of tokens A B C D E F ..  and block_size 4:
         # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]

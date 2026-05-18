@@ -37,8 +37,8 @@ class ContextGPUView:
         #   fields, then int32 request fields, then int32 MHA fields, then
         #   int32 Mamba fields (hybrid models only; omitted when
         #   max_mamba_chunks == 0).
-        tok_int64_bytes = max_tokens * 8  # 2 fields of int64 = 8 bytes/elem
-        tok_int32_bytes = max_tokens * 4  # 4 fields of int32 = 4 bytes/elem
+        tok_int64_bytes = max_tokens * 8  # 3 fields of int64 = 8 bytes/elem
+        tok_int32_bytes = max_tokens * 4  # 3 fields of int32 = 4 bytes/elem
         # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
         # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
         # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
@@ -91,8 +91,8 @@ class ContextGPUView:
             mamba_conv_seq_start_bytes = 0
 
         total_bytes = (
-            2 * tok_int64_bytes
-            + 4 * tok_int32_bytes
+            3 * tok_int64_bytes
+            + 3 * tok_int32_bytes
             + 7 * req_4byte_bytes
             + mha_query_lengths_bytes
             + mha_cu_query_seq_lengths_bytes
@@ -119,8 +119,8 @@ class ContextGPUView:
         off += tok_int64_bytes
         self.token_to_pos_ids = self._buf[off : off + tok_int64_bytes].view(torch.long)
         off += tok_int64_bytes
-        self.token_to_block_idx = self._buf[off : off + tok_int32_bytes].view(torch.int32)
-        off += tok_int32_bytes
+        self.token_to_block_idx = self._buf[off : off + tok_int64_bytes].view(torch.int64)
+        off += tok_int64_bytes
         self.token_to_local_position_within_kv_block = self._buf[off : off + tok_int32_bytes].view(
             torch.int32
         )
