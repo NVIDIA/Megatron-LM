@@ -279,6 +279,9 @@ class DistributedDataParallel(_BaseDataParallel):
             ), "Cannot average in collective when calculating per-token loss!"
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
+            ########## FlagScale Begin ##########
+            engram_embedding_gradient_scaling_factor = 1.0
+            ########## FlagScale End ##########
         else:
             # The goal is to scale reduced gradients by 1/dp_size.
             # This can be achieved in two ways:
