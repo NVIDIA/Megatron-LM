@@ -97,3 +97,24 @@ class TestEventLoopManager:
             assert called == []
         finally:
             mgr.stop()
+
+    def test_run_sync_raises_inside_running_event_loop(self):
+        """Guard against the deadlock when sync methods are called from
+        inside an asyncio event loop (e.g., a coroutine on any loop)."""
+        import asyncio
+
+        mgr = _EventLoopManager()
+        mgr.start()
+        try:
+
+            async def inner():
+                return 42
+
+            async def caller():
+                # We're inside a running loop here; run_sync must refuse.
+                mgr.run_sync(inner())
+
+            with pytest.raises(RuntimeError, match="cannot be called from inside"):
+                asyncio.run(caller())
+        finally:
+            mgr.stop()
