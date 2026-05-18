@@ -40,7 +40,6 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
@@ -163,18 +162,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 "1F1B overlap with FSDP does not support double buffer. "
                 "Please set fsdp_double_buffer=False in the ddp config."
             )
-            if config.cuda_graph_impl not in ["none", "full_iteration"]:
-                partial_cuda_graph_scopes = [
-                    scope
-                    for scope in config.cuda_graph_scope
-                    if scope
-                    not in (CudaGraphScope.full_iteration, CudaGraphScope.full_iteration_inference)
-                ]
-                assert not partial_cuda_graph_scopes, (
-                    "1F1B overlap with FSDP does not support partial CUDA graph scopes "
-                    f"({partial_cuda_graph_scopes}). "
-                    "Please use cuda_graph_scope='full' or disable CUDA graphs."
-                )
+            assert config.cuda_graph_impl in ("none", "full_iteration"), (
+                "1F1B overlap with FSDP does not support per-layer CUDA graphs "
+                f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
+                "Use cuda_graph_impl='full_iteration' or disable CUDA graphs "
+                "(cuda_graph_impl='none')."
+            )
 
         if (
             config.overlap_moe_expert_parallel_comm
