@@ -8,7 +8,7 @@ from typing import Optional, Protocol
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -496,7 +496,7 @@ class MoELayer(BaseMoELayer):
                         apply_module(self.shared_experts),
                         False,
                         tensor_parallel.random.get_cuda_rng_tracker,
-                        parallel_state.get_tensor_model_parallel_group(),
+                        self.tp_group,
                         hidden_states,
                     )
                 else:
@@ -636,7 +636,7 @@ class MoELayer(BaseMoELayer):
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
-                # like cuda_graph_scope=["moe_router", "moe_preprocess"].
+                # like cuda_graph_modules=["moe_router", "moe_preprocess"].
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
@@ -671,7 +671,7 @@ class MoELayer(BaseMoELayer):
                     custom_forward,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    self.tp_group,
                     hidden_states,
                     intermediate_tensors,
                     padding_mask,
