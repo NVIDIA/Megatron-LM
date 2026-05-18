@@ -609,6 +609,9 @@ class PretrainConfigContainer(ConfigContainerBase):
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
         else:
             # Iteration-based training
+            assert self.train.global_batch_size is not None and self.train.global_batch_size > 0, (
+                "global_batch_size must be set and positive for iteration-based training"
+            )
             if self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
             if self.scheduler.lr_wsd_decay_iters is None and self.scheduler.lr_decay_style == "WSD":
