@@ -1669,6 +1669,12 @@ class SelfAttention(Attention):
             mixed_qkv, head_wise_gate_states = torch.split(
                 mixed_qkv, [mixed_qkv.size(-1) - gate_size, gate_size], dim=-1
             )
+            # torch.split on the last dim leaves non-contiguous views: the
+            # outer-dim stride still spans the original (QKV+gate) width, so
+            # downstream key.view(sk, b*np, hn) in dot_product_attention would
+            # fail with "view size is not compatible with input tensor's size
+            # and stride." Materialize a contiguous QKV slab here.
+            mixed_qkv = mixed_qkv.contiguous()
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
