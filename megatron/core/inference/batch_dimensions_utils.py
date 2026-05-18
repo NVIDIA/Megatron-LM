@@ -476,10 +476,11 @@ class CUDAGraphBatchDimensionBuilder:
                             max_requests - prefill_req_count,
                         ),
                     )
-                    # Skip pure-prefill shapes where each prefill request has <= 1 token. The model
-                    # has no prompt to attend over so the graph isn't useful and it triggers a
-                    # vectorized_gather_kernel OOB at capture time when token_count == 1.
-                    if decode_req_count == 0 and size <= prefill_req_count:
+                    # Skip token_count == 1 with prefill_req == 1: the gather kernel asserts
+                    # on index >= 1 against a 1-element tensor at capture time. Larger
+                    # `(size, size, 0)` shapes (each prefill = 1 token, total batch >= 2) are
+                    # fine because the gather has multiple indices to read.
+                    if size < 2:
                         continue
                     add_if_valid(
                         token_count=size,
@@ -489,15 +490,11 @@ class CUDAGraphBatchDimensionBuilder:
                 # We need to ensure the prefill requests are shorter than the max sequence length,
                 # considering the one decode token is used for prefill request construction
                 prefill_only_minimal_num = max(1, math.ceil(size / max(1, max_sequence_length - 1)))
-                if prefill_only_minimal_num < max_requests:
+                if prefill_only_minimal_num < max_requests and size >= 2:
                     prefill_req_count = max(prefill_only_minimal_num, min(max_requests, size))
-                    # Do not add invalid cases (see above for note on prefill shapes).
-                    if size > prefill_req_count:
-                        add_if_valid(
-                            token_count=size,
-                            prefill_req_count=prefill_req_count,
-                            decode_req_count=0,
-                        )
+                    add_if_valid(
+                        token_count=size, prefill_req_count=prefill_req_count, decode_req_count=0
+                    )
 
             # Create decode-only dimensions with optimized token counts
             for size in cuda_graph_decode_token_counts:
