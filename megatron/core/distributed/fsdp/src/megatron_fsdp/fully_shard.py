@@ -23,6 +23,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 
 from .megatron_fsdp import MegatronFSDP
+from .mixed_precision import MixedPrecisionPolicy
 from .uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .utils import FSDPDistributedIndex, create_updated_function_signature
 
@@ -80,18 +81,19 @@ def fully_shard_model(
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
+    fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+    expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
     outer_dp_sharding_strategy: str | int = 0,
     device: Optional[torch.device] = None,
     init_model_with_meta_device: bool = False,
-    grad_reduce_in_fp32: bool = False,
-    preserve_fp32_weights: bool = True,
+    mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
-    check_for_nan_in_grad: bool = True,
+    report_nan_in_param_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -101,6 +103,7 @@ def fully_shard_model(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    use_decoupled_grad: bool = False,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -142,6 +145,17 @@ def fully_shard_model(
             Expert parallel device mesh object defining the topology for MoE distributed training.
             Utilizes the mesh dimension names specified by the *_dim arguments.
 
+        fsdp_group_ag (Optional[torch.distributed.ProcessGroup]):
+            Independent all-gather process group for overlapping all-gather and reduce-scatter
+            operations. When provided, enables AG/RS overlap optimization for regular (non-expert)
+            parameters. Users should create this group with the same ranks as the dp-cp group.
+            Defaults to None.
+
+        expt_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]):
+            Independent all-gather process group for expert parameters in MoE models. When provided,
+            enables AG/RS overlap optimization for expert parameters. Users should create this group
+            with the same ranks as the expert data parallel group. Defaults to None.
+
         fsdp_unit_modules (Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]]):
             List of (sub-)module classes or (sub-)module class import paths that are "units",
             which are torch.nn.Module(s) that are sharded and scheduled by Megatron-FSDP.
@@ -182,11 +196,9 @@ def fully_shard_model(
             implementing a custom Module.reset_parameters() or Module._reset_parameters() method.
             Defaults to False.
 
-        grad_reduce_in_fp32 (bool):
-            Whether to perform gradient reduction in FP32. Defaults to False.
-
-        preserve_fp32_weights (bool):
-            Whether to preserve FP32 optimization weights. Defaults to True.
+        mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy):
+            Megatron-FSDP mixed-precision config that controls compute and communication precision.
+            Default values are defined in `megatron_fsdp.MixedPrecisionPolicy`.
 
         overlap_grad_reduce (bool):
             Whether to overlap gradient reduce-scatter (or all-reduce) with backward compute.
@@ -209,8 +221,9 @@ def fully_shard_model(
             for both the model and the optimizer.
             Defaults to True.
 
-        check_for_nan_in_grad (bool):
-            Whether to check for NaN values in gradients. Defaults to True.
+        report_nan_in_param_grad (bool):
+            Whether to precisely check for NaN values in gradients for every weight. Can
+            significantly degrade performance. Defaults to False.
 
         average_in_collective (bool):
             Whether to average gradients in collective communication. Defaults to False.
@@ -247,6 +260,10 @@ def fully_shard_model(
             when using MXFP8 parameters with activation recomputation. Specifically, it
             unshards parameters per-Module instead of unsharding all sub-modules of an FSDP
             unit module simultaneously. Defaults to False.
+
+        use_decoupled_grad (bool):
+            If true, reduced gradients are installed into `Parameter.decoupled_grad` instead
+            of `Parameter.grad`. Defaults to False.
 
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
@@ -334,8 +351,6 @@ def fully_shard_model(
     ddp_config = DistributedDataParallelConfig(
         data_parallel_sharding_strategy=zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
         average_in_collective=average_in_collective,
@@ -344,7 +359,7 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
-        check_for_nan_in_grad=check_for_nan_in_grad,
+        megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
     )
 
     # Create FSDPDistributedIndex.
@@ -366,6 +381,9 @@ def fully_shard_model(
         hsdp_outer_dp_shard=_outer_fsdp_sharding,
         # Only required for Megatron-FSDP + EP.
         expt_device_mesh=expt_device_mesh,
+        # AG groups for AG/RS overlap optimization.
+        fsdp_group_ag=fsdp_group_ag,
+        expt_fsdp_group_ag=expt_fsdp_group_ag,
     )
 
     # Wrap model in Megatron FSDP.
@@ -373,6 +391,7 @@ def fully_shard_model(
         module=module,
         dist_index=dist_index,
         ddp_config=ddp_config,
+        mixed_precision_policy=mixed_precision_policy,
         fsdp_unit_modules=fsdp_unit_modules,
         disable_bucketing=disable_bucketing,
         device=device,
@@ -380,6 +399,7 @@ def fully_shard_model(
         init_model_with_meta_device=init_model_with_meta_device,
         sync_model_each_microbatch=sync_model_each_microbatch,
         enable_fine_grained_param_gather_hook=enable_fine_grained_param_gather,
+        report_nan_in_param_grad=report_nan_in_param_grad,
     )
 
     # Register a state dict post-hook to add Torch DCP metadata for writing checkpoints.
@@ -612,6 +632,7 @@ def fully_shard_optimizer(
     return optimizer
 
 
+@experimental_api
 def fully_shard(
     module: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -622,18 +643,19 @@ def fully_shard(
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
+    fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+    expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
     outer_dp_sharding_strategy: str | int = 0,
     device: Optional[torch.device] = None,
     init_model_with_meta_device: bool = False,
-    grad_reduce_in_fp32: bool = False,
-    preserve_fp32_weights: bool = True,
+    mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
-    check_for_nan_in_grad: bool = True,
+    report_nan_in_param_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -643,6 +665,7 @@ def fully_shard(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    use_decoupled_grad: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -671,18 +694,19 @@ def fully_shard(
         hybrid_fsdp_group=hybrid_fsdp_group,
         hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         expt_device_mesh=expt_device_mesh,
+        fsdp_group_ag=fsdp_group_ag,
+        expt_fsdp_group_ag=expt_fsdp_group_ag,
         fsdp_unit_modules=fsdp_unit_modules,
         zero_dp_strategy=zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
         device=device,
         init_model_with_meta_device=init_model_with_meta_device,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
+        mixed_precision_policy=mixed_precision_policy,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
         sync_model_each_microbatch=sync_model_each_microbatch,
         preproc_state_dict_for_dcp_ckpt=preproc_state_dict_for_dcp_ckpt,
-        check_for_nan_in_grad=check_for_nan_in_grad,
+        report_nan_in_param_grad=report_nan_in_param_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
@@ -692,6 +716,7 @@ def fully_shard(
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
         enable_fine_grained_param_gather=enable_fine_grained_param_gather,
+        use_decoupled_grad=use_decoupled_grad,
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.

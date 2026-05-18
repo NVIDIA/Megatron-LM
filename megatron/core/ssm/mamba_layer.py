@@ -14,6 +14,7 @@ from torch import Tensor
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphScope
@@ -69,7 +70,6 @@ class MambaLayer(GraphableMegatronModule):
         config: TransformerConfig,
         submodules: MambaLayerSubmodules,
         layer_number: int = 1,
-        residual_in_fp32=False,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
     ):
@@ -80,7 +80,6 @@ class MambaLayer(GraphableMegatronModule):
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
-        self.residual_in_fp32 = residual_in_fp32
         self.hidden_dropout = config.hidden_dropout
         self.mixer = build_module(
             submodules.mixer,
@@ -136,8 +135,8 @@ class MambaLayer(GraphableMegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
@@ -193,10 +192,14 @@ class MambaLayer(GraphableMegatronModule):
         """
         Check if we should call the local cudagraph path.
         """
-        # Training and validation mode CUDA graphs
-        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
+        # Training and validation mode CUDA graphs.
+        if (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs.get('inference_context') is None
+            and not torch.is_inference_mode_enabled()  # for inference eager dummy_forward
+        ):
             return True
-        elif not self.training and (
+        elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None

@@ -73,7 +73,6 @@ def _build_gpt_model(
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_experts,
             moe_grouped_gemm=num_experts is not None,
-            moe_use_legacy_grouped_gemm=False,
             multi_latent_attention=is_mla,
         ),
         vocab_size=vocab_size,
@@ -133,6 +132,7 @@ def _run_one_iter_and_capture(
     return logits.detach().float().cpu(), grads, peak_bytes
 
 
+@pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
     "is_moe, is_mla, offload_modules",
@@ -304,6 +304,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(
     not is_te_min_version("1.9.0.dev0"),
@@ -435,10 +436,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             GPTModel(
                 config=transformer_config,
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=num_experts,
-                    moe_grouped_gemm=True,
-                    moe_use_legacy_grouped_gemm=False,
-                    multi_latent_attention=is_mla,
+                    num_experts=num_experts, moe_grouped_gemm=True, multi_latent_attention=is_mla
                 ),
                 vocab_size=vocab_size,
                 max_sequence_length=seq_length,

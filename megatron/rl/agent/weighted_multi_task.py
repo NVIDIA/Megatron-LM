@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
-from typing import Any, AsyncGenerator, Optional, Type
+from typing import Any, Optional, Type
 
 import numpy as np
 
@@ -98,7 +98,10 @@ class WeightedMultiTask(
                 )
             )
 
-        return cls(agent_configs)
+        instance = cls(agent_configs)
+        if parallel_generation_tasks is not None:
+            instance.parallel_generation_tasks = parallel_generation_tasks
+        return instance
 
     def _distribute_counts(self, total_count: int, distribute_remainder: bool = True) -> list[int]:
         """Helper method to distribute counts according to weights.
@@ -182,33 +185,31 @@ class WeightedMultiTask(
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
-        if request.num_groups > 0:
-            agent_groups = self._distribute_counts(request.num_groups)
-        else:
-            agent_groups = [-1 if not agent.evaluation_only else 0 for agent in self.agent_configs]
-        parallel_generation_tasks = request.num_groups if request.num_groups > 0 else 10
-        agent_slots = self._distribute_counts(parallel_generation_tasks, distribute_remainder=False)
+        agent_groups = self._distribute_counts(request.num_groups)
+        agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
+        agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
         agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
 
         # Create tasks for each agent with non-zero groups
-        generators: list[AsyncGenerator[list[Rollout], None]] = []
-        for agent, num_groups in zip(self.agents, agent_groups):
-            if num_groups != 0:
+        generators = []
+        for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts, strict=True):
+            if num_groups > 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
                     raise TypeError(
                         f"Agent of type {type(agent)} does not support grouped rollouts"
                     )
-
+                agent.parallel_generation_tasks = pgt
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
+                    streaming=request.streaming,
+                    enforce_order=request.enforce_order,
                     rollouts_per_group=request.rollouts_per_group,
                     inference_interface=request.inference_interface,
                     validation=request.validation,
                     generation_args=request.generation_args,
                     filter_groups_with_same_reward=request.filter_groups_with_same_reward,
                 )
-                group_generator = agent.get_grouped_rollouts(agent_request)
-                generators.append(group_generator)
+                generators.append(agent.get_grouped_rollouts(agent_request))
             else:
                 generators.append(None)
 

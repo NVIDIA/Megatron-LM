@@ -17,9 +17,11 @@ from diskcache import Cache
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
+from utils import get_hf_tokenizer
 from megatron.training.utils import print_rank_0, unwrap_model
 import modelopt.torch.quantization as mtq
 from model_provider import model_provider
@@ -132,14 +134,12 @@ def generate_prompt(test_example, dev_examples, few_shots=0, no_subject_prompt=F
 
 
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_mmlu_args,
-        args_defaults={
+    parse_and_validate_args(extra_args_provider=add_mmlu_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        },
-    )
+        })
+    initialize_megatron()
 
     args = get_args()
     cache = Cache(args.cache_dir)
@@ -157,7 +157,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
     report_current_memory_info()
 
     # Materialize the model from meta device to gpu before loading the checkpoint.
@@ -168,9 +168,7 @@ if __name__ == "__main__":
 
     disable_tqdm = args.disable_tqdm or torch.distributed.get_rank() > 0
 
-    tokenizer = get_tokenizer()._tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
+    tokenizer = get_hf_tokenizer()
 
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)

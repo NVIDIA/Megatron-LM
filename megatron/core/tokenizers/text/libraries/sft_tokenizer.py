@@ -108,6 +108,25 @@ class SFTTokenizer:
 
         self._prompt_format = prompt_format
 
+    @staticmethod
+    def _extract_token_ids(result) -> np.ndarray:
+        if isinstance(result, dict) or hasattr(result, "input_ids"):
+            ids = result["input_ids"]
+            # Convert to 1D if it's a 2D batch [1, seq_len]
+            return np.array(ids[0] if len(np.shape(ids)) > 1 else ids)
+
+        # Handle the "Single Sequence" Encoding object (Fast Tokenizer [0] output)
+        if hasattr(result, "ids"):
+            return np.array(result.ids)
+
+        if isinstance(result, list):
+            return np.array(result)
+
+        # Handles raw ndarray returned by transformers v4 apply_chat_template with
+        # return_tensors="np": shape is (1, seq_len), so squeeze the batch dimension.
+        arr = np.asarray(result)
+        return arr[0] if arr.ndim == 2 and arr.shape[0] == 1 else arr
+
     def tokenize_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
     ):
@@ -128,14 +147,16 @@ class SFTTokenizer:
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
 
-        tokens = self._tokenizer.apply_chat_template(
-            conversation,
-            tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            return_assistant_token_mask=False,
-            return_tensors="np",
-            chat_template=self._prompt_config.custom_chat_template,
-        )[0]
+        tokens = self._extract_token_ids(
+            self._tokenizer.apply_chat_template(
+                conversation,
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                return_assistant_token_mask=False,
+                return_tensors="np",
+                chat_template=self._prompt_config.custom_chat_template,
+            )
+        )
 
         if not return_target:
             return tokens
@@ -144,7 +165,7 @@ class SFTTokenizer:
 
         # When using the default prompt format, we do not replace any tokens with IGNORE_INDEX.
         # Instead, all token losses will be used for simplicity.
-        if self._prompt_format == "default":
+        if self._prompt_format in ["default", "identity"]:
             return tokens, target
 
         # Mask system and user tokens in the target.
@@ -156,8 +177,10 @@ class SFTTokenizer:
             if turn["role"].lower() == "assistant":
                 assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
 
-            turn_tokens = self._tokenizer.apply_chat_template(
-                [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
+            turn_tokens = self._extract_token_ids(
+                self._tokenizer.apply_chat_template(
+                    [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
+                )
             )
 
             # There should be only one BOS at the very beginning.

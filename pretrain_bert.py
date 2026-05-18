@@ -12,11 +12,11 @@ from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
-import megatron.legacy.model
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -36,35 +36,26 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
         config = core_transformer_config_from_args(args)
     num_tokentypes = 2 if args.bert_binary_head else 0
 
-    if args.use_legacy_models:
-        model = megatron.legacy.model.BertModel(
-            config=config,
-            num_tokentypes=num_tokentypes,
-            add_binary_head=args.bert_binary_head,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process)
-    else:
-        if args.spec is None:
-            transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
-        elif args.spec[0] == 'local':
-            print_rank_0('Using Local spec for transformer layers')
-            transformer_layer_spec = bert_layer_local_spec
-        else :
-            transformer_layer_spec = import_module(args.spec)
+    if args.spec is None:
+        transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
+    elif args.spec[0] == 'local':
+        print_rank_0('Using Local spec for transformer layers')
+        transformer_layer_spec = bert_layer_local_spec
+    else :
+        transformer_layer_spec = import_module(args.spec)
 
-        model = BertModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            num_tokentypes=num_tokentypes,
-            add_binary_head=args.bert_binary_head,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process,
-            vp_stage=vp_stage)
+    model = BertModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        num_tokentypes=num_tokentypes,
+        add_binary_head=args.bert_binary_head,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        parallel_output=True,
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=vp_stage)
 
     return model
 
@@ -191,6 +182,8 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    pretrain(train_valid_test_datasets_provider, model_provider,
+    args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    full_config = pretrain_cfg_container_from_args(args)
+    pretrain(full_config, train_valid_test_datasets_provider, model_provider,
              ModelType.encoder_or_decoder,
-             forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+             forward_step)

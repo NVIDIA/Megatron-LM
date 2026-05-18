@@ -127,6 +127,10 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             assert self.tokentype_embeddings is None
 
+        # MuP: scale embeddings by alpha_input.
+        if self.config.use_mup and self.config.mup_embedding_mult != 1.0:
+            embeddings = embeddings * self.config.mup_embedding_mult
+
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
             embeddings = embeddings.float()

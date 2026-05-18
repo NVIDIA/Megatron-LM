@@ -11,7 +11,7 @@ MODEL_ARGS=" \
     --trust-remote-code \
     --save-interval 100000 \
     --micro-batch-size 1 \
-    --moe-token-dispatcher-type allgather \
+    --moe-token-dispatcher-type alltoall \
     --enable-experimental \
     --moe-permute-fusion \
     --use-fused-weighted-squared-relu \
@@ -30,17 +30,15 @@ MODEL_ARGS=" \
     \
     --attention-backend flash \
     --disable-gloo-process-groups \
-    --is-hybrid-model \
     --mamba-num-heads 64 \
     --mamba-head-dim 64 \
-    --hybrid-override-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME \
+    --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME \
     --use-mcore-models \
     --untie-embeddings-and-output-weights \
     --disable-bias-linear \
     --init-method-std 0.0173 \
     --position-embedding-type none \
     --squared-relu \
-    --num-layers 52 \
     --hidden-size 2688 \
     --num-attention-heads 32 \
     --group-query-attention \
@@ -53,5 +51,5 @@ MODEL_ARGS=" \
     --bf16 \
     --seq-length 8192 \
     --max-position-embeddings 8192 \
-    --export-model-type MambaModel \
+    --export-model-type HybridModel \
     "
