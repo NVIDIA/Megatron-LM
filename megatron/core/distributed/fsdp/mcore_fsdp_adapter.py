@@ -380,8 +380,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         # calls broadcast_params() with --data-parallel-random-init.
         self.broadcast_params = noop
         self.synchronize_param_gather = synchronize_param_gather
-        self.module.state_dict_for_save_checkpoint = not_implemented_op
-        self.state_dict_for_save_checkpoint = not_implemented_op
+        self.module.state_dict_for_save_checkpoint = module.state_dict
+        self.state_dict_for_save_checkpoint = lambda *args, **kwargs: module.state_dict()
 
         if torch.distributed.get_rank() == 0:
             self.module._log_parameter_groups()

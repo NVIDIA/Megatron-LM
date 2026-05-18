@@ -487,11 +487,25 @@ def split_dtensor(
 
 
 def make_uneven_dtensor(
-    local_tensor: torch.Tensor, shape: torch.Size, dp_mesh: DeviceMesh, placements: List[Placement]
+    local_tensor: torch.Tensor,
+    shape: torch.Size,
+    dp_mesh: DeviceMesh,
+    placements: List[Placement],
+    *,
+    post_process_uneven: bool = False,
 ):
-    """Create a DTensor from a possibly uneven local shard with known global shape."""
+    """Create a DTensor from a possibly uneven local shard with known global shape.
+
+    Args:
+        local_tensor: Local shard tensor.
+        shape: Global shape of the full DTensor.
+        dp_mesh: 1D device mesh.
+        placements: DTensor placements (e.g., [Shard(0)]).
+        post_process_uneven: If True, call ``update_uneven_dtensor_chunk_metadata``
+            on the created DTensor so that DCP can handle uneven sharding.
+    """
     assert dp_mesh.ndim == 1, "Only 1D mesh is supported for now"
-    return DTensor.from_local(
+    dtensor = DTensor.from_local(
         local_tensor=local_tensor.view(-1, *shape[1:]),
         device_mesh=dp_mesh,
         placements=placements,
@@ -499,6 +513,9 @@ def make_uneven_dtensor(
         shape=shape,
         stride=torch.empty(shape, device="meta").stride(),
     )
+    if post_process_uneven:
+        update_uneven_dtensor_chunk_metadata(dtensor)
+    return dtensor
 
 
 def get_state_dict(

@@ -27,7 +27,7 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from ..uneven_dtensor import make_uneven_dtensor
+from ..uneven_dtensor import make_uneven_dtensor, update_uneven_dtensor_chunk_metadata
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import FullyShardMixedPrecisionPolicy
@@ -305,6 +305,10 @@ class ParameterGroup:
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
             self.dist_params.append(dist_param)
+
+        # Update dist_param chunk metadata for checkpointing and debugging.
+        for dist_param in self.dist_params:
+            update_uneven_dtensor_chunk_metadata(dist_param)
 
         # Create gradient DTensor views. Some groups, e.g. uint8 FP8 model
         # payloads, do not require grads and therefore have no grad buffer.
