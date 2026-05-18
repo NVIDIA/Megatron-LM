@@ -1,7 +1,7 @@
 # What does this PR do ?
 <!-- Add a one line overview of what this PR aims to accomplish. -->
 
-:warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact the @mcore-oncall.
+:warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact @NVIDIA/mcore-oncall.
 
 ## Issue tracking
 
@@ -24,7 +24,7 @@ Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
 
 ### Code review
 
-Feel free to message or comment the [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall) to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
+Feel free to message or comment @NVIDIA/mcore-oncall to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
 
 All PRs start as **draft**. If you open a non-draft PR, it will be automatically converted to draft.
 
