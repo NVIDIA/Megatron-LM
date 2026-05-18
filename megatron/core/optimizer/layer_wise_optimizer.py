@@ -229,8 +229,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # increase monotonically when ``_ParamAndGradBuffer.__init__`` iterates
         # params in backprop order, satisfying its ``bucket_id == cur + 1``
         # invariant.
+        #
+        # Padding floor: the on-buffer bucket size is ``dp_size *
+        # max_shard_cursor``, which is at least ``dp_size * chunk_max_param``
+        # because some shard must hold that param whole. If a single param
+        # dominates the chunk, finalising on ``chunk_numel >= bucket_size``
+        # alone would emit a bucket with most of its shards near-empty
+        # padding. Instead extend the chunk so its raw numel approaches the
+        # padded buffer size, capping per-bucket overhead at ``1 /
+        # PADDING_FLOOR - 1`` (~11% at 0.9). Falls back to ``bucket_size``
+        # when no single param dominates.
+        PADDING_FLOOR = 0.9
         chunk_params: List[torch.nn.Parameter] = []
         chunk_numel = 0
+        chunk_max_param = 0
         for param in reversed(params):
             param_numel = param.data.nelement()
             if getattr(param, 'shared_embedding', False):
@@ -239,14 +251,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 _emit_bucket(chunk_params)
                 chunk_params = []
                 chunk_numel = 0
+                chunk_max_param = 0
                 _emit_bucket([param], shared_embedding=True)
                 continue
             chunk_params.append(param)
             chunk_numel += param_numel
-            if bucket_size is not None and chunk_numel >= bucket_size:
-                _emit_bucket(chunk_params)
-                chunk_params = []
-                chunk_numel = 0
+            chunk_max_param = max(chunk_max_param, param_numel)
+            if bucket_size is not None:
+                threshold = max(bucket_size, int(dp_size * chunk_max_param * PADDING_FLOOR))
+                if chunk_numel >= threshold:
+                    _emit_bucket(chunk_params)
+                    chunk_params = []
+                    chunk_numel = 0
+                    chunk_max_param = 0
         _emit_bucket(chunk_params)
 
         total_buffer_numel = bucket_indices[-1][1] if bucket_indices else 0
