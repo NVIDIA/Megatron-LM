@@ -5,7 +5,6 @@ from unittest.mock import MagicMock
 import pytest
 
 import megatron.inference._llm_base as base_mod
-from megatron.inference.async_llm import MegatronAsyncLLM
 from megatron.inference.llm import MegatronLLM
 
 
@@ -26,24 +25,26 @@ def fake_model_and_tokenizer():
     return model, tokenizer
 
 
-@pytest.mark.parametrize("cls", [MegatronLLM, MegatronAsyncLLM])
 class TestConstructorValidation:
+    """Parametrized over MegatronLLM only. MegatronAsyncLLM rejects direct
+    mode entirely (covered in test_async_llm_serve_guard.py)."""
+
     def test_coordinator_host_without_use_coordinator_raises(
-        self, cls, mock_pipeline, fake_model_and_tokenizer
+        self, mock_pipeline, fake_model_and_tokenizer
     ):
         model, tok = fake_model_and_tokenizer
         with pytest.raises(ValueError, match="coordinator_host/port require use_coordinator=True"):
-            cls(model=model, tokenizer=tok, use_coordinator=False, coordinator_host="x")
+            MegatronLLM(model=model, tokenizer=tok, use_coordinator=False, coordinator_host="x")
 
     def test_coordinator_port_without_use_coordinator_raises(
-        self, cls, mock_pipeline, fake_model_and_tokenizer
+        self, mock_pipeline, fake_model_and_tokenizer
     ):
         model, tok = fake_model_and_tokenizer
         with pytest.raises(ValueError, match="coordinator_host/port require use_coordinator=True"):
-            cls(model=model, tokenizer=tok, use_coordinator=False, coordinator_port=5000)
+            MegatronLLM(model=model, tokenizer=tok, use_coordinator=False, coordinator_port=5000)
 
-    def test_direct_mode_constructor_succeeds(self, cls, mock_pipeline, fake_model_and_tokenizer):
+    def test_direct_mode_constructor_succeeds(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
-        llm = cls(model=model, tokenizer=tok)
+        llm = MegatronLLM(model=model, tokenizer=tok)
         assert llm.is_primary_rank is True
         assert llm._use_coordinator is False

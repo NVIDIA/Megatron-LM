@@ -97,19 +97,21 @@ class _EventLoopManager:
     def run_sync(self, coro: Coroutine):
         """Schedule ``coro`` on the background loop and block on its result.
 
-        Must not be called from inside a running asyncio event loop -- blocking
-        the calling thread would freeze the user's loop, or deadlock outright
-        if the calling thread is the background loop itself.
+        Must not be called from a coroutine running on ``self._loop`` itself
+        -- that would deadlock, since the only loop that could dispatch
+        ``coro`` would be the one already blocked waiting for the caller.
+        Calling from a different loop (e.g., the user's main-thread asyncio
+        loop) is allowed: ``coro`` runs on the background loop while the
+        caller's loop is stalled until ``.result()`` returns.
         """
         try:
-            asyncio.get_running_loop()
+            running = asyncio.get_running_loop()
         except RuntimeError:
-            pass  # no running loop in this thread, safe to block
-        else:
+            running = None  # no loop on this thread, safe
+        if running is self._loop:
             raise RuntimeError(
-                "MegatronLLM sync methods cannot be called from inside an "
-                "asyncio event loop. Use MegatronAsyncLLM, or invoke from "
-                "top-level synchronous code."
+                "run_sync called from a coroutine running on the background "
+                "loop -- would deadlock waiting for the same loop."
             )
         return self.submit(coro).result()
 

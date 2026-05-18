@@ -39,13 +39,14 @@ def _make_worker_instance(cls):
     obj._coord_runtime = None
     obj._shutdown_called = False
     if cls is MegatronAsyncLLM:
-        obj._direct_generate_in_flight = False
         obj._serve_started = False
     return obj
 
 
 class TestDirectModeLifecycleGuards:
-    """Direct mode: pause/unpause/suspend/resume must raise; shutdown is a no-op."""
+    """Direct mode (MegatronLLM only): pause/unpause/suspend/resume must
+    raise; shutdown is a no-op. MegatronAsyncLLM rejects direct mode at
+    __init__ -- covered separately in test_async_llm_serve_guard.py."""
 
     def test_sync_lifecycle_raises_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
@@ -56,19 +57,6 @@ class TestDirectModeLifecycleGuards:
         # shutdown / wait_for_shutdown are no-ops, not errors.
         llm.shutdown()
         llm.wait_for_shutdown()
-
-    @pytest.mark.asyncio
-    async def test_async_lifecycle_raises_in_direct_mode(
-        self, mock_pipeline, fake_model_and_tokenizer
-    ):
-        model, tok = fake_model_and_tokenizer
-        llm = MegatronAsyncLLM(model=model, tokenizer=tok)
-        for method in ("pause", "unpause", "suspend", "resume"):
-            with pytest.raises(RuntimeError, match="use_coordinator=True"):
-                await getattr(llm, method)()
-        # shutdown / wait_for_shutdown are no-ops in direct mode.
-        await llm.shutdown()
-        await llm.wait_for_shutdown()
 
 
 class TestCoordinatorWorkerRankGuards:
@@ -94,15 +82,4 @@ class TestShutdownIdempotence:
         assert llm._shutdown_called is True
         # Second shutdown should be a no-op (idempotent).
         llm.shutdown()
-        assert llm._shutdown_called is True
-
-    @pytest.mark.asyncio
-    async def test_async_shutdown_idempotent_in_direct_mode(
-        self, mock_pipeline, fake_model_and_tokenizer
-    ):
-        model, tok = fake_model_and_tokenizer
-        llm = MegatronAsyncLLM(model=model, tokenizer=tok)
-        await llm.shutdown()
-        assert llm._shutdown_called is True
-        await llm.shutdown()
         assert llm._shutdown_called is True

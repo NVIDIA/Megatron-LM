@@ -40,6 +40,20 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
     ) -> None:
+        # MegatronAsyncLLM requires coordinator mode: direct mode invokes the
+        # synchronous ``engine.generate()`` from inside the caller's asyncio
+        # loop, which collides with the engine's loop-bound internal state
+        # (``_cond``, ``_state_events``). Coordinator mode rebinds those to a
+        # daemon-thread loop via ``start_listening_to_data_parallel_coordinator``
+        # and avoids the conflict.
+        if not use_coordinator:
+            raise ValueError(
+                "MegatronAsyncLLM requires use_coordinator=True. Direct mode is "
+                "not supported in async because the underlying engine's "
+                "asyncio primitives bind to the caller's loop and collide with "
+                "the synchronous engine.generate() path. Use MegatronLLM for "
+                "sync direct/coordinator workflows."
+            )
         super().__init__(
             model=model,
             tokenizer=tokenizer,
@@ -48,9 +62,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
         )
-        # Concurrency guard for direct-mode generate (asyncio is single-threaded;
-        # a plain bool is sufficient).
-        self._direct_generate_in_flight: bool = False
         # Set in serve() when this rank starts the HTTP frontend; consulted by shutdown().
         self._serve_started: bool = False
 
@@ -66,13 +77,8 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         ``list[list[int]]``) returns ``list[DynamicInferenceRequest]`` in
         input order.
 
-        In direct mode, ``generate`` is single-caller -- concurrent calls raise
-        ``RuntimeError``. Pass batched input instead of using
-        ``asyncio.gather``.
-
         Raises:
-            RuntimeError: if called on a non-primary rank in coordinator mode,
-                or if a second concurrent call enters in direct mode.
+            RuntimeError: if called on a non-primary rank.
         """
         self._assert_primary()
         if sampling_params is None:
@@ -85,23 +91,10 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             # here since single input is wrapped to a one-element list.
             return []
 
-        if self._use_coordinator:
-            assert self._loop_manager is not None
-            results = await self._loop_manager.run_async(
-                self._generate_impl(normalized, sampling_params)
-            )
-        else:
-            if self._direct_generate_in_flight:
-                raise RuntimeError(
-                    "MegatronAsyncLLM.generate in direct mode is single-caller; "
-                    "pass a list of prompts instead of using asyncio.gather."
-                )
-            self._direct_generate_in_flight = True
-            try:
-                results = await self._generate_impl(normalized, sampling_params)
-            finally:
-                self._direct_generate_in_flight = False
-
+        assert self._loop_manager is not None
+        results = await self._loop_manager.run_async(
+            self._generate_impl(normalized, sampling_params)
+        )
         return results if is_batch else results[0]
 
     async def pause(self) -> None:

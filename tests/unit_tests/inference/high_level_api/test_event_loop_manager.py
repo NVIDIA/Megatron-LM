@@ -98,11 +98,9 @@ class TestEventLoopManager:
         finally:
             mgr.stop()
 
-    def test_run_sync_raises_inside_running_event_loop(self):
-        """Guard against the deadlock when sync methods are called from
-        inside an asyncio event loop (e.g., a coroutine on any loop)."""
-        import asyncio
-
+    def test_run_sync_raises_when_called_from_background_loop(self):
+        """run_sync from a coroutine running on self._loop would deadlock --
+        must raise. Calling from a different running loop is allowed."""
         mgr = _EventLoopManager()
         mgr.start()
         try:
@@ -110,11 +108,12 @@ class TestEventLoopManager:
             async def inner():
                 return 42
 
-            async def caller():
-                # We're inside a running loop here; run_sync must refuse.
+            async def deadlock_attempt():
+                # Running on mgr._loop; run_sync would schedule on the same
+                # loop we're on -> deadlock.
                 mgr.run_sync(inner())
 
-            with pytest.raises(RuntimeError, match="cannot be called from inside"):
-                asyncio.run(caller())
+            with pytest.raises(RuntimeError, match="background loop"):
+                mgr.submit(deadlock_attempt()).result()
         finally:
             mgr.stop()

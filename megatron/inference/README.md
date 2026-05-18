@@ -90,7 +90,7 @@ Planned new features:
 
 ## Known limitations
 
-- **`MegatronAsyncLLM.generate()` blocks the caller's event loop in direct mode.** The engine call is sync and inline; it does not yield back while running. Acceptable for offline batched calls; degraded for server/RL workloads that interleave generation with other async work. Tracked for an upstream `engine.async_generate(...)`.
+- **`MegatronAsyncLLM` requires `use_coordinator=True`** -- constructing with `use_coordinator=False` raises `ValueError` at `__init__`. The underlying `DynamicInferenceEngine` caches its loop reference at construction time and binds internal asyncio primitives (`_cond`, `_state_events`) to it. Coordinator mode rebinds those to a dedicated daemon-thread loop via `start_listening_to_data_parallel_coordinator`; direct mode has no such rebinding, so the synchronous `engine.generate()` path collides with the caller's running asyncio loop and raises `RuntimeError: This event loop is already running`. Use `MegatronLLM` for sync direct/coordinator workflows. Tracked for an upstream `engine.async_generate(...)` (or engine loop-rebinding) fix that would let `MegatronAsyncLLM` support direct mode.
 
 - **`llm.engine.reset()` is unsafe in coordinator mode.** Two failure modes, both upstream in `dynamic_engine.py`:
   - *Deadlock*: `reset()` *rebinds* (does not mutate in-place) `_cond` / `_state_events`. Any coroutine on the engine-loop task that is `await`ing one of those primitives holds a reference to the OLD object in its suspended frame. Subsequent `notify_all()` / `set()` calls hit the NEW objects, leaving the suspended waiter stranded; the next `generate()` hangs.
