@@ -268,7 +268,13 @@ class TransformerConfig(ModelParallelConfig):
     The gate weights are fused into linear_qkv as the trailing
     num_attention_heads rows; the sigmoid of those scalars gates each
     attention head independently. Distinct from attention_output_gate,
-    which fuses a full head_dim gate into linear_qkv."""
+    which fuses a full head_dim gate into linear_qkv. Distributed checkpoint
+    TP resharding is handled via a ShardedTensorFactory in
+    SelfAttention.sharded_state_dict that splits linear_qkv.{weight,bias}
+    into independent [QKV, gate] sub-tensors (analogous to
+    apply_swiglu_sharded_factory). Both query_projection_size + 2 *
+    kv_projection_size and num_attention_heads must be divisible by every TP
+    world_size used for save/load."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""

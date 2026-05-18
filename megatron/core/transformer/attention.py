@@ -11,6 +11,12 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import (
+    ReplicaId,
+    ShardedStateDict,
+    ShardedTensorFactory,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -36,6 +42,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
+from megatron.core.transformer.utils import cat_with_oom_fallback
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -397,9 +404,13 @@ class Attention(MegatronModule, ABC):
 
         # Per-head scalar output gate (Step-3.5-Flash g_proj) is fused into
         # linear_qkv when use_head_wise_attn_gate is True; gate weights live in
-        # the trailing num_attention_heads rows of linear_qkv.weight. The gate
-        # tensor is sliced out in SelfAttention.get_query_key_value_tensors and
-        # consumed in Attention.forward.
+        # the trailing num_attention_heads_per_partition rows of each rank's
+        # local linear_qkv tensor. The gate tensor is sliced out in
+        # SelfAttention.get_query_key_value_tensors and consumed in
+        # Attention.forward. For dist-ckpt TP resharding safety, the [QKV,
+        # gate] split is preserved via a ShardedTensorFactory wired up in
+        # SelfAttention.sharded_state_dict (see
+        # apply_head_wise_attn_gate_sharded_factory below).
         self._head_wise_gate_states = None
 
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
@@ -1868,6 +1879,134 @@ class SelfAttention(Attention):
         )
 
         return weight_updated
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+        metadata: Optional[dict] = None,
+    ) -> ShardedStateDict:
+        """Return the sharded state dict, wrapping linear_qkv.{weight,bias}
+        with a factory that splits the trailing num_attention_heads gate rows
+        from the QKV block under dist-ckpt save/load. Without this override the
+        global tensor is sharded as one uniform axis-0 block, so save TP=N
+        -> load TP=M silently mixes V/K rows with gate rows; the factory makes
+        the QKV and gate sub-blocks reshard independently, analogous to
+        apply_swiglu_sharded_factory in megatron/core/transformer/mlp.py.
+        """
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if self.config.use_head_wise_attn_gate:
+            qkv_size = self.query_projection_size + 2 * self.kv_projection_size
+            gate_size = self.config.num_attention_heads
+            for sub_name in ("weight", "bias"):
+                key = f"{prefix}linear_qkv.{sub_name}"
+                if key in sharded_state_dict:
+                    sharded_state_dict[key] = apply_head_wise_attn_gate_sharded_factory(
+                        sharded_state_dict[key], sharded_offsets, qkv_size, gate_size
+                    )
+        return sharded_state_dict
+
+
+# pylint: disable=missing-function-docstring
+def apply_head_wise_attn_gate_sharded_factory(
+    original_sh_ten,
+    sharded_offsets,
+    qkv_size: int,
+    gate_size: int,
+):
+    """Build a ShardedTensorFactory that splits linear_qkv.{weight,bias} into
+    independent QKV and gate sub-tensors for dist-ckpt save/load.
+
+    The forward path of SelfAttention with use_head_wise_attn_gate=True peels
+    the trailing num_attention_heads_per_partition rows off each rank's local
+    linear_qkv output and treats them as per-head gate scalars. That assumes
+    the local layout is [qkv_local; gate_local] — but the default
+    ColumnParallelLinear / TELayerNormColumnParallelLinear sharded_state_dict
+    only declares {"weight": 0}, so the global (QKV_dim + H, hidden_size)
+    tensor is uniformly resharded along axis 0 on TP change. Whenever the new
+    per-rank size < QKV_dim, the trailing rows on non-last ranks land inside
+    the QKV block, so a saved checkpoint reloads with V/K rows being treated
+    as gate scalars (no shape error — silently wrong).
+
+    This factory chunks each rank's local tensor at the QKV/gate boundary on
+    save, registering qkv_local and gate_local as two independent sub-tensors
+    (with distinct keys) each uniformly sharded along axis 0 across TP. On
+    load they are gathered, resharded for the new TP, and cat'd back so the
+    rank-local layout is again [qkv_local; gate_local]. Same pattern as
+    apply_swiglu_sharded_factory (megatron/core/transformer/mlp.py), but with
+    unequal sub-block sizes (QKV >> gate).
+
+    Args:
+        original_sh_ten: ShardedTensor produced for linear_qkv.weight or
+            linear_qkv.bias by the underlying ColumnParallelLinear /
+            TE-variant sharded_state_dict (axis-0 sharded across TP).
+        sharded_offsets: PP-style offsets passed from the parent module.
+        qkv_size: Global axis-0 size of the QKV sub-block
+            (query_projection_size + 2 * kv_projection_size).
+        gate_size: Global axis-0 size of the gate sub-block
+            (num_attention_heads).
+    """
+    shard_axis = 0
+    prepend_axis_num = len(sharded_offsets)
+    local_axis_size = original_sh_ten.local_shape[shard_axis]
+    axis_frag = original_sh_ten.axis_fragmentations[shard_axis + prepend_axis_num]
+
+    qkv_local_size, qkv_rem = divmod(qkv_size, axis_frag)
+    gate_local_size, gate_rem = divmod(gate_size, axis_frag)
+    assert qkv_rem == 0 and gate_rem == 0, (
+        f"use_head_wise_attn_gate dist-ckpt requires both QKV ({qkv_size}) "
+        f"and gate ({gate_size}) sizes to be divisible by the TP world_size "
+        f"({axis_frag})."
+    )
+    assert local_axis_size == qkv_local_size + gate_local_size, (
+        f"Unexpected linear_qkv local axis-0 size {local_axis_size} != "
+        f"{qkv_local_size} (qkv) + {gate_local_size} (gate). The factory "
+        f"assumes a uniform axis-0 sharding from ColumnParallelLinear."
+    )
+    rank_offset = (
+        original_sh_ten.global_offset[shard_axis + prepend_axis_num] // local_axis_size
+    )
+
+    @torch.no_grad()
+    def sh_ten_build_fn(
+        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
+    ):
+        # Trailing rows of each rank's local tensor are the gate scalars; the
+        # rest is QKV. Split sizes are unequal, so we use torch.split rather
+        # than torch.chunk(2). Each sub-tensor lives under a distinct key
+        # (.{_qkv,_gate}) so dist-ckpt treats them as independent globals.
+        tensor_qkv, tensor_gate = torch.split(
+            t, [qkv_local_size, gate_local_size], dim=shard_axis
+        )
+        offset_qkv = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
+        offset_gate = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
+        return [
+            ShardedTensor.from_rank_offsets(
+                f"{key}._qkv",
+                tensor_qkv,
+                *sharded_offsets,
+                offset_qkv,
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            ),
+            ShardedTensor.from_rank_offsets(
+                f"{key}._gate",
+                tensor_gate,
+                *sharded_offsets,
+                offset_gate,
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            ),
+        ]
+
+    return ShardedTensorFactory(
+        original_sh_ten.key,
+        original_sh_ten.data,
+        sh_ten_build_fn,
+        cat_with_oom_fallback,
+        original_sh_ten.replica_id,
+        flattened_range=original_sh_ten.flattened_range,
+    )
 
 
 class CrossAttention(Attention):
