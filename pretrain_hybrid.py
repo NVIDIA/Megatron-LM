@@ -3,6 +3,7 @@
 
 # Capture the true program start time BEFORE any heavy imports.
 import time
+
 _PROGRAM_START_TIME = time.time()
 
 import json
@@ -10,6 +11,7 @@ import json
 # Suppress warnings on all ranks but rank 0.
 import os
 import warnings
+
 rank = int(os.environ.get('RANK', 0))
 if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
@@ -25,12 +27,23 @@ from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_group, get_hybrid_data_context_parallel_groups
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_hybrid_data_context_parallel_groups,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, StragglerDetector, get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
+from megatron.core.transformer.multi_token_prediction import (
+    mtp_on_this_rank as mtp_on_this_rank_func,
+)
+from megatron.core.utils import (
+    StragglerDetector,
+    get_attr_wrapped_model,
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+)
 from megatron.training import (
     get_args,
     get_timers,
@@ -39,10 +52,10 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank as mtp_on_this_rank_func
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.training import update_seqlen_squared_sum_from_cu_seqlens
 from megatron.training.utils import (
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
@@ -191,6 +204,9 @@ def forward_step(data_iterator, model: HybridModel):
         cu_seqlens = cu_seqlens[0]
         if cu_seqlens_padded is not None:
             cu_seqlens_padded = cu_seqlens_padded[0]
+        # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
+        # attention only computes work for real tokens within each chunk.
+        update_seqlen_squared_sum_from_cu_seqlens(cu_seqlens)
         cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",

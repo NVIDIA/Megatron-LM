@@ -5,6 +5,7 @@ import argparse
 import time
 
 from megatron.training.config.container import PretrainConfigContainer
+
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 
@@ -34,10 +35,8 @@ def set_startup_timestamps(program_start=None, main_entry=None):
         _STARTUP_TIMESTAMPS['main_entry'] = main_entry
 
 
-from collections import defaultdict
 import copy
 import dataclasses
-from datetime import datetime, timedelta
 import functools
 import gc
 import inspect
@@ -45,14 +44,17 @@ import logging
 import math
 import os
 import sys
+from collections import defaultdict
 from contextlib import nullcontext
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, Dict
+from typing import Any, Dict, Optional
 
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
+
 from .log_handler import CustomHandler
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -129,42 +131,49 @@ except ImportError:
     has_nvidia_modelopt = False
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import (
+    DistributedDataParallelConfig,
+    TorchFullyShardedDataParallelConfig,
+)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel as megatron_FSDP,
+)
+from megatron.core.fp8_utils import correct_amax_history_if_needed
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
-from megatron.core.utils import (
-    check_param_hashes_across_dp_replicas,
-    configure_nvtx_profiling,
-    get_attr_wrapped_model,
-    get_model_config,
-    get_pg_size,
-    get_pg_rank,
-    StragglerDetector,
-)
-from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
-from megatron.training.checkpointing import load_checkpoint
-from megatron.training.checkpointing import save_checkpoint, save_grads
-from megatron.training.checkpointing import checkpoint_exists
-from megatron.training.checkpointing import get_loaded_iteration
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
-from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
-
-from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.utils import (
+    StragglerDetector,
+    check_param_hashes_across_dp_replicas,
+    configure_nvtx_profiling,
+    get_attr_wrapped_model,
+    get_model_config,
+    get_pg_rank,
+    get_pg_size,
+)
+from megatron.training.checkpointing import (
+    checkpoint_exists,
+    get_loaded_iteration,
+    load_checkpoint,
+    save_checkpoint,
+    save_grads,
+)
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -173,43 +182,45 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.optimizer import (
-    get_megatron_optimizer,
     OptimizerConfig,
     ParamKey,
+    get_megatron_optimizer,
 )
-from megatron.core.rerun_state_machine import (
-    get_rerun_state_machine,
-    destroy_rerun_state_machine,
-    RerunDataIterator,
-    RerunMode,
-)
-from megatron.training.initialize import initialize_megatron
-from megatron.training.initialize import write_args_to_tensorboard
-from megatron.training.initialize import set_jit_fusion_options
-from megatron.training.config import FaultInjectorConfig
-from megatron.training.utils import is_hybrid_model
-from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
-from megatron.training.datasets.data_samplers import build_pretraining_data_loader
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
-from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
+    create_all_gather_groups,
     destroy_global_memory_buffer,
     destroy_model_parallel,
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
     update_pg_timeout,
-    create_all_gather_groups,
 )
-from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.rerun_state_machine import (
+    RerunDataIterator,
+    RerunMode,
+    destroy_rerun_state_machine,
+    get_rerun_state_machine,
+)
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.moe import upcycling_utils
+from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker, track_moe_metrics
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
+from megatron.training.config import FaultInjectorConfig
+from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.training.initialize import (
+    initialize_megatron,
+    set_jit_fusion_options,
+    write_args_to_tensorboard,
+)
+from megatron.training.utils import is_hybrid_model
 
 try:
     from torch_memory_saver import torch_memory_saver
@@ -218,53 +229,51 @@ try:
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
-from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
     get_current_running_global_batch_size,
     get_num_microbatches,
-    update_num_microbatches
+    update_num_microbatches,
 )
+from megatron.core.pipeline_parallel import get_forward_backward_func
 
+from . import ft_integration, one_logger_utils
+from .activation_logging import (
+    disable_activation_logging,
+    disable_tokens_per_expert_logging,
+    enable_activation_logging,
+    enable_tokens_per_expert_logging,
+    save_activations,
+    save_tokens_per_expert,
+)
 from .async_utils import maybe_finalize_async_save
+from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
+from .global_vars import (
+    destroy_global_vars,
+    get_args,
+    get_energy_monitor,
+    get_one_logger,
+    get_signal_handler,
+    get_tensorboard_writer,
+    get_timers,
+    get_tokenizer,
+    get_wandb_writer,
+)
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
-    logical_and_across_model_parallel_group,
-    reduce_max_stat_across_model_parallel_group,
     is_last_rank,
+    logical_and_across_model_parallel_group,
     print_rank_0,
     print_rank_last,
+    reduce_max_stat_across_model_parallel_group,
     report_memory,
+    to_empty_if_meta_device,
     unwrap_model,
     update_use_dist_ckpt,
-    to_empty_if_meta_device,
 )
-from .global_vars import (
-    destroy_global_vars,
-    get_args,
-    get_signal_handler,
-    get_timers,
-    get_tensorboard_writer,
-    get_wandb_writer,
-    get_one_logger,
-    get_tokenizer,
-    get_energy_monitor,
-)
-from . import one_logger_utils
-from .activation_logging import (
-    enable_activation_logging,
-    disable_activation_logging,
-    save_activations,
-    enable_tokens_per_expert_logging,
-    disable_tokens_per_expert_logging,
-    save_tokens_per_expert,
-)
-from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
-
-from . import ft_integration
 
 stimer = StragglerDetector()
 
@@ -290,7 +299,110 @@ def print_datetime(string, override_timestamp=None):
         time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
-def num_floating_point_operations(args, batch_size):
+# Per-iteration accumulator for ``sum(L_i ** 2)`` across all real (unpadded)
+# sub-sequences. Lives on GPU as a 1-element fp64 tensor so per-micro-batch
+# updates do NOT force a CPU sync; the only CPU read happens at consume time,
+# after a single all-reduce. ``_seqlen_stats_active`` flips to ``True`` the
+# first time an update lands this iteration, and is the gate that decides
+# whether ``consume_*`` issues a collective at all -- unpacked BSHD runs never
+# call ``update_*`` so the flag stays ``False`` and no collective fires.
+_seqlen_squared_sum_in_iteration: Optional[torch.Tensor] = None
+_seqlen_stats_active: bool = False
+
+
+def update_seqlen_squared_sum_from_cu_seqlens(cu_seqlens):
+    """Add ``sum(L_i ** 2)`` from one micro-batch's ``cu_seqlens`` to the GPU accumulator.
+
+    Args:
+        cu_seqlens: 1-D ``int32`` tensor of cumulative sequence lengths
+            (``[0, L_1, L_1 + L_2, ...]``), as carried by ``PackedSeqParams``.
+
+    Every rank in the same data-parallel group sees the same ``cu_seqlens`` (it is
+    broadcast across TP/CP/PP). The per-micro-batch reduction stays on device --
+    no ``.item()`` -- so this is a fused kernel launch with no host sync. The
+    ``_seqlen_stats_active`` flag is set so that ``consume_*`` knows to issue
+    the all-reduce; BSHD callers that never invoke this function leave the
+    flag at ``False`` and pay zero collective cost.
+    """
+    global _seqlen_squared_sum_in_iteration, _seqlen_stats_active
+    if cu_seqlens is None or cu_seqlens.numel() < 2:
+        return
+    # Pin the accumulator to the current CUDA device when available so the
+    # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
+    # (e.g. unit tests). Production always supplies a CUDA tensor.
+    if _seqlen_squared_sum_in_iteration is None:
+        device = (
+            torch.device(f'cuda:{torch.cuda.current_device()}')
+            if torch.cuda.is_available()
+            else cu_seqlens.device
+        )
+        _seqlen_squared_sum_in_iteration = torch.zeros(1, dtype=torch.float64, device=device)
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
+        device=_seqlen_squared_sum_in_iteration.device, dtype=torch.float64
+    )
+    _seqlen_squared_sum_in_iteration += (seqlens * seqlens).sum()
+    _seqlen_stats_active = True
+
+
+def consume_seqlen_squared_sum_in_iteration():
+    """Read, reset and globally reduce the per-iteration ``sum(L_i ** 2)`` accumulator.
+
+    Returns:
+        ``float`` total ``sum(L_i ** 2)`` across the whole global batch (all DP
+        ranks combined) for packed (THD) iterations, or ``None`` if no update
+        happened this iteration -- the BSHD path. Returning ``None`` lets
+        ``num_floating_point_operations`` fall back to its closed-form
+        ``batch_size * seq_length ** 2`` default without paying for a collective.
+
+    Sync cost: exactly one all-reduce of a 1-element ``float64`` tensor, plus
+    one ``.item()`` host sync. Skipped entirely when the flag is ``False``.
+
+    All ranks within one DP group accumulated identical values (``cu_seqlens`` is
+    replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
+    factor of ``TP * CP * PP``, which we divide out.
+    """
+    global _seqlen_squared_sum_in_iteration, _seqlen_stats_active
+    if not _seqlen_stats_active:
+        # BSHD path: never even allocated the tensor; tell the caller to use
+        # the default (closed-form) ``batch_size * seq_length ** 2``.
+        return None
+    t = _seqlen_squared_sum_in_iteration
+    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+        torch.distributed.all_reduce(t)
+        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
+        cp_size = max(mpu.get_context_parallel_world_size(), 1)
+        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
+        result = float(t.item()) / (tp_size * cp_size * pp_size)
+    else:
+        # No model-parallel state -> treat as a single rank, no reduction.
+        # This is the standalone unit-test path; production always initializes mpu.
+        result = float(t.item())
+    # Reset for the next iteration. Keep the tensor allocated so subsequent
+    # iterations reuse it without reallocating.
+    t.zero_()
+    _seqlen_stats_active = False
+    return result
+
+
+def num_floating_point_operations(args, batch_size, seqlen_squared_sum_in_batch=None):
+    """Compute the number of floating-point operations for one global batch.
+
+    Args:
+        args: Megatron args (provides hidden size, num layers, seq length, ...).
+        batch_size: Global batch size (samples per iteration). Used for token-linear
+            terms whose compute scales with the total number of tokens
+            ``batch_size * args.seq_length`` (projections, MLP, MoE, logits, ...).
+        seqlen_squared_sum_in_batch: Sum of ``L_i ** 2`` across all real
+            (unpadded) sub-sequences in the global batch. For unpacked BSHD this
+            equals ``batch_size * args.seq_length ** 2`` (the default when ``None``
+            is passed). For THD packed sequences it equals the actual ragged
+            ``sum(L_i ** 2)`` and is strictly less than the BSHD value, reflecting
+            the reduced core-attention work due to per-chunk causal masking.
+    """
+    # Default: BSHD layout assumption (full causal mask, every sample length = seq_length).
+    if seqlen_squared_sum_in_batch is None:
+        seqlen_squared_sum_in_batch = batch_size * args.seq_length * args.seq_length
+
     def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
@@ -314,18 +426,29 @@ def num_floating_point_operations(args, batch_size):
         return routed_flops + shared_flops
 
     def attn_layer_flops(
-        batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
+        batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8,
+        kv_channels=None, seqlen_squared_sum=None,
     ):
-        """Calculate FLOPs for an attention layer."""
+        """Calculate FLOPs for an attention layer.
+
+        The token-linear part (QKV projection + output projection) scales with
+        ``batch_size * seq_len`` (= total tokens) and the core-attention part
+        (``QK^T`` and ``softmax(QK^T) V``) scales with ``sum_i(L_i ** 2)``.
+
+        For BSHD (``seqlen_squared_sum=None``), each of the ``batch_size``
+        samples has length ``seq_len``, so the L^2 term reduces to
+        ``batch_size * seq_len ** 2``. For THD it is the true ragged sum.
+        """
+        if seqlen_squared_sum is None:
+            seqlen_squared_sum = batch_size * seq_len * seq_len
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
-            4
-            * batch_size
-            * seq_len
-            * hidden_size
-            * p
-            * (hidden_size + (hidden_size * (g / num_heads)) + (seq_len / 2))
+            4 * batch_size * seq_len * hidden_size * p
+            * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * seqlen_squared_sum * hidden_size * p
         )
 
     def mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
@@ -383,11 +506,13 @@ def num_floating_point_operations(args, batch_size):
                      gdn_qk_head_dim=128, gdn_v_head_dim=128,
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4,
-                     vocab_size=256000, mtp_num_layers=0):
+                     vocab_size=256000, mtp_num_layers=0,
+                     seqlen_squared_sum=None):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
                 num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
-                                                   num_attn_heads, gqa, gqa_groups, kv_channels) +
+                                                   num_attn_heads, gqa, gqa_groups, kv_channels,
+                                                   seqlen_squared_sum=seqlen_squared_sum) +
                 num_mlp_layers * mlp_layer_flops(batch_size, seq_len, hidden_size,
                                                  mlp_expansion, swiglu) +
                 num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
@@ -467,6 +592,13 @@ def num_floating_point_operations(args, batch_size):
         # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
         ffn_expansion_factor = 3 if args.swiglu else 2
 
+        # self_attn is split into a token-linear part (projections, multiplied by
+        # ``batch_size * args.seq_length`` like all other token-linear work) and a
+        # core-attention part (``QK^T`` and ``softmax(QK^T) V``) whose compute scales
+        # with ``sum_i(L_i ** 2)`` instead of ``batch * seq^2``. With unpacked BSHD the
+        # two are equal, so the BSHD result is unchanged. With THD/packed sequences
+        # ``seqlen_squared_sum_in_batch`` is strictly smaller, reflecting the per-chunk
+        # causal mask of packed attention.
         if args.multi_latent_attention:
             assert not args.group_query_attention
             '''
@@ -495,6 +627,7 @@ def num_floating_point_operations(args, batch_size):
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                     + 1
                 )
+            # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -511,11 +644,18 @@ def num_floating_point_operations(args, batch_size):
                     + args.hidden_size * args.qk_pos_emb_head_dim
                     ## o proj
                     + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
-                    ## core attn
-                    + args.seq_length
-                    * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2  # causal mask (only half of the mask is non-zero)
-                    + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                )
+            )
+            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
+            # ``/2`` accounts for the causal mask and the ``*2`` cancels it via FMA.
+            standard_self_attn_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * (
+                    args.num_attention_heads
+                    * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                    / 2
+                    + args.num_attention_heads * args.v_head_dim / 2
                 )
             )
 
@@ -525,6 +665,7 @@ def num_floating_point_operations(args, batch_size):
             key_projection_size = args.kv_channels * args.num_query_groups
             value_projection_size = args.kv_channels * args.num_query_groups
             gate_projection_size = query_projection_size if args.attention_output_gate else 0
+            # Token-linear part of self-attention (QKV projection + output projection).
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -537,15 +678,18 @@ def num_floating_point_operations(args, batch_size):
                         + value_projection_size
                         + gate_projection_size
                     )
-                    ## core attention
-                    + query_projection_size
-                    * args.seq_length
-                    / 2  # causal mask (only half of the mask is non-zero)
-                    * 2  # QK^T and (QK^T)V
                     ## out proj
                     + query_projection_size
                     * args.hidden_size
                 )
+            )
+            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``.
+            standard_self_attn_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * query_projection_size
+                / 2  # causal mask (only half of the mask is non-zero)
+                * 2  # QK^T and (QK^T)V
             )
 
         if is_linear_attention_variant(args.experimental_attention_variant):
@@ -615,10 +759,14 @@ def num_floating_point_operations(args, batch_size):
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
+        # Token-linear self-attention work (projections + linear-attention variants).
+        # Linear attention has no L^2 term, so it stays entirely token-linear.
         self_attn_term = (
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers
         )
+        # Core attention (L^2) FLOPs per standard-attention layer.
+        self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
 
         total_floating_point_operations = (
             batch_size
@@ -652,7 +800,7 @@ def num_floating_point_operations(args, batch_size):
                     + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
                     * num_moe_layers
                 )
-                # Self Attention
+                # Self Attention (token-linear part).
                 + self_attn_term
                 # MTP norms and proj
                 + forward_backward_expansion_factor
@@ -671,6 +819,11 @@ def num_floating_point_operations(args, batch_size):
                 * args.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
             )
+            # Self Attention (core L^2 part). For BSHD the default
+            # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
+            # original ``batch * seq^2 * Q_proj`` term; for THD this uses the actual
+            # ragged ``sum(L_i^2)`` and so undercounts the BSHD figure correctly.
+            + seqlen_squared_sum_in_batch * self_attn_core_term
         )
         return total_floating_point_operations
 
@@ -679,7 +832,10 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         from operator import itemgetter
 
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            Symbols,
+            get_hybrid_layer_counts,
+        )
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
@@ -722,6 +878,7 @@ def num_floating_point_operations(args, batch_size):
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            seqlen_squared_sum=seqlen_squared_sum_in_batch,
         )
     else:
         # Compute standard Transformer model FLOPs.
@@ -2073,6 +2230,7 @@ def training_log(
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
+    seqlen_squared_sum_in_batch: float | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2304,7 +2462,9 @@ def training_log(
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
-        throughput = num_floating_point_operations(args, batch_size) / (
+        throughput = num_floating_point_operations(
+            args, batch_size, seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch
+        ) / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
 
@@ -3299,7 +3459,14 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
+        # Drain the per-iteration packed-sequence ``sum(L_i^2)`` accumulator so the
+        # FLOPs computation reflects THD per-chunk causal attention. Returns
+        # ``None`` for unpacked BSHD runs (no collective issued), letting
+        # ``num_floating_point_operations`` fall back to its closed-form default.
+        seqlen_squared_sum_in_batch = consume_seqlen_squared_sum_in_iteration()
+        num_floating_point_operations_in_batch = num_floating_point_operations(
+            args, batch_size, seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch
+        )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
@@ -3330,6 +3497,7 @@ def train(
             max_attention_logit,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
         )
         is_first_iteration = False
 
