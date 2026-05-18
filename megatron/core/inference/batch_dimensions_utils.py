@@ -240,30 +240,21 @@ class CUDAGraphBatchDimensionBuilder:
             [128, 64, 32, 16, 8, 4, 2, 1]
         """
         if num_cuda_graphs == -1:
-            # automatically determine the number of CUDA graphs to
-            # capture based on the `max_requests` value
-            cuda_graph_token_counts = (
-                [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, cuda_graph_max_tokens + 1, 16))
+            # Each step in the exponential-decay loop below halves the cudagraph size, so we need
+            # ~log2(max_tokens) steps with an extra +2 to leave headroom for dedup/trim.
+            auto_n = max(4, int(math.log2(max(2, cuda_graph_max_tokens))) + 2)
+            return CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+                tp_size=tp_size,
+                num_cuda_graphs=auto_n,
+                cuda_graph_max_tokens=cuda_graph_max_tokens,
             )
-            # Align each entry to TP size
-            cuda_graph_token_counts = list(
-                dict.fromkeys(
-                    round_up_to_nearest_multiple(s, tp_size) for s in cuda_graph_token_counts
-                )
-            )
-            # Clamp to max tokens
-            cuda_graph_token_counts = [
-                s for s in cuda_graph_token_counts if s <= cuda_graph_max_tokens
-            ]
-            if not cuda_graph_token_counts or cuda_graph_token_counts[-1] != cuda_graph_max_tokens:
-                cuda_graph_token_counts.append(cuda_graph_max_tokens)
-            cuda_graph_token_counts.reverse()
-            return cuda_graph_token_counts
 
         assert num_cuda_graphs >= 1, f"num_cuda_graphs must be >= 1, got {num_cuda_graphs}"
         assert (
             cuda_graph_max_tokens > 0
         ), f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
+
+        rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
 
         # Cuda graph step size.
         cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
@@ -422,6 +413,23 @@ class CUDAGraphBatchDimensionBuilder:
                     cuda_graph_max_tokens=cuda_graph_max_tokens_decode,
                 )
             )
+
+            # Include the smallest decode-only graphs when auto-sizing (num_cuda_graphs == -1).
+            # Without this, TP alignment (size 1 -> tp_size) and the num_speculative_tokens floor
+            # division may drop the size 1 and size 2 graph sizes.
+            if num_cuda_graphs == -1:
+                spec_unit = num_speculative_tokens + 1
+                min_decode_tokens = math.lcm(spec_unit, tp_size)
+                for req_count_multiple in (1, 2):
+                    floor_tokens = min_decode_tokens * req_count_multiple
+                    if (
+                        floor_tokens <= cuda_graph_max_tokens_decode
+                        and floor_tokens not in cuda_graph_decode_token_counts
+                    ):
+                        cuda_graph_decode_token_counts.append(floor_tokens)
+                cuda_graph_decode_token_counts = sorted(
+                    set(cuda_graph_decode_token_counts), reverse=True
+                )
 
         cuda_graph_batch_dimensions_list = []
         if num_cuda_graphs is None:
