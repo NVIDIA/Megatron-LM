@@ -286,11 +286,6 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         # Use dist_param (always a DTensor) for global shape/numel,
         # as data may be a regular Tensor (e.g., optimizer states).
         global_shape = dist_param.shape
-        if isinstance(data, DTensor):
-            assert data.shape == global_shape, (
-                f"DTensor shape mismatch: data.shape={data.shape} vs "
-                f"dist_param.shape={global_shape}"
-            )
         assert global_shape[swiglu_shard_axis] % 2 == 0, (
             f"SWiGLU FC1 must have even global size along axis {swiglu_shard_axis}, "
             f"got {global_shape[swiglu_shard_axis]} (global_shape={list(global_shape)})"
@@ -308,7 +303,21 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
         view_shape = list(global_shape)
         view_shape[swiglu_shard_axis] = -1
-        local_tensor = data.to_local() if isinstance(data, DTensor) else data
+        if isinstance(data, DTensor):
+            assert data.shape == global_shape, (
+                f"DTensor shape mismatch: data.shape={data.shape} vs "
+                f"dist_param.shape={global_shape}"
+            )
+            local_tensor = data.to_local()
+        else:
+            # Plain Tensor must already be the FSDP-local shard; other layouts
+            # (TP-local / global) would silently misalign in the slice below.
+            expected = fsdp_slice.stop - fsdp_slice.start
+            assert data.numel() == expected, (
+                f"Plain Tensor must be FSDP-local shard "
+                f"(expected numel={expected}, got {data.numel()}; fsdp_slice={fsdp_slice})"
+            )
+            local_tensor = data
         weight_w = local_tensor.view(-1)[
             offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
@@ -501,11 +510,6 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         # Use dist_param (always a DTensor) for global shape/numel,
         # as data may be a regular Tensor (e.g., optimizer states).
         global_shape = dist_param.shape
-        if isinstance(data, DTensor):
-            assert data.shape == global_shape, (
-                f"DTensor shape mismatch: data.shape={data.shape} vs "
-                f"dist_param.shape={global_shape}"
-            )
 
         fsdp_slice = dist_param.megatron_fsdp_slice
         dist_index = dist_param.megatron_fsdp_dist_index
@@ -514,7 +518,21 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         data_size = dist_param.numel() // tp_mesh.mesh.numel()
         elems_per_unit = data_size // total_split
 
-        local_tensor = data.to_local() if isinstance(data, DTensor) else data
+        if isinstance(data, DTensor):
+            assert data.shape == global_shape, (
+                f"DTensor shape mismatch: data.shape={data.shape} vs "
+                f"dist_param.shape={global_shape}"
+            )
+            local_tensor = data.to_local()
+        else:
+            # Plain Tensor must already be the FSDP-local shard; other layouts
+            # (TP-local / global) would silently misalign in the slice below.
+            expected = fsdp_slice.stop - fsdp_slice.start
+            assert data.numel() == expected, (
+                f"Plain Tensor must be FSDP-local shard "
+                f"(expected numel={expected}, got {data.numel()}; fsdp_slice={fsdp_slice})"
+            )
+            local_tensor = data
         view_shape = list(global_shape)
 
         per_tp_rank_shape = list(global_shape)
