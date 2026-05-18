@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-from packaging.version import Version
 
 from .utils import is_torch_min_version
 
