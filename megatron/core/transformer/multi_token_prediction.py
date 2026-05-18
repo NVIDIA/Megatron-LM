@@ -1012,17 +1012,25 @@ class MultiTokenPredictionLayer(MegatronModule):
             hs_streams = hidden_states.view(s, b, n, h)
             hs_streams = apply_module(self.hnorm)(hs_streams)
             hs_streams = make_viewless_tensor(inp=hs_streams, requires_grad=True, keep_graph=True)
-            # e_proj: [s, b, h] -> [s, b, h], then broadcast to [s, b, n, h]
+            # e_proj/h_proj are column-parallel projections on the same TP group with
+            # gather_output=False, so both outputs hold the same hidden partition.
+            # Add within the partition first, then gather once across TP ranks.
             e_out, _ = self.e_proj(decoder_input)
-            e_out = gather_from_tensor_model_parallel_region(e_out, group=self.tp_group)
             # h_proj: applied per-stream on the h dimension
             h_out, _ = self.h_proj(hs_streams)
-            h_out = gather_from_tensor_model_parallel_region(h_out, group=self.tp_group)
-            # Sequence-parallel column projections gather the sequence dimension.
-            s, b, n, h = h_out.shape
-            e_out = e_out.unsqueeze(2).expand(s, b, n, h)
-            # Combine and flatten back to [s, b, n*h]
-            hidden_states = (e_out + h_out).reshape(s, b, n * h)
+            s, b, n, _ = h_out.shape
+            hidden_states = e_out.unsqueeze(2) + h_out
+            if not self.training:
+                hidden_states = inference_all_gather_from_tensor_model_parallel_region(
+                    hidden_states, self.tp_group, self.config
+                )
+            else:
+                hidden_states = gather_from_tensor_model_parallel_region(
+                    hidden_states, group=self.tp_group
+                )
+            # Combine and flatten back to [s, b, n*h].
+            s, b, n, h = hidden_states.shape
+            hidden_states = hidden_states.reshape(s, b, n * h)
             if self.sequence_parallel:
                 hidden_states = scatter_to_sequence_parallel_region(
                     hidden_states, group=self.tp_group
