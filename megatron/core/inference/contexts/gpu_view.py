@@ -59,8 +59,8 @@ class ContextGPUView:
         mha_cu_kv_seq_lengths_bytes = (max_bs + 1) * 4
         mha_block_table_bytes = max_bs * max_kv_blocks * 4
 
-        # Mamba section: 9 int32 fields, only present for hybrid models.
-        #   mamba_batch_indices_decode    int32 (max_bs,)
+        # Mamba section, only present for hybrid models.
+        #   mamba_batch_indices_decode    int64 (max_bs,)
         #   mamba_batch_indices_prefill   int32 (max_bs,)
         #   mamba_seq_idx                 int32 (1, max_tokens)
         #   mamba_cu_seqlens              int32 (max_bs + 1,)
@@ -70,7 +70,7 @@ class ContextGPUView:
         #   mamba_conv_seq_idx            int32 (max_tokens,)
         #   mamba_conv_seq_start          int32 (max_tokens,)
         if max_mamba_chunks > 0:
-            mamba_batch_indices_decode_bytes = max_bs * 4
+            mamba_batch_indices_decode_bytes = max_bs * 8
             mamba_batch_indices_prefill_bytes = max_bs * 4
             mamba_seq_idx_bytes = max_tokens * 4
             mamba_cu_seqlens_bytes = (max_bs + 1) * 4
@@ -182,7 +182,7 @@ class ContextGPUView:
         if max_mamba_chunks > 0:
             self.mamba_batch_indices_decode = self._buf[
                 off : off + mamba_batch_indices_decode_bytes
-            ].view(torch.int32)
+            ].view(torch.int64)
             off += mamba_batch_indices_decode_bytes
             self.mamba_batch_indices_prefill = self._buf[
                 off : off + mamba_batch_indices_prefill_bytes
