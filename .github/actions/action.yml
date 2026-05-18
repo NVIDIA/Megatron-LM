@@ -77,7 +77,15 @@ runs:
 
     - name: Change ownership of /home/runner/
       shell: bash
-      run: sudo chown -R $(whoami) /home/runner/
+      # Tolerate vanishing `.git/objects/pack/.tmp-*` files: the prior
+      # `actions/checkout` may leave a background `git gc --auto` running,
+      # whose `git pack-objects` renames/deletes temp files while `chown`
+      # is walking the tree. On failure, wait 5 s for gc to settle, retry,
+      # then succeed unconditionally.
+      run: |
+        sudo chown -R $(whoami) /home/runner/ 2>/dev/null && exit 0
+        sleep 5
+        sudo chown -R $(whoami) /home/runner/ 2>/dev/null || true
 
     - name: Setup python
       uses: actions/setup-python@v5
@@ -209,6 +217,8 @@ runs:
       if: always()
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
+        MAIN_CONCLUSION: ${{ steps.run-main-script.conclusion }}
+        MAIN_EXIT_CODE: ${{ steps.run-main-script.outputs.exit_code }}
       run: |
         logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
@@ -219,8 +229,12 @@ runs:
         fi
         echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
 
-        EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
-        IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
+        EXIT_CODE="${MAIN_EXIT_CODE:-${MAIN_CONCLUSION}}"
+        if [[ "$MAIN_CONCLUSION" == "success" ]]; then
+          IS_SUCCESS=true
+        else
+          IS_SUCCESS=false
+        fi
 
         if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is-optional }}" == "true" ]]; then
           echo "::warning::Test failed but is marked optional — treating as success."

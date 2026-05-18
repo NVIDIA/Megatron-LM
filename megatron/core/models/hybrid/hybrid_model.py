@@ -8,6 +8,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
@@ -20,7 +21,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -349,13 +350,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         Check if we should call the local cudagraph path.
         """
         if (
-            not self.training
+            InferenceMode.is_active()
             and hasattr(self, 'cudagraph_manager')
             and (
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -375,7 +376,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         """
         Create the cudagraph manager for the full iteration inference scope
         """
-        if CudaGraphScope.full_iteration_inference in config.cuda_graph_scope:
+        if config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
             self.cudagraph_manager = CudaGraphManager(config)
@@ -409,7 +410,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = InferenceMode.is_active()
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -424,6 +425,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # quantization scales to avoid corrupting amax calculations
             if (
                 in_inference_mode
+                and inference_context is not None
                 and inference_context.is_dynamic_batching()
                 and is_using_quantization_scales(self.config)
             ):
@@ -487,6 +489,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # tokens rather than stale speculative tokens from the previous step.
         is_spec_decode = (
             in_inference_mode
+            and inference_context is not None
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
@@ -527,7 +530,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                 )
         sequence_parallel_override = False
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.config.materialize_only_last_token_logits
+        ):
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
