@@ -256,14 +256,9 @@ class TransformerConfig(ModelParallelConfig):
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
     attention_output_gate: bool = False
-    """Whether to apply a full head_dim output gate to the attention layers.
-    The gate is fused into linear_qkv with an inline per-group [q, gate, k, v]
-    layout, contributing num_attention_heads * head_dim extra rows. The
-    sigmoid of the gate (head_dim values per head) is broadcast-multiplied
-    onto each head's attention output. Mutually exclusive with the related
-    `head_wise_attn_gate` flag, which fuses only a single SCALAR gate per
-    head (num_attention_heads rows) as trailing rows of linear_qkv; see
-    `head_wise_attn_gate` for the contrast."""
+    """Apply a full head_dim output gate (num_attention_heads * head_dim rows
+    fused inline per-group [q, gate, k, v] into linear_qkv). Mutually
+    exclusive with `head_wise_attn_gate` (per-head scalar gate)."""
 
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
@@ -271,60 +266,29 @@ class TransformerConfig(ModelParallelConfig):
     the shared model-level rotary_pos_emb is not created."""
 
     head_wise_attn_gate: bool = False
-    """Apply a per-head SCALAR output gate (e.g., Step-3.5-Flash g_proj).
-    The gate weights are fused into linear_qkv as the trailing
-    num_attention_heads rows; the sigmoid of those scalars (one per
-    attention head) is broadcast-multiplied onto each head's attention
-    output, so head i is scaled uniformly across all head_dim positions.
-
-    Contrast with `attention_output_gate`:
-
-        attention_output_gate:
-            Full head_dim gate per head -> num_attention_heads * head_dim
-            extra rows, inline per-group [q, gate, k, v] layout. Each head's
-            output is element-wise gated across head_dim.
-        head_wise_attn_gate (this flag):
-            Single scalar gate per head -> num_attention_heads extra rows,
-            trailing-rows layout. Each head's output is scaled by one
-            sigmoid(gate) value.
-
-    The two flags are mutually exclusive (validated in __post_init__).
-    Self-attention only: cross-attention layers do not own linear_qkv, so
-    the gate path does not apply there
-    (CrossAttention.get_query_key_value_tensors rejects the flag with an
-    explicit assertion). Distributed checkpoint TP resharding is handled
-    via a ShardedTensorFactory in SelfAttention.sharded_state_dict that
-    splits linear_qkv.{weight,bias} into independent [QKV, gate]
-    sub-tensors (analogous to apply_swiglu_sharded_factory). Requires
-    num_attention_heads % tensor_model_parallel_size == 0 and
-    num_query_groups >= tensor_model_parallel_size; both are validated in
-    __post_init__. Under fp8/fp4, the per-partition linear_qkv output dim
-    must additionally be a multiple of 16 (fp8) or 32 (fp4) for
-    Transformer Engine's GEMM alignment; this is validated in
-    __post_init__ too. attention_output_gate's wider gate (head_dim per
-    head) hits this alignment naturally; head_wise_attn_gate's tiny
-    num_attention_heads increment can mis-align, so users may need to
-    pick num_attention_heads / num_query_groups accordingly."""
+    """Apply a per-head scalar output gate (Step-3.5-Flash g_proj):
+    num_attention_heads scalar gates fused as the trailing rows of
+    linear_qkv; sigmoid scales each head uniformly across head_dim.
+    Contrast with `attention_output_gate` (full head_dim gate, inline
+    per-group); the two are mutually exclusive. Self-attention only.
+    dist-ckpt TP resharding is handled by a ShardedTensorFactory in
+    SelfAttention.sharded_state_dict. Requires (validated in
+    __post_init__): num_attention_heads % tp == 0,
+    num_query_groups >= tp, and under fp8/fp4 a per-partition
+    linear_qkv_out_dim aligned to 16/32."""
 
     head_wise_attn_gate_init_weight_scale: float = 0.1
-    """Multiplicative scale applied to the gate rows of linear_qkv.weight right
-    after construction, on top of the shared init_method (which is normal
-    init for QKV). Defaults to 0.1 so the gate's pre-sigmoid contribution
-    from the linear part is small at init (~10x smaller than QKV's), making
-    sigmoid(gate*x + bias) dominated by the gate bias term and so close to
-    identity once head_wise_attn_gate_init_bias is set. Kept on the same
-    order of magnitude as QKV so the FP8 tensor-level scale on
-    linear_qkv.weight isn't dominated by an under/over-scaled gate sub-block.
-    Only relevant when head_wise_attn_gate=True."""
+    """Multiplicative scale on the gate rows of linear_qkv.weight at init,
+    on top of init_method. Default 0.1 keeps the linear contribution small
+    so sigmoid is dominated by the bias term, while staying within ~1
+    decade of QKV magnitudes for FP8 tensor-scale safety. Only used when
+    head_wise_attn_gate=True."""
 
     head_wise_attn_gate_init_bias: float = 2.0
-    """Constant value written to the gate rows of linear_qkv.bias right after
-    construction (no-op when linear_qkv has no bias). Defaults to 2.0 so
-    sigmoid(2.0) ~= 0.88 at init -- approximately identity, so the gate
-    does not halve every head's output from step 0 and add an extra
-    optimization burden during warmup. Only relevant when
-    head_wise_attn_gate=True and the linear_qkv layer has a bias
-    (add_bias_linear=True or add_qkv_bias=True)."""
+    """Constant fill for the gate rows of linear_qkv.bias at init (no-op
+    when linear_qkv has no bias). Default 2.0 -> sigmoid(2)~=0.88, near
+    identity; avoids halving every head's output from step 0. Only used
+    when head_wise_attn_gate=True."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -1385,90 +1349,45 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        # head_wise_attn_gate layout/compose validation. Fails fast at
-        # config time (before any layer is built) so users do not hit obscure
-        # asserts deep inside the forward path.
         if self.head_wise_attn_gate:
-            # (1) Mutual exclusion with attention_output_gate. Both flags
-            #     append rows to linear_qkv: attention_output_gate uses an
-            #     inline per-group (q, gate, k, v) layout, while
-            #     head_wise_attn_gate appends a trailing-rows block.
-            #     The forward-time slicing paths assume each layout in
-            #     isolation; their joint behavior is not currently tested
-            #     or documented, so we refuse the combination outright.
+            tp = self.tensor_model_parallel_size
             if self.attention_output_gate:
                 raise ValueError(
-                    "head_wise_attn_gate and attention_output_gate cannot both be "
-                    "enabled: each appends rows to linear_qkv with an incompatible "
-                    "layout (per-group inline gate vs trailing-rows gate). Enable at "
-                    "most one."
+                    "head_wise_attn_gate and attention_output_gate cannot both be enabled "
+                    "(incompatible linear_qkv row layouts)."
                 )
-            # (2) Per-rank gate-row count must be an integer. The
-            #     num_attention_heads % tensor_model_parallel_size == 0 check
-            #     above already enforces this globally, but re-state it here
-            #     with a gate-specific message so the failure mode is obvious.
-            if self.num_attention_heads % self.tensor_model_parallel_size != 0:
+            if self.num_attention_heads % tp != 0:
                 raise ValueError(
                     f"head_wise_attn_gate requires num_attention_heads "
-                    f"({self.num_attention_heads}) to be divisible by "
-                    f"tensor_model_parallel_size ({self.tensor_model_parallel_size}); "
-                    f"otherwise the trailing num_attention_heads gate rows cannot be "
-                    f"sharded into integer per-rank counts."
+                    f"({self.num_attention_heads}) divisible by tp ({tp})."
                 )
-            # (3) num_query_groups >= tensor_model_parallel_size. The gate
-            #     peel-off in SelfAttention.get_query_key_value_tensors runs
-            #     BEFORE the num_query_groups < world_size AllGather + reslice
-            #     fallback path; under that fallback
-            #     num_attention_heads_per_partition is inflated to
-            #     num_attention_heads / num_query_groups (the pre-AG count),
-            #     so the slice over-takes and pulls V/K rows in as gate rows.
-            #     Disallow the combination here.
-            if self.num_query_groups < self.tensor_model_parallel_size:
+            # The gate peel-off in SelfAttention runs before the
+            # num_query_groups < world_size AllGather+reslice fallback, so the
+            # gate cannot ride that path without over-taking V/K rows.
+            if self.num_query_groups < tp:
                 raise ValueError(
                     f"head_wise_attn_gate requires num_query_groups "
-                    f"({self.num_query_groups}) >= tensor_model_parallel_size "
-                    f"({self.tensor_model_parallel_size}). The head-wise gate "
-                    f"peel-off runs before the num_query_groups < world_size "
-                    f"AllGather + reslice fallback; under that fallback the gate "
-                    f"slice would over-take and pick up V/K rows as gate rows."
+                    f"({self.num_query_groups}) >= tp ({tp})."
                 )
-            # (4) FP8 / FP4 GEMM alignment. Transformer Engine's FP8 GEMM
-            #     requires the per-partition output dim of linear_qkv to be
-            #     a multiple of 16 (FP4: 32). attention_output_gate adds
-            #     num_attention_heads * kv_channels rows, which is already
-            #     16-aligned for typical kv_channels (64/128); head_wise
-            #     adds only num_attention_heads rows -- a much smaller and
-            #     potentially mis-aligned increment. TE would either error
-            #     out or silently pad the weight (shifted outputs); reject
-            #     up front so this is caught at config-time, not at first
-            #     fp8 forward.
+            # TE FP8/FP4 GEMM requires per-partition output dim aligned to
+            # 16/32. attention_output_gate's wider gate gets this for free;
+            # head_wise's num_attention_heads-row increment can mis-align.
             if self.fp8 is not None or self.fp4 is not None:
                 align = 32 if self.fp4 is not None else 16
-                # Mirror SelfAttention's linear_qkv_out_dim formula. Safe
-                # because checks (2)/(3) above already ensure the QKV and
-                # gate blocks each divide tensor_model_parallel_size cleanly.
                 linear_qkv_out_dim = (
                     self.kv_channels * self.num_attention_heads
                     + 2 * self.kv_channels * self.num_query_groups
                     + self.num_attention_heads
                 )
-                per_partition = linear_qkv_out_dim // self.tensor_model_parallel_size
+                per_partition = linear_qkv_out_dim // tp
                 if per_partition % align != 0:
                     fp_name = "fp4" if self.fp4 is not None else "fp8"
                     raise ValueError(
-                        f"head_wise_attn_gate under {fp_name} requires the "
-                        f"per-partition linear_qkv output dim "
-                        f"({per_partition}) to be a multiple of {align} for "
-                        f"Transformer Engine's {fp_name.upper()} GEMM alignment. "
-                        f"Got num_attention_heads={self.num_attention_heads}, "
+                        f"head_wise_attn_gate under {fp_name} requires per-partition "
+                        f"linear_qkv output dim ({per_partition}) to be a multiple of "
+                        f"{align}; got num_attention_heads={self.num_attention_heads}, "
                         f"num_query_groups={self.num_query_groups}, "
-                        f"kv_channels={self.kv_channels}, "
-                        f"tensor_model_parallel_size={self.tensor_model_parallel_size} "
-                        f"-> linear_qkv_out_dim={linear_qkv_out_dim}. "
-                        f"Pick num_attention_heads such that "
-                        f"(kv_channels*num_attention_heads + 2*kv_channels*"
-                        f"num_query_groups + num_attention_heads) / "
-                        f"tensor_model_parallel_size is divisible by {align}."
+                        f"kv_channels={self.kv_channels}, tp={tp}."
                     )
 
         if self.linear_attention_type is not None:

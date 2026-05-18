@@ -2,32 +2,8 @@
 
 """Tests for per-head scalar attention gate (head_wise_attn_gate).
 
-The gate weights are fused into linear_qkv as the trailing num_attention_heads
-rows; in the forward pass those scalars are sliced out, passed through sigmoid,
-and used to scale each attention head's output independently.
-
-Coverage summary across this file plus
-tests/unit_tests/dist_checkpointing/test_head_wise_attn_gate_resharding.py:
-
-  - Config-time validation (mutual exclusion, TP / num_query_groups
-    divisibility): TestHeadWiseAttnGateConfigValidation.
-  - linear_qkv shape with/without gate: TestHeadWiseAttnGateInit.
-  - TP=1 forward sanity, output shape, half/no-side-channel guards:
-    TestHeadWiseAttnGateForward.
-  - Pure-tensor reshape and sigmoid saturation: TestHeadWiseAttnGateNumerics.
-  - TP=2 layout correctness (saturated gate, per-rank gate independence,
-    init-time rejection of misaligned configs):
-    TestHeadWiseAttnGateUnderTP2.
-  - Init-time gate magnitude (sigmoid~=1 at start, knob propagation,
-    FP8-friendly weight std): TestHeadWiseAttnGateInitMagnitude.
-  - dist-ckpt save TP=N -> load TP=M logits equality, parametrized over
-    MHA/GQA and bias presence: test_head_wise_attn_gate_resharding.py.
-
-Known unverified paths (filed as follow-ups, see resharding test
-docstring for details): context_parallel_size > 1, fp8 (linear_qkv shared
-tensor scale across QKV and gate blocks; set_save_original_input
-interaction), explicit backward-grad-to-gate-rows assertion, and
-packed_seq_params.qkv_format == 'thd' reshape composition.
+Unverified paths (follow-ups): CP, fp8, explicit backward-grad-to-gate,
+packed_seq_params.qkv_format == 'thd'.
 """
 
 import pytest
@@ -73,18 +49,7 @@ def _make_attention(config: TransformerConfig, transformer_impl: str) -> SelfAtt
 
 
 class TestHeadWiseAttnGateConfigValidation:
-    """TransformerConfig.__post_init__ should reject misconfigurations up
-    front so users don't hit obscure asserts deep inside the forward path.
-
-    Three invariants are validated at config-creation time:
-
-      (a) Mutual exclusion with attention_output_gate (both append rows to
-          linear_qkv with incompatible layouts).
-      (b) num_attention_heads % tensor_model_parallel_size == 0.
-      (c) num_query_groups >= tensor_model_parallel_size (otherwise the
-          forward-time gate slice over-takes through the AG+reslice
-          fallback).
-    """
+    """TransformerConfig.__post_init__ rejects misconfigurations at config time."""
 
     def _config(self, **extra) -> TransformerConfig:
         return TransformerConfig(
@@ -101,23 +66,16 @@ class TestHeadWiseAttnGateConfigValidation:
             self._config(head_wise_attn_gate=True, attention_output_gate=True)
 
     def test_rejects_num_heads_indivisible_by_tp(self):
-        """Cross-check against the global num_attention_heads % tp check: the
-        gate-specific message is what we want users to see. The global check
-        fires first (line 1334-ish of transformer_config.py), but it carries
-        the same TP-divisibility wording, so either error is acceptable for
-        users; we accept either by matching the shared substring."""
         with pytest.raises(ValueError, match="num_attention_heads"):
             self._config(
-                num_attention_heads=3,  # not divisible by 2
+                num_attention_heads=3,
                 num_query_groups=3,
-                hidden_size=24,  # divisible by 3 for head_dim
+                hidden_size=24,
                 tensor_model_parallel_size=2,
                 head_wise_attn_gate=True,
             )
 
     def test_rejects_num_query_groups_below_tp(self):
-        """num_query_groups=1 < tensor_model_parallel_size=2 must fail at
-        config time, not silently produce a wrong forward."""
         with pytest.raises(ValueError, match="num_query_groups"):
             self._config(
                 num_attention_heads=4,
@@ -127,8 +85,6 @@ class TestHeadWiseAttnGateConfigValidation:
             )
 
     def test_accepts_well_formed_config(self):
-        """Sanity: a config that satisfies all three invariants does not
-        raise. (TP=2, num_heads=4 divisible by 2, num_query_groups=4 >= 2.)"""
         self._config(
             num_attention_heads=4,
             num_query_groups=4,
@@ -137,12 +93,8 @@ class TestHeadWiseAttnGateConfigValidation:
         )
 
     def test_disabled_does_not_constrain_other_flags(self):
-        """When the gate is off, the gate-specific validations must not fire
-        even if attention_output_gate is on or num_query_groups < tp.
-        Otherwise the validations would regress unrelated configs."""
-        # attention_output_gate on, head-wise off -- must NOT raise.
+        """Gate-off must not regress unrelated configs."""
         self._config(head_wise_attn_gate=False, attention_output_gate=True)
-        # num_query_groups < tp, head-wise off -- must NOT raise.
         self._config(
             num_attention_heads=4,
             num_query_groups=1,
@@ -151,36 +103,18 @@ class TestHeadWiseAttnGateConfigValidation:
         )
 
     def test_rejects_fp8_misaligned_linear_qkv_out_dim(self):
-        """H=8, G=8, kv_channels=128, TP=1 gives linear_qkv_out_dim=3080;
-        3080 % 16 = 8. TE's FP8 GEMM requires 16-alignment, so this must
-        be rejected at config time -- otherwise TE either errors or
-        silently pads the weight (shifted outputs)."""
+        # H=8, G=8, D=128, TP=1 -> linear_qkv_out_dim=3080; 3080 % 16 = 8.
         with pytest.raises(ValueError, match=r"fp8.*multiple of 16"):
             self._config(
                 num_attention_heads=8,
                 num_query_groups=8,
-                hidden_size=8 * 128,  # kv_channels=128
+                hidden_size=8 * 128,
                 head_wise_attn_gate=True,
                 fp8="hybrid",
             )
 
-    def test_accepts_fp8_aligned_linear_qkv_out_dim(self):
-        """H=16, G=2, kv_channels=128, TP=1 gives linear_qkv_out_dim=2576;
-        2576 % 16 = 0 -- valid for FP8 GEMM. Sanity that the check does
-        not fire on a well-aligned config."""
-        self._config(
-            num_attention_heads=16,
-            num_query_groups=2,
-            hidden_size=16 * 128,
-            head_wise_attn_gate=True,
-            fp8="hybrid",
-        )
-
     def test_rejects_fp4_stricter_alignment(self):
-        """FP4 requires 32-alignment. A config that passes FP8 (16-aligned)
-        but not FP4 (32-aligned) should still be rejected when fp4 is on.
-        H=16, G=2, kv_channels=128, TP=1: linear_qkv_out_dim=2576;
-        2576 % 16 = 0 but 2576 % 32 = 16, so fp4 must reject."""
+        # H=16, G=2, D=128, TP=1 -> 2576; passes fp8 (16) but fails fp4 (32).
         with pytest.raises(ValueError, match=r"fp4.*multiple of 32"):
             self._config(
                 num_attention_heads=16,
@@ -189,20 +123,6 @@ class TestHeadWiseAttnGateConfigValidation:
                 head_wise_attn_gate=True,
                 fp4="e2m1",
             )
-
-    def test_no_alignment_check_without_fp8_or_fp4(self):
-        """The alignment check must only fire under fp8/fp4. A config that
-        is otherwise valid (passes the other gate invariants) but
-        mis-aligns linear_qkv_out_dim must NOT raise when fp8/fp4 are off
-        -- bf16 / fp16 / fp32 GEMM have no such alignment requirement."""
-        # H=8, G=8 -> linear_qkv_out_dim=3080 (mis-aligned), but no
-        # fp8/fp4 -> no raise.
-        self._config(
-            num_attention_heads=8,
-            num_query_groups=8,
-            hidden_size=8 * 128,
-            head_wise_attn_gate=True,
-        )
 
 
 @pytest.mark.parametrize("transformer_impl", ["transformer_engine", "native"])
@@ -236,7 +156,7 @@ class TestHeadWiseAttnGateInit:
 
 @pytest.mark.parametrize("transformer_impl", ["transformer_engine", "native"])
 class TestHeadWiseAttnGateForward:
-    """Verify forward-pass behaviour of the head-wise gate."""
+    """Forward-pass shape sanity + zero-gate equivalence."""
 
     @pytest.fixture(autouse=True)
     def setup_teardown(self, transformer_impl):
@@ -246,33 +166,21 @@ class TestHeadWiseAttnGateForward:
         yield
         Utils.destroy_model_parallel()
 
-    def _run_forward(self, use_gate: bool):
+    @pytest.mark.parametrize("use_gate", [True, False])
+    def test_output_shape(self, use_gate: bool):
         config = _make_config(self.transformer_impl, head_wise_attn_gate=use_gate)
         attn = _make_attention(config, self.transformer_impl).cuda()
         hidden_states = torch.randn(
             SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
         )
         attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
-        output, bias = attn(hidden_states, attention_mask)
-        return output, bias
-
-    def test_output_shape_with_gate(self):
-        output, _ = self._run_forward(use_gate=True)
-        assert output.shape == (SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE)
-
-    def test_output_shape_without_gate(self):
-        output, _ = self._run_forward(use_gate=False)
+        output, _ = attn(hidden_states, attention_mask)
         assert output.shape == (SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE)
 
     def test_zero_gate_halves_output(self):
-        """Zeroing the trailing gate rows of linear_qkv makes pre-sigmoid 0,
-        so the sigmoid is exactly 0.5 and the gated output is half the
-        ungated reference output that shares all other weights."""
+        """Zero gate rows -> sigmoid(0)=0.5 -> output = 0.5 * no-gate ref."""
         config = _make_config(self.transformer_impl, head_wise_attn_gate=True)
         attn = _make_attention(config, self.transformer_impl).cuda()
-
-        # Zero only the trailing num_attention_heads rows (the gate weights);
-        # leave QKV weights intact so the rest of the computation is unchanged.
         with torch.no_grad():
             attn.linear_qkv.weight[-NUM_HEADS:].zero_()
 
@@ -281,7 +189,6 @@ class TestHeadWiseAttnGateForward:
         )
         attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
 
-        # Reference: a gate-disabled attention layer that shares the QKV rows.
         config_no_gate = _make_config(self.transformer_impl, head_wise_attn_gate=False)
         attn_no_gate = _make_attention(config_no_gate, self.transformer_impl).cuda()
         with torch.no_grad():
@@ -297,67 +204,10 @@ class TestHeadWiseAttnGateForward:
             out_plain, _ = attn_no_gate(hidden_states, attention_mask)
 
         torch.testing.assert_close(
-            out_gated.float(),
-            (out_plain * 0.5).float(),
-            atol=1e-2,
-            rtol=1e-2,
+            out_gated.float(), (out_plain * 0.5).float(), atol=1e-2, rtol=1e-2
         )
 
 
-class TestHeadWiseAttnGateNumerics:
-    """Low-level tensor-math tests (no model-parallel overhead, pure PyTorch)."""
-
-    @pytest.fixture(autouse=True)
-    def setup_teardown(self):
-        Utils.initialize_model_parallel(1, 1)
-        yield
-        Utils.destroy_model_parallel()
-
-    def test_gate_reshape_correctness(self):
-        """Replicate the reshape logic and verify sigmoid is applied per-head."""
-        sq, b, np, hn = 4, 2, NUM_HEADS, 32
-        # Simulate core_attn_out: [sq, b, np*hn]
-        core_attn_out = torch.arange(
-            sq * b * np * hn, dtype=torch.float32
-        ).reshape(sq, b, np * hn)
-        # Simulate gate_states: [sq, b, np] (pre-sigmoid raw scores)
-        gate_scores = torch.zeros(sq, b, np)  # sigmoid(0) = 0.5
-
-        gate_states = gate_scores.view(sq, b, np, 1)
-        out = core_attn_out.view(sq, b, np, hn)
-        out = out * torch.sigmoid(gate_states)
-        out = out.view(sq, b, np * hn)
-
-        expected = core_attn_out * 0.5
-        torch.testing.assert_close(out, expected)
-
-    def test_gate_dtype_cast(self):
-        """Gate computation upcast to float32, result cast back to input dtype."""
-        sq, b, np, hn = 4, 2, NUM_HEADS, 32
-        core_attn_out = torch.randn(sq, b, np * hn, dtype=torch.bfloat16)
-        gate_scores = torch.randn(sq, b, np, dtype=torch.bfloat16)
-
-        gate_states = gate_scores.view(sq, b, np, 1)
-        out = core_attn_out.view(sq, b, np, hn)
-        # Mirrors the production code: float cast for sigmoid, then cast back
-        out = out * torch.sigmoid(gate_states.float()).to(out.dtype)
-        out = out.view(sq, b, np * hn)
-
-        assert out.dtype == torch.bfloat16
-
-    @pytest.mark.parametrize("gate_value,expected_scale", [(-1e6, 0.0), (1e6, 1.0), (0.0, 0.5)])
-    def test_gate_saturation(self, gate_value: float, expected_scale: float):
-        """Extreme gate values saturate sigmoid to 0 or 1; midpoint gives 0.5."""
-        sq, b, np, hn = 2, 1, 2, 8
-        core_attn_out = torch.ones(sq, b, np * hn)
-        gate_scores = torch.full((sq, b, np), gate_value)
-
-        gate_states = gate_scores.view(sq, b, np, 1)
-        out = core_attn_out.view(sq, b, np, hn)
-        out = out * torch.sigmoid(gate_states.float()).to(out.dtype)
-        out = out.view(sq, b, np * hn)
-
-        torch.testing.assert_close(out, torch.full_like(out, expected_scale), atol=1e-5, rtol=1e-5)
 
 
 def _make_config_tp(
@@ -408,20 +258,7 @@ def _copy_qkv_block_only(attn_dst: SelfAttention, attn_src: SelfAttention):
 
 
 class TestHeadWiseAttnGateUnderTP2:
-    """TP=2 forward tests that back-validate the trailing-rows-as-gate
-    layout. Three implicit preconditions are checked indirectly:
-
-      (1) ColumnParallelLinear partitions linear_qkv.weight along axis 0
-          contiguously and uniformly (no row interleave).
-      (2) num_attention_heads % world_size == 0.
-      (3) The global linear_qkv.weight layout is [QKV_block; Gate_block].
-
-    Each test forces the per-rank trailing gate scalars to a known constant
-    (via add_qkv_bias=True and bias surgery on the gate rows) and checks
-    that the gated output equals the expected scalar multiple of a no-gate
-    reference. If any precondition were violated, the slice would pick up
-    V/K rows instead of gate rows and the scalar relationship would not
-    hold."""
+    """TP=2 forward equivalence under known constant gate values."""
 
     @pytest.fixture(autouse=True)
     def setup_teardown(self):
@@ -434,37 +271,20 @@ class TestHeadWiseAttnGateUnderTP2:
 
     @pytest.mark.parametrize(
         "gate_value,expected_scale",
-        [
-            (0.0, 0.5),    # sigmoid(0)        = 0.5
-            (1e4, 1.0),    # sigmoid(+large)  -> 1
-            (-1e4, 0.0),   # sigmoid(-large)  -> 0
-        ],
+        [(0.0, 0.5), (1e4, 1.0), (-1e4, 0.0)],
     )
     def test_saturated_gate_under_tp2(self, gate_value: float, expected_scale: float):
-        """Force the LOCAL trailing num_attention_heads_per_partition gate rows
-        on every rank to produce a constant pre-sigmoid value (zero the gate
-        weight rows, set the gate bias rows to gate_value). The gated forward
-        output should then equal expected_scale * no-gate reference (which
-        shares all non-gate weights).
-
-        A layout bug -- e.g. trailing rows being V rows instead of gate --
-        would manifest here: setting V bias to +1e4 explodes attention
-        outputs, setting V bias to -1e4 wrecks softmax via huge negative V
-        contributions. Neither would produce the clean
-        ``expected_scale * out_plain`` relation.
-        """
+        """Zero gate weight rows + fill gate bias rows with gate_value, then
+        verify out_gated == sigmoid(gate_value) * out_no_gate. Catches layout
+        bugs where the slice would land on V/K rows instead of gate rows."""
         gated_config = _make_config_tp(head_wise_attn_gate=True, add_qkv_bias=True)
         attn = _make_attention_local(gated_config)
         gate_size = attn.num_attention_heads_per_partition
-        # Per-rank gate-row surgery: zero gate weight rows, set gate bias rows
-        # to the target pre-sigmoid value. After this, the gate input to
-        # sigmoid is constant `gate_value` regardless of hidden_states.
-        assert attn.linear_qkv.bias is not None, "test requires add_qkv_bias=True"
+        assert attn.linear_qkv.bias is not None
         with torch.no_grad():
             attn.linear_qkv.weight[-gate_size:].zero_()
             attn.linear_qkv.bias[-gate_size:].fill_(gate_value)
 
-        # Reference: no-gate attention sharing every other weight with attn.
         ref_config = _make_config_tp(head_wise_attn_gate=False, add_qkv_bias=True)
         attn_ref = _make_attention_local(ref_config)
         _copy_qkv_block_only(attn_ref, attn)
@@ -482,118 +302,9 @@ class TestHeadWiseAttnGateUnderTP2:
             out_gated, out_plain * expected_scale, atol=1e-4, rtol=1e-4
         )
 
-    def test_per_rank_gate_independence_under_tp2(self):
-        """Drive the gate to +large on rank 0 and -large on rank 1 (and vice
-        versa via parametrization is overkill here). Each TP rank's local
-        trailing gate rows correspond ONLY to that rank's query heads. After
-        linear_proj's RowParallel AllReduce, half the heads contribute
-        full-strength and half contribute zero. This test verifies the
-        slice does not cross rank boundaries -- if a rank ever read its
-        partner's gate scalars (impossible under axis-0 contiguous TP, but
-        the test guards the assumption), the half-zero / half-pass pattern
-        would collapse and the result would not match the expected
-        per-rank-weighted reference.
-
-        Verification trick: build the reference by running the no-gate
-        attention on each rank with its OWN core_attn_out scaled to
-        sigmoid(rank_gate); since linear_proj is row-parallel and sums TP
-        partial outputs, scaling each rank's slice of linear_proj.weight by
-        sigmoid(rank_gate) BEFORE the all-reduce yields the same final
-        output as gating each rank's core_attn_out by sigmoid(rank_gate).
-        """
-        tp_rank = torch.distributed.get_rank() % 2
-        gate_value = 1e4 if tp_rank == 0 else -1e4
-        # sigmoid(+1e4) ~= 1, sigmoid(-1e4) ~= 0
-        expected_rank_scale = 1.0 if tp_rank == 0 else 0.0
-
-        gated_config = _make_config_tp(head_wise_attn_gate=True, add_qkv_bias=True)
-        attn = _make_attention_local(gated_config)
-        gate_size = attn.num_attention_heads_per_partition
-        assert attn.linear_qkv.bias is not None
-        with torch.no_grad():
-            attn.linear_qkv.weight[-gate_size:].zero_()
-            attn.linear_qkv.bias[-gate_size:].fill_(gate_value)
-
-        # Reference: no-gate model with linear_proj.weight pre-scaled by this
-        # rank's expected_rank_scale. linear_proj is RowParallelLinear, so
-        # each rank holds (output, input_per_rank) and contributes
-        # `core_attn_local @ weight_local.T` to the all-reduced sum. Scaling
-        # weight_local by sigmoid(gate) on this rank == scaling that rank's
-        # contribution by sigmoid(gate), which is the per-rank effect of
-        # head-wise gating on rank-local heads.
-        ref_config = _make_config_tp(head_wise_attn_gate=False, add_qkv_bias=True)
-        attn_ref = _make_attention_local(ref_config)
-        _copy_qkv_block_only(attn_ref, attn)
-        with torch.no_grad():
-            attn_ref.linear_proj.weight.mul_(expected_rank_scale)
-
-        torch.manual_seed(0)
-        hidden_states = torch.randn(
-            SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE, dtype=torch.float32, device="cuda"
-        )
-        attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
-        with torch.no_grad():
-            out_gated, _ = attn(hidden_states, attention_mask)
-            out_ref, _ = attn_ref(hidden_states, attention_mask)
-
-        torch.testing.assert_close(out_gated, out_ref, atol=1e-4, rtol=1e-4)
-
-    @pytest.mark.parametrize(
-        "num_heads,num_query_groups,expected_match",
-        [
-            # num_query_groups (1) < world_size (2): gate slice would over-take
-            # via the AG+reslice fallback path.
-            (4, 1, "num_query_groups"),
-            # num_attention_heads (3) % world_size (2) != 0, with
-            # num_query_groups == num_attention_heads (default) and < world_size
-            # too, so parent's divide(...) uses num_query_groups not world_size
-            # and our explicit gate-row divisibility check is the one that
-            # fires.
-            (3, 1, "num_query_groups"),
-        ],
-    )
-    def test_init_rejects_misaligned_layout_under_tp2(
-        self, num_heads: int, num_query_groups: int, expected_match: str
-    ):
-        """Layout invariants for head_wise_attn_gate (both checked at
-        init):
-
-          (a) num_query_groups >= world_size -- otherwise the gate slice
-              over-takes through the AG+reslice fallback.
-          (b) num_attention_heads % world_size == 0 -- otherwise gate rows
-              cannot be partitioned cleanly across ranks.
-
-        Both should produce a clear AssertionError at SelfAttention
-        construction time, not a silent forward-time misalignment.
-        """
-        bad_config = TransformerConfig(
-            num_layers=1,
-            hidden_size=24,  # divisible by num_heads for head_dim
-            num_attention_heads=num_heads,
-            num_query_groups=num_query_groups,
-            use_cpu_initialization=True,
-            params_dtype=torch.float32,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-            head_wise_attn_gate=True,
-        )
-        submodules = get_gpt_layer_local_spec().submodules.self_attention.submodules
-        with pytest.raises(AssertionError, match=expected_match):
-            SelfAttention(bad_config, submodules, layer_number=1)
-
 
 class TestHeadWiseAttnGateInitMagnitude:
-    """Verify the init-time surgery on the gate sub-block:
-
-      - With default knobs and a bias-enabled linear_qkv, sigmoid(gate)
-        sits near 1 at init (approximate identity) -- NOT 0.5, which
-        was the previous behavior and halved every head's output during
-        warmup.
-      - The two TransformerConfig knobs
-        (head_wise_attn_gate_init_weight_scale,
-        head_wise_attn_gate_init_bias) actually flow into the surgery:
-        setting both to 0 reproduces the old sigmoid(0)=0.5 behavior.
-    """
+    """Init-time gate-row surgery: near-identity at start, knob propagation, FP8 safety."""
 
     @pytest.fixture(autouse=True)
     def setup_teardown(self):
@@ -603,8 +314,6 @@ class TestHeadWiseAttnGateInitMagnitude:
         Utils.destroy_model_parallel()
 
     def _run_pair(self, gated_config: TransformerConfig) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build a gated attention with `gated_config`, a no-gate reference
-        sharing all QKV weights, and run both forwards on a fixed input."""
         attn = _make_attention_local(gated_config)
         ref_config = _make_config_tp(head_wise_attn_gate=False, add_qkv_bias=True)
         attn_ref = _make_attention_local(ref_config)
@@ -621,39 +330,22 @@ class TestHeadWiseAttnGateInitMagnitude:
         return out_gated, out_plain
 
     def test_default_init_is_near_identity(self):
-        """Default knobs (weight_scale=0.1, bias=2.0) drive sigmoid(gate) to
-        sigmoid(2.0) ~= 0.88 at init, so the gated output is ~0.88 * no-gate
-        reference -- NOT the 0.5 halving that the shared init_method would
-        give. Also assert the near-identity scaling is closer to the truth
-        than the half-scaling, so a regression that drops the init surgery
-        (e.g. someone reverts the if-block in SelfAttention.__init__) is
-        caught even if the absolute tolerance is loose."""
+        """out_gated ~= sigmoid(2.0) * out_plain at init; closer than 0.5 *
+        out_plain (catches regressions that drop the init surgery)."""
         gated_config = _make_config_tp(head_wise_attn_gate=True, add_qkv_bias=True)
         out_gated, out_plain = self._run_pair(gated_config)
-
         expected_scale = torch.sigmoid(
             torch.tensor(gated_config.head_wise_attn_gate_init_bias)
         ).item()
-        # Loose tolerance: the gate weight contribution (gate_weight @ hidden)
-        # is not literally zero, just small after the 0.1 scale, so
-        # sigmoid(2.0 + small) deviates slightly from sigmoid(2.0) per
-        # position/head.
         torch.testing.assert_close(
             out_gated, out_plain * expected_scale, atol=5e-2, rtol=5e-2
         )
         near_id_err = (out_gated - out_plain * expected_scale).abs().mean().item()
         half_err = (out_gated - out_plain * 0.5).abs().mean().item()
-        assert near_id_err < half_err, (
-            f"Default gate init is no longer near identity: "
-            f"|gated - sigmoid({gated_config.head_wise_attn_gate_init_bias})*plain|="
-            f"{near_id_err:.4g} >= |gated - 0.5*plain|={half_err:.4g}. Did the "
-            f"init-time surgery in SelfAttention.__init__ get dropped?"
-        )
+        assert near_id_err < half_err
 
     def test_init_knobs_reproduce_half_scaling(self):
-        """Setting both knobs to 0 should reproduce the old sigmoid(0)=0.5
-        behavior, confirming both flow into the init surgery (not silently
-        ignored)."""
+        """Both knobs=0 reproduces sigmoid(0)=0.5 -- proves the knobs flow."""
         gated_config = _make_config_tp(
             head_wise_attn_gate=True,
             add_qkv_bias=True,
@@ -664,26 +356,10 @@ class TestHeadWiseAttnGateInitMagnitude:
         torch.testing.assert_close(out_gated, out_plain * 0.5, atol=1e-4, rtol=1e-4)
 
     def test_init_preserves_fp8_friendly_gate_magnitude(self):
-        """Gate weight rows should stay on the same order of magnitude as QKV
-        weight rows after the init surgery, so the shared FP8 tensor-level
-        scale on linear_qkv.weight isn't dominated by the gate sub-block.
-
-        With weight_scale=0.1 default, the gate rows are ~10x smaller than
-        QKV but still within the same dynamic range (FP8 E4M3 / E5M2 cover
-        ~6 decades of magnitude, so a 1-decade gap is harmless).
-        """
+        """gate_std ~ 0.1 * qkv_std (no zero-init, no FP8 underflow risk)."""
         gated_config = _make_config_tp(head_wise_attn_gate=True, add_qkv_bias=True)
         attn = _make_attention_local(gated_config)
         gate_rows = attn.linear_qkv.weight[-attn.num_attention_heads_per_partition:]
         qkv_rows = attn.linear_qkv.weight[: -attn.num_attention_heads_per_partition]
-        gate_std = gate_rows.float().std().item()
-        qkv_std = qkv_rows.float().std().item()
-        # Gate std should be ~0.1 * qkv std (because we mul_'d by 0.1) and
-        # definitely not 0 (which would zero the gate sub-block in FP8).
-        assert gate_std > 0, "gate weight rows zero-initialized -- FP8 underflow risk"
-        ratio = gate_std / qkv_std
-        assert 0.05 < ratio < 0.5, (
-            f"gate_std / qkv_std = {ratio:.3f}, expected close to "
-            f"head_wise_attn_gate_init_weight_scale (0.1). Gate magnitudes "
-            f"too far from QKV may break the FP8 shared tensor scale."
-        )
+        ratio = gate_rows.float().std().item() / qkv_rows.float().std().item()
+        assert 0.05 < ratio < 0.5

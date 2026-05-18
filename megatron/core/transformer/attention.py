@@ -402,20 +402,6 @@ class Attention(MegatronModule, ABC):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
 
-        # Per-head scalar output gate (Step-3.5-Flash g_proj) is fused into
-        # linear_qkv when head_wise_attn_gate is True; gate weights live in
-        # the trailing num_attention_heads_per_partition rows of each rank's
-        # local linear_qkv tensor. The gate tensor is sliced out inside
-        # SelfAttention.get_query_key_value_tensors and threaded back to
-        # Attention.forward via the return tuple (as a trailing element
-        # alongside the existing output_gate slot) -- mirroring how
-        # attention_output_gate is plumbed. No instance attribute is used, so
-        # cross-attention layers, overlapping microbatches, and selective
-        # recompute do not introduce stale-gate hazards. For dist-ckpt TP
-        # resharding safety, the [QKV, gate] split is preserved via a
-        # ShardedTensorFactory wired up in SelfAttention.sharded_state_dict
-        # (see apply_head_wise_attn_gate_sharded_factory below).
-
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
         """Build self.rotary_pos_emb using a layer-specific rotary base."""
         from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -769,14 +755,8 @@ class Attention(MegatronModule, ABC):
     ):
         """
         This method needs to be implemented based on whether the derived class
-        is "self-attn" or "cross-attn".
-
-        When ``output_gate=True`` the return tuple gains a per-head head_dim
-        gate as a 4th element (used by attention_output_gate). When
-        ``head_wise_gate=True`` a per-head scalar gate is appended as a
-        trailing element (5th if output_gate is also True, otherwise 4th);
-        Attention.forward unpacks it and threads it through as a local so
-        there is no module-level side channel.
+        is "self-attn" or "cross-attn". When ``output_gate=True`` / ``head_wise_gate=True``
+        the corresponding gate tensor is appended as a trailing tuple element.
         """
 
     def flash_decode(
@@ -1177,10 +1157,7 @@ class Attention(MegatronModule, ABC):
             ]
         )
         output_gate = self.config.attention_output_gate
-        # Per-head scalar gate (head_wise_attn_gate) is only meaningful on
-        # the self-attention path: the gate weights are fused into linear_qkv,
-        # which CrossAttention does not own. Restrict to self-attn to avoid
-        # silently dropping the gate on cross-attn layers.
+        # head_wise_attn_gate is self-attention only (gate rows live in linear_qkv).
         head_wise_gate_enabled = (
             self.config.head_wise_attn_gate and self.attention_type != "cross"
         )
@@ -1211,13 +1188,9 @@ class Attention(MegatronModule, ABC):
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
-        # Per-head scalar gate (head_wise_attn_gate) is threaded through as
-        # a local rather than via an instance attribute to keep the forward
-        # re-entrant under cross-attn / overlapped microbatches / recompute.
         head_wise_gate = None
         if split_qkv:
-            # qkv_output layout (in order, trailing elements optional):
-            #   query, key, value, [output_gate], [head_wise_gate]
+            # qkv_output is (query, key, value, [output_gate], [head_wise_gate]).
             if output_gate and head_wise_gate_enabled:
                 query, key, value, gate, head_wise_gate = qkv_output
             elif output_gate:
@@ -1424,20 +1397,14 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
-        # Per-head scalar gate (head_wise_attn_gate). Gate states were
-        # sliced off the fused linear_qkv output inside
-        # get_query_key_value_tensors and returned through qkv_output; we
-        # already unpacked them into the local `head_wise_gate` above.
         if head_wise_gate is not None:
             nvtx_range_push(suffix="head_wise_attn_gate")
-            gate_states = head_wise_gate.view(  # [sq, b, np, 1]
-                *head_wise_gate.shape[:2], -1, 1
-            )
-            core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)     # [sq, b, np, hn]
+            gate_states = head_wise_gate.view(*head_wise_gate.shape[:2], -1, 1)
+            core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)
             core_attn_out = (
                 core_attn_out * torch.sigmoid(gate_states.float()).to(core_attn_out.dtype)
             )
-            core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)     # [sq, b, np*hn]
+            core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)
             nvtx_range_pop(suffix="head_wise_attn_gate")
 
         # Output gate (attention_output_gate: full head_dim gate fused into QKV)
@@ -1514,41 +1481,16 @@ class SelfAttention(Attention):
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
         if self.config.head_wise_attn_gate:
-            # Fuse per-head scalar gate (Step-3.5-Flash g_proj) into linear_qkv.
-            # Gate rows are appended after the QKV block, so the trailing
-            # num_attention_heads rows of linear_qkv.weight are the gate
-            # weights. Two layout invariants must hold for the forward-time
-            # peel-off (in get_query_key_value_tensors) to pick up actual gate
-            # rows on every rank; enforce both at init so the failure mode is
-            # a clear constructor error rather than a silent "wrong rows =
-            # gate" misalignment during training.
+            # Defensive runtime guards against config-validation bypass; same
+            # invariants enforced earlier in TransformerConfig.__post_init__.
             tp_world_size = get_pg_size(self.pg_collection.tp)
-            # (a) num_query_groups >= world_size: the head-wise gate slice
-            #     runs BEFORE the num_query_groups < world_size AllGather +
-            #     reslice fallback in get_query_key_value_tensors. Under that
-            #     fallback, num_attention_heads_per_partition is inflated to
-            #     num_attention_heads / num_query_groups (the pre-AG count),
-            #     which is larger than the actual per-rank gate scalar count
-            #     (num_attention_heads / world_size). The slice would then
-            #     take V/K rows as gate. Disallow the combination outright.
             assert self.config.num_query_groups >= tp_world_size, (
                 f"head_wise_attn_gate requires num_query_groups "
-                f"({self.config.num_query_groups}) >= tensor-model-parallel "
-                f"world_size ({tp_world_size}). The gate peel-off happens "
-                f"before the num_query_groups < world_size AllGather + "
-                f"reslice path; under that fallback the gate slice would "
-                f"over-take and pick up V/K rows instead of gate rows."
+                f"({self.config.num_query_groups}) >= tp world_size ({tp_world_size})"
             )
-            # (b) num_attention_heads % world_size == 0: each rank must
-            #     carry an integer number of gate scalars. (Redundant with
-            #     parent's divide(num_attention_heads, world_size) under
-            #     invariant (a), but kept for an explicit error message.)
             assert self.config.num_attention_heads % tp_world_size == 0, (
                 f"head_wise_attn_gate requires num_attention_heads "
-                f"({self.config.num_attention_heads}) to be divisible by the "
-                f"tensor-model-parallel world_size ({tp_world_size}); the "
-                f"trailing-rows-as-gate layout cannot place an integer number "
-                f"of gate rows on every rank otherwise."
+                f"({self.config.num_attention_heads}) % tp world_size ({tp_world_size}) == 0"
             )
             self.linear_qkv_out_dim += self.config.num_attention_heads
         self.linear_qkv = submodules.linear_qkv(
@@ -1565,35 +1507,17 @@ class SelfAttention(Attention):
         )
 
         if self.config.head_wise_attn_gate:
-            # Re-initialize the gate sub-block of linear_qkv so sigmoid(gate)
-            # is near 1 at init (approximate identity), instead of the
-            # sigmoid(0)=0.5 that the default shared init_method gives. With
-            # a half-strength gate from step 0, every head's output is
-            # halved during warmup and the optimizer carries an extra burden
-            # to recover identity. Scale the gate rows by a small factor
-            # (default 0.1) rather than zero-init so:
-            #   - gate weight magnitudes stay on the same order as QKV,
-            #     keeping the shared FP8 tensor-level scale on
-            #     linear_qkv.weight from being dominated by a near-zero
-            #     gate sub-block;
-            #   - the gate is not literally constant at init (some signal
-            #     from the linear part still flows).
-            # The bias rows (when present) are filled with a positive
-            # constant (default 2.0, sigmoid(2.0)~=0.88) to bias the
-            # sigmoid toward 1 at init. When linear_qkv has no bias, only
-            # the weight scaling applies and the gate sits near 0.5 (still
-            # better than the bias-free default in expectation, though not
-            # identity).
-            # Both knobs are exposed on TransformerConfig:
-            # head_wise_attn_gate_init_weight_scale,
-            # head_wise_attn_gate_init_bias.
+            # Bias gate rows to sigmoid~=1 at init (approximate identity);
+            # avoids halving every head's output from step 0.
             num_heads_per_partition = self.num_attention_heads_per_partition
             with torch.no_grad():
-                gate_weight = self.linear_qkv.weight[-num_heads_per_partition:]
-                gate_weight.mul_(self.config.head_wise_attn_gate_init_weight_scale)
+                self.linear_qkv.weight[-num_heads_per_partition:].mul_(
+                    self.config.head_wise_attn_gate_init_weight_scale
+                )
                 if self.linear_qkv.bias is not None:
-                    gate_bias = self.linear_qkv.bias[-num_heads_per_partition:]
-                    gate_bias.fill_(self.config.head_wise_attn_gate_init_bias)
+                    self.linear_qkv.bias[-num_heads_per_partition:].fill_(
+                        self.config.head_wise_attn_gate_init_bias
+                    )
 
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.
@@ -1727,58 +1651,22 @@ class SelfAttention(Attention):
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
-        If `output_gate` is True, then also derives `gate` tensor.
-        If `head_wise_gate` is True, also returns a per-head scalar gate
-        tensor (shape ``[sq, b, np_per_rank]``) as a trailing element of the
-        return tuple.
-        If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
+        If `output_gate` is True, also returns a per-head head_dim gate.
+        If `head_wise_gate` is True, also returns a per-head scalar gate.
+        If `split_qkv=False`, returns the unsplit mixed_qkv tensor.
         """
         if head_wise_gate:
-            assert split_qkv, (
-                "head_wise_gate is not supported for unsplit mixed_qkv tensor."
-            )
-            assert self.config.head_wise_attn_gate, (
-                "head_wise_gate=True passed but config.head_wise_attn_gate is "
-                "False; this is an internal contract violation between forward "
-                "and get_query_key_value_tensors."
-            )
+            assert split_qkv and self.config.head_wise_attn_gate
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
 
-        # Peel off the fused per-head gate (head_wise_attn_gate). The slice
-        # takes the trailing num_attention_heads_per_partition columns of the
-        # local mixed_qkv and treats them as one scalar gate per local query
-        # head. This is only correct when ALL THREE of the following hold:
-        #
-        #   1. The linear_qkv backend (ColumnParallelLinear /
-        #      TELayerNormColumnParallelLinear / TEColumnParallelLinear)
-        #      partitions weight axis 0 contiguously and uniformly across TP
-        #      with no row interleave or stride reordering. If a backend ever
-        #      adds row interleave, the trailing columns of the local
-        #      activation are NOT the trailing rows of linear_qkv.weight, and
-        #      the slice silently picks V/K rows instead -- no shape error.
-        #   2. num_attention_heads % tp_world_size == 0, so every rank carries
-        #      an integer number of gate scalars. Enforced at init time in
-        #      SelfAttention.__init__; see the assert there.
-        #   3. The global linear_qkv.weight layout is [QKV_block; Gate_block]
-        #      (gate strictly after QKV). The dist-ckpt path preserves this
-        #      under TP resharding via apply_head_wise_attn_gate_sharded_factory
-        #      in SelfAttention.sharded_state_dict; without that factory, save
-        #      TP=N -> load TP=M would re-balance the QKV/gate boundary and
-        #      break precondition (3) on the loaded ranks.
-        #
-        # The peel runs BEFORE the num_query_groups < world_size AllGather +
-        # reslice branch below, so the gate does not participate in that
-        # fallback. That is safe because the gate has exactly
-        # num_attention_heads scalars (matches the partition count under
-        # precondition 2), not a per-group head_dim block; the per-rank
-        # alignment for the gate is independent of the kv-group reshuffle the
-        # AllGather path performs for the QKV block.
-        #
-        # The gate tensor is returned through the tuple at the end of this
-        # function; we slice it before any further reshape/AG so the
-        # trailing-dim arithmetic for the QKV path stays unchanged.
+        # Peel the trailing per-rank gate scalars before any reshape / AG.
+        # Correct only because (a) ColumnParallelLinear splits axis 0
+        # contiguously, (b) num_attention_heads % tp == 0, (c) global layout
+        # is [QKV; Gate] (preserved across dist-ckpt by
+        # apply_head_wise_attn_gate_sharded_factory). (a)+(b) checked at
+        # config / init time.
         head_wise_gate_states = None
         if head_wise_gate:
             gate_size = self.num_attention_heads_per_partition
@@ -2025,14 +1913,8 @@ class SelfAttention(Attention):
         sharded_offsets: tuple = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        """Return the sharded state dict, wrapping linear_qkv.{weight,bias}
-        with a factory that splits the trailing num_attention_heads gate rows
-        from the QKV block under dist-ckpt save/load. Without this override the
-        global tensor is sharded as one uniform axis-0 block, so save TP=N
-        -> load TP=M silently mixes V/K rows with gate rows; the factory makes
-        the QKV and gate sub-blocks reshard independently, analogous to
-        apply_swiglu_sharded_factory in megatron/core/transformer/mlp.py.
-        """
+        """Wrap linear_qkv.{weight,bias} with a factory that reshards QKV and
+        gate sub-blocks independently, analogous to apply_swiglu_sharded_factory."""
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         if self.config.head_wise_attn_gate:
             qkv_size = self.query_projection_size + 2 * self.kv_projection_size
@@ -2053,38 +1935,12 @@ def apply_head_wise_attn_gate_sharded_factory(
     qkv_size: int,
     gate_size: int,
 ):
-    """Build a ShardedTensorFactory that splits linear_qkv.{weight,bias} into
-    independent QKV and gate sub-tensors for dist-ckpt save/load.
-
-    The forward path of SelfAttention with head_wise_attn_gate=True peels
-    the trailing num_attention_heads_per_partition rows off each rank's local
-    linear_qkv output and treats them as per-head gate scalars. That assumes
-    the local layout is [qkv_local; gate_local] — but the default
-    ColumnParallelLinear / TELayerNormColumnParallelLinear sharded_state_dict
-    only declares {"weight": 0}, so the global (QKV_dim + H, hidden_size)
-    tensor is uniformly resharded along axis 0 on TP change. Whenever the new
-    per-rank size < QKV_dim, the trailing rows on non-last ranks land inside
-    the QKV block, so a saved checkpoint reloads with V/K rows being treated
-    as gate scalars (no shape error — silently wrong).
-
-    This factory chunks each rank's local tensor at the QKV/gate boundary on
-    save, registering qkv_local and gate_local as two independent sub-tensors
-    (with distinct keys) each uniformly sharded along axis 0 across TP. On
-    load they are gathered, resharded for the new TP, and cat'd back so the
-    rank-local layout is again [qkv_local; gate_local]. Same pattern as
-    apply_swiglu_sharded_factory (megatron/core/transformer/mlp.py), but with
-    unequal sub-block sizes (QKV >> gate).
-
-    Args:
-        original_sh_ten: ShardedTensor produced for linear_qkv.weight or
-            linear_qkv.bias by the underlying ColumnParallelLinear /
-            TE-variant sharded_state_dict (axis-0 sharded across TP).
-        sharded_offsets: PP-style offsets passed from the parent module.
-        qkv_size: Global axis-0 size of the QKV sub-block
-            (query_projection_size + 2 * kv_projection_size).
-        gate_size: Global axis-0 size of the gate sub-block
-            (num_attention_heads).
-    """
+    """Split linear_qkv.{weight,bias} into QKV and gate sub-tensors with
+    distinct keys so each is resharded independently along axis 0 across TP.
+    Default {"weight": 0} sharding would otherwise re-balance the QKV/gate
+    boundary on TP change and turn V/K rows into gate rows (silent miscompute).
+    Same pattern as apply_swiglu_sharded_factory, but with unequal sub-block
+    sizes (QKV >> gate)."""
     shard_axis = 0
     prepend_axis_num = len(sharded_offsets)
     local_axis_size = original_sh_ten.local_shape[shard_axis]
@@ -2093,15 +1949,10 @@ def apply_head_wise_attn_gate_sharded_factory(
     qkv_local_size, qkv_rem = divmod(qkv_size, axis_frag)
     gate_local_size, gate_rem = divmod(gate_size, axis_frag)
     assert qkv_rem == 0 and gate_rem == 0, (
-        f"head_wise_attn_gate dist-ckpt requires both QKV ({qkv_size}) "
-        f"and gate ({gate_size}) sizes to be divisible by the TP world_size "
-        f"({axis_frag})."
+        f"head_wise_attn_gate dist-ckpt requires QKV ({qkv_size}) and gate "
+        f"({gate_size}) divisible by TP world_size ({axis_frag})."
     )
-    assert local_axis_size == qkv_local_size + gate_local_size, (
-        f"Unexpected linear_qkv local axis-0 size {local_axis_size} != "
-        f"{qkv_local_size} (qkv) + {gate_local_size} (gate). The factory "
-        f"assumes a uniform axis-0 sharding from ColumnParallelLinear."
-    )
+    assert local_axis_size == qkv_local_size + gate_local_size
     rank_offset = (
         original_sh_ten.global_offset[shard_axis + prepend_axis_num] // local_axis_size
     )
@@ -2110,10 +1961,6 @@ def apply_head_wise_attn_gate_sharded_factory(
     def sh_ten_build_fn(
         key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
-        # Trailing rows of each rank's local tensor are the gate scalars; the
-        # rest is QKV. Split sizes are unequal, so we use torch.split rather
-        # than torch.chunk(2). Each sub-tensor lives under a distinct key
-        # (.{_qkv,_gate}) so dist-ckpt treats them as independent globals.
         tensor_qkv, tensor_gate = torch.split(
             t, [qkv_local_size, gate_local_size], dim=shard_axis
         )
@@ -2215,10 +2062,7 @@ class CrossAttention(Attention):
         from `key_value_states`.
         """
         assert not output_gate, "Output gate is not supported in cross attention for now."
-        assert not head_wise_gate, (
-            "head_wise_attn_gate is not supported in cross attention "
-            "(linear_qkv with fused gate rows lives only on the self-attention path)."
-        )
+        assert not head_wise_gate, "head_wise_attn_gate is self-attention only."
 
         assert split_qkv, "split_qkv must be True for CrossAttention"
         assert not output_gate, "Output gate is not supported in cross attention for now."
