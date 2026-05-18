@@ -17,7 +17,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-
 NUM_HEADS = 4
 HIDDEN_SIZE = 32
 SEQ_LEN = 4
