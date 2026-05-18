@@ -355,7 +355,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             group_kwargs = {k: v for k, v in group.items() if k != "params"}
 
             for param_idx, p in enumerate(group["params"]):
-                p_local = p.to_local()
+                p_local = p._local_tensor
                 needs_gather = param_idx in gather_param_indices
                 if p_local.numel() == 0 and not needs_gather:
                     # If this parameter is not split by Megatron-FSDP,
@@ -366,10 +366,10 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     continue
 
                 state = self.state[p]
-                mom_local = state["momentum_buffer"].to_local()
+                mom_local = state["momentum_buffer"]._local_tensor
 
                 grad = p.grad
-                local_grad = grad.to_local() if grad is not None else torch.zeros_like(mom_local)
+                local_grad = grad._local_tensor if grad is not None else torch.zeros_like(mom_local)
 
                 self._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
                 mom_local.lerp_(local_grad, 1 - group["momentum"])
@@ -433,7 +433,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         assert isinstance(
             dtensor, _DTensor
         ), f"Detected non-DTensor during {type(self).__name__}: {dtensor}"
-        local_tensor = dtensor.to_local()
+        local_tensor = dtensor._local_tensor
         return local_tensor.numel() > 0 and tuple(dtensor.shape) != tuple(local_tensor.shape)
 
     def _get_mfsdp_param_layout(self, param: torch.Tensor, param_idx: int):
@@ -523,7 +523,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         last_shard = (item_end - 1 - bucket_start) // shard_size
         crosses_boundary = first_shard != last_shard
 
-        local_tensor = param.to_local()
+        local_tensor = param._local_tensor
         if local_tensor.numel() > 0:
             local_is_partial = tuple(param.shape) != tuple(local_tensor.shape)
             if local_is_partial and not crosses_boundary:
@@ -635,7 +635,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                 f"Expected exactly one chunk metadata per rank, got {len(chunk_metadata_list)}."
             )
 
-        local_tensor = dtensor_ref.to_local()
+        local_tensor = dtensor_ref._local_tensor
         local_chunk_metadata = chunk_metadata_list[0]
         local_chunks_info = [
             {"shape": torch.Size(local_tensor.shape), "offset": tuple(local_chunk_metadata.offsets)}
@@ -672,7 +672,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             local_dtensor = self._dtensor_from_local_like(dtensor_ref, local_tensor.contiguous())
             if not hasattr(local_dtensor._local_tensor, "__create_chunk_list__"):
                 update_uneven_dtensor_chunk_metadata(local_dtensor)
-            full_tensor = redistribute_uneven_dtensor_to_replicated(local_dtensor).to_local()
+            full_tensor = redistribute_uneven_dtensor_to_replicated(local_dtensor)._local_tensor
             self._copy_dtensor_chunk_metadata(dtensor_ref, local_dtensor)
             return None if local_tensor.numel() == 0 else full_tensor
 
