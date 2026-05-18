@@ -84,4 +84,5 @@ MODEL_ARGS:
   --use-persistent-ckpt-worker: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
+TEST_TYPE: regular
 TEST_EVALUATION: xpass
