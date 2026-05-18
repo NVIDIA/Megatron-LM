@@ -263,6 +263,13 @@ class TransformerConfig(ModelParallelConfig):
     SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
     the shared model-level rotary_pos_emb is not created."""
 
+    use_head_wise_attn_gate: bool = False
+    """Apply a per-head scalar output gate (e.g., Step-3.5-Flash g_proj).
+    The gate weights are fused into linear_qkv as the trailing
+    num_attention_heads rows; the sigmoid of those scalars gates each
+    attention head independently. Distinct from attention_output_gate,
+    which fuses a full head_dim gate into linear_qkv."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 

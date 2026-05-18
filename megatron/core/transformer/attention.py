@@ -395,6 +395,13 @@ class Attention(MegatronModule, ABC):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
 
+        # Per-head scalar output gate (Step-3.5-Flash g_proj) is fused into
+        # linear_qkv when use_head_wise_attn_gate is True; gate weights live in
+        # the trailing num_attention_heads rows of linear_qkv.weight. The gate
+        # tensor is sliced out in SelfAttention.get_query_key_value_tensors and
+        # consumed in Attention.forward.
+        self._head_wise_gate_states = None
+
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
         """Build self.rotary_pos_emb using a layer-specific rotary base."""
         from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -1372,7 +1379,26 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
-        # Output gate
+        # Per-head scalar gate (use_head_wise_attn_gate). Gate states were
+        # sliced off the fused linear_qkv output in get_query_key_value_tensors;
+        # here we just apply the sigmoid gating to core_attn_out.
+        if self.config.use_head_wise_attn_gate:
+            nvtx_range_push(suffix="head_wise_attn_gate")
+            gate_states = self._head_wise_gate_states  # [sq, b, np_per_rank]
+            assert gate_states is not None, (
+                "use_head_wise_attn_gate is enabled but no fused gate tensor was "
+                "produced by get_query_key_value_tensors"
+            )
+            self._head_wise_gate_states = None
+            gate_states = gate_states.view(*gate_states.shape[:2], -1, 1)  # [sq, b, np, 1]
+            core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)     # [sq, b, np, hn]
+            core_attn_out = (
+                core_attn_out * torch.sigmoid(gate_states.float()).to(core_attn_out.dtype)
+            )
+            core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)     # [sq, b, np*hn]
+            nvtx_range_pop(suffix="head_wise_attn_gate")
+
+        # Output gate (attention_output_gate: full head_dim gate fused into QKV)
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
@@ -1445,6 +1471,11 @@ class SelfAttention(Attention):
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
+        if self.config.use_head_wise_attn_gate:
+            # Fuse per-head scalar gate (Step-3.5-Flash g_proj) into linear_qkv.
+            # Gate rows are appended after the QKV block, so the trailing
+            # num_attention_heads rows of linear_qkv.weight are the gate weights.
+            self.linear_qkv_out_dim += self.config.num_attention_heads
         self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.linear_qkv_out_dim,
@@ -1594,6 +1625,21 @@ class SelfAttention(Attention):
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+
+        # Peel off the fused per-head gate (use_head_wise_attn_gate). Under TP,
+        # ColumnParallelLinear splits the trailing num_attention_heads rows
+        # uniformly, so each rank gets num_attention_heads_per_partition gate
+        # scalars at the tail of mixed_qkv's last dim. Requires that both
+        # num_query_groups and num_attention_heads be divisible by tp world_size
+        # so the QKV and gate sub-ranges stay aligned per rank.
+        if self.config.use_head_wise_attn_gate:
+            gate_size = self.num_attention_heads_per_partition
+            mixed_qkv, gate_states = torch.split(
+                mixed_qkv, [mixed_qkv.size(-1) - gate_size, gate_size], dim=-1
+            )
+            self._head_wise_gate_states = gate_states
+        else:
+            self._head_wise_gate_states = None
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
