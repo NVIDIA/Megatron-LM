@@ -167,17 +167,35 @@ class _CoordinatorRuntime:
             self._client = client
 
     async def teardown(self) -> None:
-        """Primary-only client shutdown.
+        """Idempotent best-effort shutdown of the coordinator + client.
 
-        Worker ranks are no-ops here; their ``engine_loop_task`` is awaited by
+        Safe to call from partial-setup state (e.g., when :meth:`setup` raised
+        after the coordinator subprocess spawned but before the client opened).
+        Worker ranks are always no-op; their ``engine_loop_task`` is awaited by
         :meth:`_MegatronLLMBase._shutdown_impl` after the primary has issued
         the STOP signal.
         """
         if not self._is_primary:
             return
-        assert self._client is not None
-        self._client.shutdown_coordinator()
-        self._client.stop()
+
+        # Happy path: client open -> graceful protocol shutdown.
+        if self._client is not None:
+            try:
+                self._client.shutdown_coordinator()
+                self._client.stop()
+            finally:
+                self._client = None
+            return
+
+        # Partial-setup path: client never opened. If the coordinator
+        # subprocess was spawned, kill it via the engine's process handle.
+        proc = getattr(self._engine, "inference_coordinator_process", None)
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2)
 
     @property
     def client(self) -> "InferenceClient | None":
@@ -260,6 +278,7 @@ class _MegatronLLMBase:
         if use_coordinator:
             loop_manager = _EventLoopManager()
             loop_manager.start()
+            coord_runtime: "Optional[_CoordinatorRuntime]" = None
             try:
                 coord_runtime = _CoordinatorRuntime(
                     engine,
@@ -269,6 +288,11 @@ class _MegatronLLMBase:
                 )
                 loop_manager.run_sync(coord_runtime.setup(loop=loop_manager.loop))
             except BaseException:
+                if coord_runtime is not None:
+                    try:
+                        loop_manager.run_sync(coord_runtime.teardown())
+                    except Exception:
+                        pass  # best-effort; don't mask the original failure
                 loop_manager.stop()
                 raise
             self._loop_manager = loop_manager
