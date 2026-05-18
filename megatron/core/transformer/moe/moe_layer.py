@@ -219,7 +219,7 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
-        name: str = None,
+        name: str | None = None,
     ):
         self.submodules = not_none(submodules)
         # TODO(Hepteract): delete the usage of the global parallel_state.

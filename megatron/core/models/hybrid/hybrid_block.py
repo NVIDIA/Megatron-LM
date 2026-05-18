@@ -86,7 +86,7 @@ class HybridStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
-        name: str = None,
+        name: str | None = None,
     ) -> None:
         super().__init__(config=config)
         self.pre_process = pre_process

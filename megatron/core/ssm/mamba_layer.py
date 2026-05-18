@@ -72,7 +72,7 @@ class MambaLayer(GraphableMegatronModule):
         layer_number: int = 1,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
-        name: str = None,
+        name: str | None = None,
     ):
         """Initialize Mamba Layer."""
         super().__init__(config)

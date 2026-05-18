@@ -173,7 +173,7 @@ class TEGroupedMLP(MegatronModule):
         config: TransformerConfig,
         submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts

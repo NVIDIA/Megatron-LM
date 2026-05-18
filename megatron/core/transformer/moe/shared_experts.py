@@ -108,7 +108,7 @@ class SharedExpertMLP(MLP):
         submodules: MLPSubmodules,
         gate: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "

@@ -290,7 +290,7 @@ class Attention(MegatronModule, ABC):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
 
@@ -1381,7 +1381,7 @@ class SelfAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         super().__init__(
             config=config,
@@ -1793,7 +1793,7 @@ class CrossAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
-        name: str = None,
+        name: str | None = None,
     ):
         super().__init__(
             config=config,

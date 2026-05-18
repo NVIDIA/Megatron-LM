@@ -759,7 +759,7 @@ class TELinear(te.pytorch.Linear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -999,7 +999,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
-        name: str = None,
+        name: str | None = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1234,7 +1234,7 @@ class TEColumnParallelLinear(TELinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
-        name: str = None,
+        name: str | None = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1344,7 +1344,7 @@ class TERowParallelLinear(TELinear):
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1779,7 +1779,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool = False,
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
-            name: str = None,
+            name: str | None = None,
         ):
             self.config = config
 
@@ -2259,7 +2259,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
-            name: str = None,
+            name: str | None = None,
         ):
             super().__init__(
                 num_gemms=num_gemms,
@@ -2307,7 +2307,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
-            name: str = None,
+            name: str | None = None,
         ):
             super().__init__(
                 num_gemms=num_gemms,

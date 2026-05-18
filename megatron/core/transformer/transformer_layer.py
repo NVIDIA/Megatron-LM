@@ -305,7 +305,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)

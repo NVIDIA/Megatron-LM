@@ -169,7 +169,7 @@ class MLP(MegatronModule):
         input_size: Optional[int] = None,
         ffn_hidden_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
 

@@ -177,7 +177,7 @@ class MambaMixer(MegatronModule):
         layer_number=None,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
-        name: str = None,
+        name: str | None = None,
     ):
         if not HAVE_MAMBA_SSM:
             raise ImportError(

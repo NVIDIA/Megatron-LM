@@ -744,7 +744,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
         if mamba_submodules is not None:
@@ -1313,7 +1313,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
         if mamba_submodules is not None:
