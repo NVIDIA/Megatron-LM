@@ -14,7 +14,6 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
@@ -174,10 +173,45 @@ class TransformerLayerSchedulePlan:
         else:
             self.mtp_post_process = NoopScheduleNode()
 
-        # mlp and combine may receive dgrad from attn, which is managed by cuda graph.
-        if CudaGraphModule.attn in self.config.cuda_graph_modules:
-            self.mlp.manual_grads_release = False
-            self.moe_combine.manual_grads_release = False
+    def set_fsdp_reshard_hooks(self, post_forward_hook, post_backward_hook):
+        """Wire FSDP parameter release callbacks for the fine-grained overlap schedule.
+
+        The EP overlap schedule bypasses the normal FSDP forward/backward hooks
+        (registered on the FSDP unit module) because it calls sub-modules directly
+        instead of going through TransformerLayer.forward(). This method attaches
+        explicit release hooks to individual schedule nodes so that all-gathered
+        parameters are freed at the right time.
+
+        Args:
+            post_forward_hook: Callable(module) that releases forward-pass params
+                (bwd=False). Typically ``fsdp_wrapper.post_forward_release_module``.
+            post_backward_hook: Callable(module) that releases backward-pass params
+                (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
+        """
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        assert isinstance(self.layer, (TransformerLayer, MultiTokenPredictionLayer)), (
+            f"Megatron FSDP with EP Overlap only supports TransformerLayer, "
+            f"but got {type(self.layer).__name__}."
+        )
+
+        if isinstance(self.layer, TransformerLayer):
+            hook_module = self.layer
+        else:
+            hook_module = self.layer.mtp_model_layer
+
+        # After the last backward op (attn), release backward-pass params.
+        self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
+
+        # Determine the last node in forward order.
+        if isinstance(self.moe_combine, NoopScheduleNode):
+            last_fwd_node = self.mlp
+        else:
+            last_fwd_node = self.moe_combine
+
+        # After the last forward op, release forward-pass params.
+        last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
 
     def get_fp8_context(self):
         """
