@@ -1,5 +1,5 @@
 # Mirrors legacy test_case: gpt_dynamic_inference_tp1_pp1_583m_logitsmatch
-# (driven by examples/inference/legacy/gpt_dynamic_inference.py).
+# (driven by examples/inference/advanced/gpt_dynamic_inference.py).
 # This case drives examples/inference/offline_inference.py in async direct mode
 # (--async-mode, no --use-coordinator). Goldens copied from the legacy case;
 # async path must produce numerically identical output to the sync path.

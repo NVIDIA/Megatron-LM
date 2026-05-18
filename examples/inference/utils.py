@@ -333,7 +333,7 @@ def escape_str(s: str) -> str:
 
 
 def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -> None:
-    """Print unique prompts and their outputs in legacy gpt_dynamic_inference.py format.
+    """Print unique prompts and their outputs in gpt_dynamic_inference.py format.
 
     Reads from the high-level API's ``DynamicInferenceRequest`` records returned
     by ``MegatronLLM.generate`` / ``MegatronAsyncLLM.generate``.

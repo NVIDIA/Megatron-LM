@@ -2,11 +2,11 @@
 
 """Offline inference example using the Megatron high-level API.
 
-Mirrors examples/inference/legacy/gpt_dynamic_inference.py but drives the
+Mirrors examples/inference/advanced/gpt_dynamic_inference.py but drives the
 ``DynamicInferenceEngine`` through ``MegatronLLM`` (sync) or
 ``MegatronAsyncLLM`` (async, via ``--async-mode``) instead of the manual
 add_request/step_modern loop. Output format (setup prefix, unique prompt
-blocks, throughput line, optional JSON dump) matches the legacy script.
+blocks, throughput line, optional JSON dump) matches that script.
 
 Run modes are selected at the CLI:
 

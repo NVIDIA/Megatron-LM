@@ -6,7 +6,7 @@ This guide provides an example for Megatron Core for running model inference.
 - [What's in here](#whats-in-here)
 - [Offline inference](#offline-inference)
 - [OpenAI-compatible inference server](#openai-compatible-inference-server)
-- [Legacy examples](#legacy-examples)
+- [Advanced examples](#advanced-examples)
 - [See also](#see-also)
 
 ### What's in here
@@ -20,15 +20,15 @@ The two top-level Python entrypoints cover all common workflows:
 
 - **`offline_inference.py`** — batched offline generation. Supports the
   4 mode combinations (sync/async × direct/coordinator) via CLI flags.
-  Replaces the legacy `gpt_dynamic_inference.py` and
+  Replaces the `gpt_dynamic_inference.py` and
   `gpt_dynamic_inference_with_coordinator.py` paths.
 - **`launch_inference_server.py`** — OpenAI-compatible HTTP server using
-  `MegatronAsyncLLM.serve(...)`. Replaces the legacy
+  `MegatronAsyncLLM.serve(...)`. Replaces the
   `tools/run_dynamic_text_generation_server.py` path.
 
 `utils.py` holds shared helpers (`Request`, `build_requests`,
 `build_dynamic_engine_setup_prefix`, output formatting, JSON dump) used by
-both new examples and by the legacy scripts.
+both new examples and by the `advanced/` scripts.
 
 ### Offline inference
 
@@ -95,14 +95,17 @@ Send requests with any OpenAI-compatible client. The dynamic server
 currently returns `"model": "EMPTY"` and does not validate the request
 `model` field — pass anything you like.
 
-### Legacy examples
+### Advanced examples
 
-`legacy/` preserves the prior `gpt_dynamic_inference.py`,
-`gpt_dynamic_inference_with_coordinator.py`, `gpt_static_inference.py`, and
-`simple_t5_batch_inference.py` scripts as-is. They are still wired into
-the existing recipes under `tests/test_utils/recipes/h100/{gpt,moe,mamba}-*-inference.yaml`
-for backward compatibility. New work should target `offline_inference.py`
-and `launch_inference_server.py`.
+`advanced/` contains scripts that drive the lower-level
+`megatron.core.inference` APIs directly — manual `add_request` /
+`step_modern` stepping, explicit coordinator / `InferenceClient`
+lifecycle, the static engine, and T5 inference. Use these when you need
+step-level scheduling control, custom forward-step / sampling
+integration, or are migrating existing pipelines. For typical workflows,
+prefer `offline_inference.py` and `launch_inference_server.py`. CI
+recipes under `tests/test_utils/recipes/h100/{gpt,moe,mamba}-*-inference.yaml`
+still target these scripts.
 
 ### See also
 
