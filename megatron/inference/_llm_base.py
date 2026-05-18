@@ -263,6 +263,16 @@ class _MegatronLLMBase:
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
 
+        if not use_coordinator:
+            from megatron.core import parallel_state
+
+            ep_size = parallel_state.get_expert_model_parallel_world_size()
+            if ep_size > 1:
+                raise ValueError(
+                    f"use_coordinator=True is required when expert_model_parallel_size > 1 "
+                    f"(got EP={ep_size}). Use coordinator mode to handle EP routing."
+                )
+
         if inference_config is None:
             inference_config = InferenceConfig()
 
