@@ -558,6 +558,27 @@ class TEGroupedMLP(MegatronModule):
         # Apply padding if needed
         unpadded_tokens_per_expert = None
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
+
+        # When this rank has no locally-routed tokens, append one synthetic
+        # zero-vector token per local expert with zero routing probability.
+        # This keeps linear_fc1 / linear_fc2 active in both forward and
+        # backward so that DDP / EP collectives see a consistent autograd
+        # graph across ranks; otherwise a rank with zero local tokens diverges
+        # from its peers and the collective hangs (and some GroupedGEMM
+        # backends fail outright on empty input). The synthetic rows are
+        # sliced back off before this function returns.
+        is_dummy_forward = sum(tokens_per_expert) == 0
+        if is_dummy_forward:
+            dummy_hidden = permuted_local_hidden_states.new_zeros(
+                (self.num_local_experts, permuted_local_hidden_states.shape[1])
+            )
+            dummy_probs = permuted_probs.new_zeros((self.num_local_experts,))
+            permuted_local_hidden_states = torch.cat(
+                [permuted_local_hidden_states, dummy_hidden], dim=0
+            )
+            permuted_probs = torch.cat([permuted_probs, dummy_probs], dim=0)
+            tokens_per_expert = [1] * self.num_local_experts
+
         permuted_probs = permuted_probs.unsqueeze(-1)
         if skip_routed_expert_padding(self.config):
             pass
@@ -692,6 +713,11 @@ class TEGroupedMLP(MegatronModule):
         # upad and concat the output
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
+
+        if is_dummy_forward:
+            # Drop the synthetic rows we appended above. Slicing instead of
+            # masking preserves the autograd hooks on linear_fc1 / linear_fc2.
+            output = output[:0]
 
         output_bias = None
 
