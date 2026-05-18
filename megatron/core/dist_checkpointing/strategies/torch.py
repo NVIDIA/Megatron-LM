@@ -1079,7 +1079,11 @@ class TorchDistLoadShardedStrategy:
         for metadata_key, storage_metadata in metadata.state_dict_metadata.items():
             if not isinstance(storage_metadata, BytesStorageMetadata):
                 continue
-            sh_obj = ShardedObject.empty_from_unique_key(metadata_key)
+            # DTensor-format saves write plain dict-path keys (e.g. "optimizer.state.0.exp_avg")
+            # for non-tensor leaves, while the legacy mcore save writes "<key>/shard_<offset>_<shape>".
+            # `empty_from_key` handles both: it parses the unique-key form when a "/" is present
+            # and otherwise returns a default ShardedObject keyed by the raw path.
+            sh_obj = ShardedObject.empty_from_key(metadata_key)
             sharded_metadata[sh_obj.unique_key] = sh_obj
 
         sharded_metadata.update(self.load_tensors_metadata(checkpoint_dir, metadata))
