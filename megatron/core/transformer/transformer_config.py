@@ -298,7 +298,13 @@ class TransformerConfig(ModelParallelConfig):
     sub-tensors (analogous to apply_swiglu_sharded_factory). Requires
     num_attention_heads % tensor_model_parallel_size == 0 and
     num_query_groups >= tensor_model_parallel_size; both are validated in
-    __post_init__."""
+    __post_init__. Under fp8/fp4, the per-partition linear_qkv output dim
+    must additionally be a multiple of 16 (fp8) or 32 (fp4) for
+    Transformer Engine's GEMM alignment; this is validated in
+    __post_init__ too. attention_output_gate's wider gate (head_dim per
+    head) hits this alignment naturally; head_wise_attn_gate's tiny
+    num_attention_heads increment can mis-align, so users may need to
+    pick num_attention_heads / num_query_groups accordingly."""
 
     head_wise_attn_gate_init_weight_scale: float = 0.1
     """Multiplicative scale applied to the gate rows of linear_qkv.weight right
@@ -1426,6 +1432,44 @@ class TransformerConfig(ModelParallelConfig):
                     f"AllGather + reslice fallback; under that fallback the gate "
                     f"slice would over-take and pick up V/K rows as gate rows."
                 )
+            # (4) FP8 / FP4 GEMM alignment. Transformer Engine's FP8 GEMM
+            #     requires the per-partition output dim of linear_qkv to be
+            #     a multiple of 16 (FP4: 32). attention_output_gate adds
+            #     num_attention_heads * kv_channels rows, which is already
+            #     16-aligned for typical kv_channels (64/128); head_wise
+            #     adds only num_attention_heads rows -- a much smaller and
+            #     potentially mis-aligned increment. TE would either error
+            #     out or silently pad the weight (shifted outputs); reject
+            #     up front so this is caught at config-time, not at first
+            #     fp8 forward.
+            if self.fp8 is not None or self.fp4 is not None:
+                align = 32 if self.fp4 is not None else 16
+                # Mirror SelfAttention's linear_qkv_out_dim formula. Safe
+                # because checks (2)/(3) above already ensure the QKV and
+                # gate blocks each divide tensor_model_parallel_size cleanly.
+                linear_qkv_out_dim = (
+                    self.kv_channels * self.num_attention_heads
+                    + 2 * self.kv_channels * self.num_query_groups
+                    + self.num_attention_heads
+                )
+                per_partition = linear_qkv_out_dim // self.tensor_model_parallel_size
+                if per_partition % align != 0:
+                    fp_name = "fp4" if self.fp4 is not None else "fp8"
+                    raise ValueError(
+                        f"head_wise_attn_gate under {fp_name} requires the "
+                        f"per-partition linear_qkv output dim "
+                        f"({per_partition}) to be a multiple of {align} for "
+                        f"Transformer Engine's {fp_name.upper()} GEMM alignment. "
+                        f"Got num_attention_heads={self.num_attention_heads}, "
+                        f"num_query_groups={self.num_query_groups}, "
+                        f"kv_channels={self.kv_channels}, "
+                        f"tensor_model_parallel_size={self.tensor_model_parallel_size} "
+                        f"-> linear_qkv_out_dim={linear_qkv_out_dim}. "
+                        f"Pick num_attention_heads such that "
+                        f"(kv_channels*num_attention_heads + 2*kv_channels*"
+                        f"num_query_groups + num_attention_heads) / "
+                        f"tensor_model_parallel_size is divisible by {align}."
+                    )
 
         if self.linear_attention_type is not None:
             warnings.warn(

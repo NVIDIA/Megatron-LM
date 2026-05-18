@@ -150,6 +150,60 @@ class TestHeadWiseAttnGateConfigValidation:
             head_wise_attn_gate=False,
         )
 
+    def test_rejects_fp8_misaligned_linear_qkv_out_dim(self):
+        """H=8, G=8, kv_channels=128, TP=1 gives linear_qkv_out_dim=3080;
+        3080 % 16 = 8. TE's FP8 GEMM requires 16-alignment, so this must
+        be rejected at config time -- otherwise TE either errors or
+        silently pads the weight (shifted outputs)."""
+        with pytest.raises(ValueError, match=r"fp8.*multiple of 16"):
+            self._config(
+                num_attention_heads=8,
+                num_query_groups=8,
+                hidden_size=8 * 128,  # kv_channels=128
+                head_wise_attn_gate=True,
+                fp8="hybrid",
+            )
+
+    def test_accepts_fp8_aligned_linear_qkv_out_dim(self):
+        """H=16, G=2, kv_channels=128, TP=1 gives linear_qkv_out_dim=2576;
+        2576 % 16 = 0 -- valid for FP8 GEMM. Sanity that the check does
+        not fire on a well-aligned config."""
+        self._config(
+            num_attention_heads=16,
+            num_query_groups=2,
+            hidden_size=16 * 128,
+            head_wise_attn_gate=True,
+            fp8="hybrid",
+        )
+
+    def test_rejects_fp4_stricter_alignment(self):
+        """FP4 requires 32-alignment. A config that passes FP8 (16-aligned)
+        but not FP4 (32-aligned) should still be rejected when fp4 is on.
+        H=16, G=2, kv_channels=128, TP=1: linear_qkv_out_dim=2576;
+        2576 % 16 = 0 but 2576 % 32 = 16, so fp4 must reject."""
+        with pytest.raises(ValueError, match=r"fp4.*multiple of 32"):
+            self._config(
+                num_attention_heads=16,
+                num_query_groups=2,
+                hidden_size=16 * 128,
+                head_wise_attn_gate=True,
+                fp4="e2m1",
+            )
+
+    def test_no_alignment_check_without_fp8_or_fp4(self):
+        """The alignment check must only fire under fp8/fp4. A config that
+        is otherwise valid (passes the other gate invariants) but
+        mis-aligns linear_qkv_out_dim must NOT raise when fp8/fp4 are off
+        -- bf16 / fp16 / fp32 GEMM have no such alignment requirement."""
+        # H=8, G=8 -> linear_qkv_out_dim=3080 (mis-aligned), but no
+        # fp8/fp4 -> no raise.
+        self._config(
+            num_attention_heads=8,
+            num_query_groups=8,
+            hidden_size=8 * 128,
+            head_wise_attn_gate=True,
+        )
+
 
 @pytest.mark.parametrize("transformer_impl", ["transformer_engine", "native"])
 class TestHeadWiseAttnGateInit:
