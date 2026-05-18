@@ -76,6 +76,18 @@ asyncio.run(main())
 - Call `model.eval()` BEFORE construction. The class does not toggle model state.
 - Lifecycle methods (`pause`/`unpause`/`suspend`/`resume`) require `use_coordinator=True`; they raise `RuntimeError` in direct mode.
 
+## Future roadmap
+
+Planned new features:
+
+- **Dynamic streaming.** Offline streaming via `engine.async_step()`; HTTP streaming requires extending the coordinator / `InferenceClient` protocol to carry partial outputs (not just final request records).
+
+- **Weight update APIs.** `suspend_for_refit()`, `update_weights_from_collective()`, `resume_after_refit()` wrapping the existing resharding/refit primitives for RL workflows where weights swap between rollout steps.
+
+- **`megatron serve` CLI.** Single-binary launcher reusing `MegatronAsyncLLM.serve(...)`, with single-node and multi-node / headless modes — mirrors `vllm serve`.
+
+- **Config-based model construction.** `MegatronLLM(model="...")` style with model recipes and checkpoint resolution, removing manual model building from caller responsibilities.
+
 ## Known limitations
 
 - **`MegatronAsyncLLM.generate()` blocks the caller's event loop in direct mode.** The engine call is sync and inline; it does not yield back while running. Acceptable for offline batched calls; degraded for server/RL workloads that interleave generation with other async work. Tracked for an upstream `engine.async_generate(...)`.
@@ -86,6 +98,10 @@ asyncio.run(main())
   - The example `offline_inference.py` blocks `--inference-repeat-n > 1` with `--use-coordinator` for these reasons. Direct-mode reset is safe.
 
 - **Async-direct `generate()` is single-caller.** Concurrent `await llm.generate(...)` (e.g. via `asyncio.gather`) in direct mode raises `RuntimeError`. Pass batched prompts instead, or switch to coordinator mode.
+
+- **HTTP frontend is fixed to global rank 0.** There is no per-rank `role` override on `ServeConfig` to host the HTTP server on a non-rank-0 rank or to opt a rank out of HTTP. Control placement via the launcher (e.g., torchrun rank-0 placement), mirroring how vLLM's `--headless` is invoked today.
+
+- **Server returns `"model": "EMPTY"`.** The HTTP frontend doesn't expose a `ServeConfig.model_name` to echo in `/v1/completions` / `/v1/chat/completions` responses, doesn't validate the request `model` field against a configured name, and exposes no `GET /v1/models` discovery endpoint. Clients can still pass any `model` in their request body — the dynamic server ignores it.
 
 ## See also
 
