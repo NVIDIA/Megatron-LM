@@ -54,9 +54,13 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 
 | Function | Description |
 |----------|-------------|
-| `MegatronFSDPStateful` | ``Stateful`` wrapper implementing DCP protocol. ``state_dict()`` calls ``get_state_dict`` from ``uneven_dtensor`` (attaches uneven DTensor chunk metadata), then ``_apply_mcore_postprocess`` (SwiGLU/GDN split, FP8 cleanup, expert remapping). ``load_state_dict()`` uses PyTorch's ``set_state_dict``. |
-| `save_checkpoint(model, ckpt_dir, ...)` | One-line DCP save using ``MegatronFSDPStateful``. |
-| `load_checkpoint(model, ckpt_dir, ...)` | One-line DCP load using ``MegatronFSDPStateful``. Returns saved step. |
+| `MegatronFSDPStateful` | ``Stateful`` wrapper implementing DCP protocol (Path B). ``state_dict()`` calls ``get_state_dict`` from ``uneven_dtensor`` (attaches uneven DTensor chunk metadata), then ``_apply_mcore_postprocess`` (SwiGLU/GDN split, FP8 cleanup, expert remapping). ``load_state_dict()`` uses PyTorch's ``set_state_dict``. |
+| `save_checkpoint(model, ckpt_dir, ...)` | Full DCP save using Path A for optimizer. Gets model state dict (with ``module.`` prefix alignment), optimizer state dict via ``sharded_param_state_fsdp_dtensor``, applies MCore post-processing, uneven DTensor preprocessing, then ``dcp.save``. |
+| `load_checkpoint(model, ckpt_dir, ...)` | Full DCP load using Path A for optimizer. Builds skeleton state dicts, applies post-processing, ``dcp.load`` fills in-place, then strips ``module.`` prefix and loads into model/optimizer. |
+| `add_module_prefix(state_dict)` | Add ``module.`` prefix to all state dict keys. Megatron FSDP v2 lacks ``MegatronFSDP`` wrapper so ``model.state_dict()`` keys have no prefix; this aligns with Megatron's checkpoint format. |
+| `strip_module_prefix(state_dict)` | Remove ``module.`` prefix from state dict keys. Inverse of ``add_module_prefix``, used when loading checkpoint back into FSDP v2 model. |
+| `get_model_state_dict(model)` | Get model state dict with ``module.`` prefix. Auto-detects whether prefix is already present; adds it if missing. |
+| `get_optimizer_state_dict(optimizer, is_loading)` | Get optimizer state dict via Path A (``sharded_param_state_fsdp_dtensor``). Delegates to ``optimizer.sharded_state_dict()`` with ``fsdp_dtensor`` sharding type. Returns ``{"state": ..., "param_to_group_meta": ...}``. |
 | `handle_fp8_extra_state_case(model_sd)` | Remove ``._extra_state`` keys from model state dict (FP8 artifact cleanup). |
 | `handle_experts_in_state_dict(model_sd, num_experts)` | Rename expert parameter keys for expert-parallel sharding. |
 | `handle_swiglu_in_state_dict_v2(model, model_sd, opt_sd)` | Split SwiGLU fc1 weights/bias into ``_w``/``_v`` halves. Only processes layers with ``gated_linear_unit=True``. Uses DTensor-native operations: ``_get_fsdp_slice_from_dtensor`` + ``make_uneven_dtensor``. |
@@ -67,6 +71,7 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `_split_swiglu_weight_v2(data, dist_param)` | Convenience wrapper: ``_split_dtensor_v2(data, dist_param, [1, 1], 0)``. |
 | `_split_gdn_weight_v2(data, dist_param, sizes, dim)` | Convenience wrapper: ``_split_dtensor_v2(data, dist_param, sizes, dim)``. |
 | `_detect_glu_layers(model)` | Return ``{layer_path: gated_linear_unit}`` for all TransformerLayers. |
+| `_model_has_module_prefix(model)` | Detect whether model's ``named_parameters()`` keys already carry ``module.`` prefix. |
 
 ### 3.2 Current Save Flow
 
@@ -621,11 +626,39 @@ and their consumers.
 | Aspect | Legacy Megatron FSDP | Megatron FSDP v2 |
 |--------|---------------------|-------------------|
 | Parameter representation | `MegatronFSDP`-managed DTensors | Native `FSDPModule` DTensors |
+| Model wrapper | `MegatronFSDP` (adds `module.` prefix in state dict) | No `MegatronFSDP` wrap — `fully_shard` applied directly |
+| Model state dict keys | Keys have `module.` prefix from `MegatronFSDP` wrapper | Keys lack `module.` prefix; `add_module_prefix()` used for checkpoint alignment |
 | Model `state_dict_for_save_checkpoint` | `model.state_dict()` with `state_dict_pre_hook` | `model.state_dict()` (already DTensors) |
 | Optimizer buffer management | Megatron FSDP managed | Standard Torch optimizer managed |
 | Gradient buffer | Megatron FSDP `param_and_grad_buffer` | None (FSDP v2 handles internally) |
-| Load model state dict | `module.load_state_dict(custom, strict)` with `_load_state_dict_post_hook` | `super().load_state_dict(state_dict, strict)` |
+| Load model state dict | `module.load_state_dict(custom, strict)` with `_load_state_dict_post_hook` | `super().load_state_dict(state_dict, strict)` — after `strip_module_prefix()` |
 | Zero gradient | `model_chunk.zero_grad_buffer()` | `model_chunk._zero_grad_buffer()` |
+
+### 11.1 Model State Dict ``module.`` Prefix Alignment
+
+**Problem:** Legacy Megatron FSDP wraps the model in a ``MegatronFSDP`` class which
+stores the model as ``self.module``. This means ``MegatronFSDP.state_dict()`` produces
+keys with a ``module.`` prefix (e.g., ``module.embedding.word_embeddings.weight``).
+Megatron FSDP v2 applies ``fully_shard`` directly without a ``MegatronFSDP`` wrapper,
+so the raw model's ``state_dict()`` produces keys **without** the prefix (e.g.,
+``embedding.word_embeddings.weight``).
+
+**Solution:** ``checkpoint.py`` provides two post-processing functions:
+
+- ``add_module_prefix(state_dict)`` — adds ``module.`` prefix to all keys before
+  saving, aligning with Megatron's checkpoint format.
+- ``strip_module_prefix(state_dict)`` — removes ``module.`` prefix after loading,
+  aligning with the FSDP v2 model's expected key format.
+
+``get_model_state_dict(model)`` auto-detects whether the prefix is present and adds
+it if missing. ``load_checkpoint`` strips the prefix back before calling
+``model.load_state_dict()``.
+
+**Note on optimizer keys:** ``sharded_param_state_fsdp_dtensor()`` uses
+``model_chunk.named_parameters()`` to derive parameter names. When
+``model_chunks`` are ``FullyShardedDataParallel`` instances (which store the model
+as ``self.module``), the returned names already carry the ``module.`` prefix. This
+ensures model and optimizer state dict keys are consistent in the checkpoint.
 
 ---
 
@@ -646,7 +679,7 @@ and their consumers.
 - [x] Wire `self.state_dict_for_save_checkpoint` to `self.state_dict()` in
       `_init_with_fully_shard()` (replace `not_implemented_op` at line 383-384)
 
-### Phase 2: Torch-Native `get_state_dict` Path
+### Phase 2: Torch-Native `get_state_dict` Path (Path B — `MegatronFSDPStateful`)
 
 - [x] Add `_is_megatron_fsdp_v2()` helper to detect FSDP v2 from model
 - [x] Add `_build_megatron_fsdp_v2_state_dict()` to `checkpointing.py` using
@@ -659,6 +692,20 @@ and their consumers.
 - [x] Skip `preprocess_fsdp_dtensor_state_dict` for v2 in both save and load paths
       (post-processing already handled by ``_apply_mcore_postprocess`` inside
       ``MegatronFSDPStateful.state_dict()``)
+- [ ] Handle PP: iterate model chunks, build per-chunk state dicts
+- [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers)
+
+### Phase 2: Path A — `save_checkpoint` / `load_checkpoint` in `checkpoint.py`
+
+- [x] Add ``add_module_prefix()`` / ``strip_module_prefix()`` for model state dict
+      key alignment (Megatron FSDP v2 lacks ``MegatronFSDP`` wrapper)
+- [x] Add ``get_model_state_dict(model)`` — auto-detects prefix, adds if missing
+- [x] Add ``get_optimizer_state_dict(optimizer, is_loading)`` — delegates to
+      ``optimizer.sharded_state_dict()`` with ``fsdp_dtensor`` sharding type (Path A)
+- [x] Implement ``save_checkpoint(model, ckpt_dir, optimizer, args)`` — full DCP save
+      flow using Path A for optimizer
+- [x] Implement ``load_checkpoint(model, ckpt_dir, optimizer, args, strict)`` — full
+      DCP load flow using Path A for optimizer, with prefix strip on load
 - [ ] Handle PP: iterate model chunks, build per-chunk state dicts
 - [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers)
 
