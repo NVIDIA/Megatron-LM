@@ -33,10 +33,10 @@ def get_default_sampling_params(termination_id: int = None):
     )
 
 
-def get_curr_time() -> float:
+def get_curr_time(do_broadcast: bool = True) -> float:
     """Get synchronized time across ranks."""
     curr_time = torch.cuda.LongTensor([time.time_ns()])
-    if torch.distributed.is_initialized():
+    if torch.distributed.is_initialized() and do_broadcast:
         torch.distributed.broadcast(curr_time, src=0)
     return curr_time.item() / 10**9
 

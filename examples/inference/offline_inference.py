@@ -181,10 +181,10 @@ def _run_sync(args, model, tokenizer, inference_config, requests, prompts_list, 
                     llm.engine.reset()
                 torch.cuda.reset_peak_memory_stats()
 
-                t = get_curr_time()
+                t = get_curr_time(do_broadcast=not args.use_coordinator)
                 results = llm.generate(prompts_list, sampling_params)
                 torch.cuda.synchronize()
-                total_time = get_curr_time() - t
+                total_time = get_curr_time(do_broadcast=not args.use_coordinator) - t
 
                 total_output_tokens = sum(len(r.generated_tokens) for r in results)
                 throughputs.append(total_output_tokens / total_time)
@@ -222,10 +222,10 @@ async def _run_async(
                     llm.engine.reset()
                 torch.cuda.reset_peak_memory_stats()
 
-                t = get_curr_time()
+                t = get_curr_time(do_broadcast=not args.use_coordinator)
                 results = await llm.generate(prompts_list, sampling_params)
                 torch.cuda.synchronize()
-                total_time = get_curr_time() - t
+                total_time = get_curr_time(do_broadcast=not args.use_coordinator) - t
 
                 total_output_tokens = sum(len(r.generated_tokens) for r in results)
                 throughputs.append(total_output_tokens / total_time)
