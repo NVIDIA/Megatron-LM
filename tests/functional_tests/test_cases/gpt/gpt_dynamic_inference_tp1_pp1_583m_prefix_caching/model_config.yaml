@@ -40,17 +40,15 @@ MODEL_ARGS:
   --temperature: 1.0
   --top_k: 1
   --return-log-probs: true
+  --num-tokens-to-generate: 30
   --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-dynamic-batching-prefix-caching: true
   --dist-ckpt-strictness: log_unexpected
-  --inference-ckpt-non-strict: true # To handle the extra_state errors
+  --inference-ckpt-non-strict: true
   --output-path: ${INFERENCE_OUTPUT_PATH}
-  --output-every-n-results: 32
-  --prompt-file: ${DATA_PATH}/text/sharegpt-vicuna/filtered/processed.jsonl
-  --prompt-file-num-truncate: 128 # originally 1024
-  --num-tokens-to-generate: 128 # originally 512
-  --incoming-requests-per-step: 32
-  --termination-id: -1
-  --inference-repeat-n: 3
+  --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
+  --incoming-requests-per-sec: -1
+  --inference-repeat-n: 8
   --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"
