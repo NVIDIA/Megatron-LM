@@ -1502,19 +1502,6 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
         )
 
-        if self.config.head_wise_attn_gate:
-            # Bias gate rows to sigmoid~=1 at init (approximate identity);
-            # avoids halving every head's output from step 0.
-            num_heads_per_partition = self.num_attention_heads_per_partition
-            with torch.no_grad():
-                self.linear_qkv.weight[-num_heads_per_partition:].mul_(
-                    self.config.head_wise_attn_gate_init_weight_scale
-                )
-                if self.linear_qkv.bias is not None:
-                    self.linear_qkv.bias[-num_heads_per_partition:].fill_(
-                        self.config.head_wise_attn_gate_init_bias
-                    )
-
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.
         if self.config.qk_l2_norm:

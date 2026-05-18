@@ -175,14 +175,8 @@ class TestHeadWiseAttnGateForward:
         assert output.shape == (SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE)
 
 
-def _make_config_tp(
-    head_wise_attn_gate: bool, add_qkv_bias: bool = False, **extra: object
-) -> TransformerConfig:
-    """Float32 config for TP correctness tests; local-spec backend, no dropout.
-
-    Extra TransformerConfig kwargs (e.g. head_wise_attn_gate_init_*) can be
-    passed through ``extra``.
-    """
+def _make_config_tp(head_wise_attn_gate: bool, add_qkv_bias: bool = False) -> TransformerConfig:
+    """Float32 config for TP correctness tests; local-spec backend, no dropout"""
     return TransformerConfig(
         num_layers=1,
         hidden_size=HIDDEN_SIZE,
@@ -193,7 +187,6 @@ def _make_config_tp(
         hidden_dropout=0.0,
         add_qkv_bias=add_qkv_bias,
         head_wise_attn_gate=head_wise_attn_gate,
-        **extra,
     )
 
 
@@ -261,63 +254,3 @@ class TestHeadWiseAttnGateUnderTP2:
             out_plain, _ = attn_ref(hidden_states, attention_mask)
 
         torch.testing.assert_close(out_gated, out_plain * expected_scale, atol=1e-4, rtol=1e-4)
-
-
-class TestHeadWiseAttnGateInitMagnitude:
-    """Init-time gate-row surgery: near-identity at start, knob propagation, FP8 safety."""
-
-    @pytest.fixture(autouse=True)
-    def setup_teardown(self):
-        Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(42)
-        yield
-        Utils.destroy_model_parallel()
-
-    def _run_pair(self, gated_config: TransformerConfig) -> tuple[torch.Tensor, torch.Tensor]:
-        attn = _make_attention_local(gated_config)
-        ref_config = _make_config_tp(head_wise_attn_gate=False, add_qkv_bias=True)
-        attn_ref = _make_attention_local(ref_config)
-        _copy_qkv_block_only(attn_ref, attn)
-
-        torch.manual_seed(0)
-        hidden_states = torch.randn(
-            SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE, dtype=torch.float32, device="cuda"
-        )
-        attention_mask = torch.ones(BATCH_SIZE, 1, 1, SEQ_LEN, dtype=bool, device="cuda")
-        with torch.no_grad():
-            out_gated, _ = attn(hidden_states, attention_mask)
-            out_plain, _ = attn_ref(hidden_states, attention_mask)
-        return out_gated, out_plain
-
-    def test_default_init_is_near_identity(self):
-        """out_gated ~= sigmoid(2.0) * out_plain at init; closer than 0.5 *
-        out_plain (catches regressions that drop the init surgery)."""
-        gated_config = _make_config_tp(head_wise_attn_gate=True, add_qkv_bias=True)
-        out_gated, out_plain = self._run_pair(gated_config)
-        expected_scale = torch.sigmoid(
-            torch.tensor(gated_config.head_wise_attn_gate_init_bias)
-        ).item()
-        torch.testing.assert_close(out_gated, out_plain * expected_scale, atol=5e-2, rtol=5e-2)
-        near_id_err = (out_gated - out_plain * expected_scale).abs().mean().item()
-        half_err = (out_gated - out_plain * 0.5).abs().mean().item()
-        assert near_id_err < half_err
-
-    def test_init_knobs_reproduce_half_scaling(self):
-        """Both knobs=0 reproduces sigmoid(0)=0.5 -- proves the knobs flow."""
-        gated_config = _make_config_tp(
-            head_wise_attn_gate=True,
-            add_qkv_bias=True,
-            head_wise_attn_gate_init_weight_scale=0.0,
-            head_wise_attn_gate_init_bias=0.0,
-        )
-        out_gated, out_plain = self._run_pair(gated_config)
-        torch.testing.assert_close(out_gated, out_plain * 0.5, atol=1e-4, rtol=1e-4)
-
-    def test_init_preserves_fp8_friendly_gate_magnitude(self):
-        """gate_std ~ 0.1 * qkv_std (no zero-init, no FP8 underflow risk)."""
-        gated_config = _make_config_tp(head_wise_attn_gate=True, add_qkv_bias=True)
-        attn = _make_attention_local(gated_config)
-        gate_rows = attn.linear_qkv.weight[-attn.num_attention_heads_per_partition :]
-        qkv_rows = attn.linear_qkv.weight[: -attn.num_attention_heads_per_partition]
-        ratio = gate_rows.float().std().item() / qkv_rows.float().std().item()
-        assert 0.05 < ratio < 0.5

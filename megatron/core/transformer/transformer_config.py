@@ -277,19 +277,6 @@ class TransformerConfig(ModelParallelConfig):
     num_query_groups >= tp, and under fp8/fp4 a per-partition
     linear_qkv_out_dim aligned to 16/32."""
 
-    head_wise_attn_gate_init_weight_scale: float = 0.1
-    """Multiplicative scale on the gate rows of linear_qkv.weight at init,
-    on top of init_method. Default 0.1 keeps the linear contribution small
-    so sigmoid is dominated by the bias term, while staying within ~1
-    decade of QKV magnitudes for FP8 tensor-scale safety. Only used when
-    head_wise_attn_gate=True."""
-
-    head_wise_attn_gate_init_bias: float = 2.0
-    """Constant fill for the gate rows of linear_qkv.bias at init (no-op
-    when linear_qkv has no bias). Default 2.0 -> sigmoid(2)~=0.88, near
-    identity; avoids halving every head's output from step 0. Only used
-    when head_wise_attn_gate=True."""
-
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -2833,9 +2820,13 @@ class TransformerConfig(ModelParallelConfig):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
 
         if self.rotary_base_per_layer is not None:
-            assert len(self.rotary_base_per_layer) == self.num_layers, (
+            if self.mtp_num_layers is not None:
+                total_num_layers = self.num_layers + self.mtp_num_layers
+            else:
+                total_num_layers = self.num_layers
+            assert len(self.rotary_base_per_layer) == total_num_layers, (
                 f"rotary_base_per_layer length ({len(self.rotary_base_per_layer)}) "
-                f"must equal num_layers ({self.num_layers})"
+                f"must equal num_layers ({total_num_layers})"
             )
 
         if self.no_rope_freq:

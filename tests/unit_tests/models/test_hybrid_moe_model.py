@@ -338,8 +338,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
     "head_wise_attn_gate": False,
-    "head_wise_attn_gate_init_weight_scale": 0.1,
-    "head_wise_attn_gate_init_bias": 2.0,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
