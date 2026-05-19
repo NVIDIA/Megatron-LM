@@ -189,7 +189,7 @@ class FullyParallelLoadStrategyWrapper:
         self,
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
-        async_strategy: str = "nvrx",
+        async_strategy: str = "mcore",
     ) -> StateDict:
         """Distributes the load and calls underlying strategy only for parts of the state dict.
 

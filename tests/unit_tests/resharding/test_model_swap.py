@@ -460,6 +460,337 @@ def test_swap_gpt_parametrized(
     ],
 )
 @pytest.mark.parametrize(
+    "src_tp,src_ep,dst_tp,dst_ep",
+    [
+        (2, 2, 1, 1),  # TP2,EP2 -> TP1,EP1 (cross-cluster shape)
+        (1, 1, 2, 2),  # TP1,EP1 -> TP2,EP2 (reverse)
+        (1, 2, 2, 2),  # TP=1->TP=2 with EP unchanged
+    ],
+)
+def test_router_expert_bias_refit(
+    refit_backend: str, src_tp: int, src_ep: int, dst_tp: int, dst_ep: int
+):
+    """Regression test: MoE router ``expert_bias`` (a *persistent buffer*, not a
+    Parameter) must travel with weights during refit/resharding.
+
+    This was the root cause of stale routing on the inference model when
+    refit was used to re-shard a Nemotron-style MoE+Mamba checkpoint across
+    different TP/EP layouts: the router buffer carried aux-loss-free load
+    balancing state on the trainer but stayed at zero on the inference model
+    because ``swap_model_weights`` only enumerated ``named_parameters``.
+    """
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=1
+    )
+    world = dist.get_world_size()
+    if (world % (src_tp * src_ep) != 0) or (world % (dst_tp * dst_ep) != 0):
+        Utils.destroy_model_parallel()
+        pytest.skip("WORLD_SIZE must be divisible by both src_tp*src_ep and dst_tp*dst_ep")
+
+    try:
+        import transformer_engine
+    except Exception:
+        Utils.destroy_model_parallel()
+        pytest.skip("Transformer Engine not available")
+
+    model_parallel_cuda_manual_seed(1234)
+    torch.manual_seed(1234)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    num_experts = 4
+    cfg = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=8,
+        num_query_groups=4,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.float32,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        num_moe_experts=num_experts,
+        moe_ffn_hidden_size=64,
+        moe_grouped_gemm=True,
+        add_bias_linear=False,
+        moe_router_dtype="fp64",
+        moe_token_dispatcher_type="alltoall",
+        # The flag this regression covers: routers register a persistent
+        # ``expert_bias`` buffer used for aux-loss-free load balancing.
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+    )
+    src_cfg = copy.deepcopy(cfg)
+    dst_cfg = copy.deepcopy(cfg)
+    src_cfg.expert_model_parallel_size = src_ep
+    dst_cfg.expert_model_parallel_size = dst_ep
+
+    src_pgs = _build_pg_collection(tp_size=src_tp, pp_size=1, ep_size=src_ep)
+    dst_pgs = _build_pg_collection(tp_size=dst_tp, pp_size=1, ep_size=dst_ep)
+
+    src_model = (
+        _build_gpt(
+            src_cfg,
+            vocab_size=128,
+            seq_len=8,
+            pg_collection=src_pgs,
+            parallel_output=False,
+            num_moe_experts=num_experts,
+        )
+        .to(device)
+        .eval()
+    )
+    dst_model = (
+        _build_gpt(
+            dst_cfg,
+            vocab_size=128,
+            seq_len=8,
+            pg_collection=dst_pgs,
+            parallel_output=False,
+            num_moe_experts=num_experts,
+        )
+        .to(device)
+        .eval()
+    )
+
+    # Stamp a recognizable pattern into every router.expert_bias on src,
+    # promoting it to fp32 to mirror what _maintain_float32_expert_bias does on
+    # the trainer's first forward.  dst is left at its bf16/init state so the
+    # refit must transfer the value AND harmonize the dtype.
+    test_pattern = torch.arange(num_experts, dtype=torch.float32, device=device) + 0.25
+    src_buffers: dict[str, torch.Tensor] = {}
+    for name, mod in src_model.named_modules():
+        bias = getattr(mod, "expert_bias", None)
+        if isinstance(bias, torch.Tensor):
+            with torch.no_grad():
+                if bias.dtype != torch.float32:
+                    fp32_bias = bias.detach().to(torch.float32)
+                    fp32_bias.copy_(test_pattern)
+                    mod._buffers["expert_bias"] = fp32_bias
+                else:
+                    bias.copy_(test_pattern)
+            src_buffers[f"{name}.expert_bias"] = mod._buffers["expert_bias"]
+
+    # Sanity: dst's buffers should NOT yet match src (they're zero-init).
+    pre_swap_match = all(
+        torch.allclose(
+            dict(dst_model.named_buffers()).get(n, torch.zeros_like(b)).float(),
+            b.float(),
+            atol=1e-5,
+        )
+        for n, b in src_buffers.items()
+    )
+    assert not pre_swap_match, "test setup wrong: dst already matches src before refit"
+
+    swap_model_weights([src_model], [dst_model], refit_method=refit_backend)
+    torch.cuda.synchronize()
+
+    # Verify each router.expert_bias on dst now matches src's stamped pattern.
+    dst_named_buffers = dict(dst_model.named_buffers())
+    mismatches = []
+    for name, src_buf in src_buffers.items():
+        dst_buf = dst_named_buffers.get(name)
+        assert dst_buf is not None, f"dst missing buffer {name}"
+        if not torch.allclose(dst_buf.float(), src_buf.float(), atol=1e-5):
+            mismatches.append((name, (dst_buf - src_buf).abs().max().item()))
+    assert not mismatches, (
+        f"router.expert_bias not transferred during refit "
+        f"(src_tp={src_tp}, src_ep={src_ep} -> dst_tp={dst_tp}, dst_ep={dst_ep}, "
+        f"backend={refit_backend}): {mismatches}"
+    )
+    dist.barrier()
+
+    del src_model, dst_model
+    clear_all_caches()
+    _destroy_pg_collection(src_pgs)
+    _destroy_pg_collection(dst_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(
+            "nvshmem",
+            marks=pytest.mark.skipif(
+                not has_nvshmem,
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
+            ),
+        ),
+        "nccl",
+        "gloo",
+    ],
+)
+def test_router_expert_bias_refit_non_collocated(refit_backend: str):
+    """Non-collocated counterpart of ``test_router_expert_bias_refit``.
+
+    Splits the world into disjoint src and dst rank sets so dst-only ranks
+    have no local view of the src model.  Exercises the ``all_gather_object``-
+    based dtype harmonization path: src ranks hold ``expert_bias`` in fp32 and
+    dst ranks in bf16, and the only way dst can learn the expected dtype is
+    via the gathered map.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    world = dist.get_world_size()
+    src_tp, src_ep, dst_tp, dst_ep = 2, 1, 2, 1
+    src_world = src_tp * src_ep
+    dst_world = dst_tp * dst_ep
+    if world < src_world + dst_world:
+        Utils.destroy_model_parallel()
+        pytest.skip(f"Non-collocated test requires WORLD_SIZE >= {src_world + dst_world}")
+
+    try:
+        import transformer_engine  # noqa: F401
+    except Exception:
+        Utils.destroy_model_parallel()
+        pytest.skip("Transformer Engine not available")
+
+    from megatron.rl.parallel_utils import build_inference_pg_collection
+
+    rank = dist.get_rank()
+    is_src = rank < src_world
+    is_dst = src_world <= rank < src_world + dst_world
+
+    model_parallel_cuda_manual_seed(1234)
+    torch.manual_seed(1234)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    num_experts = 4
+    cfg = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=8,
+        num_query_groups=4,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.float32,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        num_moe_experts=num_experts,
+        moe_ffn_hidden_size=64,
+        moe_grouped_gemm=True,
+        add_bias_linear=False,
+        moe_router_dtype="fp64",
+        moe_token_dispatcher_type="alltoall",
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+    )
+    src_cfg = copy.deepcopy(cfg)
+    dst_cfg = copy.deepcopy(cfg)
+    src_cfg.expert_model_parallel_size = src_ep
+    dst_cfg.expert_model_parallel_size = dst_ep
+
+    # Both pg collections are built collectively on every rank (dist.new_group
+    # requires it) but each one's groups only contain the ranks for that side.
+    src_pgs = build_inference_pg_collection(
+        world_size=src_world, tp_size=src_tp, ep_size=src_ep, rank_offset=0
+    )
+    dst_pgs = build_inference_pg_collection(
+        world_size=dst_world, tp_size=dst_tp, ep_size=dst_ep, rank_offset=src_world
+    )
+
+    src_model = None
+    dst_model = None
+    if is_src:
+        src_model = (
+            _build_gpt(
+                src_cfg,
+                vocab_size=128,
+                seq_len=8,
+                pg_collection=src_pgs,
+                parallel_output=False,
+                num_moe_experts=num_experts,
+            )
+            .to(device)
+            .eval()
+        )
+    elif is_dst:
+        dst_model = (
+            _build_gpt(
+                dst_cfg,
+                vocab_size=128,
+                seq_len=8,
+                pg_collection=dst_pgs,
+                parallel_output=False,
+                num_moe_experts=num_experts,
+            )
+            .to(device)
+            .eval()
+        )
+
+    test_pattern = torch.arange(num_experts, dtype=torch.float32, device=device) + 0.25
+    if is_src and src_model is not None:
+        for name, mod in src_model.named_modules():
+            bias = getattr(mod, "expert_bias", None)
+            if isinstance(bias, torch.Tensor):
+                with torch.no_grad():
+                    # Promote to fp32 to mirror what _maintain_float32_expert_bias
+                    # does on the trainer's first forward, while dst remains at
+                    # its bf16/fp32-from-init state.  This forces the dtype
+                    # harmonization path to do work for non-collocated transfer
+                    # (dst-only ranks have no local view of src's dtype).
+                    if bias.dtype != torch.float32:
+                        fp32_bias = bias.detach().to(torch.float32)
+                        fp32_bias.copy_(test_pattern)
+                        mod._buffers["expert_bias"] = fp32_bias
+                    else:
+                        bias.copy_(test_pattern)
+
+    dist.barrier()
+
+    swap_model_weights(
+        [src_model] if src_model is not None else None,
+        [dst_model] if dst_model is not None else None,
+        refit_method=refit_backend,
+    )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    if is_dst and dst_model is not None:
+        dst_named_buffers = dict(dst_model.named_buffers())
+        mismatches = []
+        for name, dst_buf in dst_named_buffers.items():
+            if not name.endswith("expert_bias"):
+                continue
+            # Replicated buffer: expected value is the stamped test_pattern.
+            # dst_buf should also be fp32 thanks to dtype harmonization.
+            if dst_buf.dtype != torch.float32:
+                mismatches.append((name, f"dtype not harmonized: {dst_buf.dtype}"))
+                continue
+            if not torch.allclose(dst_buf, test_pattern, atol=1e-5):
+                mismatches.append((name, (dst_buf - test_pattern).abs().max().item()))
+        assert not mismatches, (
+            f"Non-collocated refit did not transfer router.expert_bias correctly "
+            f"(backend={refit_backend}): {mismatches}"
+        )
+
+    dist.barrier()
+    if src_model is not None:
+        del src_model
+    if dst_model is not None:
+        del dst_model
+    clear_all_caches()
+    _destroy_pg_collection(src_pgs)
+    _destroy_pg_collection(dst_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(
+            "nvshmem",
+            marks=pytest.mark.skipif(
+                not has_nvshmem,
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
+            ),
+        ),
+        "nccl",
+        "gloo",
+    ],
+)
+@pytest.mark.parametrize(
     "src_tp,src_pp,dst_tp,dst_pp",
     [
         # TP only changes (exercises block-interleaved planner for Mamba in_proj)
