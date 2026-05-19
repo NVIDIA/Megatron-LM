@@ -35,7 +35,11 @@ def _register_forward_pre_hook(module: FSDPModule):
 
     def unshard_param_groups(module, *unused):
         ctx = module._fsdp_root_context
-        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
+        module.unshard(
+            async_op=ctx.enable_unshard_prefetch,
+            bwd_pass=False,
+            is_forward_in_backward=ctx.backward_phase,
+        )
 
     module._mfsdp_forward_pre_hook = module.register_forward_pre_hook(
         unshard_param_groups, prepend=True

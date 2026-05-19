@@ -369,7 +369,12 @@ class FSDPModule(nn.Module):
                 child._fsdp_state._is_root = False
                 setattr(child, "_fsdp_root_context", root_context)
 
-    def unshard(self, async_op: bool = False, bwd_pass: bool = False):
+    def unshard(
+        self,
+        async_op: bool = False,
+        bwd_pass: bool = False,
+        is_forward_in_backward: bool = False,
+    ):
         """
         Unshard parameters by all-gathering from the sharded buffer.
 
@@ -394,8 +399,17 @@ class FSDPModule(nn.Module):
         else:
             prefetch_modules = []
         for module in [self] + prefetch_modules:
-            if ctx.unshard_done_events[id(module)] is not None:
-                continue  # Skip if unshard already issued for this module
+            if ctx.unshard_done_events[id(module)] is not None and all(
+                param_group.has_unsharded_weight_buffers(
+                    is_bwd=bwd_pass,
+                    is_forward_in_backward=is_forward_in_backward,
+                )
+                for param_group in module._fsdp_param_groups
+            ):
+                # The module-level event may come from a partial MXFP8
+                # unshard. Only skip once this phase's required buffers
+                # are all present.
+                continue
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
 
@@ -409,7 +423,10 @@ class FSDPModule(nn.Module):
                         ).any(), f"NaN detected in dist param for parameter {name}"
 
                 with torch.cuda.stream(stream):
-                    param_group.unshard(is_bwd=bwd_pass)
+                    param_group.unshard(
+                        is_bwd=bwd_pass,
+                        is_forward_in_backward=is_forward_in_backward,
+                    )
 
             # Record event to track when unshard is done for this module
             if async_op:

@@ -291,8 +291,11 @@ class FullyShardMixedPrecisionPolicy:
         transpose_weight_buffer=None,
         *,
         is_bwd: bool = False,
+        is_forward_in_backward: bool = False,
     ) -> List:
         """Return the model-weight buffers needed for this unshard phase."""
+        if is_forward_in_backward and transpose_weight_buffer is not None:
+            return [model_weight_buffer, transpose_weight_buffer]
         if is_bwd and transpose_weight_buffer is not None:
             return [transpose_weight_buffer]
         return [model_weight_buffer]
@@ -329,7 +332,12 @@ class FullyShardMixedPrecisionPolicy:
         ), "Transformer Engine >= 2.0 is required for FP8 dequantize"
         return tensor.dequantize()
 
-    def post_unshard(self, params: List[torch.Tensor], is_bwd: bool = False) -> None:
+    def post_unshard(
+        self,
+        params: List[torch.Tensor],
+        is_bwd: bool = False,
+        is_forward_in_backward: bool = False,
+    ) -> None:
         """Run post-unshard mixed precision processing for a parameter group."""
         params = [param for param in params if self.is_fp8_param(param)]
         if len(params) == 0:
@@ -339,7 +347,7 @@ class FullyShardMixedPrecisionPolicy:
             # Match v1: forward only rebinds rowwise raw data. Do not mark the
             # MXFP8 columnwise payload unavailable since TE may request the
             # backward workspace from inside the forward call stack.
-            if is_bwd:
+            if is_bwd or is_forward_in_backward:
                 if HAVE_TE_POST_ALL_GATHER_PROCESSING:
                     post_all_gather_processing(params)
                 else:

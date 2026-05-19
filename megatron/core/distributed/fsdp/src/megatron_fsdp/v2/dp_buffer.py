@@ -466,6 +466,10 @@ class DataParallelBuffer:
             start, end = self.buffer_index._get_item_local_index(item_id)
         return self.data[start:end]
 
+    def is_unsharded(self) -> bool:
+        """Return whether this buffer currently has a full unsharded view."""
+        return not self.is_distributed or self._unsharded_buffer is not None
+
     @torch.no_grad()
     def unshard(
         self,
