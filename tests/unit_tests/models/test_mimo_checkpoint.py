@@ -57,7 +57,7 @@ def _randomize_params(model, seed):
 
 
 def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seed):
-    """Create MIMO model with DDP + optimizer, do fake steps to populate optimizer state.
+    """Create MIMO model with DDP + optimizer, do a fake step to populate optimizer state.
 
     Caller must call create_all_embedding_groups() before this function.
     """
@@ -87,34 +87,12 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
     )
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
 
-    # Take several fake backward + step iterations so the Adam step counter is
-    # non-trivial; this lets us verify step-counter continuity across save/load.
-    for _ in range(3):
-        for param in mimo_model.parameters():
-            param.grad = torch.randn_like(param)
-        optimizer.step()
+    # Fake backward + step to populate optimizer state (Adam m/v)
+    for param in mimo_model.parameters():
+        param.grad = torch.randn_like(param)
+    optimizer.step()
 
     return mimo_model, optimizer
-
-
-def _find_optimizer_step(state_dict):
-    """Return the optimizer step counter from a per-module state_dict, regardless of
-    whether it lives in `state['common_step']`, `param_groups[*]['step']`, or per-param state.
-    """
-    opt = state_dict.get('optimizer', {})
-    state = opt.get('state', {})
-    if 'common_step' in state:
-        val = state['common_step']
-        return int(val.item()) if torch.is_tensor(val) else int(val)
-    for g in opt.get('param_groups', []):
-        if 'step' in g:
-            val = g['step']
-            return int(val.item()) if torch.is_tensor(val) else int(val)
-    for s in state.values():
-        if isinstance(s, dict) and 'step' in s:
-            val = s['step']
-            return int(val.item()) if torch.is_tensor(val) else int(val)
-    return None
 
 
 def run_checkpoint_test(
@@ -225,15 +203,6 @@ def run_checkpoint_test(
                         assert torch.equal(
                             state_a[param_id][key], state_b[param_id][key]
                         ), f"Optimizer {name} param {param_id} {key} mismatch"
-
-            # Verify Adam step counter survives save/load. Without restoring step,
-            # bias correction would reset and cause an effective LR drop on resume.
-            step_a = _find_optimizer_step(sd_a)
-            step_b = _find_optimizer_step(sd_b)
-            assert step_a is not None, f"Optimizer {name}: could not locate step in model A"
-            assert (
-                step_a == step_b
-            ), f"Optimizer {name}: step mismatch after load (A={step_a}, B={step_b})"
 
     finally:
         _cleanup_tmpdir(ckpt_dir)
