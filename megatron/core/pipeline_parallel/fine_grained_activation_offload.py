@@ -609,7 +609,6 @@ class PipelineOffloadManager:
 
     def init_model_chunk_offload_handler(
         self,
-        pp_rank,
         vp_size,
         vp_stage,
         min_offloaded_tensor_size=1024 * 1024,
@@ -1011,7 +1010,7 @@ class ChunkOffloadHandler:
             old_evt = q.popleft()
             cur.wait_event(old_evt)
 
-    def on_group_commit_forward(self, name, forced_released_tensors):
+    def on_group_commit_forward(self, forced_released_tensors):
         """Called at the end of a layer group's forward pass to trigger offloading."""
         if not self.do_offload:
             return
@@ -1273,9 +1272,7 @@ class FineGrainedActivationOffloadingInterface:
             PipelineOffloadManager.get_instance().__exit__()
 
     @staticmethod
-    @staticmethod
     def init_chunk_handler(
-        pp_rank,
         vp_size,
         vp_stage,
         min_offloaded_tensor_size,
@@ -1283,7 +1280,6 @@ class FineGrainedActivationOffloadingInterface:
     ):
         """Initialize the chunk handler, called at the start of a microbatch forward pass."""
         PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
-            pp_rank,
             vp_size,
             vp_stage,
             min_offloaded_tensor_size,
