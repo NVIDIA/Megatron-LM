@@ -76,7 +76,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cuda_graph_impl": "none",
     "cuda_graph_retain_backward_graph": False,
     "cuda_graph_modules": [],
-    "cuda_graph_use_single_mempool": True,
+    "cuda_graph_use_single_mempool": False,
     "cuda_graph_scope": None,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
@@ -318,7 +318,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "min_dynamic_context_parallel_size": 1,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
-    "fallback_to_eager_attn": False,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
         "_name_": "none",
@@ -329,15 +328,10 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_grouped_gemm_backend": "vllm",
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",
-    "linear_attention_type": None,
-    "mlp_chunks_for_training": 1,
     "moe_mlp_glu_interleave_size": None,
-    "moe_router_force_biased": None,
-    "sequence_packing_scheduler": None,
     "use_transformer_engine_op_fuser": False,
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
-    "head_wise_attn_gate": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
