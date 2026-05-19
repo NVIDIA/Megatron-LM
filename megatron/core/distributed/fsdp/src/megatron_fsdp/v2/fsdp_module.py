@@ -406,9 +406,11 @@ class FSDPModule(nn.Module):
                 )
                 for param_group in module._fsdp_param_groups
             ):
-                # The module-level event may come from a partial MXFP8
-                # unshard. Only skip once this phase's required buffers
-                # are all present.
+                # Buffer readiness alone is not enough: non-sharded buffers are
+                # storage-ready before params are rebound to FSDP-owned storage.
+                # The event may come from a partial MXFP8 unshard, so only skip
+                # after unshard/bind has been issued and this phase's required
+                # buffers are all present.
                 continue
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
