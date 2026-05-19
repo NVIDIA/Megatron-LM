@@ -23,6 +23,11 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
+from megatron.training.utils.common_utils import (
+    get_local_rank_preinit,
+    get_master_addr_safe,
+    get_master_port_safe,
+)
 from tests.unit_tests.test_utilities import Utils
 
 success_string = "hello,world"
@@ -519,3 +524,83 @@ class TestGetWorldSizeSafe:
 
         with pytest.raises(ValueError):
             safe_get_world_size()
+
+
+class TestGetLocalRankPreinit:
+    """Test get_local_rank_preinit function."""
+
+    @patch.dict(os.environ, {"LOCAL_RANK": "3"}, clear=True)
+    def test_uses_local_rank_env_var(self):
+        assert get_local_rank_preinit() == 3
+
+    @patch.dict(
+        os.environ, {"LOCAL_RANK": "2", "SLURM_NTASKS": "8", "SLURM_LOCALID": "5"}, clear=True
+    )
+    def test_local_rank_takes_precedence_over_slurm(self):
+        assert get_local_rank_preinit() == 2
+
+    @patch.dict(os.environ, {"SLURM_NTASKS": "8", "SLURM_LOCALID": "6"}, clear=True)
+    def test_falls_back_to_slurm_localid(self):
+        assert get_local_rank_preinit() == 6
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_defaults_to_zero_with_warning(self):
+        with pytest.warns(UserWarning, match="Could not determine local rank"):
+            assert get_local_rank_preinit() == 0
+
+
+class TestGetMasterAddrSafe:
+    """Test get_master_addr_safe function."""
+
+    @patch.dict(os.environ, {"MASTER_ADDR": "10.0.0.1"}, clear=True)
+    def test_uses_master_addr_env_var(self):
+        assert get_master_addr_safe() == "10.0.0.1"
+
+    @patch.dict(
+        os.environ,
+        {"MASTER_ADDR": "10.0.0.1", "SLURM_NTASKS": "4", "SLURM_NODELIST": "node[001-004]"},
+        clear=True,
+    )
+    def test_master_addr_takes_precedence_over_slurm(self):
+        assert get_master_addr_safe() == "10.0.0.1"
+
+    @patch.dict(os.environ, {"SLURM_NTASKS": "4", "SLURM_NODELIST": "node[010-013]"}, clear=True)
+    def test_falls_back_to_slurm_nodelist(self):
+        assert get_master_addr_safe() == "node010"
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_defaults_to_localhost_with_warning(self):
+        with pytest.warns(UserWarning, match="Could not determine master address"):
+            assert get_master_addr_safe() == "localhost"
+
+
+class TestGetMasterPortSafe:
+    """Test get_master_port_safe function."""
+
+    @patch.dict(os.environ, {"MASTER_PORT": "12345"}, clear=True)
+    def test_uses_master_port_env_var(self):
+        assert get_master_port_safe() == 12345
+
+    @patch.dict(
+        os.environ,
+        {"MASTER_PORT": "12345", "SLURM_NTASKS": "4", "SLURM_JOB_ID": "987654"},
+        clear=True,
+    )
+    def test_master_port_takes_precedence_over_slurm(self):
+        assert get_master_port_safe() == 12345
+
+    @patch.dict(os.environ, {"SLURM_NTASKS": "4", "SLURM_JOB_ID": "123456"}, clear=True)
+    def test_falls_back_to_slurm_job_derived_port(self):
+        # Last 4 digits of "123456" = "3456"; 3456 + 15000 = 18456.
+        assert get_master_port_safe() == 18456
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_defaults_to_29500_with_warning(self):
+        with pytest.warns(UserWarning, match="Could not determine master port"):
+            assert get_master_port_safe() == 29500
+
+    @patch.dict(os.environ, {"SLURM_NTASKS": "4"}, clear=True)
+    def test_slurm_without_job_id_falls_back_to_default(self):
+        # In SLURM but no SLURM_JOB_ID -> SLURM resolver returns None -> default 29500.
+        with pytest.warns(UserWarning, match="Could not determine master port"):
+            assert get_master_port_safe() == 29500
