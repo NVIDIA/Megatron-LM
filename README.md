@@ -23,10 +23,14 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
 ## Getting Started
 
-**Install from PyPI:**
+**Install from PyPI** (requires Python 3.10+):
 
 ```bash
+# Using uv (https://github.com/astral-sh/uv)
 uv pip install megatron-core
+
+# Or using standard pip
+pip install megatron-core
 ```
 
 **Or clone and install from source:**
@@ -34,7 +38,7 @@ uv pip install megatron-core
 ```bash
 git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
-uv pip install -e .
+uv pip install -e .  # or: pip install -e .
 ```
 
 > **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (e.g. `MAX_JOBS=4 uv pip install -e .`).
@@ -61,7 +65,7 @@ For NGC container setup and all installation options, see the **[Installation Gu
 <summary>Previous News</summary>
 
 - **[2024/07]** Megatron Core v0.7 improves scalability and training resiliency and adds support for multimodal training ([blog](https://developer.nvidia.com/blog/train-generative-ai-models-more-efficiently-with-new-nvidia-Megatron-Core-functionalities/)).
-- **[2024/06]** Megatron Core added supports for Mamba-based models. Check out our paper [An Empirical Study of Mamba-based Language Models](https://arxiv.org/pdf/2406.07887) and [code example](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba).
+- **[2024/06]** Megatron Core added supports for Mamba-based models. Check out our paper [An Empirical Study of Mamba-based Language Models](https://arxiv.org/pdf/2406.07887) and [code example](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mamba).
 - **[2024/01 Announcement]** NVIDIA has released the core capabilities in **Megatron-LM** into [**Megatron Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) in this repository. Megatron Core expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs.
 
 </details>

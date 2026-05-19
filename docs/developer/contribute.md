@@ -34,14 +34,14 @@ Please do file any bugs you find, keeping the following in mind:
 
 - Format new code in a style that is consistent with the file being changed. Megatron-LM doesn't (yet) have a style guide or enforced formatting.
 - Split your changes into separate, atomic commits i.e. A commit per feature or fix.
-- Make sure your commits are rebased on the master branch.
+- Make sure your commits are rebased on the main branch.
 - Write the commit message subject line in the imperative mood ("Change the default argument for X", not "Changed the default argument for X").
 - Write your commit messages in proper English, with care and punctuation.
 - Check the spelling of your code, comments and commit messages.
 
 ### Don't
 
-- Submit code that's incompatible with the project licence.
+- Submit code that's incompatible with the project license.
 - Touch anything outside the stated scope of the PR. This includes formatting changes to code not relevant to the PR.
 - Iterate excessively on your design across multiple commits.
 - Include commented-out code.
@@ -65,6 +65,6 @@ After 2 business days, tag the user @NVIDIA/mcore-oncall.
 
 Yes, we have a bot that will mark untouched PRs as "stale" after 60 days.
 
-We have a long backlog of issues and PRs dating back years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may recieve a request to re-test them with the latest code. If there's no response they may be closed. Again, if you they should be re-opened then just respond with a comment to that effect.
+We have a long backlog of issues and PRs dating back years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may receive a request to re-test them with the latest code. If there's no response they may be closed. Again, if they should be re-opened then just respond with a comment to that effect.
 
 Thank you!
