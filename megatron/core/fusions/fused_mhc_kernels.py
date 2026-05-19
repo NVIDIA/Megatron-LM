@@ -130,6 +130,8 @@ def is_triton_available() -> bool:
 # ============================================================================
 
 if _TRITON_AVAILABLE:
+    TLOG2E = tl.constexpr(LOG2E)
+
     # ============================================================================
     # Sinkhorn-Knopp
     # ============================================================================
@@ -154,7 +156,7 @@ if _TRITON_AVAILABLE:
         logits = tl.load(inp_ptr + mat_ptrs).to(tl.float32)
         row_max = tl.max(logits, axis=1)
         # Subtract row_max before exp to keep the exponent numerically stable.
-        M = tl.exp2((logits - row_max[:, None]) * LOG2E)
+        M = tl.exp2((logits - row_max[:, None]) * TLOG2E)
         tl.store(M_init_ptr + mat_ptrs, M.to(M_init_ptr.dtype.element_ty))
 
         for _ in range(NUM_ITERS):
