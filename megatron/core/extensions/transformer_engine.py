@@ -2933,6 +2933,35 @@ def set_save_original_input(module):
 
 
 try:
+    from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor as _TEGroupedTensor
+except ImportError:
+    _TEGroupedTensor = None
+
+
+def is_te_grouped_tensor(tensor: Any) -> bool:
+    """Return whether a tensor is Transformer Engine's GroupedTensor wrapper."""
+    return _TEGroupedTensor is not None and isinstance(tensor, _TEGroupedTensor)
+
+
+def te_grouped_tensor_prepare_for_saving(tensor: torch.Tensor):
+    """Use TE's canonical GroupedTensor saved-buffer layout on a shallow wrapper copy."""
+    if not is_te_grouped_tensor(tensor):
+        raise TypeError(f"Expected TE GroupedTensor, got {type(tensor).__name__}")
+
+    # GroupedTensor.prepare_for_saving clears buffer references on the object it receives.
+    # Keep the original saved tensor intact and mutate only the metadata holder that will be
+    # restored during unpack.
+    tensor_obj = tensor.detach()
+    return tensor_obj.prepare_for_saving()
+
+
+def te_grouped_tensor_restore_from_saved(tensor_obj: Any, tensors: list[Optional[torch.Tensor]]):
+    """Restore a TE GroupedTensor from buffers produced by prepare_for_saving."""
+    tensor_obj.restore_from_saved(list(tensors))
+    return tensor_obj
+
+
+try:
     # pylint: disable=unused-import
     from transformer_engine.pytorch import cpu_offload_v1 as cpu_offload
 except ImportError:

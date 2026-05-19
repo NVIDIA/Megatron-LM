@@ -10,23 +10,16 @@ import torch
 DEBUG = False
 DEBUG_RANK = 0
 
+from megatron.core.extensions.transformer_engine import (
+    is_te_grouped_tensor,
+    te_grouped_tensor_prepare_for_saving,
+    te_grouped_tensor_restore_from_saved,
+)
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 _TE_GROUPED_TENSOR_STATE = "te_grouped_tensor"
 _TE_GROUPED_TENSOR_RESIDENT_BUFFER_STATE = "te_grouped_tensor_resident_buffer"
-_TE_GROUPED_TENSOR_BUFFER_NAMES = (
-    "rowwise_data",
-    "columnwise_data",
-    "scale_inv",
-    "columnwise_scale_inv",
-    "amax",
-    "columnwise_amax",
-    "scale",
-    "first_dims",
-    "last_dims",
-    "tensor_offsets",
-)
 
 
 def debug_rank(message):
@@ -110,25 +103,6 @@ def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
     torch.distributed.barrier()
 
 
-def _is_te_grouped_tensor(tensor):
-    """Return whether tensor looks like Transformer Engine's GroupedTensor."""
-    return (
-        isinstance(tensor, torch.Tensor)
-        and type(tensor).__name__ == "GroupedTensor"
-        and hasattr(tensor, "logical_shape")
-        and hasattr(tensor, "num_tensors")
-        and hasattr(tensor, "fake_dtype")
-    )
-
-
-def _iter_te_grouped_tensor_buffers(tensor):
-    """Iterate over non-empty tensor buffers inside a TE GroupedTensor."""
-    for name in _TE_GROUPED_TENSOR_BUFFER_NAMES:
-        buffer = getattr(tensor, name, None)
-        if isinstance(buffer, torch.Tensor):
-            yield name, buffer
-
-
 def _tensor_allows_offloading(tensor):
     """Return whether a tensor's optional offload preference allows offloading."""
     return not (hasattr(tensor, "offloading_activation") and not tensor.offloading_activation)
@@ -139,41 +113,36 @@ def _regular_tensor_needs_offloading(tensor, min_offloaded_tensor_size):
     return tensor.numel() >= min_offloaded_tensor_size and _tensor_allows_offloading(tensor)
 
 
-def _te_grouped_tensor_offload_nbytes(tensor, min_offloaded_tensor_size):
-    """Count bytes of TE GroupedTensor buffers that individually meet the offload policy."""
-    return sum(
-        buffer.numel() * buffer.element_size()
-        for _, buffer in _iter_te_grouped_tensor_buffers(tensor)
-        if _regular_tensor_needs_offloading(buffer, min_offloaded_tensor_size)
-    )
+def _is_te_grouped_tensor_state(state):
+    """Return whether state contains offloaded TE GroupedTensor buffers."""
+    return isinstance(state, tuple) and len(state) > 0 and state[0] == _TE_GROUPED_TENSOR_STATE
 
 
-def _te_grouped_tensor_needs_offloading(tensor, min_offloaded_tensor_size):
-    """Return whether any TE GroupedTensor backing buffer should be offloaded."""
-    if not _tensor_allows_offloading(tensor):
-        return False
-    return any(
-        _regular_tensor_needs_offloading(buffer, min_offloaded_tensor_size)
-        for _, buffer in _iter_te_grouped_tensor_buffers(tensor)
-    )
+def _te_grouped_tensor_state_offload_nbytes(state):
+    """Return bytes actually offloaded for a TE GroupedTensor state."""
+    return state[3]
 
 
 def _record_tensor_stream(tensor, stream):
-    """Record stream usage for regular tensors or TE GroupedTensor backing buffers."""
-    if _is_te_grouped_tensor(tensor):
-        for _, buffer in _iter_te_grouped_tensor_buffers(tensor):
-            buffer.record_stream(stream)
-    else:
-        tensor.record_stream(stream)
+    """Record stream usage for regular tensors.
+
+    TE GroupedTensor buffers are recorded individually when the selected backing buffers are
+    offloaded.
+    """
+    if is_te_grouped_tensor(tensor):
+        return
+    tensor.record_stream(stream)
 
 
 def _release_tensor_storage(tensor):
-    """Release storage for regular tensors or TE GroupedTensor backing buffers."""
-    if _is_te_grouped_tensor(tensor):
-        for _, buffer in _iter_te_grouped_tensor_buffers(tensor):
-            buffer.untyped_storage().resize_(0)
-    else:
-        tensor.untyped_storage().resize_(0)
+    """Release storage for regular tensors.
+
+    TE GroupedTensor wrappers do not own a single storage to release here; their backing buffers
+    are either offloaded individually or left resident.
+    """
+    if is_te_grouped_tensor(tensor):
+        return
+    tensor.untyped_storage().resize_(0)
 
 
 class GPUTensorPool:
@@ -454,15 +423,14 @@ class OffloadTensorGroup:
         """Wait for the reload event."""
         stream.wait_event(self._reload_event)
 
-    def update_offload_info(self, tensor, min_offloaded_tensor_size=None):
+    def update_offload_info(self, tensor_or_state):
         """Update the offload information."""
-        if _is_te_grouped_tensor(tensor):
-            assert min_offloaded_tensor_size is not None
-            self.total_offload_bytes += _te_grouped_tensor_offload_nbytes(
-                tensor, min_offloaded_tensor_size
-            )
+        if _is_te_grouped_tensor_state(tensor_or_state):
+            self.total_offload_bytes += _te_grouped_tensor_state_offload_nbytes(tensor_or_state)
+        elif is_te_grouped_tensor(tensor_or_state):
+            self.total_offload_bytes += 0
         else:
-            self.total_offload_bytes += tensor.numel() * tensor.element_size()
+            self.total_offload_bytes += tensor_or_state.numel() * tensor_or_state.element_size()
         self.total_tensor_count += 1
 
 
@@ -850,95 +818,57 @@ class ChunkOffloadHandler:
         return gpu_tensor
 
     def _offload_te_grouped_tensor(self, src_tensor, pin_memory=True, use_cpu_pool=True):
-        """Offload TE GroupedTensor backing buffers without stacking members."""
+        """Offload selected TE GroupedTensor backing buffers without stacking members."""
         debug_rank("--------offload TE GroupedTensor")
 
-        buffer_states = {}
-        for name in _TE_GROUPED_TENSOR_BUFFER_NAMES:
-            buffer = getattr(src_tensor, name, None)
+        saved_tensors, tensor_obj = te_grouped_tensor_prepare_for_saving(src_tensor)
+        buffer_states = []
+        offload_nbytes = 0
+        for buffer in saved_tensors:
             if not isinstance(buffer, torch.Tensor):
-                buffer_states[name] = None
+                buffer_states.append(None)
             elif _regular_tensor_needs_offloading(buffer, self.min_offloaded_tensor_size):
-                buffer_states[name] = self._offload_tensor(
-                    buffer, pin_memory=pin_memory, use_cpu_pool=use_cpu_pool
+                buffer_states.append(
+                    self._offload_tensor(buffer, pin_memory=pin_memory, use_cpu_pool=use_cpu_pool)
                 )
+                buffer.record_stream(self.d2h_stream)
+                offload_nbytes += buffer.numel() * buffer.element_size()
             else:
-                buffer_states[name] = (_TE_GROUPED_TENSOR_RESIDENT_BUFFER_STATE, buffer)
+                buffer_states.append((_TE_GROUPED_TENSOR_RESIDENT_BUFFER_STATE, buffer))
 
-        metadata = {
-            "class": type(src_tensor),
-            "logical_shape": tuple(src_tensor.logical_shape),
-            "dtype": (
-                src_tensor.get_dtype() if hasattr(src_tensor, "get_dtype") else src_tensor.dtype
-            ),
-            "num_tensors": src_tensor.num_tensors,
-            "tensor_shapes": src_tensor.tensor_shapes,
-            "quantizer": src_tensor.quantizer,
-            "offsets": src_tensor.offsets,
-            "scale_inv_offsets": src_tensor.scale_inv_offsets,
-            "columnwise_scale_inv_offsets": src_tensor.columnwise_scale_inv_offsets,
-            "requires_grad": src_tensor.requires_grad,
-            "stride": list(src_tensor.stride()),
-            "with_gemm_swizzled_scales": getattr(
-                src_tensor, "_with_gemm_swizzled_scales", False
-            ),
-            "row_scaled_nvfp4": getattr(src_tensor, "row_scaled_nvfp4", False),
-        }
-        return (_TE_GROUPED_TENSOR_STATE, metadata, buffer_states)
+        if offload_nbytes == 0:
+            return src_tensor
+        return (_TE_GROUPED_TENSOR_STATE, tensor_obj, buffer_states, offload_nbytes)
 
     def _reload_te_grouped_tensor(self, state, non_blocking=None):
         """Reload TE GroupedTensor backing buffers and reconstruct the wrapper."""
         debug_rank("------reload TE GroupedTensor")
-        _, metadata, buffer_states = state
+        _, tensor_obj, buffer_states, _ = state
 
-        buffers = {}
-        for name, buffer_state in buffer_states.items():
+        buffers = []
+        for buffer_state in buffer_states:
             if buffer_state is None:
-                buffers[name] = None
+                buffers.append(None)
             elif (
                 isinstance(buffer_state, tuple)
                 and len(buffer_state) > 0
                 and buffer_state[0] == _TE_GROUPED_TENSOR_RESIDENT_BUFFER_STATE
             ):
-                buffers[name] = buffer_state[1]
+                buffers.append(buffer_state[1])
             else:
-                buffers[name] = self._reload_tensor(buffer_state, non_blocking=non_blocking)
+                buffers.append(self._reload_tensor(buffer_state, non_blocking=non_blocking))
 
-        grouped_tensor = metadata["class"](
-            shape=metadata["logical_shape"],
-            dtype=metadata["dtype"],
-            num_tensors=metadata["num_tensors"],
-            shapes=metadata["tensor_shapes"],
-            quantizer=metadata["quantizer"],
-            data=buffers["rowwise_data"],
-            columnwise_data=buffers["columnwise_data"],
-            scale_inv=buffers["scale_inv"],
-            columnwise_scale_inv=buffers["columnwise_scale_inv"],
-            amax=buffers["amax"],
-            columnwise_amax=buffers["columnwise_amax"],
-            scale=buffers["scale"],
-            first_dims=buffers["first_dims"],
-            last_dims=buffers["last_dims"],
-            tensor_offsets=buffers["tensor_offsets"],
-            offsets=metadata["offsets"],
-            scale_inv_offsets=metadata["scale_inv_offsets"],
-            columnwise_scale_inv_offsets=metadata["columnwise_scale_inv_offsets"],
-            requires_grad=metadata["requires_grad"],
-            stride=metadata["stride"],
-            with_gemm_swizzled_scales=metadata["with_gemm_swizzled_scales"],
-            row_scaled_nvfp4=metadata["row_scaled_nvfp4"],
-        )
-        return grouped_tensor
+        return te_grouped_tensor_restore_from_saved(tensor_obj, buffers)
 
     def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
         """Offload a tensor-like saved activation."""
-        if _is_te_grouped_tensor(src_tensor):
+        if is_te_grouped_tensor(src_tensor):
             return self._offload_te_grouped_tensor(src_tensor, pin_memory, use_cpu_pool)
         return self._offload_tensor(src_tensor, pin_memory, use_cpu_pool)
 
     def reload(self, state, non_blocking=None):
         """Reload a tensor-like saved activation."""
-        if isinstance(state, tuple) and len(state) > 0 and state[0] == _TE_GROUPED_TENSOR_STATE:
+        if _is_te_grouped_tensor_state(state):
             return self._reload_te_grouped_tensor(state, non_blocking)
         return self._reload_tensor(state, non_blocking)
 
@@ -1042,8 +972,8 @@ class ChunkOffloadHandler:
         debug_rank(
             f"tensor_need_offloading_checker {getattr(tensor, 'offloading_activation', None)}"
         )
-        if _is_te_grouped_tensor(tensor):
-            return _te_grouped_tensor_needs_offloading(tensor, self.min_offloaded_tensor_size)
+        if is_te_grouped_tensor(tensor):
+            return _tensor_allows_offloading(tensor)
         return _regular_tensor_needs_offloading(tensor, self.min_offloaded_tensor_size)
 
     def bulk_offload_group(self):
@@ -1060,7 +990,7 @@ class ChunkOffloadHandler:
                     )
                     if self.is_warmup:
                         group_to_offload.update_offload_info(
-                            tensor_on_device, self.min_offloaded_tensor_size
+                            state if is_te_grouped_tensor(tensor_on_device) else tensor_on_device
                         )
                     _record_tensor_stream(tensor_on_device, self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
