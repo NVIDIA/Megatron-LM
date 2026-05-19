@@ -187,16 +187,7 @@ def test_ep_async_handoff_launches_or_skips_with_global_state(
 @pytest.mark.internal
 def test_ep_protocol_diagnostics_count_reuse_discard_launch_and_skip():
     communicator = _RecordingEPCommunicator(
-        sync_results=[
-            (1, 1, 1, 0, 0, 0),
-            1,
-            (1, 1, 0, 0, 1, 0),
-            1,
-            (1, 1, 0),
-            1,
-            (1, 1, 1),
-            1,
-        ]
+        sync_results=[(1, 1, 1, 0, 0, 0), 1, (1, 1, 0, 0, 1, 0), 1, (1, 1, 0), 1, (1, 1, 1), 1]
     )
     protocol = EPAsyncStepProtocol(communicator)
 
@@ -574,19 +565,14 @@ def test_async_sampling_and_logprob_bookkeeping_matrix(
 
     assert (
         controller._should_collect_dynamic_sampling_bookkeeping(
-            async_next_prepared=async_next_prepared,
-            pending_forward_reused=pending_forward_reused,
+            async_next_prepared=async_next_prepared, pending_forward_reused=pending_forward_reused
         )
         is expected
     )
 
 
 def _install_async_prepare_stubs(
-    controller,
-    *,
-    disabled_reason=None,
-    prepare_result=True,
-    launch_decision=True,
+    controller, *, disabled_reason=None, prepare_result=True, launch_decision=True
 ):
     events = []
     context = controller.inference_wrapped_model.inference_context

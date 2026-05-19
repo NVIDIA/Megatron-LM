@@ -1854,7 +1854,7 @@ class TextGenerationController:
                 ].copy_(
                     self._sampled_mtp_tokens_cuda_slots[sample_slot, :, :active_request_count],
                     non_blocking=True,
-            )
+                )
             sample_ready_event.record(self._async_copy_stream)
         sampled_mtp_tokens_cpu = (
             self._async_sampled_mtp_tokens_cpu_slots[sample_slot, :, :active_request_count]
@@ -2015,10 +2015,7 @@ class TextGenerationController:
         )
 
     def _should_collect_dynamic_logprob_bookkeeping(
-        self,
-        *,
-        async_next_prepared: bool,
-        pending_forward_reused: bool,
+        self, *, async_next_prepared: bool, pending_forward_reused: bool
     ) -> bool:
         """Whether this step needs sampling metadata for logprob calculation."""
         if not (async_next_prepared or pending_forward_reused):
@@ -2026,17 +2023,13 @@ class TextGenerationController:
         return self._active_requests_need_logprob_results()
 
     def _should_collect_dynamic_sampling_bookkeeping(
-        self,
-        *,
-        async_next_prepared: bool,
-        pending_forward_reused: bool,
+        self, *, async_next_prepared: bool, pending_forward_reused: bool
     ) -> bool:
         """Whether this step needs sampling buckets or logprob bookkeeping."""
         if self._active_requests_need_sampling_bookkeeping():
             return True
         return self._should_collect_dynamic_logprob_bookkeeping(
-            async_next_prepared=async_next_prepared,
-            pending_forward_reused=pending_forward_reused,
+            async_next_prepared=async_next_prepared, pending_forward_reused=pending_forward_reused
         )
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
