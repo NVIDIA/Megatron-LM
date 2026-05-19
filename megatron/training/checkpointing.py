@@ -790,7 +790,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully "
                              f"saved local checkpoint from iteration {iteration:7d}")
                 if args.log_progress and args.async_save:
-                    append_to_progress_log(f'Saved async local checkpoint\tIteration: {iteration}',
+                    append_to_progress_log(args.save, f'Saved async local checkpoint\tIteration: {iteration}',
                                            barrier=False)
         else:
             def iter_finalize_fn():
@@ -809,7 +809,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                              f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
                              f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
                 if args.log_progress and args.async_save:
-                    append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
+                    append_to_progress_log(args.save, f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
 
                 if save_retain_interval is not None:
@@ -910,7 +910,7 @@ def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=F
         print(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
               f'at {save_path}', flush=True)
         if log_progress:
-            append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
+            append_to_progress_log(args.save, f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
     except Exception as e:
         print(f'  encountered exception "{e}" when trying to delete checkpoint from '
               f'iteration {iteration_to_delete:7d} at {save_path}', flush=True)

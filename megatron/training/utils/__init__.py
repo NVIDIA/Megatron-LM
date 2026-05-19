@@ -18,7 +18,6 @@ from megatron.training.utils.common_utils import (
     is_hybrid_model,
     is_first_or_last_pipeline_stage,
     get_device_arch_version,
-    append_to_progress_log,
     get_blend_and_blend_per_split,
     get_batch_on_this_tp_rank,
     update_use_dist_ckpt,
@@ -27,3 +26,5 @@ from megatron.training.utils.common_utils import (
     has_nvrx_installed,
     has_nvrx_checkpointing_async_support,
 )
+
+from megatron.training.utils.log_utils import append_to_progress_log
