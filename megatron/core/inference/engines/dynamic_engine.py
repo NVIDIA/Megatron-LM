@@ -19,6 +19,10 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+from megatron.core.inference.batch_dimensions_utils import (
+    CUDAGraphBatchDimensionBuilder,
+    InferenceBatchDimensions,
+)
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
@@ -255,6 +259,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
+        # Steps after which a deferred request emits a starvation warning. Tied to
+        # max_sequence_length: at least one active decode should finish within that
+        # window during normal operation, so longer waits suggest a real bug (hung
+        # kernel, infinite loop, P-grid that doesn't cover the workload).
+        self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
         # Initialize engine.
         self.reset()
 
@@ -1605,6 +1614,20 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
+                # CG-aware admission gating: defer if the resulting batch shape lacks a
+                # matching captured CG. Non-chunked admit takes the request whole, so the
+                # candidate token_count is active + remaining_prompt_tokens.
+                if self._cg_admission_gating_active():
+                    candidate = InferenceBatchDimensions(
+                        token_count=(
+                            self.context.active_token_count + len(req.remaining_prompt_tokens)
+                        ),
+                        prefill_req_count=self.context.num_prefill_requests + 1,
+                        decode_req_count=self.context.num_decode_requests,
+                    )
+                    if not self._cg_admission_check(req, candidate):
+                        break
+
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
@@ -1623,6 +1646,71 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:
             self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+
+    def _cg_admission_gating_active(self) -> bool:
+        """CG-aware admission gating is active when all-prefill graphs are enabled and captured."""
+        return self.context.use_cuda_graphs_for_non_decode_steps and bool(
+            self.context.cuda_graph_batch_dimensions_list
+        )
+
+    def _find_cg_chunk_size(self, max_chunk_tokens: int) -> int:
+        """Return the largest chunk size <= max_chunk_tokens whose resulting batch matches a CG.
+
+        Walks the (descending-token_count) captured list and returns the first chunk that
+        (a) falls within the available budget and (b) produces an applicable batch_dim.
+        Falls back to max_chunk_tokens if no CG-aligned size exists (caller still schedules,
+        just without a graph match — the engine's eager path handles it).
+        """
+        active_tok = self.context.active_token_count
+        active_p = self.context.num_prefill_requests
+        active_d = self.context.num_decode_requests
+        strict = self.context.is_hybrid_model
+
+        for cg in self.context.cuda_graph_batch_dimensions_list:
+            chunk = cg.token_count - active_tok
+            if chunk < 1:
+                continue
+            if chunk > max_chunk_tokens:
+                continue
+            candidate = InferenceBatchDimensions(
+                token_count=cg.token_count,
+                prefill_req_count=active_p + 1,
+                decode_req_count=active_d,
+            )
+            if cg.is_applicable_for_batch_dim(candidate, strict=strict):
+                return chunk
+
+        return max_chunk_tokens  # no CG match; caller will schedule eagerly
+
+    def _cg_admission_check(self, req, candidate: InferenceBatchDimensions) -> bool:
+        """Return True if the candidate batch shape matches a captured CG.
+
+        On miss, increments `req.cg_wait_iters` and emits a starvation warning every
+        `_cg_admission_warn_after` steps. On hit, resets the counter. Caller is
+        responsible for deferring (e.g., breaking the scheduler loop) when False.
+        """
+        matched = CUDAGraphBatchDimensionBuilder.match_graph_config(
+            real_batch_dim=candidate,
+            cuda_graph_batch_dimensions_list=self.context.cuda_graph_batch_dimensions_list,
+            strict=self.context.is_hybrid_model,
+        )
+        if matched is not None:
+            req.cg_wait_iters = 0
+            return True
+        req.cg_wait_iters += 1
+        if req.cg_wait_iters % self._cg_admission_warn_after == 0:
+            logging.warning(
+                "request %d has been deferred by CG-aware admission for %d steps — "
+                "possible starvation (strict=%s, active P=%d D=%d tok=%d, candidate=%s)",
+                req.request_id,
+                req.cg_wait_iters,
+                self.context.is_hybrid_model,
+                self.context.num_prefill_requests,
+                self.context.num_decode_requests,
+                self.context.active_token_count,
+                candidate,
+            )
+        return False
 
     def schedule_chunked_prefill(self):
         """
@@ -1678,23 +1766,48 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
-            token_fully_can_be_added = (
-                self.context.active_token_count + remaining_len <= self.context.max_tokens
-            )
             token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
             request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
-            if request_can_be_added and kv_cache_available:
-                if token_fully_can_be_added:
-                    # Add these hashes to pending.
-                    if prefix_caching_enabled:
-                        for block_hash in req.precomputed_block_hashes:
-                            if (
-                                block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
-                            ):
-                                pending_block_hashes.add(block_hash)
+            if request_can_be_added and kv_cache_available and token_partially_can_be_added:
+                # How many tokens we can admit this step.
+                token_budget = self.context.max_tokens - self.context.active_token_count
+                max_chunk = min(remaining_len, token_budget)
+
+                if self._cg_admission_gating_active():
+                    # Snap chunk size to the largest captured-CG boundary within budget,
+                    # then defer if no shape covers it.
+                    prefill_chunk_length = self._find_cg_chunk_size(max_chunk)
+                    candidate = InferenceBatchDimensions(
+                        token_count=self.context.active_token_count + prefill_chunk_length,
+                        prefill_req_count=self.context.num_prefill_requests + 1,
+                        decode_req_count=self.context.num_decode_requests,
+                    )
+                    if not self._cg_admission_check(req, candidate):
+                        can_schedule = False
+                        break
+                else:
+                    prefill_chunk_length = max_chunk
+
+                # Flash-attn guard: if this chunk would leave exactly 1 token for the
+                # final chunk, reduce by 1 (or defer if we only have 1 token of budget).
+                # See https://github.com/Dao-AILab/flash-attention/issues/1537
+                if remaining_len - prefill_chunk_length == 1:
+                    if prefill_chunk_length > 1:
+                        prefill_chunk_length -= 1
+                    else:
+                        can_schedule = False
+                        break
+
+                # Add hashes to pending set (prefix-caching bookkeeping).
+                if prefix_caching_enabled:
+                    for block_hash in req.precomputed_block_hashes:
+                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                            pending_block_hashes.add(block_hash)
+
+                if prefill_chunk_length >= remaining_len:
+                    # Full admit.
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1702,35 +1815,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                     req.add_event_add_context()
-                    # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
-                    # Only this case we keep checking the rest of the waiting queue
                     can_schedule = True
-                elif token_partially_can_be_added:
-                    # Add these hashes to pending.
-                    if prefix_caching_enabled:
-                        for block_hash in req.precomputed_block_hashes:
-                            if (
-                                block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
-                            ):
-                                pending_block_hashes.add(block_hash)
-                    prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
-
-                    # If this chunk would leave exactly 1 token for the final chunk, reduce
-                    # this chunk by 1 or skip scheduling so the final chunk has 2 tokens.
-                    # This avoids the edge case where max_seqlen_q=1 which results in a bug
-                    # with the Flash Attention kernel.
-                    # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                    if remaining_len - prefill_chunk_length == 1:
-                        if prefill_chunk_length > 1:
-                            prefill_chunk_length -= 1
-                        else:
-                            # We only have space for 1 token, but remaining is 2.
-                            # Delay scheduling to avoid leaving exactly 1 token for the final chunk.
-                            can_schedule = False
-                            break
-
+                else:
+                    # Partial admit: schedule this chunk and keep the request at the queue head.
                     self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
@@ -1738,9 +1826,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.chunked_prefill_request_id = req.request_id
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[prefill_chunk_length:]
                     req.finished_chunk_token_count += prefill_chunk_length
-                    # Still have tokens to prefill, so we break and keep the
-                    # chunked prefill request at the head of the waiting queue
-                    # Note that we do not need to continue check the queue, as the tokens are full
 
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:
