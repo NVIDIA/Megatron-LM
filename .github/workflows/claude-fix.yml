@@ -1,0 +1,543 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Claude Fix PR
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: claude-fix-pr-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  claude-fix:
+    name: Claude Fix
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/claude fix')
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - name: Check commenter has write access
+        env:
+          COMMENTER: ${{ github.event.comment.user.login }}
+        run: |
+          PERMISSION=$(gh api repos/$REPO/collaborators/$COMMENTER/permission --jq .permission)
+          if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "write" ]]; then
+            gh pr comment $PR_NUMBER --repo $REPO --body "❌ You do not have write access to use \`/claude fix\`."
+            exit 1
+          fi
+
+      - name: React to trigger comment
+        run: |
+          gh api repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions \
+            --method POST \
+            -f content='eyes'
+
+      - name: Parse user steering text
+        id: parse-steer
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # Everything after the first `/claude fix` token is treated as
+          # an optional natural-language steer (e.g. "merge conflicts
+          # only", "just fix unit tests, keep qk_layernorm"). The body
+          # is passed via env to avoid shell injection.
+          STEER="${COMMENT_BODY#*/claude fix}"
+          # Strip a single leading whitespace/newline run, then strip
+          # trailing whitespace.
+          STEER="$(printf '%s' "$STEER" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+          {
+            echo "steer<<__CLAUDE_FIX_STEER_EOF__"
+            printf '%s\n' "$STEER"
+            echo "__CLAUDE_FIX_STEER_EOF__"
+          } >> "$GITHUB_OUTPUT"
+          if [ -n "$STEER" ]; then
+            echo "User steering text detected (${#STEER} chars)."
+          else
+            echo "No user steering text — running default Phase A then Phase B."
+          fi
+
+      - name: Resolve PR metadata
+        id: pr-info
+        run: |
+          PR_JSON=$(gh pr view $PR_NUMBER --repo $REPO --json headRefName,headRefOid,baseRefName,headRepository,headRepositoryOwner,maintainerCanModify,isCrossRepository)
+          HEAD_REF=$(echo "$PR_JSON" | jq -r .headRefName)
+          HEAD_SHA=$(echo "$PR_JSON" | jq -r .headRefOid)
+          BASE_REF=$(echo "$PR_JSON" | jq -r .baseRefName)
+          HEAD_REPO_OWNER=$(echo "$PR_JSON" | jq -r .headRepositoryOwner.login)
+          HEAD_REPO_NAME=$(echo "$PR_JSON" | jq -r .headRepository.name)
+          HEAD_REPO="${HEAD_REPO_OWNER}/${HEAD_REPO_NAME}"
+          IS_CROSS_REPO=$(echo "$PR_JSON" | jq -r .isCrossRepository)
+          MAINTAINER_CAN_MODIFY=$(echo "$PR_JSON" | jq -r .maintainerCanModify)
+
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+          echo "head_repo=$HEAD_REPO" >> "$GITHUB_OUTPUT"
+          echo "is_cross_repo=$IS_CROSS_REPO" >> "$GITHUB_OUTPUT"
+          echo "maintainer_can_modify=$MAINTAINER_CAN_MODIFY" >> "$GITHUB_OUTPUT"
+
+          if [ "$IS_CROSS_REPO" = "true" ] && [ "$MAINTAINER_CAN_MODIFY" != "true" ]; then
+            gh pr comment $PR_NUMBER --repo $REPO --body "❌ \`/claude fix\` requires *Allow edits by maintainers* to be enabled on this PR so the bot can push commits back to your fork branch. Please enable that option in the PR sidebar and re-trigger."
+            exit 1
+          fi
+
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.pr-info.outputs.head_repo }}
+          ref: ${{ steps.pr-info.outputs.head_ref }}
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
+
+      - name: Configure Git and add upstream remote
+        run: |
+          git config user.name "svcnvidia-nemo-ci"
+          git config user.email "svcnvidia-nemo-ci@nvidia.com"
+          git remote add upstream https://github.com/${{ github.repository }}.git
+          git fetch upstream ${{ steps.pr-info.outputs.base_ref }}
+
+      - name: Run Claude Code to resolve conflicts and fix CI
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.PAT }}
+          trigger_phrase: "/claude fix"
+          show_full_output: true
+          prompt: |
+            You are an automated PR-fix bot. A maintainer typed `/claude fix`
+            on an open PR. Your job is to do one or both of the following,
+            in this order, and then exit:
+
+              1. If the PR head cannot fast-forward over its base branch
+                 (i.e. there are merge conflicts or the head is behind
+                 base), merge the base branch into the PR head, resolve
+                 conflicts, and push the merge to the PR branch.
+              2. If any non-exempt required check on the PR is currently
+                 failing, iterate (diagnose → fix → push → re-trigger CI
+                 → poll) until every non-exempt required check on the
+                 LATEST CI run for the current HEAD SHA reaches a
+                 terminal green conclusion.
+
+            REPO: ${{ github.repository }}
+            PR_NUMBER: ${{ github.event.issue.number }}
+            HEAD_REPO: ${{ steps.pr-info.outputs.head_repo }}
+            HEAD_REF: ${{ steps.pr-info.outputs.head_ref }}
+            HEAD_SHA: ${{ steps.pr-info.outputs.head_sha }}
+            BASE_REF: ${{ steps.pr-info.outputs.base_ref }}
+            IS_CROSS_REPO: ${{ steps.pr-info.outputs.is_cross_repo }}
+
+            The PR head has already been checked out (origin = the PR's
+            head repo, which may be a fork) and `upstream` has been
+            added pointing at $REPO with $BASE_REF already fetched.
+
+            ## Optional user steering
+
+            The user may have appended a natural-language instruction
+            after `/claude fix`. If the block below is non-empty, treat
+            it as authoritative scoping/constraint guidance that
+            OVERRIDES the default "do Phase A then Phase B in full"
+            behavior. Examples and how to interpret them:
+
+            - `merge conflicts only` → run Phase A; SKIP Phase B
+              entirely; exit after pushing the merge (if any) and
+              posting the exit summary.
+            - `just fix unit tests` → run Phase A only if conflicts
+              exist; in Phase B, when diagnosing failures, focus on
+              unit-test failures and leave other check failures alone
+              (still report them in the exit summary).
+            - `keep qk_layernorm` (or any "preserve X" hint) → treat
+              X as a constraint on every fix you write; do not delete
+              or refactor away the named symbol/feature.
+            - `don't touch tests/` (or any "do not modify Y" hint) →
+              treat Y as off-limits when writing fixes.
+
+            If the steer block is empty, run the default Phase A
+            then Phase B without modification.
+
+            <user_steering>
+            ${{ steps.parse-steer.outputs.steer }}
+            </user_steering>
+
+            ## Progress comments while you work
+
+            The user expects to see forward motion in the PR
+            conversation while you run. Post a SHORT progress comment
+            on the PR (`gh pr comment $PR_NUMBER --repo $REPO --body
+            "..."`) at each of these moments:
+
+            - **Phase A start**: one line stating whether you'll merge
+              base or skip (e.g. "Phase A: merging `origin/main` into
+              the PR head to resolve conflicts.").
+            - **Phase A end**: one line summarizing what was done
+              (e.g. "Phase A done: resolved 3 conflicts in
+              `megatron/training/training.py`,
+              `megatron/core/transformer/attention.py`, and
+              `tests/conftest.py`. Pushed merge commit `<short-sha>`.").
+              Skip this if Phase A was a no-op.
+            - **Each fix push in Phase B**: one line naming the
+              failing check and a one-sentence summary of the fix
+              (e.g. "Fix push `<short-sha>`: `linting` was failing
+              because `isort` reordered `megatron/legacy/...`; pinned
+              the import block.").
+            - **Final exit summary**: the longer multi-section comment
+              described in the Exit summary section below.
+
+            Keep each in-progress comment to one or two sentences —
+            details belong in the exit summary, not in every progress
+            ping.
+
+            ## Mandatory workflow — never skip or reorder
+
+            1. Read `CLAUDE.md`.
+            2. Read the relevant skill files (these document
+               long-lived, general-purpose procedures; this workflow
+               does not depend on any of them and inlines its own
+               procedure below):
+                 - `.claude/skills/cicd/SKILL.md` — CI pipeline
+                   structure and PR-label scope.
+                 - `.claude/skills/build-and-dependency/SKILL.md` if
+                   the failure involves dependencies / containers.
+                 - `.claude/skills/testing/SKILL.md` if the failure
+                   involves unit or functional tests.
+                 - `.claude/skills/linting-and-formatting/SKILL.md` if
+                   the failure is a lint / format issue.
+            3. Only then perform Phase A / Phase B using the skill
+               context plus the explicit procedure in this prompt.
+
+            ## Phase A — Resolve merge conflicts with the base branch
+
+            Run this phase first.
+
+            ```
+            # Are we already up to date?
+            if git merge-base --is-ancestor upstream/$BASE_REF HEAD; then
+              echo "PR is already up to date with $BASE_REF; skipping Phase A."
+              PHASE_A_PUSHED=0
+            else
+              git merge upstream/$BASE_REF --no-edit || true
+              # If conflicts exist, resolve them. General rule:
+              #   - For files the PR itself genuinely changes, favor the
+              #     PR's intent and re-apply on top of base's structure.
+              #   - For files the PR does not touch, favor base.
+              # After resolution: stage, finish the merge, run any
+              # required formatters (`tools/autoformat.sh` for Python
+              # changes), and commit if needed.
+              git add -A
+              git commit --no-edit || true   # no-op if merge already committed
+              git push origin HEAD:$HEAD_REF
+              PHASE_A_PUSHED=1
+            fi
+            ```
+
+            Push target for Phase A and Phase B is ALWAYS
+            `origin HEAD:$HEAD_REF` (the PR's actual head branch on
+            its head repo). Never push to `pull-request/<PR_NUMBER>` —
+            that branch is managed by the community bot and pushing to
+            it breaks the CI trigger mechanism.
+
+            **After Phase A pushes a merge commit, you MUST re-trigger
+            CI before doing anything else.** The previous CI run was
+            against the pre-merge SHA and is no longer relevant; the
+            `copy-pr-bot` `/ok to test <sha>` authorization is
+            per-commit, so the new merge SHA needs its own comment
+            before NVIDIA runners will pick it up:
+
+            ```
+            if [ "$PHASE_A_PUSHED" = "1" ]; then
+              gh pr comment $PR_NUMBER --repo $REPO \
+                --body "/ok to test $(git rev-parse HEAD)"
+            fi
+            ```
+
+            Only after that comment is posted do you enter Phase B's
+            poll. If Phase A was a no-op (PR already up to date), do
+            NOT post a fresh `/ok to test` here — Phase B's first
+            outer-loop iteration handles the existing CI state.
+
+            ## Phase B — CI iteration (fix-then-retrigger loop)
+
+            Two nested loops. Do NOT conflate them:
+
+            - The **outer loop** is YOUR sequence of tool calls (each
+              iteration: optionally one `/ok to test`, one blocking
+              poll, maybe one fix-and-push). It is NOT a Bash loop. It
+              advances because you make new tool calls.
+            - The **inner loop** is a single blocking Bash tool call
+              using `while true; do ... sleep 120; done`. It runs
+              during one iteration of the outer loop and ends when CI
+              reaches a terminal state for that iteration.
+
+            The outer loop terminates ONLY when the exit gate below is
+            satisfied.
+
+            **Source of truth:**
+            `gh pr view $PR_NUMBER --repo $REPO --json statusCheckRollup`.
+            This lists every required check, including external
+            status contexts (GitLab CI, `copy-pr-bot`, etc.) that
+            `gh api .../actions/runs/.../jobs` does NOT show.
+
+            ### Outer-loop iteration
+
+            Each iteration is a few tool calls:
+
+            1. `latest_sha=$(git rev-parse HEAD)` (one Bash call).
+            2. If you have NOT yet posted `/ok to test` for
+               `$latest_sha` in this run (either via Phase A's
+               re-trigger or a previous outer-loop iteration's
+               fix-push), post it now:
+               `gh pr comment $PR_NUMBER --repo $REPO --body "/ok to test $latest_sha"`.
+               Otherwise skip — `copy-pr-bot` only needs one
+               `/ok to test` per SHA.
+            3. ONE blocking Bash tool call. This is the inner loop.
+               Use this template verbatim:
+
+               ```bash
+               REPO='${{ github.repository }}'
+               PR='${{ github.event.issue.number }}'
+               # Names matched case-insensitively, anchored to the START
+               # of the name. Covers the user-requested exemptions
+               # (codecov, MBridge, approval) plus other pre-merge
+               # policy signals that do not indicate code correctness.
+               EXEMPT='copy-pr-bot|is-not-external-contributor|greptile|coderabbit|codeowners|.*review|.*approval|codecov|coverage|build-docs|doc-build|readthedocs|sphinx|.*mbridge.*'
+               # Sentinel check that tells us CI has fully run. Update
+               # if the aggregate gate job is renamed.
+               SENTINEL='Nemo_CICD_Test'
+
+               while true; do
+                 # Normalize both CheckRun (.status / .conclusion) and
+                 # StatusContext (.state) entries into the same
+                 # {name, status, conclusion} shape.
+                 rollup=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '
+                   .statusCheckRollup[] | [
+                     (.name // .context // "?"),
+                     (if .__typename == "StatusContext" then
+                        (if (.state == "PENDING" or .state == "EXPECTED") then "IN_PROGRESS"
+                         else "COMPLETED" end)
+                      else (.status // "UNKNOWN") end),
+                     (if .__typename == "StatusContext" then
+                        (if .state == "SUCCESS" then "SUCCESS"
+                         elif (.state == "FAILURE" or .state == "ERROR") then "FAILURE"
+                         else "NEUTRAL" end)
+                      else (.conclusion // "UNKNOWN") end)
+                   ] | @tsv')
+
+                 # Sentinel: do NOT declare green until the CI
+                 # aggregate gate has reached a terminal state. Before
+                 # /ok to test triggers the run, the sentinel is
+                 # absent; while CI is running, it's IN_PROGRESS.
+                 sentinel_line=$(printf '%s\n' "$rollup" | awk -F'\t' -v s="$SENTINEL" '$1 == s')
+                 sentinel_status=$(printf '%s\n' "$sentinel_line" | awk -F'\t' 'NR==1 {print $2}')
+                 if [ "$sentinel_status" != "COMPLETED" ]; then
+                   echo "=== $(date -u) waiting for $SENTINEL (status: ${sentinel_status:-absent}) ==="
+                   sleep 120
+                   continue
+                 fi
+
+                 # Classify non-exempt checks (exempt list applied to
+                 # the NAME only).
+                 non_exempt=$(printf '%s\n' "$rollup" | awk -F'\t' -v p="^($EXEMPT)" 'tolower($1) !~ tolower(p)')
+                 failed=$(printf '%s\n' "$non_exempt" | awk -F'\t' '$2 == "COMPLETED" && $3 !~ /^(SUCCESS|SKIPPED|NEUTRAL)$/')
+                 pending=$(printf '%s\n' "$non_exempt" | awk -F'\t' '$2 != "COMPLETED"')
+
+                 if [ -n "$failed" ]; then
+                   echo "=== NON-EXEMPT FAILURES ==="
+                   printf '%s\n' "$failed"
+                   echo "RESULT=FAILURE"
+                   exit 0
+                 fi
+                 if [ -n "$pending" ]; then
+                   # Sentinel is COMPLETED but a non-exempt check is
+                   # still pending — rare but possible. Keep waiting.
+                   echo "=== $(date -u) sentinel done but non-exempt checks still pending ==="
+                   printf '%s\n' "$pending"
+                   sleep 120
+                   continue
+                 fi
+
+                 echo "=== ALL NON-EXEMPT CHECKS COMPLETED GREEN ==="
+                 printf '%s\n' "$non_exempt"
+                 echo "RESULT=GREEN"
+                 exit 0
+               done
+               ```
+
+               This Bash call blocks for as long as CI takes (minutes
+               to hours). Do NOT split it into many short polls
+               interleaved with other tool calls — that wastes
+               `--max-turns` and creates windows where you could lose
+               track of the loop state.
+
+            4. Read the tool output:
+               - If `RESULT=FAILURE`: diagnose via
+                 `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs` (or
+                 the external-context equivalent) and fix the code.
+                 Then push the fix. Use a single rolling fix commit
+                 across the run:
+                 ```bash
+                 git add -A
+                 if git rev-parse --verify HEAD^2 >/dev/null 2>&1 \
+                     || [ "$(git log -1 --format=%s)" != "fix: claude-fix corrections" ]; then
+                   # HEAD is the Phase A merge commit OR the original
+                   # PR head — first failure of this run, create the
+                   # fix commit.
+                   git commit -m "fix: claude-fix corrections"
+                   git push origin HEAD:$HEAD_REF
+                 else
+                   # HEAD is the existing fix commit — amend it.
+                   git commit --amend --no-edit
+                   git push --force-with-lease origin HEAD:$HEAD_REF
+                 fi
+                 ```
+                 `--force-with-lease` (NEVER plain `--force`): if a
+                 human pushed onto the branch since the bot last
+                 fetched, the lease aborts the push instead of
+                 clobbering them — fetch and decide what to do.
+                 Start a new outer-loop iteration at step 1 with the
+                 new HEAD SHA (which will need its own
+                 `/ok to test <sha>` comment in step 2).
+               - If `RESULT=GREEN`: outer loop is done. Proceed to the
+                 Exit summary below.
+
+            **Anti-patterns to avoid:**
+
+            - Do NOT classify a queued/in-progress job as
+              "infrastructure-blocked" and exit. A stuck queue drains
+              eventually — wait. If the job eventually passes, great;
+              if it fails, go fix it.
+            - Do NOT exit while any required non-exempt check is
+              `PENDING` / `QUEUED` / `IN_PROGRESS` on the HEAD SHA.
+              A push is not a pass; only a `COMPLETED` + green status
+              is.
+            - Do NOT declare an untested job "pre-existing." A job
+              that never ran on your PR cannot be pre-existing — wait
+              for it to finish first.
+            - Do NOT use `gh api .../actions/runs/.../jobs` alone as
+              the gate signal. External status contexts do NOT
+              appear there. Use `statusCheckRollup`.
+            - Do NOT push directly to `pull-request/<PR_NUMBER>`.
+              That branch is managed by `copy-pr-bot` when it
+              processes `/ok to test`. Always push to
+              `origin HEAD:$HEAD_REF` (the PR's actual head branch).
+            - Do NOT push with plain `--force`. Use
+              `--force-with-lease` so a concurrent human push aborts
+              cleanly instead of being clobbered.
+
+            ### Pre-existing-failure verification
+
+            Before classifying any failure as pre-existing (and thus
+            acceptable to leave failing), empirically verify:
+
+            1. `gh pr list --repo $REPO --base $BASE_REF --state merged --limit 3`
+            2. `gh pr checks <RECENT_MERGED_PR> --repo $REPO` on a
+               recently merged PR against the same base branch.
+            3. If the same test bucket **passes on recent base-branch
+               CI** → the failure is PR-caused. You must fix it.
+            4. Only if the test **also fails on recent base-branch
+               CI** can you classify it as pre-existing. Document
+               with the recent PR number and CI run URL as evidence.
+
+            ## Hard Constraints
+
+            **Source of truth for CI status:**
+            `gh pr view $PR_NUMBER --repo $REPO --json statusCheckRollup`.
+            This lists every required check — GitHub Actions jobs AND
+            external contexts (GitLab CI, `copy-pr-bot`, etc.). The
+            `gh api .../actions/runs/<RUN_ID>/jobs` endpoint alone is
+            NOT sufficient — it misses external contexts.
+
+            **NO background tasks. Ever.**
+            You are running inside a single GitHub Actions step. The
+            step process owns your shell. When you stop issuing tool
+            calls, the step ends and the runner container is
+            DESTROYED — every background process dies with it and
+            cannot resume. There is no "future session" to wake up
+            into.
+
+            The following are strictly forbidden:
+            - `Bash` with `run_in_background: true`
+            - `Agent` with `run_in_background: true`
+            - `ScheduleWakeup` (nothing will ever wake up)
+            - Any shell command ending in `&`, or using `nohup`,
+              `disown`, or `setsid` to detach a process
+            - `tail -f` on a log produced by a backgrounded task
+
+            Required shape for every long wait: ONE foreground Bash
+            tool call containing an inline `while true; do ... sleep
+            <N>; done` or `until ...; do sleep <N>; done` loop that
+            BLOCKS inside that single tool call and only returns when
+            the wait is resolved (success, failure, or a
+            clearly-classified terminal state). Do NOT break a long
+            wait into many short polls with conversation in between —
+            that wastes `--max-turns` and creates windows where the
+            agent could forget the loop.
+
+            **Pre-existing failures:** MUST verify against recent CI
+            on the PR's base branch before classifying any failure as
+            pre-existing. A check that has never completed on your PR
+            cannot be pre-existing — wait for it to finish first.
+
+            **Exit gate — strict "all terminal, all green":**
+            Do NOT exit Phase B until every non-exempt required check
+            in `statusCheckRollup` on the LATEST CI run against the
+            current HEAD SHA satisfies BOTH:
+              - `status == "COMPLETED"` (NOT `QUEUED`, `IN_PROGRESS`,
+                `PENDING`, `WAITING`, or `REQUESTED`), AND
+              - `conclusion` ∈ {`SUCCESS`, `SKIPPED`, `NEUTRAL`}.
+            A check stuck in a runner queue is NOT complete. Never
+            classify queued/in-progress jobs as
+            "infrastructure-blocked" and exit anyway — wait for them
+            to reach a terminal conclusion, then act on that result.
+            When a check fails, loop: diagnose → fix → commit →
+            push → `/ok to test <sha>` → poll. Only exit the loop
+            when the gate is satisfied on the LATEST CI run against
+            the current HEAD SHA.
+
+            ## Exit summary
+
+            Before exiting (success OR you have run out of turns / a
+            failure is clearly unfixable), post one summary comment on
+            the PR:
+
+            - Whether Phase A performed a merge, and a one-line
+              summary of any conflicts resolved.
+            - SHAs of any commits the bot authored on $HEAD_REF.
+            - Final list of non-exempt checks that passed.
+            - Any pre-existing failures accepted, each with: the
+              recent base-branch PR number and CI run URL showing the
+              same failure (per the Pre-existing-failure verification
+              procedure above).
+            - If you ran out of turns or hit an unfixable failure, say
+              so explicitly and describe the remaining work.
+
+            Then exit. Do NOT call `gh pr ready` (the PR is owned by
+            the human author, not the bot).
+          claude_args: |
+            --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
+            --model "opus[1m]"
+            --effort max
+            --max-turns 1500
