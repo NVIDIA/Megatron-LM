@@ -1066,7 +1066,8 @@ class _HybridEPManager(_DispatchManager):
             nt = torch.tensor([num_tokens], device=routing_map.device, dtype=torch.long)
             torch.distributed.all_reduce(nt, op=torch.distributed.ReduceOp.MAX, group=self.group)
             padded_num_tokens = int(nt.item())
-            padded_num_tokens += -padded_num_tokens % 64
+            _HYBRIDEP_TOKEN_ALIGNMENT = 64
+            padded_num_tokens += -padded_num_tokens % _HYBRIDEP_TOKEN_ALIGNMENT
         self._padded_num_tokens = padded_num_tokens
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
