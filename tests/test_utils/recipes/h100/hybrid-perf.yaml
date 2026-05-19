@@ -38,5 +38,5 @@ products:
   - test_case: [hybrid_2b_perf]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]

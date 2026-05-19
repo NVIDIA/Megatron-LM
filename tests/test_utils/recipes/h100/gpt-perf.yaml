@@ -38,10 +38,10 @@ products:
   - test_case: [gpt_583m_perf]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_16b_perf]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
