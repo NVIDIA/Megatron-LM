@@ -1273,10 +1273,7 @@ class FineGrainedActivationOffloadingInterface:
 
     @staticmethod
     def init_chunk_handler(
-        vp_size,
-        vp_stage,
-        min_offloaded_tensor_size,
-        max_inflight_offloads: Optional[int] = None,
+        vp_size, vp_stage, min_offloaded_tensor_size, max_inflight_offloads: Optional[int] = None
     ):
         """Initialize the chunk handler, called at the start of a microbatch forward pass."""
         PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
