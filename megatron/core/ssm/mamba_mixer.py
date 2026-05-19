@@ -112,6 +112,45 @@ class ExtendedRMSNorm(RMSNormGated):
         )
 
 
+class MambaConv1d(nn.Conv1d):
+    """Conv1d owner for Mamba fused-kernel weight and bias views."""
+
+    def _weight_bias(self, cp: Optional[MambaContextParallel] = None):
+        if cp is None:
+            return self.weight, self.bias
+
+        weight = cp.slice_conv_param(self.weight)
+        bias = cp.slice_conv_param(self.bias) if self.bias is not None else None
+        return weight, bias
+
+    def forward(
+        self,
+        input_: Optional[torch.Tensor] = None,
+        *,
+        cp: Optional[MambaContextParallel] = None,
+        return_weight_bias: bool = False,
+    ):
+        if return_weight_bias:
+            return self._weight_bias(cp)
+
+        if input_ is None:
+            raise ValueError("MambaConv1d.forward requires input unless return_weight_bias=True")
+
+        if cp is None or cp.cp_size == 1:
+            return super().forward(input_)
+
+        weight, bias = self._weight_bias(cp)
+        return F.conv1d(
+            input=input_,
+            weight=weight,
+            bias=bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=cp.conv1d_channels(),
+        )
+
+
 @dataclass
 class MambaMixerSubmodules:
     """
@@ -287,7 +326,7 @@ class MambaMixer(MegatronModule):
         with get_cuda_rng_tracker().fork():
             # weight shape: [conv_dim, 1, d_conv]
             # bias shape: [conv_dim]
-            self.conv1d = nn.Conv1d(
+            self.conv1d = MambaConv1d(
                 in_channels=conv_dim,
                 out_channels=conv_dim,
                 bias=conv_bias,
@@ -412,6 +451,9 @@ class MambaMixer(MegatronModule):
             D_has_hdim=self.D_has_hdim,
         )
         self.tp_group = pg_collection.tp
+
+    def _conv1d_weight_bias(self):
+        return self.conv1d(cp=self.cp, return_weight_bias=True)
 
     def forward(
         self,
@@ -690,9 +732,7 @@ class MambaMixer(MegatronModule):
         # (nheads_local_tpcp)
         A = -torch.exp(self.cp.get_A_log().float())
 
-        # TODO(duncan): Can this code be removed?
-        if self.conv1d.bias is not None:
-            self.conv1d.bias.data_ptr()
+        conv_weight, conv_bias = self._conv1d_weight_bias()
 
         seq_idx = None
         if packed_seq_params is not None:
@@ -704,8 +744,8 @@ class MambaMixer(MegatronModule):
 
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
-            rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-            self.cp.get_conv1d_bias(),
+            rearrange(conv_weight, "d 1 w -> d w"),
+            conv_bias,
             self.cp.get_dt_bias().float(),
             A,
             D=(
@@ -828,10 +868,9 @@ class MambaMixer(MegatronModule):
             conv_state_dtype = conv_state.dtype
 
             xBC = xBC.to(conv_state_dtype)
-            conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w").to(
-                conv_state_dtype
-            )
-            conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
+            conv_weight, conv_bias = self._conv1d_weight_bias()
+            conv_weight = rearrange(conv_weight, "d 1 w -> d w").to(conv_state_dtype)
+            conv_bias = conv_bias.to(conv_state_dtype) if conv_bias is not None else None
 
             xBC_pre_conv = xBC if intermediate_conv_out is not None else None
             from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
@@ -859,13 +898,14 @@ class MambaMixer(MegatronModule):
 
             seqlen = xBC.size(2)
             if causal_conv1d_fn is None:
-                xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
+                xBC = self.act(self.conv1d(xBC, cp=self.cp)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
+                conv_weight, conv_bias = self._conv1d_weight_bias()
                 xBC = causal_conv1d_fn(
                     x=xBC,
-                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                    bias=self.cp.get_conv1d_bias(),
+                    weight=rearrange(conv_weight, "d 1 w -> d w"),
+                    bias=conv_bias,
                     activation=self.activation,
                     seq_idx=seq_idx,
                 )
@@ -1095,6 +1135,7 @@ class MambaMixer(MegatronModule):
         )
 
         # Conv step
+        conv_weight, conv_bias = self._conv1d_weight_bias()
         if causal_conv1d_update is None:
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
@@ -1102,22 +1143,23 @@ class MambaMixer(MegatronModule):
             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
             conv_state[:, :, -1] = xBC_squeeze
             xBC_squeeze = torch.sum(
-                conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
+                conv_state * rearrange(conv_weight, "d 1 w -> d w"), dim=-1
             )  # (B D)
-            if self.conv1d.bias is not None:
-                xBC_squeeze = xBC_squeeze + self.conv1d.bias
+            if conv_bias is not None:
+                xBC_squeeze = xBC_squeeze + conv_bias
             xBC = self.act(xBC_squeeze).to(dtype=xBC.dtype).unsqueeze(1)
         else:
             # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
             # tensors to the conv state dtype for causal_conv1d_update and then cast xBC
             # back to the original dtype
             xBC_dtype = xBC.dtype
-            weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
+            weight = rearrange(conv_weight, "d 1 w -> d w")
+            bias = conv_bias.to(conv_state.dtype) if conv_bias is not None else None
             xBC = causal_conv1d_update(
                 xBC.to(conv_state.dtype),
                 conv_state,
                 weight.to(conv_state.dtype),
-                self.conv1d.bias.to(conv_state.dtype),
+                bias,
                 self.activation,
                 conv_state_indices=batch_indices,
                 intermediate_conv_states=intermediate_conv_state,

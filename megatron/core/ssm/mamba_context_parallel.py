@@ -231,12 +231,12 @@ class MambaContextParallel:
     def get_conv1d_weight(self) -> torch.Tensor:
         """Returns a slice of the conv1d weight relevant to the current context parallel rank"""
         # weight shape: [conv_dim, 1, d_conv]
-        return self._slice_conv_param(self.conv1d_cp1.weight)
+        return self.slice_conv_param(self.conv1d_cp1.weight)
 
     def get_conv1d_bias(self) -> torch.Tensor:
         """Returns a slice of the conv1d bias relevant to the current context parallel rank"""
         # bias shape: [conv_dim]
-        return self._slice_conv_param(self.conv1d_cp1.bias)
+        return self.slice_conv_param(self.conv1d_cp1.bias)
 
     def get_dt_bias(self) -> torch.Tensor:
         """Returns a slice of dt_bias relevant to the current context parallel rank"""
@@ -250,7 +250,7 @@ class MambaContextParallel:
         """Returns a slice of D relevant to the current context parallel rank"""
         return self._slice_vector_param(self.D_cp1, has_hdim=self.D_has_hdim)
 
-    def _slice_conv_param(self, param: torch.Tensor) -> torch.Tensor:
+    def slice_conv_param(self, param: torch.Tensor) -> torch.Tensor:
         """
         Slices a cp_size=1 conv1d parameter (either weight or bias) along the first dimension,
         returning the parts of the parameter needed for convolution on the current context parallel

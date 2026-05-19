@@ -949,14 +949,14 @@ def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
     return {"abs_diff": abs_diff, "rel_diff": rel_diff, "better": better}
 
 
-class TestFsdpMambaDirectWeightAccess:
-    """Regression repro for Mamba raw child-parameter reads under Megatron FSDP.
+class TestFsdpMambaConv1dGather:
+    """Regression repro for Mamba fused conv params under Megatron FSDP.
 
-    MambaMixer reads ``self.conv1d.weight`` through the fused causal-conv path instead
-    of invoking ``self.conv1d(...)``. That bypasses the child module pre-forward hook,
-    so the conv1d bucket is only gathered if another hook prefetches it incidentally.
-    This test makes that dependency deterministic by disabling AG prefetch before the
-    first forward.
+    The fused causal-conv path must invoke the conv1d owner module before using
+    its weight and bias views. Otherwise, the child module pre-forward hook is
+    bypassed and the conv1d bucket is only gathered if another hook prefetches
+    it incidentally. This test makes that dependency deterministic by disabling
+    AG prefetch before the first forward.
     """
 
     @classmethod
@@ -967,7 +967,7 @@ class TestFsdpMambaDirectWeightAccess:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
-    def test_mamba_conv1d_raw_weight_read_without_prefetch(self):
+    def test_mamba_conv1d_fused_path_without_prefetch(self):
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
         if Utils.world_size < 2:
@@ -1036,7 +1036,7 @@ class TestFsdpMambaDirectWeightAccess:
             "bucket_size may be too large and could mask this repro."
         )
 
-        # Disabling prefetch isolates the raw conv1d weight read: the forward cannot
+        # Disabling prefetch isolates the fused conv path: the forward cannot
         # incidentally gather conv1d.weight from an earlier module hook.
         x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
         fsdp_model.module.suggested_AG_prefetch_size = 0
