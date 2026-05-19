@@ -45,64 +45,9 @@ python tools/checkpoint/convert.py \
 ```
 
 ## Text generation with Mixtral 8x7B
-Inference with Mixtral 8x7B requires at least 2 GPUS, such that a distributed checkpoint with EP>=2 or PP>=2 converted with above script is needed.
+Inference with Mixtral 8x7B requires at least 2 GPUs, such that a distributed checkpoint with EP>=2 or PP>=2 converted with above script is needed.
 
-The Megatron-LM have included a simple REST server to use for text generation in `tools/run_text_generation_server.py`, launch it with the following script:
-```
-#!/bin/bash
-# This example will start serving the Mixtral 8x7B model.
-DISTRIBUTED_ARGS="--nproc_per_node 2 \
-                  --nnodes 1 \
-                  --node_rank 0 \
-                  --master_addr localhost \
-                  --master_port 6000"
-
-CHECKPOINT=<Path to checkpoint>
-TOKENIZER_MODEL=<Path to tokenizer (e.g. /tokenizer.model)>
-
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-
-pip install flask-restful
-
-torchrun $DISTRIBUTED_ARGS tools/run_text_generation_server.py   \
-       --tensor-model-parallel-size 1  \
-       --pipeline-model-parallel-size 2  \
-       --expert-model-parallel-size 1 \
-       --load ${CHECKPOINT}  \
-       --tokenizer-type Llama2Tokenizer \
-       --tokenizer-model $TOKENIZER_MODEL \
-       --use-mcore-models \
-       --max-position-embeddings 32768 \
-       --num-layers 32 \
-       --hidden-size 4096 \
-       --ffn-hidden-size 14336 \
-       --num-attention-heads 32 \
-       --normalization RMSNorm \
-       --disable-bias-linear \
-       --position-embedding-type rope \
-       --no-position-embedding \
-       --swiglu \
-       --untie-embeddings-and-output-weights \
-       --group-query-attention \
-       --num-query-groups 8 \
-       --bf16  \
-       --micro-batch-size 1  \
-       --seq-length 1024  \
-       --seed 42 \
-       --num-experts 8 \
-       --moe-router-topk 2 \
-       --moe-token-dispatcher-type alltoall \
-       --moe-grouped-gemm \
-       --mock-data \
-       --rotary-base 1000000
-```
-
-Once the server is running you can use `tools/text_generation_cli.py` to query it, it takes one argument which is the host the server is running on.
-
-```
-python tools/text_generation_cli.py localhost:5000
-```
-
+Use `tools/run_dynamic_text_generation_server.py` to launch an OpenAI-compatible inference server backed by `DynamicInferenceEngine`. See [examples/inference/README.md](../inference/README.md) for the dynamic-inference quickstart.
 
 ## Finetuning from pretrained Mixtral 8x7B
 To finetuning pretrained Mixtral 8x7B, use the following scripts:
