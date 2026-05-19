@@ -1111,7 +1111,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act".
+             "mlp_norm", "expert_fc1", "moe_act", "group_mlp".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1119,6 +1119,7 @@ class TransformerConfig(ModelParallelConfig):
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "group_mlp": offload the TE op-fuser GroupedMLP saved activations as one group.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1605,6 +1606,7 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_proj",
                 "expert_fc1",
                 "moe_act",
+                "group_mlp",
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
@@ -1620,6 +1622,40 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
+                offload_inside_moe = {"moe_act", "expert_fc1", "group_mlp"} & set(
+                    self.offload_modules
+                )
+                assert not offload_inside_moe, (
+                    f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
+                    "'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
+                    "so saved-tensor hooks from fine-grained activation offload cannot safely "
+                    "track those tensors. Either remove 'moe' from --recompute-modules or remove "
+                    f"{offload_inside_moe} from --offload-modules."
+                )
+            if "group_mlp" in self.offload_modules:
+                if self.num_moe_experts is None:
+                    raise ValueError(
+                        "group_mlp in offload_modules requires num_moe_experts to be set."
+                    )
+                if not self.moe_grouped_gemm:
+                    raise ValueError(
+                        "group_mlp in offload_modules requires moe_grouped_gemm to be enabled."
+                    )
+                if not self.use_transformer_engine_op_fuser:
+                    raise ValueError(
+                        "group_mlp in offload_modules requires "
+                        "use_transformer_engine_op_fuser to be enabled."
+                    )
+                conflicting_moe_offload = {"expert_fc1", "moe_act"} & set(
+                    self.offload_modules
+                )
+                if conflicting_moe_offload:
+                    raise ValueError(
+                        "group_mlp offloads the fused TE GroupedMLP op as one group and cannot "
+                        f"be combined with {conflicting_moe_offload}. Use either group_mlp for "
+                        "the TE op-fuser path or expert_fc1/moe_act for the non-fused path."
+                    )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None

@@ -234,6 +234,11 @@ class TEGroupedMLP(MegatronModule):
             and "moe_act" in self.config.offload_modules
         )
 
+        self.offload_group_mlp = (
+            self.config.fine_grained_activation_offloading
+            and "group_mlp" in self.config.offload_modules
+        )
+
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
@@ -314,7 +319,7 @@ class TEGroupedMLP(MegatronModule):
         if self.tp_group.size() > 1:
             return False  # Tensor parallelism is not supported
         if self.offload_expert_fc1 or self.offload_moe_act:
-            return False  # Fine-grained activation offloading is not supported
+            return False  # expert_fc1/moe_act offloading needs non-fused boundaries
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
 
@@ -528,13 +533,24 @@ class TEGroupedMLP(MegatronModule):
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
 
-        # Call fused impl
-        output = ops(
-            permuted_local_hidden_states,
-            tokens_per_expert,  # FC1
-            permuted_probs,  # Scaled SwiGLU
-            tokens_per_expert,  # FC2
+        group_mlp_manager = off_interface(
+            self.offload_group_mlp, permuted_local_hidden_states, "group_mlp"
         )
+        with group_mlp_manager as permuted_local_hidden_states:
+            # Call fused impl. With group_mlp offload enabled, TE op-fuser saved tensors
+            # are captured by the active saved_tensors_hooks and offloaded as one group.
+            output = ops(
+                permuted_local_hidden_states,
+                tokens_per_expert,  # FC1
+                permuted_probs,  # Scaled SwiGLU/SReLU
+                tokens_per_expert,  # FC2
+            )
+        if self.offload_group_mlp:
+            output = off_interface.group_commit(
+                output,
+                name="group_mlp",
+                forced_released_tensors=[permuted_local_hidden_states],
+            )
 
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:

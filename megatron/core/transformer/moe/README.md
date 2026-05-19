@@ -386,8 +386,12 @@ Unlike recomputation (which trades compute for memory), offloading trades **GPU-
 **Usage**
 ```bash
 --fine-grained-activation-offloading
---offload-modules expert_fc1 moe_act # Choices: attn_norm, core_attn, attn_proj, mlp_norm, expert_fc1, moe_act
+--offload-modules expert_fc1 moe_act # Choices: attn_norm, core_attn, attn_proj, mlp_norm, expert_fc1, moe_act, group_mlp
 ```
+
+Use `group_mlp` instead of `expert_fc1`/`moe_act` when `--use-transformer-engine-op-fuser`
+is enabled for TE GroupedMLP; the fused path offloads saved activations for the whole
+GroupedMLP as one group.
 
 For more details, see `docs/user-guide/features/fine_grained_activation_offloading.md`
 
