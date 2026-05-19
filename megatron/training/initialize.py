@@ -248,6 +248,52 @@ def _initialize_tp_communicators():
         )
 
 
+def _setup_flight_recorder_env(dist_config: DistributedInitConfig) -> None:
+    """Set flight recorder env vars based on config or pre-existing environment.
+
+    Priority: pre-existing env var > config value. If no dump path is provided
+    (either via config or env), no env vars are set.
+    """
+    _fr_path = (
+        os.environ.get("TORCH_FR_DUMP_TEMP_FILE")
+        or os.environ.get("TORCH_NCCL_DEBUG_INFO_TEMP_FILE")
+        or dist_config.flight_recorder_dump_path
+    )
+    if _fr_path is None:
+        return
+
+    _fr_dump_prefix = _fr_path
+    if os.path.isdir(_fr_path):
+        _fr_dump_prefix = os.path.join(_fr_path, '_dump_')
+        warnings.warn(
+            "Flight recorder: using directory "
+            f"'{_fr_path}' for dump path, appending per-rank prefix "
+            f"'{_fr_dump_prefix}'.",
+            stacklevel=2,
+        )
+    _fr_env_defaults = {
+        "TORCH_FR_DUMP_TEMP_FILE": _fr_dump_prefix,
+        "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": _fr_dump_prefix,
+        "TORCH_NCCL_TRACE_BUFFER_SIZE": str(dist_config.flight_recorder_trace_buffer_size),
+        "TORCH_NCCL_DUMP_ON_TIMEOUT": str(int(dist_config.flight_recorder_dump_on_timeout)),
+        "TORCH_INCLUDE_STACK_TRACE": str(int(dist_config.flight_recorder_include_stack_trace)),
+        "TORCH_INCLUDE_ONLY_ACTIVE": str(int(dist_config.flight_recorder_include_only_active)),
+        "TORCH_NCCL_EXTRA_DUMP_ON_EXEC": str(int(dist_config.flight_recorder_extra_dump_on_exec)),
+    }
+    for _var, _default in _fr_env_defaults.items():
+        if _var in os.environ:
+            warnings.warn(
+                f"Flight recorder: env var {_var} is already set to "
+                f"'{os.environ[_var]}'; ignoring config value '{_default}'.",
+                stacklevel=2,
+            )
+        else:
+            os.environ[_var] = _default
+    print_rank_0(
+            "Flight recorder env vars:\n" + "\n".join(f"  {k}={os.environ[k]}" for k in _fr_env_defaults),
+        )
+
+
 def _create_pg_collection(
     model_config: TransformerConfig,
     num_distributed_optimizer_instances: int,
@@ -432,48 +478,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if args.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
 
-        # Set flight recorder env vars if specified.
-        # Priority: pre-existing environment variable > MLM argument.
-        # All vars follow the same setdefault semantics: if already set in the
-        # environment we warn and keep the user's value; otherwise we apply the
-        # value derived from the MLM argument / flag.
-        # The block is also triggered when either path env var is already set
-        # so that the remaining defaults are applied consistently.
-        _fr_path = (
-            args.flight_recorder_dump_path
-            or os.environ.get('TORCH_FR_DUMP_TEMP_FILE')
-            or os.environ.get('TORCH_NCCL_DEBUG_INFO_TEMP_FILE')
-        )
-        if _fr_path is not None:
-            _fr_dump_prefix = _fr_path
-            if os.path.isdir(_fr_path):
-                _fr_dump_prefix = os.path.join(_fr_path, '_dump_')
-                warn_rank_0(
-                    "Flight recorder: using directory "
-                    f"'{_fr_path}' for dump path, appending per-rank prefix "
-                    f"'{_fr_dump_prefix}'."
-                )
-            _fr_env_defaults = {
-                'TORCH_FR_DUMP_TEMP_FILE': _fr_dump_prefix,
-                'TORCH_NCCL_DEBUG_INFO_TEMP_FILE': _fr_dump_prefix,
-                'TORCH_NCCL_TRACE_BUFFER_SIZE': str(args.flight_recorder_trace_buffer_size),
-                'TORCH_NCCL_DUMP_ON_TIMEOUT': str(int(args.flight_recorder_dump_on_timeout)),
-                'TORCH_INCLUDE_STACK_TRACE': str(int(args.flight_recorder_include_stack_trace)),
-                'TORCH_INCLUDE_ONLY_ACTIVE': str(int(args.flight_recorder_include_only_active)),
-                'TORCH_NCCL_EXTRA_DUMP_ON_EXEC': str(int(args.flight_recorder_extra_dump_on_exec)),
-            }
-            for _var, _default in _fr_env_defaults.items():
-                if _var in os.environ:
-                    warn_rank_0(
-                        f"Flight recorder: environment variable {_var} is already set to "
-                        f"'{os.environ[_var]}'; ignoring config value '{_default}'."
-                    )
-                else:
-                    os.environ[_var] = _default
-            print_rank_0(
-                "Flight recorder env vars:\n"
-                + "\n".join(f"  {k}={os.environ[k]}" for k in _fr_env_defaults)
-            )
+        _setup_flight_recorder_env(dist_config)
 
         # Call the init process
         init_process_group_kwargs = {
