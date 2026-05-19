@@ -372,8 +372,7 @@ class FSDPModule(nn.Module):
     def unshard(
         self,
         async_op: bool = False,
-        bwd_pass: bool = False,
-        is_forward_in_backward: bool = False,
+        training_state=None,
     ):
         """
         Unshard parameters by all-gathering from the sharded buffer.
@@ -385,6 +384,7 @@ class FSDPModule(nn.Module):
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
+        bwd_pass = getattr(training_state, "name", None) == "PRE_BACKWARD"
 
         if async_op:
             # Synchronize ag_stream with current_stream to guarantee that main-stream
@@ -401,8 +401,7 @@ class FSDPModule(nn.Module):
         for module in [self] + prefetch_modules:
             if ctx.unshard_done_events[id(module)] is not None and all(
                 param_group.has_unsharded_weight_buffers(
-                    is_bwd=bwd_pass,
-                    is_forward_in_backward=is_forward_in_backward,
+                    training_state=training_state,
                 )
                 for param_group in module._fsdp_param_groups
             ):
@@ -426,8 +425,7 @@ class FSDPModule(nn.Module):
 
                 with torch.cuda.stream(stream):
                     param_group.unshard(
-                        is_bwd=bwd_pass,
-                        is_forward_in_backward=is_forward_in_backward,
+                        training_state=training_state,
                     )
 
             # Record event to track when unshard is done for this module

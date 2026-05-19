@@ -16,6 +16,7 @@
 
 import functools
 import logging
+from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Tuple
 
 import torch
@@ -30,15 +31,25 @@ from .utils import RegisterFSDPBackwardFunction
 logger = logging.getLogger(__name__)
 
 
+class TrainingState(Enum):
+    """Runtime state used by hooks to select FSDP unshard behavior."""
+
+    FORWARD = auto()
+    PRE_BACKWARD = auto()
+    FORWARD_IN_BACKWARD = auto()
+
+
 def _register_forward_pre_hook(module: FSDPModule):
     """Register pre-forward hook to unshard parameters."""
 
     def unshard_param_groups(module, *unused):
         ctx = module._fsdp_root_context
+        training_state = (
+            TrainingState.FORWARD_IN_BACKWARD if ctx.backward_phase else TrainingState.FORWARD
+        )
         module.unshard(
             async_op=ctx.enable_unshard_prefetch,
-            bwd_pass=False,
-            is_forward_in_backward=ctx.backward_phase,
+            training_state=training_state,
         )
 
     module._mfsdp_forward_pre_hook = module.register_forward_pre_hook(
@@ -112,7 +123,10 @@ def _register_backward_pre_hook(module: FSDPModule):
                     setattr(param, "overwrite_main_grad", True)
         if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
             _register_post_backward_final_callback(module._fsdp_state, module)
-        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
+        module.unshard(
+            async_op=ctx.enable_unshard_prefetch,
+            training_state=TrainingState.PRE_BACKWARD,
+        )
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=pre_backward_hook
