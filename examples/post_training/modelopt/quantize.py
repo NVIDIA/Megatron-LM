@@ -7,7 +7,6 @@ import gc
 import inspect
 import json
 import os
-import random
 import sys
 import warnings
 
@@ -24,6 +23,20 @@ from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
 
+# modelopt 0.45+ exposes a shared Megatron calibration forward loop. Fall back to the
+# legacy local-JSONL + HF-dataset calibration path on 0.44 so this script works on both
+# releases. The 0.45 path uses pack=True (no padding/truncation loss); the 0.44 fallback
+# uses padding+truncation, which is slightly worse for long-document corpora but
+# functional.
+try:
+    from modelopt.torch.utils.plugins.megatron_calibration import (
+        get_megatron_calibration_forward_loop,
+    )
+
+    _HAS_SHARED_CALIB = True
+except ImportError:
+    _HAS_SHARED_CALIB = False
+
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
 except ImportError:
@@ -39,7 +52,6 @@ except ImportError:
 
 from utils import get_hf_tokenizer
 
-from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -78,7 +90,10 @@ def add_text_generate_ptq_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
     group = parser.add_argument_group(title="ModelOpt text generation ptq")
     group.add_argument(
-        "--calib-size", type=int, default=512, help="Number of samples to use for ptq calibration."
+        "--calib-size",
+        type=int,
+        default=1024,
+        help="Number of samples to use for ptq calibration.",
     )
     group.add_argument(
         "--calib-dataset-path-or-name",
@@ -89,7 +104,7 @@ def add_text_generate_ptq_args(parser):
     group.add_argument(
         "--calib-max-sequence-length",
         type=int,
-        default=512,
+        default=4096,
         help="Maximum sequence length for calibration.",
     )
     group.add_argument(
@@ -223,79 +238,6 @@ def get_modelopt_torch_quantization_config():
     return mtq_config
 
 
-def get_calib_dataloader(
-    dataset_path_or_name,
-    tokenizer,
-    calib_size=512,
-    max_sequence_length=512,
-    use_random_offset=False,
-    batch_size=1,
-):
-    """Return a dataloader/iterator for calibration using SFT or HF datasets.
-
-    Supports either a local path (.jsonl) or a HuggingFace dataset name.
-    """
-    if os.path.isfile(dataset_path_or_name):
-        # Local file
-        print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
-        all_texts = []
-        with open(dataset_path_or_name) as f:
-            for i, line in enumerate(f):
-                if len(all_texts) == calib_size:
-                    break
-                if not line.strip():
-                    continue
-                sample = json.loads(line)
-
-                # Extract text field from various possible keys
-                if isinstance(sample, dict) and "text" in sample:
-                    if not sample["text"]:
-                        warnings.warn(f"Sample {i} has empty text, skipping")
-                        continue
-                    full_text = sample["text"]
-                elif isinstance(sample, dict) and "messages" in sample:
-                    conversations = sample["messages"]
-                    assert "role" in conversations[0] and "content" in conversations[0]
-                    full_text = "".join([f"{msg['role']}: {msg['content']}" for msg in conversations])
-                elif isinstance(sample, list) and isinstance(sample[0], dict):
-                    assert "role" in sample[0] and "content" in sample[0]
-                    full_text = "".join([f"{msg['role']}: {msg['content']}" for msg in sample])
-                else:
-                    raise ValueError(f"Sample {i} has unexpected format")
-
-                # Slice text
-                max_text_length = int(max_sequence_length / 0.75)  # tokenized text is roughtly ~75% length of original
-                start_idx = 0
-                if use_random_offset and len(full_text) > max_text_length:
-                    start_idx = random.randint(0, len(full_text) - max_text_length)
-                text = full_text[start_idx : start_idx + max_text_length]
-                all_texts.append(text)
-
-        print_rank_0(f"Loaded calibration dataset ({dataset_path_or_name}) with {len(all_texts)} samples")
-        print_rank_0(f"Actual num samples: {len(all_texts)}, max seq length: {max_sequence_length}")
-        print_rank_0(f"Sampling Strategy: {'Random Index' if use_random_offset else 'From Beginning'}")
-
-        # Tokenize all texts at once and move to device
-        tokens = tokenizer(
-            all_texts, return_tensors="pt", padding="max_length", max_length=max_sequence_length, truncation=True
-        )
-        all_input_ids = tokens.input_ids.cuda()
-        return [{"input_ids": all_input_ids[i:i+batch_size]} for i in range(0, len(all_input_ids), batch_size)]
-    else:
-        # HuggingFace dataset
-        if use_random_offset:
-            warnings.warn("Random offset is not supported for HuggingFace datasets.")
-        print_rank_0(f"Loading calibration dataset from HuggingFace: {dataset_path_or_name}")
-        return get_dataset_dataloader(
-            dataset_name=dataset_path_or_name,
-            tokenizer=tokenizer,
-            num_samples=calib_size,
-            max_sample_length=max_sequence_length,
-            batch_size=batch_size,
-            device="cuda",
-        )
-
-
 if __name__ == "__main__":
     parse_and_validate_args(extra_args_provider=add_text_generate_ptq_args, args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
@@ -354,18 +296,66 @@ if __name__ == "__main__":
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
-    def _dataset_forward_loop_func(model):
-        dataloader = get_calib_dataloader(
-            dataset_path_or_name=args.calib_dataset_path_or_name,
-            tokenizer=tokenizer,
-            calib_size=args.calib_size,
-            max_sequence_length=args.calib_max_sequence_length,
-            use_random_offset=args.calib_use_random_offset,
+    if _HAS_SHARED_CALIB:
+        _dataset_forward_loop_func = get_megatron_calibration_forward_loop(
+            tokenizer,
+            dataset_name=args.calib_dataset_path_or_name,
+            num_samples=args.calib_size,
+            seq_length=args.calib_max_sequence_length,
             batch_size=args.calib_batch_size,
         )
-        for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
-            sample = get_batch_on_this_cp_rank(sample)
-            megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
+    else:
+        # modelopt 0.44 fallback: pad+truncate path via get_dataset_dataloader. Uses the
+        # tokenizer's `padding="max_length", truncation=True` defaults — long documents get
+        # cut at calib_max_sequence_length and short ones pad to it (some activation
+        # statistics noise, less ideal than pack=True but functional).
+        if os.path.isfile(args.calib_dataset_path_or_name):
+            # Local JSONL: load via HF builder, tokenize batched with padding.
+            all_texts = []
+            with open(args.calib_dataset_path_or_name) as f:
+                for line in f:
+                    if len(all_texts) == args.calib_size:
+                        break
+                    if not line.strip():
+                        continue
+                    sample = json.loads(line)
+                    if isinstance(sample, dict) and "text" in sample:
+                        if sample["text"]:
+                            all_texts.append(sample["text"])
+                    elif isinstance(sample, dict) and "messages" in sample:
+                        all_texts.append("".join(
+                            f"{m['role']}: {m['content']}" for m in sample["messages"]
+                        ))
+                    elif isinstance(sample, list):
+                        all_texts.append("".join(
+                            f"{m['role']}: {m['content']}" for m in sample
+                        ))
+            tokens = tokenizer(
+                all_texts,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=args.calib_max_sequence_length,
+                truncation=True,
+            )
+            all_input_ids = tokens.input_ids.cuda()
+            _calib_loader = [
+                {"input_ids": all_input_ids[i : i + args.calib_batch_size]}
+                for i in range(0, len(all_input_ids), args.calib_batch_size)
+            ]
+        else:
+            # HF dataset name: route through modelopt's dataset_utils.
+            _calib_loader = get_dataset_dataloader(
+                dataset_name=args.calib_dataset_path_or_name,
+                tokenizer=tokenizer,
+                num_samples=args.calib_size,
+                max_sample_length=args.calib_max_sequence_length,
+                batch_size=args.calib_batch_size,
+                device="cuda",
+            )
+
+        def _dataset_forward_loop_func(model):
+            for sample in tqdm(_calib_loader, disable=torch.distributed.get_rank()):
+                megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 
     unwrapped_model = unwrap_model(model)[0]
 
