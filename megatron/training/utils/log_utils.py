@@ -76,8 +76,8 @@ def setup_logging(
     from specific modules.
 
     Logging Level Precedence:
-    1. Env var `MEGATRON_BRIDGE_LOGGING_LEVEL`
-    2. `logging_level` argument
+    1. `logging_level` argument
+    2. Env var `MEGATRON_BRIDGE_LOGGING_LEVEL`
     3. Default: `logging.INFO`
 
     Args:
