@@ -140,9 +140,9 @@ class MimoOptimizer(MegatronOptimizer):
     def load_state_dict(self, state_dict: Dict):
         """Load per-module optimizer state dicts.
 
-        Reassembles param_groups, grad_scaler, and param_state_sharding_type
-        that were extracted and saved as ShardedObjects by sharded_state_dict(),
-        then delegates to each per-module optimizer's load_state_dict.
+        Reassembles param_groups and grad_scaler that were extracted and saved
+        as ShardedObjects by sharded_state_dict(), then delegates to each
+        per-module optimizer's load_state_dict.
         """
         for name, info in self.module_infos.items():
             if not (info.is_active and info.optimizer):
@@ -153,16 +153,14 @@ class MimoOptimizer(MegatronOptimizer):
 
             for sub_sd, inner_opt in _iter_optimizer_sub_dicts(module_sd, info.optimizer):
                 _restore_param_groups(sub_sd, inner_opt, name)
-                _restore_param_state_sharding_type(sub_sd)
                 _restore_grad_scaler(sub_sd)
 
             info.optimizer.load_state_dict(module_sd)
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
-        """Build sharded state dict, routing param_groups, grad_scaler, and
-        param_state_sharding_type through distributed save as ShardedObjects
-        (common.pt is rank-0 only, which misses non-colocated LLM optimizer
-        state).
+        """Build sharded state dict, routing param_groups and grad_scaler
+        through distributed save as ShardedObjects (common.pt is rank-0 only,
+        which misses LLM optimizer state in non-colocated mode).
         """
         sharded_state = {}
         for name, info in self.module_infos.items():
@@ -177,7 +175,6 @@ class MimoOptimizer(MegatronOptimizer):
                 ):
                     suffix = f'.{idx}' if idx > 0 else ''
                     _extract_param_groups(sub_sd, name, suffix, replica_id)
-                    _extract_param_state_sharding_type(sub_sd, name, suffix, replica_id)
                     _extract_grad_scaler(sub_sd, name, suffix, replica_id)
 
                 sharded_state[name] = module_sd
@@ -221,8 +218,6 @@ def _extract_param_groups(sub_sd, module_name, suffix, replica_id):
             replica_id=replica_id,
         )
         del opt_sub['param_groups']
-        if not opt_sub:
-            del sub_sd['optimizer']
 
 
 def _extract_grad_scaler(sub_sd, module_name, suffix, replica_id):
@@ -231,23 +226,6 @@ def _extract_grad_scaler(sub_sd, module_name, suffix, replica_id):
         sub_sd[f'_mimo_grad_scaler{suffix}'] = ShardedObject(
             f'optimizer.mimo.{module_name}{suffix}.grad_scaler',
             sub_sd.pop('grad_scaler'),
-            (1,),
-            (0,),
-            replica_id=replica_id,
-        )
-
-
-def _extract_param_state_sharding_type(sub_sd, module_name, suffix, replica_id):
-    """Save: extract param_state_sharding_type into a ShardedObject.
-
-    Plain non-tensor scalars at the per-module level otherwise travel through
-    dist_checkpointing's common-state path (rank 0 only), so for non-colocated
-    MIMO they are lost on ranks whose module is inactive on rank 0.
-    """
-    if 'param_state_sharding_type' in sub_sd:
-        sub_sd[f'_mimo_param_state_sharding_type{suffix}'] = ShardedObject(
-            f'optimizer.mimo.{module_name}{suffix}.param_state_sharding_type',
-            sub_sd.pop('param_state_sharding_type'),
             (1,),
             (0,),
             replica_id=replica_id,
@@ -289,14 +267,6 @@ def _restore_grad_scaler(sub_sd):
     for k in list(sub_sd.keys()):
         if k.startswith('_mimo_grad_scaler'):
             sub_sd['grad_scaler'] = sub_sd.pop(k)
-            break
-
-
-def _restore_param_state_sharding_type(sub_sd):
-    """Load: restore param_state_sharding_type from ShardedObject key."""
-    for k in list(sub_sd.keys()):
-        if k.startswith('_mimo_param_state_sharding_type'):
-            sub_sd['param_state_sharding_type'] = sub_sd.pop(k)
             break
 
 
