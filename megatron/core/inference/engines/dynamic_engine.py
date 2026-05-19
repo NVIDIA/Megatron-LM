@@ -142,7 +142,7 @@ def format_mem_bytes(mem_bytes):
     return "%d bytes" % mem_bytes
 
 
-def _cuda_graph_mempool_bytes():
+def _cuda_graph_mempool_bytes() -> Tuple[int, int]:
     """Return (reserved, allocated) bytes belonging to the global CUDA graph mempool.
 
     PyTorch's `torch.cuda.memory_stats()` reports process-wide totals that mix in
@@ -374,7 +374,6 @@ class DynamicInferenceEngine(AbstractEngine):
         controller = self.controller
 
         time_start = time.time()
-        torch.cuda.reset_peak_memory_stats()
         mem_stats_start = torch.cuda.memory_stats()
 
         # Snapshot of process-wide stats for the "total memory used by capture" summary.
@@ -479,7 +478,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 format_mem_bytes(pool_alloc - prev_pool_alloc),
             )
             prev_pool_reserved, prev_pool_alloc = pool_reserved, pool_alloc
-            torch.cuda.reset_peak_memory_stats()
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))

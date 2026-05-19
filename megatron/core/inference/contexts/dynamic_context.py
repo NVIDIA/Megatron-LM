@@ -644,6 +644,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_sequence_length=self.max_sequence_length,
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
+                sizing_distribution=inference_config.cuda_graph_sizing_distribution,
             )
         )
 
