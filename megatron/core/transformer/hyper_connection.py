@@ -69,11 +69,11 @@ def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
-    """Native H_res @ residual + H_post * (x [+ bias])."""
+    """Native H_res.T @ residual + H_post * (x [+ bias])."""
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
     residual_batched = original_residual.view(s * b, n, C)
-    mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
+    mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
@@ -153,13 +153,13 @@ class HyperConnectionModule(MegatronModule):
     Unified mHC (Manifold-Constrained Hyper-Connections) module.
 
     Implements the complete mHC propagation:
-        x_{l+1} = H_res @ x_l + H_post^T @ F(H_pre @ x_l)
+        x_{l+1} = H_res^T @ x_l + H_post^T @ F(H_pre @ x_l)
 
     This module handles:
     1. Computing learnable mappings: H_pre, H_post, H_res (with Sinkhorn-Knopp projection)
     2. Aggregation: n-stream → 1-stream (H_pre @ x)
     3. Expansion: 1-stream → n-stream (H_post^T @ output)
-    4. Residual merge: H_res @ x + expanded_output
+    4. Residual merge: H_res^T @ x + expanded_output
     5. Block-level expand/contract for TransformerBlock boundaries
 
     Args:
@@ -434,7 +434,7 @@ class HyperConnectionModule(MegatronModule):
         """
         Apply H_res to residual using H_res weights.
 
-        Computes: H_res @ residual
+        Computes: H_res.T @ residual
 
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
@@ -449,8 +449,8 @@ class HyperConnectionModule(MegatronModule):
         # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
         residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
 
-        # Batch matrix multiply: [s*b, n, n] @ [s*b, n, C] -> [s*b, n, C]
-        mixed = torch.bmm(h_res_batched, residual_batched)
+        # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
+        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
 
         return mixed.view(s, b, n * C)
 
@@ -611,7 +611,7 @@ class HyperConnectionModule(MegatronModule):
         Currently implements the operations sequentially using native PyTorch.
 
         The computation flow is:
-            1. mixed = H_res @ original_residual (apply_h_res)
+            1. mixed = H_res.T @ original_residual (apply_h_res)
             2. expanded = H_post^T @ layer_output (apply_h_post)
             3. output = dropout(expanded + bias) + mixed (bias-dropout-add)
 
@@ -667,7 +667,7 @@ class HyperConnectionModule(MegatronModule):
         h_res, h_post and bda.
 
         When dropout is zero (or inference), uses a single fused/reference kernel
-        for H_res @ residual + H_post * (x + bias). Falls back to unfused
+        for H_res.T @ residual + H_post * (x + bias). Falls back to unfused
         implementation when dropout is needed.
 
         Args:

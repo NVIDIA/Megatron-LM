@@ -91,12 +91,23 @@ def _ref_h_post_bda(
     h_res: Tensor, orig_res: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     s, b, n, C = orig_res.shape
-    mixed = torch.bmm(h_res.view(s * b, n, n), orig_res.view(s * b, n, C)).view(s, b, n, C)
+    h_res_batched = h_res.view(s * b, n, n)
+    orig_batched = orig_res.view(s * b, n, C)
+    mixed = torch.bmm(h_res_batched.transpose(1, 2), orig_batched).view(s, b, n, C)
     x_exp = h_post.unsqueeze(-1) * x.unsqueeze(2)
     out = x_exp + mixed
     if bias is not None:
         out = out + h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
     return out
+
+
+def _h_post_bda_transpose_case():
+    h_res = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], dtype=DTYPE, device=DEVICE)
+    orig = torch.tensor([[[[10.0, 100.0], [1.0, 2.0]]]], dtype=DTYPE, device=DEVICE)
+    h_post = torch.zeros(1, 1, 2, dtype=DTYPE, device=DEVICE)
+    x = torch.zeros(1, 1, 2, dtype=DTYPE, device=DEVICE)
+    expected = torch.tensor([[[[13.0, 106.0], [24.0, 208.0]]]], dtype=DTYPE, device=DEVICE)
+    return h_res, orig, h_post, x, expected
 
 
 def _ref_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6):
@@ -282,6 +293,12 @@ class TestTritonHAggregate:
 class TestNativeHPostBDA:
     """Tests for native_h_post_bda."""
 
+    def test_forward_uses_h_res_transpose(self):
+        h_res, orig, h_post, x, expected = _h_post_bda_transpose_case()
+        out = native_h_post_bda(h_res, orig, h_post, x, bias=None)
+
+        torch.testing.assert_close(out, expected, atol=0.0, rtol=0.0)
+
     @pytest.mark.parametrize("with_bias", [True, False])
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C, with_bias):
@@ -327,6 +344,14 @@ class TestNativeHPostBDA:
 
 class TestFusedHPostBDA:
     """Public fused h_post_bda dispatch/fallback plus numerical correctness."""
+
+    def test_forward_uses_h_res_transpose(self):
+        from megatron.core.fusions.fused_mhc_kernels import fused_h_post_bda
+
+        h_res, orig, h_post, x, expected = _h_post_bda_transpose_case()
+        out = fused_h_post_bda(h_res, orig, h_post, x, bias=None)
+
+        torch.testing.assert_close(out, expected, atol=0.0, rtol=0.0)
 
     @pytest.mark.flaky_in_dev
     @_require_cutile

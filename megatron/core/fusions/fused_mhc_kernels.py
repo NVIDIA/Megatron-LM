@@ -10,7 +10,7 @@ kernels are unavailable or when the ``use_fused_mhc`` config flag is False.
 Four fused operations:
   - sinkhorn:     Sinkhorn-Knopp projection to doubly stochastic matrix
   - h_aggregate:  weighted n-stream -> 1-stream aggregation
-  - h_post_bda:   fused H_res @ residual + H_post * (x + bias)
+  - h_post_bda:   fused H_res.T @ residual + H_post * (x + bias)
   - proj_rms:     fused projection + RMS normalization
 """
 
@@ -396,7 +396,7 @@ if _TRITON_AVAILABLE:
         BLOCK_C: tl.constexpr,
         BLOCK_S: tl.constexpr,
     ):
-        """out = hr @ orig + hp * (x + bias)."""
+        """out = hr.T @ orig + hp * (x + bias)."""
         pid_s = tl.program_id(0)
         pid_c = tl.program_id(1)
         offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
@@ -417,8 +417,8 @@ if _TRITON_AVAILABLE:
             out_i = hp_i[:, None] * x_tile
 
             for j in tl.static_range(N):
-                hr_ij = tl.load(
-                    hr_ptr + offs_s * stride_hr_s + i * stride_hr_i + j * stride_hr_j,
+                hr_ji = tl.load(
+                    hr_ptr + offs_s * stride_hr_s + j * stride_hr_i + i * stride_hr_j,
                     mask=mask_s,
                     other=0.0,
                 ).to(tl.float32)
@@ -430,7 +430,7 @@ if _TRITON_AVAILABLE:
                     mask=mask_2d,
                     other=0.0,
                 ).to(tl.float32)
-                out_i += hr_ij[:, None] * orig_j
+                out_i += hr_ji[:, None] * orig_j
 
             tl.store(
                 out_ptr + offs_s[:, None] * stride_out_s + i * stride_out_n + offs_c[None, :],
@@ -505,7 +505,7 @@ if _TRITON_AVAILABLE:
         BLOCK_C: tl.constexpr,
         BLOCK_S: tl.constexpr,
     ):
-        """g_x = hp @ go, g_orig = hr.T @ go."""
+        """g_x = hp @ go, g_orig = hr @ go."""
         pid_s = tl.program_id(0)
         pid_c = tl.program_id(1)
         offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
@@ -537,12 +537,12 @@ if _TRITON_AVAILABLE:
                     mask=mask_2d,
                     other=0.0,
                 ).to(tl.float32)
-                hr_ji = tl.load(
-                    hr_ptr + offs_s * stride_hr_s + j * stride_hr_i + i * stride_hr_j,
+                hr_ij = tl.load(
+                    hr_ptr + offs_s * stride_hr_s + i * stride_hr_i + j * stride_hr_j,
                     mask=mask_s,
                     other=0.0,
                 ).to(tl.float32)
-                g_orig_i += hr_ji[:, None] * go_j
+                g_orig_i += hr_ij[:, None] * go_j
             tl.store(
                 g_orig_ptr + offs_s[:, None] * stride_orig_s + i * stride_orig_n + offs_c[None, :],
                 g_orig_i.to(g_orig_ptr.dtype.element_ty),
@@ -582,7 +582,7 @@ if _TRITON_AVAILABLE:
         BLOCK_C: tl.constexpr,
         BLOCK_S: tl.constexpr,
     ):
-        """g_hp = sum_c go*(x+bias), g_hr = go @ orig.T."""
+        """g_hp = sum_c go*(x+bias), g_hr = orig @ go.T."""
         pid_s = tl.program_id(0)
         offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
         mask_s = offs_s < sb
@@ -625,7 +625,7 @@ if _TRITON_AVAILABLE:
                     ).to(tl.float32)
                     dot_hr = tl.sum(go_i * orig_j, axis=1)
                     g_hr_acc += tl.where(
-                        tl.arange(0, N * N)[None, :] == i * N + j,
+                        tl.arange(0, N * N)[None, :] == j * N + i,
                         dot_hr[:, None],
                         tl.zeros((BLOCK_S, N * N), dtype=tl.float32),
                     )
@@ -1038,7 +1038,8 @@ if _CUTILE_AVAILABLE:
             x_exp = ct.expand_dims(x_tile, axis=1)  # (TILE_SIZE, 1, TILE_C)
             out_tile = hp_exp * x_exp  # (TILE_SIZE, N, TILE_C)
             for j in range(N):
-                hr_col = ct.extract(hr_tile, (0, 0, j), shape=(TILE_SIZE, N, 1))
+                hr_row = ct.extract(hr_tile, (0, j, 0), shape=(TILE_SIZE, 1, N))
+                hr_col = ct.reshape(hr_row, (TILE_SIZE, N, 1))
                 orig_row = ct.extract(orig_tile, (0, j, 0), shape=(TILE_SIZE, 1, TILE_C))
                 out_tile = out_tile + hr_col * orig_row
             ct.store(out, index=(pid, 0, ct_idx), tile=out_tile.astype(out.dtype))
@@ -1063,7 +1064,8 @@ if _CUTILE_AVAILABLE:
             xb_exp = ct.expand_dims(x_tile + bias_tile, axis=1)  # (TILE_SIZE, 1, TILE_C)
             out_tile = hp_exp * xb_exp  # (TILE_SIZE, N, TILE_C)
             for j in range(N):
-                hr_col = ct.extract(hr_tile, (0, 0, j), shape=(TILE_SIZE, N, 1))
+                hr_row = ct.extract(hr_tile, (0, j, 0), shape=(TILE_SIZE, 1, N))
+                hr_col = ct.reshape(hr_row, (TILE_SIZE, N, 1))
                 orig_row = ct.extract(orig_tile, (0, j, 0), shape=(TILE_SIZE, 1, TILE_C))
                 out_tile = out_tile + hr_col * orig_row
             ct.store(out, index=(pid, 0, ct_idx), tile=out_tile.astype(out.dtype))
@@ -1072,7 +1074,7 @@ if _CUTILE_AVAILABLE:
     def _ct_hpb_bwd_g_x_orig_kernel(
         go, hr, hp, g_orig, g_x, N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt
     ):
-        """Compute g_x = hp @ go and g_orig = hr.T @ go.
+        """Compute g_x = hp @ go and g_orig = hr @ go.
 
         Grid: (ceil(sb / TILE_SIZE), ceil(C / TILE_C)).
         2D grid — no loop, no accumulators.
@@ -1091,8 +1093,8 @@ if _CUTILE_AVAILABLE:
             hp_j_exp = ct.expand_dims(hp_j, axis=2)  # [TS, 1, 1]
             go_j = ct.extract(go_tile, (0, j, 0), shape=(TILE_SIZE, 1, TILE_C))
             g_x_tile = g_x_tile + hp_j_exp * go_j
-            hr_row_j = ct.extract(hr_tile, (0, j, 0), shape=(TILE_SIZE, 1, N))
-            g_orig_tile = g_orig_tile + ct.reshape(hr_row_j, (TILE_SIZE, N, 1)) * go_j
+            hr_col_j = ct.extract(hr_tile, (0, 0, j), shape=(TILE_SIZE, N, 1))
+            g_orig_tile = g_orig_tile + hr_col_j * go_j
         ct.store(
             g_x,
             index=(pid, ct_idx),
@@ -1104,7 +1106,7 @@ if _CUTILE_AVAILABLE:
     def _ct_hpb_bwd_g_hp_hr_kernel(
         go, orig, x, g_hr, g_hp, N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt
     ):
-        """Compute g_hp = sum(go * x) and g_hr = go @ orig.T (no bias).
+        """Compute g_hp = sum(go * x) and g_hr = orig @ go.T (no bias).
 
         Grid: (ceil(sb / TILE_SIZE),).  Loops over C-tiles.
         """
@@ -1125,7 +1127,7 @@ if _CUTILE_AVAILABLE:
             )
             acc_g_hp = acc_g_hp + ct.sum(go_tile * x_exp, axis=2, keepdims=True)
             acc_g_hr = acc_g_hr + ct.sum(
-                ct.expand_dims(go_tile, axis=2) * ct.expand_dims(orig_tile, axis=1), axis=3
+                ct.expand_dims(orig_tile, axis=2) * ct.expand_dims(go_tile, axis=1), axis=3
             )
         ct.store(g_hp, index=(pid, 0), tile=ct.reshape(acc_g_hp, (TILE_SIZE, N)).astype(g_hp.dtype))
         ct.store(g_hr, index=(pid, 0, 0), tile=acc_g_hr.astype(g_hr.dtype))
@@ -1134,7 +1136,7 @@ if _CUTILE_AVAILABLE:
     def _ct_hpb_bwd_g_hp_hr_bias_kernel(
         go, orig, x, bias, g_hr, g_hp, N: ConstInt, TILE_C: ConstInt, TILE_SIZE: ConstInt
     ):
-        """Compute g_hp = sum(go * (x+bias)) and g_hr = go @ orig.T (with bias).
+        """Compute g_hp = sum(go * (x+bias)) and g_hr = orig @ go.T (with bias).
 
         Grid: (ceil(sb / TILE_SIZE),).  Loops over C-tiles.
         """
@@ -1156,7 +1158,7 @@ if _CUTILE_AVAILABLE:
             )
             acc_g_hp = acc_g_hp + ct.sum(go_tile * xb_exp, axis=2, keepdims=True)
             acc_g_hr = acc_g_hr + ct.sum(
-                ct.expand_dims(go_tile, axis=2) * ct.expand_dims(orig_tile, axis=1), axis=3
+                ct.expand_dims(orig_tile, axis=2) * ct.expand_dims(go_tile, axis=1), axis=3
             )
         ct.store(g_hp, index=(pid, 0), tile=ct.reshape(acc_g_hp, (TILE_SIZE, N)).astype(g_hp.dtype))
         ct.store(g_hr, index=(pid, 0, 0), tile=acc_g_hr.astype(g_hr.dtype))
@@ -2955,8 +2957,8 @@ def _torch_h_post_bda_bwd(
     hp = h_post.reshape(sb, n)
     x_flat = x.reshape(sb, C)
 
-    g_hr = torch.bmm(go, orig.transpose(1, 2)).view(s, b, n, n)
-    g_res = torch.bmm(hr.transpose(1, 2), go).view(s, b, n, C)
+    g_hr = torch.bmm(orig, go.transpose(1, 2)).view(s, b, n, n)
+    g_res = torch.bmm(hr, go).view(s, b, n, C)
     g_x = torch.sum(go * hp.unsqueeze(-1), dim=1).view(s, b, C)
     xb = x_flat if bias is None else x_flat + bias.view(1, C)
     g_hp = torch.sum(go * xb.unsqueeze(1), dim=2).view(s, b, n)
@@ -3216,7 +3218,7 @@ def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
 def fused_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
-    """Fused H_res @ residual + H_post * (x + bias)."""
+    """Fused H_res.T @ residual + H_post * (x + bias)."""
     if _TRITON_AVAILABLE or _CUTILE_AVAILABLE:
         return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
     return native_h_post_bda(h_res, original_residual, h_post, x, bias)

@@ -46,6 +46,21 @@ class TestHyperConnectionCheckpoint:
         module.cuda()
         return module
 
+    def test_apply_h_res_uses_h_res_transpose(self):
+        """apply_h_res should compute H_res.T @ residual."""
+        module = self._create_hyper_connection_module(hidden_size=4, num_residual_streams=2)
+        h_res = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], device='cuda')
+        residual = torch.tensor(
+            [[[10.0, 100.0, 3.0, 4.0, 1.0, 2.0, 5.0, 6.0]]], device='cuda'
+        )
+        expected = torch.tensor(
+            [[[13.0, 106.0, 18.0, 22.0, 24.0, 208.0, 26.0, 32.0]]], device='cuda'
+        )
+
+        mixed = module.apply_h_res(h_res, residual)
+
+        torch.testing.assert_close(mixed, expected, atol=0.0, rtol=0.0)
+
     def test_forward_normal_vs_checkpoint_correctness(self):
         """
         Test that _forward_with_checkpoint produces the same outputs as _forward_normal.
