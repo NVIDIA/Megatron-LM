@@ -10,6 +10,8 @@ from datetime import timedelta
 from typing import Callable
 
 import numpy as np
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
+from megatron.training.utils.common_utils import get_local_rank_preinit
 import torch
 import torch.nn.functional as F
 
@@ -39,6 +41,7 @@ from megatron.training import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
+from megatron.training.config import DistributedInitConfig
 
 logger = logging.getLogger(__name__)
 
@@ -453,42 +456,59 @@ def _create_pg_collection(
     return pg_collection
 
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):
+def _initialize_distributed(
+    model_config: TransformerConfig,
+    dist_config: DistributedInitConfig,
+    num_distributed_optimizer_instances: int,
+    get_embedding_ranks: Callable[[list[int], int | None], list[int]] | None,
+    get_position_embedding_ranks: Callable[[list[int], int | None], list[int]] | None,
+    restart_store: torch.distributed.Store | None = None,
+    use_inprocess_restart: bool = False,
+) -> ProcessGroupCollection:
     """Initialize torch.distributed and core model parallel."""
-    args = get_args()
 
     device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
 
         print_rank_0("torch distributed is already initialized, skipping initialization ...")
-        args.rank = torch.distributed.get_rank()
-        args.world_size = torch.distributed.get_world_size()
 
     else:
 
         print_rank_0("> initializing torch distributed ...")
         # Manually set the device ids.
         if device_count > 0:
-            torch.cuda.set_device(args.local_rank)
-            device_id = torch.device(f'cuda:{args.local_rank}')
+            if dist_config.external_gpu_device_mapping:
+                torch.cuda.set_device(0)
+                device_id = torch.device(f'cuda:0')
+            else:
+                local_rank = get_local_rank_preinit()
+                torch.cuda.set_device(local_rank)
+                device_id = torch.device(f'cuda:{local_rank}')
         else:
             device_id = None
 
         # Set to non-default stream for cudagraph capturing.
-        if args.cuda_graph_impl == "transformer_engine":
+        if model_config.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
+
+        # Ensure MASTER_ADDR and MASTER_PORT are set for distributed initialization
+        # These may come from torchrun, SLURM, or defaults
+        if "MASTER_ADDR" not in os.environ:
+            os.environ["MASTER_ADDR"] = get_master_addr_safe()
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = str(get_master_port_safe())
 
         _setup_flight_recorder_env(dist_config)
 
         # Call the init process
         init_process_group_kwargs = {
-            'backend': args.distributed_backend,
-            'store': store,
-            'world_size': args.world_size,
-            'rank': args.rank,
-            'timeout': timedelta(minutes=args.distributed_timeout_minutes),
+            "backend": dist_config.distributed_backend,
+            "world_size": safe_get_world_size(),
+            "rank": safe_get_rank(),
+            "store": restart_store,
+            "timeout": timedelta(minutes=dist_config.distributed_timeout_minutes),
         }
-        if args.fake_process_group:
+        if dist_config.fake_process_group:
             assert is_torch_min_version(
                 "2.3.0"
             ), "Fake process group is only supported with PyTorch 2.3.0 and above."
@@ -499,34 +519,63 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             init_process_group_kwargs['store'] = store
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
-        inprocess_restart.maybe_force_nccl_backend_init(device_id)
+        if use_inprocess_restart:
+            inprocess_restart.maybe_force_nccl_backend_init(device_id)
+
+        if dist_config.external_gpu_device_mapping:
+            torch.distributed.barrier(device_ids=[0])
+        else:
+            torch.distributed.barrier(device_ids=[get_local_rank_preinit()])
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
-    if device_count > 0:
+
+    if device_count == 0:
+        if dist_config.use_decentralized_pg or dist_config.distributed_backend == "nccl":
+            raise RuntimeError("Cannot initialize parallel groups with no CUDA devices available (device_count=0)")
+
+    if dist_config.use_decentralized_pg:
+        # Use HyperCommGrid to create local parallel groups passed through functions
+        # instead of relying on mcore's global parallel state (mpu) variables.
+        mpu._set_global_memory_buffer()
+        pg_collection = _create_pg_collection(
+            model_config,
+            num_distributed_optimizer_instances,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+        )
+        if safe_get_rank() == 0:
+            tp = int(model_config.tensor_model_parallel_size)
+            pp = int(model_config.pipeline_model_parallel_size)
+            cp = int(model_config.context_parallel_size) if getattr(model_config, "context_parallel_size", 1) else 1
+            dp = torch.distributed.get_world_size() // (tp * pp * cp)
+            print(f"> initialized HyperCommGrid with tp={tp}, pp={pp}, cp={cp}, dp={dp}")
+        return pg_collection
+    else:
+        # Use the original mcore parallel_state.initialize_model_parallel approach
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
             mpu.initialize_model_parallel(
-                args.tensor_model_parallel_size,
-                args.pipeline_model_parallel_size,
-                args.virtual_pipeline_model_parallel_size,
-                pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
-                use_sharp=args.use_sharp,
-                context_parallel_size=args.context_parallel_size,
-                hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                hybrid_context_parallel=args.hybrid_context_parallel,
-                expert_model_parallel_size=args.expert_model_parallel_size,
-                num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
-                expert_tensor_parallel_size=args.expert_tensor_parallel_size,
-                distributed_timeout_minutes=args.distributed_timeout_minutes,
-                nccl_communicator_config_path=args.nccl_communicator_config_path,
-                order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
+                tensor_model_parallel_size=model_config.tensor_model_parallel_size,
+                pipeline_model_parallel_size=model_config.pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size=model_config.virtual_pipeline_model_parallel_size,
+                pipeline_model_parallel_comm_backend=model_config.pipeline_model_parallel_comm_backend,
+                context_parallel_size=model_config.context_parallel_size,
+                hierarchical_context_parallel_sizes=model_config.hierarchical_context_parallel_sizes,
+                hybrid_context_parallel=model_config.hybrid_context_parallel,
+                expert_model_parallel_size=model_config.expert_model_parallel_size,
+                num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+                expert_tensor_parallel_size=model_config.expert_tensor_parallel_size,
+                distributed_timeout_minutes=dist_config.distributed_timeout_minutes,
+                nccl_communicator_config_path=dist_config.nccl_communicator_config_path,
+                order="tp-cp-ep-dp-pp" if not dist_config.use_tp_pp_dp_mapping else "tp-cp-ep-pp-dp",
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
-                create_gloo_process_groups=args.use_gloo_process_groups,
-                high_priority_stream_groups=args.high_priority_stream_groups,
-                sharp_enabled_group=args.sharp_enabled_group,
+                create_gloo_process_groups=dist_config.use_gloo_process_groups,
+                use_sharp=dist_config.use_sharp,
+                high_priority_stream_groups=dist_config.high_priority_stream_groups,
+                sharp_enabled_group=dist_config.sharp_enabled_group,
             )
             print_rank_0(
                 f"> initialized tensor model parallel with size "
@@ -536,6 +585,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 f"> initialized pipeline model parallel with size "
                 f"{mpu.get_pipeline_model_parallel_world_size()}"
             )
+
+        # Return a ProcessGroupCollection using mpu process groups
+        return ProcessGroupCollection.use_mpu_process_groups()
 
 
 def _init_autoresume():
