@@ -2864,7 +2864,6 @@ from megatron.core.transformer.hyper_connection import (
     native_sinkhorn,
 )
 
-
 _BACKEND_INFO_LOGGED = False
 
 
@@ -2901,9 +2900,7 @@ def log_fused_mhc_backend_once() -> None:
         return
     _BACKEND_INFO_LOGGED = True
     log_single_rank(
-        logger,
-        logging.INFO,
-        f"[mHC] fused backend selection: {_mhc_backend_selection()}",
+        logger, logging.INFO, f"[mHC] fused backend selection: {_mhc_backend_selection()}"
     )
 
 

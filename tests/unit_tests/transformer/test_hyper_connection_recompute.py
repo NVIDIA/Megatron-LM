@@ -50,9 +50,7 @@ class TestHyperConnectionCheckpoint:
         """apply_h_res should compute H_res.T @ residual."""
         module = self._create_hyper_connection_module(hidden_size=4, num_residual_streams=2)
         h_res = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], device='cuda')
-        residual = torch.tensor(
-            [[[10.0, 100.0, 3.0, 4.0, 1.0, 2.0, 5.0, 6.0]]], device='cuda'
-        )
+        residual = torch.tensor([[[10.0, 100.0, 3.0, 4.0, 1.0, 2.0, 5.0, 6.0]]], device='cuda')
         expected = torch.tensor(
             [[[13.0, 106.0, 18.0, 22.0, 24.0, 208.0, 26.0, 32.0]]], device='cuda'
         )
