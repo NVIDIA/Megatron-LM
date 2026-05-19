@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
+import dataclasses
 import inspect
 import io
 import os
@@ -453,11 +454,18 @@ class PlaceholderValue:
     key: str
 
 
-def inject_placeholders(sharded_state_dict: ShardedStateDict) -> Dict[str, Any]:
+def inject_placeholders(
+    sharded_state_dict: ShardedStateDict, keep_only_main_replica: bool = False
+) -> Dict[str, Any]:
     """Replaces values in state dict with ValuePlaceholders.
 
     Extracts all values from a given state dict to a flat dict, injecting
     placeholders instead to allow later recovery with `fill_placeholders`.
+
+    When `keep_only_main_replica=True`, non-main-replica ShardedObjects are
+    replaced with placeholders but not added to the extracted values, so each
+    FQN gets written by exactly one rank. DTensors are not filtered because
+    their placements (e.g. `Replicate`) already dedup on save.
     """
     # TODO: in order to handle arbitrary DTensors (without `.key` attribute)
     #  an additional step computing FQNs might be needed (`traverse_state_dict`?)
@@ -470,6 +478,19 @@ def inject_placeholders(sharded_state_dict: ShardedStateDict) -> Dict[str, Any]:
                 raise NotImplementedError(f'DTensors currently require `key` attribute, got: {x}')
         elif not isinstance(x, ShardedBase):
             raise RuntimeError(f'Unexpected type {x} during placeholders injection')
+
+        # On save we only emit one BYTE_IO write per FQN. ShardedObjects are
+        # serialized via pickle (DCP's BYTE_IO path), which has no placement-level
+        # deduplication like DTensor has, so multiple ranks emitting the same
+        # FQN would trip DCP's `assert item.index.fqn not in md` in the global
+        # plan. Filtering to main replica here mirrors the regular MCore save
+        # path (`_replace_state_dict_keys_with_sharded_keys(keep_only_main_replica=True)`).
+        if (
+            keep_only_main_replica
+            and isinstance(x, ShardedObject)
+            and not is_main_replica(x.replica_id)
+        ):
+            return PlaceholderValue(x.key)
 
         if x.key in extracted_values:
             raise RuntimeError(f'Duplicated sharded key encountered: {x.key}')
@@ -488,6 +509,35 @@ def fill_placeholders(sharded_state_dict: ShardedStateDict, loaded_values: Dict[
         return loaded_values[x.key]
 
     dict_list_map_inplace(_fill_placeholder, sharded_state_dict)
+
+
+class DTensorFormatSavePlanner(DefaultSavePlanner):
+    """Save planner for the DTensor checkpoint format.
+
+    `DefaultSavePlanner.create_local_plan` only emits write items for
+    `ShardedTensor` on non-coordinator ranks — non-tensor objects (which DCP
+    serializes via BYTE_IO) are only written by rank 0. That silently drops
+    rank-unique ShardedObjects produced by `DistributedOptimizer`, e.g.
+    `chained_<i>.optimizer.distributed.dp_group_idx_<rank>.optimizer`, which
+    surface as "Missing key in checkpoint state_dict" on load.
+
+    This planner emits a write item for every value in `state_dict` on every
+    rank. The caller is expected to have filtered to main replicas via
+    `inject_placeholders(..., keep_only_main_replica=True)` so each BYTE_IO
+    FQN is unique across ranks, avoiding DCP's
+    `assert item.index.fqn not in md` in the global plan.
+    """
+
+    def create_local_plan(self) -> SavePlan:
+        """Emit a write item for every value on every rank."""
+        write_items = []
+        for fqn, obj in self.state_dict.items():
+            write_items += _create_write_items(fqn, obj)
+        plan = SavePlan(items=write_items)
+        if self.flatten_state_dict:
+            plan = dataclasses.replace(plan, planner_data=self.mappings)
+        self.plan = plan
+        return self.plan
 
 
 class MCoreSavePlanner(DefaultSavePlanner):
@@ -747,27 +797,26 @@ class TorchDistSaveShardedStrategy:
             # `inject_placeholders` returns a *flat* dict keyed by each ShardedBase/DTensor's
             # `.key`. Saving that flat dict directly makes DCP record FQNs that are equal to
             # mcore `.key` strings, which is what `_determine_missing_and_unexpected_keys`
-            # compares against on load. If we instead re-nested via `fill_placeholders` and
-            # let DCP's `DefaultSavePlanner(flatten_state_dict=True)` join dict-paths with
-            # dots, the FQNs would diverge from mcore keys (e.g. `model.decoder...` vs
-            # `decoder...`, numeric-index optimizer paths vs explicit `dp_group_idx_/gbuf_idx_/
-            # bucket_idx_/dtype_` names), every key would be flagged unexpected, and
-            # `adjust_non_strict_load` would prune the entire state dict.
-            values_to_save = inject_placeholders(sharded_state_dict)
+            # compares against on load. Wrapping the dict under a per-PP-stage key (e.g.
+            # `{"pp0": ...}`) would diverge the FQNs from mcore `.key`s and break reshard
+            # tests (the on-disk metadata would carry the `pp<rank>.` prefix while the
+            # in-memory `sharded_state_dict` would not), causing validation to flag every
+            # key as unexpected and `adjust_non_strict_load` to prune the whole state dict.
+            # Keys are already globally unique (model params include layer indices; optimizer
+            # ShardedObjects include `dp_group_idx_<rank>`), so no extra wrapping is needed.
+            #
+            # `keep_only_main_replica=True` mirrors the regular MCore save so each BYTE_IO
+            # FQN is emitted by exactly one rank. The custom `DTensorFormatSavePlanner` then
+            # emits write items for every value on every rank so rank-unique ShardedObjects
+            # (e.g. per-rank optimizer state) survive the save — they're dropped by DCP's
+            # default planner, which only writes BYTE_IO on the coordinator.
+            values_to_save = inject_placeholders(sharded_state_dict, keep_only_main_replica=True)
             values_to_save = convert_state_dict_to_dcp_compatible(values_to_save)
-            # With PP > 1 different pipeline stages hold different parameters that
-            # share the same local optimizer-state index (e.g. "state.1.exp_avg_sq").
-            # Wrapping each stage's dict under a "ppN" key gives every stage a unique
-            # DCP path, preventing shape-mismatch collisions on save and load.
-            from megatron.core import parallel_state as mpu
-
-            pp_size = mpu.get_pipeline_model_parallel_world_size()
-            if pp_size > 1:
-                pp_rank = mpu.get_pipeline_model_parallel_rank()
-                dcp_state_dict = {f"pp{pp_rank}": values_to_save}
-            else:
-                dcp_state_dict = values_to_save
-            return torch.distributed.checkpoint.save(dcp_state_dict, checkpoint_id=checkpoint_dir)
+            return torch.distributed.checkpoint.save(
+                values_to_save,
+                checkpoint_id=checkpoint_dir,
+                planner=DTensorFormatSavePlanner(),
+            )
         else:
             async_request = self.async_save(
                 sharded_state_dict, checkpoint_dir, async_strategy="mcore"
@@ -997,19 +1046,15 @@ class TorchDistLoadShardedStrategy:
             # populates the DTensors (which alias the original ShardedTensor `.data`),
             # `fill_placeholders` restores the user-visible nested structure and
             # `unwrap_dtensors_and_sh_ten` collapses DTensors back to local tensors.
+            #
+            # Unlike save, load does not filter to main replicas: every rank needs to
+            # request its keys (including replicated ones), and DCP fans the single
+            # on-disk entry out to all requesters.
             values_to_load = inject_placeholders(sharded_state_dict)
             values_to_load = convert_state_dict_to_dcp_compatible(values_to_load)
 
-            from megatron.core import parallel_state as mpu
-
-            pp_size = mpu.get_pipeline_model_parallel_world_size()
-            if pp_size > 1:
-                pp_rank = mpu.get_pipeline_model_parallel_rank()
-                dcp_state_dict = {f"pp{pp_rank}": values_to_load}
-            else:
-                dcp_state_dict = values_to_load
             torch.distributed.checkpoint.load(
-                state_dict=dcp_state_dict, checkpoint_id=checkpoint_dir
+                state_dict=values_to_load, checkpoint_id=checkpoint_dir
             )
             fill_placeholders(sharded_state_dict, values_to_load)
             unwrap_dtensors_and_sh_ten(sharded_state_dict)
