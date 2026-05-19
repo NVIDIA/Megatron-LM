@@ -33,7 +33,6 @@ class EPStepBeginDecision:
 
     step_id: int
     has_real_work: bool
-    use_pending_async_sample: bool
     reuse_pending_forward: bool
     discard_pending_forward: bool
     row_mapped_forward: bool
@@ -202,7 +201,6 @@ class EPAsyncStepProtocol:
         *,
         has_real_work: bool,
         has_pending_forward: bool,
-        has_pending_async_sample: bool,
         pending_forward_reusable: bool,
         pending_forward_row_mapped: bool,
     ) -> EPStepBeginDecision:
@@ -210,37 +208,30 @@ class EPAsyncStepProtocol:
         step_id = self._step_id_for_phase(EPAsyncPhase.STEP_BEGIN)
         local_real = int(has_real_work)
         local_pending_forward = int(has_pending_forward)
-        local_pending_sample = int(has_pending_async_sample)
         local_reusable = int(has_pending_forward and pending_forward_reusable)
         local_row_mapped = int(has_pending_forward and pending_forward_row_mapped)
         local_discard = int(has_pending_forward and not pending_forward_reusable)
         local_real_missing_forward = int(has_real_work and not has_pending_forward)
-        local_real_missing_sample = int(has_real_work and not has_pending_async_sample)
 
         (
             any_real,
             any_pending_forward,
-            any_pending_sample,
             any_reusable,
             any_row_mapped,
             any_discard,
             any_real_missing_forward,
-            any_real_missing_sample,
         ) = self._sync_all_reduce_max_at_step(
             EPAsyncPhase.STEP_BEGIN,
             step_id,
             local_real,
             local_pending_forward,
-            local_pending_sample,
             local_reusable,
             local_row_mapped,
             local_discard,
             local_real_missing_forward,
-            local_real_missing_sample,
         )
         self._sync_ack_at_step(EPAsyncPhase.STEP_BEGIN_ACK, step_id)
 
-        use_pending_async_sample = bool(any_pending_sample and not any_real_missing_sample)
         reuse_pending_forward = bool(
             any_pending_forward
             and any_reusable
@@ -256,7 +247,6 @@ class EPAsyncStepProtocol:
         return EPStepBeginDecision(
             step_id=step_id,
             has_real_work=bool(any_real),
-            use_pending_async_sample=use_pending_async_sample,
             reuse_pending_forward=reuse_pending_forward,
             discard_pending_forward=discard_pending_forward,
             row_mapped_forward=bool(any_row_mapped and reuse_pending_forward),

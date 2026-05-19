@@ -109,11 +109,10 @@ async def test_ep_protocol_local_mode_nested_steps_and_collective_errors():
 @pytest.mark.parametrize(
     ("global_state", "expected"),
     [
-        ((1, 1, 1, 1, 0, 0, 0, 0), (True, True, False, False)),
-        ((1, 1, 1, 1, 1, 0, 0, 0), (True, True, False, True)),
-        ((1, 1, 1, 1, 0, 0, 1, 0), (True, False, True, False)),
-        ((1, 1, 1, 0, 0, 1, 0, 0), (True, False, True, False)),
-        ((1, 1, 1, 1, 0, 0, 0, 1), (False, True, False, False)),
+        ((1, 1, 1, 0, 0, 0), (True, False, False)),
+        ((1, 1, 1, 1, 0, 0), (True, False, True)),
+        ((1, 1, 1, 0, 0, 1), (False, True, False)),
+        ((1, 1, 0, 0, 1, 0), (False, True, False)),
     ],
 )
 async def test_ep_step_begin_reuses_or_discards_with_global_state(global_state, expected):
@@ -126,14 +125,12 @@ async def test_ep_step_begin_reuses_or_discards_with_global_state(global_state, 
     decision = protocol.decide_step_begin(
         has_real_work=True,
         has_pending_forward=True,
-        has_pending_async_sample=True,
         pending_forward_reusable=True,
-        pending_forward_row_mapped=bool(global_state[4]),
+        pending_forward_row_mapped=bool(global_state[3]),
     )
     await protocol.complete_work_step()
 
     assert (
-        decision.use_pending_async_sample,
         decision.reuse_pending_forward,
         decision.discard_pending_forward,
         decision.row_mapped_forward,
@@ -142,7 +139,7 @@ async def test_ep_step_begin_reuses_or_discards_with_global_state(global_state, 
         "sync",
         EPAsyncPhase.STEP_BEGIN,
         0,
-        (1, 1, 1, 1, int(bool(global_state[4])), 0, 0, 0),
+        (1, 1, 1, int(bool(global_state[3])), 0, 0),
     )
 
 
@@ -191,9 +188,9 @@ def test_ep_async_handoff_launches_or_skips_with_global_state(
 def test_ep_protocol_diagnostics_count_reuse_discard_launch_and_skip():
     communicator = _RecordingEPCommunicator(
         sync_results=[
-            (1, 1, 1, 1, 0, 0, 0, 0),
+            (1, 1, 1, 0, 0, 0),
             1,
-            (1, 1, 1, 0, 0, 1, 0, 0),
+            (1, 1, 0, 0, 1, 0),
             1,
             (1, 1, 0),
             1,
@@ -206,14 +203,12 @@ def test_ep_protocol_diagnostics_count_reuse_discard_launch_and_skip():
     reuse = protocol.decide_step_begin(
         has_real_work=True,
         has_pending_forward=True,
-        has_pending_async_sample=True,
         pending_forward_reusable=True,
         pending_forward_row_mapped=False,
     )
     discard = protocol.decide_step_begin(
         has_real_work=True,
         has_pending_forward=True,
-        has_pending_async_sample=True,
         pending_forward_reusable=False,
         pending_forward_row_mapped=False,
     )
@@ -421,7 +416,6 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
             return EPStepBeginDecision(
                 step_id=4,
                 has_real_work=kwargs["has_real_work"],
-                use_pending_async_sample=kwargs["has_pending_async_sample"],
                 reuse_pending_forward=kwargs["pending_forward_reusable"],
                 discard_pending_forward=not kwargs["pending_forward_reusable"],
                 row_mapped_forward=kwargs["pending_forward_row_mapped"],
@@ -432,7 +426,7 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
     else:
         controller._ep_async_protocol = None
 
-    decision = controller._decide_ep_step_begin(has_real_work=True, pending_async_sample=True)
+    decision = controller._decide_ep_step_begin(has_real_work=True)
 
     assert controller._ep_async_handoff_decided_this_step is False
     assert controller._ep_async_handoff_decision_this_step is None
@@ -441,7 +435,6 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
             {
                 "has_real_work": True,
                 "has_pending_forward": pending_forward,
-                "has_pending_async_sample": True,
                 "pending_forward_reusable": row_status[0],
                 "pending_forward_row_mapped": row_status[1],
             }
@@ -558,12 +551,11 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
         "expected",
     ),
     [
-        ([1, 1], [0.0, 0.0], [False, False], [0, 0], False, (False, False, False), True),
-        ([4, 1], [0.0, 0.0], [False, False], [0, 0], False, (True, False, True), True),
-        ([1, 1], [0.0, 0.0], [True, False], [0, 0], True, (True, False, False), True),
-        ([1, 1], [0.0, 0.0], [False, False], [2, 0], True, (True, False, False), True),
-        ([1, 1], [0.0, 0.0], [True, False], [0, 0], True, (True, False, True), False),
-        ([1, 1], [0.0, 0.0], [False, False], [0, 0], True, (True, True, False), False),
+        ([1, 1], [0.0, 0.0], [False, False], [0, 0], False, (False, False), True),
+        ([4, 1], [0.0, 0.0], [False, False], [0, 0], False, (True, False), True),
+        ([1, 1], [0.0, 0.0], [True, False], [0, 0], True, (True, False), True),
+        ([1, 1], [0.0, 0.0], [False, False], [2, 0], True, (True, False), True),
+        ([1, 1], [0.0, 0.0], [False, False], [0, 0], True, (True, True), False),
     ],
 )
 def test_async_sampling_and_logprob_bookkeeping_matrix(
@@ -578,13 +570,12 @@ def test_async_sampling_and_logprob_bookkeeping_matrix(
         "return_log_probs": torch.tensor(return_log_probs, dtype=torch.bool),
         "top_n_logprobs": torch.tensor(top_n_logprobs, dtype=torch.int32),
     }
-    async_next_prepared, pending_forward_reused, async_sample_already_launched = bookkeeping_state
+    async_next_prepared, pending_forward_reused = bookkeeping_state
 
     assert (
         controller._should_collect_dynamic_sampling_bookkeeping(
             async_next_prepared=async_next_prepared,
             pending_forward_reused=pending_forward_reused,
-            async_sample_already_launched=async_sample_already_launched,
         )
         is expected
     )
@@ -596,9 +587,6 @@ def _install_async_prepare_stubs(
     disabled_reason=None,
     prepare_result=True,
     launch_decision=True,
-    logprob_results=False,
-    greedy=True,
-    async_decode_graph=None,
 ):
     events = []
     context = controller.inference_wrapped_model.inference_context
@@ -610,9 +598,6 @@ def _install_async_prepare_stubs(
         ("eligibility", reason)
     )
     controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
-    controller._get_async_decode_graph = lambda: async_decode_graph
-    controller._active_requests_need_logprob_results = lambda: logprob_results
-    controller._active_requests_use_greedy_sampling = lambda _count: greedy
 
     def _handoff(*, has_real_work, can_launch_async_handoff):
         events.append(("handoff", has_real_work, can_launch_async_handoff))
@@ -636,12 +621,10 @@ def _install_async_prepare_stubs(
         ("disabled", False, None),
         ("prepare_failed", False, "failed to prepare next-step metadata"),
         ("handoff_skipped", False, "ep async handoff skipped"),
-        ("logprobs", True, None),
-        ("non_greedy", True, None),
-        ("fallback_forward", True, None),
+        ("eligible", True, None),
     ],
 )
-def test_launch_async_decode_graph_handoff_paths(
+def test_prepare_async_decode_before_sampling_handoff_paths(
     monkeypatch, case, expected_ok, expected_disable_reason
 ):
     monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
@@ -652,22 +635,11 @@ def test_launch_async_decode_graph_handoff_paths(
         disabled_reason="blocked" if case == "disabled" else None,
         prepare_result=case != "prepare_failed",
         launch_decision=case != "handoff_skipped",
-        logprob_results=case == "logprobs",
-        greedy=case != "non_greedy",
     )
 
-    ok, sampled, mtp_sampled, sample_event, h2d_event, graph_launched = (
-        controller._try_launch_async_decode_graph(active_request_count=2)
-    )
+    ok = controller._try_prepare_async_decode_before_sampling()
 
     assert ok is expected_ok
-    assert (sampled, mtp_sampled, sample_event, h2d_event, graph_launched) == (
-        None,
-        None,
-        None,
-        None,
-        False,
-    )
     if case == "disabled":
         assert ("handoff", True, False) in events
         assert "prepare" not in events
@@ -677,58 +649,6 @@ def test_launch_async_decode_graph_handoff_paths(
         assert ("handoff", True, True) in events
     if expected_disable_reason is not None:
         assert ("disable", expected_disable_reason) in events
-
-
-@pytest.mark.internal
-@pytest.mark.parametrize("require_captured_graph", [False, True])
-def test_launch_async_decode_graph_captured_graph_launch_and_required_gate(
-    monkeypatch, require_captured_graph
-):
-    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
-    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    controller, _context = _make_async_gate_controller()
-    sample_ready_event = object()
-    h2d_done_event = object()
-    fake_graph = SimpleNamespace(
-        sample_ready_events=(sample_ready_event,), h2d_done_events=(h2d_done_event,)
-    )
-    events = _install_async_prepare_stubs(
-        controller, async_decode_graph=None if require_captured_graph else fake_graph
-    )
-    controller._launch_async_decode_graph = lambda graph: events.append(("launch", graph)) or 0
-    controller._async_transfer_samples_to_cpu = (
-        lambda active_count, event, sample_slot: events.append(
-            ("transfer", active_count, event, sample_slot)
-        )
-        or (torch.tensor([1, 2]), None, event)
-    )
-
-    ok, sampled, mtp_sampled, sample_event, h2d_event, graph_launched = (
-        controller._try_launch_async_decode_graph(
-            active_request_count=2, require_captured_graph=require_captured_graph
-        )
-    )
-
-    if require_captured_graph:
-        assert not ok
-        assert (sampled, mtp_sampled, sample_event, h2d_event, graph_launched) == (
-            None,
-            None,
-            None,
-            None,
-            False,
-        )
-        assert ("disable", "async decode graph not captured") in events
-        assert "prepare" not in events
-    else:
-        assert ok
-        assert sampled.tolist() == [1, 2]
-        assert mtp_sampled is None
-        assert sample_event is sample_ready_event
-        assert h2d_event is h2d_done_event
-        assert graph_launched
-        assert ("launch", fake_graph) in events
-        assert ("transfer", 2, sample_ready_event, 0) in events
 
 
 @pytest.mark.internal
@@ -847,7 +767,7 @@ def test_wait_for_dummy_context_h2d_synchronizes_once():
 
 
 @pytest.mark.internal
-def test_pending_async_forward_and_sample_cleanup_releases_only_when_needed():
+def test_pending_async_forward_cleanup_releases_only_when_needed():
     context = SimpleNamespace(release_count=0)
     context.release_deferred_async_kv_blocks = lambda: setattr(
         context, "release_count", context.release_count + 1
@@ -870,18 +790,6 @@ def test_pending_async_forward_and_sample_cleanup_releases_only_when_needed():
     assert controller._async_pending_cuda_graph_request_count is None
     assert controller._async_pending_forward_request_ids is None
     assert controller._async_discarded_forward_count == 1
-
-    controller._async_pending_sampled_tokens_cpu = torch.tensor([1])
-    controller._async_pending_sampled_mtp_tokens_cpu = torch.tensor([[2]])
-    controller._async_pending_sample_ready_event = object()
-    controller._async_pending_h2d_done_event = object()
-    controller._async_pending_sample_cuda_graph_request_count = 4
-    controller._clear_pending_async_sample()
-    assert controller._async_pending_sampled_tokens_cpu is None
-    assert controller._async_pending_sampled_mtp_tokens_cpu is None
-    assert controller._async_pending_sample_ready_event is None
-    assert controller._async_pending_h2d_done_event is None
-    assert controller._async_pending_sample_cuda_graph_request_count is None
 
 
 @pytest.mark.internal
@@ -1005,8 +913,6 @@ def test_dynamic_bookkeeping_marks_lifecycle_boundaries(
     controller._async_evict_boundary_count = 0
     if accepted_tokens is not None:
         controller._accepted_tokens_per_request = torch.tensor(accepted_tokens, dtype=torch.int64)
-    consumed_events = []
-    controller._mark_async_sample_copy_consumed = consumed_events.append
     sample_ready_event = _SyncEvent()
     h2d_done_event = _SyncEvent()
 
@@ -1035,7 +941,6 @@ def test_dynamic_bookkeeping_marks_lifecycle_boundaries(
     }
     assert sample_ready_event.sync_count == 1
     assert h2d_done_event.sync_count == 1
-    assert consumed_events == [sample_ready_event]
     assert controller._async_pause_boundary_count == 1
     assert controller._async_evict_boundary_count == 1
     assert controller._async_finish_boundary_count == int(expected_finish_counter == "base")
@@ -1238,14 +1143,10 @@ def test_row_mapped_mtp_sampling_uses_pending_forward_logits(materialize_only_la
 @pytest.mark.internal
 def test_inference_config_async_scheduling_flags_are_opt_in():
     default_config = InferenceConfig()
-    enabled_config = InferenceConfig(
-        enable_async_scheduling=True, enable_async_decode_graphs=True, logging_step_interval=0
-    )
+    enabled_config = InferenceConfig(enable_async_scheduling=True, logging_step_interval=0)
 
     assert not default_config.enable_async_scheduling
-    assert not default_config.enable_async_decode_graphs
     assert enabled_config.enable_async_scheduling
-    assert enabled_config.enable_async_decode_graphs
     assert enabled_config.logging_step_interval == 0
 
 

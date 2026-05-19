@@ -434,8 +434,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
-        controller.capture_async_decode_graphs()
-
         # Memory usage.
         time_end = time.time()
         mem_stats_end = torch.cuda.memory_stats()
@@ -2183,9 +2181,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             async_diag = self.controller.get_async_scheduling_diagnostics()
             if async_diag["enabled"]:
-                output_str += " ... async: fwd %d, graph %d, eligible %d/%d" % (
+                output_str += " ... async: fwd %d, eligible %d/%d" % (
                     async_diag["forward_launches"],
-                    async_diag["decode_graph_launches"],
                     async_diag["eligibility_passes"],
                     async_diag["eligibility_checks"],
                 )
