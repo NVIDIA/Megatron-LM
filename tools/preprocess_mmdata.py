@@ -97,64 +97,33 @@ def get_args():
     )
 
     group = parser.add_argument_group(title='tokenizer')
-    group.add_argument(
-        '--tokenizer-type',
-        type=str,
-        required=True,
-        choices=[
-            'BertWordPieceLowerCase',
-            'BertWordPieceCase',
-            'GPT2BPETokenizer',
-            'SentencePieceTokenizer',
-            'GPTSentencePieceTokenizer',
-        ],
-        help='What type of tokenizer to use.',
-    )
-    group.add_argument('--vocab-file', type=str, default=None, help='Path to the vocab file')
-    group.add_argument(
-        '--merge-file', type=str, default=None, help='Path to the BPE merge file (if necessary).'
-    )
-    group.add_argument(
-        '--append-eod', action='store_true', help='Append an <eod> token to the end of a document.'
-    )
-    group.add_argument(
-        '--lang',
-        type=str,
-        default='english',
-        help='Language to use for NLTK-powered sentence splitting.',
-    )
-    group.add_argument(
-        '--tokenizer-model', type=str, default=None, help='sentencepeice tokenizer model.'
-    )
-    group.add_argument(
-        '--metadata-path', type=str, default=None, help='Path to tokenizer metadata in json format.'
-    )
-    group.add_argument(
-        '--special-tokens',
-        type=str,
-        nargs='+',
-        default=None,
-        help='List of special tokens. For TikTokenizer needs to have '
-        '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]',
-    )
-    group.add_argument(
-        '--tokenizer-hf-no-use-fast',
-        action='store_true',
-        default=False,
-        help='Whether to use fast HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        '--tokenizer-hf-no-include-special-tokens',
-        action='store_true',
-        default=False,
-        help='Converting text to ids will not include special for HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        default=False,
-        help='Whether or not to allow PreTrainedTokenizer to execute remote code',
-    )
+    group.add_argument('--tokenizer-type', type=str, required=True,
+                       choices=['BertWordPieceLowerCase','BertWordPieceCase',
+                                'GPT2BPETokenizer', 'SentencePieceTokenizer', 'GPTSentencePieceTokenizer'],
+                       help='What type of tokenizer to use.')
+    group.add_argument('--vocab-file', type=str, default=None,
+                       help='Path to the vocab file')
+    group.add_argument('--merge-file', type=str, default=None,
+                       help='Path to the BPE merge file (if necessary).')
+    group.add_argument('--append-eod', action='store_true',
+                       help='Append an <eod> token to the end of a document.')
+    group.add_argument('--lang', type=str, default='english',
+                       help='Language to use for NLTK-powered sentence splitting.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='sentencepeice tokenizer model.')
+    group.add_argument('--metadata-path', type=str, default=None,
+                       help='Path to tokenizer metadata in json format.')
+    group.add_argument('--special-tokens', type=str, nargs='+', default=None,
+                       help='List of special tokens. For TikTokenizer needs to have '
+                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
+    group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
+                       help='Whether to use fast HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true', default=False,
+                       help='Converting text to ids will not include special for HuggingFace tokenizer.')
+    group.add_argument("--trust-remote-code", action="store_true", default=False,
+                       help='Whether or not to allow PreTrainedTokenizer to execute remote code')
+    group.add_argument("--pad-vocab-size", action="store_true", default=False,
+                       help='Whether to pad vocab size of the model automatically if padded_vocab_size is not provided.')
 
     group = parser.add_argument_group(title='output data')
     group.add_argument(
