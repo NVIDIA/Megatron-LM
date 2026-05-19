@@ -462,6 +462,13 @@ def inject_placeholders(
     Extracts all values from a given state dict to a flat dict, injecting
     placeholders instead to allow later recovery with `fill_placeholders`.
 
+    Keys in the returned dict are the on-disk DCP FQNs: `x.key` for ShardedTensor
+    / DTensor, and `x.unique_key` (i.e. `key + "/shard_<offset>_<shape>"`) for
+    ShardedObject. This matches the MCore async save convention
+    (`_replace_state_dict_keys_with_sharded_keys`, which keys ShardedObjects by
+    `unique_key`), so checkpoints produced by either save path use the same
+    on-disk FQN format and either path can load the other's checkpoint.
+
     When `keep_only_main_replica=True`, non-main-replica ShardedObjects are
     replaced with placeholders but not added to the extracted values, so each
     FQN gets written by exactly one rank. DTensors are not filtered because
@@ -472,12 +479,17 @@ def inject_placeholders(
     #  which computes DTensor.key
     extracted_values = {}
 
+    def _fqn(x: Union[ShardedBase, DTensor]) -> str:
+        return x.unique_key if isinstance(x, ShardedObject) else x.key
+
     def _replace_with_placeholder(x: Union[ShardedBase, DTensor]):
         if isinstance(x, DTensor):
             if not hasattr(x, 'key'):
                 raise NotImplementedError(f'DTensors currently require `key` attribute, got: {x}')
         elif not isinstance(x, ShardedBase):
             raise RuntimeError(f'Unexpected type {x} during placeholders injection')
+
+        fqn = _fqn(x)
 
         # On save we only emit one BYTE_IO write per FQN. ShardedObjects are
         # serialized via pickle (DCP's BYTE_IO path), which has no placement-level
@@ -490,12 +502,12 @@ def inject_placeholders(
             and isinstance(x, ShardedObject)
             and not is_main_replica(x.replica_id)
         ):
-            return PlaceholderValue(x.key)
+            return PlaceholderValue(fqn)
 
-        if x.key in extracted_values:
-            raise RuntimeError(f'Duplicated sharded key encountered: {x.key}')
-        extracted_values[x.key] = x
-        return PlaceholderValue(x.key)
+        if fqn in extracted_values:
+            raise RuntimeError(f'Duplicated sharded key encountered: {fqn}')
+        extracted_values[fqn] = x
+        return PlaceholderValue(fqn)
 
     dict_list_map_inplace(_replace_with_placeholder, sharded_state_dict)
     return extracted_values
@@ -537,21 +549,6 @@ class DTensorFormatSavePlanner(DefaultSavePlanner):
         if self.flatten_state_dict:
             plan = dataclasses.replace(plan, planner_data=self.mappings)
         self.plan = plan
-
-        # DEBUG: dump FQNs this rank is planning to write. Filter to optimizer
-        # bytes-IO entries to keep the log readable.
-        try:
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        except Exception:
-            rank = -1
-        optim_fqns = sorted(
-            it.index.fqn for it in self.plan.items
-            if "optimizer.distributed.dp_group_idx_" in it.index.fqn
-        )
-        logger.warning(
-            f"[DTensorFormatSavePlanner][rank={rank}] local plan optimizer FQNs "
-            f"({len(optim_fqns)}): {optim_fqns}"
-        )
         return self.plan
 
 
@@ -826,23 +823,6 @@ class TorchDistSaveShardedStrategy:
             # (e.g. per-rank optimizer state) survive the save — they're dropped by DCP's
             # default planner, which only writes BYTE_IO on the coordinator.
             values_to_save = inject_placeholders(sharded_state_dict, keep_only_main_replica=True)
-            # DEBUG: list optimizer FQNs surviving the main-replica filter on this rank.
-            try:
-                _rank = (
-                    torch.distributed.get_rank()
-                    if torch.distributed.is_initialized()
-                    else 0
-                )
-            except Exception:
-                _rank = -1
-            _optim_save_fqns = sorted(
-                k for k in values_to_save.keys()
-                if isinstance(k, str) and "optimizer.distributed.dp_group_idx_" in k
-            )
-            logger.warning(
-                f"[inject_placeholders/save][rank={_rank}] kept optimizer FQNs "
-                f"({len(_optim_save_fqns)}): {_optim_save_fqns}"
-            )
             values_to_save = convert_state_dict_to_dcp_compatible(values_to_save)
             return torch.distributed.checkpoint.save(
                 values_to_save,
@@ -1085,40 +1065,6 @@ class TorchDistLoadShardedStrategy:
             values_to_load = inject_placeholders(sharded_state_dict)
             values_to_load = convert_state_dict_to_dcp_compatible(values_to_load)
 
-            # DEBUG: list optimizer FQNs this rank is asking the load to fetch,
-            # plus the optimizer FQNs the on-disk metadata actually has.
-            try:
-                _rank = (
-                    torch.distributed.get_rank()
-                    if torch.distributed.is_initialized()
-                    else 0
-                )
-            except Exception:
-                _rank = -1
-            _optim_load_fqns = sorted(
-                k for k in values_to_load.keys()
-                if isinstance(k, str) and "optimizer.distributed.dp_group_idx_" in k
-            )
-            logger.warning(
-                f"[inject_placeholders/load][rank={_rank}] requested optimizer FQNs "
-                f"({len(_optim_load_fqns)}): {_optim_load_fqns}"
-            )
-            if _rank == 0:
-                try:
-                    from torch.distributed.checkpoint import FileSystemReader
-                    _reader = FileSystemReader(checkpoint_dir)
-                    _meta = _reader.read_metadata()
-                    _disk_optim = sorted(
-                        k for k in _meta.state_dict_metadata.keys()
-                        if "optimizer.distributed.dp_group_idx_" in k
-                    )
-                    logger.warning(
-                        f"[disk-metadata][rank=0] on-disk optimizer FQNs "
-                        f"({len(_disk_optim)}): {_disk_optim}"
-                    )
-                except Exception as _e:
-                    logger.warning(f"[disk-metadata][rank=0] failed to read: {_e}")
-
             torch.distributed.checkpoint.load(
                 state_dict=values_to_load, checkpoint_id=checkpoint_dir
             )
@@ -1203,10 +1149,12 @@ class TorchDistLoadShardedStrategy:
         for metadata_key, storage_metadata in metadata.state_dict_metadata.items():
             if not isinstance(storage_metadata, BytesStorageMetadata):
                 continue
-            # DTensor-format saves write plain dict-path keys (e.g. "optimizer.state.0.exp_avg")
-            # for non-tensor leaves, while the mcore save writes "<key>/shard_<offset>_<shape>".
-            # `empty_from_key` handles both: it parses the unique-key form when a "/" is present
-            # and otherwise returns a default ShardedObject keyed by the raw path.
+            # Both the DTensor-format save and the mcore async save write
+            # ShardedObjects under "<key>/shard_<offset>_<shape>" (the
+            # `ShardedObject.unique_key`). `empty_from_key` handles legacy
+            # plain-key entries as well: it parses the unique-key form when a "/"
+            # is present and otherwise returns a default ShardedObject keyed by
+            # the raw path.
             sh_obj = ShardedObject.empty_from_key(metadata_key)
             sharded_metadata[sh_obj.unique_key] = sh_obj
 
