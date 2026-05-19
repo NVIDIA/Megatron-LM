@@ -41,7 +41,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 )
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import get_pg_size, internal_api
+from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -361,7 +361,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
-            self.num_attention_layers = model_config.num_layers // pp_size
+            # Use the same per-PP-rank layer count as TransformerBlock (handles
+            # account_for_embedding_in_pipeline_split, account_for_loss_in_pipeline_split,
+            # uneven first/last PP stages, and pipeline_model_parallel_layout). Using
+            # num_layers // pp_size mis-sizes the KV layer_map and can raise KeyError in
+            # append_key_value_cache.
+            from megatron.core.transformer.transformer_block import get_num_layers_to_build
+
+            # Interleaved / virtual PP is not used for inference (see
+            # AbstractModelInferenceWrapper: Iterable models are rejected). Always pass
+            # vp_stage=None into get_num_layers_to_build, consistent with attention inference
+            # (e.g. get_transformer_layer_offset(..., vp_stage=None, pp_rank=...)).
+            # When pg_collection is set, use the PP group's rank (same as attention.py).
+            if pg_collection is not None:
+                pp_rank = get_pg_rank(pg_collection.pp)
+            else:
+                pp_rank = None
+            self.num_attention_layers = get_num_layers_to_build(
+                model_config, vp_stage=None, pp_rank=pp_rank
+            )
             self.num_mamba_layers = 0
             (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
