@@ -851,7 +851,6 @@ def _get_megatron_emerging_optimizer(
             pg_collection,
             init_state_fn_list=list(init_fns),
             model_chunks=model_chunks if config.overlap_param_gather else None,
-            overlap_param_gather=config.overlap_param_gather,
         )
 
     return ChainedOptimizer(results)

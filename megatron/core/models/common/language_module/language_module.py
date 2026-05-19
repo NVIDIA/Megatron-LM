@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
 try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
@@ -62,6 +63,20 @@ class LanguageModule(MegatronModule):
         self.embd_group = pg_collection.embd
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
+
+    def _setup_mtp_cuda_graphs(self):
+        """Wrap `compute_mtp_single_step` with a CudaGraphManager.
+
+        Must be called by subclasses after `self.mtp` is created.
+        """
+        if self.config.cuda_graph_impl == "local":
+            self._mtp_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_single_step",
+                need_backward=False,
+                is_mtp_inference=True,
+            )
 
     def _is_in_embd_group(self):
         if self.embd_group is None:
@@ -325,7 +340,11 @@ class LanguageModule(MegatronModule):
 
     @torch.inference_mode()
     def compute_mtp_single_step(
-        self, hidden_states: Tensor, next_token_ids: Tensor, position_ids: Tensor, depth: int
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: Optional[int] = None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 
@@ -336,13 +355,15 @@ class LanguageModule(MegatronModule):
             hidden_states (Tensor): Hidden states at last accepted positions.
             next_token_ids (Tensor): Correct next token IDs [1, N].
             position_ids (Tensor): Position IDs for the next tokens [1, N].
-            depth (int): MTP depth index (0-indexed).
+            depth (int, optional): MTP depth index. Only needed when
+                ``mtp_use_repeated_layer`` is False (each depth uses a
+                distinct layer). Omit for repeated-layer models so that a
+                single CUDA graph can serve all depths.
 
         Returns:
             tuple: (new_hidden_states, logits [N, 1, vocab_size]).
         """
-        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
-
+        layer_idx = 0 if depth is None else depth
         mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
             hidden_states=hidden_states,
             next_token_ids=next_token_ids,

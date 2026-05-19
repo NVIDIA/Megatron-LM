@@ -1377,7 +1377,7 @@ class ChainedOptimizer(MegatronOptimizer):
                         or (
                             # Megatron-FSDP always uses decoupled_grad with FusedAdam.
                             self.config.use_precision_aware_optimizer
-                            and getattr(params[0], "__fsdp_param__", False)
+                            and getattr(parameters[0], "__fsdp_param__", False)
                         )
                     ),
                 )

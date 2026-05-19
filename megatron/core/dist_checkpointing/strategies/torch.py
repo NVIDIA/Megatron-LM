@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
+import inspect
 import io
 import os
 import pickle
@@ -600,6 +601,7 @@ class TorchDistSaveShardedStrategy:
         thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
+        cpu_shm_mode: bool = False,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -614,6 +616,10 @@ class TorchDistSaveShardedStrategy:
                 gathering local metadata every checkpointing invocation
             separation_hint(str, optional): If provided, all tensors whose keys have this
                 prefix will be saved to a separate file.
+            cpu_shm_mode (bool, optional): Copy GPU tensors to CPU shared-memory in the
+                training process before handing off to the async worker. Avoids CUDA IPC /
+                NVLink fabric handles in the worker subprocess. Only applies with nvrx async
+                strategy.
         """
         self.backend = backend
         self.version = version
@@ -640,6 +646,7 @@ class TorchDistSaveShardedStrategy:
         self.cached_global_metadata: Optional[Metadata] = None
 
         self.separation_hint = separation_hint
+        self.cpu_shm_mode = cpu_shm_mode
 
         self.validated_loaded_metadata_reuse = False
 
@@ -698,6 +705,18 @@ class TorchDistSaveShardedStrategy:
                     self._metadata_cache.set_cached_global_metadata(self.cached_global_metadata)
             # Define additional arguments
             async_writer_kwargs["use_cached_data_structure"] = self.use_cached_ckpt_structure
+            if self.cpu_shm_mode:
+                if (
+                    "use_cpu_shm_for_gpu_tensors"
+                    in inspect.signature(async_writer.__init__).parameters
+                ):
+                    async_writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
+                else:
+                    raise AssertionError(
+                        "Installed nvidia-resiliency-ext does not support "
+                        "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
+                        "to enable cpu_shm_mode."
+                    )
             state_dict_saver_kwargs["enable_cache"] = self.use_cached_ckpt_structure
             state_dict_saver_kwargs["metadata_cache"] = self._metadata_cache
         else:

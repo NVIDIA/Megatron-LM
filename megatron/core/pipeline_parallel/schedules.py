@@ -219,6 +219,13 @@ def custom_backward(output, grad_output):
     )
 
 
+def get_tensor_device(tensor: Union[torch.Tensor, Dict[str, torch.Tensor]]):
+    """Get the device of a tensor or a dictionary of tensors."""
+    if isinstance(tensor, dict):
+        return next(iter(tensor.values())).device
+    return tensor.device
+
+
 def forward_step_calc_loss(
     model,
     output_tensor,
@@ -284,10 +291,11 @@ def forward_step_calc_loss(
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        device = get_tensor_device(output_tensor)
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:
@@ -299,10 +307,11 @@ def forward_step_calc_loss(
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        device = get_tensor_device(output_tensor)
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:
@@ -734,6 +743,15 @@ def forward_backward_no_pipelining(
 
     if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
+    # Reset all_gather_pipeline bucket status before next validation iteration
+    if forward_only:
+        for model_chunk in [model]:
+            if (
+                hasattr(model_chunk, 'ddp_config')
+                and model_chunk.ddp_config.use_megatron_fsdp
+                and model_chunk.ddp_config.overlap_param_gather
+            ):
+                model_chunk.synchronize_param_gather()
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
@@ -1547,6 +1565,11 @@ def forward_backward_pipelining_with_interleaving(
                 )
                 if "recv_prev" in fwd_wait_handles:
                     recv_prev_wait_handles.append(fwd_wait_handles.pop("recv_prev"))
+            # isend() copies asynchronously; wait until the copy is done before
+            # freeing the source buffer, otherwise the next PP stage gets corrupted data.
+            if send_next_wait_handle is not None and config.deallocate_pipeline_outputs:
+                send_next_wait_handle.wait()
+                send_next_wait_handle = None
 
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
             if recv_prev:
@@ -1669,6 +1692,11 @@ def forward_backward_pipelining_with_interleaving(
                     )
                     if "recv_prev" in fwd_wait_handles:
                         recv_prev_wait_handles.append(fwd_wait_handles.pop("recv_prev"))
+                # isend() copies asynchronously; wait until the copy is done before
+                # freeing the source buffer, otherwise the next PP stage gets corrupted data.
+                if send_next_wait_handle is not None and config.deallocate_pipeline_outputs:
+                    send_next_wait_handle.wait()
+                    send_next_wait_handle = None
                 # assert fwd_wait_handles is not None
 
                 # Put input_tensor and output_tensor_grad in data structures in the

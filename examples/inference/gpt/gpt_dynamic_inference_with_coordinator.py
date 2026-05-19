@@ -9,6 +9,7 @@ import warnings
 from collections import defaultdict
 from typing import List
 
+from megatron.training.arguments import parse_and_validate_args
 import torch
 import torch.distributed as dist
 
@@ -202,12 +203,12 @@ if __name__ == "__main__":
     # enable inference mode in the very beginning as some fp8 optimizations
     # check for it.
     with torch.inference_mode():
-        initialize_megatron(
+        args = parse_and_validate_args(
             extra_args_provider=add_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
+        initialize_megatron()
 
-        args = get_args()
         tokenizer = get_tokenizer()
 
         # Sampling params.

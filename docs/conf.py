@@ -99,7 +99,7 @@ if not skip_autodoc:
 html_theme = "nvidia_sphinx_theme"
 html_theme_options = {
     "switcher": {
-        "json_url": "versions1.json",
+        "json_url": "../versions1.json",
         "version_match": release,
     },
     "icon_links": [
@@ -109,7 +109,7 @@ html_theme_options = {
             "icon": "fa-brands fa-github",
         }
     ],
-    "public_docs_features": True
+    "public_docs_features": os.environ.get("SKIP_PUBLIC_DOCS_FEATURES", "false").lower() != "true",
 }
 html_extra_path = ["project.json", "versions1.json"]
 

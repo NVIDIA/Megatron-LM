@@ -16,3 +16,5 @@ from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
+
+from megatron.training.config.container import PretrainConfigContainer

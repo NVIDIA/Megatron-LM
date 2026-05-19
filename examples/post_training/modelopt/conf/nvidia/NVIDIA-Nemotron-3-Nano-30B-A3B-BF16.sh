@@ -51,5 +51,5 @@ MODEL_ARGS=" \
     --bf16 \
     --seq-length 8192 \
     --max-position-embeddings 8192 \
-    --export-model-type MambaModel \
+    --export-model-type HybridModel \
     "
