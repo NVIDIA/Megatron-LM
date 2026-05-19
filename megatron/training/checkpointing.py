@@ -39,14 +39,14 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
-from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model
+from .utils import append_to_progress_log, is_last_rank, print_rank_0
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
