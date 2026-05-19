@@ -158,3 +158,10 @@ class DistributedInitConfig:
     instead of local rank for CUDA device selection. This is useful when launching
     with external process managers that handle GPU visibility.
     """
+
+    fake_process_group: bool = False
+    """If True, initialize with fake distributed process group and all distributed communication 
+    operations will be skipped. This is quite useful for profiling memory usage of distributed
+    training with just one GPU. Setting WORLD_SIZE and RANK to the specific values for target
+    distributed scale.
+    """
