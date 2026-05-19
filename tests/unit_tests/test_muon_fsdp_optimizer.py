@@ -512,9 +512,12 @@ class TestFSDPTensorParallelMuon:
 
         dtensor = _make_hfsdp_dtensor(local_update.clone(), full_update.shape, device_mesh)
         param = nn.Parameter(dtensor)
-        optimizer = _make_fsdp_muon([param], dp_group=device_mesh.get_group("dp"))
+        optimizer = _make_fsdp_muon([param], dp_group=torch.distributed.group.WORLD)
 
-        assert optimizer._get_uneven_gather_plan(param) is None
+        plan = optimizer._get_uneven_gather_plan(param)
+        assert plan is not None
+        assert plan["shard_mesh_dims"] == (0, 1)
+        assert len(plan["stages"]) == 2
 
         gathered = optimizer._gather_full_uneven_local_tensor_like(param, local_update)
         ref_dtensor = optimizer._dtensor_from_local_like(param, local_update)
@@ -524,6 +527,53 @@ class TestFSDPTensorParallelMuon:
             expected, full_update
         ), f"generic HFSDP gather mismatch on rank {dp_rank}"
         assert torch.equal(gathered, expected), f"Muon HFSDP gather mismatch on rank {dp_rank}"
+
+    @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP cache test requires at least 4 ranks")
+    def test_hfsdp_boundary_metadata_collectives_are_cached_across_steps(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("HFSDP cache test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        logical_rank = inner_rank * outer_size + outer_rank
+
+        rows, cols = dp_size * 3 + 5, 4
+        full_param = (
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) / 100
+        )
+        full_grad = (
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) / 50
+            + 0.1
+        )
+        rows_per_logical_rank = [
+            rows // dp_size + (1 if rank < rows % dp_size else 0) for rank in range(dp_size)
+        ]
+        row_start = sum(rows_per_logical_rank[:logical_rank])
+        row_count = rows_per_logical_rank[logical_rank]
+
+        local_param = full_param[row_start : row_start + row_count].contiguous()
+        param = nn.Parameter(_make_hfsdp_dtensor(local_param, full_param.shape, device_mesh))
+        local_grad = full_grad[row_start : row_start + row_count].contiguous()
+        param.grad = _make_hfsdp_dtensor(local_grad, full_grad.shape, device_mesh)
+
+        optimizer = _make_fsdp_muon([param], dp_group=torch.distributed.group.WORLD)
+
+        with patch(
+            "torch.distributed.all_gather_object", wraps=torch.distributed.all_gather_object
+        ) as mocked_all_gather_object:
+            optimizer.step()
+            first_step_calls = mocked_all_gather_object.call_count
+            optimizer.step()
+
+        assert first_step_calls > 0
+        assert mocked_all_gather_object.call_count == first_step_calls
 
     def test_step_batches_multiple_split_boundary_params(self):
         from torch.distributed.device_mesh import init_device_mesh

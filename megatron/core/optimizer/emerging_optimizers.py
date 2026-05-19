@@ -621,12 +621,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     "Expected Shard, _StridedShard, or Replicate."
                 )
 
-        if len(shard_mesh_dims) != 1:
-            # The fast path below issues one all-gather over one process group,
-            # so it is only correct for layouts with a single sharded mesh
-            # dimension. HFSDP layouts shard over both DP-inner and DP-outer
-            # mesh dimensions and must use the generic M-FSDP helper, which
-            # gathers each sharded mesh dimension in order.
+        if not shard_mesh_dims:
             return None
 
         if not hasattr(dtensor_ref._local_tensor, "__create_chunk_list__"):
@@ -640,28 +635,57 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
 
         local_tensor = dtensor_ref._local_tensor
         local_chunk_metadata = chunk_metadata_list[0]
-        local_chunks_info = [
-            {"shape": torch.Size(local_tensor.shape), "offset": tuple(local_chunk_metadata.offsets)}
-        ]
-        shard_group = dtensor_ref.device_mesh.get_group(shard_mesh_dims[0])
-        group_chunks_info: list[list[dict[str, Any]] | None] = [None] * shard_group.size()
-        torch.distributed.all_gather_object(group_chunks_info, local_chunks_info, group=shard_group)
 
-        chunk_infos = [
-            {
-                "shape": torch.Size(chunk_info["shape"]),
-                "offset": tuple(chunk_info["offset"]),
-                "numel": torch.Size(chunk_info["shape"]).numel(),
-            }
-            for chunks_info in group_chunks_info
-            if chunks_info is not None
-            for chunk_info in chunks_info
+        def _normalize_chunk_info(chunk_info: dict[str, Any]) -> dict[str, Any]:
+            shape = torch.Size(chunk_info["shape"])
+            return {"shape": shape, "offset": tuple(chunk_info["offset"]), "numel": shape.numel()}
+
+        local_chunks_info = [
+            _normalize_chunk_info(
+                {
+                    "shape": torch.Size(local_tensor.shape),
+                    "offset": tuple(local_chunk_metadata.offsets),
+                }
+            )
         ]
+        stages = []
+        for shard_mesh_dim in shard_mesh_dims:
+            shard_group = dtensor_ref.device_mesh.get_group(shard_mesh_dim)
+            group_chunks_info: list[list[dict[str, Any]] | None] = [None] * shard_group.size()
+            torch.distributed.all_gather_object(
+                group_chunks_info, local_chunks_info, group=shard_group
+            )
+            if any(chunks_info is None for chunks_info in group_chunks_info):
+                raise AssertionError(
+                    "Uneven DTensor gather metadata exchange returned an incomplete result."
+                )
+
+            stage_chunks_info = [
+                [_normalize_chunk_info(chunk_info) for chunk_info in chunks_info]
+                for chunks_info in group_chunks_info
+                if chunks_info is not None
+            ]
+            stages.append(
+                {
+                    "shard_group": shard_group,
+                    "rank_numels": [
+                        sum(chunk_info["numel"] for chunk_info in chunks_info)
+                        for chunks_info in stage_chunks_info
+                    ],
+                }
+            )
+            local_chunks_info = [
+                chunk_info for chunks_info in stage_chunks_info for chunk_info in chunks_info
+            ]
+
+        chunk_infos = local_chunks_info
         plan = {
-            "shard_group": shard_group,
             "shard_mesh_dims": tuple(shard_mesh_dims),
+            "stages": stages,
             "chunk_infos": chunk_infos,
         }
+        if len(stages) == 1:
+            plan["shard_group"] = stages[0]["shard_group"]
         self._uneven_gather_plan_cache[cache_key] = plan
         return plan
 
@@ -683,19 +707,55 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             self._copy_dtensor_chunk_metadata(dtensor_ref, local_dtensor)
             return None if local_tensor.numel() == 0 else full_tensor
 
-        if len(plan["shard_mesh_dims"]) != 1:
-            raise AssertionError(
-                "Single-group uneven DTensor gather plan was created for a layout with "
-                f"{len(plan['shard_mesh_dims'])} sharded mesh dimensions. "
-                "HFSDP/multi-shard layouts must use redistribute_uneven_dtensor_to_replicated."
-            )
-
         local_buffer = local_tensor.contiguous().view(-1)
-        group_tensors = [
-            torch.empty(chunk_info["numel"], dtype=local_tensor.dtype, device=local_tensor.device)
-            for chunk_info in plan["chunk_infos"]
-        ]
-        torch.distributed.all_gather(group_tensors, local_buffer, group=plan["shard_group"])
+        if len(plan["stages"]) == 1:
+            stage = plan["stages"][0]
+            shard_group = stage["shard_group"]
+            group_rank = torch.distributed.get_rank(shard_group)
+            expected_local_numel = stage["rank_numels"][group_rank]
+            if local_buffer.numel() != expected_local_numel:
+                raise AssertionError(
+                    "Uneven DTensor gather local buffer size mismatch: "
+                    f"got {local_buffer.numel()}, expected {expected_local_numel}."
+                )
+            group_tensors = [
+                torch.empty(numel, dtype=local_tensor.dtype, device=local_tensor.device)
+                for numel in stage["rank_numels"]
+            ]
+            torch.distributed.all_gather(group_tensors, local_buffer, group=shard_group)
+
+            if local_tensor.numel() == 0:
+                return None
+
+            full_tensor = torch.empty(
+                dtensor_ref.shape, dtype=local_tensor.dtype, device=local_tensor.device
+            )
+            assigned_numel = 0
+            for chunk_info, gathered_tensor in zip(plan["chunk_infos"], group_tensors):
+                chunk_shape = chunk_info["shape"]
+                offset = chunk_info["offset"]
+                slices = tuple(slice(o, o + s) for o, s in zip(offset, chunk_shape))
+                full_tensor[slices] = gathered_tensor.view(chunk_shape)
+                assigned_numel += chunk_info["numel"]
+
+            _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
+            return full_tensor
+
+        for stage in plan["stages"]:
+            shard_group = stage["shard_group"]
+            group_rank = torch.distributed.get_rank(shard_group)
+            expected_local_numel = stage["rank_numels"][group_rank]
+            if local_buffer.numel() != expected_local_numel:
+                raise AssertionError(
+                    "Uneven DTensor gather local buffer size mismatch: "
+                    f"got {local_buffer.numel()}, expected {expected_local_numel}."
+                )
+            group_tensors = [
+                torch.empty(numel, dtype=local_tensor.dtype, device=local_tensor.device)
+                for numel in stage["rank_numels"]
+            ]
+            torch.distributed.all_gather(group_tensors, local_buffer, group=shard_group)
+            local_buffer = torch.cat(group_tensors)
 
         if local_tensor.numel() == 0:
             return None
@@ -704,12 +764,16 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             dtensor_ref.shape, dtype=local_tensor.dtype, device=local_tensor.device
         )
         assigned_numel = 0
-        for chunk_info, gathered_tensor in zip(plan["chunk_infos"], group_tensors):
+        buffer_offset = 0
+        for chunk_info in plan["chunk_infos"]:
             chunk_shape = chunk_info["shape"]
+            chunk_numel = chunk_info["numel"]
+            gathered_tensor = local_buffer[buffer_offset : buffer_offset + chunk_numel]
+            buffer_offset += chunk_numel
             offset = chunk_info["offset"]
             slices = tuple(slice(o, o + s) for o, s in zip(offset, chunk_shape))
             full_tensor[slices] = gathered_tensor.view(chunk_shape)
-            assigned_numel += chunk_info["numel"]
+            assigned_numel += chunk_numel
 
         _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
         return full_tensor
@@ -737,10 +801,10 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                 )
                 continue
             if len(plan["shard_mesh_dims"]) != 1:
-                raise AssertionError(
-                    "Batched uneven DTensor gather only supports single-shard layouts; "
-                    "multi-shard layouts must use redistribute_uneven_dtensor_to_replicated."
+                results[item_idx] = self._gather_full_uneven_local_tensor_like(
+                    dtensor_ref, local_tensor
                 )
+                continue
 
             key = (id(plan["shard_group"]), local_tensor.dtype, local_tensor.device)
             batch = batches.setdefault(
