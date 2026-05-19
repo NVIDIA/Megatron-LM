@@ -561,11 +561,10 @@ _BIK_BACKEND: str = "deepgemm"
 
 
 def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """`a @ b` via DeepGEMM `bf16_gemm_nt`.
+    """`a @ b` via DeepGEMM `bf16_gemm_nn`. Both inputs are row-major.
 
-    `aten::mm` is (M, K) @ (K, N). DeepGEMM NT layout is (M, K) @ (N, K).T,
-    so we transpose B before passing. Bitwise-identical to `torch.mm` on
-    Hopper/Blackwell, deterministic across runs, batch-invariant.
+    Bitwise-identical to `torch.mm` on Hopper/Blackwell, deterministic across
+    runs, batch-invariant.
     """
     if a.dtype != torch.bfloat16:
         raise RuntimeError(
@@ -575,7 +574,7 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     M = a.shape[0]
     N = b.shape[1]
     d = torch.empty(M, N, device=a.device, dtype=a.dtype)
-    deep_gemm.bf16_gemm_nt(a, b.transpose(0, 1).contiguous(), d)
+    deep_gemm.bf16_gemm_nn(a, b, d)
     return d
 
 

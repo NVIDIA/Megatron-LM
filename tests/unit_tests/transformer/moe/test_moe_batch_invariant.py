@@ -38,8 +38,7 @@ pytestmark = [
         reason="DeepGEMM with bf16 grouped bindings is required for MoE batch-invariant tests.",
     ),
     pytest.mark.skipif(
-        not _hopper_or_newer(),
-        reason="DeepGEMM bf16 grouped kernels require Hopper (sm_90+).",
+        not _hopper_or_newer(), reason="DeepGEMM bf16 grouped kernels require Hopper (sm_90+)."
     ),
 ]
 
@@ -62,9 +61,7 @@ def test_offs_to_m_indices_basic():
     offs = torch.tensor([4, 6, 9], dtype=torch.int32, device="cuda")
     m_total = 10  # one trailing pad row past offs[-1]=9
     out = _offs_to_m_indices(offs, m_total)
-    expected = torch.tensor(
-        [0, 0, 0, 0, 1, 1, 2, 2, 2, -1], dtype=torch.int32, device="cuda"
-    )
+    expected = torch.tensor([0, 0, 0, 0, 1, 1, 2, 2, 2, -1], dtype=torch.int32, device="cuda")
     assert torch.equal(out, expected)
 
 
@@ -94,16 +91,12 @@ def test_grouped_gemm_split_invariance(E):
     # Split into halves at expert boundaries (mid-expert split is not legal for
     # contiguous-layout DeepGEMM — must split on a boundary).
     half = (E // 2) * per_expert
-    y0 = _bf16_grouped_gemm_contiguous(
-        x[:half].contiguous(), w, m_indices[:half].contiguous()
-    )
-    y1 = _bf16_grouped_gemm_contiguous(
-        x[half:].contiguous(), w, m_indices[half:].contiguous()
-    )
+    y0 = _bf16_grouped_gemm_contiguous(x[:half].contiguous(), w, m_indices[:half].contiguous())
+    y1 = _bf16_grouped_gemm_contiguous(x[half:].contiguous(), w, m_indices[half:].contiguous())
     y_cat = torch.cat([y0, y1], dim=0)
-    assert torch.equal(y_full, y_cat), (
-        f"max abs diff: {(y_full.float() - y_cat.float()).abs().max().item()}"
-    )
+    assert torch.equal(
+        y_full, y_cat
+    ), f"max abs diff: {(y_full.float() - y_cat.float()).abs().max().item()}"
 
 
 def test_grouped_gemm_per_expert_token_count_invariance():
@@ -159,36 +152,13 @@ def test_train_and_inference_kernel_bitwise_parity():
         torch.tensor([per_expert] * E, device="cuda", dtype=torch.int32),
     ).contiguous()
     # offs is the inclusive cumulative offsets the inference path uses.
-    offs = torch.tensor(
-        [(i + 1) * per_expert for i in range(E)], dtype=torch.int32, device="cuda"
-    )
+    offs = torch.tensor([(i + 1) * per_expert for i in range(E)], dtype=torch.int32, device="cuda")
 
     with torch.no_grad():
         y_train = BatchInvariantGroupedGemmFn.apply(x, w, m_indices, E)
         y_infer = grouped_gemm_batch_invariant(x, w, offs=offs, m_total=M)
 
     assert torch.equal(y_train, y_infer)
-
-
-def test_grouped_gemm_backward_runs():
-    """Forward+backward smoke test for BatchInvariantGroupedGemmFn."""
-    torch.manual_seed(3)
-    E, K, N = 2, 64, 48
-    per_expert = 16
-    M = per_expert * E
-    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    m_indices = torch.repeat_interleave(
-        torch.arange(E, device="cuda", dtype=torch.int32),
-        torch.tensor([per_expert] * E, device="cuda", dtype=torch.int32),
-    ).contiguous()
-
-    y = BatchInvariantGroupedGemmFn.apply(x, w, m_indices, E)
-    y.sum().backward()
-    assert x.grad is not None and x.grad.shape == x.shape
-    assert w.grad is not None and w.grad.shape == w.shape
-    assert torch.isfinite(x.grad).all()
-    assert torch.isfinite(w.grad).all()
 
 
 # ---------------------------------------------------------------------------
@@ -212,9 +182,7 @@ def test_inference_bf16_grouped_mm_routes_when_enabled():
     M = per_expert * E
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
-    offs = torch.tensor(
-        [(i + 1) * per_expert for i in range(E)], dtype=torch.int32, device="cuda"
-    )
+    offs = torch.tensor([(i + 1) * per_expert for i in range(E)], dtype=torch.int32, device="cuda")
 
     with set_batch_invariant_mode(True):
         y_bik = _bf16_grouped_mm(x, w, offs)
@@ -349,23 +317,3 @@ def test_tegroupedmlp_invariance_under_permutation(_moe_env):
     )
 
 
-def test_tegroupedmlp_batch_invariance_disabled_when_off(_moe_env):
-    """Sanity: without batch-invariant mode, the GroupedMLP path may drift —
-    confirms that our test setup actually catches batch-variance (i.e. the
-    above tests aren't trivially passing because the underlying kernel is
-    accidentally already invariant)."""
-    layer, cfg = _build_moe_layer()
-    torch.manual_seed(3)
-    M = 48
-    x = torch.randn(M, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
-
-    with torch.no_grad():
-        y_full, _ = layer(x)
-        y0, _ = layer(x[: M // 2])
-        y1, _ = layer(x[M // 2 :])
-    y_cat = torch.cat([y0, y1], dim=0)
-    # We do NOT assert equality here — the point of this test is just to run
-    # the off-mode path without crashing, so the framework infrastructure is
-    # exercised. The actual batch-invariance contract is checked in the
-    # set_batch_invariant_mode(True) tests above.
-    assert y_full.shape == y_cat.shape

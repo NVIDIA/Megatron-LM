@@ -530,6 +530,7 @@ def unpermute(
     elif torch.are_deterministic_algorithms_enabled():
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
     else:
+        # Scatter add the permuted_input back to the original positions
         output_tokens.scatter_add_(
             0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
         )

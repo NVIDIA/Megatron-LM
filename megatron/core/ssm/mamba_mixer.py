@@ -973,9 +973,7 @@ class MambaMixer(MegatronModule):
             tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
 
             if self.config.batch_invariant_mode and cu_seqlens is not None:
-                self._bik_seed_decode_buffers(
-                    x, dt, B, C, z, cu_seqlens, batch_indices, ssm_state
-                )
+                self._bik_seed_decode_buffers(x, dt, B, C, z, cu_seqlens, batch_indices, ssm_state)
 
             # Write intermediate states to pre-allocated output buffers
             # All tensor ops, no Python loops, fully CUDA graph compatible
@@ -1070,21 +1068,11 @@ class MambaMixer(MegatronModule):
         if hasattr(self, "_bik_chunk_x_buf"):
             return
         buf_len = self.chunk_size
-        self._bik_chunk_x_buf = torch.zeros(
-            max_batch, buf_len, nh, p, device=device, dtype=x_dtype
-        )
-        self._bik_chunk_dt_buf = torch.zeros(
-            max_batch, buf_len, nh, device=device, dtype=dt_dtype
-        )
-        self._bik_chunk_B_buf = torch.zeros(
-            max_batch, buf_len, ng, n, device=device, dtype=B_dtype
-        )
-        self._bik_chunk_C_buf = torch.zeros(
-            max_batch, buf_len, ng, n, device=device, dtype=C_dtype
-        )
-        self._bik_chunk_z_buf = torch.zeros(
-            max_batch, buf_len, nh, p, device=device, dtype=z_dtype
-        )
+        self._bik_chunk_x_buf = torch.zeros(max_batch, buf_len, nh, p, device=device, dtype=x_dtype)
+        self._bik_chunk_dt_buf = torch.zeros(max_batch, buf_len, nh, device=device, dtype=dt_dtype)
+        self._bik_chunk_B_buf = torch.zeros(max_batch, buf_len, ng, n, device=device, dtype=B_dtype)
+        self._bik_chunk_C_buf = torch.zeros(max_batch, buf_len, ng, n, device=device, dtype=C_dtype)
+        self._bik_chunk_z_buf = torch.zeros(max_batch, buf_len, nh, p, device=device, dtype=z_dtype)
         self._bik_chunk_count = torch.zeros(max_batch, device=device, dtype=torch.int32)
         # True when prefill_len < chunk_size for this slot: decode must pass
         # initial_states=None on its first call instead of reading ssm_state.
@@ -1115,8 +1103,7 @@ class MambaMixer(MegatronModule):
         p = x.shape[-1]
         ng, n = B.shape[-2], B.shape[-1]
         self._bik_ensure_chunk_buffers(
-            max_batch, nh, p, ng, n, x.device,
-            x.dtype, dt.dtype, B.dtype, C.dtype, z.dtype,
+            max_batch, nh, p, ng, n, x.device, x.dtype, dt.dtype, B.dtype, C.dtype, z.dtype
         )
         z_flat = z.squeeze(0) if z.dim() == 4 else z
         num_prefill = cu_seqlens.numel() - 1
@@ -1173,9 +1160,11 @@ class MambaMixer(MegatronModule):
         B = rearrange(B, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
         C = rearrange(C, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
         x = rearrange(x, "b s (h p) -> b s h p", p=self.headdim)
-        z = rearrange(z, "b s (h p) -> b s h p", p=self.headdim) if (
-            z is not None and not self.rmsnorm
-        ) else None
+        z = (
+            rearrange(z, "b s (h p) -> b s h p", p=self.headdim)
+            if (z is not None and not self.rmsnorm)
+            else None
+        )
 
         A = -torch.exp(self.cp.get_A_log().float())
         D = (
@@ -1197,8 +1186,16 @@ class MambaMixer(MegatronModule):
         # flow; this covers requests that reach decode without a prefill
         # pass through this layer in the current process).
         self._bik_ensure_chunk_buffers(
-            ssm_state.shape[0], nh, p, ng, n, dev,
-            x.dtype, dt.dtype, B.dtype, C.dtype,
+            ssm_state.shape[0],
+            nh,
+            p,
+            ng,
+            n,
+            dev,
+            x.dtype,
+            dt.dtype,
+            B.dtype,
+            C.dtype,
             z.dtype if z is not None else x.dtype,
         )
 
@@ -1228,19 +1225,30 @@ class MambaMixer(MegatronModule):
             if z is not None:
                 self._bik_chunk_z_buf[slot, cnt] = z[i, 0]
 
-            x_buf = self._bik_chunk_x_buf[slot:slot + 1, :cnt + 1]
-            dt_buf = self._bik_chunk_dt_buf[slot:slot + 1, :cnt + 1]
-            B_buf = self._bik_chunk_B_buf[slot:slot + 1, :cnt + 1]
-            C_buf = self._bik_chunk_C_buf[slot:slot + 1, :cnt + 1]
-            z_buf = self._bik_chunk_z_buf[slot:slot + 1, :cnt + 1] if z is not None else None
+            x_buf = self._bik_chunk_x_buf[slot : slot + 1, : cnt + 1]
+            dt_buf = self._bik_chunk_dt_buf[slot : slot + 1, : cnt + 1]
+            B_buf = self._bik_chunk_B_buf[slot : slot + 1, : cnt + 1]
+            C_buf = self._bik_chunk_C_buf[slot : slot + 1, : cnt + 1]
+            z_buf = self._bik_chunk_z_buf[slot : slot + 1, : cnt + 1] if z is not None else None
 
-            init = None if bool(self._bik_state_is_zero[slot]) else (
-                ssm_state[slot:slot + 1].contiguous()
+            init = (
+                None
+                if bool(self._bik_state_is_zero[slot])
+                else (ssm_state[slot : slot + 1].contiguous())
             )
             y_run, new_state = mamba_chunk_scan_combined(
-                x_buf, dt_buf, A, B_buf, C_buf, self.chunk_size,
-                D=D, z=z_buf, dt_bias=dt_bias, dt_softplus=True,
-                initial_states=init, return_final_states=True,
+                x_buf,
+                dt_buf,
+                A,
+                B_buf,
+                C_buf,
+                self.chunk_size,
+                D=D,
+                z=z_buf,
+                dt_bias=dt_bias,
+                dt_softplus=True,
+                initial_states=init,
+                return_final_states=True,
             )
             outs.append(y_run[:, -1:])
 
