@@ -575,6 +575,49 @@ class TestFSDPTensorParallelMuon:
         assert first_step_calls > 0
         assert mocked_all_gather_object.call_count == first_step_calls
 
+    @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP boundary test requires at least 4 ranks")
+    def test_hfsdp_boundary_detector_uses_local_split_union_when_flat_metadata_misses_outer_split(
+        self,
+    ):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("HFSDP boundary test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        logical_rank = inner_rank * outer_size + outer_rank
+
+        rows, cols = dp_size * 2 + 1, 4
+        full_param = torch.zeros(rows, cols, device="cuda")
+        rows_per_logical_rank = [
+            rows // dp_size + (1 if rank < rows % dp_size else 0) for rank in range(dp_size)
+        ]
+        row_start = sum(rows_per_logical_rank[:logical_rank])
+        row_count = rows_per_logical_rank[logical_rank]
+        local_param = full_param[row_start : row_start + row_count].contiguous()
+        param = nn.Parameter(_make_hfsdp_dtensor(local_param, full_param.shape, device_mesh))
+
+        # The fake flat bucket says the item is wholly inside one shard. HFSDP
+        # still exposes a partial local DTensor shard, so Muon must gather it.
+        bucket = _make_fake_mfsdp_bucket(
+            bucket_id=0,
+            dp_rank=torch.distributed.get_rank(),
+            dp_size=dp_size,
+            shard_size=full_param.numel() * 2,
+        )
+        _attach_fake_mfsdp_bucket_metadata(param, bucket, item_id=0, offset=0)
+
+        optimizer = _make_fsdp_muon([param], dp_group=torch.distributed.group.WORLD)
+
+        assert optimizer._mfsdp_param_crosses_shard_boundary(param, 0) is False
+        assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0}
+
     def test_step_batches_multiple_split_boundary_params(self):
         from torch.distributed.device_mesh import init_device_mesh
 

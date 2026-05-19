@@ -527,13 +527,11 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         if local_tensor.numel() > 0:
             local_is_partial = tuple(param.shape) != tuple(local_tensor.shape)
             if local_is_partial and not crosses_boundary:
-                raise AssertionError(
-                    "M-FSDP DTensor local shape indicates a split parameter, but flat "
-                    "bucket metadata does not cross a shard boundary: "
-                    f"param_idx={param_idx}, item=({item_start}, {item_end}), "
-                    f"shard_size={shard_size}, global_shape={tuple(param.shape)}, "
-                    f"local_shape={tuple(local_tensor.shape)}."
-                )
+                # HFSDP can introduce a second sharding dimension after the
+                # flat bucket metadata has identified an inner-DP shard. The
+                # caller globally unions these local split observations so
+                # empty ranks still participate in the required collective.
+                return False
 
         return crosses_boundary
 
@@ -548,6 +546,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         has_mfsdp_params = any(getattr(param, "orig_param", None) is not None for param in params)
         if has_mfsdp_params:
             result = set()
+            local_split_indices = []
             for idx, param in enumerate(params):
                 if getattr(param, "orig_param", None) is None:
                     raise AssertionError(
@@ -556,6 +555,23 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     )
                 if self._mfsdp_param_crosses_shard_boundary(param, idx):
                     result.add(idx)
+                elif self._needs_boundary_gather(param):
+                    local_split_indices.append(idx)
+            if self.dp_group is not None and get_pg_size(self.dp_group) > 1:
+                gathered_local_split_indices: list[list[int] | None] = [None] * get_pg_size(
+                    self.dp_group
+                )
+                torch.distributed.all_gather_object(
+                    gathered_local_split_indices, local_split_indices, group=self.dp_group
+                )
+                result.update(
+                    idx
+                    for rank_indices in gathered_local_split_indices
+                    if rank_indices is not None
+                    for idx in rank_indices
+                )
+            else:
+                result.update(local_split_indices)
             self._boundary_gather_indices_cache[cache_key] = result
             return result
 
