@@ -165,3 +165,8 @@ class DistributedInitConfig:
     training with just one GPU. Setting WORLD_SIZE and RANK to the specific values for target
     distributed scale.
     """
+
+    use_decentralized_pg: bool = False
+    """Use ProcessGroupCollection passed through functions instead of relying on mcore's
+    global parallel state (mpu) variables. When True, parallel groups are obtained from
+    the pg_collection object rather than the global megatron.core.parallel_state module."""
