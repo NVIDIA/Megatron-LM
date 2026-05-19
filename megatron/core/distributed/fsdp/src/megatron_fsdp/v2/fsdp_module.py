@@ -284,7 +284,7 @@ class FSDPModule(nn.Module):
                 recurse=False,
             )
             init_context = (
-                mp_policy.model_init_context() if mp_policy is not None else nullcontext()
+                mp_policy.model_init_context(m) if mp_policy is not None else nullcontext()
             )
             with init_context:
                 if hasattr(m, "reset_parameters"):
@@ -558,17 +558,23 @@ class FSDPModule(nn.Module):
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
-        """Scale gradients by a factor (e.g., for loss scaling)."""
+        """Scale optimizer-facing gradients by a factor."""
         ctx = self._fsdp_root_context
         torch.cuda.current_stream().wait_stream(ctx.rs_stream)
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                for dist_grad in param_group.dist_grads:
-                    if dist_grad is None:
+                for dist_param in param_group.dist_params:
+                    grad = getattr(dist_param, "decoupled_grad", None)
+                    if grad is None:
+                        grad = dist_param.grad
+                    if grad is None:
                         continue
-                    dist_grad._local_tensor.mul_(scaling_factor)
+                    if isinstance(grad, DTensor):
+                        grad._local_tensor.mul_(scaling_factor)
+                    else:
+                        grad.mul_(scaling_factor)
 
     def _zero_grad_buffer(self):
         """Zero the gradient buffer for all parameter groups."""

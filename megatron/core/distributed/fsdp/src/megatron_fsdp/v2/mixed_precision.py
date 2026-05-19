@@ -7,7 +7,7 @@ config objects belongs in the adapter layer.
 """
 
 import inspect
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from importlib.metadata import version
 from typing import List, Optional, Tuple
@@ -87,6 +87,18 @@ except Exception:
     except Exception:
         QUANTIZED_MODEL_INIT_CLASS = nullcontext
 
+try:
+    from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+except Exception:
+    TransformerEngineBaseModule = None
+
+try:
+    from megatron.core.tensor_parallel import get_cuda_rng_tracker
+except Exception:
+    from ..utils import get_cuda_rng_tracker
+
+from ..utils import _MODEL_PARALLEL_RNG_TRACKER_NAME
+
 if not HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
     try:
         from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
@@ -159,22 +171,35 @@ class FullyShardMixedPrecisionPolicy:
         object.__setattr__(self, "fp8_recipe", self.fp8.recipe)
         object.__setattr__(self, "keep_fp8_transpose_cache", self.fp8.keep_transpose_cache)
 
-    def model_init_context(self):
+    @contextmanager
+    def model_init_context(self, module: Optional[torch.nn.Module] = None):
         """Return the model-init context for mixed precision parameter creation."""
-        if not self.fp8.enabled:
-            return nullcontext()
+        with ExitStack() as stack:
+            if self.fp8.enabled:
+                # TE initializes FP8 parameters while preserving a high-precision value
+                # that can seed the optimizer main-weight buffer.
+                assert (
+                    QUANTIZED_MODEL_INIT_CLASS is not nullcontext
+                ), "Transformer Engine is required for FP8 parameter initialization"
+                args = {"enabled": True}
+                if "preserve_high_precision_init_val" in inspect.signature(
+                    QUANTIZED_MODEL_INIT_CLASS
+                ).parameters:
+                    args["preserve_high_precision_init_val"] = True
+                stack.enter_context(QUANTIZED_MODEL_INIT_CLASS(**args))
 
-        # TE initializes FP8 parameters while preserving a high-precision value
-        # that can seed the optimizer main-weight buffer.
-        assert (
-            QUANTIZED_MODEL_INIT_CLASS is not nullcontext
-        ), "Transformer Engine is required for FP8 parameter initialization"
-        args = {"enabled": True}
-        if "preserve_high_precision_init_val" in inspect.signature(
-            QUANTIZED_MODEL_INIT_CLASS
-        ).parameters:
-            args["preserve_high_precision_init_val"] = True
-        return QUANTIZED_MODEL_INIT_CLASS(**args)
+            if (
+                module is not None
+                and TransformerEngineBaseModule is not None
+                and TE_VERSION is not None
+                and TE_VERSION >= PkgVersion("0.9.0")
+                and not isinstance(module, TransformerEngineBaseModule)
+            ):
+                cuda_rng_tracker = get_cuda_rng_tracker()
+                if _MODEL_PARALLEL_RNG_TRACKER_NAME in cuda_rng_tracker.states_:
+                    stack.enter_context(cuda_rng_tracker.fork())
+
+            yield
 
     def group_key_dtype(self, tensor: torch.Tensor):
         """Return the parameter grouping dtype key."""
