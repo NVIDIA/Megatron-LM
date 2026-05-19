@@ -259,10 +259,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
-        # Steps after which a deferred request emits a starvation warning. Tied to
-        # max_sequence_length: at least one active decode should finish within that
-        # window during normal operation, so longer waits suggest a real bug (hung
-        # kernel, infinite loop, P-grid that doesn't cover the workload).
+        # Steps after which a deferred request emits a starvation warning.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
         # Initialize engine.
         self.reset()
@@ -1614,7 +1611,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
-                # CG-aware admission gating: defer if the resulting batch shape lacks a
+                # CUDA graph-aware admission gating: defer if the resulting batch shape lacks a
                 # matching captured CG. Non-chunked admit takes the request whole, so the
                 # candidate token_count is active + remaining_prompt_tokens.
                 if self._cg_admission_gating_active():
@@ -1654,12 +1651,11 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
     def _find_cg_chunk_size(self, max_chunk_tokens: int) -> int:
-        """Return the largest chunk size <= max_chunk_tokens whose resulting batch matches a CG.
+        """Return the largest chunk size <= max_chunk_tokens which matches a graph.
 
-        Walks the (descending-token_count) captured list and returns the first chunk that
-        (a) falls within the available budget and (b) produces an applicable batch_dim.
-        Falls back to max_chunk_tokens if no CG-aligned size exists (caller still schedules,
-        just without a graph match — the engine's eager path handles it).
+        Returns the first chunk in the (descending-token_count) captured list that falls within the
+        available budget and produces an applicable batch_dim. Falls back to max_chunk_tokens if no
+        CG-aligned size exists.
         """
         active_tok = self.context.active_token_count
         active_p = self.context.num_prefill_requests
@@ -1685,9 +1681,8 @@ class DynamicInferenceEngine(AbstractEngine):
     def _cg_admission_check(self, req, candidate: InferenceBatchDimensions) -> bool:
         """Return True if the candidate batch shape matches a captured CG.
 
-        On miss, increments `req.cg_wait_iters` and emits a starvation warning every
-        `_cg_admission_warn_after` steps. On hit, resets the counter. Caller is
-        responsible for deferring (e.g., breaking the scheduler loop) when False.
+        On miss, increments req.cg_wait_iters and emits a starvation warning. On hit, resets the
+        counter. Caller is responsible for breaking the scheduler loop when False.
         """
         matched = CUDAGraphBatchDimensionBuilder.match_graph_config(
             real_batch_dim=candidate,
@@ -1776,8 +1771,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 max_chunk = min(remaining_len, token_budget)
 
                 if self._cg_admission_gating_active():
-                    # Snap chunk size to the largest captured-CG boundary within budget,
-                    # then defer if no shape covers it.
+                    # Snap chunk size to the largest captured-CG boundary within budget; defer if no
+                    # shape covers it.
                     prefill_chunk_length = self._find_cg_chunk_size(max_chunk)
                     candidate = InferenceBatchDimensions(
                         token_count=self.context.active_token_count + prefill_chunk_length,
@@ -1807,7 +1802,6 @@ class DynamicInferenceEngine(AbstractEngine):
                             pending_block_hashes.add(block_hash)
 
                 if prefill_chunk_length >= remaining_len:
-                    # Full admit.
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
