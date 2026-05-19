@@ -49,9 +49,12 @@ def get_hybrid_stack_modelopt_spec(
             (only for use_default_te_spec=True)
     """
     if use_default_te_spec:
-        from megatron.core.models.hybrid.hybrid_layer_specs import get_hybrid_stack_spec
+        from megatron.core.models.hybrid.hybrid_layer_specs import (
+            hybrid_stack_spec,
+            hybrid_stack_spec_no_moe_grouped_gemm,
+        )
 
-        return get_hybrid_stack_spec(moe_grouped_gemm=moe_grouped_gemm)
+        return hybrid_stack_spec if moe_grouped_gemm else hybrid_stack_spec_no_moe_grouped_gemm
 
     return _get_hybrid_stack_local_spec(
         local_core_attention=local_core_attention, remap_te_layernorm=remap_te_layernorm
