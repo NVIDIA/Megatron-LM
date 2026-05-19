@@ -7,6 +7,7 @@ import random
 import time
 import warnings
 from datetime import timedelta
+from typing import Callable
 
 import numpy as np
 import torch
@@ -18,6 +19,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 from megatron.core.parallel_state import create_group
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
@@ -244,6 +246,165 @@ def _initialize_tp_communicators():
             use_fp8=(args.fp8 is not None),
             ub_cfgs=ub_cfgs,
         )
+
+
+def _create_pg_collection(
+    model_config: TransformerConfig,
+    num_distributed_optimizer_instances: int,
+    get_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
+    get_position_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
+    world_size: int | None = None,
+    rank_offset: int | None = None,
+    save_grid: bool = False,
+) -> ProcessGroupCollection:
+    """Create all process groups via HyperCommGrid and return a ProcessGroupCollection."""
+    hcp_sizes = getattr(model_config, "hierarchical_context_parallel_sizes", None)
+    if hcp_sizes is not None:
+        raise NotImplementedError(
+            "Decentralized process groups (use_decentralized_pg=True) do not support "
+            "hierarchical_context_parallel_sizes. Use cp_comm_type='a2a' or 'p2p' instead, "
+            "or set use_decentralized_pg=False to use the MPU path which supports 'a2a+p2p'."
+        )
+    if world_size is None:
+        world_size = torch.distributed.get_world_size()
+    if rank_offset is None:
+        rank_offset = 0
+    tp_size = int(model_config.tensor_model_parallel_size)
+    pp_size = int(model_config.pipeline_model_parallel_size)
+    cp_size = int(model_config.context_parallel_size) if getattr(model_config, "context_parallel_size", 1) else 1
+    model_size = tp_size * pp_size * cp_size
+    if world_size % model_size != 0:
+        raise RuntimeError(f"world_size ({world_size}) is not divisible by {model_size}")
+    dp_size = world_size // model_size
+
+    grid = HyperCommGrid(
+        shape=[tp_size, cp_size, dp_size, pp_size],
+        dim_names=["tp", "cp", "dp", "pp"],
+        rank_offset=rank_offset,
+        backend="nccl",
+    )
+    # Core groups
+    tp_pg = grid.create_pg(["tp"])
+    cp_pg = grid.create_pg(["cp"])
+    pp_pg = grid.create_pg(["pp"])
+    dp_pg = grid.create_pg(["dp"])
+    mp_pg = grid.create_pg(["tp", "pp"])
+    tp_cp_pg = grid.create_pg(["tp", "cp"])
+    tp_dp_cp_pg = grid.create_pg(["tp", "dp", "cp"])
+    dp_cp_pg = grid.create_pg(["dp", "cp"])
+
+    # Expert/MoE related groups (refer to original parallel_state.initialize_model_parallel)
+    expert_tp_size = (
+        int(model_config.expert_tensor_parallel_size)
+        if getattr(model_config, "expert_tensor_parallel_size", None)
+        else tp_size
+    )
+    ep_size = (
+        int(model_config.expert_model_parallel_size) if getattr(model_config, "expert_model_parallel_size", 1) else 1
+    )
+    # Expert data-parallel size folds CP into DP (as in original expert rank generator)
+    expt_model_block = expert_tp_size * ep_size * pp_size
+    if world_size % expt_model_block != 0:
+        raise RuntimeError(
+            f"world_size ({world_size}) is not divisible by expert_tensor_model_pipeline size ({expt_model_block})"
+        )
+    expt_dp_size = world_size // expt_model_block
+    use_optimizer_instance_groups = num_distributed_optimizer_instances > 1
+    inner_dp_dim: str | None = None
+    outer_dp_dim: str | None = None
+    if use_optimizer_instance_groups:
+        assert expt_dp_size % num_distributed_optimizer_instances == 0, (
+            "Expert DP size must be divisible by the number of optimizer instances."
+        )
+        inner_expt_dp_size = expt_dp_size // num_distributed_optimizer_instances
+        expert_grid = HyperCommGrid(
+            shape=[expert_tp_size, ep_size, inner_expt_dp_size, num_distributed_optimizer_instances, pp_size],
+            dim_names=["tp", "ep", "inner_dp", "outer_dp", "pp"],
+            rank_offset=rank_offset,
+            backend="nccl",
+        )
+        dp_group_dims: list[str] = ["inner_dp", "outer_dp"]
+        inner_dp_dim = "inner_dp"
+        outer_dp_dim = "outer_dp"
+    else:
+        expert_grid = HyperCommGrid(
+            shape=[expert_tp_size, ep_size, expt_dp_size, pp_size],
+            dim_names=["tp", "ep", "dp", "pp"],
+            rank_offset=rank_offset,
+            backend="nccl",
+        )
+        dp_group_dims = ["dp"]
+    ep_pg = expert_grid.create_pg(["ep"])
+    expt_tp_pg = expert_grid.create_pg(["tp"])
+    tp_ep_pg = expert_grid.create_pg(["tp", "ep"])
+    tp_ep_pp_pg = expert_grid.create_pg(["tp", "ep", "pp"])
+    expt_dp_pg = expert_grid.create_pg(dp_group_dims)
+
+    # Embedding and position-embedding groups
+    embd_pg = None
+    pos_embd_pg = None
+    # Enumerate ranks per PP group
+    pp_rank_lists = grid._gen_rank_enum(["pp"])
+    # Determine embedding ranks for each pp group
+    embedding_rank_lists: list[list[int]] = []
+    pos_embedding_rank_lists: list[list[int]] = []
+    for ranks in pp_rank_lists:
+        if not ranks:
+            continue
+        if get_embedding_ranks is not None:
+            # Use custom callback to determine embedding ranks
+            embedding_rank_lists.append(get_embedding_ranks(ranks, pp_size))
+        else:
+            # Default: embedding_ranks are first and last pp stage (or only one if pp_size==1)
+            embedding_rank_lists.append([ranks[0]] if len(ranks) == 1 else [ranks[0], ranks[-1]])
+        if get_position_embedding_ranks is not None:
+            # Use custom callback to determine position embedding ranks
+            pos_embedding_rank_lists.append(get_position_embedding_ranks(ranks, pp_size))
+        else:
+            # Default: position embedding ranks are first pp stage only
+            pos_embedding_rank_lists.append([ranks[0]])
+    if embedding_rank_lists:
+        embd_pg, _ = torch.distributed.new_subgroups_by_enumeration(embedding_rank_lists, backend="nccl")
+    if pos_embedding_rank_lists:
+        pos_embd_pg, _ = torch.distributed.new_subgroups_by_enumeration(pos_embedding_rank_lists, backend="nccl")
+
+    # Build Partial-Distributed-Optimizer groups for Expert DP when multiple instances are used.
+    intra_expt_dp_pg = None
+    inter_dist_opt_pg = None
+    intra_dist_opt_pg = None
+    if inner_dp_dim is not None and outer_dp_dim is not None:
+        intra_expt_dp_pg = expert_grid.create_pg([inner_dp_dim])
+        inter_dist_opt_pg = expert_grid.create_pg([outer_dp_dim])
+        # Match distributed optimizer instance grouping from parallel_state:
+        # combine tp-ep-pp ranks across the intra-partial DP slice.
+        intra_dist_opt_pg = expert_grid.create_pg(["tp", "ep", inner_dp_dim, "pp"])
+
+    # Build ProcessGroupCollection with available groups.
+    pg_collection = ProcessGroupCollection(
+        tp=tp_pg,
+        pp=pp_pg,
+        mp=mp_pg,
+        embd=embd_pg,
+        pos_embd=pos_embd_pg,
+        cp=cp_pg,
+        tp_cp=tp_cp_pg,
+        hcp=None,
+        ep=ep_pg,
+        expt_tp=expt_tp_pg,
+        tp_ep=tp_ep_pg,
+        tp_ep_pp=tp_ep_pp_pg,
+        tp_dp_cp=tp_dp_cp_pg,
+        dp=dp_pg,
+        dp_cp=dp_cp_pg,
+        expt_dp=expt_dp_pg,
+        intra_dp_cp=dp_cp_pg,
+        intra_expt_dp=intra_expt_dp_pg if intra_expt_dp_pg is not None else expt_dp_pg,
+        inter_dist_opt=inter_dist_opt_pg,
+        intra_dist_opt=intra_dist_opt_pg,
+    )
+    if save_grid:
+        model_config.grid = grid
+    return pg_collection
 
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):
