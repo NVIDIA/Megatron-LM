@@ -487,9 +487,7 @@ def _get_thd_padded_seqlens(seqlens, cp_size, tp_size):
 def _to_cu_seqlens(seqlens):
     cu_seqlens = torch.empty(len(seqlens) + 1, dtype=torch.int32, device="cuda")
     cu_seqlens[0] = 0
-    cu_seqlens[1:] = torch.cumsum(
-        torch.tensor(seqlens, dtype=torch.int32, device="cuda"), dim=0
-    )
+    cu_seqlens[1:] = torch.cumsum(torch.tensor(seqlens, dtype=torch.int32, device="cuda"), dim=0)
     return cu_seqlens
 
 
@@ -519,9 +517,7 @@ def _make_sharded_thd_hidden_states(seqlens, hidden_size, cp_size, tp_size, dtyp
             sequence = torch.cat(
                 [
                     sequence,
-                    torch.zeros(
-                        padded_seqlen - seqlen, hidden_size, device="cuda", dtype=dtype
-                    ),
+                    torch.zeros(padded_seqlen - seqlen, hidden_size, device="cuda", dtype=dtype),
                 ],
                 dim=0,
             )
@@ -546,8 +542,7 @@ def _make_sharded_thd_hidden_states(seqlens, hidden_size, cp_size, tp_size, dtyp
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(
-    Utils.world_size % 8 != 0,
-    reason="requires world size divisible by 8 for pp2/cp2/tp2/ep2/etp2",
+    Utils.world_size % 8 != 0, reason="requires world size divisible by 8 for pp2/cp2/tp2/ep2/etp2"
 )
 @pytest.mark.internal
 @pytest.mark.parametrize("dispatcher", ["alltoall", "deepep", "hybridep"])
@@ -607,18 +602,12 @@ def test_sequence_packing_thd_e2e_proxy_model(dispatcher):
             hidden_dropout=0.0,
             use_cpu_initialization=True,
         )
-        transformer_block = (
-            TransformerBlock(transformer_config, spec).cuda().to(torch.bfloat16)
-        )
+        transformer_block = TransformerBlock(transformer_config, spec).cuda().to(torch.bfloat16)
 
         torch.manual_seed(1000 + torch.distributed.get_rank())
         seqlens = [257, 509, 1021]
         hidden_states = _make_sharded_thd_hidden_states(
-            seqlens,
-            transformer_config.hidden_size,
-            cp_size,
-            tp_size,
-            torch.bfloat16,
+            seqlens, transformer_config.hidden_size, cp_size, tp_size, torch.bfloat16
         )
         packed_seq_params = _make_thd_packed_seq_params(seqlens, cp_size, tp_size)
 
