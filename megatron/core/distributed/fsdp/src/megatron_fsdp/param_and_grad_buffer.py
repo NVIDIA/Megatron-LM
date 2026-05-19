@@ -3393,13 +3393,13 @@ class BucketStatus(Enum):
 
     Attributes:
         EMPTY (int): The bucket is empty and not in use.
-        NEEDS_REFRESH (int): The bucket is allocated but its contents are stale.
+        PRESERVED (int): The bucket storage is retained but not ready for use.
         COMMUNICATING (int): The bucket is currently being used for communication.
         READY_TO_USE (int): The bucket is filled with data and ready for use.
     """
 
     EMPTY = 1
-    NEEDS_REFRESH = 2
+    PRESERVED = 2
     COMMUNICATING = 3
     READY_TO_USE = 4
 
@@ -3946,23 +3946,24 @@ class AllGatherPipeline:
         # recycle_unused_buckets free the gather scratch. Preserved non-unit
         # buckets keep their storage pinned per the release_bucket contract
         # (cross-module readers such as fused kernels that bypass nn.Module.forward
-        # may dereference them), but we still mark their contents stale so the next
-        # async_bucket_gather refreshes wbuf.data from the post-optimizer-step shard
-        # in place. TemporaryBucketAllocator.allocate() is idempotent for an already
-        # allocated bucket_id, so no new memory is allocated.
+        # may dereference them), but the AG pipeline should not treat them as
+        # freshly gathered. If a later all-gather targets the bucket,
+        # async_bucket_gather refreshes wbuf.data in place from the current shard.
+        # TemporaryBucketAllocator.allocate() is idempotent for an already allocated
+        # bucket_id, so no new memory is allocated.
         for bucket_id in range(self.num_buckets):
             is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
             for bwd in [False, True]:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
                 if preserve_non_fsdp_units and not is_unit_bucket:
-                    self.bucket_status[bucket_key] = BucketStatus.NEEDS_REFRESH
+                    self.bucket_status[bucket_key] = BucketStatus.PRESERVED
                 else:
                     self.bucket_can_be_released[bucket_key] = True
         self.recycle_unused_buckets()
 
         expected_statuses = (BucketStatus.EMPTY,)
         if preserve_non_fsdp_units:
-            expected_statuses += (BucketStatus.NEEDS_REFRESH,)
+            expected_statuses += (BucketStatus.PRESERVED,)
 
         assert all(status in expected_statuses for status in self.bucket_status.values()), (
             f"There are still working buckets, it is not safe to reset. "
@@ -4093,12 +4094,12 @@ class AllGatherPipeline:
                 bucket_id = next_bucket_id(ag_buckets)
 
         # Only all-gather on buckets that have not been allocated yet or whose
-        # persistent storage needs to be refreshed.
+        # persistent storage was preserved but is not ready for use.
         ag_buckets = [
             bucket_id
             for bucket_id in ag_buckets
             if self.bucket_status[self.get_bucket_key(bucket_id, bwd)]
-            in (BucketStatus.EMPTY, BucketStatus.NEEDS_REFRESH)
+            in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
         ]
         if len(ag_buckets) == 0:
             return
@@ -4172,11 +4173,12 @@ class AllGatherPipeline:
         if self.bucket_status[bucket_key] == BucketStatus.READY_TO_USE:
             # Already ready to use.
             return
-        if self.bucket_status[bucket_key] in (BucketStatus.EMPTY, BucketStatus.NEEDS_REFRESH):
+        if self.bucket_status[bucket_key] in (BucketStatus.EMPTY, BucketStatus.PRESERVED):
             if empty_ok:
                 return
-            # Bucket should not be empty or stale here; this implies that the bucket
-            # was not allocated, was not refreshed, or NCCL operations are not complete.
+            # Bucket should not be empty or merely preserved here; this implies that
+            # the bucket was not allocated, was not made ready for use, or NCCL
+            # operations are not complete.
             raise ValueError(f"Bucket {bucket_id} is {self.bucket_status[bucket_key].name}.")
 
         # Wait for asynchronous / overlapped NCCL operations to complete.
