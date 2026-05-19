@@ -537,6 +537,21 @@ class DTensorFormatSavePlanner(DefaultSavePlanner):
         if self.flatten_state_dict:
             plan = dataclasses.replace(plan, planner_data=self.mappings)
         self.plan = plan
+
+        # DEBUG: dump FQNs this rank is planning to write. Filter to optimizer
+        # bytes-IO entries to keep the log readable.
+        try:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        except Exception:
+            rank = -1
+        optim_fqns = sorted(
+            it.index.fqn for it in self.plan.items
+            if "optimizer.distributed.dp_group_idx_" in it.index.fqn
+        )
+        logger.warning(
+            f"[DTensorFormatSavePlanner][rank={rank}] local plan optimizer FQNs "
+            f"({len(optim_fqns)}): {optim_fqns}"
+        )
         return self.plan
 
 
@@ -811,6 +826,23 @@ class TorchDistSaveShardedStrategy:
             # (e.g. per-rank optimizer state) survive the save — they're dropped by DCP's
             # default planner, which only writes BYTE_IO on the coordinator.
             values_to_save = inject_placeholders(sharded_state_dict, keep_only_main_replica=True)
+            # DEBUG: list optimizer FQNs surviving the main-replica filter on this rank.
+            try:
+                _rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
+            except Exception:
+                _rank = -1
+            _optim_save_fqns = sorted(
+                k for k in values_to_save.keys()
+                if isinstance(k, str) and "optimizer.distributed.dp_group_idx_" in k
+            )
+            logger.warning(
+                f"[inject_placeholders/save][rank={_rank}] kept optimizer FQNs "
+                f"({len(_optim_save_fqns)}): {_optim_save_fqns}"
+            )
             values_to_save = convert_state_dict_to_dcp_compatible(values_to_save)
             return torch.distributed.checkpoint.save(
                 values_to_save,
@@ -1052,6 +1084,40 @@ class TorchDistLoadShardedStrategy:
             # on-disk entry out to all requesters.
             values_to_load = inject_placeholders(sharded_state_dict)
             values_to_load = convert_state_dict_to_dcp_compatible(values_to_load)
+
+            # DEBUG: list optimizer FQNs this rank is asking the load to fetch,
+            # plus the optimizer FQNs the on-disk metadata actually has.
+            try:
+                _rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
+            except Exception:
+                _rank = -1
+            _optim_load_fqns = sorted(
+                k for k in values_to_load.keys()
+                if isinstance(k, str) and "optimizer.distributed.dp_group_idx_" in k
+            )
+            logger.warning(
+                f"[inject_placeholders/load][rank={_rank}] requested optimizer FQNs "
+                f"({len(_optim_load_fqns)}): {_optim_load_fqns}"
+            )
+            if _rank == 0:
+                try:
+                    from torch.distributed.checkpoint import FileSystemReader
+                    _reader = FileSystemReader(checkpoint_dir)
+                    _meta = _reader.read_metadata()
+                    _disk_optim = sorted(
+                        k for k in _meta.state_dict_metadata.keys()
+                        if "optimizer.distributed.dp_group_idx_" in k
+                    )
+                    logger.warning(
+                        f"[disk-metadata][rank=0] on-disk optimizer FQNs "
+                        f"({len(_disk_optim)}): {_disk_optim}"
+                    )
+                except Exception as _e:
+                    logger.warning(f"[disk-metadata][rank=0] failed to read: {_e}")
 
             torch.distributed.checkpoint.load(
                 state_dict=values_to_load, checkpoint_id=checkpoint_dir
