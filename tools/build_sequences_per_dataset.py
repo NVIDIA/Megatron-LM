@@ -104,14 +104,14 @@ if __name__ == "__main__":
                        '`--(train|valid|test)-data-path` with weighted dataset, '
                        'we pass in a file path from which we read those arguments. '
                        'This is useful when the list of data is too big. Format is a '
-                       'json file with `train`, `valid, `test` keys')
+                       'json file with `train`, `valid`, `test` keys')
     parser.add_argument('--per-dataset-sequences-path', type=str, required=True,
                        help='Path to the output json file with the sequences per dataset.')
     args = parser.parse_args()
 
     sequence_count_dict = build_sequences_per_dataset(args)
 
-    with open(args.path_to_sequences_per_dataset_json, "w") as f:
+    with open(args.per_dataset_sequences_path, "w") as f:
         json.dump(sequence_count_dict, f)
 
-    print(f"Done! Saving --path-to-sequences-per-dataset file to {args.path_to_sequences_per_dataset_json}")
+    print(f"Done! Saving --per-dataset-sequences-path file to {args.per_dataset_sequences_path}")

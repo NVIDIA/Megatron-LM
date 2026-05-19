@@ -60,6 +60,27 @@ _active_grids: list = []
 _embedding_pg_cache: dict = {}
 
 
+def build_no_sync_func(mimo_model):
+    """Build a no_sync_func that stacks DDP no_sync over each sub-module.
+
+    Shared by 1F1B pipeline tests and colocated-correctness tests — both need
+    DDP's gradient sync disabled during microbatches and resumed via the
+    schedule's finalize_grads_func.
+    """
+
+    @contextmanager
+    def no_sync_func():
+        with ExitStack() as stack:
+            if mimo_model.language_model is not None:
+                stack.enter_context(mimo_model.language_model.no_sync())
+            for submodule in mimo_model.modality_submodules.values():
+                if submodule is not None:
+                    stack.enter_context(submodule.no_sync())
+            yield
+
+    return no_sync_func
+
+
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     """Create a HyperCommGrid with specified parallelism."""
     grid = HyperCommGrid(
@@ -183,12 +204,39 @@ def is_rank_in_grid(grid):
 
 
 def get_language_model_spec(
-    num_layers, hidden_size, num_attention_heads, vocab_size, seq_len, pg_collection
+    num_layers,
+    hidden_size,
+    num_attention_heads,
+    vocab_size,
+    seq_len,
+    pg_collection,
+    bf16=True,
+    bias=True,
+    dropout=True,
+    per_token_loss=False,
 ):
-    """Get the language model spec."""
+    """Get the language model spec.
+
+    ``bf16=False`` switches pipeline dtype and autocast to fp32. Correctness
+    tests also pass ``bias=False, dropout=False`` to remove bias-update and
+    stochastic noise from the cross-config diff signal.
+
+    ``per_token_loss=True`` sets ``calculate_per_token_loss=True`` on the
+    TransformerConfig, which pins DDP's gradient_scaling_factor to 1.0
+    (pure SUM reduction). Callers that flip this must supply a 3-tuple
+    loss_func and drive the external divide in their finalize hook.
+    """
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
+
+    pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
+    extra_kwargs = {}
+    if not bias:
+        extra_kwargs['add_bias_linear'] = False
+    if not dropout:
+        extra_kwargs['attention_dropout'] = 0.0
+        extra_kwargs['hidden_dropout'] = 0.0
 
     lm_config = TransformerConfig(
         num_layers=num_layers,
@@ -199,10 +247,12 @@ def get_language_model_spec(
         moe_token_dispatcher_type='alltoall',
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
-        pipeline_dtype=torch.bfloat16,
-        bf16=True,
+        pipeline_dtype=pipeline_dtype,
+        bf16=bf16,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='te',
+        calculate_per_token_loss=per_token_loss,
+        **extra_kwargs,
     )
     return ModuleSpec(
         module=GPTModel,
@@ -218,12 +268,12 @@ def get_language_model_spec(
     )
 
 
-def get_projection_config(hidden_size):
+def get_projection_config(hidden_size, bias=True):
     """Return a TransformerConfig for the vision projection MLP."""
     cfg = TransformerConfig(num_layers=1, hidden_size=hidden_size, num_attention_heads=1)
     cfg.ffn_hidden_size = hidden_size
-    cfg.bias_activation_fusion = True
-    cfg.add_bias_linear = True
+    cfg.bias_activation_fusion = bool(bias)
+    cfg.add_bias_linear = bool(bias)
     cfg.activation_func = torch.nn.functional.gelu
     return cfg
 
@@ -239,14 +289,37 @@ def get_projection_layer_spec():
 
 
 def get_vision_submodules_spec(
-    num_layers, hidden_size, num_attention_heads, language_hidden_size, pg_collection
+    num_layers,
+    hidden_size,
+    num_attention_heads,
+    language_hidden_size,
+    pg_collection,
+    bf16=True,
+    bias=True,
+    dropout=True,
+    per_token_loss=False,
 ):
-    """Get the submodule spec for the vision modality."""
+    """Get the submodule spec for the vision modality.
+
+    ``bias=False`` / ``dropout=False`` mirror the LM-spec kwargs for
+    correctness tests. ``per_token_loss=True`` sets
+    ``calculate_per_token_loss=True`` on the encoder's TransformerConfig so
+    the encoder DDP also pure-SUMs across DP (needed for the heterogeneous-DP
+    colocated path).
+    """
     from megatron.core.transformer.transformer_block import TransformerBlock
 
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
     pp_size = pg_collection.pp.size() if pg_collection.pp is not None else 1
     pp_rank = dist.get_rank(pg_collection.pp)
+
+    pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
+    extra_kwargs = {}
+    if not bias:
+        extra_kwargs['add_bias_linear'] = False
+    if not dropout:
+        extra_kwargs['attention_dropout'] = 0.0
+        extra_kwargs['hidden_dropout'] = 0.0
 
     vision_config = TransformerConfig(
         num_layers=num_layers,
@@ -257,8 +330,10 @@ def get_vision_submodules_spec(
         moe_token_dispatcher_type='alltoall',
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
-        pipeline_dtype=torch.bfloat16,
-        bf16=True,
+        pipeline_dtype=pipeline_dtype,
+        bf16=bf16,
+        calculate_per_token_loss=per_token_loss,
+        **extra_kwargs,
     )
     vision_encoder_spec = ModuleSpec(
         module=TransformerBlock,
@@ -274,7 +349,7 @@ def get_vision_submodules_spec(
     vision_projection_spec = ModuleSpec(
         module=MultimodalProjector,
         params={
-            "config": get_projection_config(hidden_size=language_hidden_size),
+            "config": get_projection_config(hidden_size=language_hidden_size, bias=bias),
             "submodules": get_projection_layer_spec().submodules,
             "projector_type": "mlp",
             "input_size": vision_config.hidden_size,
@@ -293,9 +368,38 @@ def get_vision_submodules_spec(
 
 
 def get_mimo_model(
-    encoder_name, encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seq_len
+    encoder_name,
+    encoder_grid,
+    llm_grid,
+    hidden_size,
+    num_layers,
+    vocab_size,
+    seq_len,
+    ddp_config=None,
+    bf16=True,
+    bias=True,
+    dropout=True,
+    per_token_loss=False,
 ):
-    """Create MIMO model with TransformerBlock encoder and GPTModel LLM."""
+    """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
+
+    Args:
+        ddp_config: Optional override for the Megatron DDP config. Default
+            matches the 1F1B schedule tests' config.
+        bf16: If True (default) build the model in bf16; if False build in
+            fp32 end-to-end for deterministic numerics in correctness tests.
+        bias: If False, disable ``add_bias_linear`` in LM/vision configs and
+            the projection MLP — removes bias-update noise from diffs.
+        dropout: If False, force attention/hidden dropout to 0.0.
+        per_token_loss: If True, set ``calculate_per_token_loss=True`` on
+            both sub-model configs. This pins the encoder and LLM DDP
+            gradient_scaling_factor to 1.0 (pure SUM across DP). The caller
+            MUST supply a 3-tuple loss_func ``(sum_loss, num_tokens,
+            log_dict)`` and a custom ``finalize_model_grads_func`` that
+            divides grads by the correct global divisor on both sides;
+            hetero-DP callers use this to land ``1/B_full`` on both encoder
+            and LLM without relying on the per-DDP built-in scaling.
+    """
     language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
     vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
 
@@ -306,6 +410,10 @@ def get_mimo_model(
         vocab_size=vocab_size,
         seq_len=seq_len,
         pg_collection=language_pg,
+        bf16=bf16,
+        bias=bias,
+        dropout=dropout,
+        per_token_loss=per_token_loss,
     )
     vision_submodule_spec = get_vision_submodules_spec(
         num_layers=num_layers,
@@ -313,6 +421,10 @@ def get_mimo_model(
         num_attention_heads=8,
         language_hidden_size=hidden_size,
         pg_collection=vision_pg,
+        bf16=bf16,
+        bias=bias,
+        dropout=dropout,
+        per_token_loss=per_token_loss,
     )
 
     module_to_grid_map = {encoder_name: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid}
@@ -326,12 +438,15 @@ def get_mimo_model(
     )
 
     mimo_model = MimoModel(mimo_config)
-    mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
+    mimo_model.to(torch.device("cuda"))
+    if bf16:
+        mimo_model.to(torch.bfloat16)
 
-    # Wrap with DDP
-    ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
-    )
+    # Wrap with DDP (caller may override e.g. for heterogeneous-DP scaling).
+    if ddp_config is None:
+        ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
+        )
 
     if mimo_model.language_model is not None:
         mimo_model.language_model = DistributedDataParallel(
@@ -485,16 +600,7 @@ def run_mimo_1f1b_test(
         seq_len=seq_length,
     )
 
-    # Build schedule functions using pre-created pg_collections (no leaks)
-    @contextmanager
-    def no_sync_func():
-        with ExitStack() as stack:
-            if mimo_model.language_model is not None:
-                stack.enter_context(mimo_model.language_model.no_sync())
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    stack.enter_context(submodule.no_sync())
-            yield
+    no_sync_func = build_no_sync_func(mimo_model)
 
     def finalize_grads_func(*args, **kwargs):
         if mimo_model.language_model is not None:
@@ -595,30 +701,35 @@ def run_mimo_1f1b_test(
 
     optimizer.zero_grad()
 
-    losses = schedule.forward_backward_pipelining_without_interleaving(
-        forward_step_func=step_func,
-        data_iterator=data_iterator,
-        model=[mimo_model],
-        num_microbatches=num_microbatches,
-        seq_length=seq_length,
-        micro_batch_size=micro_batch_size,
-        forward_only=False,
-        p2p_communicator=communicator,
-        pg_collection=pg_collection,
-    )
+    try:
+        losses = schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=step_func,
+            data_iterator=data_iterator,
+            model=[mimo_model],
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            forward_only=False,
+            p2p_communicator=communicator,
+            pg_collection=pg_collection,
+        )
 
-    # Optimizer step with global gradient clipping
-    success, grad_norm, num_zeros = optimizer.step()
-    assert success, "Optimizer step failed"
-    assert grad_norm is not None and grad_norm > 0, f"Expected positive grad norm, got {grad_norm}"
+        # Optimizer step with global gradient clipping
+        success, grad_norm, num_zeros = optimizer.step()
+        assert success, "Optimizer step failed"
+        assert (
+            grad_norm is not None and grad_norm > 0
+        ), f"Expected positive grad norm, got {grad_norm}"
 
-    # Verify results on last LLM stage
-    if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
-        assert len(losses) > 0, "Expected losses on last LLM stage"
-        for loss_dict in losses:
-            assert 'loss_reduced' in loss_dict
+        # Verify results on last LLM stage
+        if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
+            assert len(losses) > 0, "Expected losses on last LLM stage"
+            for loss_dict in losses:
+                assert 'loss_reduced' in loss_dict
 
-    return losses
+        return losses
+    finally:
+        mimo_model.destroy()
 
 
 # ============================================================================

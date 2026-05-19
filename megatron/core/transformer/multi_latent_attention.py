@@ -1,11 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Union
+from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
 import torch
+import torch.nn.functional as F
 
 try:
     from einops import rearrange
@@ -34,12 +35,12 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import Attention, LinearProjBuilder
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.typed_torch import apply_module
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_size,
@@ -76,10 +77,42 @@ else:
         split_te_layernorm_column_parallel_linear,
     ) = (None, None, None, None, None, None)
 
+if TYPE_CHECKING:
+    from megatron.core.inference.contexts import BaseInferenceContext
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+
+def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
+    """Prepare value tensor for MLA core attention THD execution."""
+    orig_v_dim = value.shape[-1] if value is not None else None
+    padded_v_dim = orig_v_dim
+    need_v_pad = (
+        packed_seq_params is not None
+        and packed_seq_params.qkv_format == "thd"
+        and parallel_attention.config.experimental_attention_variant is None
+        and value is not None
+        and query.shape[-1] != orig_v_dim
+    )
+    if need_v_pad:
+        value = F.pad(value, [0, query.shape[-1] - orig_v_dim])
+        padded_v_dim = value.shape[-1]
+    return value, need_v_pad, orig_v_dim, padded_v_dim
+
+
+def _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim):
+    """Trim THD MLA core attention output back to the original V dimension."""
+    if need_v_pad:
+        if core_attn_out.ndim == 2:
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-1], -1, padded_v_dim)
+        core_attn_out = core_attn_out[..., :orig_v_dim]
+    return core_attn_out
+
 
 @dataclass
 class MLASelfAttentionSubmodules:
     """Submodules for the MLA self-attention layer."""
+
+    linear_proj: LinearProjBuilder
 
     # TODO(nschank): Move layernorms back to the bottom once all other layers have defaults removed.
     q_layernorm: LayerNormBuilder
@@ -92,7 +125,6 @@ class MLASelfAttentionSubmodules:
     linear_kv_up_proj: Union[ModuleSpec, type] = None
     linear_qkv_down_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
-    linear_proj: Union[ModuleSpec, type] = None
 
 
 class MultiLatentAttention(Attention):
@@ -111,8 +143,10 @@ class MultiLatentAttention(Attention):
         attention_type: str,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        pp_layer_offset: Optional[int] = None,
     ) -> None:
-
+        # TODO(nschank): Restructure so that the Attention initializer knows which specific
+        # submodules it will construct, so that MLASelfAttentionSubmodules honors that interface.
         super().__init__(
             config=config,
             submodules=submodules,
@@ -120,6 +154,7 @@ class MultiLatentAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
         )
         self.config: MLATransformerConfig
 
@@ -181,12 +216,11 @@ class MultiLatentAttention(Attention):
         )
 
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
+        self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -213,22 +247,67 @@ class MultiLatentAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _run_core_attention(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        packed_seq_params=None,
+        attn_mask_type=None,
+        **extra_kwargs,
+    ):
+        """Run MLA core attention with the THD value pad/trim workaround."""
+        value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
+            self, query, value, packed_seq_params
+        )
+        if attn_mask_type is None:
+            attn_mask_type = self.attn_mask_type
+
+        orig_v_head_dim = None
+        if (
+            need_v_pad
+            and value is not None
+            and hasattr(self.core_attention, 'hidden_size_per_attention_head_v')
+        ):
+            orig_v_head_dim = self.core_attention.hidden_size_per_attention_head_v
+            if value.shape[-1] == orig_v_head_dim:
+                orig_v_head_dim = None
+            else:
+                self.core_attention.hidden_size_per_attention_head_v = value.shape[-1]
+
+        try:
+            core_attn_out = self.core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                attn_mask_type=attn_mask_type,
+                **extra_kwargs,
+            )
+        finally:
+            if orig_v_head_dim is not None:
+                self.core_attention.hidden_size_per_attention_head_v = orig_v_head_dim
+
+        return _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim)
+
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        key_value_states=None,
-        inference_context=None,
-        rotary_pos_emb=None,
-        rotary_pos_cos=None,
-        rotary_pos_sin=None,
-        rotary_pos_cos_sin=None,
-        attention_bias=None,
-        packed_seq_params=None,
-        position_ids=None,
-        sequence_len_offset=None,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        key_value_states: torch.Tensor | None = None,
+        inference_context: BaseInferenceContext | None = None,
+        rotary_pos_emb: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
+        rotary_pos_cos: torch.Tensor | None = None,
+        rotary_pos_sin: torch.Tensor | None = None,
+        rotary_pos_cos_sin: torch.Tensor | None = None,
+        attention_bias: torch.Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        position_ids: torch.Tensor | None = None,
+        sequence_len_offset: int | None = None,
         *,
-        inference_params=None,
+        inference_params: BaseInferenceContext | None = None,
     ):
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
@@ -287,10 +366,13 @@ class MultiLatentAttention(Attention):
         if value is not None:
             value = value.contiguous()
 
+        thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+
         # ==================================
         # core attention computation
         # ==================================
         # Need corresponding TE change
+        needs_output_trim = False
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
@@ -306,7 +388,7 @@ class MultiLatentAttention(Attention):
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
-                    core_attn_out = self.core_attention(
+                    core_attn_out = self._run_core_attention(
                         query,
                         key,
                         value,
@@ -316,6 +398,9 @@ class MultiLatentAttention(Attention):
                         **extra_kwargs,
                     )
             elif self.cache_mla_latents:
+                value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
+                    self, query, value, packed_seq_params
+                )
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
@@ -335,6 +420,7 @@ class MultiLatentAttention(Attention):
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                needs_output_trim = need_v_pad
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
@@ -349,7 +435,12 @@ class MultiLatentAttention(Attention):
             # Flatten back: [seq, batch, num_heads * v_head_dim]
             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if needs_output_trim:
+            core_attn_out = _trim_mla_core_attention_output(
+                core_attn_out, need_v_pad, orig_v_dim, padded_v_dim
+            )
+
+        if thd_packed_seq:
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
@@ -365,7 +456,7 @@ class MultiLatentAttention(Attention):
         # Output. [sq, b, h]
         # =================
         with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
+            output, bias = apply_module(self.linear_proj)(core_attn_out)
         if self.offload_attn_proj:
             output = off_interface.group_commit(
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
@@ -389,6 +480,7 @@ class MLASelfAttention(MultiLatentAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        pp_layer_offset: Optional[int] = None,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -401,6 +493,7 @@ class MLASelfAttention(MultiLatentAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
         )
 
         if self.config.q_lora_rank is None:
@@ -587,13 +680,13 @@ class MLASelfAttention(MultiLatentAttention):
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -602,7 +695,9 @@ class MLASelfAttention(MultiLatentAttention):
                     and fused_apply_mla_rope_for_kv is not None
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                rotary_pos_emb, mscale = self.rotary_pos_emb(
+                    rotary_seq_len, packed_seq=thd_packed_seq
+                )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:

@@ -398,6 +398,10 @@ def _make_permutation_map(M, num_padding=0):
     return torch.cat([real, pad])
 
 
+def _vt(n):
+    return torch.tensor(n, dtype=torch.int32, device="cuda")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # squared_relu_and_quantize_mxfp8 vs PyTorch reference
 # ──────────────────────────────────────────────────────────────────────
@@ -440,7 +444,7 @@ class TestSquaredReluAndQuantizeMxfp8:
         _, ref_data = ref_to_mxfp(activated_ref)
 
         # Fused kernel
-        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map)
+        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M))
 
         torch.testing.assert_close(
             fused_result.data.view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0
@@ -461,7 +465,7 @@ class TestSquaredReluAndQuantizeMxfp8:
         ref_swizzled = ref_swizzle(ref_scales_2d)
 
         # Fused kernel
-        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map)
+        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M))
 
         torch.testing.assert_close(
             fused_result.scale.view(torch.uint8), ref_swizzled.view(torch.uint8), atol=0, rtol=0
@@ -485,7 +489,7 @@ class TestSquaredReluAndQuantizeMxfp8:
         _, ref_data = ref_to_mxfp(activated_ref)
 
         # Fused kernel
-        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map)
+        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M))
 
         torch.testing.assert_close(
             fused_result.data[:real_rows].view(torch.uint8),
@@ -533,12 +537,12 @@ class TestPermuteAndQuantizeMxfp8:
 
         hidden, probs, routing_map = self._make_inputs(num_tokens, K, topk, num_experts)
 
-        fused_mxfp8, _, fused_perm_map, _ = permute_and_quantize_mxfp8(
-            hidden, probs, routing_map, 0, num_experts, alignment=128
+        fused_mxfp8, _, fused_perm_map, offs = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, num_experts, _vt(num_tokens), alignment=128
         )
 
         # For each real row, quantize the source token with PyTorch ref and compare
-        for i in range(fused_perm_map.shape[0]):
+        for i in range(offs[-1].item()):
             src = fused_perm_map[i].item()
             if src < 0:
                 continue
@@ -560,11 +564,11 @@ class TestPermuteAndQuantizeMxfp8:
 
         hidden, probs, routing_map = self._make_inputs(num_tokens, K, topk, num_experts)
 
-        fused_mxfp8, _, fused_perm_map, _ = permute_and_quantize_mxfp8(
-            hidden, probs, routing_map, 0, num_experts, alignment=128
+        fused_mxfp8, _, fused_perm_map, offs = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, num_experts, _vt(num_tokens), alignment=128
         )
 
-        real_mask = fused_perm_map >= 0
+        real_mask = fused_perm_map[: offs[-1].item()] >= 0
         real_indices = real_mask.nonzero(as_tuple=True)[0]
         if len(real_indices) == 0:
             return
@@ -590,11 +594,11 @@ class TestPermuteAndQuantizeMxfp8:
 
         hidden, probs, routing_map = self._make_inputs(num_tokens, K, topk, num_experts)
 
-        _, _, fused_perm_map, _ = permute_and_quantize_mxfp8(
-            hidden, probs, routing_map, 0, num_experts, alignment=128
+        _, _, fused_perm_map, offs = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, num_experts, _vt(num_tokens), alignment=128
         )
 
-        real_count = (fused_perm_map >= 0).sum().item()
+        real_count = (fused_perm_map[: offs[-1].item()] >= 0).sum().item()
         # All experts are local, so every pair should appear
         assert real_count == num_tokens * topk
 
@@ -608,11 +612,11 @@ class TestPermuteAndQuantizeMxfp8:
 
         hidden, probs, routing_map = self._make_inputs(num_tokens, K, topk, num_experts)
 
-        _, _, fused_perm_map, _ = permute_and_quantize_mxfp8(
-            hidden, probs, routing_map, local_start, num_local, alignment=128
+        _, _, fused_perm_map, offs = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, local_start, num_local, _vt(num_tokens), alignment=128
         )
 
-        real_count = (fused_perm_map >= 0).sum().item()
+        real_count = (fused_perm_map[: offs[-1].item()] >= 0).sum().item()
         local_mask = (routing_map >= local_start) & (routing_map < local_start + num_local)
         expected_count = local_mask.sum().item()
         assert real_count == expected_count
@@ -624,7 +628,7 @@ class TestPermuteAndQuantizeMxfp8:
 
         hidden, probs, routing_map = self._make_inputs(16, 128, 2, 4)
         result, _, _, _ = permute_and_quantize_mxfp8(
-            hidden, probs, routing_map, 0, 4, alignment=128
+            hidden, probs, routing_map, 0, 4, _vt(16), alignment=128
         )
         assert isinstance(result, MXFP8Tensor)
         assert result.backend == "triton"
@@ -637,7 +641,7 @@ class TestPermuteAndQuantizeMxfp8:
 
         hidden, probs, routing_map = self._make_inputs(64, 128, 4, 8)
         _, _, _, offs = permute_and_quantize_mxfp8(
-            hidden, probs, routing_map, 0, 8, alignment=alignment
+            hidden, probs, routing_map, 0, 8, _vt(64), alignment=alignment
         )
         for i in range(offs.shape[0]):
             assert (

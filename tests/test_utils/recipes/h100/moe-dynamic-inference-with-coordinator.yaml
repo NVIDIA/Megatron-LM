@@ -68,5 +68,5 @@ products:
   - test_case: [gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_logitsmatch_zmq_suspend_resume]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]

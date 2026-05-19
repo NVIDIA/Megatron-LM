@@ -20,7 +20,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from tests.unit_tests.test_utilities import Utils
 
 success_string = "hello,world"
@@ -163,17 +164,19 @@ def test_nvtx_decorator():
     # Track function execution
     execution_tracker = {'decorated': False, 'decorated_with_message': False}
 
-    # Create decorated functions
+    # Decorate while NVTX is disabled (the common import-time scenario).
+    # The _nvtx_enabled flag must be checked at call time, not decoration time.
+    util.configure_nvtx_profiling(False)
+
     @util.nvtx_decorator()
     def nvtx_decorated_function():
         execution_tracker['decorated'] = True
 
-    @util.nvtx_decorator(message="test_nvtx_decorator", color="red")
+    @util.nvtx_decorator(message="test_nvtx_decorator")
     def nvtx_decorated_function_with_message():
         execution_tracker['decorated_with_message'] = True
 
-    # Test with NVTX disabled
-    util.configure_nvtx_profiling(False)
+    # Call with NVTX disabled — should still execute the wrapped function
     nvtx_decorated_function()
     nvtx_decorated_function_with_message()
     assert all(execution_tracker.values())
@@ -181,8 +184,17 @@ def test_nvtx_decorator():
     # Reset tracker
     execution_tracker = {'decorated': False, 'decorated_with_message': False}
 
-    # Test with NVTX enabled
+    # Enable NVTX *after* decoration — should pick up the new flag value
     util.configure_nvtx_profiling(True)
+    nvtx_decorated_function()
+    nvtx_decorated_function_with_message()
+    assert all(execution_tracker.values())
+
+    # Reset tracker
+    execution_tracker = {'decorated': False, 'decorated_with_message': False}
+
+    # Disable NVTX again — should respect the toggled flag
+    util.configure_nvtx_profiling(False)
     nvtx_decorated_function()
     nvtx_decorated_function_with_message()
     assert all(execution_tracker.values())
@@ -315,12 +327,11 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
         add_bias_linear=False,
         bf16=True,
     )
-    model = MoELayer(
-        transformer_config,
-        get_gpt_layer_with_transformer_engine_submodules(
-            num_experts=2, moe_grouped_gemm=True
-        ).mlp.submodules,
-    ).to(device='cuda')
+    submodules = get_submodules(
+        get_gpt_layer_with_transformer_engine_submodules(num_experts=2, moe_grouped_gemm=True).mlp
+    )
+    assert isinstance(submodules, MoESubmodules)
+    model = MoELayer(transformer_config, submodules).to(device='cuda')
     model.requires_grad_(True)
     # Initialize the model with all 1.0 for weights.
     for param in model.parameters():

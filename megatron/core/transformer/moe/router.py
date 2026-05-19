@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -755,16 +756,6 @@ class InferenceTopKRouter(TopKRouter):
 
         super().__init__(config=config, pg_collection=pg_collection)
 
-        self.is_inference_cuda_graphed_iteration = False
-
-    def set_inference_cuda_graphed_iteration(self):
-        """Enable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = True
-
-    def unset_inference_cuda_graphed_iteration(self):
-        """Disable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = False
-
     @staticmethod
     @torch.compile
     def _compiled_topk_routing(
@@ -825,7 +816,7 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
-        if self.training or not self.is_inference_cuda_graphed_iteration:
+        if not InferenceMode.is_active():
             return super().forward(input, padding_mask)
 
         return self._forward(input, padding_mask)
