@@ -208,8 +208,10 @@ class HyperConnectionModule(MegatronModule):
                 fused_proj_rms,
                 fused_proj_rms_compute_h,
                 fused_sinkhorn,
+                log_fused_mhc_backend_once,
             )
 
+            log_fused_mhc_backend_once()
             self._sinkhorn_op = fused_sinkhorn
             self._h_aggregate_op = fused_h_aggregate
             self._h_post_bda_op = fused_h_post_bda
@@ -469,6 +471,9 @@ class HyperConnectionModule(MegatronModule):
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
 
         Returns:
+            A 4-tuple. This is an intentional breaking change from the older
+            3-tuple API because fused_h_res_h_post_bda consumes the residual
+            branch created by BroadcastTensorFused.
             aggregated: [s, b, C] - aggregated input for layer computation
             h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
             h_post: [s, b, n] - expansion weights

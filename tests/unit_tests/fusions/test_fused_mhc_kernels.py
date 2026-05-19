@@ -4,7 +4,8 @@
 
 Each test compares the fused kernel's forward output AND backward gradients
 against a pure-PyTorch differentiable reference to catch numerical drift
-introduced by kernel fusion.
+introduced by kernel fusion. The public fused API tests also exercise backend
+dispatch and fallback selection through the same entry points used by mHC.
 """
 
 import math
@@ -163,6 +164,8 @@ class TestNativeSinkhorn:
 
 
 class TestFusedSinkhorn:
+    """Public fused sinkhorn dispatch/fallback plus numerical correctness."""
+
     @pytest.mark.flaky_in_dev
     @_require_cutile
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10)])
@@ -222,6 +225,8 @@ class TestNativeHAggregate:
 
 
 class TestFusedHAggregate:
+    """Public fused h_aggregate dispatch/fallback plus numerical correctness."""
+
     @pytest.mark.flaky_in_dev
     @_require_cutile
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
@@ -321,6 +326,8 @@ class TestNativeHPostBDA:
 
 
 class TestFusedHPostBDA:
+    """Public fused h_post_bda dispatch/fallback plus numerical correctness."""
+
     @pytest.mark.flaky_in_dev
     @_require_cutile
     @pytest.mark.parametrize("with_bias", [True, False])
@@ -637,6 +644,8 @@ class TestNativeProjRms:
 
 
 class TestFusedProjRms:
+    """Public fused proj_rms dispatch/fallback plus numerical correctness."""
+
     @pytest.mark.flaky_in_dev
     @_require_cutile
     @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
@@ -679,6 +688,8 @@ class TestFusedProjRms:
 
 
 class TestFusedProjRmsComputeH:
+    """Public fused proj_rms_compute_h dispatch/fallback plus numerical correctness."""
+
     @pytest.mark.parametrize("M,n,K", [(256, 4, 4096), (64, 2, 512), (128, 4, 2048)])
     def test_fwd_bwd_vs_reference(self, M, n, K):
         """E2E: public fused fwd output and bwd grads must match the PyTorch reference."""
@@ -1186,7 +1197,7 @@ class TestEndToEndNativeBroadcast:
 
 
 class TestEndToEndFusedBroadcast:
-    """Full mHC pipeline using the public fused API + BroadcastTensorFused."""
+    """Full mHC pipeline through public fused dispatch + BroadcastTensorFused."""
 
     def test_full_pipeline_fwd_bwd(self):
         from megatron.core.fusions.fused_mhc_kernels import (

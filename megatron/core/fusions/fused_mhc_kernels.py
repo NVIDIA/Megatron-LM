@@ -14,12 +14,18 @@ Four fused operations:
   - proj_rms:     fused projection + RMS normalization
 """
 
+import logging
 import math
 import os
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
+
+from megatron.core._rank_utils import log_single_rank
+
+logger = logging.getLogger(__name__)
+LOG2E = math.log2(math.e)
 
 
 def _env_flag(name: str) -> bool:
@@ -147,7 +153,8 @@ if _TRITON_AVAILABLE:
 
         logits = tl.load(inp_ptr + mat_ptrs).to(tl.float32)
         row_max = tl.max(logits, axis=1)
-        M = tl.exp2((logits - row_max[:, None]) * 1.4426950408889634)
+        # Subtract row_max before exp to keep the exponent numerically stable.
+        M = tl.exp2((logits - row_max[:, None]) * LOG2E)
         tl.store(M_init_ptr + mat_ptrs, M.to(M_init_ptr.dtype.element_ty))
 
         for _ in range(NUM_ITERS):
@@ -725,7 +732,6 @@ if _TRITON_AVAILABLE:
 if _CUTILE_AVAILABLE:
     ConstInt = ct.Constant[int]
     PAD_ZERO = ct.PaddingMode.ZERO
-    LOG2E = 1.4426950408889634
 
     # -- Sinkhorn kernels ----------------------------------------------------
 
@@ -1343,6 +1349,8 @@ if _CUTILE_AVAILABLE:
         '''
         Grid: (num_tiles_m, num_tiles_k).
         Fused matmul + norm + r: proj, norm, r in one pass over K.
+        R is a retained signature placeholder; r is computed after split-K
+        reduction from NORM.
         '''
         tile_m_id = ct.bid(0)
         split_k_id = ct.bid(1)
@@ -1438,10 +1446,7 @@ if _CUTILE_AVAILABLE:
 
         # 2. Compute r = norm / sqrt(K)
         denom = ct.full((TILE_SIZE_M, 1), K * 1.0, dtype=ct.float32)
-        mean = ct.truediv(r_accum, denom)
-        rstd = ct.rsqrt(mean)
-        ones = ct.full((TILE_SIZE_M, 1), 1.0, dtype=ct.float32)
-        r_val = ct.truediv(ones, rstd)  # norm / sqrt(K)
+        r_val = ct.sqrt(ct.truediv(r_accum, denom))
 
         ct.store(R, index=(bid_m, 0), tile=r_val.astype(R.dtype))
 
@@ -1663,6 +1668,8 @@ if _CUTILE_AVAILABLE:
 
             proj = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
             norm = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+            # _ct_proj_rms_fwd_kernel keeps R in its signature; r is computed
+            # below from the reduced norm.
             r = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
 
             ct.launch(
@@ -1684,6 +1691,7 @@ if _CUTILE_AVAILABLE:
                 tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
                 proj = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
                 norm = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                # Signature placeholder for the cuTile kernel; not read.
                 r = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
                 ct.launch(
                     stream,
@@ -1697,6 +1705,7 @@ if _CUTILE_AVAILABLE:
                 mx_split_k = max(cfg.SPLIT_K for cfg in configs)
                 proj = torch.empty(mx_split_k * M, N, dtype=x.dtype, device=dev)
                 norm = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                # Signature placeholder for autotune launches; not read.
                 r = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
                 tuned = ct_experimental.autotune_launch(
                     stream,
@@ -1728,6 +1737,7 @@ if _CUTILE_AVAILABLE:
                 )
                 proj = torch.empty(best.SPLIT_K * M, N, dtype=x.dtype, device=dev)
                 norm = torch.empty(best.SPLIT_K * M, 1, dtype=x.dtype, device=dev)
+                # Signature placeholder for the cuTile kernel; not read.
                 r = torch.empty(best.SPLIT_K * M, 1, dtype=x.dtype, device=dev)
                 # Re-launch with best config for correct output.
                 ct.launch(
@@ -1909,6 +1919,8 @@ if _CUTILE_AVAILABLE:
 
             proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
             norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+            # _ct_proj_rms_fwd_kernel keeps R in its signature; reduce_compute_h
+            # computes r from norm_acc.
             r_placeholder = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
 
             ct.launch(
@@ -1926,6 +1938,7 @@ if _CUTILE_AVAILABLE:
                 tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
                 proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
                 norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                # Signature placeholder for the cuTile kernel; not read.
                 r_placeholder = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
                 ct.launch(
                     stream,
@@ -1951,6 +1964,7 @@ if _CUTILE_AVAILABLE:
                 mx_split_k = max(cfg.SPLIT_K for cfg in configs)
                 proj_acc = torch.empty(mx_split_k * M, N, dtype=x.dtype, device=dev)
                 norm_acc = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                # Signature placeholder for autotune launches; not read.
                 r_placeholder = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
                 tuned = ct_experimental.autotune_launch(
                     stream,
@@ -1984,6 +1998,7 @@ if _CUTILE_AVAILABLE:
 
                 proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
                 norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                # Signature placeholder for the cuTile kernel; not read.
                 r_placeholder = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
                 ct.launch(
                     stream,
@@ -2846,6 +2861,48 @@ from megatron.core.transformer.hyper_connection import (
 )
 
 
+_BACKEND_INFO_LOGGED = False
+
+
+def _select_triton_cutile_native(triton_impl) -> str:
+    if triton_impl is not None:
+        return "triton"
+    if _CUTILE_AVAILABLE:
+        return "cutile"
+    return "native"
+
+
+def _mhc_backend_selection() -> str:
+    """Return a concise description of the selected mHC fused backends."""
+    sinkhorn = _select_triton_cutile_native(_get_triton_sinkhorn())
+    h_aggregate_fwd = _select_triton_cutile_native(_get_triton_h_aggregate_fwd())
+    h_aggregate_bwd = "cutile" if _CUTILE_AVAILABLE else "native"
+    h_post_bda_fwd = _select_triton_cutile_native(_get_triton_h_post_bda_fwd())
+    h_post_bda_bwd = _select_triton_cutile_native(_get_triton_h_post_bda_bwd())
+    proj_rms = "cutile" if _CUTILE_AVAILABLE else "native"
+    return (
+        f"MHC_FORCE_BACKEND={_MHC_FORCED_BACKEND}; "
+        f"sinkhorn={sinkhorn}; "
+        f"h_aggregate=fwd:{h_aggregate_fwd},bwd:{h_aggregate_bwd}; "
+        f"h_post_bda=fwd:{h_post_bda_fwd},bwd:{h_post_bda_bwd}; "
+        f"proj_rms={proj_rms}; "
+        f"proj_rms_compute_h={proj_rms}"
+    )
+
+
+def log_fused_mhc_backend_once() -> None:
+    """Log the fused mHC backend selection once per process."""
+    global _BACKEND_INFO_LOGGED
+    if _BACKEND_INFO_LOGGED:
+        return
+    _BACKEND_INFO_LOGGED = True
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[mHC] fused backend selection: {_mhc_backend_selection()}",
+    )
+
+
 def fused_add_3(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
     """Add three tensors using the native torch.compile-backed implementation."""
     return native_fused_add_3(a, b, c)
@@ -2876,8 +2933,9 @@ def _get_triton_h_post_bda_bwd():
 
 
 def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tuple[Tensor, Tensor]:
-    grad_x = grad_output.unsqueeze(2) * h_pre.unsqueeze(-1)
-    grad_h = torch.sum(grad_output.unsqueeze(2) * x, dim=-1)
+    grad_output_expanded = grad_output.unsqueeze(2)
+    grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
+    grad_h = torch.sum(grad_output_expanded * x, dim=-1)
     return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype)
 
 
