@@ -2944,15 +2944,10 @@ def is_te_grouped_tensor(tensor: Any) -> bool:
 
 
 def te_grouped_tensor_prepare_for_saving(tensor: torch.Tensor):
-    """Use TE's canonical GroupedTensor saved-buffer layout on a shallow wrapper copy."""
+    """Use TE's canonical GroupedTensor saved-buffer layout."""
     if not is_te_grouped_tensor(tensor):
         raise TypeError(f"Expected TE GroupedTensor, got {type(tensor).__name__}")
-
-    # GroupedTensor.prepare_for_saving clears buffer references on the object it receives.
-    # Keep the original saved tensor intact and mutate only the metadata holder that will be
-    # restored during unpack.
-    tensor_obj = tensor.detach()
-    return tensor_obj.prepare_for_saving()
+    return tensor.prepare_for_saving()
 
 
 def te_grouped_tensor_restore_from_saved(tensor_obj: Any, tensors: list[Optional[torch.Tensor]]):
