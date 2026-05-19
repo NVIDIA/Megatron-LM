@@ -65,7 +65,7 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
+                    linear_proj=not_none(TERowParallelLinear),
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
@@ -95,7 +95,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
+                    linear_proj=not_none(TERowParallelLinear),
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
@@ -109,7 +109,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                     linear_q=not_none(TEColumnParallelLinear),
                     linear_kv=not_none(TEColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
+                    linear_proj=not_none(TERowParallelLinear),
                 ),
             ),
             cross_attn_bda=get_bias_dropout_add,

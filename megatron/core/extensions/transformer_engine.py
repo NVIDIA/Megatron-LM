@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
 
 import dataclasses
 import enum
@@ -865,7 +866,7 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, self.training, is_context_quantized
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
@@ -1707,11 +1708,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
 
             extra_kwargs = _get_extra_te_kwargs(config)
+
             self.delay_wgrad_compute = (
                 self.config.delay_wgrad_compute
                 or self.config.overlap_dispatch_backward_with_experts_wgrad
             )
-
             if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
                     extra_kwargs["delay_wgrad_compute"] = True
@@ -1755,6 +1756,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
+            if is_te_min_version("2.14.0"):
+                extra_kwargs["single_grouped_weight"] = getattr(
+                    config, "moe_single_grouped_weight", False
+                )
+                extra_kwargs["single_grouped_bias"] = getattr(
+                    config, "moe_single_grouped_bias", False
+                )
+
             super().__init__(
                 num_gemms=num_gemms,
                 in_features=input_size,
@@ -1790,6 +1799,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     if weight is not None:
                         setattr(weight, "partition_dim", part_dim)
                         setattr(weight, "partition_stride", 1)
+
+            self._register_load_state_dict_pre_hook(
+                type(self)._normalize_grouped_parameter_keys, with_module=True
+            )
 
             def merge_extra_states(
                 self,
@@ -1880,6 +1893,76 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 state_dict[f"{prefix}_extra_state"] = self._encode_extra_state(extra_state)
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
+
+        def _normalize_grouped_parameter_keys(
+            self,
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        ):
+            """Make grouped checkpoint keys compatible across parameter layouts.
+
+            Registered as a load_state_dict pre-hook to bridge checkpoints saved
+            in one layout (single grouped tensor vs per-GEMM indexed tensors)
+            and a model expecting the other.
+            """
+
+            def maybe_remap_param(param_name: str, single_grouped: bool) -> None:
+                grouped_key = f"{prefix}{param_name}"
+                indexed_keys = [
+                    f"{prefix}{param_name}{gemm_idx}" for gemm_idx in range(self.num_gemms)
+                ]
+                has_grouped_key = grouped_key in state_dict
+                has_any_indexed_key = any(key in state_dict for key in indexed_keys)
+                has_all_indexed_keys = all(key in state_dict for key in indexed_keys)
+
+                if single_grouped:
+                    if has_grouped_key or not has_all_indexed_keys:
+                        return
+                    state_dict[grouped_key] = torch.stack(
+                        [state_dict.pop(key) for key in indexed_keys], dim=0
+                    )
+                else:
+                    if has_any_indexed_key or not has_grouped_key:
+                        return
+                    split_tensors = self._split_grouped_checkpoint_tensor(
+                        state_dict.pop(grouped_key), grouped_key
+                    )
+                    for gemm_idx, tensor in enumerate(split_tensors):
+                        state_dict[f"{prefix}{param_name}{gemm_idx}"] = tensor
+
+            maybe_remap_param("weight", getattr(self, "single_grouped_weight", False))
+            if self.use_bias:
+                maybe_remap_param("bias", getattr(self, "single_grouped_bias", False))
+
+        def _split_grouped_checkpoint_tensor(
+            self, tensor: torch.Tensor, checkpoint_key: str
+        ) -> list[torch.Tensor]:
+            """Split grouped checkpoint tensor into one tensor per GEMM."""
+            if hasattr(tensor, "split_into_quantized_tensors") and callable(
+                tensor.split_into_quantized_tensors
+            ):
+                grouped_tensors = getattr(tensor, "quantized_tensors", None)
+                if grouped_tensors is None:
+                    grouped_tensors = tensor.split_into_quantized_tensors()
+                if len(grouped_tensors) != self.num_gemms:
+                    raise RuntimeError(
+                        f"Grouped checkpoint tensor {checkpoint_key} has {len(grouped_tensors)} "
+                        f"groups, expected {self.num_gemms}."
+                    )
+                return list(grouped_tensors)
+            if tensor.ndim > 0 and tensor.shape[0] == self.num_gemms:
+                return list(tensor.unbind(dim=0))
+            if tensor.ndim > 0 and tensor.shape[0] % self.num_gemms == 0:
+                return list(torch.chunk(tensor, self.num_gemms, dim=0))
+            raise RuntimeError(
+                f"Cannot split checkpoint tensor {checkpoint_key} with shape {tuple(tensor.shape)} "
+                f"into {self.num_gemms} GEMM shards."
+            )
 
         def finish_init(self, quantization_config: QuantizationConfig):
             """Post-init of quantization override"""
@@ -1987,6 +2070,21 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
             sharded_state_dict = {}
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
+            grouped_split_cache = {}
+
+            def get_gemm_tensor(param_name: str, gemm_idx: int) -> torch.Tensor:
+                indexed_name = f"{param_name}{gemm_idx}"
+                if indexed_name in full_state_dict:
+                    return full_state_dict[indexed_name]
+                if param_name not in full_state_dict:
+                    raise KeyError(indexed_name)
+                if param_name not in grouped_split_cache:
+                    grouped_split_cache[param_name] = self._split_grouped_checkpoint_tensor(
+                        full_state_dict[param_name], param_name
+                    )
+                grouped_splits = grouped_split_cache[param_name]
+                return grouped_splits[gemm_idx]
+
             num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
             local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
             ep_axis = len(sharded_offsets)
@@ -1994,11 +2092,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             for gemm_idx in range(self.num_gemms):
                 global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
-                    f"{gemm_idx}.weight": full_state_dict[f"weight{gemm_idx}"],
+                    f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),
                     f"{gemm_idx}._extra_state": extra_states[gemm_idx],
                 }
                 if self.use_bias:
-                    state_dict[f"{gemm_idx}.bias"] = full_state_dict[f"bias{gemm_idx}"]
+                    state_dict[f"{gemm_idx}.bias"] = get_gemm_tensor("bias", gemm_idx)
                 if singleton_local_shards:
                     expert_prefix = f"{global_expert_idx}.{prefix}"
                     new_sharded_offsets = sharded_offsets
