@@ -603,7 +603,7 @@ def _build_gpt_model_with_cuda_graph(
     min_offloaded_tensor_size: int,
     is_mla: bool,
     cuda_graph_impl: str,
-    cuda_graph_scope: Optional[List[str]],
+    cuda_graph_modules: Optional[List[str]],
     cuda_graph_warmup_steps: int,
     delay_offload_until_cuda_graph: bool = False,
     activation_offload_fraction: float = 1.0,
@@ -637,7 +637,7 @@ def _build_gpt_model_with_cuda_graph(
         activation_offload_fraction=activation_offload_fraction,
         # CUDA Graph settings
         cuda_graph_impl=cuda_graph_impl,
-        cuda_graph_scope=cuda_graph_scope,
+        cuda_graph_modules=cuda_graph_modules,
         cuda_graph_warmup_steps=cuda_graph_warmup_steps,
         use_te_rng_tracker=True,
         # Hyper Connection settings
@@ -773,7 +773,7 @@ def _run_iters_with_cuda_graph(
 )
 @pytest.mark.flaky_in_dev
 @pytest.mark.parametrize(
-    "is_mla, offload_modules, cuda_graph_scope, activation_offload_fraction, delay_offload",
+    "is_mla, offload_modules, cuda_graph_modules, activation_offload_fraction, delay_offload",
     [
         # MoE model with attention CUDA graph + attn offloading
         (False, ["core_attn", "attn_proj"], ["attn", "moe_router"], 1.0, True),
@@ -810,7 +810,7 @@ def _run_iters_with_cuda_graph(
 def test_fine_grained_activation_offloading_with_cuda_graph(
     is_mla: bool,
     offload_modules: List[str],
-    cuda_graph_scope: List[str],
+    cuda_graph_modules: List[str],
     activation_offload_fraction: float,
     delay_offload: bool,
 ):
@@ -866,7 +866,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             min_offloaded_tensor_size=1024 * 1024,
             is_mla=is_mla,
             cuda_graph_impl="transformer_engine",
-            cuda_graph_scope=cuda_graph_scope,
+            cuda_graph_modules=cuda_graph_modules,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
         ).cuda()
         base_model.train()
@@ -899,7 +899,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             min_offloaded_tensor_size=1024,  # Force offloading for determinism
             is_mla=is_mla,
             cuda_graph_impl="transformer_engine",
-            cuda_graph_scope=cuda_graph_scope,
+            cuda_graph_modules=cuda_graph_modules,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
             delay_offload_until_cuda_graph=delay_offload,
             activation_offload_fraction=activation_offload_fraction,
@@ -969,7 +969,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
     not is_te_min_version("2.14.0"), reason="CUDA Graph with TE RNG tracker requires TE >= 2.13.0"
 )
 @pytest.mark.parametrize(
-    "offload_modules, cuda_graph_scope, delay_offload",
+    "offload_modules, cuda_graph_modules, delay_offload",
     [
         # mHC + MoE with attention CUDA graph + attn offloading
         (["core_attn", "attn_proj"], ["attn", "moe_router"], True),
@@ -982,7 +982,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
     ],
 )
 def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
-    offload_modules: List[str], cuda_graph_scope: List[str], delay_offload: bool
+    offload_modules: List[str], cuda_graph_modules: List[str], delay_offload: bool
 ):
     """
     Test mHC (Hyper Connection) + fine-grained activation offloading + CUDA graph.
@@ -1037,7 +1037,7 @@ def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
             min_offloaded_tensor_size=1024 * 1024,
             is_mla=False,
             cuda_graph_impl="transformer_engine",
-            cuda_graph_scope=cuda_graph_scope,
+            cuda_graph_modules=cuda_graph_modules,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
             enable_hyper_connections=True,
             num_residual_streams=4,
@@ -1072,7 +1072,7 @@ def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
             min_offloaded_tensor_size=1024,
             is_mla=False,
             cuda_graph_impl="transformer_engine",
-            cuda_graph_scope=cuda_graph_scope,
+            cuda_graph_modules=cuda_graph_modules,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
             delay_offload_until_cuda_graph=delay_offload,
             enable_hyper_connections=True,

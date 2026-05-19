@@ -11,6 +11,12 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import (
+    ReplicaId,
+    ShardedStateDict,
+    ShardedTensorFactory,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -36,6 +42,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
+from megatron.core.transformer.utils import cat_with_oom_fallback
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -52,7 +59,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType, CudaGraphScope
+from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
 try:
@@ -738,15 +745,18 @@ class Attention(MegatronModule, ABC):
         hidden_states: Tensor,
         key_value_states: Tensor | None,
         output_gate: bool = False,
+        head_wise_gate: bool = False,
         split_qkv: bool = True,
     ) -> (
-        tuple[Tensor, Tensor, Tensor, Tensor]
+        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
         | tuple[Tensor, list[int]]
     ):
         """
         This method needs to be implemented based on whether the derived class
-        is "self-attn" or "cross-attn".
+        is "self-attn" or "cross-attn". When ``output_gate=True`` / ``head_wise_gate=True``
+        the corresponding gate tensor is appended as a trailing tuple element.
         """
 
     def flash_decode(
@@ -1147,6 +1157,8 @@ class Attention(MegatronModule, ABC):
             ]
         )
         output_gate = self.config.attention_output_gate
+        # head_wise_attn_gate is self-attention only (gate rows live in linear_qkv).
+        head_wise_gate_enabled = self.config.head_wise_attn_gate and self.attention_type != "cross"
         # Check if fused_single_qkv_rope is requested but either unavailable or not
         # supported for the current use case.
         if self.attention_type != "cross":
@@ -1155,6 +1167,8 @@ class Attention(MegatronModule, ABC):
             ), "fused_single_qkv_rope requested but not available/supported for the config."
         if output_gate:
             assert split_qkv, "output_gate is not supported for unsplit mixed_qkv tensor."
+        if head_wise_gate_enabled:
+            assert split_qkv, "head_wise_attn_gate is not supported for unsplit mixed_qkv tensor."
 
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
         with qkv_linear_manager as hidden_states:
@@ -1162,16 +1176,23 @@ class Attention(MegatronModule, ABC):
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
-                output_gate=self.config.attention_output_gate,
+                output_gate=output_gate,
+                head_wise_gate=head_wise_gate_enabled,
             )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
+        head_wise_gate = None
         if split_qkv:
-            if self.config.attention_output_gate:
+            # qkv_output is (query, key, value, [output_gate], [head_wise_gate]).
+            if output_gate and head_wise_gate_enabled:
+                query, key, value, gate, head_wise_gate = qkv_output
+            elif output_gate:
                 query, key, value, gate = qkv_output
+            elif head_wise_gate_enabled:
+                query, key, value, head_wise_gate = qkv_output
             else:
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
@@ -1221,7 +1242,6 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
@@ -1373,7 +1393,17 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
-        # Output gate
+        if head_wise_gate is not None:
+            nvtx_range_push(suffix="head_wise_attn_gate")
+            gate_states = head_wise_gate.view(*head_wise_gate.shape[:2], -1, 1)
+            core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)
+            core_attn_out = core_attn_out * torch.sigmoid(gate_states.float()).to(
+                core_attn_out.dtype
+            )
+            core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)
+            nvtx_range_pop(suffix="head_wise_attn_gate")
+
+        # Output gate (attention_output_gate: full head_dim gate fused into QKV)
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
@@ -1446,6 +1476,19 @@ class SelfAttention(Attention):
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
+        if self.config.head_wise_attn_gate:
+            # Defensive runtime guards against config-validation bypass; same
+            # invariants enforced earlier in TransformerConfig.__post_init__.
+            tp_world_size = get_pg_size(self.pg_collection.tp)
+            assert self.config.num_query_groups >= tp_world_size, (
+                f"head_wise_attn_gate requires num_query_groups "
+                f"({self.config.num_query_groups}) >= tp world_size ({tp_world_size})"
+            )
+            assert self.config.num_attention_heads % tp_world_size == 0, (
+                f"head_wise_attn_gate requires num_attention_heads "
+                f"({self.config.num_attention_heads}) % tp world_size ({tp_world_size}) == 0"
+            )
+            self.linear_qkv_out_dim += self.config.num_attention_heads
         self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.linear_qkv_out_dim,
@@ -1581,20 +1624,44 @@ class SelfAttention(Attention):
         hidden_states: Tensor,
         key_value_states: Tensor | None = None,
         output_gate: bool = False,
+        head_wise_gate: bool = False,
         split_qkv: bool = True,
     ) -> (
-        tuple[Tensor, Tensor, Tensor, Tensor]
+        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
         | tuple[Tensor, list[int]]
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
-        If `output_gate` is True, then also derives `gate` tensor.
-        If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
+        If `output_gate` is True, also returns a per-head head_dim gate.
+        If `head_wise_gate` is True, also returns a per-head scalar gate.
+        If `split_qkv=False`, returns the unsplit mixed_qkv tensor.
         """
+        if head_wise_gate:
+            assert split_qkv and self.config.head_wise_attn_gate
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+
+        # Peel the trailing per-rank gate scalars before any reshape / AG.
+        # Correct only because (a) ColumnParallelLinear splits axis 0
+        # contiguously, (b) num_attention_heads % tp == 0, (c) global layout
+        # is [QKV; Gate] (preserved across dist-ckpt by
+        # apply_head_wise_attn_gate_sharded_factory). (a)+(b) checked at
+        # config / init time.
+        head_wise_gate_states = None
+        if head_wise_gate:
+            gate_size = self.num_attention_heads_per_partition
+            mixed_qkv, head_wise_gate_states = torch.split(
+                mixed_qkv, [mixed_qkv.size(-1) - gate_size, gate_size], dim=-1
+            )
+            # torch.split on the last dim leaves non-contiguous views: the
+            # outer-dim stride still spans the original (QKV+gate) width, so
+            # downstream key.view(sk, b*np, hn) in dot_product_attention would
+            # fail with "view size is not compatible with input tensor's size
+            # and stride." Materialize a contiguous QKV slab here.
+            mixed_qkv = mixed_qkv.contiguous()
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
@@ -1704,7 +1771,12 @@ class SelfAttention(Attention):
                     self.world_size // self.config.num_query_groups
                 )
                 gate = gate[:, :, idx * size : (idx + 1) * size, :]
+            if head_wise_gate:
+                return query, key, value, gate, head_wise_gate_states
             return query, key, value, gate
+
+        if head_wise_gate:
+            return query, key, value, head_wise_gate_states
 
         return query, key, value
 
@@ -1824,6 +1896,83 @@ class SelfAttention(Attention):
 
         return weight_updated
 
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """Wrap linear_qkv.{weight,bias} with a factory that reshards QKV and
+        gate sub-blocks independently, analogous to apply_swiglu_sharded_factory."""
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if self.config.head_wise_attn_gate:
+            qkv_size = self.query_projection_size + 2 * self.kv_projection_size
+            gate_size = self.config.num_attention_heads
+            for sub_name in ("weight", "bias"):
+                key = f"{prefix}linear_qkv.{sub_name}"
+                if key in sharded_state_dict:
+                    sharded_state_dict[key] = apply_head_wise_attn_gate_sharded_factory(
+                        sharded_state_dict[key], sharded_offsets, qkv_size, gate_size
+                    )
+        return sharded_state_dict
+
+
+# pylint: disable=missing-function-docstring
+def apply_head_wise_attn_gate_sharded_factory(
+    original_sh_ten, sharded_offsets, qkv_size: int, gate_size: int
+):
+    """Split linear_qkv.{weight,bias} into QKV and gate sub-tensors with
+    distinct keys so each is resharded independently along axis 0 across TP.
+    Default {"weight": 0} sharding would otherwise re-balance the QKV/gate
+    boundary on TP change and turn V/K rows into gate rows (silent miscompute).
+    Same pattern as apply_swiglu_sharded_factory, but with unequal sub-block
+    sizes (QKV >> gate)."""
+    shard_axis = 0
+    prepend_axis_num = len(sharded_offsets)
+    local_axis_size = original_sh_ten.local_shape[shard_axis]
+    axis_frag = original_sh_ten.axis_fragmentations[shard_axis + prepend_axis_num]
+
+    qkv_local_size, qkv_rem = divmod(qkv_size, axis_frag)
+    gate_local_size, gate_rem = divmod(gate_size, axis_frag)
+    assert qkv_rem == 0 and gate_rem == 0, (
+        f"head_wise_attn_gate dist-ckpt requires QKV ({qkv_size}) and gate "
+        f"({gate_size}) divisible by TP world_size ({axis_frag})."
+    )
+    assert local_axis_size == qkv_local_size + gate_local_size
+    rank_offset = original_sh_ten.global_offset[shard_axis + prepend_axis_num] // local_axis_size
+
+    @torch.no_grad()
+    def sh_ten_build_fn(
+        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
+    ):
+        tensor_qkv, tensor_gate = torch.split(t, [qkv_local_size, gate_local_size], dim=shard_axis)
+        offset_qkv = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
+        offset_gate = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
+        return [
+            ShardedTensor.from_rank_offsets(
+                f"{key}._qkv",
+                tensor_qkv,
+                *sharded_offsets,
+                offset_qkv,
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            ),
+            ShardedTensor.from_rank_offsets(
+                f"{key}._gate",
+                tensor_gate,
+                *sharded_offsets,
+                offset_gate,
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            ),
+        ]
+
+    return ShardedTensorFactory(
+        original_sh_ten.key,
+        original_sh_ten.data,
+        sh_ten_build_fn,
+        cat_with_oom_fallback,
+        original_sh_ten.replica_id,
+        flattened_range=original_sh_ten.flattened_range,
+    )
+
 
 class CrossAttention(Attention):
     """Cross-attention layer class
@@ -1884,6 +2033,7 @@ class CrossAttention(Attention):
         hidden_states: Tensor,
         key_value_states: Optional[Tensor],
         output_gate: bool = False,
+        head_wise_gate: bool = False,
         split_qkv: bool = True,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -1891,6 +2041,7 @@ class CrossAttention(Attention):
         from `key_value_states`.
         """
         assert not output_gate, "Output gate is not supported in cross attention for now."
+        assert not head_wise_gate, "head_wise_attn_gate is self-attention only."
 
         assert split_qkv, "split_qkv must be True for CrossAttention"
         assert not output_gate, "Output gate is not supported in cross attention for now."

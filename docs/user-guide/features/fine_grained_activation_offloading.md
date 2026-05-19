@@ -42,13 +42,13 @@ Supported offloading modules are `"attn_norm"`, `"core_attn"`, `"attn_proj"`, `"
 ```bash
 # Optional: cap inflight D2H offloads per offload group to N (omit or None in most setups).
 # Required as a non-None non-negative integer when fine-grained activation offloading is used with
-# local full-iteration CUDA graphs (full_iteration in cuda_graph_scope); see prose below.
+# full-iteration CUDA graphs (--cuda-graph-impl full_iteration); see prose below.
 --fine_grained_offloading_max_inflight_offloads <N>
 ```
 
 TransformerConfig.fine_grained_offloading_max_inflight_offloads caps, per offload group (for example `moe_act`, `qkv_linear`), how many D2H copies may be in flight before a main-stream wait_event. 0 waits after each offload; larger values allow more overlap; None skips these joins.
 
-With full-iteration CUDA graphs (local graph impl, full_iteration in cuda_graph_scope) and fine-grained activation offloading enabled, set it to a non-None integer: that path does not rely on record_stream, so explicit joins are required.
+With full-iteration CUDA graphs (`--cuda-graph-impl full_iteration`) and fine-grained activation offloading enabled, set it to a non-None integer: that path does not rely on record_stream, so explicit joins are required.
 
 ## Compatible With Fine-Grained Recomputation
 

@@ -75,8 +75,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "csa_window_size": 128,
     "cuda_graph_impl": "none",
     "cuda_graph_retain_backward_graph": False,
-    "cuda_graph_scope": [],
+    "cuda_graph_modules": [],
     "cuda_graph_use_single_mempool": True,
+    "cuda_graph_scope": None,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
     "defer_embedding_wgrad_compute": False,
@@ -216,6 +217,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_token_dropping": False,
     "moe_z_loss_coeff": None,
     "moe_enable_routing_replay": False,
+    "mrope_interleaved": False,
     "mrope_section": None,
     "mup_attn_scale_power": 1.0,
     "mup_base_head_dim": None,
@@ -317,6 +319,12 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "fallback_to_eager_attn": False,
+    "inference_cuda_graph_scope": {
+        "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
+        "_name_": "none",
+        "_sort_order_": 0,
+        "_value_": 1,
+    },
     "inference_disable_triton_nvls_kernels": False,
     "inference_grouped_gemm_backend": "vllm",
     "inference_moe_disable_fused_quant_kernels": False,
@@ -329,6 +337,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_transformer_engine_op_fuser": False,
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
+    "head_wise_attn_gate": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

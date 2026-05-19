@@ -31,6 +31,7 @@ try:
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        split_dtensor,
         uneven_dtensor_to_full_tensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
@@ -273,10 +274,21 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis, is_expert_param):
         """
         Split the SWiGLU linear_fc1 parameter into two parts: weight_w and weight_v.
+
+        Args:
+            data: The tensor to split. May be a DTensor (model state dict) or a
+                plain Tensor (optimizer states from FusedAdam).
+            dist_param: The corresponding model parameter (always a DTensor).
+                Used for global shape, numel, FSDP slice, and dist index metadata.
+            swiglu_shard_axis: Axis along which to split W and V gates.
+            is_expert_param: Whether this is an expert parameter (affects TP mesh).
         """
-        assert data.shape[swiglu_shard_axis] % 2 == 0, (
-            f"SWiGLU weights must have an even size along the shard axis {swiglu_shard_axis}, "
-            f"got {data.shape[swiglu_shard_axis]}"
+        # Use dist_param (always a DTensor) for global shape/numel,
+        # as data may be a regular Tensor (e.g., optimizer states).
+        global_shape = dist_param.shape
+        assert global_shape[swiglu_shard_axis] % 2 == 0, (
+            f"SWiGLU FC1 must have even global size along axis {swiglu_shard_axis}, "
+            f"got {global_shape[swiglu_shard_axis]} (global_shape={list(global_shape)})"
         )
 
         fsdp_slice = dist_param.megatron_fsdp_slice
@@ -285,13 +297,27 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         tp_mesh = megatron_fsdp_dist_index.get_submesh(
             [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param
         )
-        data_size = data.numel() // tp_mesh.mesh.numel()
+        data_size = dist_param.numel() // tp_mesh.mesh.numel()
         w_slice = slice(0, data_size // 2)
         v_slice = slice(data_size // 2, data_size)
 
-        view_shape = list(data.shape)
+        view_shape = list(global_shape)
         view_shape[swiglu_shard_axis] = -1
-        local_tensor = data.to_local()
+        if isinstance(data, DTensor):
+            assert data.shape == global_shape, (
+                f"DTensor shape mismatch: data.shape={data.shape} vs "
+                f"dist_param.shape={global_shape}"
+            )
+            local_tensor = data.to_local()
+        else:
+            # Plain Tensor must already be the FSDP-local shard; other layouts
+            # (TP-local / global) would silently misalign in the slice below.
+            expected = fsdp_slice.stop - fsdp_slice.start
+            assert data.numel() == expected, (
+                f"Plain Tensor must be FSDP-local shard "
+                f"(expected numel={expected}, got {data.numel()}; fsdp_slice={fsdp_slice})"
+            )
+            local_tensor = data
         weight_w = local_tensor.view(-1)[
             offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
@@ -303,7 +329,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
         # Fake parameters w and v are used to provide the correct parameter
         # shape and Tensor-Parallelism information.
-        per_tp_rank_shape = list(data.shape)
+        per_tp_rank_shape = list(global_shape)
         if is_mcore_tensor_model_parallel(dist_param):
             tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
             assert tp_dim is not None, "Tensor model parallel dimension not found"
@@ -462,19 +488,54 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         return slice(s.start + offset, s.stop + offset)
 
     def split_gdn_fused(data, dist_param, split_sizes, split_dim):
-        """Split a fused GDN projection DTensor into per-component DTensors."""
+        """Split a fused GDN projection DTensor into per-component DTensors.
+
+        Args:
+            data: The tensor to split. May be a DTensor (model state dict) or a
+                plain Tensor (optimizer states from FusedAdam).
+            dist_param: The corresponding model parameter (always a DTensor).
+                Used for global shape, numel, FSDP slice, and dist index metadata.
+            split_sizes: List of sizes for each component along split_dim.
+            split_dim: Dimension along which to split.
+        """
+        total_split = sum(split_sizes)
+        if isinstance(data, DTensor) and data.shape[split_dim] == total_split:
+            # GDN tensors are already TP-local here (fast-path from #4799).
+            return list(
+                split_dtensor(
+                    data, split_sizes, dim=split_dim, update_uneven_dtensor_chunk_meta=True
+                )
+            )
+
+        # Use dist_param (always a DTensor) for global shape/numel,
+        # as data may be a regular Tensor (e.g., optimizer states).
+        global_shape = dist_param.shape
+
         fsdp_slice = dist_param.megatron_fsdp_slice
         dist_index = dist_param.megatron_fsdp_dist_index
         tp_mesh = dist_index.get_submesh([dist_index.tp_dim], is_expert_parallel=False)
 
-        data_size = data.numel() // tp_mesh.mesh.numel()
-        total_split = sum(split_sizes)
+        data_size = dist_param.numel() // tp_mesh.mesh.numel()
         elems_per_unit = data_size // total_split
 
-        local_tensor = data.to_local()
-        view_shape = list(data.shape)
+        if isinstance(data, DTensor):
+            assert data.shape == global_shape, (
+                f"DTensor shape mismatch: data.shape={data.shape} vs "
+                f"dist_param.shape={global_shape}"
+            )
+            local_tensor = data.to_local()
+        else:
+            # Plain Tensor must already be the FSDP-local shard; other layouts
+            # (TP-local / global) would silently misalign in the slice below.
+            expected = fsdp_slice.stop - fsdp_slice.start
+            assert data.numel() == expected, (
+                f"Plain Tensor must be FSDP-local shard "
+                f"(expected numel={expected}, got {data.numel()}; fsdp_slice={fsdp_slice})"
+            )
+            local_tensor = data
+        view_shape = list(global_shape)
 
-        per_tp_rank_shape = list(data.shape)
+        per_tp_rank_shape = list(global_shape)
         if is_mcore_tensor_model_parallel(dist_param):
             tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
             assert tp_dim is not None, "Tensor model parallel dimension not found"

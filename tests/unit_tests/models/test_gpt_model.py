@@ -469,7 +469,6 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
     mock_args.qk_layernorm = False
     mock_args.multi_latent_attention = False
     mock_args.experimental_attention_variant = None
-    mock_args.moe_use_legacy_grouped_gemm = False
     mock_args.qk_l2_norm = False
 
     with (

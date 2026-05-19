@@ -31,7 +31,7 @@ MODEL_ARGS:
   --cross-entropy-fusion-impl: native
   --attention-backend: flash
   --enable-cuda-graph: true
-  --cuda-graph-scope: mamba attn moe_router
+  --cuda-graph-modules: mamba attn moe_router
   --te-rng-tracker: true
   --manual-gc: true
   --manual-gc-interval: 10

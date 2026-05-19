@@ -190,6 +190,15 @@ class SharedExpertMLP(MLP):
             output = output * gate_score
         return output
 
+    def _reset_parameters(self):
+        """Initialize parameters owned directly by SharedExpertMLP for meta init."""
+
+        if self.use_shared_expert_gate and self.gate_weight is not None:
+            if self.config.perform_initialization:
+                self.config.init_method(self.gate_weight)
+            self.gate_weight.data = self.gate_weight.data.to(dtype=self.config.params_dtype)
+            setattr(self.gate_weight, 'sequence_parallel', self.config.sequence_parallel)
+
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -269,6 +278,7 @@ class SharedExpertMLP(MLP):
                         intermediate_parallel,
                         bias_parallel,
                         self.config.activation_func_fp8_input_store,
+                        clamp_value=self.config.activation_func_clamp_value,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
@@ -278,8 +288,13 @@ class SharedExpertMLP(MLP):
                 if self.config.gated_linear_unit:
 
                     def glu(x):
-                        x = torch.chunk(x, 2, dim=-1)
-                        return self.config.activation_func(x[0]) * x[1]
+                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                        if (val := self.config.activation_func_clamp_value) is not None:
+                            x_glu = x_glu.clamp(min=None, max=val)
+                            x_linear = x_linear.clamp(min=-val, max=val)
+                        return self.config.activation_func(x_glu) * (
+                            x_linear + self.config.glu_linear_offset
+                        )
 
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
