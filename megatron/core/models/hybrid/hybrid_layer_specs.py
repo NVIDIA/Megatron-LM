@@ -51,12 +51,12 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 
-_moe = get_moe_module_spec(
+# This should be private and should not be used outside of this file.
+moe = get_moe_module_spec(
     use_te=True,
     num_experts=8,  # Can be any positive integer (must not be None).
     moe_grouped_gemm=True,
 )
-_moe_no_grouped_gemm = get_moe_module_spec(use_te=True, num_experts=8, moe_grouped_gemm=False)
 
 # Inference-optimized MoE spec
 moe_inference = get_inference_optimized_moe_spec()
@@ -183,29 +183,7 @@ hybrid_stack_spec = ModuleSpec(
         moe_layer=ModuleSpec(
             module=MoETransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=_moe, mlp_bda=get_bias_dropout_add
-            ),
-        ),
-        mtp_block_spec=_hybrid_mtp_block_spec,
-    ),
-)
-
-
-# Identical to `hybrid_stack_spec` except the MoE layer uses SequentialMLP (per-expert
-# linears) instead of TEGroupedMLP, so flows that need to operate on individual experts
-# (e.g. ModelOpt pruning) can dispatch on each linear.
-hybrid_stack_spec_no_moe_grouped_gemm = ModuleSpec(
-    module=HybridStack,
-    submodules=HybridStackSubmodules(
-        mamba_layer=hybrid_stack_spec.submodules.mamba_layer,
-        gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
-        attention_layer=hybrid_stack_spec.submodules.attention_layer,
-        dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
-        mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
-        moe_layer=ModuleSpec(
-            module=MoETransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=_moe_no_grouped_gemm, mlp_bda=get_bias_dropout_add
+                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
         mtp_block_spec=_hybrid_mtp_block_spec,

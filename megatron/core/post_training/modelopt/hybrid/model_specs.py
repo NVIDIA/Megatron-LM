@@ -1,10 +1,11 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 from functools import partial
 
-from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.extensions.transformer_engine import TEDotProductAttention, TENorm
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.post_training.modelopt.layers import Norm
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
@@ -14,7 +15,34 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import (
+    MoETransformerLayer,
+    TransformerLayer,
+    TransformerLayerSubmodules,
+)
+
+# Identical to `hybrid_stack_spec` except the MoE layer uses SequentialMLP (per-expert
+# linears) instead of TEGroupedMLP, so ModelOpt flows that need to operate on individual
+# experts (e.g. pruning) can dispatch on each linear.
+hybrid_stack_spec_no_moe_grouped_gemm = ModuleSpec(
+    module=hybrid_stack_spec.module,
+    submodules=HybridStackSubmodules(
+        mamba_layer=hybrid_stack_spec.submodules.mamba_layer,
+        gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
+        attention_layer=hybrid_stack_spec.submodules.attention_layer,
+        dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
+        mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
+        moe_layer=ModuleSpec(
+            module=MoETransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                pre_mlp_layernorm=TENorm,
+                mlp=get_moe_module_spec(use_te=True, num_experts=8, moe_grouped_gemm=False),
+                mlp_bda=get_bias_dropout_add,
+            ),
+        ),
+        mtp_block_spec=hybrid_stack_spec.submodules.mtp_block_spec,
+    ),
+)
 
 
 # Use this spec for ModelOpt PTQ and TensorRT-LLM export
@@ -49,11 +77,6 @@ def get_hybrid_stack_modelopt_spec(
             (only for use_default_te_spec=True)
     """
     if use_default_te_spec:
-        from megatron.core.models.hybrid.hybrid_layer_specs import (
-            hybrid_stack_spec,
-            hybrid_stack_spec_no_moe_grouped_gemm,
-        )
-
         return hybrid_stack_spec if moe_grouped_gemm else hybrid_stack_spec_no_moe_grouped_gemm
 
     return _get_hybrid_stack_local_spec(
