@@ -42,6 +42,7 @@ from megatron.training import (
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 from megatron.training.config import DistributedInitConfig
+from megatron.training.models import HybridModelConfig, GPTModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +174,9 @@ def _compile_dependencies():
 
     torch.distributed.barrier()
 
-def _initialize_tp_communicators():
+def _initialize_tp_communicators(
+    model_config: GPTModelConfig | HybridModelConfig, micro_batch_size: int
+) -> None:
     """initializing the communicators with user buffers for high-performance tensor-model-parallel
     communication overlap"""
 
@@ -188,14 +191,17 @@ def _initialize_tp_communicators():
             "'transformer_engine' packages"
         )
 
-    args = get_args()
-
-    if args.tp_comm_overlap_cfg is not None:
-        with open(args.tp_comm_overlap_cfg, "r") as stream:
-            ub_cfgs = yaml.safe_load(stream)
+    tp_comm_overlap_cfg = getattr(model_config, "tp_comm_overlap_cfg", None)
+    if tp_comm_overlap_cfg is not None:
+        if isinstance(tp_comm_overlap_cfg, str):
+            with open(tp_comm_overlap_cfg, "r") as stream:
+                ub_cfgs = yaml.safe_load(stream)
+        else:
+            ub_cfgs = tp_comm_overlap_cfg
     else:
         ub_cfgs = {}
 
+    # TODO (@maanug): figure out what to do about this flag
     if getattr(args, 'decoder_tp_comm_overlap', False):
         input_shape = [
             (args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size,
@@ -203,40 +209,40 @@ def _initialize_tp_communicators():
         ]
     else:
         input_shape = [
-            (args.seq_length * args.micro_batch_size) // args.context_parallel_size,
-            args.hidden_size,
+            (model_config.seq_length * micro_batch_size) // model_config.context_parallel_size,
+            model_config.hidden_size,
         ]
 
     if is_te_min_version("2.7.0"):
         UserBufferQuantizationMode = te_module.base.UserBufferQuantizationMode
         quantization_modes = [
-            UserBufferQuantizationMode.FP8 if args.fp8 else UserBufferQuantizationMode.NONE
+            UserBufferQuantizationMode.FP8 if model_config.fp8 else UserBufferQuantizationMode.NONE
         ]
         if (
-            args.fp8 is not None
-            and args.first_last_layers_bf16
-            and (args.num_layers_at_start_in_bf16 > 0 or args.num_layers_at_end_in_bf16 > 0)
+            model_config.fp8 is not None
+            and model_config.first_last_layers_bf16
+            and (model_config.num_layers_at_start_in_bf16 > 0 or model_config.num_layers_at_end_in_bf16 > 0)
         ):
             quantization_modes.append(UserBufferQuantizationMode.NONE)
         # The process group with the target bootstrap backend is created in Transformer Engine.
         te_module.base.initialize_ub(
             shape=input_shape,
-            tp_size=args.tensor_model_parallel_size,
+            tp_size=model_config.tensor_model_parallel_size,
             quantization_modes=quantization_modes,
             ub_cfgs=ub_cfgs,
-            bootstrap_backend=args.tp_comm_bootstrap_backend,
+            bootstrap_backend=model_config.tp_comm_bootstrap_backend,
         )
     elif is_te_min_version("1.9.0"):
         # The process group with the target bootstrap backend is created in Transformer Engine.
         te_module.base.initialize_ub(
             shape=input_shape,
-            tp_size=args.tensor_model_parallel_size,
-            use_fp8=(args.fp8 is not None),
+            tp_size=model_config.tensor_model_parallel_size,
+            use_fp8=(model_config.fp8 is not None),
             ub_cfgs=ub_cfgs,
-            bootstrap_backend=args.tp_comm_bootstrap_backend,
+            bootstrap_backend=model_config.tp_comm_bootstrap_backend,
         )
     else:
-        if args.tp_comm_bootstrap_backend != 'mpi':
+        if model_config.tp_comm_bootstrap_backend != 'mpi':
             warnings.warn(
                 f"Transformer Engine v{get_te_version()} supports only MPI bootstrap backend."
             )
@@ -245,8 +251,8 @@ def _initialize_tp_communicators():
 
         te_module.base.initialize_ub(
             shape=input_shape,
-            tp_size=args.tensor_model_parallel_size,
-            use_fp8=(args.fp8 is not None),
+            tp_size=model_config.tensor_model_parallel_size,
+            use_fp8=(model_config.fp8 is not None),
             ub_cfgs=ub_cfgs,
         )
 
