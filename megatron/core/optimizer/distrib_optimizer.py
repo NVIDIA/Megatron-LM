@@ -2928,9 +2928,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         if self.ddp_config.use_megatron_fsdp:
-            raise NotImplementedError(
-                "Megatron-FSDP does not implement a model-to-main parameter update."
-            )
+            # No-op under Megatron-FSDP: by the time we get here, the fp32
+            # ``main_weight_buffer`` is already populated and ``model_weight_buffer``
+            # mirrors it (bf16/fp16). Mechanism (see ``MegatronFSDP`` in
+            # ``megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py``):
+            #   1. The ``state_dict`` pre-hook runs
+            #      ``_replace_param_with_distributed_if_needed`` before any state_dict
+            #      op, swapping each module ``nn.Parameter`` for the fp32 DTensor over
+            #      the matching ``main_weight_buffer`` slice.
+            #   2. The preceding ``model.load_state_dict(state_dict["model"])`` (from
+            #      checkpointing.py::_load_base_checkpoint -> dcp.load_state_dict,
+            #      then load_model_state_dict) therefore writes the checkpoint's fp32
+            #      tensors directly into ``main_weight_buffer``. ``--no-load-optim``
+            #      only skips ``state_dict["optimizer"]`` (Adam moments + group
+            #      metadata); it does NOT skip main params, because they live in the
+            #      *model* state dict under fsdp_dtensor.
+            #   3. The ``load_state_dict`` post-hook then calls
+            #      ``install_optimized_model_weights`` ->
+            #      ``copy_main_weights_to_model_weights``, which casts
+            #      ``main_weight_buffer`` down to bf16/fp16 to refresh
+            #      ``model_weight_buffer``.
+            # Implementing a model->main copy here would *downgrade* main precision
+            # from the loaded fp32 to ``model_weight.float()`` (bf16-cast-back-to-fp32);
+            # see PR #4748 / #4753 history for an empirical verification.
+            return
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
