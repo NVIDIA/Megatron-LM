@@ -470,7 +470,8 @@ class PagedTensor:
         """
         assert self._tensor is not None, "reload_from_stash expects _tensor pre-allocated on main"
         assert tuple(self._tensor.shape) == tuple(self.original_shape), (
-            f"_tensor shape {tuple(self._tensor.shape)} != original_shape {tuple(self.original_shape)}"
+            f"_tensor shape {tuple(self._tensor.shape)} != "
+            f"original_shape {tuple(self.original_shape)}"
         )
         assert self._tensor.dtype == self.dtype and self._tensor.device == self.device
 
@@ -1222,13 +1223,13 @@ class PagedStashRunner:
             _track_cfg(model_with_decoder.config)
             for layer in model_with_decoder.decoder.layers:
                 transformer_layer = (
-                    layer.mtp_model_layer
-                    if isinstance(layer, MultiTokenPredictionLayer)
-                    else layer
+                    layer.mtp_model_layer if isinstance(layer, MultiTokenPredictionLayer) else layer
                 )
                 mlp = getattr(transformer_layer, "mlp", None)
-                if mlp is not None and hasattr(mlp, 'token_dispatcher') and hasattr(
-                    mlp.token_dispatcher, 'check_over_budget'
+                if (
+                    mlp is not None
+                    and hasattr(mlp, 'token_dispatcher')
+                    and hasattr(mlp.token_dispatcher, 'check_over_budget')
                 ):
                     self.moe_layers.append(mlp)
             if model_with_decoder.mtp_process:
@@ -1239,8 +1240,10 @@ class PagedStashRunner:
                         else layer
                     )
                     mlp = getattr(transformer_layer, "mlp", None)
-                    if mlp is not None and hasattr(mlp, 'token_dispatcher') and hasattr(
-                        mlp.token_dispatcher, 'check_over_budget'
+                    if (
+                        mlp is not None
+                        and hasattr(mlp, 'token_dispatcher')
+                        and hasattr(mlp.token_dispatcher, 'check_over_budget')
                     ):
                         self.moe_layers.append(mlp)
 
