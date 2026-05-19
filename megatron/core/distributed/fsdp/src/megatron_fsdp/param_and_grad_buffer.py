@@ -3393,13 +3393,15 @@ class BucketStatus(Enum):
 
     Attributes:
         EMPTY (int): The bucket is empty and not in use.
+        NEEDS_REFRESH (int): The bucket is allocated but its contents are stale.
         COMMUNICATING (int): The bucket is currently being used for communication.
         READY_TO_USE (int): The bucket is filled with data and ready for use.
     """
 
     EMPTY = 1
-    COMMUNICATING = 2
-    READY_TO_USE = 3
+    NEEDS_REFRESH = 2
+    COMMUNICATING = 3
+    READY_TO_USE = 4
 
 
 class GradReducePipeline:
@@ -3921,8 +3923,14 @@ class AllGatherPipeline:
         """Return the number of buckets."""
         return self.buffer.num_buckets
 
-    def reset(self):
-        """Reset the pipeline state."""
+    def reset(self, preserve_non_fsdp_units: bool = True):
+        """Reset the pipeline state.
+
+        Non-FSDP-unit buckets are preserved by default because their params may
+        be read across module boundaries. Setting preserve_non_fsdp_units=False
+        releases all bucket storage and is intended only for debugging when the
+        model will not be reused.
+        """
         if len(self.param_gather_event_map) > 0:
             warnings.warn(
                 (
@@ -3935,24 +3943,28 @@ class AllGatherPipeline:
                 (bucket_id, bwd) = next(iter(self.param_gather_event_map))
                 self.wait_bucket_ready(bucket_id, bwd)
         # Unit buckets follow the normal release path: mark can_be_released and let
-        # recycle_unused_buckets free the gather scratch. Non-unit buckets keep their
-        # storage pinned per the release_bucket contract (cross-module readers such
-        # as fused kernels that bypass nn.Module.forward may dereference them), but
-        # we still transition them back to EMPTY so the next async_bucket_gather
-        # refreshes wbuf.data from the (post-optimizer-step) shard in place. The
-        # underlying TemporaryBucketAllocator.allocate() is idempotent for an
-        # already-allocated bucket_id, so no new memory is allocated.
+        # recycle_unused_buckets free the gather scratch. Preserved non-unit
+        # buckets keep their storage pinned per the release_bucket contract
+        # (cross-module readers such as fused kernels that bypass nn.Module.forward
+        # may dereference them), but we still mark their contents stale so the next
+        # async_bucket_gather refreshes wbuf.data from the post-optimizer-step shard
+        # in place. TemporaryBucketAllocator.allocate() is idempotent for an already
+        # allocated bucket_id, so no new memory is allocated.
         for bucket_id in range(self.num_buckets):
             is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
             for bwd in [False, True]:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
-                if is_unit_bucket:
-                    self.bucket_can_be_released[bucket_key] = True
+                if preserve_non_fsdp_units and not is_unit_bucket:
+                    self.bucket_status[bucket_key] = BucketStatus.NEEDS_REFRESH
                 else:
-                    self.bucket_status[bucket_key] = BucketStatus.EMPTY
+                    self.bucket_can_be_released[bucket_key] = True
         self.recycle_unused_buckets()
 
-        assert all([status is BucketStatus.EMPTY for status in self.bucket_status.values()]), (
+        expected_statuses = (BucketStatus.EMPTY,)
+        if preserve_non_fsdp_units:
+            expected_statuses += (BucketStatus.NEEDS_REFRESH,)
+
+        assert all(status in expected_statuses for status in self.bucket_status.values()), (
             f"There are still working buckets, it is not safe to reset. "
             f"bucket_status: {self.bucket_status}."
         )
@@ -4080,11 +4092,13 @@ class AllGatherPipeline:
                 ag_buckets = list(sorted(set(ag_buckets)))
                 bucket_id = next_bucket_id(ag_buckets)
 
-        # Only all-gather on buckets that have not been allocated yet.
+        # Only all-gather on buckets that have not been allocated yet or whose
+        # persistent storage needs to be refreshed.
         ag_buckets = [
             bucket_id
             for bucket_id in ag_buckets
-            if self.bucket_status[self.get_bucket_key(bucket_id, bwd)] == BucketStatus.EMPTY
+            if self.bucket_status[self.get_bucket_key(bucket_id, bwd)]
+            in (BucketStatus.EMPTY, BucketStatus.NEEDS_REFRESH)
         ]
         if len(ag_buckets) == 0:
             return
@@ -4158,12 +4172,12 @@ class AllGatherPipeline:
         if self.bucket_status[bucket_key] == BucketStatus.READY_TO_USE:
             # Already ready to use.
             return
-        if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
+        if self.bucket_status[bucket_key] in (BucketStatus.EMPTY, BucketStatus.NEEDS_REFRESH):
             if empty_ok:
                 return
-            # Bucket shouldn't be empty, this implies that the bucket
-            # was not allocated or NCCL operations are not complete.
-            raise ValueError(f"Bucket {bucket_id} is empty.")
+            # Bucket should not be empty or stale here; this implies that the bucket
+            # was not allocated, was not refreshed, or NCCL operations are not complete.
+            raise ValueError(f"Bucket {bucket_id} is {self.bucket_status[bucket_key].name}.")
 
         # Wait for asynchronous / overlapped NCCL operations to complete.
         param_gather_event, mark_bucket_ready_to_use = self.param_gather_event_map.pop(bucket_key)
@@ -4254,7 +4268,10 @@ class AllGatherPipeline:
         bucket_key = self.get_bucket_key(bucket_id, bwd)
 
         self.bucket_can_be_released[bucket_key] = False
-        if self.bucket_status[bucket_key] != BucketStatus.EMPTY:
+        if self.bucket_status[bucket_key] in (
+            BucketStatus.COMMUNICATING,
+            BucketStatus.READY_TO_USE,
+        ):
             return
 
         self.bucket_status[bucket_key] = BucketStatus.COMMUNICATING
