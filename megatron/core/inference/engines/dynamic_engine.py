@@ -250,6 +250,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        self.cuda_graph_all_prefills = inference_config.cuda_graph_all_prefills
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
@@ -259,7 +260,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
-        # Steps after which a deferred request emits a starvation warning.
+        # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
+        # The floor value of 100 avoids warnings in test configs where max_sequence_length < 100.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
         # Initialize engine.
         self.reset()
@@ -1645,17 +1647,26 @@ class DynamicInferenceEngine(AbstractEngine):
             self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
     def _cg_admission_gating_active(self) -> bool:
-        """CG-aware admission gating is active when all-prefill graphs are enabled and captured."""
-        return self.context.use_cuda_graphs_for_non_decode_steps and bool(
-            self.context.cuda_graph_batch_dimensions_list
+        """Cudagraph-aware admission gating is active when --inference-cuda-graph-all-prefills
+        is set, the engine has prefill/mixed CGs, and the batch-dim list is populated.
+
+        All are required so legacy tests that exercise the scheduler without intending to run on
+        captured graphs are unaffected. Gating is opt-in via `cuda_graph_all_prefills`.
+        """
+        return (
+            self.cuda_graph_all_prefills
+            and self.context.use_cuda_graphs_for_non_decode_steps
+            and bool(self.context.cuda_graph_batch_dimensions_list)
         )
 
-    def _find_cg_chunk_size(self, max_chunk_tokens: int) -> int:
-        """Return the largest chunk size <= max_chunk_tokens which matches a graph.
+    def _find_cg_chunk_size(self, max_chunk_tokens: int) -> Optional[int]:
+        """Return the largest chunk size <= max_chunk_tokens where batch matches a captured graph,
+        or None if no graph covers any chunk in the budget.
 
-        Returns the first chunk in the (descending-token_count) captured list that falls within the
-        available budget and produces an applicable batch_dim. Falls back to max_chunk_tokens if no
-        CG-aligned size exists.
+        Walks the captured-CG list (sorted descending by token_count) and returns the first chunk
+        that falls within budget and produces an applicable batch_dim under the engine's matching
+        mode (strict for hybrid models). Callers must explicitly handle the None case by deferring
+        the admission rather than scheduling eagerly.
         """
         active_tok = self.context.active_token_count
         active_p = self.context.num_prefill_requests
@@ -1676,35 +1687,45 @@ class DynamicInferenceEngine(AbstractEngine):
             if cg.is_applicable_for_batch_dim(candidate, strict=strict):
                 return chunk
 
-        return max_chunk_tokens  # no CG match; caller will schedule eagerly
+        return None
 
-    def _cg_admission_check(self, req, candidate: InferenceBatchDimensions) -> bool:
-        """Return True if the candidate batch shape matches a captured CG.
+    def _register_cg_wait(self, req) -> None:
+        """Track a deferred admission attempt and emit a starvation warning at the threshold.
 
-        On miss, increments req.cg_wait_iters and emits a starvation warning. On hit, resets the
-        counter. Caller is responsible for breaking the scheduler loop when False.
+        Decode is bounded by the number of decode steps, so deferring is bounded in practice.
+        Persistent waits past `_cg_admission_warn_after` consecutive steps signal a problem.
         """
-        matched = CUDAGraphBatchDimensionBuilder.match_graph_config(
-            real_batch_dim=candidate,
-            cuda_graph_batch_dimensions_list=self.context.cuda_graph_batch_dimensions_list,
-            strict=self.context.is_hybrid_model,
-        )
-        if matched is not None:
-            req.cg_wait_iters = 0
-            return True
         req.cg_wait_iters += 1
         if req.cg_wait_iters % self._cg_admission_warn_after == 0:
             logging.warning(
                 "request %d has been deferred by CG-aware admission for %d steps — "
-                "possible starvation (strict=%s, active P=%d D=%d tok=%d, candidate=%s)",
+                "possible starvation (strict=%s, active P=%d D=%d tok=%d)",
                 req.request_id,
                 req.cg_wait_iters,
                 self.context.is_hybrid_model,
                 self.context.num_prefill_requests,
                 self.context.num_decode_requests,
                 self.context.active_token_count,
-                candidate,
             )
+
+    def _cg_admission_check(self, req, candidate: InferenceBatchDimensions) -> bool:
+        """Return True if the candidate batch shape matches a captured cudagraph.
+
+        On miss, registers a wait + warning via `_register_cg_wait`. On hit, resets the counter.
+        Caller is responsible for breaking the scheduler loop on False.
+        Passes match_ep_token_counts=False so this local admission probe doesn't force a per-attempt
+        NCCL all-reduce — the step-time matcher does its own EP sync.
+        """
+        matched = CUDAGraphBatchDimensionBuilder.match_graph_config(
+            real_batch_dim=candidate,
+            cuda_graph_batch_dimensions_list=self.context.cuda_graph_batch_dimensions_list,
+            strict=self.context.is_hybrid_model,
+            match_ep_token_counts=False,
+        )
+        if matched is not None:
+            req.cg_wait_iters = 0
+            return True
+        self._register_cg_wait(req)
         return False
 
     def schedule_chunked_prefill(self):
@@ -1770,18 +1791,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 token_budget = self.context.max_tokens - self.context.active_token_count
                 max_chunk = min(remaining_len, token_budget)
 
-                if self._cg_admission_gating_active():
-                    # Snap chunk size to the largest captured-CG boundary within budget; defer if no
-                    # shape covers it.
-                    prefill_chunk_length = self._find_cg_chunk_size(max_chunk)
-                    candidate = InferenceBatchDimensions(
-                        token_count=self.context.active_token_count + prefill_chunk_length,
-                        prefill_req_count=self.context.num_prefill_requests + 1,
-                        decode_req_count=self.context.num_decode_requests,
-                    )
-                    if not self._cg_admission_check(req, candidate):
+                # Skip CG gating for the continuation of an in-flight chunked prefill:
+                # the request is already mid-flight, deferring it would deadlock progress.
+                if self._cg_admission_gating_active() and not is_continuing_chunked_prefill:
+                    # Snap chunk size to the largest captured-CG boundary within budget,
+                    # or defer if no shape covers any chunk in the budget.
+                    snapped_chunk = self._find_cg_chunk_size(max_chunk)
+                    if snapped_chunk is None:
+                        self._register_cg_wait(req)
                         can_schedule = False
                         break
+                    prefill_chunk_length = snapped_chunk
+                    req.cg_wait_iters = 0
                 else:
                     prefill_chunk_length = max_chunk
 
