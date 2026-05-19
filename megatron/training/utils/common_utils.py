@@ -15,6 +15,8 @@ from megatron.core.msc_utils import open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 
+from megatron.core._slurm_utils import resolve_slurm_local_rank
+
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
 except ImportError:
@@ -594,3 +596,25 @@ def has_nvrx_installed():
 def has_nvrx_checkpointing_async_support():
     """Checks whether the installed NVRx package exposes the async checkpointing API Megatron uses."""
     return has_nvrx_async_support()
+
+
+def get_local_rank_preinit() -> int:
+    """Get the local rank from the environment variable, intended for use before full init.
+
+    Fallback order:
+    1. LOCAL_RANK environment variable (torchrun/torchelastic)
+    2. SLURM_LOCALID environment variable (SLURM)
+    3. Default: 0 (with warning)
+
+    Returns:
+        The local rank of the current process.
+    """
+    if "LOCAL_RANK" in os.environ:
+        return int(os.environ["LOCAL_RANK"])
+
+    slurm_local_rank = resolve_slurm_local_rank()
+    if slurm_local_rank is not None:
+        return slurm_local_rank
+
+    warnings.warn("Could not determine local rank from LOCAL_RANK or SLURM_LOCALID. Defaulting to local rank 0.")
+    return 0
