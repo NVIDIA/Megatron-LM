@@ -2134,10 +2134,16 @@ def train_step(
         # 1. The first iteration's params are already in param.data (from init or checkpoint).
         # 2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
         #    so the main grads will be polluted by the main params.
+        #
+        # Exception: when a full-iteration CUDA graph has been captured, the all-gather
+        # and subsequent param_data zero are baked into the graph and replay
+        # unconditionally. We must populate param_data so the replayed AG gathers
+        # correct weights, even when forward pre-hooks are disabled.
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
-            if forward_pre_hook_enabled:
+            full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
+            if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
@@ -3635,6 +3641,14 @@ def train(
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
+            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                # disable_forward_pre_hook(param_sync=True) below force-syncs params for eval.
+                # Copy the main params to param buffer before the forced AllGather.
+                for model_chunk in model:
+                    model_chunk.zero_grad_buffer()
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        optim_instance._copy_main_params_to_param_buffer()
             if should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model)
                 pre_hook_enabled = False
