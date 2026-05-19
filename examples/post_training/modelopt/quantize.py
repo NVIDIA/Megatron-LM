@@ -6,6 +6,7 @@ import functools
 import importlib.util
 import inspect
 import json
+import math
 import os
 import random
 import sys
@@ -23,7 +24,7 @@ import modelopt.torch.quantization as mtq
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
-from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
+from modelopt.torch.utils.dataset_utils import get_dataloader_from_dataset, get_dataset_dataloader
 
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
@@ -38,6 +39,8 @@ except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
+from megatron.core import parallel_state
+from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
@@ -89,6 +92,28 @@ if mtq_psx is not None:
 
 if mtq_luts is not None:
     QUANT_CFG_CHOICES.update({k: getattr(mtq_luts, k) for k in mtq_luts.choices})
+
+
+class _TensorDictDataset(torch.utils.data.Dataset):
+    def __init__(self, tensors):
+        self.tensors = tensors
+
+    def __getitem__(self, idx):
+        return {key: tensor[idx] for key, tensor in self.tensors.items()}
+
+    def __len__(self):
+        return len(next(iter(self.tensors.values())))
+
+
+def _get_data_parallel_rank_and_world_size():
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0, 1
+    return parallel_state.get_data_parallel_rank(), parallel_state.get_data_parallel_world_size()
+
+
+def _get_data_parallel_sampler_kwargs():
+    dp_rank, dp_world_size = _get_data_parallel_rank_and_world_size()
+    return dp_world_size, {"num_replicas": dp_world_size, "rank": dp_rank}
 
 
 def add_text_generate_ptq_args(parser):
@@ -199,15 +224,6 @@ def add_text_generate_ptq_args(parser):
         help="Number of samples to use for sensitivity scoring in auto_quantize.",
     )
     group.add_argument(
-        "--auto-quantize-num-calib-steps",
-        type=int,
-        default=None,
-        help=(
-            "Number of batches to use for calibration in auto_quantize. Defaults to the "
-            "size of the calibration dataloader if unset."
-        ),
-    )
-    group.add_argument(
         "--auto-quantize-checkpoint",
         type=str,
         default=None,
@@ -231,6 +247,19 @@ def check_arguments():
         print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
         args.moe_grouped_gemm = False
 
+    uses_calibration = args.auto_quantize_bits is not None or (
+        (args.export_quant_cfg is not None or args.recipe is not None) and not args.weight_only
+    )
+    if (
+        uses_calibration
+        and args.context_parallel_size > 1
+        and args.calib_max_sequence_length % (2 * args.context_parallel_size) != 0
+    ):
+        raise ValueError(
+            "--calib-max-sequence-length must be a multiple of 2 * "
+            "--context-parallel-size when context parallelism is enabled."
+        )
+
     if args.auto_quantize_bits is not None:
         if args.export_quant_cfg is not None:
             print_rank_0(
@@ -244,8 +273,8 @@ def check_arguments():
             args.recipe = None
         if args.pipeline_model_parallel_size > 1:
             raise ValueError(
-                "auto_quantize currently requires pipeline-model-parallel-size=1 since the "
-                "forward/backward path bypasses get_forward_backward_func()."
+                "auto_quantize currently requires pipeline-model-parallel-size=1 because "
+                "ModelOpt needs additional support for pipeline parallelism."
             )
         for fmt in args.auto_quantize_formats:
             if fmt not in QUANT_CFG_CHOICES:
@@ -324,11 +353,15 @@ def get_calib_dataloader(
     max_sequence_length=512,
     use_random_offset=False,
     batch_size=1,
+    pad_to_max_length=False,
 ):
     """Return a dataloader/iterator for calibration using SFT or HF datasets.
 
     Supports either a local path (.jsonl) or a HuggingFace dataset name.
     """
+    dp_world_size, sampler_kwargs = _get_data_parallel_sampler_kwargs()
+    distributed = dp_world_size > 1
+
     if os.path.isfile(dataset_path_or_name):
         # Local file
         print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
@@ -373,8 +406,18 @@ def get_calib_dataloader(
         tokens = tokenizer(
             all_texts, return_tensors="pt", padding="max_length", max_length=max_sequence_length, truncation=True
         )
-        all_input_ids = tokens.input_ids.cuda()
-        return [{"input_ids": all_input_ids[i:i+batch_size]} for i in range(0, len(all_input_ids), batch_size)]
+        tokenized_dataset = _TensorDictDataset(
+            {
+                "input_ids": tokens.input_ids.cuda(),
+                "attention_mask": tokens.attention_mask.cuda(),
+            }
+        )
+        return get_dataloader_from_dataset(
+            tokenized_dataset,
+            batch_size=batch_size,
+            distributed=distributed,
+            sampler_kwargs=sampler_kwargs,
+        )
     else:
         # HuggingFace dataset
         if use_random_offset:
@@ -387,7 +430,118 @@ def get_calib_dataloader(
             max_sample_length=max_sequence_length,
             batch_size=batch_size,
             device="cuda",
+            distributed=distributed,
+            sampler_kwargs=sampler_kwargs,
+            pad_to_max_length=pad_to_max_length,
+            warn_on_right_padding=False,
         )
+
+
+def _prepare_calib_tokenizer(tokenizer):
+    if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+
+def _get_calib_dataloader_from_args(tokenizer):
+    args = get_args()
+    return get_calib_dataloader(
+        dataset_path_or_name=args.calib_dataset_path_or_name,
+        tokenizer=tokenizer,
+        calib_size=args.calib_size,
+        max_sequence_length=args.calib_max_sequence_length,
+        use_random_offset=args.calib_use_random_offset,
+        batch_size=args.calib_batch_size,
+        pad_to_max_length=True,
+    )
+
+
+def _build_calib_batch(batch, pad_token_id, with_labels=False, use_context_parallel=False):
+    tokens = batch["input_ids"]
+    token_attention_mask = batch.get("attention_mask")
+    if token_attention_mask is None:
+        token_attention_mask = torch.ones_like(tokens)
+    elif token_attention_mask.device != tokens.device:
+        token_attention_mask = token_attention_mask.to(tokens.device)
+
+    bsz, seq_len = tokens.shape
+    position_ids = (
+        torch.arange(seq_len, dtype=torch.long, device=tokens.device)
+        .unsqueeze(0)
+        .expand(bsz, -1)
+        .contiguous()
+    )
+    attention_mask = (
+        torch.triu(
+            torch.ones((bsz, seq_len, seq_len), device=tokens.device, dtype=torch.bool),
+            diagonal=1,
+        ).view(bsz, 1, seq_len, seq_len)
+    )
+    calib_batch = {
+        "tokens": tokens.contiguous(),
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+
+    if with_labels:
+        labels = torch.empty_like(tokens)
+        labels[:, :-1] = tokens[:, 1:]
+        labels[:, -1] = pad_token_id
+
+        loss_mask = torch.zeros(tokens.shape, dtype=torch.float, device=tokens.device)
+        loss_mask[:, :-1] = token_attention_mask[:, 1:].to(dtype=loss_mask.dtype)
+        calib_batch.update({"labels": labels.contiguous(), "loss_mask": loss_mask.contiguous()})
+
+    if use_context_parallel:
+        calib_batch = get_batch_on_this_cp_rank(calib_batch)
+    return calib_batch
+
+
+def _calib_loss_func(loss_mask, output):
+    losses = output.reshape(-1).float()
+    loss_mask = loss_mask.reshape(-1).float()
+    loss = torch.sum(losses * loss_mask)
+    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    return loss, num_tokens, {"lm loss": torch.cat([loss.detach().view(1), num_tokens.view(1)])}
+
+
+def _calib_forward_step(data_iterator, model, pad_token_id, with_labels):
+    args = get_args()
+    batch = _build_calib_batch(
+        next(data_iterator),
+        pad_token_id=pad_token_id,
+        with_labels=with_labels,
+        use_context_parallel=args.context_parallel_size > 1,
+    )
+    model_kwargs = {"labels": batch["labels"]} if with_labels else {}
+    output = model(
+        batch["tokens"],
+        batch["position_ids"],
+        batch["attention_mask"],
+        **model_kwargs,
+    )
+    if not with_labels:
+        return output, None
+    return output, functools.partial(_calib_loss_func, batch["loss_mask"])
+
+
+def _run_calib_step(model, batch, pad_token_id, with_labels=False, forward_only=True):
+    seq_length = batch["input_ids"].shape[-1]
+    return get_forward_backward_func()(
+        forward_step_func=functools.partial(
+            _calib_forward_step,
+            pad_token_id=pad_token_id,
+            with_labels=with_labels,
+        ),
+        data_iterator=iter([batch]),
+        model=model,
+        num_microbatches=1,
+        seq_length=seq_length,
+        micro_batch_size=batch["input_ids"].shape[0],
+        decoder_seq_length=seq_length,
+        forward_only=forward_only,
+        collect_non_loss_data=forward_only,
+    )
 
 
 def auto_quantize_model(unwrapped_model, tokenizer):
@@ -397,64 +551,23 @@ def auto_quantize_model(unwrapped_model, tokenizer):
     """
     args = get_args()
 
-    if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-
-    calib_dataloader = list(
-        get_calib_dataloader(
-            dataset_path_or_name=args.calib_dataset_path_or_name,
-            tokenizer=tokenizer,
-            calib_size=args.calib_size,
-            max_sequence_length=args.calib_max_sequence_length,
-            use_random_offset=args.calib_use_random_offset,
-            batch_size=args.calib_batch_size,
-        )
-    )
+    _prepare_calib_tokenizer(tokenizer)
+    calib_dataloader = _get_calib_dataloader_from_args(tokenizer)
 
     use_gradient = args.auto_quantize_method == "gradient"
     pad_token_id = tokenizer.pad_token_id
 
-    def _build_inputs(tokens):
-        bsz, seq_len = tokens.shape
-        position_ids = (
-            torch.arange(seq_len, dtype=torch.long, device=tokens.device)
-            .unsqueeze(0)
-            .expand(bsz, -1)
-            .contiguous()
-        )
-        attention_mask = (
-            torch.triu(
-                torch.ones((bsz, seq_len, seq_len), device=tokens.device, dtype=torch.bool),
-                diagonal=1,
-            ).view(bsz, 1, seq_len, seq_len)
-        )
-        return position_ids, attention_mask
-
-    def _build_labels(tokens):
-        # Shift labels left and mask the synthetic final token as padding.
-        labels = torch.empty_like(tokens)
-        labels[:, :-1] = tokens[:, 1:]
-        labels[:, -1] = pad_token_id
-        return labels
-
     def forward_step(model, batch):
-        tokens = batch["input_ids"]
-        position_ids, attention_mask = _build_inputs(tokens)
-        if use_gradient:
-            labels = _build_labels(tokens)
-            return model(tokens, position_ids, attention_mask, labels=labels)
-        return model(tokens, position_ids, attention_mask)
+        return _run_calib_step(model, batch, pad_token_id, forward_only=True)[0]
 
-    # TODO(asma): use Megatron's dataset-provided loss mask here. The current
-    # label-based mask also drops real EOS tokens when pad_token == eos_token.
-    def loss_func(output, batch):
-        # Average per-token CE over non-padding next-token labels.
-        labels = _build_labels(batch["input_ids"])
-        loss_mask = (labels != pad_token_id).to(output.dtype)
-        losses = output.float() * loss_mask
-        num_tokens = loss_mask.sum()
-        return losses.sum() / torch.clamp(num_tokens, min=1)
+    def forward_backward_step(model, batch):
+        _run_calib_step(
+            model,
+            batch,
+            pad_token_id,
+            with_labels=True,
+            forward_only=False,
+        )
 
     quantization_formats = [QUANT_CFG_CHOICES[fmt] for fmt in args.auto_quantize_formats]
     disabled_layers = [
@@ -463,10 +576,12 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         if "parent_class" not in entry
     ]
 
-    num_calib_steps = args.auto_quantize_num_calib_steps or len(calib_dataloader)
+    _, dp_world_size = _get_data_parallel_rank_and_world_size()
+    num_calib_steps = len(calib_dataloader)
+    score_samples_per_step = max(dp_world_size * args.calib_batch_size, 1)
     num_score_steps = min(
         len(calib_dataloader),
-        max(args.auto_quantize_score_size // max(args.calib_batch_size, 1), 1),
+        max(math.ceil(args.auto_quantize_score_size / score_samples_per_step), 1),
     )
 
     print_rank_0(
@@ -481,7 +596,8 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         quantization_formats=quantization_formats,
         data_loader=calib_dataloader,
         forward_step=forward_step,
-        loss_func=loss_func if use_gradient else None,
+        loss_func=None,
+        forward_backward_step=forward_backward_step if use_gradient else None,
         disabled_layers=disabled_layers,
         num_calib_steps=num_calib_steps,
         num_score_steps=num_score_steps,
@@ -554,19 +670,6 @@ if __name__ == "__main__":
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
-    def _dataset_forward_loop_func(model):
-        dataloader = get_calib_dataloader(
-            dataset_path_or_name=args.calib_dataset_path_or_name,
-            tokenizer=tokenizer,
-            calib_size=args.calib_size,
-            max_sequence_length=args.calib_max_sequence_length,
-            use_random_offset=args.calib_use_random_offset,
-            batch_size=args.calib_batch_size,
-        )
-        for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
-            sample = get_batch_on_this_cp_rank(sample)
-            simple_generate(model, sample["input_ids"], osl=1, calibration_mode=True)
-
     unwrapped_model = unwrap_model(model)[0]
 
     if args.auto_quantize_bits is not None:
@@ -582,18 +685,18 @@ if __name__ == "__main__":
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
 
-        if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"  # better for calibration
+        _prepare_calib_tokenizer(tokenizer)
 
         if args.weight_only:
             mtq.quantize(unwrapped_model, mtq_config)
-        elif hasattr(unwrapped_model, "calibration_mode"):
-            unwrapped_model.calibration_mode = True
-            mtq.quantize(unwrapped_model, mtq_config, _dataset_forward_loop_func)
-            unwrapped_model.calibration_mode = False
         else:
-            mtq.quantize(unwrapped_model, mtq_config, _dataset_forward_loop_func)
+            calib_dataloader = _get_calib_dataloader_from_args(tokenizer)
+
+            def forward_loop(model):
+                for sample in tqdm(calib_dataloader, disable=torch.distributed.get_rank()):
+                    _run_calib_step(model, sample, tokenizer.pad_token_id)
+
+            mtq.quantize(unwrapped_model, mtq_config, forward_loop)
 
         if args.compress:
             mtq.compress(unwrapped_model)
