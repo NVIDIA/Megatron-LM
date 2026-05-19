@@ -2985,7 +2985,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
 
         Walks each model chunk's DDP bucket groups and skips those tagged
-        ``is_layer_wise_distributed_optimizer=True`` (so a sibling
+        ``is_managed_by_layer_wise_optimizer=True`` (so a sibling
         :class:`LayerWiseDistributedOptimizer` does not double-sync the same
         buckets). When no LayerWise tagging is present every bucket group is
         included — matching the previous ``model_chunk.start_param_sync()``
@@ -2995,7 +2995,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Deferred import: layer_wise_optimizer's compute_full_param_layout
         # lazily imports DistributedOptimizer, so importing the helper at
         # module load here would create a cycle.
-        from .layer_wise_optimizer import _bucket_is_layer_wise_managed
+        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
 
         for model_chunk in self.model_chunks:
             for bucket_group in (
@@ -3003,7 +3003,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             ):
                 if not bucket_group.buckets:
                     continue
-                if _bucket_is_layer_wise_managed(
+                if _bucket_is_managed_by_layer_wise_optimizer(
                     bucket_group.buckets[0], default_for_untagged=False
                 ):
                     continue

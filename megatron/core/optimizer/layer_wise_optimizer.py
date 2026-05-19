@@ -32,7 +32,7 @@ from .param_layout import (
 logger = logging.getLogger(__name__)
 
 
-def is_layer_wise_managed_param(param: torch.nn.Parameter) -> bool:
+def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     """Whether a parameter is managed by :class:`LayerWiseDistributedOptimizer`.
 
     Returns True for the 2D matrix-like weight parameters that Muon orthogonalizes
@@ -50,7 +50,7 @@ def is_layer_wise_managed_param(param: torch.nn.Parameter) -> bool:
     return True
 
 
-def _bucket_is_layer_wise_managed(bucket, default_for_untagged: bool = True) -> bool:
+def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: bool = True) -> bool:
     """Whether a DDP bucket belongs to a LayerWise-managed buffer.
 
     Buckets are built from params that share a :class:`BufferKey`, so checking
@@ -63,13 +63,13 @@ def _bucket_is_layer_wise_managed(bucket, default_for_untagged: bool = True) -> 
     if not bucket.params_list:
         return False
     param = bucket.params_list[0]
-    if not hasattr(param, 'is_layer_wise_distributed_optimizer'):
+    if not hasattr(param, 'is_managed_by_layer_wise_optimizer'):
         return default_for_untagged
-    return param.is_layer_wise_distributed_optimizer
+    return param.is_managed_by_layer_wise_optimizer
 
 
 def tag_params_for_buffer_routing(model_chunks) -> None:
-    """Tag every requires-grad param with ``is_layer_wise_distributed_optimizer``.
+    """Tag every requires-grad param with ``is_managed_by_layer_wise_optimizer``.
 
     Run this once on the un-DDP-wrapped model chunks before
     :class:`DistributedDataParallel` constructs its grad/param buffers — the
@@ -81,7 +81,7 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
         for param in model_chunk.parameters():
             if not param.requires_grad:
                 continue
-            param.is_layer_wise_distributed_optimizer = is_layer_wise_managed_param(param)
+            param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
 
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -332,7 +332,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
             # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
             # get DistOpt's byte-level layout.
-            if buffer_key.is_layer_wise_distributed_optimizer:
+            if buffer_key.is_managed_by_layer_wise_optimizer:
                 compute_per_buffer_layout = (
                     LayerWiseDistributedOptimizer._compute_per_buffer_param_layout
                 )
@@ -474,7 +474,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # Non-LayerWise buffers (e.g. Adam-managed embeddings, biases,
                 # layernorms with a DistOpt byte-level layout) are managed by a
                 # separate DistributedOptimizer; LayerWise does not own them.
-                if not buffer_key.is_layer_wise_distributed_optimizer:
+                if not buffer_key.is_managed_by_layer_wise_optimizer:
                     continue
                 dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
                 for param, (
@@ -595,7 +595,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for model_chunk in model_chunks:
             for group in model_chunk.bucket_groups:
                 for bucket in group.buckets:
-                    if not _bucket_is_layer_wise_managed(bucket):
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
                     bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
                     for bucket_list, full_params_list in zip(
@@ -608,7 +608,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # Do the same for expert parallel bucket groups.
             for group in model_chunk.expert_parallel_bucket_groups:
                 for bucket in group.buckets:
-                    if not _bucket_is_layer_wise_managed(bucket):
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
                     if self.expt_dp_params_list is not None:
                         bucket_params_list = [
@@ -731,7 +731,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             for bucket_group in (
                 model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
             ):
-                if bucket_group.buckets and _bucket_is_layer_wise_managed(bucket_group.buckets[0]):
+                if bucket_group.buckets and _bucket_is_managed_by_layer_wise_optimizer(
+                    bucket_group.buckets[0]
+                ):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 
     @torch.no_grad()

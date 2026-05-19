@@ -67,7 +67,7 @@ from .emerging_optimizers import (
     _create_emerging_optimizer,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
-from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_layer_wise_managed_param
+from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -217,7 +217,7 @@ def get_mup_config_overrides(
     def is_muon_managed_matrix_parameter(param: torch.nn.Parameter, _: str) -> bool:
         if not is_muon_optimizer:
             return False
-        return is_layer_wise_managed_param(param)
+        return is_managed_by_layer_wise_optimizer(param)
 
     def should_scale_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
         if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
@@ -839,7 +839,7 @@ def _get_megatron_emerging_optimizer(
                 buffer
                 for buffer in model_chunk.buffers
                 if buffer.params
-                and not getattr(buffer.params[0], 'is_layer_wise_distributed_optimizer', False)
+                and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
             ]
             if non_layer_wise_buffers:
                 distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
