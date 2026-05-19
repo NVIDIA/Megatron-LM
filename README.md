@@ -23,10 +23,14 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
 ## Getting Started
 
-**Install from PyPI:**
+**Install from PyPI** (requires Python 3.10+):
 
 ```bash
+# Using uv (https://github.com/astral-sh/uv)
 uv pip install megatron-core
+
+# Or using standard pip
+pip install megatron-core
 ```
 
 **Or clone and install from source:**
@@ -34,7 +38,7 @@ uv pip install megatron-core
 ```bash
 git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
-uv pip install -e .
+uv pip install -e .  # or: pip install -e .
 ```
 
 > **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (for example, `MAX_JOBS=4 uv pip install -e .`).
