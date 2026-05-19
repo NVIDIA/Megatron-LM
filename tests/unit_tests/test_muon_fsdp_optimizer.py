@@ -115,6 +115,29 @@ def _make_dtensor(local_tensor, global_shape, device_mesh):
     return dtensor
 
 
+def _make_hfsdp_dtensor(local_tensor, global_shape, device_mesh):
+    from torch.distributed.tensor import DTensor, Shard
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        update_uneven_dtensor_chunk_metadata,
+    )
+
+    global_stride = torch.empty(
+        global_shape, dtype=local_tensor.dtype, device=local_tensor.device
+    ).stride()
+    setattr(device_mesh, "_shard_order", [1, 0])
+    dtensor = DTensor.from_local(
+        local_tensor=local_tensor,
+        device_mesh=device_mesh,
+        placements=[Shard(0), Shard(0)],
+        shape=torch.Size(global_shape),
+        stride=global_stride,
+        run_check=False,
+    )
+    update_uneven_dtensor_chunk_metadata(dtensor)
+    return dtensor
+
+
 def _attach_fake_mfsdp_bucket_metadata(param, bucket, item_id, offset):
     bucket.item_index_map[item_id] = SimpleNamespace(
         global_data_index=offset, size=torch.Size(param.shape).numel()
@@ -454,6 +477,53 @@ class TestFSDPTensorParallelMuon:
             assert orthogonalize_calls == []
         else:
             assert orthogonalize_calls == [tuple(full_grad.shape)]
+
+    @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP gather test requires at least 4 ranks")
+    def test_hfsdp_boundary_gather_matches_generic_redistribute_bitwise(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+            redistribute_uneven_dtensor_to_replicated,
+        )
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("HFSDP gather test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        logical_rank = inner_rank * outer_size + outer_rank
+
+        rows, cols = dp_size * 3 + 5, 4
+        full_update = (
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) + 13
+        )
+        rows_per_logical_rank = [
+            rows // dp_size + (1 if rank < rows % dp_size else 0) for rank in range(dp_size)
+        ]
+        row_start = sum(rows_per_logical_rank[:logical_rank])
+        row_count = rows_per_logical_rank[logical_rank]
+        local_update = full_update[row_start : row_start + row_count].contiguous()
+
+        dtensor = _make_hfsdp_dtensor(local_update.clone(), full_update.shape, device_mesh)
+        param = nn.Parameter(dtensor)
+        optimizer = _make_fsdp_muon([param], dp_group=device_mesh.get_group("dp"))
+
+        assert optimizer._get_uneven_gather_plan(param) is None
+
+        gathered = optimizer._gather_full_uneven_local_tensor_like(param, local_update)
+        ref_dtensor = optimizer._dtensor_from_local_like(param, local_update)
+        expected = redistribute_uneven_dtensor_to_replicated(ref_dtensor)._local_tensor
+
+        assert torch.equal(
+            expected, full_update
+        ), f"generic HFSDP gather mismatch on rank {dp_rank}"
+        assert torch.equal(gathered, expected), f"Muon HFSDP gather mismatch on rank {dp_rank}"
 
     def test_step_batches_multiple_split_boundary_params(self):
         from torch.distributed.device_mesh import init_device_mesh

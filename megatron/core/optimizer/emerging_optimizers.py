@@ -622,8 +622,11 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                 )
 
         if len(shard_mesh_dims) != 1:
-            # M-FSDP optimizer shards are expected to have one sharded mesh
-            # dimension. Keep the generic helper as a conservative fallback.
+            # The fast path below issues one all-gather over one process group,
+            # so it is only correct for layouts with a single sharded mesh
+            # dimension. HFSDP layouts shard over both DP-inner and DP-outer
+            # mesh dimensions and must use the generic M-FSDP helper, which
+            # gathers each sharded mesh dimension in order.
             return None
 
         if not hasattr(dtensor_ref._local_tensor, "__create_chunk_list__"):
@@ -654,7 +657,11 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             if chunks_info is not None
             for chunk_info in chunks_info
         ]
-        plan = {"shard_group": shard_group, "chunk_infos": chunk_infos}
+        plan = {
+            "shard_group": shard_group,
+            "shard_mesh_dims": tuple(shard_mesh_dims),
+            "chunk_infos": chunk_infos,
+        }
         self._uneven_gather_plan_cache[cache_key] = plan
         return plan
 
@@ -675,6 +682,13 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             full_tensor = redistribute_uneven_dtensor_to_replicated(local_dtensor)._local_tensor
             self._copy_dtensor_chunk_metadata(dtensor_ref, local_dtensor)
             return None if local_tensor.numel() == 0 else full_tensor
+
+        if len(plan["shard_mesh_dims"]) != 1:
+            raise AssertionError(
+                "Single-group uneven DTensor gather plan was created for a layout with "
+                f"{len(plan['shard_mesh_dims'])} sharded mesh dimensions. "
+                "HFSDP/multi-shard layouts must use redistribute_uneven_dtensor_to_replicated."
+            )
 
         local_buffer = local_tensor.contiguous().view(-1)
         group_tensors = [
@@ -722,6 +736,11 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     dtensor_ref, local_tensor
                 )
                 continue
+            if len(plan["shard_mesh_dims"]) != 1:
+                raise AssertionError(
+                    "Batched uneven DTensor gather only supports single-shard layouts; "
+                    "multi-shard layouts must use redistribute_uneven_dtensor_to_replicated."
+                )
 
             key = (id(plan["shard_group"]), local_tensor.dtype, local_tensor.device)
             batch = batches.setdefault(
