@@ -519,8 +519,10 @@ def _initialize_distributed(
             init_process_group_kwargs['store'] = store
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
+
+        # Force NCCL backend initialization if using in-process restart
         if use_inprocess_restart:
-            inprocess_restart.maybe_force_nccl_backend_init(device_id)
+            inprocess_restart.force_nccl_backend_init(device_id)
 
         if dist_config.external_gpu_device_mapping:
             torch.distributed.barrier(device_ids=[0])
