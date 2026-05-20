@@ -546,7 +546,7 @@ class FSDPModule(nn.Module):
                     if dist_param.grad is not None:
                         del dist_param.grad
                 else:
-                    assert dist_param.dtype == dist_grad.dtype, (
+                    assert dist_grad is None or dist_param.dtype == dist_grad.dtype, (
                         f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
                     )
                     setattr(dist_param, "grad", dist_grad)
