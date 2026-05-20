@@ -1420,14 +1420,14 @@ class TestFsdpNonUnitBucketPreservation:
         torch.cuda.synchronize()
 
 
-class TestFsdpMambaDirectWeightAccess:
-    """Regression repro for Mamba raw child-parameter reads under Megatron FSDP.
+class TestFsdpMambaConvParamGather:
+    """Regression repro for Mamba fused conv params under Megatron FSDP.
 
-    MambaMixer reads ``self.conv1d.weight`` through the fused causal-conv path instead
-    of invoking ``self.conv1d(...)``. That bypasses the child module pre-forward hook,
-    so the conv1d bucket is only gathered if another hook prefetches it incidentally.
-    This test makes that dependency deterministic by disabling AG prefetch before the
-    first forward.
+    The fused causal-conv path reads conv weight and bias views inside
+    MambaMixer.forward. Those parameters must therefore be shallow MambaMixer
+    parameters so the existing non-unit module pre-forward hook gathers them.
+    This test makes that dependency deterministic by disabling AG prefetch before
+    the first forward.
     """
 
     @classmethod
@@ -1438,7 +1438,7 @@ class TestFsdpMambaDirectWeightAccess:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
-    def test_mamba_conv1d_raw_weight_read_without_prefetch(self):
+    def test_mamba_fused_conv_param_without_prefetch(self):
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
         if Utils.world_size < 2:
@@ -1484,6 +1484,10 @@ class TestFsdpMambaDirectWeightAccess:
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
+        mixer_state = model.mamba_layer.mixer.state_dict()
+        assert "conv1d_weight" in mixer_state
+        assert not hasattr(model.mamba_layer.mixer, "conv1d")
+
         fsdp_model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -1506,9 +1510,14 @@ class TestFsdpMambaDirectWeightAccess:
             "Expected non-unit params to split across multiple buckets; "
             "bucket_size may be too large and could mask this repro."
         )
+        conv_weight = fsdp_model.module.raw_param["mamba_layer.mixer.conv1d_weight"]
+        conv_bucket_id = fsdp_model.param_and_grad_buffer.param_to_param_group[conv_weight]
+        assert (
+            fsdp_model.param_and_grad_buffer.parameter_groups[conv_bucket_id].fsdp_unit_id is None
+        ), "conv1d_weight should be a shallow non-unit MambaMixer parameter."
 
-        # Disabling prefetch isolates the raw conv1d weight read: the forward cannot
-        # incidentally gather conv1d.weight from an earlier module hook.
+        # Disabling prefetch isolates the fused conv path: the forward cannot
+        # incidentally gather conv1d_weight from an earlier module hook.
         x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
         fsdp_model.module.suggested_AG_prefetch_size = 0
         fsdp_model(x)
