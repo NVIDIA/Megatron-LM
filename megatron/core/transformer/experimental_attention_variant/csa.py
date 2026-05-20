@@ -25,6 +25,14 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+    build_flat_topk_idxs,
+    dsa_sparse_attn,
+    fused_indexer_sparse_attn,
+    indexer_topk,
+)
+
+
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
 # ---------------------------------------------------------------------------
@@ -596,7 +604,7 @@ class CompressedSparseAttention(MegatronModule):
             softmax_scale = config.v_head_dim**-0.5
         self.softmax_scale = softmax_scale
 
-        self.force_unfused_dsa = getattr(config, 'force_unfused_dsa', True)
+        self.force_unfused_dsa = getattr(config, 'force_unfused_dsa', False)
 
         # Learnable attention sink per head
         self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
@@ -768,7 +776,76 @@ class CompressedSparseAttention(MegatronModule):
             nvtx_range_pop("sparse_attn_kernel")
 
         else:
-            raise ValueError("Fused path is not supported for CompressedSparseAttention")
+            if self.compress_ratio > 1 and n_compressed > 0 and self.indexer is not None:
+                if self.training and torch.is_grad_enabled():
+                    # Path B: fused indexer (with loss) + sparse attn
+                    x_det = x.detach()
+                    qr_det = qr.detach()
+                    q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
+                        x_det, qr_det, packed_seq_params
+                    )
+                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+                    output, indexer_loss = fused_indexer_sparse_attn(
+                        query, kv_full, self.attn_sink.float(), window_idxs,
+                        q_indexer, k_indexer, weights_indexer,
+                        min(self.indexer.index_topk, n_compressed),
+                        self.compress_ratio,
+                        self.softmax_scale,
+                        self.indexer.softmax_scale,
+                        indexer_loss_coeff,
+                        sparse_loss=getattr(self.config, "dsa_indexer_use_sparse_loss", True),
+                        kv_offset=offset,
+                    )
+                    if indexer_loss_coeff > 0:
+                        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                            loss=indexer_loss,
+                            layer_number=self.layer_number,
+                            num_layers=self.config.num_layers,
+                        )
+                else:
+                    # Path C: separate indexer fwd (no loss) + sparse attn (compact)
+                    x_det = x.detach()
+                    qr_det = qr.detach()
+                    q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
+                        x_det, qr_det, packed_seq_params
+                    )
+                    topk_indices_cmp, _ = indexer_topk(
+                        q_indexer, k_indexer, weights_indexer,
+                        min(self.indexer.index_topk, n_compressed),
+                        self.compress_ratio,
+                        indexer_softmax_scale=self.indexer.softmax_scale,
+                    )
+                    compress_topk_idxs = torch.where(
+                        topk_indices_cmp >= 0, topk_indices_cmp + offset, -1,
+                    )
+                    flat_idxs, flat_tlen = build_flat_topk_idxs(
+                        window_idxs, compress_topk_idxs,
+                        batch_size=b, seqlen_kv=kv_full.shape[0], compact=True,
+                    )
+                    output = dsa_sparse_attn(
+                        query, kv_full, self.attn_sink.float(),
+                        flat_idxs, self.softmax_scale,
+                        topk_length=flat_tlen,
+                    )
+            else:
+                # Path A: fused sparse attn only (window / window + all compressed)
+                if self.compress_ratio > 1 and n_compressed > 0:
+                    compress_topk_idxs = get_compress_topk_idxs(
+                        self.compress_ratio, b, sq, offset, query.device
+                    )
+                    flat_idxs, _ = build_flat_topk_idxs(
+                        window_idxs, compress_topk_idxs,
+                        batch_size=b, seqlen_kv=kv_full.shape[0],
+                    )
+                else:
+                    flat_idxs, _ = build_flat_topk_idxs(
+                        window_idxs,
+                        batch_size=b, seqlen_kv=kv_full.shape[0],
+                    )
+                output = dsa_sparse_attn(
+                    query, kv_full, self.attn_sink.float(),
+                    flat_idxs, self.softmax_scale,
+                )
 
         # --- Step 6: Attach indexer loss ---
         if indexer_loss is not None and self.training and torch.is_grad_enabled():
