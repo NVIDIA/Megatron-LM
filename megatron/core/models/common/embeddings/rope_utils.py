@@ -216,6 +216,7 @@ def _apply_rotary_pos_emb_thd(
     mla_output_remove_interleaving: bool = False,
     cp_group: torch.distributed.ProcessGroup = None,
     multi_latent_attention: Optional[bool] = None,
+    max_seqlen: Optional[int] = None,
 ) -> Tensor:
     """Apply RoPE for `thd` format using pure CUDA ops (CUDA Graph compatible).
 
@@ -227,6 +228,7 @@ def _apply_rotary_pos_emb_thd(
         cu_seqlens (Tensor): Cumulative sequence lengths, shape [num_seqs + 1], int32.
         freqs (Tensor): RoPE frequencies, shape [max_s, 1, 1, d] or [total_tokens, 1, 1, d]
         cp_group: Context parallel group
+        max_seqlen: Global max sequence length for this packed batch when known.
 
     Returns:
         Tensor: Shape [total_tokens, h, d]. Input with RoPE applied.
@@ -246,42 +248,50 @@ def _apply_rotary_pos_emb_thd(
     total_tokens = t.shape[0]
     device = t.device
 
-    token_pos = torch.arange(total_tokens, device=device)
-    # `searchsorted(..., right=True) - 1` returns the index of the sequence each
-    # token belongs to. The `clamp` here guards padding tokens whose
-    # `searchsorted` position can fall outside the valid `[0, num_seqs)` range
-    # (last cu_seqlens entry); they get any wrong-but-harmless freq because
-    # their RoPE output is masked away later by `padding_mask` / `loss_mask`.
-    seq_idx = torch.searchsorted(cu_seqlens, token_pos, right=True) - 1
+    token_pos = torch.arange(total_tokens, device=device, dtype=torch.int64)
+
+    # `cu_seqlens` describes the global packed sequence. With CP, `t` is already
+    # CP-partitioned, so build a local cumulative-length view before assigning
+    # local tokens to packed sequences.
+    cu_seqlens_i64 = cu_seqlens.to(torch.int64)
+    global_seq_lens = cu_seqlens_i64[1:] - cu_seqlens_i64[:-1]
+    local_seq_lens = global_seq_lens // cp_size if cp_size > 1 else global_seq_lens
+    local_cu_seqlens = torch.zeros_like(cu_seqlens_i64)
+    local_cu_seqlens[1:] = torch.cumsum(local_seq_lens, dim=0)
+
+    # `searchsorted(..., right=True) - 1` returns the local sequence index. The
+    # clamp guards padded tokens that sit beyond the final real local token; they
+    # get a harmless frequency and are later masked out.
+    seq_idx = torch.searchsorted(local_cu_seqlens, token_pos, right=True) - 1
     seq_idx = seq_idx.clamp(min=0, max=cu_seqlens.shape[0] - 2)
 
-    seq_start = cu_seqlens[seq_idx]
-    local_pos = token_pos - seq_start
-
-    # int64 for the multiplications: `cu_seqlens` are int32 (per TE convention),
-    # but `(seq_len * cp_size)` and downstream arithmetic can overflow int32 at
-    # very long contexts (e.g. >65k tokens × cp_size). Cast once here and the
-    # rest of the computation stays in int64.
-    seq_len_i64 = (cu_seqlens[seq_idx + 1] - seq_start).to(torch.int64)
-    full_seqlen = seq_len_i64 * cp_size
-    chunk_size = seq_len_i64 // 2
+    local_seq_start = local_cu_seqlens[seq_idx]
+    local_pos = token_pos - local_seq_start
+    local_seq_len = local_seq_lens[seq_idx]
+    global_seq_start = cu_seqlens_i64[seq_idx]
 
     if cp_size > 1:
-        is_first_half = local_pos < chunk_size
+        cp_seg = local_seq_len // 2
+        full_seqlen = local_seq_len * cp_size
+        is_first_half = local_pos < cp_seg
         freq_pos = torch.where(
             is_first_half,
-            cp_rank * chunk_size + local_pos,
-            full_seqlen - (cp_rank + 1) * chunk_size + (local_pos - chunk_size),
+            cp_rank * cp_seg + local_pos,
+            full_seqlen - (cp_rank + 1) * cp_seg + (local_pos - cp_seg),
         )
     else:
         freq_pos = local_pos.to(torch.int64)
 
-    if freqs.dim() >= 1 and freqs.size(0) > total_tokens:
+    if max_seqlen is None:
+        exact_packed_freqs = freqs.dim() >= 1 and cp_size == 1 and freqs.size(0) > total_tokens
+    else:
+        exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
+    if exact_packed_freqs:
         # `freqs` covers all positions across all sequences (used for non-1D
         # RoPE / VLMs); shift by the per-sequence start offset so each token
         # samples its absolute position. When `freqs` only spans one max-len
         # sequence, no shift is needed.
-        freq_pos = freq_pos + seq_start.to(torch.int64) * cp_size
+        freq_pos = freq_pos + global_seq_start
 
     # Same rationale as the seq_idx clamp above: padded positions can index
     # past `freqs`; they receive a known wrong-but-harmless freq that gets
@@ -311,6 +321,7 @@ def apply_rotary_pos_emb(
     mla_rotary_interleaved: bool = False,
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
+    max_seqlen: Optional[int] = None,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -386,6 +397,7 @@ def apply_rotary_pos_emb(
             cp_group=cp_group,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
+            max_seqlen=max_seqlen,
         )
 
 

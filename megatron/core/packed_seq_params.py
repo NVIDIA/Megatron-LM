@@ -172,21 +172,23 @@ def pad_thd_for_cuda_graph(
         actual_T = int(packed_seq_params.cu_seqlens_q[-1].item())
         mask_device = packed_seq_params.cu_seqlens_q.device
 
+    from megatron.core import parallel_state
+
+    cp_size = (
+        packed_seq_params.local_cp_size
+        if packed_seq_params.local_cp_size is not None
+        else parallel_state.get_context_parallel_world_size()
+    )
+    cp_rank = parallel_state.get_context_parallel_rank() if cp_size > 1 else 0
+    max_seqlen_global = max_seqlen * cp_size
+
     if actual_T is not None and packed_seq_params.cu_seqlens_q is not None:
         _cu = packed_seq_params.cu_seqlens_q
         _individual_lens = _cu[1:] - _cu[:-1]
         _max_individual = int(_individual_lens.max().item()) if _individual_lens.numel() > 0 else 0
-        from megatron.core import parallel_state
-
-        _cp_size = (
-            packed_seq_params.local_cp_size
-            if packed_seq_params.local_cp_size is not None
-            else parallel_state.get_context_parallel_world_size()
-        )
-        _global_max_seqlen = max_seqlen * _cp_size
-        assert _max_individual <= _global_max_seqlen, (
+        assert _max_individual <= max_seqlen_global, (
             f"Individual request length ({_max_individual}) exceeds the global max sequence length "
-            f"({_global_max_seqlen} = max_seqlen_per_dp_cp_rank {max_seqlen} * cp_size {_cp_size}). "
+            f"({max_seqlen_global} = max_seqlen_per_dp_cp_rank {max_seqlen} * cp_size {cp_size}). "
             f"Each request must fit within the CUDA Graph static buffer after CP partitioning. "
             f"Increase --max-seqlen-per-dp-cp-rank or --seq-length, or filter out overlong requests."
         )
@@ -207,20 +209,11 @@ def pad_thd_for_cuda_graph(
         cu_seqlens_kv_padded=_pad_cu_seqlens(
             packed_seq_params.cu_seqlens_kv_padded, target_cu_entries
         ),
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
+        max_seqlen_q=max_seqlen_global,
+        max_seqlen_kv=max_seqlen_global,
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
     )
-
-    from megatron.core import parallel_state
-
-    cp_size = (
-        packed_seq_params.local_cp_size
-        if packed_seq_params.local_cp_size is not None
-        else parallel_state.get_context_parallel_world_size()
-    )
-    cp_rank = parallel_state.get_context_parallel_rank() if cp_size > 1 else 0
 
     if cp_size > 1:
         from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
@@ -244,7 +237,7 @@ def pad_thd_for_cuda_graph(
                     padded_params.cu_seqlens_q_padded
                     if padded_params.cu_seqlens_q_padded is not None
                     else padded_params.cu_seqlens_q,
-                    max_seqlen,
+                    max_seqlen_global,
                     cp_size,
                     cp_rank,
                 ).numel()

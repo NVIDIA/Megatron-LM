@@ -1097,7 +1097,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
-                max_T = self.config.max_seqlen_per_dp_cp_rank
+                # Static cu_seqlens shaped [thd_max_num_seqs + 1]. We seed it as
+                # one full-length sequence (covers the worst case at capture):
+                #   cu_seqlens = [0, max_T, max_T, ..., max_T]
+                # which represents a single packed sequence followed by zero-length
+                # entries. cu_seqlens_q / kv / *_padded all share this layout.
+                max_T = (
+                    self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+                )
                 max_num_seqs = self.config.thd_max_num_seqs
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
                 cu_seqlens[1:] = max_T
@@ -1206,7 +1213,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         if 'cu_seqlens_q' not in kwargs:
             return
-        max_seqlen = self.config.max_seqlen_per_dp_cp_rank
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
             cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
@@ -1290,9 +1297,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         For THD format, PackedSeqParams is decomposed into individual tensor kwargs.
         """
-        self._decompose_packed_seq_params_to_kwargs(kwargs)
-
         context = None
+        padding_mask = kwargs.get("padding_mask", None)
         if (
             self.config.cuda_graph_modules
             and CudaGraphModule.attn not in self.config.cuda_graph_modules
@@ -1300,6 +1306,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
             kwargs = {}
+            if padding_mask is not None:
+                kwargs["padding_mask"] = padding_mask
+        else:
+            self._decompose_packed_seq_params_to_kwargs(kwargs)
 
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None
