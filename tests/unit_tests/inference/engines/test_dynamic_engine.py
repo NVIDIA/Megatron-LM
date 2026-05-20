@@ -3762,7 +3762,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             logits[:, :, 0] = 100.0
             return hidden_states, logits
 
-
         unwrapped_model.forward = mock_deterministic_forward
         unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
