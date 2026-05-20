@@ -26,22 +26,7 @@ from wandb import wandb_run
 
 from megatron.core import mpu
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
-from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
-from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
-from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.utils import (
-    toggle_cuda_graphs,
-    transition_moe_cudagraphs,
-)
-from megatron.core.inference.utils import set_decode_expert_padding
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,

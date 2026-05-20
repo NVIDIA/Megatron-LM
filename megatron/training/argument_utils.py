@@ -8,15 +8,16 @@ import inspect
 import itertools
 import types
 import typing
+import warnings
 from argparse import ArgumentParser, Namespace, _ArgumentGroup
 from dataclasses import Field, fields
-import warnings
-import torch.nn.functional as F
+from typing import Any, Callable, Optional
+
 import torch
+import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
-
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -32,6 +33,7 @@ from megatron.training.config import (
     ValidationConfig,
 )
 from megatron.training.models.hybrid import HybridModelConfig
+
 # TODO: support arg renames
 
 
@@ -292,13 +294,13 @@ class ArgumentGroupFactory:
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
-    from megatron.core.transformer import MLATransformerConfig
-    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
-        HeterogeneousTransformerConfig,
-    )
     from megatron.core.quantization.utils import (
         kitchen_quantization_recipe_config,
         load_quantization_recipe,
+    )
+    from megatron.core.transformer import MLATransformerConfig
+    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+        HeterogeneousTransformerConfig,
     )
 
     # Config class.
@@ -308,7 +310,9 @@ def core_transformer_config_from_args(args, config_class=None):
         config_class = MLATransformerConfig
 
     if args.heterogeneous_layers_config_path is not None:
-        assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
+        assert (
+            not args.multi_latent_attention
+        ), "Multi latent attention with heterogeneous layers is not supported."
         config_class = HeterogeneousTransformerConfig
 
     # Translate args to core transformer configuration
@@ -322,8 +326,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
-    kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
-    kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['num_layers_in_first_pipeline_stage'] = args.decoder_first_pipeline_num_layers
+    kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
     if args.swiglu:
@@ -351,15 +355,16 @@ def core_transformer_config_from_args(args, config_class=None):
         # Pop 'rope_type' to let the config class use the default value.
         kw_args.pop('rope_type', None)
     else:
-        assert (args.multi_latent_attention or args.rope_type == 'rope'), (
-            f'Common attention only support rope_type="rope", but got {args.rope_type}.'
-        )
+        assert (
+            args.multi_latent_attention or args.rope_type == 'rope'
+        ), f'Common attention only support rope_type="rope", but got {args.rope_type}.'
 
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
 
@@ -408,7 +413,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
-def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
+def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
     """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
 
     kwargs = {}
@@ -425,7 +430,6 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
     elif args.spec is not None:
         kwargs["hybrid_stack_spec"] = import_module(args.spec)
 
-
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
     kwargs["position_embedding_type"] = args.position_embedding_type
@@ -440,9 +444,11 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
     if args.padded_vocab_size is not None:
         kwargs["vocab_size"] = args.padded_vocab_size
     else:
-        # Megatron-Bridge uses an explicit setting "should_pad_vocab" so that 
-        # when converting model configs from HF, we can set a vocab size and disable padding. 
-        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        # Megatron-Bridge uses an explicit setting "should_pad_vocab" so that
+        # when converting model configs from HF, we can set a vocab size and disable padding.
+        assert (
+            args.vocab_size is not None
+        ), "Either --padded-vocab-size or --vocab-size must be specified."
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
