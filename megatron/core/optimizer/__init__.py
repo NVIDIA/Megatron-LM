@@ -821,7 +821,7 @@ def _build_megatron_fsdp_emerging_optimizer(
         if use_fsdp_zero_muon:
             dense_kwargs["dp_group"] = pg_collection.dp_cp
             dense_kwargs["fsdp_batched_all_gather"] = getattr(
-                config, "muon_fsdp_batched_all_gather", False
+                config, "muon_fsdp_batched_all_gather", True
             )
         muon_base = optimizer_cls(linear_param_groups, **dense_kwargs)
         muon_opt = DistributedOptimizer(
@@ -847,7 +847,7 @@ def _build_megatron_fsdp_emerging_optimizer(
         if use_fsdp_zero_muon:
             expert_kwargs["dp_group"] = pg_collection.expt_dp
             expert_kwargs["fsdp_batched_all_gather"] = getattr(
-                config, "muon_fsdp_batched_all_gather", False
+                config, "muon_fsdp_batched_all_gather", True
             )
         expert_muon_base = optimizer_cls(expert_param_groups, **expert_kwargs)
         expert_muon_opt = DistributedOptimizer(

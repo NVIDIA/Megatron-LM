@@ -289,9 +289,9 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
-    muon_fsdp_batched_all_gather: bool = False
-    """If True, batch Muon+M-FSDP boundary parameter all-gathers by dtype/device/param-group.
-    This can reduce collective count but increases temporary peak memory.
+    muon_fsdp_batched_all_gather: bool = True
+    """If True, batch Muon+M-FSDP boundary parameter all-gathers by dtype/device/group.
+    This reduces collective count but increases temporary peak memory.
     """
 
     # Lion.

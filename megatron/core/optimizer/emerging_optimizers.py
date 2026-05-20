@@ -10,6 +10,7 @@ To add a new emerging optimizer:
 
 import inspect
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional, get_args
 
@@ -63,6 +64,67 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        log_single_rank(
+            logger, logging.WARNING, "Ignoring invalid %s=%r; using %s.", name, value, default
+        )
+        return default
+
+
+def _should_use_padded_all_gather(rank_total_numels: list[int], pad_factor: float) -> bool:
+    total_numel = sum(rank_total_numels)
+    if total_numel == 0:
+        return False
+    max_rank_numel = max(rank_total_numels)
+    if max_rank_numel == 0 or pad_factor <= 0:
+        return False
+    return max_rank_numel * len(rank_total_numels) <= pad_factor * total_numel
+
+
+def _chunk_infos_are_contiguous_full_order(
+    full_shape: torch.Size, chunk_infos: list[dict[str, Any]]
+) -> bool:
+    """Return whether row-sharded chunks cover `full_shape` in row-major order."""
+    full_shape = torch.Size(full_shape)
+    if full_shape.numel() == 0:
+        return all(chunk_info["numel"] == 0 for chunk_info in chunk_infos)
+
+    expected_flat_start = 0
+    trailing_numel = torch.Size(full_shape[1:]).numel() if len(full_shape) > 1 else 1
+    for chunk_info in chunk_infos:
+        chunk_numel = chunk_info["numel"]
+        if chunk_numel == 0:
+            continue
+
+        offset = tuple(chunk_info["offset"])
+        chunk_shape = torch.Size(chunk_info["shape"])
+        if len(offset) != len(full_shape) or len(chunk_shape) != len(full_shape):
+            return False
+        if len(full_shape) > 1:
+            for dim in range(1, len(full_shape)):
+                if offset[dim] != 0 or chunk_shape[dim] != full_shape[dim]:
+                    return False
+        flat_start = offset[0] * trailing_numel
+        if flat_start != expected_flat_start:
+            return False
+        expected_flat_start += chunk_numel
+
+    return expected_flat_start == full_shape.numel()
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -309,7 +371,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         self,
         params: ParamsT,
         dp_group: torch.distributed.ProcessGroup | None = None,
-        fsdp_batched_all_gather: bool = False,
+        fsdp_batched_all_gather: bool = True,
         **kwargs: Any,
     ) -> None:
         assert _HAVE_DTENSOR, (
@@ -318,9 +380,90 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         )
         self.dp_group = dp_group
         self.fsdp_batched_all_gather = fsdp_batched_all_gather
-        self._boundary_gather_indices_cache: Dict[tuple[int, ...], set[int]] = {}
-        self._uneven_gather_plan_cache: Dict[int, Dict[str, Any]] = {}
+        self.fsdp_reuse_gather_scratch = _env_flag("MUON_FSDP_REUSE_GATHER_SCRATCH", True)
+        self.fsdp_padded_all_gather = _env_flag("MUON_FSDP_PADDED_ALL_GATHER", True)
+        self.fsdp_padded_all_gather_pad_factor = _env_float(
+            "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR", 1.25
+        )
+        self.fsdp_batch_max_gather_bytes = int(
+            _env_float("MUON_FSDP_BATCH_MAX_GATHER_BYTES", 1024 * 1024 * 1024)
+        )
+        self.fsdp_padded_all_gather_zero_pad = _env_flag(
+            "MUON_FSDP_PADDED_ALL_GATHER_ZERO_PAD", True
+        )
+        self.fsdp_fast_reconstruct = _env_flag("MUON_FSDP_FAST_RECONSTRUCT", True)
+        self._boundary_gather_indices_cache: dict[tuple[int, ...], set[int]] = {}
+        self._uneven_gather_plan_cache: dict[int, dict[str, Any]] = {}
+        self._fsdp_gather_scratch_cache: dict[tuple[Any, ...], Any] = {}
         super().__init__(params, **kwargs)
+
+    def _fsdp_gather_scratch_cache_bytes(self) -> int:
+        total = 0
+        for value in self._fsdp_gather_scratch_cache.values():
+            if isinstance(value, torch.Tensor):
+                total += value.numel() * value.element_size()
+            elif isinstance(value, list):
+                total += sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in value
+                    if isinstance(tensor, torch.Tensor)
+                )
+        return total
+
+    def clear_fsdp_gather_scratch_cache(self) -> None:
+        """Clear the gather scratch buffer."""
+        self._fsdp_gather_scratch_cache.clear()
+
+    def _get_fsdp_gather_scratch_tensor(
+        self, key: tuple[Any, ...], numel: int, *, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        if not self.fsdp_reuse_gather_scratch:
+            return torch.empty(numel, dtype=dtype, device=device)
+
+        cached = self._fsdp_gather_scratch_cache.get(key)
+        if (
+            not isinstance(cached, torch.Tensor)
+            or cached.numel() < numel
+            or cached.dtype != dtype
+            or cached.device != device
+        ):
+            cached = torch.empty(numel, dtype=dtype, device=device)
+            self._fsdp_gather_scratch_cache[key] = cached
+        return cached[:numel]
+
+    def _get_uneven_group_tensors(
+        self,
+        rank_numels: list[int],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        shard_group: torch.distributed.ProcessGroup,
+    ) -> list[torch.Tensor]:
+        if not self.fsdp_reuse_gather_scratch:
+            return [torch.empty(numel, dtype=dtype, device=device) for numel in rank_numels]
+
+        key = ("uneven_group_tensors", id(shard_group), dtype, device, tuple(rank_numels))
+        cached = self._fsdp_gather_scratch_cache.get(key)
+        if not isinstance(cached, list):
+            cached = [torch.empty(numel, dtype=dtype, device=device) for numel in rank_numels]
+            self._fsdp_gather_scratch_cache[key] = cached
+        return cached
+
+    def _candidate_batch_gather_bytes(
+        self, stage_rank_total_numels: list[list[int]], plan: dict[str, Any], *, element_size: int
+    ) -> int:
+        max_stage_bytes = 0
+        for stage_idx, stage in enumerate(plan["stages"]):
+            candidate_rank_total_numels = [
+                stage_rank_total_numels[stage_idx][rank] + stage["rank_numels"][rank]
+                for rank in range(len(stage["rank_numels"]))
+            ]
+            if self.fsdp_padded_all_gather:
+                gathered_numel = max(candidate_rank_total_numels) * len(candidate_rank_total_numels)
+            else:
+                gathered_numel = sum(candidate_rank_total_numels)
+            max_stage_bytes = max(max_stage_bytes, gathered_numel * element_size)
+        return max_stage_bytes
 
     @torch.no_grad()  # type: ignore[misc]
     def step(self, closure: Callable | None = None) -> float | None:
@@ -695,15 +838,139 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             ]
 
         chunk_infos = local_chunks_info
+        full_shape = torch.Size(dtensor_ref.shape)
         plan = {
             "shard_mesh_dims": tuple(shard_mesh_dims),
             "stages": stages,
             "chunk_infos": chunk_infos,
+            "full_numel": full_shape.numel(),
+            "is_contiguous_full_order": _chunk_infos_are_contiguous_full_order(
+                full_shape, chunk_infos
+            ),
         }
         if len(stages) == 1:
             plan["shard_group"] = stages[0]["shard_group"]
         self._uneven_gather_plan_cache[cache_key] = plan
         return plan
+
+    def _all_gather_padded_equal_size(
+        self,
+        local_buffer: torch.Tensor,
+        rank_total_numels: list[int],
+        shard_group: torch.distributed.ProcessGroup,
+    ) -> tuple[torch.Tensor, int]:
+        max_rank_numel = max(rank_total_numels)
+        group_size = len(rank_total_numels)
+        if max_rank_numel == 0:
+            raise AssertionError("Cannot padded-all-gather an empty uneven DTensor batch.")
+
+        padded_local_buffer = self._get_fsdp_gather_scratch_tensor(
+            ("padded_local_buffer", id(shard_group), local_buffer.dtype, local_buffer.device),
+            max_rank_numel,
+            dtype=local_buffer.dtype,
+            device=local_buffer.device,
+        )
+        if local_buffer.numel() > 0:
+            padded_local_buffer[: local_buffer.numel()].copy_(local_buffer)
+        if self.fsdp_padded_all_gather_zero_pad and local_buffer.numel() < max_rank_numel:
+            padded_local_buffer[local_buffer.numel() : max_rank_numel].zero_()
+
+        gathered_padded_buffer = self._get_fsdp_gather_scratch_tensor(
+            (
+                "gathered_padded_buffer",
+                id(shard_group),
+                local_buffer.dtype,
+                local_buffer.device,
+                group_size,
+            ),
+            group_size * max_rank_numel,
+            dtype=local_buffer.dtype,
+            device=local_buffer.device,
+        )
+        torch.distributed.all_gather_into_tensor(
+            gathered_padded_buffer, padded_local_buffer, group=shard_group
+        )
+        return gathered_padded_buffer, max_rank_numel
+
+    def _reconstruct_full_tensor_from_rank_buffers(
+        self,
+        dtensor_ref,
+        plan: dict[str, Any],
+        rank_buffers: list[torch.Tensor],
+        rank_buffer_offsets: list[int] | None = None,
+    ) -> torch.Tensor:
+        full_tensor = torch.empty(
+            dtensor_ref.shape, dtype=rank_buffers[0].dtype, device=rank_buffers[0].device
+        )
+        assigned_numel = 0
+
+        if self.fsdp_fast_reconstruct and plan["is_contiguous_full_order"]:
+            full_flat = full_tensor.view(-1)
+            dest_offset = 0
+            for rank, rank_buffer in enumerate(rank_buffers):
+                chunk_info = plan["chunk_infos"][rank]
+                chunk_numel = chunk_info["numel"]
+                if chunk_numel == 0:
+                    continue
+                source_offset = 0 if rank_buffer_offsets is None else rank_buffer_offsets[rank]
+                full_flat[dest_offset : dest_offset + chunk_numel].copy_(
+                    rank_buffer[source_offset : source_offset + chunk_numel]
+                )
+                dest_offset += chunk_numel
+                assigned_numel += chunk_numel
+            if assigned_numel != plan["full_numel"]:
+                raise AssertionError(
+                    "Fast uneven DTensor reconstruction did not cover the full tensor: "
+                    f"assigned={assigned_numel}, expected={plan['full_numel']}."
+                )
+            return full_tensor
+
+        for rank, rank_buffer in enumerate(rank_buffers):
+            chunk_info = plan["chunk_infos"][rank]
+            chunk_numel = chunk_info["numel"]
+            if chunk_numel == 0:
+                continue
+            source_offset = 0 if rank_buffer_offsets is None else rank_buffer_offsets[rank]
+            chunk_shape = chunk_info["shape"]
+            chunk_tensor = rank_buffer[source_offset : source_offset + chunk_numel].view(
+                chunk_shape
+            )
+            slices = tuple(slice(o, o + s) for o, s in zip(chunk_info["offset"], chunk_shape))
+            full_tensor[slices] = chunk_tensor
+            assigned_numel += chunk_numel
+
+        _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
+        return full_tensor
+
+    def _reconstruct_full_tensor_from_flat_buffer(
+        self, dtensor_ref, plan: dict[str, Any], full_flat_buffer: torch.Tensor
+    ) -> torch.Tensor:
+        if full_flat_buffer.numel() != plan["full_numel"]:
+            raise AssertionError(
+                "Uneven DTensor flat reconstruction buffer size mismatch: "
+                f"got {full_flat_buffer.numel()}, expected {plan['full_numel']}."
+            )
+
+        if self.fsdp_fast_reconstruct and plan["is_contiguous_full_order"]:
+            return full_flat_buffer.view(dtensor_ref.shape)
+
+        full_tensor = torch.empty(
+            dtensor_ref.shape, dtype=full_flat_buffer.dtype, device=full_flat_buffer.device
+        )
+        assigned_numel = 0
+        buffer_offset = 0
+        for chunk_info in plan["chunk_infos"]:
+            chunk_shape = chunk_info["shape"]
+            chunk_numel = chunk_info["numel"]
+            gathered_tensor = full_flat_buffer[buffer_offset : buffer_offset + chunk_numel]
+            buffer_offset += chunk_numel
+            offset = chunk_info["offset"]
+            slices = tuple(slice(o, o + s) for o, s in zip(offset, chunk_shape))
+            full_tensor[slices] = gathered_tensor.view(chunk_shape)
+            assigned_numel += chunk_numel
+
+        _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
+        return full_tensor
 
     def _gather_full_uneven_local_tensor_like(
         self, dtensor_ref, local_tensor: torch.Tensor
@@ -734,28 +1001,18 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     "Uneven DTensor gather local buffer size mismatch: "
                     f"got {local_buffer.numel()}, expected {expected_local_numel}."
                 )
-            group_tensors = [
-                torch.empty(numel, dtype=local_tensor.dtype, device=local_tensor.device)
-                for numel in stage["rank_numels"]
-            ]
+            group_tensors = self._get_uneven_group_tensors(
+                stage["rank_numels"],
+                dtype=local_tensor.dtype,
+                device=local_tensor.device,
+                shard_group=shard_group,
+            )
             torch.distributed.all_gather(group_tensors, local_buffer, group=shard_group)
 
             if local_tensor.numel() == 0:
                 return None
 
-            full_tensor = torch.empty(
-                dtensor_ref.shape, dtype=local_tensor.dtype, device=local_tensor.device
-            )
-            assigned_numel = 0
-            for chunk_info, gathered_tensor in zip(plan["chunk_infos"], group_tensors):
-                chunk_shape = chunk_info["shape"]
-                offset = chunk_info["offset"]
-                slices = tuple(slice(o, o + s) for o, s in zip(offset, chunk_shape))
-                full_tensor[slices] = gathered_tensor.view(chunk_shape)
-                assigned_numel += chunk_info["numel"]
-
-            _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
-            return full_tensor
+            return self._reconstruct_full_tensor_from_rank_buffers(dtensor_ref, plan, group_tensors)
 
         for stage in plan["stages"]:
             shard_group = stage["shard_group"]
@@ -766,33 +1023,19 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     "Uneven DTensor gather local buffer size mismatch: "
                     f"got {local_buffer.numel()}, expected {expected_local_numel}."
                 )
-            group_tensors = [
-                torch.empty(numel, dtype=local_tensor.dtype, device=local_tensor.device)
-                for numel in stage["rank_numels"]
-            ]
+            group_tensors = self._get_uneven_group_tensors(
+                stage["rank_numels"],
+                dtype=local_tensor.dtype,
+                device=local_tensor.device,
+                shard_group=shard_group,
+            )
             torch.distributed.all_gather(group_tensors, local_buffer, group=shard_group)
             local_buffer = torch.cat(group_tensors)
 
         if local_tensor.numel() == 0:
             return None
 
-        full_tensor = torch.empty(
-            dtensor_ref.shape, dtype=local_tensor.dtype, device=local_tensor.device
-        )
-        assigned_numel = 0
-        buffer_offset = 0
-        for chunk_info in plan["chunk_infos"]:
-            chunk_shape = chunk_info["shape"]
-            chunk_numel = chunk_info["numel"]
-            gathered_tensor = local_buffer[buffer_offset : buffer_offset + chunk_numel]
-            buffer_offset += chunk_numel
-            offset = chunk_info["offset"]
-            slices = tuple(slice(o, o + s) for o, s in zip(offset, chunk_shape))
-            full_tensor[slices] = gathered_tensor.view(chunk_shape)
-            assigned_numel += chunk_numel
-
-        _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
-        return full_tensor
+        return self._reconstruct_full_tensor_from_flat_buffer(dtensor_ref, plan, local_buffer)
 
     def _gather_full_uneven_local_tensors_like(
         self, items: list[tuple[torch.Tensor, torch.Tensor]]
@@ -807,7 +1050,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         reconstruct or orthogonalize the full boundary tensor.
         """
         results: list[torch.Tensor | None] = [None] * len(items)
-        batches: dict[tuple[int, torch.dtype, torch.device], Dict[str, Any]] = {}
+        batches: dict[tuple[int, torch.dtype, torch.device], list[dict[str, Any]]] = {}
 
         for item_idx, (dtensor_ref, local_tensor) in enumerate(items):
             plan = self._get_uneven_gather_plan(dtensor_ref)
@@ -816,28 +1059,48 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     dtensor_ref, local_tensor
                 )
                 continue
-            if len(plan["shard_mesh_dims"]) != 1:
-                results[item_idx] = self._gather_full_uneven_local_tensor_like(
-                    dtensor_ref, local_tensor
-                )
-                continue
 
-            key = (id(plan["shard_group"]), local_tensor.dtype, local_tensor.device)
-            batch = batches.setdefault(
-                key,
-                {
-                    "shard_group": plan["shard_group"],
-                    "dtype": local_tensor.dtype,
-                    "device": local_tensor.device,
-                    "item_indices": [],
-                    "plans": [],
-                },
-            )
+            stage_group_key = tuple(id(stage["shard_group"]) for stage in plan["stages"])
+            key = (stage_group_key, local_tensor.dtype, local_tensor.device)
+            key_batches = batches.setdefault(key, [])
+            element_size = local_tensor.element_size()
+            if not key_batches:
+                key_batches.append(
+                    {
+                        "dtype": local_tensor.dtype,
+                        "device": local_tensor.device,
+                        "item_indices": [],
+                        "plans": [],
+                        "stage_rank_total_numels": [
+                            [0] * len(stage["rank_numels"]) for stage in plan["stages"]
+                        ],
+                    }
+                )
+            batch = key_batches[-1]
+            if batch["item_indices"]:
+                candidate_bytes = self._candidate_batch_gather_bytes(
+                    batch["stage_rank_total_numels"], plan, element_size=element_size
+                )
+                if candidate_bytes > self.fsdp_batch_max_gather_bytes:
+                    batch = {
+                        "dtype": local_tensor.dtype,
+                        "device": local_tensor.device,
+                        "item_indices": [],
+                        "plans": [],
+                        "stage_rank_total_numels": [
+                            [0] * len(stage["rank_numels"]) for stage in plan["stages"]
+                        ],
+                    }
+                    key_batches.append(batch)
             batch["item_indices"].append(item_idx)
             batch["plans"].append(plan)
+            for stage_idx, stage in enumerate(plan["stages"]):
+                for rank, rank_numel in enumerate(stage["rank_numels"]):
+                    batch["stage_rank_total_numels"][stage_idx][rank] += rank_numel
 
-        for batch in batches.values():
-            self._gather_full_uneven_local_tensor_batch(items, results, batch)
+        for key_batches in batches.values():
+            for batch in key_batches:
+                self._gather_full_uneven_local_tensor_batch(items, results, batch)
 
         return results
 
@@ -847,41 +1110,109 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         results: list[torch.Tensor | None],
         batch: dict[str, Any],
     ) -> None:
-        shard_group = batch["shard_group"]
-        group_size = get_pg_size(shard_group)
-        group_rank = torch.distributed.get_rank(shard_group)
         item_indices = batch["item_indices"]
         plans = batch["plans"]
+        current_buffers = [items[item_idx][1].contiguous().view(-1) for item_idx in item_indices]
 
-        local_chunks = [items[item_idx][1].contiguous().view(-1) for item_idx in item_indices]
-        local_buffer = (
-            torch.cat(local_chunks)
-            if local_chunks and sum(chunk.numel() for chunk in local_chunks) > 0
-            else torch.empty(0, dtype=batch["dtype"], device=batch["device"])
-        )
-        expected_local_numel = sum(plan["chunk_infos"][group_rank]["numel"] for plan in plans)
-        if local_buffer.numel() != expected_local_numel:
-            raise AssertionError(
-                "Batched uneven DTensor gather local buffer size mismatch: "
-                f"got {local_buffer.numel()}, expected {expected_local_numel}."
+        for stage_idx, stage in enumerate(plans[0]["stages"]):
+            shard_group = stage["shard_group"]
+            group_size = get_pg_size(shard_group)
+            group_rank = torch.distributed.get_rank(shard_group)
+
+            expected_item_numels = [
+                plan["stages"][stage_idx]["rank_numels"][group_rank] for plan in plans
+            ]
+            expected_local_numel = sum(expected_item_numels)
+            local_buffer = self._get_fsdp_gather_scratch_tensor(
+                ("batch_local_buffer", stage_idx, id(shard_group), batch["dtype"], batch["device"]),
+                expected_local_numel,
+                dtype=batch["dtype"],
+                device=batch["device"],
             )
+            local_offset = 0
+            for buffer, expected_numel in zip(current_buffers, expected_item_numels):
+                if buffer.numel() != expected_numel:
+                    raise AssertionError(
+                        "Batched uneven DTensor gather stage buffer size mismatch: "
+                        f"stage={stage_idx}, got {buffer.numel()}, expected {expected_numel}."
+                    )
+                if expected_numel == 0:
+                    continue
+                local_buffer[local_offset : local_offset + expected_numel].copy_(buffer)
+                local_offset += expected_numel
 
-        rank_offsets: list[list[int]] = []
-        rank_total_numels: list[int] = []
-        for rank in range(group_size):
-            offsets = []
-            total_numel = 0
-            for plan in plans:
-                offsets.append(total_numel)
-                total_numel += plan["chunk_infos"][rank]["numel"]
-            rank_offsets.append(offsets)
-            rank_total_numels.append(total_numel)
+            if local_offset != expected_local_numel:
+                raise AssertionError(
+                    "Batched uneven DTensor gather local buffer size mismatch: "
+                    f"stage={stage_idx}, packed {local_offset}, expected {expected_local_numel}."
+                )
 
-        group_tensors = [
-            torch.empty(total_numel, dtype=batch["dtype"], device=batch["device"])
-            for total_numel in rank_total_numels
-        ]
-        torch.distributed.all_gather(group_tensors, local_buffer, group=shard_group)
+            rank_offsets: list[list[int]] = []
+            rank_total_numels: list[int] = []
+            for rank in range(group_size):
+                offsets = []
+                total_numel = 0
+                for plan in plans:
+                    offsets.append(total_numel)
+                    total_numel += plan["stages"][stage_idx]["rank_numels"][rank]
+                rank_offsets.append(offsets)
+                rank_total_numels.append(total_numel)
+
+            use_padded_all_gather = (
+                self.fsdp_padded_all_gather
+                and hasattr(torch.distributed, "all_gather_into_tensor")
+                and _should_use_padded_all_gather(
+                    rank_total_numels, self.fsdp_padded_all_gather_pad_factor
+                )
+            )
+            gathered_padded_buffer = None
+            max_rank_numel = 0
+            group_tensors = None
+            if use_padded_all_gather:
+                gathered_padded_buffer, max_rank_numel = self._all_gather_padded_equal_size(
+                    local_buffer, rank_total_numels, shard_group
+                )
+            else:
+                group_tensors = self._get_uneven_group_tensors(
+                    rank_total_numels,
+                    dtype=batch["dtype"],
+                    device=batch["device"],
+                    shard_group=shard_group,
+                )
+                torch.distributed.all_gather(group_tensors, local_buffer, group=shard_group)
+
+            if use_padded_all_gather:
+                assert gathered_padded_buffer is not None
+                rank_buffers = [
+                    gathered_padded_buffer[rank * max_rank_numel : (rank + 1) * max_rank_numel]
+                    for rank in range(group_size)
+                ]
+            else:
+                assert group_tensors is not None
+                rank_buffers = group_tensors
+
+            next_buffers = []
+            for batch_item_idx, plan in enumerate(plans):
+                item_numel = sum(plan["stages"][stage_idx]["rank_numels"])
+                item_buffer = torch.empty(item_numel, dtype=batch["dtype"], device=batch["device"])
+                item_offset = 0
+                for rank, rank_buffer in enumerate(rank_buffers):
+                    chunk_numel = plan["stages"][stage_idx]["rank_numels"][rank]
+                    if chunk_numel == 0:
+                        continue
+                    source_offset = rank_offsets[rank][batch_item_idx]
+                    item_buffer[item_offset : item_offset + chunk_numel].copy_(
+                        rank_buffer[source_offset : source_offset + chunk_numel]
+                    )
+                    item_offset += chunk_numel
+                if item_offset != item_numel:
+                    raise AssertionError(
+                        "Batched uneven DTensor stage unpack did not cover the item: "
+                        f"stage={stage_idx}, assigned={item_offset}, expected={item_numel}."
+                    )
+                next_buffers.append(item_buffer)
+
+            current_buffers = next_buffers
 
         for batch_item_idx, item_idx in enumerate(item_indices):
             dtensor_ref, local_tensor = items[item_idx]
@@ -889,25 +1220,10 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                 results[item_idx] = None
                 continue
 
-            full_tensor = torch.empty(
-                dtensor_ref.shape, dtype=local_tensor.dtype, device=local_tensor.device
-            )
-            assigned_numel = 0
             plan = plans[batch_item_idx]
-            for rank, gathered_rank_tensor in enumerate(group_tensors):
-                chunk_info = plan["chunk_infos"][rank]
-                chunk_numel = chunk_info["numel"]
-                if chunk_numel == 0:
-                    continue
-                offset = rank_offsets[rank][batch_item_idx]
-                chunk_shape = chunk_info["shape"]
-                chunk_tensor = gathered_rank_tensor[offset : offset + chunk_numel].view(chunk_shape)
-                slices = tuple(slice(o, o + s) for o, s in zip(chunk_info["offset"], chunk_shape))
-                full_tensor[slices] = chunk_tensor
-                assigned_numel += chunk_numel
-
-            _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
-            results[item_idx] = full_tensor
+            results[item_idx] = self._reconstruct_full_tensor_from_flat_buffer(
+                dtensor_ref, plan, current_buffers[batch_item_idx]
+            )
 
     def _local_shard_from_full_update_like(self, dtensor_ref, full_update: torch.Tensor):
         if not hasattr(dtensor_ref._local_tensor, "__create_chunk_list__"):
