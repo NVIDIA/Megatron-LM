@@ -4742,6 +4742,8 @@ def make_fsdp_dtensor(
         shape=param.shape,
         stride=param.stride(),
     )
+    setattr(fsdp_tensor, "megatron_fsdp_dist_index", dist_index)
+    setattr(fsdp_tensor, "megatron_fsdp_is_expert_param", is_expert_param)
 
     if run_check:
         validate_uneven_dtensor(fsdp_tensor)

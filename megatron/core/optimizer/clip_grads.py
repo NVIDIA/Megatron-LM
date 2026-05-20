@@ -49,7 +49,7 @@ except ImportError:
 
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
-from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
+from ..utils import get_data_parallel_group_if_dtensor, is_same_process_group, to_local_if_dtensor
 
 
 def get_grad_norm_fp32(
@@ -99,9 +99,10 @@ def get_grad_norm_fp32(
             torch.distributed.all_reduce(
                 total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
             )
-        torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=grad_stats_parallel_group
-        )
+        if not is_same_process_group(data_parallel_group, grad_stats_parallel_group):
+            torch.distributed.all_reduce(
+                total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=grad_stats_parallel_group
+            )
         total_norm = total_norm_cuda[0].item()
 
     else:
@@ -133,9 +134,10 @@ def get_grad_norm_fp32(
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
             )
-        torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
-        )
+        if not is_same_process_group(data_parallel_group, grad_stats_parallel_group):
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+            )
         if multi_tensor_scale_tensor_impl is not None:
             total_norm = total_norm.pow(1.0 / norm_type)
         else:
@@ -232,18 +234,9 @@ def count_zeros_fp32(
     #   - should not be a replica due to tensor model parallelism
     total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
     data_parallel_group = None
-    use_megatron_fsdp = False
     for param in parameters:
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
         grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
-        if getattr(param, "__fsdp_param__", False) and grad_not_none:
-            # If the parameter is managed by Megatron FSDP, the gradient is
-            # an FSDP-sharded DTensor, and we should use the local shard.
-            use_megatron_fsdp = True
-            grad = getattr(param, grad_attr)._local_tensor
-            num_zeros = grad.numel() - torch.count_nonzero(grad)
-            total_num_zeros += num_zeros
-            continue
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
         if grad_not_none and is_not_shared and is_not_tp_duplicate:
@@ -253,23 +246,16 @@ def count_zeros_fp32(
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros = num_zeros + total_num_zeros
 
-    if use_megatron_fsdp and data_parallel_group is not None:
-        # Megatron-FSDP does not need to all-reduce the gradient across DP,
-        # as FSDP has already handled the DP reduction during BWD.
-        raise ValueError(
-            "Unexpected use of Megatron FSDP with data parallel group. "
-            "Please ensure that the parameters are properly managed by Megatron FSDP."
-        )
-
     # Sum across all data-parallel GPUs if using FSDP.
     if data_parallel_group:
         torch.distributed.all_reduce(
             total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
         )
     # Sum across all model-parallel GPUs.
-    torch.distributed.all_reduce(
-        total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
-    )
+    if not is_same_process_group(data_parallel_group, grad_stats_parallel_group):
+        torch.distributed.all_reduce(
+            total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+        )
 
     total_num_zeros = total_num_zeros.item()
 
