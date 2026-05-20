@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
-    TEFusedDenseMLP,
+    TEFusedMLPWithGroupedLinear,
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
@@ -15,7 +15,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
-_SKIP_REASON = "TEFusedDenseMLP requires Transformer Engine >= 2.14.0"
+_SKIP_REASON = "TEFusedMLPWithGroupedLinear requires Transformer Engine >= 2.14.0"
 _SKIP = not HAVE_TE or not is_te_min_version("2.14.0")
 
 
@@ -38,7 +38,7 @@ def _make_config(**overrides):
 
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
-class TestTEFusedDenseMLPSpec:
+class TestTEFusedMLPWithGroupedLinearSpec:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -49,23 +49,43 @@ class TestTEFusedDenseMLPSpec:
 
     def test_instantiation(self):
         config = _make_config()
-        mlp = TEFusedDenseMLP(config, _make_submodules())
-        assert isinstance(mlp, TEFusedDenseMLP)
+        mlp = TEFusedMLPWithGroupedLinear(config, _make_submodules())
+        assert isinstance(mlp, TEFusedMLPWithGroupedLinear)
 
     def test_wrong_activation_raises(self):
         config = _make_config(activation_func=F.gelu, gated_linear_unit=False)
         with pytest.raises(ValueError, match="SwiGLU activation"):
-            TEFusedDenseMLP(config, _make_submodules())
+            TEFusedMLPWithGroupedLinear(config, _make_submodules())
 
     def test_gated_linear_unit_false_raises(self):
         config = _make_config(gated_linear_unit=False)
         with pytest.raises(ValueError, match="SwiGLU activation"):
-            TEFusedDenseMLP(config, _make_submodules())
+            TEFusedMLPWithGroupedLinear(config, _make_submodules())
 
     def test_add_bias_linear_raises(self):
         config = _make_config(add_bias_linear=True)
         with pytest.raises(ValueError, match="add_bias_linear"):
-            TEFusedDenseMLP(config, _make_submodules())
+            TEFusedMLPWithGroupedLinear(config, _make_submodules())
+
+    def test_tensor_parallel_falls_back_to_base_fused_mlp(self, monkeypatch):
+        import megatron.core.extensions.transformer_engine as te_ext
+
+        calls = {}
+
+        def fake_forward(self, hidden_states, **kwargs):
+            calls["hidden_states"] = hidden_states
+            calls["kwargs"] = kwargs
+            return "output", "bias"
+
+        monkeypatch.setattr(te_ext, "get_tensor_model_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(te_ext.TEFusedMLP, "forward", fake_forward)
+
+        config = _make_config()
+        mlp = TEFusedMLPWithGroupedLinear(config, _make_submodules())
+        hidden_states = object()
+
+        assert mlp.forward(hidden_states, test_kwarg=True) == ("output", "bias")
+        assert calls == {"hidden_states": hidden_states, "kwargs": {"test_kwarg": True}}
 
     def test_norm_seq_not_registered_as_submodule(self):
         # _norm_seq must be stored in a tuple (not directly as nn.Module) to avoid
@@ -74,7 +94,7 @@ class TestTEFusedDenseMLPSpec:
         import torch.nn as nn
 
         config = _make_config()
-        mlp = TEFusedDenseMLP(config, _make_submodules())
+        mlp = TEFusedMLPWithGroupedLinear(config, _make_submodules())
         assert mlp._norm_seq is None
         assert '_norm_seq' not in dict(mlp.named_children())
 

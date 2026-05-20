@@ -2557,7 +2557,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 ffn_hidden_size=ffn_hidden_size,
             )
 
-    class TEFusedDenseMLP(TEFusedMLP):
+    class TEFusedMLPWithGroupedLinear(TEFusedMLP):
         """Dense MLP using GroupedLinear(num_groups=1) to trigger
         ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
 
@@ -2591,13 +2591,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            fused_impl = te.pytorch.ops.Sequential()
-
-            # Tensor parallelism configuration
             tp_world_size = get_tensor_model_parallel_world_size()
-            tp_group = None
             if tp_world_size > 1:
-                tp_group = get_tensor_model_parallel_group()
+                return super()._make_fused_impl()
+
+            fused_impl = te.pytorch.ops.Sequential()
 
             # RNG state
             rng_state_tracker_function = None
@@ -2698,6 +2696,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
+            if get_tensor_model_parallel_world_size() > 1:
+                return super().forward(hidden_states, **kwargs)
+
             orig_shape = hidden_states.shape
             hidden_size = hidden_states.size(-1)
             hidden_states_2d = hidden_states.view(-1, hidden_size)
@@ -2720,7 +2721,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             recipe = self._recipe
 
             if self._fused_impl is None:
-                with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                with te.pytorch.quantized_model_init(enabled=True, recipe=recipe):
                     self._fused_impl = (self._make_fused_impl(),)
 
             # Apply norm in BF16 OUTSIDE the MXFP8 autocast to preserve the rstd
@@ -2728,7 +2729,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # gradient amplification, and causes convergence issues).
             normed = self._norm_seq[0](hidden_states_2d)
 
-            with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            with te.pytorch.autocast(enabled=True, recipe=recipe):
                 out = self._fused_impl[0](normed, tokens_per_expert, scales, tokens_per_expert)
 
             out = out.view(*orig_shape[:-1], out.size(-1))
@@ -2743,7 +2744,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
-    TEFusedDenseMLP = None  # type: ignore[assignment, misc]
+    TEFusedMLPWithGroupedLinear = None  # type: ignore[assignment, misc]
 
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):

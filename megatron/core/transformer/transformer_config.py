@@ -746,7 +746,7 @@ class TransformerConfig(ModelParallelConfig):
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
 
-    dense_grouped_gemm: bool = False
+    use_grouped_gemm_for_dense_mlp: bool = False
     """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
     ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
