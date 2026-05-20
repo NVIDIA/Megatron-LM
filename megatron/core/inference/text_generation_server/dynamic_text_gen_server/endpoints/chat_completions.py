@@ -360,6 +360,35 @@ def _replace_prefix_tokens(
     return previous_turn_token_ids + current_turn_additional_token_ids
 
 
+def _coerce_to_token_id_list(result):
+    """Convert the return value of `tokenizer.apply_chat_template` to `list[int]`.
+
+    transformers >= 5.x.x sometimes returns a `BatchEncoding` object instead of a `list[int]`.
+    """
+    # BatchEncoding / dict-like with input_ids
+    if isinstance(result, dict) or hasattr(result, "input_ids"):
+        ids = result["input_ids"]
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return list(ids)
+    # Fast-tokenizer Encoding object
+    if hasattr(result, "ids"):
+        ids = result.ids
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        return list(ids)
+    # Raw tensor / ndarray
+    if hasattr(result, "tolist"):
+        ids = result.tolist()
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return ids
+    # Plain list
+    return list(result)
+
+
 try:
     import orjson
 
@@ -433,12 +462,14 @@ try:
                 hasattr(tokenizer, 'apply_chat_template')
                 and getattr(tokenizer, "chat_template", None) is not None
             ):
-                prompt_tokens = tokenizer.apply_chat_template(
-                    template_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    tools=template_tools,
-                    **chat_template_kwargs,
+                prompt_tokens = _coerce_to_token_id_list(
+                    tokenizer.apply_chat_template(
+                        template_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=template_tools,
+                        **chat_template_kwargs,
+                    )
                 )
 
                 if req.get("prevent_retokenization", True):
@@ -479,12 +510,14 @@ try:
                         ]
 
                         # Get the templated tokenization of just the previous generation
-                        retokenized_previous_turn_token_ids = tokenizer.apply_chat_template(
-                            messages_to_last_assistant_message,
-                            tokenize=True,
-                            add_generation_prompt=False,
-                            tools=template_tools,
-                            **chat_template_kwargs,
+                        retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
+                            tokenizer.apply_chat_template(
+                                messages_to_last_assistant_message,
+                                tokenize=True,
+                                add_generation_prompt=False,
+                                tools=template_tools,
+                                **chat_template_kwargs,
+                            )
                         )
 
                         # Replace the prefix tokens with the tokens from the previous generation.
