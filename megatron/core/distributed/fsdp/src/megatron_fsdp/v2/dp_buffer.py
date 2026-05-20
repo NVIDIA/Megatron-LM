@@ -579,7 +579,7 @@ class DataParallelBuffer:
 
         sm = self.buffer_index.shard_meta
         local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
-        reduced_grad_shard = torch.empty(sm.size, dtype=grad_comm_dtype, device=self.device)
+        reduced_grad_shard = comm_input[sm.bucket_data_index : sm.bucket_data_index + sm.size]
 
         torch.distributed.reduce_scatter_tensor(
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op

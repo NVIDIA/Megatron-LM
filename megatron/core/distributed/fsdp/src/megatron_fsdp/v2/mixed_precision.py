@@ -313,7 +313,7 @@ class FullyShardMixedPrecisionPolicy:
         """Return the main-gradient dtype for a parameter group."""
         if self.main_grads_dtype is not None:
             return self.main_grads_dtype
-        return torch.bfloat16 if self.is_fp8_param(tensor) else tensor.dtype
+        return torch.float32
 
     def get_high_precision_value(self, tensor: torch.Tensor) -> torch.Tensor:
         """Return a high-precision value for initializing optimizer main weights."""

@@ -546,9 +546,9 @@ class FSDPModule(nn.Module):
                     if dist_param.grad is not None:
                         del dist_param.grad
                 else:
-                    if dist_grad is not None:
-                        with torch.cuda.stream(stream):
-                            dist_grad = dist_grad.to(dist_param.dtype)
+                    assert dist_param.dtype == dist_grad.dtype, (
+                        f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
+                    )
                     setattr(dist_param, "grad", dist_grad)
                     if hasattr(dist_param, "decoupled_grad"):
                         dist_param.decoupled_grad = None
