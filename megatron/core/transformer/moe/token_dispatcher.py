@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
+    HYBRIDEP_TOKEN_ALIGNMENT,
     fused_combine,
     fused_dispatch,
     hybrid_ep_combine,
@@ -1063,11 +1064,14 @@ class _HybridEPManager(_DispatchManager):
         if self.config.sequence_packing_scheduler is not None:
             # Use the actual tp_ep max so all ranks in the MoE communication
             # group pass the same token count to HybridEP.
-            nt = torch.tensor([num_tokens], device=routing_map.device, dtype=torch.long)
-            torch.distributed.all_reduce(nt, op=torch.distributed.ReduceOp.MAX, group=self.group)
-            padded_num_tokens = int(nt.item())
-            _HYBRIDEP_TOKEN_ALIGNMENT = 64
-            padded_num_tokens += -padded_num_tokens % _HYBRIDEP_TOKEN_ALIGNMENT
+            max_num_tokens_across_ep = torch.tensor(
+                [num_tokens], device=routing_map.device, dtype=torch.long
+            )
+            torch.distributed.all_reduce(
+                max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
+            )
+            padded_num_tokens = int(max_num_tokens_across_ep.item())
+            padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
         self._padded_num_tokens = padded_num_tokens
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
