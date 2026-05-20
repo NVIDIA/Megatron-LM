@@ -253,7 +253,13 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
         )
     for loaded_g, current_g in zip(loaded_pg, current_pg):
         loaded_g['params'] = current_g['params']
-    sub_sd['optimizer']['param_groups'] = loaded_pg
+    # `sub_sd['optimizer']` may be absent on load: when the per-module state_dict
+    # produced by DistributedOptimizer.state_dict() only contains `param_groups`
+    # under the 'optimizer' key, `_extract_param_groups` removes it at save time
+    # and the resulting empty dict can be dropped during dist_checkpointing
+    # common-state save/load. Use setdefault so the restored param_groups land
+    # in the right place regardless.
+    sub_sd.setdefault('optimizer', {})['param_groups'] = loaded_pg
 
 
 def _restore_grad_scaler(sub_sd):
@@ -267,17 +273,21 @@ def _restore_grad_scaler(sub_sd):
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Includes pp_rank so only one PP stage writes the metadata,
-    and dp_rank so only dp_rank=0 writes (others are replicas).
+    Returns (tp_rank, pp_rank, dp_rank) so only (0, 0, 0) within each
+    module's parallelism group is the main replica; all other ranks
+    in the same module are non-main replicas of the same object.
     """
     assert pg_collection is not None, "pg_collection required for checkpoint replica_id"
+    assert (
+        hasattr(pg_collection, 'tp') and pg_collection.tp is not None
+    ), "pg_collection.tp must be set for checkpoint deduplication"
     assert (
         hasattr(pg_collection, 'pp') and pg_collection.pp is not None
     ), "pg_collection.pp must be set for checkpoint deduplication"
     assert (
         hasattr(pg_collection, 'dp') and pg_collection.dp is not None
     ), "pg_collection.dp must be set for checkpoint deduplication"
-    return (0, pg_collection.pp.rank(), pg_collection.dp.rank())
+    return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
