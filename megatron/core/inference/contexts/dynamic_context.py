@@ -978,10 +978,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         _mha_kv_seq_lengths_bytes = self.max_requests * 4
         _mha_cu_kv_seq_lengths_bytes = (self.max_requests + 1) * 4
         _mha_block_table_bytes = self.max_requests * self.max_kv_block_count * 4
+        _pre_mamba_bytes = (
+            3 * _tok_int64_bytes
+            + 3 * _tok_int32_bytes
+            + 7 * _req_4byte_bytes
+            + _mha_query_lengths_bytes
+            + _mha_cu_query_seq_lengths_bytes
+            + _mha_kv_seq_lengths_bytes
+            + _mha_cu_kv_seq_lengths_bytes
+            + _mha_block_table_bytes
+        )
         # Mamba section (hybrid models only). Must match the MambaMetadata
         # shapes (mirrors the layout documented in ContextGPUView).
         # batch_indices_decode is int64; all other fields are int32.
         if self.is_hybrid_model:
+            # mamba_batch_indices_decode is int64; pad to 8-byte alignment.
+            _mamba_align_pad = (8 - _pre_mamba_bytes % 8) % 8
             self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
             _mamba_batch_indices_decode_bytes = self.max_requests * 8
             _mamba_batch_indices_prefill_bytes = self.max_requests * 4
@@ -993,6 +1005,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_conv_seq_idx_bytes = self.max_tokens * 4
             _mamba_conv_seq_start_bytes = self.max_tokens * 4
         else:
+            _mamba_align_pad = 0
             self._max_mamba_chunks = 0
             _mamba_batch_indices_decode_bytes = 0
             _mamba_batch_indices_prefill_bytes = 0
@@ -1004,14 +1017,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_conv_seq_idx_bytes = 0
             _mamba_conv_seq_start_bytes = 0
         _total_bytes = (
-            3 * _tok_int64_bytes
-            + 3 * _tok_int32_bytes
-            + 7 * _req_4byte_bytes
-            + _mha_query_lengths_bytes
-            + _mha_cu_query_seq_lengths_bytes
-            + _mha_kv_seq_lengths_bytes
-            + _mha_cu_kv_seq_lengths_bytes
-            + _mha_block_table_bytes
+            _pre_mamba_bytes
+            + _mamba_align_pad
             + _mamba_batch_indices_decode_bytes
             + _mamba_batch_indices_prefill_bytes
             + _mamba_seq_idx_bytes
@@ -1141,6 +1148,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # by MambaMetadata.compute_cpu_metadata(); transferred as part of the
         # single coalesced H2D in transfer_bookkeeping_to_gpu().
         if self.is_hybrid_model:
+            _off += _mamba_align_pad
             self._cpu_mamba_batch_indices_decode = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_decode_bytes
             ].view(torch.int64)

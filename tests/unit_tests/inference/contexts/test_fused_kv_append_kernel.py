@@ -3,14 +3,10 @@
 import pytest
 import torch
 
-try:
-    from megatron.core.inference.contexts.fused_kv_append_kernel import (
-        triton_append_key_value_cache,
-    )
-
-    HAVE_TRITON = True
-except (ImportError, AttributeError):
-    HAVE_TRITON = False
+from megatron.core.inference.contexts.fused_kv_append_kernel import (
+    HAVE_TRITON,
+    triton_append_key_value_cache,
+)
 
 from megatron.core.inference.contexts.gpu_view import ContextGPUView
 
