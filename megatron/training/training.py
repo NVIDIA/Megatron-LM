@@ -1609,6 +1609,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 use_layer_wise_distributed_optimizer=getattr(
                     args, 'use_layer_wise_distributed_optimizer', False
                 ),
+                use_layer_wise_param_layout=getattr(
+                    args, 'use_layer_wise_param_layout', True
+                ),
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
