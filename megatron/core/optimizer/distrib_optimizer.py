@@ -2794,6 +2794,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
 
+    @torch.no_grad()
+    def prepare_model_params_for_param_sync(self) -> None:
+        """Stage FP32 master shards into DDP param buffers before explicit param sync."""
+        if self.is_stub_optimizer:
+            return
+        if not (
+            self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather
+        ):
+            return
+
+        for model_chunk in self.model_chunks:
+            model_chunk.zero_grad_buffer()
+        self._copy_main_params_to_param_buffer()
+
     def _copy_main_params_to_param_buffer(self):
         """
         This function is only used for MXFP8 params.
