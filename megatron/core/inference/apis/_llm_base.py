@@ -81,7 +81,7 @@ class _EventLoopManager:
             raise RuntimeError("_EventLoopManager.start() must be called before accessing loop.")
         return self._loop
 
-    def submit(self, coro: Coroutine) -> "concurrent.futures.Future":
+    def submit(self, coro: Coroutine) -> concurrent.futures.Future:
         """Schedule ``coro`` on the background loop and return its future.
 
         The caller decides how to wait on the returned future (e.g.

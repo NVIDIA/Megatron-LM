@@ -153,7 +153,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         # ``_serve_started`` can only be True when ``use_coordinator=True``
         # because ``serve()`` raises otherwise.
         if self._serve_started:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (  # pylint: disable=line-too-long
                 stop_text_gen_server,
             )
 
