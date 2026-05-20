@@ -15,6 +15,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
@@ -629,6 +630,7 @@ def test_sequence_packing_thd_e2e_proxy_model(dispatcher):
             if param.requires_grad
         )
     finally:
+        reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
 
 
@@ -641,6 +643,7 @@ class TestFlexDispatcher:
         pass
 
     def teardown_method(self, method):
+        reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
