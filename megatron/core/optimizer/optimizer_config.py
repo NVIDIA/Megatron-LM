@@ -420,6 +420,12 @@ class OptimizerConfig:
                     "recommended for mxfp8 training."
                 )
 
+        if self.reuse_grad_buf_for_mxfp8_param_ag and self.overlap_param_gather_with_optimizer_step:
+            raise ValueError(
+                "overlap_param_gather_with_optimizer_step is not supported with "
+                "reuse_grad_buf_for_mxfp8_param_ag."
+            )
+
         if self.use_precision_aware_optimizer:
             assert (
                 self.optimizer == 'adam'
