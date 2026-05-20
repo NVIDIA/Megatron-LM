@@ -135,9 +135,11 @@ class TestMimoFrozenModules:
 
         mimo_model = self._build_mimo(encoder_grid, llm_grid)
 
-        encoder = mimo_model.modality_submodules.get(ENCODER_NAME)
-        if encoder is not None:
-            _freeze_module(encoder)
+        # ``modality_submodules`` is a ``torch.nn.ModuleDict`` (no ``.get``);
+        # check membership before indexing. Entry exists only on ranks where
+        # the encoder grid is active.
+        if ENCODER_NAME in mimo_model.modality_submodules:
+            _freeze_module(mimo_model.modality_submodules[ENCODER_NAME])
 
         optimizer = get_mimo_optimizer(mimo_model, _make_opt_config())
 
@@ -182,9 +184,11 @@ class TestMimoFrozenModules:
 
         mimo_model = self._build_mimo(encoder_grid, llm_grid)
 
-        encoder = mimo_model.modality_submodules.get(ENCODER_NAME)
-        if encoder is not None:
-            _freeze_module(encoder)
+        # ``modality_submodules`` is a ``torch.nn.ModuleDict`` (no ``.get``);
+        # check membership before indexing. Entry exists only on ranks where
+        # the encoder grid is active.
+        if ENCODER_NAME in mimo_model.modality_submodules:
+            _freeze_module(mimo_model.modality_submodules[ENCODER_NAME])
 
         optimizer = get_mimo_optimizer(mimo_model, _make_opt_config())
 
