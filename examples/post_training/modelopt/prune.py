@@ -6,13 +6,13 @@ Read more about ModelOpt pruning at https://github.com/NVIDIA/Model-Optimizer/tr
 """
 
 import functools
-import inspect
+import gc
+import json
 import os
 import sys
 import warnings
 
 import torch
-from datasets import load_dataset
 from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
@@ -20,6 +20,9 @@ import modelopt.torch.opt as mto
 import modelopt.torch.prune as mtp
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.prune.plugins.mcore_minitron import SUPPORTED_HPARAMS
+from modelopt.torch.utils.dataset_utils import get_dataset_dataloader, get_supported_datasets
+from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
+from utils import get_hf_tokenizer
 
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
@@ -27,14 +30,10 @@ from megatron.core.parallel_state import (
 )
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.post_training.utils import (
-    report_current_memory_info,
-)
+from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
@@ -46,7 +45,26 @@ def add_prune_args(parser):
     """Add additional arguments for ModelOpt pruning."""
     group = parser.add_argument_group(title="ModelOpt pruning")
     group.add_argument(
-        "--calib-size", type=int, default=1024, help="Samples to use for pruning calibration."
+        "--calib-size",
+        type=int,
+        default=1024,
+        help="Samples to use for pruning calibration.",
+    )
+    group.add_argument(
+        "--calib-dataset",
+        type=str,
+        default="nemotron-post-training-dataset-v2",
+        help=(
+            f"HF Dataset name or local .jsonl path for calibration "
+            f"(supported options: {', '.join(get_supported_datasets())}). "
+            "You can also pass any other dataset and see if auto-detection works."
+        ),
+    )
+    group.add_argument(
+        "--calib-max-sequence-length",
+        type=int,
+        default=512,
+        help="Maximum sequence length for calibration samples.",
     )
     group.add_argument(
         "--prompts",
@@ -61,123 +79,126 @@ def add_prune_args(parser):
         help="Reference texts. Please use | to separate different batches.",
     )
     group.add_argument(
-        "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
-    )
-    # Pruning parameters
-    group.add_argument(
-        "--target-ffn-hidden-size", type=int, help="Prune MLP FFN hidden size to this value"
-    )
-    group.add_argument(
-        "--target-hidden-size", type=int, help="Prune hidden size (embedding dim) to this value"
-    )
-    group.add_argument(
-        "--target-num-attention-heads",
-        type=int,
-        help="Prune number of attention heads to this value. Must be supplied with --target-num-query-groups",
-    )
-    group.add_argument(
-        "--target-num-query-groups",
-        type=int,
-        help="Prune number of query groups to this value. Must be supplied with --target-num-attention-heads",
-    )
-    group.add_argument(
-        "--target-mamba-num-heads",
-        type=int,
-        help="Prune number of Mamba attention heads to this value",
-    )
-    group.add_argument(
-        "--target-mamba-head-dim",
-        type=int,
-        help="Prune dimension of Mamba attention heads to this value",
-    )
-    group.add_argument(
-        "--target-num-moe-experts", type=int, help="Prune number of MoE experts to this value"
-    )
-    group.add_argument(
-        "--target-moe-ffn-hidden-size", type=int, help="Prune MoE FFN hidden size to this value"
-    )
-    group.add_argument(
-        "--target-moe-shared-expert-intermediate-size",
-        type=int,
-        help="Prune MoE shared expert intermediate size to this value",
-    )
-    group.add_argument(
-        "--target-num-layers",
-        type=int,
-        help="Prune number of transformer layers to this value based on "
-        "Block Influence metric (cosine similarity) as per https://arxiv.org/abs/2403.03853",
-    )
-    group.add_argument(
-        "--layers-to-drop",
-        type=int,
-        metavar="N",
-        nargs="*",
-        help="Drop specific model layers (1-indexed). Cannot be used with rest of the pruning options",
-    )
-    group.add_argument(
-        "--pruning-scores-path",
+        "--pretrained-model-path",
         type=str,
         default=None,
-        help="Path to the cache and reuse pruning scores for pruning again to different params",
+        help="HuggingFace pretrained model",
+    )
+    group.add_argument(
+        "--skip-generate",
+        action="store_true",
+        default=False,
+        help="Skip the post-pruning generate/validation step.",
+    )
+    # Pruning targets
+    group.add_argument(
+        "--prune-export-config",
+        type=str,
+        required=True,
+        help=(
+            'Target pruned config as a JSON object, e.g. \'{"hidden_size": 3584, '
+            '"ffn_hidden_size": 9216}\'. '
+            f"Supported hyperparameters: {sorted(SUPPORTED_HPARAMS)}."
+        ),
+    )
+    group.add_argument(
+        "--prune-intermediate-ckpt",
+        type=str,
+        default=None,
+        help=(
+            "Directory to cache and reuse per-rank intermediate pruning scores "
+            "for resuming / faster re-runs (e.g. pruning the same model to a different config)."
+        ),
     )
     add_modelopt_args(parser)
     return parser
 
 
 def check_arguments(args):
-    """Checking user arguments."""
-    if args.layers_to_drop:
-        if any(getattr(args, f"target_{k}", None) is not None for k in SUPPORTED_HPARAMS):
-            raise ValueError("--layers_to_drop cannot be used with other pruning parameters")
+    """Validate user-provided pruning arguments."""
+    try:
+        args.prune_export_config = json.loads(args.prune_export_config)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON for --prune-export-config: {args.prune_export_config}"
+        ) from exc
+    if not isinstance(args.prune_export_config, dict):
+        raise ValueError("--prune-export-config must parse to a dictionary.")
+    unsupported = set(args.prune_export_config) - set(SUPPORTED_HPARAMS)
+    if unsupported:
+        raise ValueError(
+            f"Unsupported hyperparameters in --prune-export-config: {sorted(unsupported)}. "
+            f"Supported: {sorted(SUPPORTED_HPARAMS)}"
+        )
 
-
-def get_calib_dataloader(calib_size=1024, max_sequence_length=512):
-    """Return a dataloader for calibration."""
-    dataset = load_dataset("cnn_dailymail", name="3.0.0", split="train")
-    text_column = "article"
-
-    calib_size = min(len(dataset), calib_size)
-    for i in range(calib_size):
-        yield dataset[i][text_column][:max_sequence_length]
+    # Default the intermediate-checkpoint location to <save>/modelopt_pruning_scores
+    # so that re-running on the same --save target reuses cached per-rank scores
+    if args.prune_intermediate_ckpt is None and args.save is not None:
+        args.prune_intermediate_ckpt = os.path.join(
+            args.save, "modelopt_pruning_scores"
+        )
+        print_rank_0(
+            "No directory provided to cache per-rank intermediate pruning scores. "
+            f"Setting to: {args.prune_intermediate_ckpt}"
+        )
 
 
 def get_params(model):
     params = sum(p.numel() for p in model.parameters())
     reduced_params = torch.Tensor([params]).to(device=next(model.parameters()).device)
-    torch.distributed.all_reduce(reduced_params, group=get_pipeline_model_parallel_group())
-    torch.distributed.all_reduce(reduced_params, group=get_tensor_model_parallel_group())
+    torch.distributed.all_reduce(
+        reduced_params, group=get_pipeline_model_parallel_group()
+    )
+    torch.distributed.all_reduce(
+        reduced_params, group=get_tensor_model_parallel_group()
+    )
     return reduced_params.item()
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_prune_args, args_defaults={
+    parse_and_validate_args(
+        extra_args_provider=add_prune_args,
+        args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
             "no_load_rng": True,
             "no_load_optim": True,
-        })
+        },
+    )
     initialize_megatron()
 
     args = get_args()
     check_arguments(args)
 
     tokenizer = get_hf_tokenizer()
+    # Pruning operates on per-expert linears (which only exist as separate modules under
+    # SequentialMLP, not the packed-tensor TEGroupedMLP). `disable_moe_grouped_gemm=True`
+    # forces the export spec to SequentialMLP so mtp.prune can act on individual experts.
+    # Other example scripts (quantize.py, generate.py, finetune.py) keep the default.
+    prune_builder = functools.partial(
+        modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
+    )
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
+        functools.partial(model_provider, prune_builder),
+        wrap_with_ddp=False,
     )
     unwrapped_model = unwrap_model(model)[0]
+    print_rank_0(f"Original Model: {unwrapped_model}")
 
     report_current_memory_info()
 
     if args.load is not None:
-        load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
+        load_modelopt_checkpoint(
+            model, strict=not args.untie_embeddings_and_output_weights
+        )
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        import_kwargs = {"dtype": import_dtype}
-        if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
-            import_kwargs.update({"trust_remote_code": args.trust_remote_code})
+        import_kwargs = {
+            "dtype": import_dtype,
+            "trust_remote_code": args.trust_remote_code,
+        }
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
@@ -189,52 +210,61 @@ if __name__ == "__main__":
         else:
             all_references = args.references.split("|")
 
-        for idx, prompt in tqdm(enumerate(all_prompts), disable=torch.distributed.get_rank()):
+        for idx, prompt in tqdm(
+            enumerate(all_prompts), disable=torch.distributed.get_rank()
+        ):
             tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=32)
+            # enable_kv_cache=False to skip the static KV-cache pre-allocation; this is a
+            # sanity-check generation (32 tokens) and skipping the cache keeps memory headroom.
+            generated_ids = megatron_generate(
+                model, tokens.input_ids.cuda(), osl=32, enable_kv_cache=False
+            )
             generated_texts = tokenizer.batch_decode(generated_ids)
             print_rank_0("{}".format(generated_texts))
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
-    def _hf_dataset_forword_loop_func(model):
-        dataloader = get_calib_dataloader(args.calib_size)
+    def _hf_dataset_forward_loop_func(model):
+        if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-        for prompt in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
-            tokens = tokenizer(prompt, return_tensors="pt")
-            simple_generate(model, tokens.input_ids.cuda(), osl=1)
+        dataloader = get_dataset_dataloader(
+            dataset_name=args.calib_dataset,
+            tokenizer=tokenizer,
+            num_samples=args.calib_size,
+            max_sample_length=args.calib_max_sequence_length,
+            batch_size=1,
+            device="cuda",
+            pack=True,
+        )
+        for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
+            megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 
-    if args.layers_to_drop:
-        mtp.mcore_minitron.drop_mcore_language_model_layers(
-            model, layers_to_drop=args.layers_to_drop
-        )
-    else:
-        print_rank_0("Pruning model...")
-        export_config = {
-            k: getattr(args, f"target_{k}")
-            for k in SUPPORTED_HPARAMS
-            if getattr(args, f"target_{k}", None) is not None
-        }
-        config = {"forward_loop": _hf_dataset_forword_loop_func}
-        if args.pruning_scores_path is not None:
-            config["scores_path"] = args.pruning_scores_path
-        mtp.prune(
-            unwrapped_model,
-            mode="mcore_minitron",
-            constraints={"export_config": export_config},
-            dummy_input=None,  # Not used
-            config=config,
-        )
-        # [WAR till modelopt 0.39]: Remove prune state to avoid converting again on restore which forces TP=1.
-        if mto.ModeloptStateManager.has_state_for_mode_type("prune", model=unwrapped_model):
-            mto.ModeloptStateManager.remove_state(unwrapped_model)
+    print_rank_0(f"Pruning model with export_config: {args.prune_export_config}")
+    config = {"forward_loop": _hf_dataset_forward_loop_func}
+    if args.prune_intermediate_ckpt is not None:
+        config["checkpoint"] = args.prune_intermediate_ckpt
+    mtp.prune(
+        unwrapped_model,
+        mode="mcore_minitron",
+        constraints={"export_config": args.prune_export_config},
+        dummy_input=None,  # Not used
+        config=config,
+    )
+    # Remove unnecessary modelopt_state since ckpt is homogeneous
+    if mto.ModeloptStateManager.has_state_for_mode_type("prune", model=unwrapped_model):
+        mto.ModeloptStateManager.remove_state(unwrapped_model)
 
     print_rank_0(f"Pruned Model:\n {unwrapped_model}")
-    print_rank_0(f"Pruned Model Params: {get_params(unwrapped_model)/1e9:.2f}B")
-
-    _custom_prompt_forward_loop_func(unwrapped_model)
+    print_rank_0(f"Pruned Model Params: {get_params(unwrapped_model) / 1e9:.2f}B")
 
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0)
+
+    # Free pruning-side memory before the sanity-check generation (do this after saving in case it causes issues)
+    gc.collect()
+    torch.cuda.empty_cache()
+    if not args.skip_generate:
+        _custom_prompt_forward_loop_func(unwrapped_model)
 
     print_rank_0("Done")
