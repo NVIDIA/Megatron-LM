@@ -17,8 +17,13 @@ conflicts, iterating on CI, and shipping the PR.
 ### Branch Setup
 
 1. Create branch `$BRANCH` from `origin/dev`
-2. Merge: `git merge origin/main -X theirs --no-edit`
-3. If conflicts remain (e.g. add/add), resolve by favoring main
+2. Merge: `git merge origin/main --no-edit`
+3. Resolve conflicts surgically. Do NOT use global `-X theirs`, and do NOT
+   blanket-checkout main's version of a shared file. Main's version may be
+   taken wholesale only for files in "Files to Override from Main" below, or
+   when you have identified a specific main commit that intentionally removes
+   the dev-only code. For all other conflicts, combine both sides so recent
+   dev-only additions remain present.
 
 ### Preserving Dev-Only Additions
 
@@ -31,14 +36,13 @@ conflict.
 
 Dev often develops features as a chain of PRs (PR1 → PR2 → PR3) where each
 builds on the last. When PR1 is squash-merged to main, git sees main's squashed
-version and dev's original commits as unrelated changes. `-X theirs` will pick
-main's PR1 code and silently discard PR2/PR3's improvements on dev.
+version and dev's original commits as unrelated changes. A conflict resolution
+that blindly picks main can silently discard PR2/PR3's improvements on dev.
 
 After the merge, check for this pattern:
 
-1. For each file where `-X theirs` resolved a conflict, run
-   `git log --oneline origin/dev -- <file>` to see if dev has commits that
-   came AFTER the code main is bringing in.
+1. For each conflicted file, run `git log --oneline origin/dev -- <file>` to
+   see if dev has commits that came AFTER the code main is bringing in.
 2. If dev has follow-up commits (bug fixes, refactors, extensions), **favor
    dev's version** for those sections.
 3. If the conflict is just main bringing in a clean copy of what dev already
@@ -50,7 +54,7 @@ more evolved one.
 
 Real examples from PR #4291:
 - `emerging_optimizers.py`: Main's version was MORE complete — it squash-merged
-  dev's PRs plus added more. `-X theirs` was correct.
+  dev's PRs plus added more. Taking main for that section was correct.
 - `distrib_optimizer.py`: Main overwrote dev's `GroupedQuantizedTensor` support.
   Had to restore `_is_distopt_quantized_param` and the expanded
   `_expand_quantized_param_shard_for_cast` loop while keeping main's NVFP4
@@ -59,6 +63,13 @@ Real examples from PR #4291:
 Key insight: squash-merge chains can go in EITHER direction. Sometimes main
 is ahead (it squash-merged dev's work + more), sometimes dev is ahead (it has
 follow-up PRs). Always diff both ways before deciding which version to favor.
+
+Real example from PR #4882 / PR #4318:
+- `transformer_engine.py`: main had unrelated `TEFusedMLP` refactors, while dev
+  had the new `TEFusedDenseMLP` class. The sync kept the config flag and test
+  but dropped the class and `gpt_layer_specs.py` selection. That is a merge
+  accident: restore the dev class and selection while preserving main's
+  `TEFusedMLP.as_mlp_submodule` refactor.
 
 ### Files to Override from Main
 
@@ -228,20 +239,29 @@ AND every fix-push in Phase 3), run these bash checks. If any fails,
 fix the condition and re-check before pushing:
 
 ```bash
+MERGE_COMMIT=$(git rev-list --min-parents=2 --max-count=1 HEAD || true)
+if [ -n "$MERGE_COMMIT" ]; then
+  DEV_REF="${MERGE_COMMIT}^1"
+  MAIN_REF="${MERGE_COMMIT}^2"
+else
+  DEV_REF="origin/dev"
+  MAIN_REF="origin/main"
+fi
+
 # 1. CODEOWNERS must be identical to dev's.
-if ! git diff --quiet origin/dev -- .github/CODEOWNERS; then
-  echo "ABORT: .github/CODEOWNERS differs from origin/dev. Restore with:"
-  echo "  git checkout origin/dev -- .github/CODEOWNERS"
+if ! git diff --quiet "$DEV_REF" HEAD -- .github/CODEOWNERS; then
+  echo "ABORT: .github/CODEOWNERS differs from dev. Restore with:"
+  echo "  git checkout $DEV_REF -- .github/CODEOWNERS"
   exit 1
 fi
 
 # 2. Dependency-management triple must be identical to dev's.
 for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
-  if ! git diff --quiet origin/dev -- "$f"; then
+  if ! git diff --quiet "$DEV_REF" HEAD -- "$f"; then
     # pyproject.toml is allowed to differ ONLY for git source reconciliation
     # (new [tool.uv.sources] entries from main). If you intentionally edited
     # it for that reason, bypass this check by re-running with $f skipped.
-    echo "WARNING: $f differs from origin/dev"
+    echo "WARNING: $f differs from dev"
   fi
 done
 
@@ -251,9 +271,9 @@ done
 # that main does not have yet. Pattern:
 #   T0: a feature lands on dev
 #   T1 > T0: the same feature lands on main (possibly reformatted)
-#   The sync runs between T0 and T1. `-X theirs` resolves any conflict in
-#   main's favour, dropping dev's addition wherever main happened to
-#   touch a nearby line for an unrelated reason.
+#   The sync runs between T0 and T1. Blindly resolving a conflict in
+#   main's favour drops dev's addition wherever main happened to touch a
+#   nearby line for an unrelated reason.
 #
 # For each file the sync touched (modulo skill-sanctioned overrides and
 # the dependency triple), find every line that satisfies ALL of:
@@ -271,20 +291,19 @@ done
 INTENTIONAL_OVERRIDE_REGEX='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
 SKIP_REGEX='^(pyproject\.toml|uv\.lock|docker/Dockerfile\.ci\.dev|\.github/CODEOWNERS)$'
 
-BASE=$(git merge-base origin/dev origin/main)
 VIOLATIONS=0
-for f in $(git diff --name-only "$BASE"...HEAD \
+for f in $(git diff --name-only "$DEV_REF"..HEAD \
             -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
                '*.sh' '*.cpp' '*.cu' '*.h' \
             | sort -u); do
   [[ "$f" =~ $SKIP_REGEX ]] && continue
   [[ "$f" =~ $INTENTIONAL_OVERRIDE_REGEX ]] && continue
-  [ -f "$f" ] || continue
+  git cat-file -e "HEAD:$f" 2>/dev/null || continue
 
   missing=$(comm -23 \
-              <(git show "origin/dev:$f"  2>/dev/null | sort -u) \
-              <(git show "origin/main:$f" 2>/dev/null | sort -u) \
-            | comm -23 - <(sort -u "$f") \
+              <(git show "$DEV_REF:$f"  2>/dev/null | sort -u) \
+              <(git show "$MAIN_REF:$f" 2>/dev/null | sort -u) \
+            | comm -23 - <(git show "HEAD:$f" 2>/dev/null | sort -u) \
             | grep -E '[[:alnum:]_]' \
             || true)
 
@@ -321,6 +340,8 @@ Recent regressions the dev-feature audit would have flagged (all
 - `gpt_dynamic_inference_with_coordinator.py` lost
   `from megatron.training.arguments import parse_and_validate_args`
 - `datasets/readme.md` lost the dev-only "Packing Scheduler" section
+- PR #4882 / PR #4318 dropped the `TEFusedDenseMLP` implementation and
+  `gpt_layer_specs.py` selection while leaving the config flag and unit test
 - `data_samplers.py` / `utils.py` / `training.py` kept main's
   `args.hybrid_context_parallel` instead of dev's
   `args.dynamic_context_parallel` (counts as a MERGE ACCIDENT — dev's
@@ -673,8 +694,11 @@ comment should include:
 
 ## Rules
 
-- Prioritize main over dev on genuine conflicts. Preserve dev-only additions
-  that do not conflict.
+- Do not globally prioritize main over dev. Preserve recent dev-only additions
+  unless a specific main commit intentionally removed them. Main may win
+  wholesale only for the explicit override list above; otherwise resolve
+  conflicts by combining main's incoming changes with dev's still-unmerged
+  features.
 - **Two-commit policy:** the PR contains at most two bot-authored
   commits — the Phase 1 merge commit (immutable once pushed) and a
   single rolling fix commit on top. The fix commit is created on
