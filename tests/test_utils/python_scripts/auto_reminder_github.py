@@ -244,7 +244,7 @@ class PRReviewTracker:
                     mcore_members = {m.login for m in mcore_team.get_members()}
                     valid_approvers = approvers & mcore_members
                     reviewer_emails = sorted([self.get_user_email(u) for u in valid_approvers])
-                    action_message = "All Final Reviewers approved the PR. Please ping the @mcore-oncall to merge the PR."
+                    action_message = "All Final Reviewers approved the PR. Please ping @NVIDIA/mcore-oncall to merge the PR."
 
                 except Exception as e:
                     logger.warning(
