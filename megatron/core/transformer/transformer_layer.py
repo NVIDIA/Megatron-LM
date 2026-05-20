@@ -408,28 +408,47 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         # [Module 8: MLP block]
         # import here to avoid circular import
-        from megatron.core.extensions.transformer_engine import TEFusedMLP
+        from megatron.core.extensions.transformer_engine import TEFusedDenseMLP, TEFusedMLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
         # We can change MLP to accept pg_collection but it makes the logic implicit
         # The conditional below is to make the logic explicit
         # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
-        if isinstance(submodules.mlp, ModuleSpec) and submodules.mlp.module in (MLP, TEFusedMLP):
-            submodules.mlp = functools.partial(
-                submodules.mlp.module.as_mlp_submodule,
-                submodules=submodules.mlp.submodules,
-                **submodules.mlp.params,
-            )
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                f"Rewrapping ModuleSpec with module {type(submodules.mlp)} to forward kwargs. "
-                "Consider migrating the `mlp` submodule spec to a direct call of the "
-                "`as_mlp_submodule` classmethod instead.",
-            )
+        as_mlp_submodule_classes = tuple(
+            cls for cls in (MLP, TEFusedMLP, TEFusedDenseMLP) if cls is not None
+        )
+        if isinstance(submodules.mlp, ModuleSpec):
+            if submodules.mlp.module in as_mlp_submodule_classes:
+                submodules.mlp = functools.partial(
+                    submodules.mlp.module.as_mlp_submodule,
+                    submodules=submodules.mlp.submodules,
+                    **submodules.mlp.params,
+                )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Rewrapping ModuleSpec with module {type(submodules.mlp)} to forward "
+                    "kwargs. Consider migrating the `mlp` submodule spec to a direct call of "
+                    "the `as_mlp_submodule` classmethod instead.",
+                )
+            elif submodules.mlp.module is MoELayer:
+                # Dev's get_moe_module_spec_for_backend returns ModuleSpec(MoELayer, ...);
+                # wrap it as a partial so the construction call below works.
+                submodules.mlp = functools.partial(
+                    submodules.mlp.module,
+                    submodules=submodules.mlp.submodules,
+                    **submodules.mlp.params,
+                )
+        # Pass layer_number at construction so submodules that need it during __init__
+        # (e.g. MoELayer.router with config.moe_n_hash_layers > 0) see it. MLP /
+        # TEFusedMLP as_mlp_submodule classmethods accept a layer_number=None kwarg
+        # that they ignore.
         self.mlp = submodules.mlp(
-            config=self.config, pg_collection=pg_collection, is_mtp_layer=self.is_mtp_layer
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=self.is_mtp_layer,
+            layer_number=self.layer_number,
         )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)

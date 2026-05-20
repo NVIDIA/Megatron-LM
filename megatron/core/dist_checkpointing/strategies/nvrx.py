@@ -84,4 +84,6 @@ def is_nvrx_min_version(version: str = NVRX_MIN_VERSION) -> bool:
 
     nvrx_version = str(nvrx.__version__) if HAVE_NVRX else "0.0.0"
 
-    return PkgVersion(nvrx_version) >= PkgVersion(version)
+    # Use base_version so a pre-release like "0.6.0.dev33+15a8515" — produced by
+    # installs from a git revision — counts as satisfying "0.6.0".
+    return PkgVersion(PkgVersion(nvrx_version).base_version) >= PkgVersion(version)

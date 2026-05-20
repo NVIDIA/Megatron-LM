@@ -512,7 +512,10 @@ class TEGroupedMLP(MegatronModule):
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
 
-        if self.config.moe_paged_stash:
+        # `moe_paged_stash` is dev-only and may be absent on mock configs (SimpleNamespace)
+        # used by tests carried over from main; default to False so the path is opt-in.
+        use_paged_stash = getattr(self.config, "moe_paged_stash", False)
+        if use_paged_stash:
             permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
             max_num_tokens = permuted_local_hidden_states.shape[0]
             # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
@@ -544,7 +547,7 @@ class TEGroupedMLP(MegatronModule):
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
 
-        if self.config.moe_paged_stash:
+        if use_paged_stash:
             output = paged_stash_group_commit(output, name="grouped_mlp")
 
         return output
@@ -609,18 +612,16 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        with off_interface(
+        fc1_manager = off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        ) as permuted_local_hidden_states:
+        )
+        with fc1_manager as permuted_local_hidden_states:
             fc1_output, bias_parallel = apply_module(self.linear_fc1)(
                 permuted_local_hidden_states, tokens_per_expert
             )
-        if self.offload_expert_fc1:
-            fc1_output = off_interface.group_commit(
-                fc1_output,
-                name="expert_fc1",
-                forced_released_tensors=[permuted_local_hidden_states],
-            )
+        fc1_output = fc1_manager.group_offload(
+            fc1_output, forced_released_tensors=[permuted_local_hidden_states]
+        )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
 
@@ -697,14 +698,15 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
+        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
+            with moe_act_manager as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
-            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
+            with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
@@ -712,10 +714,7 @@ class TEGroupedMLP(MegatronModule):
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
-        if self.offload_moe_act:
-            output = off_interface.group_commit(
-                output, name="moe_act", forced_released_tensors=[fc1_output]
-            )
+        output = moe_act_manager.group_offload(output, forced_released_tensors=[fc1_output])
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output

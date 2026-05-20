@@ -2587,9 +2587,10 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             is_expert: bool = False,
             input_size: int | None = None,
             ffn_hidden_size: int | None = None,
+            layer_number: int | None = None,
         ) -> MLP:
             """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
-            del is_mtp_layer
+            del is_mtp_layer, layer_number
             assert hasattr(
                 pg_collection, 'tp'
             ), 'TP process group is required for TEFusedMLP in TransformerLayer'
