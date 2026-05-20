@@ -56,8 +56,10 @@ jobs:
 
   sync-main-to-dev:
     if: github.event_name == 'workflow_dispatch' && github.repository == 'NVIDIA/Megatron-LM'
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # GitHub-hosted runners are capped at 6h; use an NVIDIA runner so the
+    # sync bot can wait through long CI queues and retries.
+    runs-on: linux-amd64-cpu16
+    timeout-minutes: 720
     env:
       GH_TOKEN: ${{ secrets.PAT }}
     steps:
