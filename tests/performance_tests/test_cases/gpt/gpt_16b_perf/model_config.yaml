@@ -1,0 +1,21 @@
+# Inference perf test: deepseek-style 16B MoE checkpoint, TP=1 PP=1 DP=1 (single GPU).
+
+MODEL: gpt_16b
+TP: 1
+PP: 1
+DP: 1
+NUM_INPUT_TOKENS: 512
+NUM_OUTPUT_TOKENS: 128
+NUM_WARMUP_ITERS: 2
+NUM_TIMED_ITERS: 5
+BATCH_SIZES:
+  - 1
+  - 8
+  - 32
+TOLERANCE_PCT: 10
+METRICS:
+  - throughput_tok_per_sec
+  - avg_latency_ms
+  - p50_latency_ms
+  - p99_latency_ms
+  - tpot_ms_per_tok
