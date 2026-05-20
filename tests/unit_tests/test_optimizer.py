@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -324,6 +325,46 @@ def test_chained_optimizer():
 
     assert list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
     assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+
+
+def test_chained_optimizer_defers_megatron_fsdp_weight_install():
+    """Chained M-FSDP optimizers install weights once after all inner steps."""
+
+    class MockMegatronFSDP:
+        def __init__(self):
+            self.ddp_config = SimpleNamespace(use_megatron_fsdp=True)
+
+        def install_optimized_model_weights(self):
+            events.append("install")
+
+        def start_param_sync(self):
+            events.append("sync")
+
+    class MockOptimizer:
+        def __init__(self, name, config, model_chunk):
+            self.name = name
+            self.config = config
+            self.model_chunks = [model_chunk]
+            self.update_model_params_values = []
+            self.param_groups = []
+
+        def step_with_ready_grads(self, update_model_params=True):
+            self.update_model_params_values.append(update_model_params)
+            events.append(f"step:{self.name}:{update_model_params}")
+            return True
+
+    events = []
+    config = SimpleNamespace(overlap_param_gather_with_optimizer_step=False)
+    model_chunk = MockMegatronFSDP()
+    muon_optimizer = MockOptimizer("muon", config, model_chunk)
+    adam_optimizer = MockOptimizer("adam", config, model_chunk)
+    chained_optimizer = ChainedOptimizer([muon_optimizer, adam_optimizer])
+
+    assert chained_optimizer.step_with_ready_grads()
+
+    assert muon_optimizer.update_model_params_values == [False]
+    assert adam_optimizer.update_model_params_values == [False]
+    assert events == ["step:muon:False", "step:adam:False", "install", "sync"]
 
 
 def test_chained_optimizer_get_parameters():
