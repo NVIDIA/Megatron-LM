@@ -120,10 +120,7 @@ class ParameterGroup:
                 buffer.allocator = allocator
 
     def _create_buffer(
-        self,
-        dtype: torch.dtype,
-        is_distributed: bool,
-        role: str,
+        self, dtype: torch.dtype, is_distributed: bool, role: str
     ) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
@@ -191,9 +188,7 @@ class ParameterGroup:
             # Pass the replacement buffers so the policy can tell whether this
             # parameter's original storage has been copied into FSDP-owned storage.
             for tensor in self.mp_policy.storage_tensors_to_free(
-                p,
-                self.model_weight_buffer,
-                self.main_weight_buffer,
+                p, self.model_weight_buffer, self.main_weight_buffer
             ):
                 _free_storage(tensor)
 

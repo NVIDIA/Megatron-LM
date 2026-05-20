@@ -111,7 +111,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
 
-        if ddp_config.use_fully_shard_api:
+        if ddp_config.use_megatron_fsdp_v2:
             self._init_with_fully_shard(
                 config,
                 ddp_config,
@@ -395,7 +395,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         Load the state dictionary into the module.
         """
-        if self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_megatron_fsdp_v2:
             super().load_state_dict(state_dict, strict=strict)
             return
 
@@ -628,7 +628,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         For the Megatron-FSDP path: calls synchronize_gradient_reduce and
         synchronize_param_gather.
         """
-        if self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_megatron_fsdp_v2:
             ctx = self.module._fsdp_root_context
             torch.cuda.current_stream().wait_stream(ctx.ag_stream)
             torch.cuda.current_stream().wait_stream(ctx.rs_stream)

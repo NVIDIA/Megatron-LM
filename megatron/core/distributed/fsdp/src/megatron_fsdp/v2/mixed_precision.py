@@ -241,17 +241,14 @@ class FullyShardMixedPrecisionPolicy:
         return tensor.detach()
 
     def bind_unsharded_param(
-        self,
-        tensor: torch.Tensor,
-        data: torch.Tensor,
-        buffer_role: str,
+        self, tensor: torch.Tensor, data: torch.Tensor, buffer_role: str
     ) -> None:
         """Bind a parameter to an unsharded model-weight buffer view."""
         if self.is_fp8_param(tensor):
             if buffer_role == "transpose_weight":
-                assert self.needs_transpose_weight_buffer(tensor), (
-                    f"Type {type(tensor)} has no transpose payload"
-                )
+                assert self.needs_transpose_weight_buffer(
+                    tensor
+                ), f"Type {type(tensor)} has no transpose payload"
                 attr = "_columnwise_data"
             else:
                 attr = "_rowwise_data" if hasattr(tensor, "_rowwise_data") else "_data"
@@ -259,21 +256,18 @@ class FullyShardMixedPrecisionPolicy:
             # Rebind TE's raw uint8 payload to the all-gathered FSDP buffer view.
             old_data = getattr(tensor, attr)
             if old_data is not None:
-                assert old_data.dtype == data.dtype, (
-                    f"FP8 raw dtype mismatch: {old_data.dtype} vs {data.dtype}"
-                )
-                assert old_data.shape == data.shape, (
-                    f"FP8 raw shape mismatch: {old_data.shape} vs {data.shape}"
-                )
+                assert (
+                    old_data.dtype == data.dtype
+                ), f"FP8 raw dtype mismatch: {old_data.dtype} vs {data.dtype}"
+                assert (
+                    old_data.shape == data.shape
+                ), f"FP8 raw shape mismatch: {old_data.shape} vs {data.shape}"
             setattr(tensor, attr, data)
             return
         tensor.data = data
 
     def storage_tensors_to_free(
-        self,
-        tensor: torch.Tensor,
-        model_weight_buffer,
-        main_weight_buffer,
+        self, tensor: torch.Tensor, model_weight_buffer, main_weight_buffer
     ) -> List[torch.Tensor]:
         """Return original parameter storages that FSDP buffers have replaced."""
         # The buffers are ownership signals, not data sources: non-FP8 params can
@@ -437,11 +431,7 @@ class FullyShardMixedPrecisionPolicy:
             model_param_shards.append((model_shard, transpose_shard))
 
         quantize_main_weights_to_fp8(
-            fp8_params,
-            main_params,
-            start_offsets,
-            data_parallel_group,
-            model_param_shards,
+            fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
         )
 
 

@@ -472,8 +472,7 @@ class DataParallelBuffer:
 
     @torch.no_grad()
     def unshard(
-        self,
-        async_op: bool = True,
+        self, async_op: bool = True
     ) -> Tuple[torch.Tensor, Optional[torch.distributed.Work]]:
         """All-gather the full buffer from all shards and bind parameter storage.
 

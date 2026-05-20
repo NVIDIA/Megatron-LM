@@ -28,24 +28,23 @@ Provides:
 
 import logging
 import re
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import set_state_dict as _set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard as DShard
 
 import megatron.core.parallel_state as mpu
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import copy_chunk_metadata
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     get_state_dict as _get_state_dict,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     make_uneven_dtensor,
     preprocess_state_dict_for_uneven_dtensor,
+    split_dtensor,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
@@ -64,6 +63,7 @@ __all__ = [
     "strip_module_prefix",
     "get_model_state_dict",
     "get_optimizer_state_dict",
+    "_build_dtensor_optim_sd",
     "handle_fp8_extra_state_case",
     "handle_experts_in_state_dict",
     "handle_swiglu_in_state_dict_v2",
@@ -104,7 +104,13 @@ class MegatronFSDPStateful(Stateful):
         self.args = args
 
     def state_dict(self):
-        model_sd, optim_sd = _get_state_dict(self.model, self.optimizer)
+        if self.optimizer is not None:
+            model_sd, optim_sd = _get_state_dict(self.model, self.optimizer)
+        else:
+            model_sd = self.model.state_dict()
+            preprocess_state_dict_for_uneven_dtensor(model_sd)
+            optim_sd = None
+
         state_dict = {"model": model_sd}
         if optim_sd is not None:
             state_dict["optimizer"] = optim_sd
@@ -156,7 +162,8 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
         return local_expert_start <= expert_index < local_expert_end
 
     def _replace(key, expert_index, sd):
-        new_idx = expert_index - local_expert_start
+        new_idx = expert_index + local_expert_start
+        # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
         if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
             if key.endswith('_w') or key.endswith('_v'):
                 new_key = key.replace(
@@ -164,10 +171,9 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
                 )
             else:
                 new_key = key.replace(f'weight{expert_index}', f'weight{new_idx}')
+        # SequentialMLP: index is between 'local_experts.' and next '.'
         elif 'mlp.experts.local_experts' in key:
-            new_key = key.replace(
-                f'local_experts.{expert_index}.', f'local_experts.{new_idx}.'
-            )
+            new_key = key.replace(f'local_experts.{expert_index}.', f'local_experts.{new_idx}.')
         else:
             raise ValueError(f"Unexpected expert key format: {key}")
         sd[new_key] = sd.pop(key)
@@ -211,6 +217,7 @@ def _expert_param_local_key(key: str, num_experts: int | None = None) -> str:
 # Shared helpers
 # ------------------------------------------------------------------
 
+
 def _strip_wrappers(path: str) -> str:
     """Strip DDP/FSDP wrapper prefixes (``module.``, ``model.``) from a path."""
     parts = path.split('.')
@@ -229,35 +236,6 @@ def _offset_slice(s: slice, offset: int) -> slice:
     return slice(s.start + offset, s.stop + offset)
 
 
-def _get_fsdp_slice_from_dtensor(dist_param: DTensor) -> slice:
-    """Compute the FSDP slice (flattened byte range) from a v2 DTensor.
-
-    Does NOT rely on ``__create_chunk_list__`` — derives the slice directly
-    from the DTensor's placements and device mesh.
-    """
-    local_numel = dist_param._local_tensor.numel()
-    if local_numel == 0:
-        return slice(0, 0)
-
-    global_shape = dist_param.size()
-    mesh = dist_param.device_mesh
-    shard_placements = [p for p in dist_param.placements if isinstance(p, DShard)]
-
-    if len(shard_placements) == 1 and shard_placements[0].dim == 0:
-        row_stride = global_shape[1:].numel() if global_shape[1:].numel() > 0 else 1
-        rank = dist.get_rank(mesh.get_group())
-        chunk_rows = global_shape[0] // mesh.size()
-        start = rank * chunk_rows * row_stride
-        return slice(start, start + local_numel)
-    elif len(shard_placements) == 1 and shard_placements[0].dim != 0:
-        chunk_numel = global_shape.numel() // mesh.size()
-        rank = dist.get_rank(mesh.get_group())
-        start = rank * chunk_numel
-        return slice(start, start + local_numel)
-    else:
-        return slice(0, global_shape.numel())
-
-
 def _get_tp_world_size(dist_param: DTensor) -> int:
     """Get tensor-parallel world size from propagated TP attributes."""
     if is_mcore_tensor_model_parallel(dist_param):
@@ -270,11 +248,31 @@ def _get_tp_world_size(dist_param: DTensor) -> int:
 
 
 def _get_dist_param(model: nn.Module, key: str) -> nn.Parameter:
-    """Get a model parameter by state dict key, handling ``module.`` prefix."""
+    """Get a model parameter by state dict key, handling ``module.`` prefix.
+
+    Tries multiple key variants to handle both wrapped (``FullyShardedDataParallel``
+    with ``self.module``) and unwrapped (raw ``FSDPModule``) models:
+      1. Key as-is.
+      2. Key with ``module.`` prefix added.
+      3. Key with ``module.`` prefix stripped (if present).
+    """
     try:
         return model.get_parameter(key)
     except AttributeError:
+        pass
+    try:
         return model.get_parameter(f"module.{key}")
+    except AttributeError:
+        pass
+    if key.startswith("module."):
+        try:
+            return model.get_parameter(key[len("module.") :])
+        except AttributeError:
+            pass
+    raise AttributeError(
+        f"Parameter '{key}' not found in model "
+        f"(tried as-is, with 'module.' prefix, and without 'module.' prefix)"
+    )
 
 
 def _detect_glu_layers(model: nn.Module) -> dict:
@@ -282,9 +280,7 @@ def _detect_glu_layers(model: nn.Module) -> dict:
     _layer_glu = {}
     for name, module in model.named_modules():
         if isinstance(module, TransformerLayer):
-            _layer_glu[_strip_wrappers(name)] = getattr(
-                module.config, 'gated_linear_unit', False
-            )
+            _layer_glu[_strip_wrappers(name)] = getattr(module.config, 'gated_linear_unit', False)
     return _layer_glu
 
 
@@ -320,94 +316,23 @@ def _is_swiglu_key(key: str) -> bool:
     return any(re.search(pat, key) for pat in _SWIGLU_KEY_PATTERNS)
 
 
-def _split_dtensor_v2(
-    data: DTensor,
-    dist_param: DTensor,
-    split_sizes: List[int],
-    split_dim: int,
-) -> List[DTensor]:
-    """Split a DTensor into per-component DTensors along ``split_dim``.
-
-    Shared implementation for SwiGLU (``[1, 1]`` → ``_w``/``_v``) and GDN
-    (``[1, 1, 1]`` → query/key/value).  Each component gets a proportionally
-    sized global shape and a local shard derived from the FSDP slice.
-
-    Args:
-        data: The fused DTensor to split.
-        dist_param: A reference DTensor providing placements and device mesh.
-        split_sizes: Relative sizes of each component (e.g. ``[1, 1]`` for
-            two equal halves).
-        split_dim: Dimension along which to split.
-
-    Returns:
-        List of component DTensors, one per element in *split_sizes*.
-    """
-    assert isinstance(data, DTensor)
-    local_tensor = data.to_local()
-    if local_tensor.numel() == 0:
-        return [
-            make_uneven_dtensor(
-                local_tensor,
-                shape=torch.Size([0] * data.ndim),
-                dp_mesh=dist_param.device_mesh,
-                placements=dist_param.placements,
-            )
-            for _ in split_sizes
-        ]
-
-    fsdp_slice = _get_fsdp_slice_from_dtensor(dist_param)
-    tp_world_size = _get_tp_world_size(dist_param)
-
-    total_split = sum(split_sizes)
-    data_size = data.numel() // tp_world_size
-    elems_per_unit = data_size // total_split
-
-    view_shape = list(data.shape)
-
-    results = []
-    flat_offset = 0
-    for s in split_sizes:
-        comp_flat = s * elems_per_unit
-        comp_slice = slice(flat_offset, flat_offset + comp_flat)
-
-        shard = _intersection(fsdp_slice, comp_slice)
-        comp_data = local_tensor.view(-1)[_offset_slice(shard, -fsdp_slice.start)]
-
-        comp_view = list(view_shape)
-        comp_view[split_dim] = -1
-        comp_data = comp_data.reshape(comp_view)
-
-        global_shape = list(dist_param.size())
-        global_shape[split_dim] = s * (dist_param.size()[split_dim] // total_split)
-
-        dtensor = make_uneven_dtensor(
-            comp_data,
-            shape=torch.Size(global_shape),
-            dp_mesh=dist_param.device_mesh,
-            placements=dist_param.placements,
-        )
-        results.append(dtensor)
-        flat_offset += comp_flat
-
-    return results
-
-
 def _split_swiglu_weight_v2(
-    data: DTensor,
-    dist_param: DTensor,
-    swiglu_shard_axis: int = 0,
+    dtensor: DTensor, swiglu_shard_axis: int = 0
 ) -> Tuple[DTensor, DTensor]:
     """Split a SwiGLU fc1 weight into ``_w`` and ``_v`` DTensors.
 
     Convenience wrapper around ``_split_dtensor_v2`` with ``[1, 1]`` splits.
     """
-    return tuple(_split_dtensor_v2(data, dist_param, [1, 1], swiglu_shard_axis))
+    dim = swiglu_shard_axis
+    assert (
+        dtensor.shape[dim] % 2 == 0
+    ), f"Expected SwiGLU fc1 weight size divisible by 2, got {dtensor.shape[dim]}"
+    half = dtensor.shape[dim] // 2
+    return tuple(split_dtensor(dtensor, [half, half], dim))
 
 
 def handle_swiglu_in_state_dict_v2(
-    model: nn.Module,
-    model_state_dict: dict,
-    optimizer_state_dict: Optional[dict],
+    model: nn.Module, model_state_dict: dict, optimizer_state_dict: Optional[dict]
 ) -> Tuple[dict, Optional[dict]]:
     """Split SwiGLU fc1 parameters in model and optimizer state dicts.
 
@@ -417,8 +342,7 @@ def handle_swiglu_in_state_dict_v2(
     # Extract num_experts for expert parameter processing.
     model_config = get_attr_wrapped_model(model, "config", allow_none=True)
     num_experts = (
-        getattr(model_config, 'num_moe_experts', None)
-        if model_config is not None else None
+        getattr(model_config, 'num_moe_experts', None) if model_config is not None else None
     )
 
     layer_glu = _detect_glu_layers(model)
@@ -435,12 +359,10 @@ def handle_swiglu_in_state_dict_v2(
             continue
 
         dist_param = _get_dist_param(model, key)
-        assert isinstance(dist_param, DTensor), (
-            f"Expected DTensor for {key}, got {type(dist_param).__name__}"
-        )
-        weight_w, weight_v = _split_swiglu_weight_v2(
-            model_state_dict[key], dist_param,
-        )
+        assert isinstance(
+            dist_param, DTensor
+        ), f"Expected DTensor for {key}, got {type(dist_param).__name__}"
+        weight_w, weight_v = _split_swiglu_weight_v2(model_state_dict[key])
         model_state_dict[f"{key}_w"] = weight_w
         model_state_dict[f"{key}_v"] = weight_v
         del model_state_dict[key]
@@ -468,16 +390,14 @@ def handle_swiglu_in_state_dict_v2(
                 for subkey in ["exp_avg", "exp_avg_sq"]:
                     param_key = key
                     if param_key.startswith("module."):
-                        param_key = param_key[len("module."):]
-                    dist_param = _get_dist_param(
-                        model,
-                        _expert_param_local_key(param_key, num_experts)
-                        if "expert" in param_key else param_key,
+                        param_key = param_key[len("module.") :]
+                    dist_param = _get_dist_param(model, param_key)
+                    assert isinstance(opt_state[key][subkey], DTensor), (
+                        f"Expected optimizer state for {key} to be a DTensor, got "
+                        f"{type(opt_state[key][subkey]).__name__}"
                     )
-                    assert isinstance(dist_param, DTensor)
-                    _, weight_v_t = _split_swiglu_weight_v2(
-                        opt_state[key][subkey], dist_param,
-                    )
+                    weight_w_t, weight_v_t = _split_swiglu_weight_v2(opt_state[key][subkey])
+                    new_opt_state[f"{key}_w"][subkey] = weight_w_t
                     new_opt_state[f"{key}_v"][subkey] = weight_v_t
             optimizer_state_dict["state"] = new_opt_state
 
@@ -488,9 +408,7 @@ def handle_swiglu_in_state_dict_v2(
 # GDN fused-projection splitting (Megatron FSDP v2)
 # ------------------------------------------------------------------
 
-GDN_CONV1D_NAMES = [
-    "query", "key", "value",
-]
+GDN_CONV1D_NAMES = ["query", "key", "value"]
 
 _GDN_KEY_PATTERNS = [
     r"(.*)\.self_attention\.linear_proj\.weight$",
@@ -499,40 +417,22 @@ _GDN_KEY_PATTERNS = [
 ]
 
 
-def _match_gdn_key(key: str):
+def _match_gdn_key(key: str, dtensor: DTensor):
     for pat in _GDN_KEY_PATTERNS:
         m = re.match(pat, key)
         if m:
-            base = m.group(1)
-            info = getattr(
-                get_attr_wrapped_model(
-                    m, "config", allow_none=True
-                ), 'gdn_config', None
-            )
-            info = {
-                'conv1d_sizes': [1, 1, 1],
-            } if info is None else info
-            return info.get('conv1d_sizes', [1, 1, 1]), GDN_CONV1D_NAMES, 0
+            dim = 0
+            size = dtensor[dim]
+            assert (
+                size % 3 == 0
+            ), f"Expected GDN projection size divisible by 3, got {size} for key {key}"
+            qkv_size = size // 3
+            return [qkv_size, qkv_size, qkv_size], GDN_CONV1D_NAMES, dim
     return None
 
 
-def _split_gdn_weight_v2(
-    data: DTensor,
-    dist_param: DTensor,
-    split_sizes: List[int],
-    split_dim: int,
-) -> List[DTensor]:
-    """Split a fused GDN projection DTensor into per-component DTensors.
-
-    Convenience wrapper around ``_split_dtensor_v2``.
-    """
-    return _split_dtensor_v2(data, dist_param, split_sizes, split_dim)
-
-
 def handle_gdn_in_state_dict_v2(
-    model: nn.Module,
-    model_state_dict: dict,
-    optimizer_state_dict: Optional[dict],
+    model: nn.Module, model_state_dict: dict, optimizer_state_dict: Optional[dict]
 ) -> Tuple[dict, Optional[dict]]:
     """Split fused GDN projection parameters into per-component DTensors.
 
@@ -541,19 +441,17 @@ def handle_gdn_in_state_dict_v2(
     # ---- Model state dict ----
     model_state_dict = model_state_dict.copy()
     split_count = 0
-    for key in list(model_state_dict.keys()):
-        match = _match_gdn_key(key)
+    for key, value in model_state_dict.items():
+        match = _match_gdn_key(key, value)
         if match is None:
             continue
         sizes, names, dim = match
 
         dist_param = _get_dist_param(model, key)
-        assert isinstance(dist_param, DTensor), (
-            f"Expected DTensor for {key}, got {type(dist_param).__name__}"
-        )
-        sub_tensors = _split_gdn_weight_v2(
-            model_state_dict[key], dist_param, sizes, dim,
-        )
+        assert isinstance(
+            dist_param, DTensor
+        ), f"Expected DTensor for {key}, got {type(dist_param).__name__}"
+        sub_tensors = split_dtensor(model_state_dict[key], sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
             model_state_dict[f"{key}.{sub_name}"] = tensor
         del model_state_dict[key]
@@ -579,12 +477,10 @@ def handle_gdn_in_state_dict_v2(
                 for subkey in ["exp_avg", "exp_avg_sq"]:
                     param_key = key
                     if param_key.startswith("module."):
-                        param_key = param_key[len("module."):]
+                        param_key = param_key[len("module.") :]
                     dist_param = _get_dist_param(model, param_key)
                     assert isinstance(dist_param, DTensor)
-                    sub_tensors = _split_gdn_weight_v2(
-                        opt_state[key][subkey], dist_param, sizes, dim,
-                    )
+                    sub_tensors = split_dtensor(opt_state[key][subkey], sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
             optimizer_state_dict["state"] = new_opt_state
@@ -597,12 +493,51 @@ def handle_gdn_in_state_dict_v2(
 # ------------------------------------------------------------------
 
 
-def _apply_mcore_postprocess(state_dict, args, model):
+def _find_param_in_map(key: str, param_map: dict) -> Optional[DTensor]:
+    """Look up *key* in *param_map*, trying ``module.`` prefix variants."""
+    param = param_map.get(key)
+    if param is not None:
+        return param
+    stripped = key[len(_MODULE_PREFIX) :] if key.startswith(_MODULE_PREFIX) else key
+    param = param_map.get(stripped)
+    if param is not None:
+        return param
+    return param_map.get(f"{_MODULE_PREFIX}{key}")
+
+
+def _propagate_chunk_metadata_to_state_dict(model: nn.Module, state_dict: dict) -> None:
+    """Copy chunk metadata from model parameters to state dict DTensors.
+
+    ``model.state_dict()`` returns fresh DTensor objects that lack
+    ``__create_chunk_list__`` / ``__create_write_items__``.  The model
+    parameters (from ``named_parameters()``) already have them.  This
+    function copies the closures locally — no collectives.
+    """
+    param_map = {}
+    for name, param in model.named_parameters():
+        if isinstance(param, DTensor) and hasattr(param._local_tensor, "__create_chunk_list__"):
+            param_map[name] = param
+
+    for key, value in state_dict.items():
+        if not isinstance(value, DTensor):
+            continue
+        param = _find_param_in_map(key, param_map)
+        if param is not None:
+            copy_chunk_metadata(param, value)
+
+
+def _apply_mcore_postprocess(raw_state_dict, args, model):
     """Apply MCore-specific state dict post-processing.
 
-    Called after ``get_state_dict`` has attached uneven DTensor chunk
-    metadata.  Uses v2-native implementations throughout.
+    Copies *raw_state_dict*, wraps optimizer states as DTensors, then
+    applies FP8 cleanup, SwiGLU/GDN split, and expert key remapping.
+    The original *raw_state_dict* is not mutated.
     """
+    state_dict = raw_state_dict.copy()
+    _propagate_chunk_metadata_to_state_dict(model, state_dict["model"])
+
+    if "optimizer" in state_dict:
+        state_dict["optimizer"] = _build_dtensor_optim_sd(state_dict["optimizer"], model)
     handle_fp8_extra_state_case(state_dict["model"])
 
     if getattr(args, "swiglu", False):
@@ -613,9 +548,7 @@ def _apply_mcore_postprocess(state_dict, args, model):
             state_dict["model"] = model_sd
             state_dict["optimizer"] = optim_sd
         else:
-            model_sd, _ = handle_swiglu_in_state_dict_v2(
-                model, state_dict["model"], None
-            )
+            model_sd, _ = handle_swiglu_in_state_dict_v2(model, state_dict["model"], None)
             state_dict["model"] = model_sd
 
     if getattr(args, "gdn", False):
@@ -626,16 +559,18 @@ def _apply_mcore_postprocess(state_dict, args, model):
             state_dict["model"] = model_sd
             state_dict["optimizer"] = optim_sd
         else:
-            model_sd, _ = handle_gdn_in_state_dict_v2(
-                model, state_dict["model"], None
-            )
+            model_sd, _ = handle_gdn_in_state_dict_v2(model, state_dict["model"], None)
             state_dict["model"] = model_sd
 
     num_experts = getattr(args, "num_experts", None)
     if num_experts:
-        state_dict["model"] = handle_experts_in_state_dict(
-            state_dict["model"], num_experts
-        )
+        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], num_experts)
+        if "optimizer" in state_dict:
+            optim_sd = state_dict["optimizer"]
+            optim_sd["state"] = handle_experts_in_state_dict(optim_sd["state"], num_experts)
+            optim_sd["param_to_group_meta"] = handle_experts_in_state_dict(
+                optim_sd["param_to_group_meta"], num_experts
+            )
 
     return state_dict
 
@@ -667,7 +602,7 @@ def strip_module_prefix(state_dict: dict) -> dict:
     Megatron FSDP v2 model that does not use the prefix.
     """
     return {
-        k[len(_MODULE_PREFIX):] if k.startswith(_MODULE_PREFIX) else k: v
+        k[len(_MODULE_PREFIX) :] if k.startswith(_MODULE_PREFIX) else k: v
         for k, v in state_dict.items()
     }
 
@@ -706,10 +641,7 @@ def get_model_state_dict(model: nn.Module) -> dict:
 # ------------------------------------------------------------------
 
 
-def get_optimizer_state_dict(
-    optimizer,
-    is_loading: bool = False,
-) -> Optional[dict]:
+def get_optimizer_state_dict(optimizer, is_loading: bool = False) -> Optional[dict]:
     """Get optimizer state dict following Path A (``sharded_param_state_fsdp_dtensor``).
 
     Delegates to ``optimizer.sharded_state_dict()`` with the ``fsdp_dtensor``
@@ -744,97 +676,52 @@ def get_optimizer_state_dict(
 
 
 # ------------------------------------------------------------------
-# Save / Load checkpoint
+# Optimizer state DTensor wrapping
 # ------------------------------------------------------------------
 
 
-def save_checkpoint(
-    model: nn.Module,
-    ckpt_dir,
-    optimizer=None,
-    args=None,
-) -> None:
-    """Save a Megatron FSDP v2 checkpoint via DCP.
+def _build_dtensor_optim_sd(raw_opt_state_dict: dict, model: nn.Module) -> dict:
+    """Return a copy of *raw_opt_state_dict* with optimizer state tensors converted to DTensors.
 
-    Implements the full save flow:
-      1. Get model state dict (with ``module.`` prefix).
-      2. Get optimizer state dict via Path A
-         (``sharded_param_state_fsdp_dtensor``).
-      3. Apply MCore post-processing (FP8, SwiGLU, GDN, experts).
-      4. Apply uneven DTensor preprocessing.
-      5. Save via ``torch.distributed.checkpoint.save``.
-
-    Args:
-        model: FSDP v2 wrapped model.
-        ckpt_dir: Checkpoint directory (path-like).
-        optimizer: Optional ``DistributedOptimizer``.
-        args: Optional MCore args namespace for post-processing
-            (``swiglu``, ``num_experts``, ``gdn``).
+    FusedAdam stores ``exp_avg`` / ``exp_avg_sq`` as plain tensors matching
+    the parameter's local DTensor shard.  DCP requires all sharded data to
+    be DTensors.  This returns a new dict where those plain tensors are
+    converted to uneven DTensors using the model parameter's mesh/placements.
+    *raw_opt_state_dict* is **not** mutated.
     """
-    import torch.distributed.checkpoint as dcp
+    opt_state_dict = raw_opt_state_dict.copy()
+    if "state" not in opt_state_dict:
+        return opt_state_dict
 
-    model_sd = get_model_state_dict(model)
+    param_map = {}
+    for name, param in model.named_parameters():
+        if isinstance(param, DTensor):
+            param_map[name] = param
 
-    optim_sd = get_optimizer_state_dict(optimizer, is_loading=False)
+    if not param_map:
+        return opt_state_dict
 
-    state_dict = {"model": model_sd}
-    if optim_sd is not None:
-        state_dict["optimizer"] = optim_sd
+    old_state = opt_state_dict["state"]
+    new_state = {}
+    for key, param_states in old_state.items():
+        if not isinstance(param_states, dict):
+            new_state[key] = param_states
+            continue
+        new_param_states = dict(param_states)
+        dist_param = _find_param_in_map(key, param_map)
+        if dist_param is not None:
+            for state_key, state_val in new_param_states.items():
+                if not isinstance(state_val, torch.Tensor) or isinstance(state_val, DTensor):
+                    continue
+                if state_val.shape == dist_param._local_tensor.shape:
+                    new_param_states[state_key] = make_uneven_dtensor(
+                        state_val,
+                        shape=dist_param.size(),
+                        dp_mesh=dist_param.device_mesh,
+                        placements=dist_param.placements,
+                    )
+                    copy_chunk_metadata(dist_param, new_param_states[state_key])
+        new_state[key] = new_param_states
 
-    if args is not None:
-        _apply_mcore_postprocess(state_dict, args, model)
-
-    preprocess_state_dict_for_uneven_dtensor(state_dict)
-
-    dcp.save(state_dict, checkpoint_id=str(ckpt_dir))
-
-
-def load_checkpoint(
-    model: nn.Module,
-    ckpt_dir,
-    optimizer=None,
-    args=None,
-    strict: bool = True,
-) -> None:
-    """Load a Megatron FSDP v2 checkpoint via DCP.
-
-    Implements the full load flow:
-      1. Pre-allocate optimizer state tensors (required for in-place DCP load).
-      2. Build skeleton state dicts matching the saved checkpoint structure.
-      3. Apply MCore post-processing and uneven DTensor preprocessing to the
-         skeleton so DCP can match keys.
-      4. DCP load fills skeleton tensors in-place.
-      5. Strip ``module.`` prefix and load model state dict.
-      6. Load optimizer state dict.
-
-    Args:
-        model: FSDP v2 wrapped model.
-        ckpt_dir: Checkpoint directory (path-like).
-        optimizer: Optional ``DistributedOptimizer``.
-        args: Optional MCore args namespace for post-processing.
-        strict: Whether to enforce strict key matching for model state dict.
-    """
-    import torch.distributed.checkpoint as dcp
-
-    model_sd = get_model_state_dict(model)
-
-    optim_sd = get_optimizer_state_dict(optimizer, is_loading=True)
-
-    state_dict = {"model": model_sd}
-    if optim_sd is not None:
-        state_dict["optimizer"] = optim_sd
-
-    if args is not None:
-        _apply_mcore_postprocess(state_dict, args, model)
-
-    preprocess_state_dict_for_uneven_dtensor(state_dict)
-
-    dcp.load(state_dict, checkpoint_id=str(ckpt_dir))
-
-    loaded_model_sd = state_dict["model"]
-    if not _model_has_module_prefix(model):
-        loaded_model_sd = strip_module_prefix(loaded_model_sd)
-    model.load_state_dict(loaded_model_sd, strict=strict)
-
-    if optimizer is not None and "optimizer" in state_dict:
-        optimizer.load_state_dict(state_dict["optimizer"])
+    opt_state_dict["state"] = new_state
+    return opt_state_dict
