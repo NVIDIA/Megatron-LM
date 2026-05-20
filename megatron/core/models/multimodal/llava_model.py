@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import logging
 from collections import namedtuple
 from functools import partial
@@ -11,7 +11,11 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.mamba import MambaModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.multimodal.context_parallel import (
+    gather_from_context_parallel_ranks_dynamic_res,
+    split_to_context_parallel_ranks_dynamic_res,
+)
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
@@ -43,8 +47,10 @@ else:
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
 # Image token index can be tokenizer dependent so the default value does not work in all cases.
 DEFAULT_IMAGE_TOKEN_INDEX = -200
+DEFAULT_SOUND_TOKEN_INDEX = -300
 IMAGE_TOKEN = "<image>"
 VIDEO_TOKEN = "<video>"
+SOUND_TOKEN = "<so_embedding>"
 
 
 # Note: This is under development and may be missing features.
@@ -125,6 +131,18 @@ class LLaVAModel(MegatronModule):
         tokenizer_type: str = "",
         vp_stage: Optional[int] = None,
         use_vision_backbone_fp8_arch: bool = False,
+        dynamic_resolution: bool = False,
+        sound_model: Optional[torch.nn.Module] = None,
+        sound_projection: Optional[torch.nn.Module] = None,
+        sound_token_index: int = DEFAULT_SOUND_TOKEN_INDEX,
+        radio_force_eval_mode: bool = False,
+        radio_force_cpe_eval_mode: bool = False,
+        radio_interpolate_only_cpe: bool = False,
+        radio_cpe_aspect_ratio_select: bool = False,
+        radio_disable_cpe: bool = False,
+        temporal_patch_dim: int = 1,
+        separate_video_embedder: bool = False,
+        temporal_ckpt_compat: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -147,6 +165,18 @@ class LLaVAModel(MegatronModule):
         self.vision_model = None
         self.vision_projection = None
         self.language_model = None
+        self.sound_model = sound_model
+        self.sound_projection = sound_projection
+        self.sound_token_index = sound_token_index
+        self.dynamic_resolution = dynamic_resolution
+        self.radio_force_eval_mode = radio_force_eval_mode
+        self.radio_force_cpe_eval_mode = radio_force_cpe_eval_mode
+        self.radio_interpolate_only_cpe = radio_interpolate_only_cpe
+        self.radio_cpe_aspect_ratio_select = radio_cpe_aspect_ratio_select
+        self.radio_disable_cpe = radio_disable_cpe
+        self.temporal_patch_dim = temporal_patch_dim
+        self.separate_video_embedder = separate_video_embedder
+        self.temporal_ckpt_compat = temporal_ckpt_compat
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -157,7 +187,9 @@ class LLaVAModel(MegatronModule):
         self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
         self.context_parallel_lm = language_transformer_config.context_parallel_size
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
-            if not language_model_type.startswith('nemotron5-hybrid'):
+            if not language_model_type.startswith(
+                'nemotron5-hybrid'
+            ) and not language_model_type.startswith('nemotron6-moe'):
                 assert isinstance(
                     language_transformer_layer_spec.submodules, TransformerLayerSubmodules
                 )
@@ -188,17 +220,12 @@ class LLaVAModel(MegatronModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
         if self.add_decoder:
-            if getattr(language_transformer_config, "language_model_type", "").startswith("hf://"):
-                from megatron.core.models.huggingface.module import build_hf_model
-
-                self.language_model = build_hf_model(
-                    language_transformer_config, language_transformer_config.language_model_type
-                )
-                self.language_model = build_hf_model(language_transformer_config)
-            elif language_model_type.startswith('nemotron5-hybrid'):
-                self.language_model = MambaModel(
+            if language_model_type.startswith('nemotron5-hybrid') or language_model_type.startswith(
+                'nemotron6-moe'
+            ):
+                self.language_model = HybridModel(
                     config=language_transformer_config,
-                    mamba_stack_spec=language_transformer_layer_spec,
+                    hybrid_stack_spec=language_transformer_layer_spec,
                     vocab_size=language_vocab_size,
                     max_sequence_length=language_max_sequence_length,
                     parallel_output=parallel_output,
@@ -210,6 +237,7 @@ class LLaVAModel(MegatronModule):
                     rotary_base=language_rotary_base,
                     fp16_lm_cross_entropy=fp16_lm_cross_entropy,
                     scatter_embedding_sequence_parallel=False,
+                    share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                     pg_collection=self.pg_collection,
                 )
             else:
@@ -272,7 +300,6 @@ class LLaVAModel(MegatronModule):
                 )
             elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
                 # TODO: should refactor into model code itself?
-                class_token_len = 0
                 max_img_h = 0
                 max_img_w = 0
                 embedder_bias = False
@@ -280,14 +307,9 @@ class LLaVAModel(MegatronModule):
                 use_mask_token = False
 
                 if vision_transformer_config.vision_model_type == "radio":
-                    class_token_len = 8
                     max_img_h = 2048
                     max_img_w = 2048
-                    embedder_bias = False
-                    ln_post_impl = None
-                    use_mask_token = False
                 elif vision_transformer_config.vision_model_type == "radio-g":
-                    class_token_len = 5
                     max_img_h = 1792
                     max_img_w = 1792
                     embedder_bias = True
@@ -296,15 +318,18 @@ class LLaVAModel(MegatronModule):
                     ln_post_impl = TENorm
                     use_mask_token = True
                 elif vision_transformer_config.vision_model_type == "cradio-g":
-                    class_token_len = 8
                     max_img_h = 2048
                     max_img_w = 2048
-                    embedder_bias = False
-                    ln_post_impl = None
-                    use_mask_token = False
+
+                # Use config value if set (e.g. by provider), otherwise model-specific defaults
+                _default_ctl = {"radio": 8, "radio-g": 5, "cradio-g": 8}.get(
+                    vision_transformer_config.vision_model_type, 8
+                )
+                class_token_len = getattr(
+                    vision_transformer_config, "class_token_len", _default_ctl
+                )
 
                 if vision_transformer_config.fp8 or use_vision_backbone_fp8_arch:
-                    # FP8 padding for final sequence length to be a multiple of 16 or 32.
                     class_token_len = 32 if vision_transformer_config.fp8_recipe == "mxfp8" else 16
 
                 self.vision_model = RADIOViTModel(
@@ -319,7 +344,16 @@ class LLaVAModel(MegatronModule):
                     patch_dim=patch_dim,
                     add_class_token=add_class_token,
                     embedder_bias=embedder_bias,
+                    dynamic_resolution=dynamic_resolution,
                     use_mask_token=use_mask_token,
+                    force_eval_mode=radio_force_eval_mode,
+                    force_cpe_eval_mode=radio_force_cpe_eval_mode,
+                    interpolate_only_cpe=radio_interpolate_only_cpe,
+                    cpe_aspect_ratio_select=radio_cpe_aspect_ratio_select,
+                    has_cpe=not radio_disable_cpe,
+                    temporal_patch_dim=temporal_patch_dim,
+                    separate_video_embedder=separate_video_embedder,
+                    temporal_ckpt_compat=temporal_ckpt_compat,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
@@ -411,7 +445,12 @@ class LLaVAModel(MegatronModule):
             self.language_model.set_input_tensor(input_tensor[0])
 
     def freeze(
-        self, freeze_language_model: bool, freeze_vision_model: bool, freeze_vision_projection: bool
+        self,
+        freeze_language_model: bool,
+        freeze_vision_model: bool,
+        freeze_vision_projection: bool,
+        freeze_sound_model: bool = False,
+        freeze_sound_projection: bool = False,
     ):
         """Freeze model modules.
 
@@ -421,6 +460,8 @@ class LLaVAModel(MegatronModule):
             freeze_language_model (bool): Freeze the language model module.
             freeze_vision_model (bool): Freeze the vision model module.
             freeze_vision_projection (bool): Freeze the vision projection module.
+            freeze_sound_model (bool): Freeze the sound model module.
+            freeze_sound_projection (bool): Freeze the sound projection module.
         """
         modules = []
         if freeze_language_model and self.language_model is not None:
@@ -429,6 +470,10 @@ class LLaVAModel(MegatronModule):
             modules.append(self.vision_model)
         if freeze_vision_projection and self.vision_projection is not None:
             modules.append(self.vision_projection)
+        if freeze_sound_model and self.sound_model is not None:
+            modules.append(self.sound_model)
+        if freeze_sound_projection and self.sound_projection is not None:
+            modules.append(self.sound_projection)
 
         for module in modules:
             for param in module.parameters():
@@ -447,6 +492,10 @@ class LLaVAModel(MegatronModule):
         num_image_tiles,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        is_packed_dynamic_res: bool = False,
+        sound_embeddings: Optional[torch.Tensor] = None,
+        sound_embeddings_len: Optional[torch.Tensor] = None,
+        sound_timestamps: Optional[torch.Tensor] = None,
     ):
         """Preprocess input data before input to language model.
 
@@ -479,7 +528,8 @@ class LLaVAModel(MegatronModule):
         Currently, we assume the language model uses a causal mask.
 
         Returns:
-            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h].
+            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h] if
+                context_parallel_lm == 1 else [b, combined_seq_len, h].
             final_labels (torch.Tensor): labels for image and text positions [b, combined_seq_len].
             final_loss_mask (torch.Tensor): loss mask [b, combined_seq_len].
         """
@@ -497,7 +547,9 @@ class LLaVAModel(MegatronModule):
         if use_inference_kv_cache:
             return language_embeddings, loss_mask, labels
 
-        img_seq_len = self.img_seq_len
+        # Packed dynamic-res path: each image's token count is in num_image_tiles (one entry
+        # per image) and there is exactly 1 embedding per "tile", so img_seq_len collapses to 1.
+        img_seq_len = 1 if is_packed_dynamic_res else self.img_seq_len
         batch_size, text_seq_len = input_ids.shape
 
         has_labels = labels is not None
@@ -601,6 +653,34 @@ class LLaVAModel(MegatronModule):
                 final_embedding[images_mask] = (
                     image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
                 )
+
+            # Replace sound token positions with sound embeddings.
+            if sound_embeddings is not None:
+                sound_mask = input_ids == self.sound_token_index
+                if sound_mask.any():
+                    sound_batch_indices, sound_token_indices = torch.where(sound_mask)
+                    sound_new_position_ids = new_position_ids[
+                        sound_batch_indices, sound_token_indices
+                    ]
+                    if self.sound_model is not None and getattr(
+                        getattr(self.sound_model, "config", None),
+                        "sound_pad_to_clip_duration",
+                        False,
+                    ):
+                        flat_sound = sound_embeddings.permute(1, 0, 2).reshape(-1, embed_dim)
+                    else:
+                        flat_sound = torch.cat(
+                            [
+                                se[:sel]
+                                for se, sel in zip(
+                                    sound_embeddings.permute(1, 0, 2), sound_embeddings_len
+                                )
+                            ],
+                            dim=0,
+                        )
+                    final_embedding[sound_batch_indices, sound_new_position_ids] = (
+                        flat_sound.reshape(-1, embed_dim)
+                    )
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
@@ -707,6 +787,55 @@ class LLaVAModel(MegatronModule):
                 shard_factor = self.tensor_model_parallel_size_lm
                 seq_dim = 0
 
+            # Pad combined sequence to be divisible by shard_factor.
+            # VLM combined embeddings (text + vision tokens) may not align naturally.
+            seq_len = combined_embeddings.shape[seq_dim]
+            remainder = seq_len % shard_factor
+            if remainder != 0:
+                pad_len = shard_factor - remainder
+                if seq_dim == 0:  # [seq, batch, hidden]
+                    pad_shape = (pad_len, *combined_embeddings.shape[1:])
+                    combined_embeddings = torch.cat(
+                        [
+                            combined_embeddings,
+                            torch.zeros(
+                                pad_shape,
+                                dtype=combined_embeddings.dtype,
+                                device=combined_embeddings.device,
+                            ),
+                        ],
+                        dim=0,
+                    )
+                    if new_labels is not None:
+                        new_labels = torch.nn.functional.pad(new_labels, (0, pad_len), value=-100)
+                    if new_loss_mask is not None:
+                        new_loss_mask = torch.nn.functional.pad(
+                            new_loss_mask, (0, pad_len), value=0
+                        )
+                else:  # [batch, seq, hidden]
+                    pad_shape = (
+                        combined_embeddings.shape[0],
+                        pad_len,
+                        *combined_embeddings.shape[2:],
+                    )
+                    combined_embeddings = torch.cat(
+                        [
+                            combined_embeddings,
+                            torch.zeros(
+                                pad_shape,
+                                dtype=combined_embeddings.dtype,
+                                device=combined_embeddings.device,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    if new_labels is not None:
+                        new_labels = torch.nn.functional.pad(new_labels, (0, pad_len), value=-100)
+                    if new_loss_mask is not None:
+                        new_loss_mask = torch.nn.functional.pad(
+                            new_loss_mask, (0, pad_len), value=0
+                        )
+
             assert (
                 combined_embeddings.shape[seq_dim] % shard_factor == 0
             ), f"Sequence length should be divisible by {shard_factor} for \
@@ -808,6 +937,13 @@ class LLaVAModel(MegatronModule):
         image_token_index: Optional[int] = None,
         runtime_gather_output: Optional[bool] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        vision_packed_seq_params: Optional[PackedSeqParams] = None,
+        sound_clips: Optional[torch.Tensor] = None,
+        sound_length: Optional[torch.Tensor] = None,
+        sound_timestamps: Optional[torch.Tensor] = None,
+        num_sound_clips: Optional[torch.Tensor] = None,
+        imgs_sizes: Optional[torch.Tensor] = None,
+        num_frames: Optional[List[int]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> torch.Tensor:
@@ -842,11 +978,12 @@ class LLaVAModel(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        use_inference_kv_cache = (
-            inference_context is not None
-            and "image_tokens_count" in inference_context.key_value_memory_dict
+        use_inference_kv_cache = inference_context is not None and (
+            "image_tokens_count" in inference_context.key_value_memory_dict
+            or "sound_tokens_count" in inference_context.key_value_memory_dict
         )
         has_images = images is not None and images.shape[0] > 0
+        is_packed_dynamic_res = False
 
         # If running inference, we can skip image token computation
         # if they were computed already earlier for this sample.
@@ -858,13 +995,161 @@ class LLaVAModel(MegatronModule):
                 0, 0, 0
             )
         elif self.add_encoder and has_images:
-            image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
-            if self._drop_vision_class_token:
-                image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
+            use_temporal = (
+                self.temporal_patch_dim > 1 and imgs_sizes is not None and num_frames is not None
+            )
+            is_packed_dynamic_res = False
+            if use_temporal:
+                # CP-aware vision split: each rank processes only its share of
+                # frames/tubelets. Embeddings are gathered back to global shape
+                # below so that the text-token merge sees the full image set.
+                num_padded_imgs = 0
+                if self.context_parallel_lm > 1 and vision_packed_seq_params is not None:
+                    (
+                        images,
+                        imgs_sizes,
+                        vision_packed_seq_params,
+                        _has_pad_img,
+                        num_padded_imgs,
+                        local_num_frames,
+                    ) = split_to_context_parallel_ranks_dynamic_res(
+                        images,
+                        imgs_sizes,
+                        vision_packed_seq_params,
+                        fp8_enabled=False,
+                        fp8_recipe=getattr(self.config, "fp8_recipe", None),
+                        patch_dim=self.vision_model.patch_dim,
+                        num_frames=num_frames,
+                        temporal_patch_size=self.temporal_patch_dim,
+                    )
+                    if local_num_frames is not None:
+                        num_frames = local_num_frames
 
-            if self._pixel_shuffle:
+                vision_out = self.vision_model(
+                    images,
+                    imgs_sizes=imgs_sizes,
+                    packed_seq_params=vision_packed_seq_params,
+                    num_frames=num_frames,
+                )
+                image_embeddings, post_imgs_sizes, post_num_frames = vision_out
+                # Split packed output back to per-tubelet chunks and stack.
+                # RADIO in dynamic-resolution mode with add_class_token=True interleaves
+                # class_token_len tokens before each image's patches, so per-chunk length
+                # is (patches + class_token_len) until we strip the class tokens below.
+                sizes_iter = (
+                    [tuple(sz) for sz in post_imgs_sizes.tolist()]
+                    if torch.is_tensor(post_imgs_sizes)
+                    else list(post_imgs_sizes)
+                )
+                patch_counts = [
+                    (h // self.vision_model.patch_dim) * (w // self.vision_model.patch_dim)
+                    for h, w in sizes_iter
+                ]
+                ct_len = (
+                    self.vision_model.class_token_len
+                    if getattr(self.vision_model, "add_class_token", False)
+                    else 0
+                )
+                seq_lens = [p + ct_len for p in patch_counts]
+                chunks = torch.split(image_embeddings.squeeze(0), seq_lens, dim=0)
+                if self._drop_vision_class_token and ct_len > 0:
+                    chunks = [c[ct_len:] for c in chunks]
+                image_embeddings = torch.stack(chunks)  # [num_tubelets, patches, h_vision]
+
+                # Gather per-rank tubelet embeddings back to the full set so the
+                # downstream text-token merge (which sees all image tokens) finds a
+                # matching number of tiles on every rank.
+                if self.context_parallel_lm > 1 and vision_packed_seq_params is not None:
+                    image_embeddings = gather_from_context_parallel_ranks_dynamic_res(
+                        image_embeddings, num_padded_imgs
+                    )
+
+                # After temporal grouping each tubelet is one "tile" for LLaVAModel's
+                # _preprocess_data; one entry per post-grouping image (images have 1 frame,
+                # videos contribute ceil(nf/T) tubelets).
+                num_image_tiles = torch.ones(
+                    image_embeddings.shape[0], dtype=torch.int, device=image_embeddings.device
+                )
+            else:
+                # Packed dynamic-resolution image path: imgs_sizes carries per-image
+                # (H, W) so RADIO returns a packed [1, sum(patches_i+ct_len), h_vision].
+                # We must split per-image, strip class tokens, pixel-shuffle each chunk
+                # with its own (ps_h, ps_w), then reassemble.
+                is_packed_dynamic_res = (
+                    imgs_sizes is not None
+                    and vision_packed_seq_params is not None
+                    and imgs_sizes.shape[0] > 0
+                )
+                if is_packed_dynamic_res:
+                    image_embeddings = self.vision_model(
+                        images, imgs_sizes=imgs_sizes, packed_seq_params=vision_packed_seq_params
+                    )  # [1, sum(patches_i + ct_len), h_vision]
+                    P = int(self.vision_model.patch_dim)
+                    sizes = (
+                        [tuple(sz) for sz in imgs_sizes.tolist()]
+                        if torch.is_tensor(imgs_sizes)
+                        else list(imgs_sizes)
+                    )
+                    patch_counts = [(int(h) // P) * (int(w) // P) for h, w in sizes]
+                    ct_len = (
+                        self.vision_model.class_token_len
+                        if getattr(self.vision_model, "add_class_token", False)
+                        else 0
+                    )
+                    seq_lens = [p + ct_len for p in patch_counts]
+                    chunks = torch.split(image_embeddings.squeeze(0), seq_lens, dim=0)
+                    if self._drop_vision_class_token and ct_len > 0:
+                        chunks = [c[ct_len:] for c in chunks]
+
+                    if self._pixel_shuffle:
+                        shuffled_chunks = []
+                        for chunk, (h, w) in zip(chunks, sizes):
+                            ps_h, ps_w = int(h) // P, int(w) // P
+                            chunk_b = chunk.unsqueeze(0)  # [1, patches_i, h_vision]
+                            shuffled = pixel_shuffle(chunk_b, h=ps_h, w=ps_w)
+                            shuffled_chunks.append(shuffled.squeeze(0))
+                        cat = torch.cat(shuffled_chunks, dim=0)
+                    else:
+                        cat = torch.cat(list(chunks), dim=0)
+                    image_embeddings = cat.unsqueeze(0).contiguous()
+                    _tile_counts = [p // 4 if self._pixel_shuffle else p for p in patch_counts]
+                    num_image_tiles = torch.tensor(
+                        _tile_counts, dtype=torch.int, device=image_embeddings.device
+                    )
+                else:
+                    if getattr(self, "dynamic_resolution", False) or imgs_sizes is not None:
+                        image_embeddings = self.vision_model(
+                            images,
+                            imgs_sizes=imgs_sizes,
+                            packed_seq_params=vision_packed_seq_params,
+                        )
+                    else:
+                        image_embeddings = self.vision_model(
+                            images
+                        )  # [num_tiles, img_seq_len, h_vision]
+                    if self._drop_vision_class_token:
+                        image_embeddings = image_embeddings[
+                            :, self.vision_model.class_token_len :, :
+                        ]
+
+            # Packed dynamic-res path already pixel-shuffled per-image above; skip outer call.
+            # For the single-image (non-packed) case pass h/w from imgs_sizes if available.
+            skip_outer_pixel_shuffle = (not use_temporal) and is_packed_dynamic_res
+            if self._pixel_shuffle and not skip_outer_pixel_shuffle:
+                ps_h = ps_w = None
+                if (
+                    imgs_sizes is not None
+                    and image_embeddings.shape[0] == 1
+                    and imgs_sizes.shape[0] == 1
+                ):
+                    H = int(imgs_sizes[0, 0].item())
+                    W = int(imgs_sizes[0, 1].item())
+                    P = int(self.vision_model.patch_dim)
+                    ps_h, ps_w = H // P, W // P
+                    if ps_h * ps_w != image_embeddings.shape[1]:
+                        ps_h = ps_w = None
                 image_embeddings = pixel_shuffle(
-                    image_embeddings
+                    image_embeddings, h=ps_h, w=ps_w
                 )  # [num_tiles, img_seq_len_shuffled, h_vision_shuffled]
 
             # contiguous() required as `permute` can sparsify the tensor and this breaks pipelining
@@ -891,6 +1176,42 @@ class LLaVAModel(MegatronModule):
         else:
             image_embeddings = self.encoder_hidden_state
 
+        # Sound processing.
+        #
+        # The data path may pass a ``[1, 1]`` zero tensor as a "no sound this batch"
+        # sentinel (so the field is always a tensor, simplifying collation). Treat
+        # that sentinel as if ``sound_clips`` were ``None`` to avoid running the
+        # sound encoder on a dummy. The ``.item()`` call below is a deliberate
+        # CUDA sync but only runs in the sentinel-shaped case.
+        has_sounds = sound_clips is not None and sound_clips.numel() > 0
+        if has_sounds and sound_clips.shape == torch.Size([1, 1]):
+            has_sounds = sound_clips[0, 0].item() != 0
+
+        if use_inference_kv_cache:
+            sound_embeddings = None
+            sound_embeddings_len = None
+        elif self.add_encoder and not has_sounds:
+            if sound_clips is not None:
+                device = sound_clips.device
+                dtype = sound_clips.dtype
+            else:
+                device = torch.cuda.current_device()
+                dtype = torch.float32
+            sound_embeddings = torch.tensor([], dtype=dtype, device=device).reshape(0, 0, 0)
+            sound_embeddings_len = torch.tensor([], dtype=torch.long, device=device).reshape(0)
+        elif self.add_encoder and has_sounds:
+            sound_embeddings, sound_embeddings_len = self.sound_model(sound_clips, sound_length)
+            sound_embeddings = sound_embeddings.permute(1, 0, 2).contiguous()
+            sound_embeddings = self.sound_projection(sound_embeddings).contiguous()
+
+            if inference_context is not None:
+                inference_context.key_value_memory_dict["sound_tokens_count"] = (
+                    sound_embeddings.shape[1]
+                )
+        else:
+            sound_embeddings = self.encoder_hidden_state
+            sound_embeddings_len = None
+
         if not self.add_decoder:
             return image_embeddings, loss_mask
 
@@ -913,6 +1234,10 @@ class LLaVAModel(MegatronModule):
         if num_image_tiles is None and images is not None:
             num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
+        # if context_parallel_lm == 1:
+        #   [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+        # else:
+        #   [b, combined_seq_len, h_language], [b, combined_seq_len], [b, combined_seq_len]
         combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
             image_embeddings,
             language_embeddings,
@@ -923,6 +1248,10 @@ class LLaVAModel(MegatronModule):
             inference_context,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
+            is_packed_dynamic_res=is_packed_dynamic_res,
+            sound_embeddings=sound_embeddings,
+            sound_embeddings_len=sound_embeddings_len,
+            sound_timestamps=sound_timestamps,
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
 
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
@@ -995,16 +1324,24 @@ def _load_state_dict_hook_ignore_extra_state(
 # pylint: disable-next=line-too-long
 # Based on https://github.com/OpenGVLab/InternVL/blob/c7c5af1a8930b4862afe8ed14672307082ef61fa/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L218
 # Copyright (c) 2023 OpenGVLab.
-def pixel_shuffle(x, scale_factor=0.5, version=2):
+def pixel_shuffle(x, scale_factor=0.5, version=2, h=None, w=None):
     """Pixel shuffle based on InternVL but adapted for our use case.
 
     Args:
         x (torch.Tensor): Vision model outputs [num_tiles, img_seq_len, h_vision]
         version (int): Implementation version.
+        h (int, optional): Height in patches for non-square grids.
+        w (int, optional): Width in patches for non-square grids.
 
     Returns:
         Shuffled vision model outputs [num_tiles, (sq ** 2) * (scale ** 2), h_vision / (scale ** 2)]
     """
+    if h is not None or w is not None:
+        assert h is not None and w is not None, "h and w must both be provided"
+        assert h * w == x.shape[1], f"h*w ({h}*{w}={h*w}) must equal patches ({x.shape[1]})"
+        r = int(1 / scale_factor)
+        n, patches, c = x.shape
+        return x.reshape(n, patches // (r * r), c * r * r)
     h = w = int(x.shape[1] ** 0.5)  # sq
     x = x.reshape(x.shape[0], h, w, -1)  # [num_tiles, sq, sq, h_vision]
 

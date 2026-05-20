@@ -75,6 +75,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             raw_text=choice.raw_text,
             token_ids=choice.prompt_token_ids + choice.generation_token_ids,
             logprobs=choice.generation_log_probs,
+            finish_reason=choice.finish_reason,
             prompt_length=len(choice.prompt_token_ids),
             policy_epoch=choice.policy_epoch,
             kv_cache_epoch=choice.kv_cache_epoch,
@@ -112,7 +113,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 tokenizer=inference_engine.controller.tokenizer,
                 rank=dist.get_rank(),
                 server_port=kwargs.get('port', 8294),
-                parsers=[],
+                parsers=args.rl_inference_parsers,
                 verbose=kwargs.get('verbose', False),
             )
         else:

@@ -1,9 +1,9 @@
 # Megatron Core MoE
 
-Megatron Core MoE is a production-ready framework for training large-scale Mixture-of-Experts models, providing the foundational architecture, performance optimizations, and best practices that guide MoE framework development across the industry.
+Megatron Core MoE is a production-ready stack for training large-scale Mixture-of-Experts models, built on the Megatron Core framework. It provides foundational architecture, performance optimizations, and best practices that guide MoE development across the industry.
 
 ## What's New
-For latest features and architectures, please refer to the [MCore dev roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729).
+For the latest features and architectures, please refer to the [MCore dev roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729).
 
 ### 🔥 [MCore dev] (2026/01)
 - 🚀 Pipeline-aware fine-grained activation offloading
@@ -92,9 +92,9 @@ For latest features and architectures, please refer to the [MCore dev roadmap](h
 To train a top-2 MoE model with 8 experts and auxiliary loss, add the following arguments to your megatron training script:
 
 ```bash
-## Set MoE Hidden site
+## Set MoE hidden size
 --num-experts 8
---moe-shared-expert-intermediate-size: 2048
+--moe-shared-expert-intermediate-size 2048
 ## Set router config
 --moe-router-load-balancing-type aux_loss
 --moe-router-topk 2
@@ -259,7 +259,7 @@ After establishing a working parallel configuration, profile your training to id
 | Optimization | Config |
 |--------------|--------|
 | Disable Python GC | `--manual-gc --manual-gc-interval 100` |
-| Enable CUDA Graphs | `--cuda-graph-impl transformer_engine --cuda-graph-scope attn moe_router moe_preprocess` |
+| Enable CUDA Graphs | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router moe_preprocess` |
 | Reduce kernel launches | Decrease TP size or increase micro-batch size |
 
 #### Computation Bottleneck
@@ -360,7 +360,7 @@ Memory optimization is critical for large-scale MoE training, as MoE models main
 | Optimization | Description | Config |
 |--------------|-------------|--------|
 | **Fine-grained Recomputation** | Selectively recomputes specific modules (e.g., `mla_up_proj`, `layernorm`, `moe_act`) instead of full layers | `--recompute-granularity selective --recompute-modules mla_up_proj layernorm moe_act` |
-| **Fine-grained Activation Offloading** | Offloads activations to CPU memory, overlapping D2H/H2D transfers with computation | See `docs/source/api-guide/fine_grained_activation_offloading.md` |
+| **Fine-grained Activation Offloading** | Offloads activations to CPU memory, overlapping D2H/H2D transfers with computation | See `docs/user-guide/features/fine_grained_activation_offloading.md` |
 | **Precision-aware Optimizer** | Stores optimizer states (exp_avg, exp_avg_sq) in BF16 instead of FP32, reducing optimizer memory by 50% | `--use-precision-aware-optimizer --exp-avg-dtype bf16 --exp-avg-sq-dtype bf16` |
 | **Optimizer Offloading** | Offloads optimizer states to CPU memory. | `--optimizer-cpu-offload` |
 
@@ -389,7 +389,7 @@ Unlike recomputation (which trades compute for memory), offloading trades **GPU-
 --offload-modules expert_fc1 moe_act # Choices: attn_norm, core_attn, attn_proj, mlp_norm, expert_fc1, moe_act
 ```
 
-For more details, see `docs/source/api-guide/fine_grained_activation_offloading.md`
+For more details, see `docs/user-guide/features/fine_grained_activation_offloading.md`
 
 ### Communication Optimization
 
@@ -499,14 +499,19 @@ FP8 training provides benefits across all three performance walls:
 
 
 ### CUDA Graph
-CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are two implementations:
+CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are three implementations:
 
-1. `--cuda-graph-impl=local`: Captures cuda graphs using the MCore-internal cuda graph manager.
-2. `--cuda-graph-impl=transformer_engine`: Captures cuda graphs using the TE `make_graphed_callables()` interface.
+1. `--cuda-graph-impl=local`: Captures per-layer cuda graphs using the MCore-internal cuda graph manager.
+2. `--cuda-graph-impl=transformer_engine`: Captures per-layer cuda graphs using the TE `make_graphed_callables()` interface.
+3. `--cuda-graph-impl=full_iteration`: Captures the whole training/evaluation forward-backward iteration as a single cuda graph.
+
+For inference, CUDA graph scope is controlled separately with
+`--inference-cuda-graph-scope=layer|block` together with
+`--cuda-graph-impl=local`.
 
 To use `--cuda-graph-impl=transformer_engine`, the user should call related methods `TECudaGraphHelper.create_cudagraphs()` and `TECudaGraphHelper.cuda_graph_set_manual_hooks()` in the training script. Please refer to the usage in `megatron/training/training.py`.
 
-For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-scope=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-scope`.
+For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-modules=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-modules`.
 
 ## MoE Arguments Reference
 ### Core Arguments
@@ -515,7 +520,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --num-experts | Number of Experts in MoE | None |
 | --expert-model-parallel-size | Degree of expert model parallelism | 1 |
 | --moe-ffn-hidden-size | MoE FFN hidden size | FFN hidden size of the dense model |
-| --expert-tensor-parallel-size | Expert layer tensor parallelism | Same as TP(Recommeded to set to 1 for fine-grained MoE models) |
+| --expert-tensor-parallel-size | Expert layer tensor parallelism | Same as TP(Recommended to set to 1 for fine-grained MoE models) |
 | --moe-layer-freq | MoE layer frequency pattern | 1 |
 
 ### Router Arguments
@@ -693,11 +698,12 @@ We welcome contributions! Please see [CONTRIBUTING.md](https://github.com/NVIDIA
 
 - GitHub Issues: [Report bugs or request features](https://github.com/NVIDIA/Megatron-LM/issues)
 - Documentation: [Full documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
+- Performance: [Latest MoE training performance summary](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html)
 
 
 ## Citation
 
-If you use Megatron-Core MoE in your research, please cite:
+If you use Megatron Core MoE in your research, please cite:
 
 ```bibtex
 

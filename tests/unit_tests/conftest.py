@@ -44,7 +44,7 @@ def cleanup():
     yield
     if torch.distributed.is_initialized():
         try:
-            torch.distributed.barrier(timeout=timedelta(seconds=30))
+            torch.distributed.barrier()
         except Exception:
             return
         torch.distributed.destroy_process_group()

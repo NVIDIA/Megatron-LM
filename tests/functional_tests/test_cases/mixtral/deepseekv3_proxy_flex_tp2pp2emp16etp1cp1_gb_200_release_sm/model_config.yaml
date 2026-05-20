@@ -16,6 +16,7 @@ ENV_VARS:
   NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 8
   USE_MNNVL: 1
 TEST_TYPE: "release"
+LAUNCHER: ft_launcher
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
