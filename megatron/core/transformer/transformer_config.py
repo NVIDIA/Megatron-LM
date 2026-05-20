@@ -256,12 +256,26 @@ class TransformerConfig(ModelParallelConfig):
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
     attention_output_gate: bool = False
-    """Whether to apply output gate to the attention layers."""
+    """Apply a full head_dim output gate (num_attention_heads * head_dim rows
+    fused inline per-group [q, gate, k, v] into linear_qkv). Mutually
+    exclusive with `head_wise_attn_gate` (per-head scalar gate)."""
 
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
     SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
     the shared model-level rotary_pos_emb is not created."""
+
+    head_wise_attn_gate: bool = False
+    """Apply a per-head scalar output gate (Step-3.5-Flash g_proj):
+    num_attention_heads scalar gates fused as the trailing rows of
+    linear_qkv; sigmoid scales each head uniformly across head_dim.
+    Contrast with `attention_output_gate` (full head_dim gate, inline
+    per-group); the two are mutually exclusive. Self-attention only.
+    dist-ckpt TP resharding is handled by a ShardedTensorFactory in
+    SelfAttention.sharded_state_dict. Requires (validated in
+    __post_init__): num_attention_heads % tp == 0,
+    num_query_groups >= tp, and under fp8/fp4 a per-partition
+    linear_qkv_out_dim aligned to 16/32."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -1321,6 +1335,47 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        if self.head_wise_attn_gate:
+            tp = self.tensor_model_parallel_size
+            if self.attention_output_gate:
+                raise ValueError(
+                    "head_wise_attn_gate and attention_output_gate cannot both be enabled "
+                    "(incompatible linear_qkv row layouts)."
+                )
+            if self.num_attention_heads % tp != 0:
+                raise ValueError(
+                    f"head_wise_attn_gate requires num_attention_heads "
+                    f"({self.num_attention_heads}) divisible by tp ({tp})."
+                )
+            # The gate peel-off in SelfAttention runs before the
+            # num_query_groups < world_size AllGather+reslice fallback, so the
+            # gate cannot ride that path without over-taking V/K rows.
+            if self.num_query_groups < tp:
+                raise ValueError(
+                    f"head_wise_attn_gate requires num_query_groups "
+                    f"({self.num_query_groups}) >= tp ({tp})."
+                )
+            # TE FP8/FP4 GEMM requires per-partition output dim aligned to
+            # 16/32. attention_output_gate's wider gate gets this for free;
+            # head_wise's num_attention_heads-row increment can mis-align.
+            if self.fp8 is not None or self.fp4 is not None:
+                align = 32 if self.fp4 is not None else 16
+                linear_qkv_out_dim = (
+                    self.kv_channels * self.num_attention_heads
+                    + 2 * self.kv_channels * self.num_query_groups
+                    + self.num_attention_heads
+                )
+                per_partition = linear_qkv_out_dim // tp
+                if per_partition % align != 0:
+                    fp_name = "fp4" if self.fp4 is not None else "fp8"
+                    raise ValueError(
+                        f"head_wise_attn_gate under {fp_name} requires per-partition "
+                        f"linear_qkv output dim ({per_partition}) to be a multiple of "
+                        f"{align}; got num_attention_heads={self.num_attention_heads}, "
+                        f"num_query_groups={self.num_query_groups}, "
+                        f"kv_channels={self.kv_channels}, tp={tp}."
+                    )
 
         if self.linear_attention_type is not None:
             warnings.warn(
@@ -2765,9 +2820,13 @@ class TransformerConfig(ModelParallelConfig):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
 
         if self.rotary_base_per_layer is not None:
-            assert len(self.rotary_base_per_layer) == self.num_layers, (
+            if self.mtp_num_layers is not None:
+                total_num_layers = self.num_layers + self.mtp_num_layers
+            else:
+                total_num_layers = self.num_layers
+            assert len(self.rotary_base_per_layer) == total_num_layers, (
                 f"rotary_base_per_layer length ({len(self.rotary_base_per_layer)}) "
-                f"must equal num_layers ({self.num_layers})"
+                f"must equal num_layers ({total_num_layers})"
             )
 
         if self.no_rope_freq:
