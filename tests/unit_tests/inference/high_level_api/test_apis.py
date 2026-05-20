@@ -53,8 +53,7 @@ class TestConstructorValidation:
     """Constructor-time validation for both ``MegatronLLM`` and ``MegatronAsyncLLM``."""
 
     @pytest.mark.parametrize(
-        "extra_kwargs",
-        [{"coordinator_host": "x"}, {"coordinator_port": 5000}],
+        "extra_kwargs", [{"coordinator_host": "x"}, {"coordinator_port": 5000}]
     )
     def test_coordinator_host_or_port_without_use_coordinator_raises(
         self, mock_pipeline, fake_model_and_tokenizer, extra_kwargs
