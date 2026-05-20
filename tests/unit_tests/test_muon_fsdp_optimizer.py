@@ -878,41 +878,38 @@ class TestFSDPTensorParallelMuon:
             local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
             items_second.append((param, local_grad))
 
-        with patch.dict(
-            os.environ,
-            {"MUON_FSDP_PADDED_ALL_GATHER": "0", "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000"},
+        uneven_optimizer = _make_fsdp_muon(
+            params,
+            dp_group=dp_group,
+            fsdp_batched_all_gather=True,
+            fsdp_padded_all_gather=False,
+            fsdp_padded_all_gather_pad_factor=1000,
+        )
+        uneven_results = uneven_optimizer._gather_full_uneven_local_tensors_like(items)
+
+        padded_optimizer = _make_fsdp_muon(
+            params,
+            dp_group=dp_group,
+            fsdp_batched_all_gather=True,
+            fsdp_padded_all_gather=True,
+            fsdp_padded_all_gather_pad_factor=1000,
+            fsdp_reuse_gather_scratch=True,
+        )
+        padded_calls = []
+        real_padded_gather = padded_optimizer._all_gather_padded_equal_size
+
+        def counting_padded_gather(*args, **kwargs):
+            padded_calls.append(args[1])
+            return real_padded_gather(*args, **kwargs)
+
+        with patch.object(
+            padded_optimizer, "_all_gather_padded_equal_size", counting_padded_gather
         ):
-            uneven_optimizer = _make_fsdp_muon(
-                params, dp_group=dp_group, fsdp_batched_all_gather=True
+            padded_results = padded_optimizer._gather_full_uneven_local_tensors_like(items)
+            scratch_bytes_after_first = padded_optimizer._fsdp_gather_scratch_cache_bytes()
+            padded_results_second = padded_optimizer._gather_full_uneven_local_tensors_like(
+                items_second
             )
-            uneven_results = uneven_optimizer._gather_full_uneven_local_tensors_like(items)
-
-        with patch.dict(
-            os.environ,
-            {
-                "MUON_FSDP_PADDED_ALL_GATHER": "1",
-                "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000",
-                "MUON_FSDP_REUSE_GATHER_SCRATCH": "1",
-            },
-        ):
-            padded_optimizer = _make_fsdp_muon(
-                params, dp_group=dp_group, fsdp_batched_all_gather=True
-            )
-            padded_calls = []
-            real_padded_gather = padded_optimizer._all_gather_padded_equal_size
-
-            def counting_padded_gather(*args, **kwargs):
-                padded_calls.append(args[1])
-                return real_padded_gather(*args, **kwargs)
-
-            with patch.object(
-                padded_optimizer, "_all_gather_padded_equal_size", counting_padded_gather
-            ):
-                padded_results = padded_optimizer._gather_full_uneven_local_tensors_like(items)
-                scratch_bytes_after_first = padded_optimizer._fsdp_gather_scratch_cache_bytes()
-                padded_results_second = padded_optimizer._gather_full_uneven_local_tensors_like(
-                    items_second
-                )
 
         assert len(padded_calls) == 2
         assert padded_optimizer._fsdp_gather_scratch_cache_bytes() == scratch_bytes_after_first
@@ -958,16 +955,15 @@ class TestFSDPTensorParallelMuon:
         param = nn.Parameter(_make_dtensor(local_value, full_grad.shape, device_mesh))
         local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
 
-        with patch.dict(
-            os.environ,
-            {
-                "MUON_FSDP_PADDED_ALL_GATHER": "1",
-                "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000",
-                "MUON_FSDP_REUSE_GATHER_SCRATCH": "0",
-            },
-        ):
-            optimizer = _make_fsdp_muon([param], dp_group=dp_group, fsdp_batched_all_gather=True)
-            result = optimizer._gather_full_uneven_local_tensors_like([(param, local_grad)])[0]
+        optimizer = _make_fsdp_muon(
+            [param],
+            dp_group=dp_group,
+            fsdp_batched_all_gather=True,
+            fsdp_padded_all_gather=True,
+            fsdp_padded_all_gather_pad_factor=1000,
+            fsdp_reuse_gather_scratch=False,
+        )
+        result = optimizer._gather_full_uneven_local_tensors_like([(param, local_grad)])[0]
 
         assert optimizer._fsdp_gather_scratch_cache_bytes() == 0
         if local_grad.numel() == 0:
@@ -990,17 +986,19 @@ class TestFSDPTensorParallelMuon:
         param = nn.Parameter(_make_dtensor(local_value, full_grad.shape, device_mesh))
         local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
 
-        with patch.dict(
-            os.environ,
-            {"MUON_FSDP_PADDED_ALL_GATHER": "1", "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1.0"},
-        ):
-            optimizer = _make_fsdp_muon([param], dp_group=dp_group, fsdp_batched_all_gather=True)
+        optimizer = _make_fsdp_muon(
+            [param],
+            dp_group=dp_group,
+            fsdp_batched_all_gather=True,
+            fsdp_padded_all_gather=True,
+            fsdp_padded_all_gather_pad_factor=1.0,
+        )
 
-            def fail_padded_gather(*_args, **_kwargs):
-                raise AssertionError("padding threshold should select the uneven gather path")
+        def fail_padded_gather(*_args, **_kwargs):
+            raise AssertionError("padding threshold should select the uneven gather path")
 
-            with patch.object(optimizer, "_all_gather_padded_equal_size", fail_padded_gather):
-                result = optimizer._gather_full_uneven_local_tensors_like([(param, local_grad)])[0]
+        with patch.object(optimizer, "_all_gather_padded_equal_size", fail_padded_gather):
+            result = optimizer._gather_full_uneven_local_tensors_like([(param, local_grad)])[0]
 
         if local_grad.numel() == 0:
             assert result is None
@@ -1048,22 +1046,24 @@ class TestFSDPTensorParallelMuon:
             params.append(param)
             items.append((param, local_grad))
 
-        with patch.dict(
-            os.environ,
-            {"MUON_FSDP_PADDED_ALL_GATHER": "1", "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000"},
+        optimizer = _make_fsdp_muon(
+            params,
+            dp_group=dp_group,
+            fsdp_batched_all_gather=True,
+            fsdp_padded_all_gather=True,
+            fsdp_padded_all_gather_pad_factor=1000,
+        )
+        batch_sizes = []
+        real_batch_gather = optimizer._gather_full_uneven_local_tensor_batch
+
+        def counting_batch_gather(items_arg, results_arg, batch):
+            batch_sizes.append(len(batch["item_indices"]))
+            return real_batch_gather(items_arg, results_arg, batch)
+
+        with patch.object(
+            optimizer, "_gather_full_uneven_local_tensor_batch", counting_batch_gather
         ):
-            optimizer = _make_fsdp_muon(params, dp_group=dp_group, fsdp_batched_all_gather=True)
-            batch_sizes = []
-            real_batch_gather = optimizer._gather_full_uneven_local_tensor_batch
-
-            def counting_batch_gather(items_arg, results_arg, batch):
-                batch_sizes.append(len(batch["item_indices"]))
-                return real_batch_gather(items_arg, results_arg, batch)
-
-            with patch.object(
-                optimizer, "_gather_full_uneven_local_tensor_batch", counting_batch_gather
-            ):
-                results = optimizer._gather_full_uneven_local_tensors_like(items)
+            results = optimizer._gather_full_uneven_local_tensors_like(items)
 
         assert batch_sizes == [1, 1]
         for result, full_grad, (_, local_grad) in zip(results, full_grads, items):
@@ -1096,26 +1096,25 @@ class TestFSDPTensorParallelMuon:
             params.append(param)
             items.append((param, local_grad))
 
-        with patch.dict(
-            os.environ,
-            {
-                "MUON_FSDP_PADDED_ALL_GATHER": "1",
-                "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000",
-                "MUON_FSDP_BATCH_MAX_GATHER_BYTES": "64",
-            },
+        optimizer = _make_fsdp_muon(
+            params,
+            dp_group=dp_group,
+            fsdp_batched_all_gather=True,
+            fsdp_padded_all_gather=True,
+            fsdp_padded_all_gather_pad_factor=1000,
+            fsdp_batch_max_gather_bytes=64,
+        )
+        batch_sizes = []
+        real_batch_gather = optimizer._gather_full_uneven_local_tensor_batch
+
+        def counting_batch_gather(items_arg, results_arg, batch):
+            batch_sizes.append(len(batch["item_indices"]))
+            return real_batch_gather(items_arg, results_arg, batch)
+
+        with patch.object(
+            optimizer, "_gather_full_uneven_local_tensor_batch", counting_batch_gather
         ):
-            optimizer = _make_fsdp_muon(params, dp_group=dp_group, fsdp_batched_all_gather=True)
-            batch_sizes = []
-            real_batch_gather = optimizer._gather_full_uneven_local_tensor_batch
-
-            def counting_batch_gather(items_arg, results_arg, batch):
-                batch_sizes.append(len(batch["item_indices"]))
-                return real_batch_gather(items_arg, results_arg, batch)
-
-            with patch.object(
-                optimizer, "_gather_full_uneven_local_tensor_batch", counting_batch_gather
-            ):
-                results = optimizer._gather_full_uneven_local_tensors_like(items)
+            results = optimizer._gather_full_uneven_local_tensors_like(items)
 
         assert batch_sizes == [1, 1]
         for result, full_grad, (_, local_grad) in zip(results, full_grads, items):
@@ -1461,6 +1460,19 @@ class TestFSDPFactoryIntegration:
         yield
         Utils.destroy_model_parallel()
 
+    def test_muon_fsdp_gather_fast_paths_default_to_opt_in(self):
+        from megatron.core.optimizer import OptimizerConfig
+
+        config = OptimizerConfig(optimizer="muon")
+
+        assert not config.muon_fsdp_batched_all_gather
+        assert not config.muon_fsdp_reuse_gather_scratch
+        assert not config.muon_fsdp_padded_all_gather
+        assert config.muon_fsdp_padded_all_gather_pad_factor == 1.25
+        assert config.muon_fsdp_batch_max_gather_bytes == 1024 * 1024 * 1024
+        assert config.muon_fsdp_padded_all_gather_zero_pad
+        assert config.muon_fsdp_fast_reconstruct
+
     @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
     def test_factory_dispatches_correct_muon_cls(self, strategy):
         from megatron.core.optimizer import (
@@ -1505,6 +1517,12 @@ class TestFSDPFactoryIntegration:
             muon_split_qkv=False,
             muon_extra_scale_factor=1.0,
             muon_fsdp_batched_all_gather=True,
+            muon_fsdp_reuse_gather_scratch=True,
+            muon_fsdp_padded_all_gather=True,
+            muon_fsdp_padded_all_gather_pad_factor=2.0,
+            muon_fsdp_batch_max_gather_bytes=123456,
+            muon_fsdp_padded_all_gather_zero_pad=False,
+            muon_fsdp_fast_reconstruct=False,
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -1546,3 +1564,9 @@ class TestFSDPFactoryIntegration:
             assert isinstance(base_opt, FSDPTensorParallelMuon)
             assert base_opt.dp_group is not None
             assert base_opt.fsdp_batched_all_gather
+            assert base_opt.fsdp_reuse_gather_scratch
+            assert base_opt.fsdp_padded_all_gather
+            assert base_opt.fsdp_padded_all_gather_pad_factor == 2.0
+            assert base_opt.fsdp_batch_max_gather_bytes == 123456
+            assert not base_opt.fsdp_padded_all_gather_zero_pad
+            assert not base_opt.fsdp_fast_reconstruct

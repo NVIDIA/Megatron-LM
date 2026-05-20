@@ -2352,10 +2352,38 @@ def _add_regularization_args(parser):
                        'when using muon. Defaults to adam.')
     group.add_argument('--muon-fsdp-batched-all-gather',
                        action=argparse.BooleanOptionalAction,
-                       default=True,
+                       default=False,
                        help='Batch Muon+M-FSDP boundary parameter all-gathers by '
                        'dtype/device/group. This reduces collective count but increases '
-                       'temporary peak memory.')
+                       'temporary peak memory. Defaults to false.')
+    group.add_argument('--muon-fsdp-reuse-gather-scratch',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Cache and reuse Muon+M-FSDP gather scratch buffers. '
+                       'Defaults to false.')
+    group.add_argument('--muon-fsdp-padded-all-gather',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Use padded equal-size all_gather_into_tensor for Muon+M-FSDP '
+                       'batched gathers when padding overhead is within the configured '
+                       'threshold. Defaults to false.')
+    group.add_argument('--muon-fsdp-padded-all-gather-pad-factor', type=float, default=1.25,
+                       help='Maximum padded-gather size as a multiple of the uneven '
+                       'gathered size for Muon+M-FSDP. Default: 1.25.')
+    group.add_argument('--muon-fsdp-batch-max-gather-bytes', type=int,
+                       default=1024 * 1024 * 1024,
+                       help='Maximum gathered bytes per Muon+M-FSDP batched gather stage. '
+                       'Default: 1073741824.')
+    group.add_argument('--muon-fsdp-padded-all-gather-zero-pad',
+                       action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='Zero-fill unused padding before Muon+M-FSDP padded gathers. '
+                       'Defaults to true.')
+    group.add_argument('--muon-fsdp-fast-reconstruct',
+                       action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='View contiguous gathered Muon+M-FSDP buffers without an '
+                       'additional reconstruction copy. Defaults to true.')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')

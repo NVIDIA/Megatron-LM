@@ -738,6 +738,25 @@ def _get_mfsdp_models(model_chunks):
     return mfsdp_models
 
 
+def _get_muon_fsdp_kwargs(config: OptimizerConfig) -> dict[str, Any]:
+    """Map Muon+M-FSDP optimizer config fields to FSDPTensorParallelMuon kwargs."""
+    return {
+        "fsdp_batched_all_gather": getattr(config, "muon_fsdp_batched_all_gather", False),
+        "fsdp_reuse_gather_scratch": getattr(config, "muon_fsdp_reuse_gather_scratch", False),
+        "fsdp_padded_all_gather": getattr(config, "muon_fsdp_padded_all_gather", False),
+        "fsdp_padded_all_gather_pad_factor": getattr(
+            config, "muon_fsdp_padded_all_gather_pad_factor", 1.25
+        ),
+        "fsdp_batch_max_gather_bytes": getattr(
+            config, "muon_fsdp_batch_max_gather_bytes", 1024 * 1024 * 1024
+        ),
+        "fsdp_padded_all_gather_zero_pad": getattr(
+            config, "muon_fsdp_padded_all_gather_zero_pad", True
+        ),
+        "fsdp_fast_reconstruct": getattr(config, "muon_fsdp_fast_reconstruct", True),
+    }
+
+
 def _build_megatron_fsdp_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -820,9 +839,7 @@ def _build_megatron_fsdp_emerging_optimizer(
         dense_kwargs = dict(eopt_kwargs)
         if use_fsdp_zero_muon:
             dense_kwargs["dp_group"] = pg_collection.dp_cp
-            dense_kwargs["fsdp_batched_all_gather"] = getattr(
-                config, "muon_fsdp_batched_all_gather", True
-            )
+            dense_kwargs.update(_get_muon_fsdp_kwargs(config))
         muon_base = optimizer_cls(linear_param_groups, **dense_kwargs)
         muon_opt = DistributedOptimizer(
             muon_base,
@@ -846,9 +863,7 @@ def _build_megatron_fsdp_emerging_optimizer(
         expert_kwargs = dict(eopt_kwargs)
         if use_fsdp_zero_muon:
             expert_kwargs["dp_group"] = pg_collection.expt_dp
-            expert_kwargs["fsdp_batched_all_gather"] = getattr(
-                config, "muon_fsdp_batched_all_gather", True
-            )
+            expert_kwargs.update(_get_muon_fsdp_kwargs(config))
         expert_muon_base = optimizer_cls(expert_param_groups, **expert_kwargs)
         expert_muon_opt = DistributedOptimizer(
             expert_muon_base,

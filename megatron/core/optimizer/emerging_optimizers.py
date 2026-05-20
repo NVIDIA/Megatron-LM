@@ -10,7 +10,6 @@ To add a new emerging optimizer:
 
 import inspect
 import logging
-import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional, get_args
 
@@ -64,26 +63,6 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off", ""}
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        log_single_rank(
-            logger, logging.WARNING, "Ignoring invalid %s=%r; using %s.", name, value, default
-        )
-        return default
 
 
 def _should_use_padded_all_gather(rank_total_numels: list[int], pad_factor: float) -> bool:
@@ -371,7 +350,13 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         self,
         params: ParamsT,
         dp_group: torch.distributed.ProcessGroup | None = None,
-        fsdp_batched_all_gather: bool = True,
+        fsdp_batched_all_gather: bool = False,
+        fsdp_reuse_gather_scratch: bool = False,
+        fsdp_padded_all_gather: bool = False,
+        fsdp_padded_all_gather_pad_factor: float = 1.25,
+        fsdp_batch_max_gather_bytes: int = 1024 * 1024 * 1024,
+        fsdp_padded_all_gather_zero_pad: bool = True,
+        fsdp_fast_reconstruct: bool = True,
         **kwargs: Any,
     ) -> None:
         assert _HAVE_DTENSOR, (
@@ -380,18 +365,12 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         )
         self.dp_group = dp_group
         self.fsdp_batched_all_gather = fsdp_batched_all_gather
-        self.fsdp_reuse_gather_scratch = _env_flag("MUON_FSDP_REUSE_GATHER_SCRATCH", True)
-        self.fsdp_padded_all_gather = _env_flag("MUON_FSDP_PADDED_ALL_GATHER", True)
-        self.fsdp_padded_all_gather_pad_factor = _env_float(
-            "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR", 1.25
-        )
-        self.fsdp_batch_max_gather_bytes = int(
-            _env_float("MUON_FSDP_BATCH_MAX_GATHER_BYTES", 1024 * 1024 * 1024)
-        )
-        self.fsdp_padded_all_gather_zero_pad = _env_flag(
-            "MUON_FSDP_PADDED_ALL_GATHER_ZERO_PAD", True
-        )
-        self.fsdp_fast_reconstruct = _env_flag("MUON_FSDP_FAST_RECONSTRUCT", True)
+        self.fsdp_reuse_gather_scratch = fsdp_reuse_gather_scratch
+        self.fsdp_padded_all_gather = fsdp_padded_all_gather
+        self.fsdp_padded_all_gather_pad_factor = fsdp_padded_all_gather_pad_factor
+        self.fsdp_batch_max_gather_bytes = fsdp_batch_max_gather_bytes
+        self.fsdp_padded_all_gather_zero_pad = fsdp_padded_all_gather_zero_pad
+        self.fsdp_fast_reconstruct = fsdp_fast_reconstruct
         self._boundary_gather_indices_cache: dict[tuple[int, ...], set[int]] = {}
         self._uneven_gather_plan_cache: dict[int, dict[str, Any]] = {}
         self._fsdp_gather_scratch_cache: dict[tuple[Any, ...], Any] = {}
