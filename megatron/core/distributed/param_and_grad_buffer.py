@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 import functools
@@ -833,9 +833,7 @@ def group_params_for_buffers(
 
 
 def _compute_default_per_buffer_param_layout(
-    params: List[torch.nn.Parameter],
-    bucket_size: Optional[int],
-    pad_param_starts: bool = False,
+    params: List[torch.nn.Parameter], bucket_size: Optional[int], pad_param_starts: bool = False
 ) -> 'PerBufferParamLayout':
     """Compute parameter layout for the non-distributed-optimizer case.
 
