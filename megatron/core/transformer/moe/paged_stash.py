@@ -539,7 +539,7 @@ class PipelinePreScheduleFunction(torch.autograd.Function):
             if next_schedule_layer < 0:
                 ctx.stash_manager.reload_paged_tensors(-next_schedule_layer)
 
-        return grad_output + (None, None)
+        return grad_output + (None,)
 
 
 class PipelinePostScheduleFunction(torch.autograd.Function):
@@ -592,7 +592,7 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
             current_stream.wait_stream(ctx.stash_manager.unpack_stream)
             ctx.stash_manager._unpack_stream_status = 'idle'
 
-        return grad_output + (None, None)
+        return grad_output + (None,)
 
 
 class PagedStashManager:

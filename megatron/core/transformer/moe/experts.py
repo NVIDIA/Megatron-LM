@@ -38,14 +38,14 @@ from megatron.core.transformer.moe.moe_utils import (
     get_align_size_for_quantization,
     skip_routed_expert_padding,
 )
-from megatron.core.transformer.moe.token_dispatcher_inference import (
-    InferenceAllGatherDispatcherBase,
-    NVLSAllGatherVDispatcher,
-)
 from megatron.core.transformer.moe.paged_stash import (
     get_paged_stash_context,
     paged_stash_group_commit,
     paged_stash_group_start,
+)
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
+    NVLSAllGatherVDispatcher,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (

@@ -1655,17 +1655,20 @@ class TransformerConfig(ModelParallelConfig):
                     "which is needed in core_attn.backward()."
                 )
         if self.moe_paged_stash:
-            assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
-            assert self.moe_expert_rank_capacity_factor is not None, (
-                "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
-                "there is no need to use paged stashing without it."
-            )
+            if self.cpu_offloading:
+                raise ValueError("moe_paged_stash cannot be enabled with cpu_offloading.")
+            if self.moe_expert_rank_capacity_factor is None:
+                raise ValueError(
+                    "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
+                    "there is no need to use paged stashing without it."
+                )
             moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
-            assert not moe_offload_conflict, (
-                "When moe_paged_stash is enabled, offload_modules must not include "
-                f"expert_fc1 or moe_act (paged stash covers those activations). "
-                f"Remove: {moe_offload_conflict}"
-            )
+            if moe_offload_conflict:
+                raise ValueError(
+                    "When moe_paged_stash is enabled, offload_modules must not include "
+                    f"expert_fc1 or moe_act (paged stash covers those activations). "
+                    f"Remove: {moe_offload_conflict}"
+                )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -2396,8 +2399,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.cuda_graph_impl != "none":
                 if self.cuda_graph_impl == "transformer_engine":
                     assert (
-                        self.cuda_graph_impl == "transformer_engine"
-                        and CudaGraphModule.moe not in self.cuda_graph_modules
+                        CudaGraphModule.moe not in self.cuda_graph_modules
                         and CudaGraphModule.mlp not in self.cuda_graph_modules
                     ), (
                         'CUDA graph scope on moe and mlp is not '
