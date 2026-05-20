@@ -31,6 +31,7 @@ from .fsdp_module import FSDPModule
 from .hooks import (
     _register_backward_hook,
     _register_backward_pre_hook,
+    _register_fine_grained_forward_pre_hooks,
     _register_forward_hook,
     _register_forward_pre_hook,
 )
@@ -99,7 +100,10 @@ def fully_shard(
     )
     module._init_param_main_grad_func()
 
-    _register_forward_pre_hook(module)
+    if mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups):
+        _register_fine_grained_forward_pre_hooks(module)
+    else:
+        _register_forward_pre_hook(module)
     _register_forward_hook(module)
     _register_backward_pre_hook(module)
     _register_backward_hook(module)

@@ -152,8 +152,8 @@ else:
     prefetch = []
 
 for module in [self] + prefetch:
-    if ctx.unshard_done_events[id(module)] is not None:
-        continue          # AG already launched for this module — skip
+    if all(pg.has_unsharded_weight_buffers(bwd_pass=bwd_pass) for pg in module._fsdp_param_groups):
+        continue          # Required buffers are already unsharded — skip
 
     with torch.cuda.stream(stream):
         for _, param_group in module._named_param_groups:
@@ -168,9 +168,8 @@ for module in [self] + prefetch:
         ctx.unshard_done_events[id(module)] = event   # store completion signal
 
 # Synchronize self: block main stream until this module's AG is done.
-# The event is NOT cleared here — it persists as a "currently unsharded" flag
-# and is only cleared by reshard(). This prevents redundant all-gathers during
-# activation recompute and prefetch re-entry (see Feature 3 below).
+# The event is NOT cleared here; it is only cleared by reshard(). Buffer
+# readiness, not event presence, determines whether a later unshard can skip.
 if ctx.unshard_done_events[id(self)] is not None:
     ctx.unshard_done_events[id(self)].wait()          # main stream waits on ag_stream event
 
@@ -377,8 +376,8 @@ forward hooks fire again. Without mitigation this causes two problems:
 2. **Premature reshard**: `forward_hook` → `reshard()` releases the unsharded
    parameter buffer before backward gradient computation has consumed it.
 
-The baseline Megatron-FSDP addresses this by setting `TrainingState.PRE_BACKWARD`
-on all submodules before backprop (`megatron_fsdp.py:900-938`).
+The baseline Megatron-FSDP addresses this by switching submodules into a
+pre-backward mode before backprop (`megatron_fsdp.py:900-938`).
 
 ### Solution Overview
 
@@ -387,7 +386,7 @@ Two mechanisms:
 | Mechanism | Effect |
 |---|---|
 | **Derived `backward_module`** | `_advance_backward_module()` scans `_reversed_order` for the first module **not** in `backward_done_modules`. This identifies the pending module even when activation recompute fires **before** any layer's `pre_backward_hook` (which is always the case — the checkpoint wrapper triggers recompute, then backward flows through the recomputed graph). |
-| **Persistent `unshard_done_events`** | Event is only cleared by `reshard()`, never by `unshard()`. Prevents redundant all-gathers. |
+| **Buffer readiness check** | `has_unsharded_weight_buffers(bwd_pass=...)` skips redundant all-gathers for the buffers required by the current forward/backward phase. |
 
 The `backward_phase` flag gates the forward post-hook check; `backward_done_modules`
 drives both the derived pointer and the prefetch guard.

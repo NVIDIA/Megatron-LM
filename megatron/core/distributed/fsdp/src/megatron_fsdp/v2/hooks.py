@@ -16,7 +16,6 @@
 
 import functools
 import logging
-from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Tuple
 
 import torch
@@ -31,30 +30,38 @@ from .utils import RegisterFSDPBackwardFunction
 logger = logging.getLogger(__name__)
 
 
-class TrainingState(Enum):
-    """Runtime state used by hooks to select FSDP unshard behavior."""
+def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module | None = None):
+    """Register a pre-forward hook to unshard parameters for this FSDP unit."""
 
-    FORWARD = auto()
-    PRE_BACKWARD = auto()
-    FORWARD_IN_BACKWARD = auto()
-
-
-def _register_forward_pre_hook(module: FSDPModule):
-    """Register pre-forward hook to unshard parameters."""
-
-    def unshard_param_groups(module, *unused):
-        ctx = module._fsdp_root_context
-        training_state = (
-            TrainingState.FORWARD_IN_BACKWARD if ctx.backward_phase else TrainingState.FORWARD
-        )
-        module.unshard(
+    def unshard_param_groups(_hook_module, *unused):
+        ctx = fsdp_module._fsdp_root_context
+        if ctx.backward_phase:
+            fsdp_module.unshard(
+                async_op=ctx.enable_unshard_prefetch,
+                bwd_pass=True,
+            )
+        fsdp_module.unshard(
             async_op=ctx.enable_unshard_prefetch,
-            training_state=training_state,
+            bwd_pass=False,
         )
 
-    module._mfsdp_forward_pre_hook = module.register_forward_pre_hook(
+    return (hook_module or fsdp_module).register_forward_pre_hook(
         unshard_param_groups, prepend=True
     )
+
+
+def _register_fine_grained_forward_pre_hooks(module: FSDPModule):
+    """Register pre-forward hooks on this FSDP unit and its owned submodules."""
+
+    nested_fsdp_modules = set()
+    for submodule in module.modules():
+        if submodule is not module and isinstance(submodule, FSDPModule):
+            nested_fsdp_modules.update(submodule.modules())
+
+    for submodule in module.modules():
+        if submodule in nested_fsdp_modules:
+            continue
+        _register_forward_pre_hook(module, hook_module=submodule)
 
 
 def _register_forward_hook(module: FSDPModule):
@@ -125,7 +132,7 @@ def _register_backward_pre_hook(module: FSDPModule):
             _register_post_backward_final_callback(module._fsdp_state, module)
         module.unshard(
             async_op=ctx.enable_unshard_prefetch,
-            training_state=TrainingState.PRE_BACKWARD,
+            bwd_pass=True,
         )
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(

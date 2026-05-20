@@ -372,7 +372,7 @@ class FSDPModule(nn.Module):
     def unshard(
         self,
         async_op: bool = False,
-        training_state=None,
+        bwd_pass: bool = False,
     ):
         """
         Unshard parameters by all-gathering from the sharded buffer.
@@ -384,7 +384,6 @@ class FSDPModule(nn.Module):
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
-        bwd_pass = getattr(training_state, "name", None) == "PRE_BACKWARD"
 
         if async_op:
             # Synchronize ag_stream with current_stream to guarantee that main-stream
@@ -399,17 +398,12 @@ class FSDPModule(nn.Module):
         else:
             prefetch_modules = []
         for module in [self] + prefetch_modules:
-            if ctx.unshard_done_events[id(module)] is not None and all(
+            if all(
                 param_group.has_unsharded_weight_buffers(
-                    training_state=training_state,
+                    bwd_pass=bwd_pass,
                 )
                 for param_group in module._fsdp_param_groups
             ):
-                # Buffer readiness alone is not enough: non-sharded buffers are
-                # storage-ready before params are rebound to FSDP-owned storage.
-                # The event may come from a partial MXFP8 unshard, so only skip
-                # after unshard/bind has been issued and this phase's required
-                # buffers are all present.
                 continue
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
@@ -425,7 +419,7 @@ class FSDPModule(nn.Module):
 
                 with torch.cuda.stream(stream):
                     param_group.unshard(
-                        training_state=training_state,
+                        bwd_pass=bwd_pass,
                     )
 
             # Record event to track when unshard is done for this module

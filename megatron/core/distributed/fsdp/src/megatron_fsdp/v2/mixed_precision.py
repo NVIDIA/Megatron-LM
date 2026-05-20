@@ -221,6 +221,14 @@ class FullyShardMixedPrecisionPolicy:
         """Return whether ``tensor`` is managed as an FP8 parameter."""
         return is_fp8_param(tensor)
 
+    def fine_grained_forward_hooks_required(self, param_groups) -> bool:
+        """Return whether submodule forward hooks are needed for these parameter groups."""
+        for param_group in param_groups:
+            for param in param_group.params:
+                if self.is_fp8_param(param):
+                    return True
+        return False
+
     @staticmethod
     def model_weight_buffer_dtype(tensor: torch.Tensor) -> torch.dtype:
         """Return the model-weight buffer dtype for ``tensor``."""
@@ -290,13 +298,10 @@ class FullyShardMixedPrecisionPolicy:
         model_weight_buffer,
         transpose_weight_buffer=None,
         *,
-        training_state=None,
+        bwd_pass: bool = False,
     ) -> List:
-        """Return the model-weight buffers needed for this training state."""
-        state_name = getattr(training_state, "name", None)
-        if state_name == "FORWARD_IN_BACKWARD" and transpose_weight_buffer is not None:
-            return [model_weight_buffer, transpose_weight_buffer]
-        if state_name == "PRE_BACKWARD" and transpose_weight_buffer is not None:
+        """Return the weight buffer needed for forward or backward compute."""
+        if bwd_pass and transpose_weight_buffer is not None:
             return [transpose_weight_buffer]
         return [model_weight_buffer]
 
@@ -335,19 +340,18 @@ class FullyShardMixedPrecisionPolicy:
     def post_unshard(
         self,
         params: List[torch.Tensor],
-        training_state=None,
+        bwd_pass: bool = False,
     ) -> None:
         """Run post-unshard mixed precision processing for a parameter group."""
         params = [param for param in params if self.is_fp8_param(param)]
         if len(params) == 0:
             return
-        state_name = getattr(training_state, "name", None)
 
         if self.needs_transpose_weight_buffer(params[0]):
             # Match v1: forward only rebinds rowwise raw data. Do not mark the
             # MXFP8 columnwise payload unavailable since TE may request the
             # backward workspace from inside the forward call stack.
-            if state_name in ("PRE_BACKWARD", "FORWARD_IN_BACKWARD"):
+            if bwd_pass:
                 if HAVE_TE_POST_ALL_GATHER_PROCESSING:
                     post_all_gather_processing(params)
                 else:
@@ -371,7 +375,7 @@ class FullyShardMixedPrecisionPolicy:
         for param in params:
             if hasattr(param, "update_usage"):
                 param.update_usage(
-                    rowwise_usage=state_name != "PRE_BACKWARD",
+                    rowwise_usage=not bwd_pass,
                     columnwise_usage=True,
                 )
 

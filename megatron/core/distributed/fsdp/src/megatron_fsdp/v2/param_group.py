@@ -210,7 +210,7 @@ class ParameterGroup:
     def unshard(
         self,
         async_op: bool = False,
-        training_state=None,
+        bwd_pass: bool = False,
     ):
         """
         Unshard model weights by all-gathering from sharded buffer.
@@ -222,7 +222,7 @@ class ParameterGroup:
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer,
             self.transpose_weight_buffer,
-            training_state=training_state,
+            bwd_pass=bwd_pass,
         ):
             if weight_buffer is None:
                 continue
@@ -236,19 +236,19 @@ class ParameterGroup:
 
         self.mp_policy.post_unshard(
             self.params,
-            training_state=training_state,
+            bwd_pass=bwd_pass,
         )
         return work
 
     def has_unsharded_weight_buffers(
         self,
-        training_state=None,
+        bwd_pass: bool = False,
     ) -> bool:
-        """Return whether all weight buffers needed for this training state are unsharded."""
+        """Return whether all weight buffers needed for this forward/backward phase are unsharded."""
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer,
             self.transpose_weight_buffer,
-            training_state=training_state,
+            bwd_pass=bwd_pass,
         ):
             if weight_buffer is None:
                 continue
