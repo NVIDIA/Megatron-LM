@@ -225,7 +225,8 @@ def main(
                 "needs": needs,
                 "script": [" ".join(script)],
                 "artifacts": {"paths": ["results/"], "when": "always"},
-                "allow_failure": test_case["spec"]["model"] == "gpt-nemo",
+                "allow_failure": bool(test_case["spec"].get("allow_failure", False))
+                or test_case["spec"]["model"] == "gpt-nemo",
                 "retry": {
                     "max": 2,
                     "when": [

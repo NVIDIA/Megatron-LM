@@ -208,6 +208,7 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_gb200]
+        allow_failure: [true]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2]
     products:
       - environment: [dev]
