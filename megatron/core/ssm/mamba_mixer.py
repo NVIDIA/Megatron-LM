@@ -130,6 +130,7 @@ class MambaConv1d(nn.Conv1d):
         cp: Optional[MambaContextParallel] = None,
         return_weight_bias: bool = False,
     ):
+        """Run conv1d or return CP-local parameter views for fused Mamba kernels."""
         if return_weight_bias:
             return self._weight_bias(cp)
 
