@@ -503,8 +503,7 @@ def _install_fake_te_ops_modules(monkeypatch, fake_te):
 
 
 @pytest.mark.parametrize(
-    ("use_fused_weighted_squared_relu", "expected"),
-    [(True, True), (False, False)],
+    ("use_fused_weighted_squared_relu", "expected"), [(True, True), (False, False)]
 )
 def test_is_fused_impl_supported_gates_scaled_srelu_on_weighted_squared_relu_flag(
     monkeypatch, use_fused_weighted_squared_relu, expected
