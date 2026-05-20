@@ -139,9 +139,12 @@ def run_checkpoint_test(
         # Save model
         save(model_a.sharded_state_dict(), model_ckpt)
 
-        # Save optimizer (needs fresh model sharded_state_dict since save() consumes tensor refs)
+        # Save optimizer (needs fresh model sharded_state_dict since save() consumes tensor refs).
+        # validate_access_integrity=True is the regression guard for the _get_replica_id fix:
+        # without including TP rank in replica_id, every TP rank at (pp=0, dp=0) would emit
+        # the same `_mimo_*` ShardedObject as a main replica, producing duplicate-key errors.
         optim_sd_a = optimizer_a.sharded_state_dict(model_a.sharded_state_dict(), is_loading=False)
-        save(optim_sd_a, optim_ckpt, validate_access_integrity=False)
+        save(optim_sd_a, optim_ckpt, validate_access_integrity=True)
 
         dist.barrier()
 
