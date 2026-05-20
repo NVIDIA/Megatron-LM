@@ -14,6 +14,12 @@ from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubm
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
@@ -166,6 +172,24 @@ def _get_hybrid_stack_local_spec(
         ),
     )
 
+    mtp_block_spec = ModuleSpec(
+        module=MultiTokenPredictionBlock,
+        submodules=MultiTokenPredictionBlockSubmodules(
+            layer_specs=[
+                ModuleSpec(
+                    module=MultiTokenPredictionLayer,
+                    submodules=MultiTokenPredictionLayerSubmodules(
+                        enorm=Norm,
+                        hnorm=Norm,
+                        eh_proj=ColumnParallelLinear,
+                        mtp_model_layer=None,  # Built via pattern + hybrid_submodules
+                        layer_norm=Norm,
+                    ),
+                )
+            ]
+        ),
+    )
+
     return ModuleSpec(
         module=HybridStack,
         submodules=HybridStackSubmodules(
@@ -173,5 +197,6 @@ def _get_hybrid_stack_local_spec(
             attention_layer=attention_layer,
             mlp_layer=mlp_layer,
             moe_layer=moe_layer,
+            mtp_block_spec=mtp_block_spec,
         ),
     )
