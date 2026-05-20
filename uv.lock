@@ -4110,24 +4110,35 @@ name = "numpy"
 version = "2.0.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.11' and platform_machine != 's390x' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
+    "python_full_version < '3.11' and platform_machine == 's390x' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version < '3.11' and platform_machine != 's390x' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version < '3.11' and platform_machine == 's390x' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version < '3.11' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a9/75/10dd1f8116a8b796cb2c737b674e02d02e80454bda953fa7e65d8c12b016/numpy-2.0.2.tar.gz", hash = "sha256:883c987dee1880e2a864ab0dc9892292582510604156762362d9326444636e78", size = 18902015, upload-time = "2024-08-26T20:19:40.945Z" }
 wheels = [
@@ -4280,7 +4291,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/04/74/f4c001f4714c3ad9ce037e18cf2b9c64871a84951eaa0baf683a9ca9301c/numpy-2.4.4-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:f2cf083b324a467e1ab358c105f6cad5ea950f50524668a80c486ff1db24e119", size = 12509075, upload-time = "2026-03-29T13:21:57.644Z" },
 ]
 
-
 [[package]]
 name = "nvdlfw-inspect"
 version = "0.2.2"
@@ -4348,24 +4358,27 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.22.0"
+version = "1.24.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/40/7d/28ab9cb9119fc6a3a383d943448ab310fe787daf784869b167dc7269969f/nvidia_cudnn_frontend-1.22.0-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:dbd3100ae212dd1f4691f8c096fe3aded46491f9a6cb258bfb802d07ca1a88fc", size = 2670597, upload-time = "2026-04-03T02:27:56.886Z" },
-    { url = "https://files.pythonhosted.org/packages/8b/b4/976996f1ab721bbcae4b7379652949ddcd41803817d4b65b9bd0d726aa60/nvidia_cudnn_frontend-1.22.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:62bf9c8569caf4d9518dae0755507ad36a4e311726aa015fde104c38a1630f76", size = 2811815, upload-time = "2026-04-03T02:32:24.504Z" },
-    { url = "https://files.pythonhosted.org/packages/2b/56/755412cf4ce5ad95bcb00be3144c8e1fa07cbbae073f31a7b75ddec96ca0/nvidia_cudnn_frontend-1.22.0-cp310-cp310-win_amd64.whl", hash = "sha256:22748b41049d02c029719467924ea20d928517dd8f35e204a390f97407298eb2", size = 2260435, upload-time = "2026-04-03T02:24:51.808Z" },
-    { url = "https://files.pythonhosted.org/packages/bf/ff/e4955b6fdff929ddf04a1252facae6201b308e001c91c690e96f65c4e90a/nvidia_cudnn_frontend-1.22.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cdff54c945fbabf9da06fd64ded60cf1ec94d580474f5746786c0effd759fedc", size = 2672347, upload-time = "2026-04-03T02:28:51.106Z" },
-    { url = "https://files.pythonhosted.org/packages/52/27/62fc6e2cddff7d6396be3685342ceec1c12fe2ee50e6f31d270887ecb5ad/nvidia_cudnn_frontend-1.22.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bb50bd2758c6d47c6210451c5c1932ed16e7563d7629228f4cc97edc0e01d0c5", size = 2814387, upload-time = "2026-04-03T02:32:47.972Z" },
-    { url = "https://files.pythonhosted.org/packages/d5/4f/de06583ec21313f31d8b83bc2164e88fc22f5b48d8eb5cb45490fcf7c262/nvidia_cudnn_frontend-1.22.0-cp311-cp311-win_amd64.whl", hash = "sha256:49f817377a19e10e4aafa5797cd68315739dfdb2fc6a67dd1052b64c805d24ec", size = 2261332, upload-time = "2026-04-03T02:25:17.241Z" },
-    { url = "https://files.pythonhosted.org/packages/7e/f1/67681e585abd98f968298c771b72830ce984a90fd0d787098d2ea2ba55c7/nvidia_cudnn_frontend-1.22.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:bc9c12891d5427ef49b72b26df2b7889d623086d77c9e33b021c2de417d3e4dc", size = 2673215, upload-time = "2026-04-03T02:29:41.421Z" },
-    { url = "https://files.pythonhosted.org/packages/0e/46/95b7779a2f71dfccce1783cc5ac210dda0124b93f8bf66cf62ed3d9ce0a5/nvidia_cudnn_frontend-1.22.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:98ffa05699d71795372f112fa2361c13be716fa3fda911c1e809903163ea5d11", size = 2815106, upload-time = "2026-04-03T02:33:11.473Z" },
-    { url = "https://files.pythonhosted.org/packages/61/47/522e84a37eedb1f680e74df449d39fe6f8641779523313d1a8522d449766/nvidia_cudnn_frontend-1.22.0-cp312-cp312-win_amd64.whl", hash = "sha256:81fde93d9b86ad631e17da1e2c103c4a7a541ec7abcb7f9a121cbd018c8eff26", size = 2262120, upload-time = "2026-04-03T02:25:40.18Z" },
-    { url = "https://files.pythonhosted.org/packages/c7/93/43541b581207024824cb740f429bf882aaf3bde3633bd4099393dd9c0c16/nvidia_cudnn_frontend-1.22.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c9bdf48cf989b2a77f8b52623fc31c078362fd34389207d11cdb0b5624a7b311", size = 2673259, upload-time = "2026-04-03T02:30:30.634Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/5b/af9da5a455064380e68a441b9cfa1f1212dd6363bd02b5aa696d319bd211/nvidia_cudnn_frontend-1.22.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d02c4b4aae3e243ddb08ad4eb939988bcf7b1aefe25f5d400f6858c7276a6631", size = 2815032, upload-time = "2026-04-03T02:33:34.171Z" },
-    { url = "https://files.pythonhosted.org/packages/ba/1d/3a15b719817ca6241e5f3a7a38608af21a3259e550a5dee5520e29adac00/nvidia_cudnn_frontend-1.22.0-cp313-cp313-win_amd64.whl", hash = "sha256:4906a38954725e35bc8431874f4d9db60d50e0d9dbc40ecaf8e5f40df545350b", size = 2262156, upload-time = "2026-04-03T02:26:03.322Z" },
-    { url = "https://files.pythonhosted.org/packages/27/ec/8c9b53a9174cca2d0062cbd8cb7c31403a38cb4c79984a9c554830cac5e9/nvidia_cudnn_frontend-1.22.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0f650058bda46a6542dfc3d021803021e7932e1cd6bb78cf46e81fa219717b5e", size = 2674887, upload-time = "2026-04-03T02:31:21.166Z" },
-    { url = "https://files.pythonhosted.org/packages/89/bd/3464d181ec2d94085cab98fd5ea4d312478aa6cb16ff38994a9188ac9f05/nvidia_cudnn_frontend-1.22.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:90f30b0d6563d050ca1972efa594a31d5affe5c3eeb467542e715d7ee73e3b5b", size = 2815841, upload-time = "2026-04-03T02:33:56.66Z" },
-    { url = "https://files.pythonhosted.org/packages/a5/fd/bdec32a32b44f52b60a03f43e8619552ea0eb90a61de06632a054bf17d6a/nvidia_cudnn_frontend-1.22.0-cp314-cp314-win_amd64.whl", hash = "sha256:5994400a7f76a1be5e327a9ac1a4a635ee734d2ac8a5875e52481c52cf2b0922", size = 2263464, upload-time = "2026-04-03T02:26:26.553Z" },
+    { url = "https://files.pythonhosted.org/packages/71/05/bf31134b6e5d41c5a1e4abc65b5bb5461a73be74013da273b18fef7a2244/nvidia_cudnn_frontend-1.24.0-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e8833079f0283948cb5f99a2dc0c8fbff29d320e6a5635c4f77fa7eaf877043b", size = 3222069, upload-time = "2026-05-20T05:01:12.464Z" },
+    { url = "https://files.pythonhosted.org/packages/50/4d/861c75757e688a5094da621871688d7583b52c7cb3ad75d0d5ab1dcdff68/nvidia_cudnn_frontend-1.24.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5736397ab8f29e06731960e055d27f65e8fda70c70f988e8bd91b671a3506999", size = 3370408, upload-time = "2026-05-20T05:01:36.098Z" },
+    { url = "https://files.pythonhosted.org/packages/de/13/cee7f47acbb1d85a2019522f88238cbd4ac182a65fdea5d41e504b7c48be/nvidia_cudnn_frontend-1.24.0-cp310-cp310-win_amd64.whl", hash = "sha256:77bc9f3203c677f74b6cedf84125514b4881dc82f4177cc4ab33949693abe6aa", size = 2764295, upload-time = "2026-05-20T05:01:56.212Z" },
+    { url = "https://files.pythonhosted.org/packages/81/75/767973a56b98d2a8fbc04c78fc28684cdb0df7c032ba4858090243df81cc/nvidia_cudnn_frontend-1.24.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9c0f39f211bb105798c7a8617b1d674e01dbd538b97714025628ea7127bfaf8a", size = 3223392, upload-time = "2026-05-20T05:02:56.092Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/8c/f5226ab5163dfffbe82ff41b9e1fbf649c908c077a5416bb16a1c3634cfa/nvidia_cudnn_frontend-1.24.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:dec07dcfea168792098b9a2652ec465d79e228d3d17a2f86a08404b487336530", size = 3372046, upload-time = "2026-05-20T05:03:20.091Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/bf/fa08a8bd953ad8db7ea3f64676b30f1cb2846f6518595a6faf7fb3558db4/nvidia_cudnn_frontend-1.24.0-cp311-cp311-win_amd64.whl", hash = "sha256:b461259b85b7a7e3a1c41b02c33ce4fde0dbcde7e0a227a968dedb74d311e2c3", size = 2764877, upload-time = "2026-05-20T05:04:21.965Z" },
+    { url = "https://files.pythonhosted.org/packages/25/f4/a57efcbeb1dec0a047fa8f8aaa4defa4935db7d52e8afaf83224f1258ec6/nvidia_cudnn_frontend-1.24.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3b4398cecbaa555baa73a9b8716233632e3c16259c6ab999d83c51ca3b8fd09c", size = 3224420, upload-time = "2026-05-20T05:04:50.051Z" },
+    { url = "https://files.pythonhosted.org/packages/19/b7/c1b8de8292b8fe28b2ffc95601a0b69392536a9515315bcfcdb0b07d2af8/nvidia_cudnn_frontend-1.24.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:144bfe09098d681d4c793c867fff53b1fb7c49f845324d5d0c52d824b14b74f5", size = 3376971, upload-time = "2026-05-20T05:05:19.998Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/00/284b8de99fbc1e8fd91c292a024943ee61d3361aa669c435ee44e14b6498/nvidia_cudnn_frontend-1.24.0-cp312-cp312-win_amd64.whl", hash = "sha256:5476d6a51ebaf5ef04e462e0052f1d9bca1af6274f738cb509715b4cf443a8df", size = 2765023, upload-time = "2026-05-20T05:05:40.269Z" },
+    { url = "https://files.pythonhosted.org/packages/41/3e/430941e91a0c5234c79aa0bd6dcdb27c0e3a443f66953f881f8cb3428e93/nvidia_cudnn_frontend-1.24.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ccf1d2352f4b82fafbfb803512493c7a211224b424b6a78fbf45e42a94dcdb81", size = 3224661, upload-time = "2026-05-20T05:06:01.577Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/95/02691a6f0db4c2194899579a9c196df8990b140e0503fc6be1f09e7aa063/nvidia_cudnn_frontend-1.24.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ec45b08e0ab511f61532bc980c343c15eb5eda9ff14a3c80e75bc0aa3776860c", size = 3376128, upload-time = "2026-05-20T05:06:21.613Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/c5/e6c9ef439e167675e64fd1ca025df79211cafdf70ec9edbf6b99f876cafd/nvidia_cudnn_frontend-1.24.0-cp313-cp313-win_amd64.whl", hash = "sha256:2d02744a46726d262d80ed54299fae6491e4385e7d580eb6a027fb5b3b2c1db8", size = 2765241, upload-time = "2026-05-20T05:06:45.6Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/fc/c5a1d386f22dc8e17304874368ba213ff8c093093e9b0ccc3b2bd81a1d12/nvidia_cudnn_frontend-1.24.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:190857577a11d22b62da1863cb1a4b72692f98913d1c9c2e6a72224d08685575", size = 3226124, upload-time = "2026-05-20T05:07:14.426Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/39/e7f12c1a640174bdebbbf87be19819483c9da9f8f3af948f5dcb46cf501d/nvidia_cudnn_frontend-1.24.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b7e9aca4b6ce4d4bd484f01a1c4f530a9bea317cd69d21760d582b47e05514d8", size = 3375383, upload-time = "2026-05-20T05:07:38.976Z" },
+    { url = "https://files.pythonhosted.org/packages/16/f8/cae1cffd3ab944301e3a736395f85925a887fc5255c100f561638d6b2fba/nvidia_cudnn_frontend-1.24.0-cp314-cp314-win_amd64.whl", hash = "sha256:b8968eb9dd9a71fe3d64b55d1e9731cffb7272578a9a39c9bf816f5e27c3f14e", size = 2765850, upload-time = "2026-05-20T05:07:59.264Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/27/c04b542fd2a882fabed1cb4e6778a8a6159f1123e00c2f0da8383690c713/nvidia_cudnn_frontend-1.24.0-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:65044724acc5fcb92ab829c2d2fcefc7fd4419881030e04358a66a4bcbce5d43", size = 3230149, upload-time = "2026-05-20T05:08:21.883Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/17/89a0eccbf5be9455c395f977022e299c910f1d7d5b0820661908f552ac70/nvidia_cudnn_frontend-1.24.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:37c6ef88c7cbc41eab6e36d5c6715ff0d6c639f76ca12c65ce7a24b453e184eb", size = 3382455, upload-time = "2026-05-20T05:08:48.412Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/d2/dac91d6a6fa2e6c07b59239f01fb07472f36d8368c29840647cfcd1c7dd0/nvidia_cudnn_frontend-1.24.0-cp314-cp314t-win_amd64.whl", hash = "sha256:79e902e124123d84d52fa06c0931415cccfa71ff8550c1c156dd3539bffeda5c", size = 2791017, upload-time = "2026-05-20T05:09:07.477Z" },
 ]
 
 [[package]]
@@ -4994,7 +5007,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-api"
-version = "1.41.0"
+version = "1.42.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -5012,12 +5025,11 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "importlib-metadata", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/47/8e/3778a7e87801d994869a9396b9fc2a289e5f9be91ff54a27d41eace494b0/opentelemetry_api-1.41.0.tar.gz", hash = "sha256:9421d911326ec12dee8bc933f7839090cad7a3f13fcfb0f9e82f8174dc003c09", size = 71416, upload-time = "2026-04-09T14:38:34.544Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/86/ca/25288069c399be6769159d9fb7b1190b603537d82aad2fa2746a0cc2c8c6/opentelemetry_api-1.42.0.tar.gz", hash = "sha256:ea84c893ad177791d138e0349d6ceebd8d3bf006440900400ce220008dafc372", size = 72300, upload-time = "2026-05-19T09:46:29.885Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/58/ee/99ab786653b3bda9c37ade7e24a7b607a1b1f696063172768417539d876d/opentelemetry_api-1.41.0-py3-none-any.whl", hash = "sha256:0e77c806e6a89c9e4f8d372034622f3e1418a11bdbe1c80a50b3d3397ad0fa4f", size = 69007, upload-time = "2026-04-09T14:38:11.833Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/0b/be5daf659b82b525338fde371dfcfab09b606a19bb5620c37076964710ec/opentelemetry_api-1.42.0-py3-none-any.whl", hash = "sha256:558d88f88192a973579910ef6f2c13db47a268d5ec2e53e83e50e74a39a02922", size = 61310, upload-time = "2026-05-19T09:46:06.561Z" },
 ]
 
 [[package]]
@@ -5064,7 +5076,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-exporter-prometheus"
-version = "0.62b0"
+version = "0.63b0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -5082,13 +5094,13 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
-    { name = "opentelemetry-sdk", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.42.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-sdk", version = "1.42.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "prometheus-client", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0f/ec/fa8a722199dc2e75dc582779d62207b00b0bdb014b5635594afa0cf3ee43/opentelemetry_exporter_prometheus-0.62b0.tar.gz", hash = "sha256:4d1106566a9b3e8dff028e69e9f2dc90723e6b431c900ff8c72982fcf11dbae5", size = 15441, upload-time = "2026-04-09T14:38:38.934Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/18/2c/0643113a5bef20e8242f7ae7915913fab61e8c901d391518a0aefa2da6fc/opentelemetry_exporter_prometheus-0.63b0.tar.gz", hash = "sha256:76b52078ee70131542e53d5cf1942cadd6d5628e7a1bf1f60047f29fa079e9b1", size = 15231, upload-time = "2026-05-19T09:46:35.1Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d1/1e/43645fadd561471af2aec95906a3dd54af1a8e7782322310e802a810ad3a/opentelemetry_exporter_prometheus-0.62b0-py3-none-any.whl", hash = "sha256:cd7e8acae3be5f425ffa2e0864eea474fa7a40706f786de7a2d23846573d8f75", size = 13278, upload-time = "2026-04-09T14:38:19.367Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/48/18e2b0eec9242beb168b1100ed6c602c2a378d0ccb779d1c0a1b85b9ba89/opentelemetry_exporter_prometheus-0.63b0-py3-none-any.whl", hash = "sha256:0cfe4846bf5905f096a4d9678ffe25c7fe6f662f6c7282d2b191138d6bf487fb", size = 12466, upload-time = "2026-05-19T09:46:15.025Z" },
 ]
 
 [[package]]
@@ -5147,7 +5159,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-sdk"
-version = "1.41.0"
+version = "1.42.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -5165,13 +5177,13 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
-    { name = "opentelemetry-semantic-conventions", version = "0.62b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.42.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-semantic-conventions", version = "0.63b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f8/0e/a586df1186f9f56b5a0879d52653effc40357b8e88fc50fe300038c3c08b/opentelemetry_sdk-1.41.0.tar.gz", hash = "sha256:7bddf3961131b318fc2d158947971a8e37e38b1cd23470cfb72b624e7cc108bd", size = 230181, upload-time = "2026-04-09T14:38:47.225Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b7/c9/dabaaf1c754a57b82b5a36aeca3806d92c1877ccfb12a697b65f88bf027c/opentelemetry_sdk-1.42.0.tar.gz", hash = "sha256:2479e462cc69357825c2c847ce4a601bc1b17e1279aa7f80d3490f0ae614d0e5", size = 239072, upload-time = "2026-05-19T09:46:42.992Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2c/13/a7825118208cb32e6a4edcd0a99f925cbef81e77b3b0aedfd9125583c543/opentelemetry_sdk-1.41.0-py3-none-any.whl", hash = "sha256:a596f5687964a3e0d7f8edfdcf5b79cbca9c93c7025ebf5fb00f398a9443b0bd", size = 180214, upload-time = "2026-04-09T14:38:30.657Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/7d/16bf9a9d42ebbd1679e0cda018d57a0712f3b6f6f1e7ae5ef3c7ee5927c0/opentelemetry_sdk-1.42.0-py3-none-any.whl", hash = "sha256:ec4a4f69e15220b3d7bccd93217aac745682bb6435b9381f7bb44cb7e07b4f2b", size = 170879, upload-time = "2026-05-19T09:46:25.871Z" },
 ]
 
 [[package]]
@@ -5217,7 +5229,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.62b0"
+version = "0.63b0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -5235,12 +5247,12 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.42.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a3/b0/c14f723e86c049b7bf8ff431160d982519b97a7be2857ed2247377397a24/opentelemetry_semantic_conventions-0.62b0.tar.gz", hash = "sha256:cbfb3c8fc259575cf68a6e1b94083cc35adc4a6b06e8cf431efa0d62606c0097", size = 145753, upload-time = "2026-04-09T14:38:48.274Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/20/f8/be4625838aae098c2f9fbdc062a1b3128ebb9e799b891b654ee8cad94897/opentelemetry_semantic_conventions-0.63b0.tar.gz", hash = "sha256:cfea295264654fa324fcef24aa56fb1836fdc0da27db128645dc6aa76115cc6c", size = 148333, upload-time = "2026-05-19T09:46:44.01Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/58/6c/5e86fa1759a525ef91c2d8b79d668574760ff3f900d114297765eb8786cb/opentelemetry_semantic_conventions-0.62b0-py3-none-any.whl", hash = "sha256:0ddac1ce59eaf1a827d9987ab60d9315fb27aea23304144242d1fcad9e16b489", size = 231619, upload-time = "2026-04-09T14:38:32.394Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/6f/8d0ce225b8fdbb72c97cf4130107d861eafcb3d8e5c3f5891e8556177316/opentelemetry_semantic_conventions-0.63b0-py3-none-any.whl", hash = "sha256:1f3962732b04f43e4fef28173c9a3615b8847b4b2d6386fdc085361b29875ab9", size = 203712, upload-time = "2026-05-19T09:46:27.569Z" },
 ]
 
 [[package]]
@@ -5328,27 +5340,7 @@ wheels = [
 name = "packaging"
 version = "26.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a1/d4/1fc4078c65507b51b96ca8f8c3ba19e6a61c8253c72794544580a7b6c24d/packaging-25.0.tar.gz", hash = "sha256:d443872c98d677bf60f6a1f2f8c1cb748e8fe762d2bf9d3148b5599295b0fc4f", size = 165727, upload-time = "2025-04-19T11:48:59.673Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/65/ee/299d360cdc32edc7d2cf530f3accf79c4fca01e96ffc950d8a52213bd8e4/packaging-26.0.tar.gz", hash = "sha256:00243ae351a257117b6a241061796684b084ed1c516a08c48a3f7e147a9d80b4", size = 143416, upload-time = "2026-01-21T20:50:39.064Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/b9/c538f279a4e237a006a2c98387d081e9eb060d203d8ed34467cc0f0b9b53/packaging-26.0-py3-none-any.whl", hash = "sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529", size = 74366, upload-time = "2026-01-21T20:50:37.788Z" },
 ]
@@ -5358,24 +5350,35 @@ name = "pandas"
 version = "2.3.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.11' and platform_machine != 's390x' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
+    "python_full_version < '3.11' and platform_machine == 's390x' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version < '3.11' and platform_machine != 's390x' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version < '3.11' and platform_machine == 's390x' and extra == 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
+    "python_full_version < '3.11' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
 ]
 dependencies = [
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -6624,10 +6627,10 @@ default = [
     { name = "grpcio" },
     { name = "opencensus" },
     { name = "opentelemetry-exporter-prometheus", version = "0.54b1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
-    { name = "opentelemetry-exporter-prometheus", version = "0.62b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-exporter-prometheus", version = "0.63b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "opentelemetry-proto" },
     { name = "opentelemetry-sdk", version = "1.33.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
-    { name = "opentelemetry-sdk", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-sdk", version = "1.42.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "prometheus-client" },
     { name = "py-spy" },
     { name = "pydantic" },
