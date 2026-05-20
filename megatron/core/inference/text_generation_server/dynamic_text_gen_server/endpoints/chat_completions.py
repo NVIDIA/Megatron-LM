@@ -701,9 +701,7 @@ try:
             message["generation_log_probs"] = result.get("generated_log_probs", [])
             message["policy_epoch"] = result["policy_epoch"]
             message["kv_cache_epoch"] = result["kv_cache_epoch"]
-            message["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
+            message["num_evictions"] = sum(1 for e in result["events"] if e.get("type") == "EVICT")
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
