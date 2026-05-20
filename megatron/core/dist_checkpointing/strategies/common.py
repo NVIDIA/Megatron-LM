@@ -11,6 +11,7 @@ import torch
 from megatron.core.dist_checkpointing.mapping import StateDict
 from megatron.core.msc_utils import MultiStorageClientFeature
 
+from ..core import is_local_rank_zero
 from ..mapping import CheckpointingException
 
 COMMON_STATE_FNAME = 'common.pt'
@@ -19,8 +20,14 @@ logger = logging.getLogger(__name__)
 
 
 def save_common(common_state_dict: StateDict, checkpoint_dir: str):
-    """Save common part of the state dict."""
-    if torch.distributed.get_rank() == 0:
+    """Save common part of the state dict.
+
+    Written by every local rank 0 so that each node has a copy when the
+    checkpoint directory is on node-local storage rather than a shared
+    filesystem. On a shared filesystem the duplicate writes are wasted but
+    harmless (identical content).
+    """
+    if is_local_rank_zero():
         path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()

@@ -18,7 +18,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
-from .core import CheckpointingConfig, save_config
+from .core import CheckpointingConfig, is_local_rank_zero, save_config
 from .dict_utils import merge
 from .mapping import (
     CommonStateDict,
@@ -399,7 +399,10 @@ def save(
     save_common(state_dict, checkpoint_dir)
 
     def metadata_finalize_fn():
-        if torch.distributed.get_rank() == 0:
+        # Every loader rank reads metadata.json during verify_checkpoint, so
+        # write it from every local rank 0 to ensure each node has a copy when
+        # checkpoint_dir is on node-local storage.
+        if is_local_rank_zero():
             save_config(
                 CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
                 checkpoint_dir,
@@ -407,6 +410,13 @@ def save(
         torch.distributed.barrier()
 
     def integrity_finalize_fn():
+        # integrity.json is intentionally written only by global rank 0:
+        # save_integrity_manifest walks the checkpoint directory and hashes
+        # every file it sees, and verify_integrity_manifest also runs only on
+        # global rank 0. Both sides assume a single process can observe the
+        # full checkpoint, which already requires a shared filesystem or
+        # MultiStorageClient backing. Replicating the write per-node would not
+        # remove that requirement.
         if torch.distributed.get_rank() == 0:
             save_integrity_manifest(checkpoint_dir)
         torch.distributed.barrier()

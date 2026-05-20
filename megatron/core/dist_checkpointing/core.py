@@ -7,9 +7,27 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Optional
 
+import torch
+
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 CONFIG_FNAME = 'metadata.json'
+
+
+def is_local_rank_zero() -> bool:
+    """Returns True if this process is the first rank on its node.
+
+    Reads ``LOCAL_RANK`` from the environment (set by ``torchrun`` and most
+    distributed launchers). Falls back to global rank 0 when ``LOCAL_RANK`` is
+    unset, preserving the original single-writer behaviour for launchers that
+    don't expose it. Used by checkpoint files that every rank reads at load
+    time (``metadata.json``, ``common.pt``) so that each node has a local copy
+    when the checkpoint directory is not on a shared filesystem.
+    """
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is not None:
+        return int(local_rank) == 0
+    return torch.distributed.get_rank() == 0
 
 
 class CheckpointingException(Exception):
