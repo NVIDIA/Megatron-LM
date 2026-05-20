@@ -17,9 +17,7 @@
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
 # example script: 
-# WANDB_PROJECT=qwen35-cp-test  WANDB_MODE=online CP=2 GPUS_PER_NODE=8 CKPT_LOAD=/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/models/Qwen/Qwen3.5-0.8B-fsdp-0420/ USE_FSDP=1 EP=1  GBS=16 MODEL_VARIANT=0.8b   SAVE_INTERVAL=10000 CKPT_RESUME=0 DRY_RUN=0  USE_PACKED_SEQUENCE=1  bash ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
-
-# WANDB_PROJECT=qwen35-cp-test  WANDB_MODE=online CP=1 GPUS_PER_NODE=4 CKPT_LOAD=/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/models/Qwen/Qwen3.5-0.8B-fsdp-0420/ USE_FSDP=1 EP=1  GBS=16 MODEL_VARIANT=0.8b   SAVE_INTERVAL=10000 CKPT_RESUME=0 DRY_RUN=0  USE_PACKED_SEQUENCE=1  bash ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
+# DRY_RUN=0 MODEL_VARIANT=proxy USE_PACKED_SEQUENCE=1  bash ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
 
 set -euo pipefail
 
@@ -242,7 +240,7 @@ TRAINING_ARGS=(
     --cross-entropy-fusion-impl te
     --enable-experimental
     --manual-gc
-    --manual-gc-interval 5
+    --manual-gc-interval 50
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
     --sft
@@ -288,6 +286,8 @@ EVAL_AND_LOGGING_ARGS=(
     --wandb-exp-name "$EXP_NAME"
     --wandb-save-dir "$CHECKPOINT_STORE_PATH"
     --log-throughput
+    --log-timers-to-tensorboard
+    --log-params-norm
 )
 
 # --- Tokenizer ---
@@ -388,6 +388,8 @@ if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
         --moe-aux-loss-coeff 1e-3
         --moe-token-dispatcher-type alltoall
         --moe-router-dtype fp32
+        --moe-permute-fusion
+        --moe-router-fusion
     )
 fi
 
@@ -438,7 +440,6 @@ if [ "$USE_FSDP" -eq 1 ]; then
     FSDP_ARGS=(
         --use-megatron-fsdp
         --data-parallel-sharding-strategy optim_grads_params
-        --no-gradient-accumulation-fusion
         --init-model-with-meta-device
         --use-distributed-optimizer
         --ckpt-format fsdp_dtensor
