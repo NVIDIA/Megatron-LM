@@ -121,11 +121,21 @@ class TextGenerationController:
             self._init_dynamic_sampling_tensors()
 
     def _get_mtp_num_heads(self) -> int:
-        """Get the number of MTP layers from the model config."""
+        """Get the number of MTP depths from the model config.
+
+        When ``mtp_use_repeated_layer`` is enabled a single MTP layer is
+        applied repeatedly, so the number of usable depths equals the
+        configured ``num_speculative_tokens`` rather than the physical
+        layer count stored in ``mtp_num_layers``.
+        """
         model = self.inference_wrapped_model.model
-        if hasattr(model, 'config') and hasattr(model.config, 'mtp_num_layers'):
-            return model.config.mtp_num_layers or 0
-        return 0
+        if not (hasattr(model, 'config') and hasattr(model.config, 'mtp_num_layers')):
+            return 0
+        if not model.config.mtp_num_layers:
+            return 0
+        if getattr(model.config, 'mtp_use_repeated_layer', False):
+            return self.num_speculative_tokens
+        return model.config.mtp_num_layers
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
