@@ -725,7 +725,7 @@ class CompressedSparseAttention(MegatronModule):
                         # indexer_softmax_scale; apply it here via the
                         # weights-scaling trick so the effective weights match
                         # the pre-scale-split behaviour.
-                        weights_for_unfused = weights_indexer * self.indexer.softmax_scale
+                        weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
                         topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
                             q_indexer,
                             weights_for_unfused,
