@@ -37,3 +37,10 @@ def register_platforms() -> None:
     if platform_txda.is_available():
         PLATFORMS["txda"] = platform_txda # use lower keys: txda
         print(f"Megatron-LM-FL Platform: txda Registered")
+
+    # Register NPU Platform
+    from .platform_npu import PlatformNPU
+    platform_npu = PlatformNPU()
+    if platform_npu.is_available():
+        PLATFORMS["npu"] = platform_npu # use lower keys: npu
+        print(f"Megatron-LM-FL Platform: npu Registered")

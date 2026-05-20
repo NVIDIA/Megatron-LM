@@ -24,6 +24,9 @@ def get_platform():
     elif "txda" in PLATFORMS.keys() and PLATFORMS["txda"].is_available():
         cur_platform = PLATFORMS["txda"]
         print(f"Megatron-LM-FL Platform: txda Selected")
+    elif "npu" in PLATFORMS.keys() and PLATFORMS["npu"].is_available():
+        cur_platform = PLATFORMS["npu"]
+        print(f"Megatron-LM-FL Platform: npu Selected")
     elif "cpu" in PLATFORMS.keys() and PLATFORMS["cpu"].is_available():
         cur_platform = PLATFORMS["cpu"]
         print(f"Megatron-LM-FL Platform: cpu Selected")
