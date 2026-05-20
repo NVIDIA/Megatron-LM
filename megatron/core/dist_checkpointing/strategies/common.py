@@ -24,8 +24,7 @@ def save_common(common_state_dict: StateDict, checkpoint_dir: str):
 
     Written by every local rank 0 so that each node has a copy when the
     checkpoint directory is on node-local storage rather than a shared
-    filesystem. On a shared filesystem the duplicate writes are wasted but
-    harmless (identical content).
+    filesystem.
     """
     if is_local_rank_zero():
         path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)

@@ -410,13 +410,6 @@ def save(
         torch.distributed.barrier()
 
     def integrity_finalize_fn():
-        # integrity.json is intentionally written only by global rank 0:
-        # save_integrity_manifest walks the checkpoint directory and hashes
-        # every file it sees, and verify_integrity_manifest also runs only on
-        # global rank 0. Both sides assume a single process can observe the
-        # full checkpoint, which already requires a shared filesystem or
-        # MultiStorageClient backing. Replicating the write per-node would not
-        # remove that requirement.
         if torch.distributed.get_rank() == 0:
             save_integrity_manifest(checkpoint_dir)
         torch.distributed.barrier()
