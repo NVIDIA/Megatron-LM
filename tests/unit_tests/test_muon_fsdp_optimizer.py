@@ -12,6 +12,7 @@ import torch.nn as nn
 from packaging.version import Version
 
 from megatron.core.optimizer import _get_mfsdp_models
+from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
 from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     FSDPTensorParallelMuon,
@@ -138,6 +139,54 @@ def _make_hfsdp_dtensor(local_tensor, global_shape, device_mesh):
     return dtensor
 
 
+def _make_hsdp_dtensor(local_tensor, global_shape, device_mesh):
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        update_uneven_dtensor_chunk_metadata,
+    )
+
+    global_stride = torch.empty(
+        global_shape, dtype=local_tensor.dtype, device=local_tensor.device
+    ).stride()
+    dtensor = DTensor.from_local(
+        local_tensor=local_tensor,
+        device_mesh=device_mesh,
+        placements=[Replicate(), Shard(0)],
+        shape=torch.Size(global_shape),
+        stride=global_stride,
+        run_check=False,
+    )
+    update_uneven_dtensor_chunk_metadata(dtensor)
+    return dtensor
+
+
+def _make_replicated_dtensor(local_tensor, global_shape, device_mesh):
+    from torch.distributed.tensor import DTensor, Replicate
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        update_uneven_dtensor_chunk_metadata,
+    )
+
+    global_stride = torch.empty(
+        global_shape, dtype=local_tensor.dtype, device=local_tensor.device
+    ).stride()
+    dtensor = DTensor.from_local(
+        local_tensor=local_tensor,
+        device_mesh=device_mesh,
+        placements=[Replicate()],
+        shape=torch.Size(global_shape),
+        stride=global_stride,
+        run_check=False,
+    )
+    update_uneven_dtensor_chunk_metadata(dtensor)
+    return dtensor
+
+
+def _as_float(value):
+    return float(value.item()) if isinstance(value, torch.Tensor) else float(value)
+
+
 def _attach_fake_mfsdp_bucket_metadata(param, bucket, item_id, offset):
     bucket.item_index_map[item_id] = SimpleNamespace(
         global_data_index=offset, size=torch.Size(param.shape).numel()
@@ -191,6 +240,90 @@ class TestFSDPTensorParallelMuon:
         yield
         Utils.destroy_model_parallel()
 
+    def test_dtensor_grad_norm_reduces_only_fsdp_shard_dims(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from megatron.core import parallel_state
+
+        world_size = torch.distributed.get_world_size()
+        world_rank = torch.distributed.get_rank()
+        mp_group = parallel_state.get_model_parallel_group()
+
+        fsdp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_cp",))
+        rows_per_rank = 2
+        cols = 3
+        local = torch.full(
+            (rows_per_rank, cols), float(world_rank + 1), device="cuda", dtype=torch.float32
+        )
+        fsdp_grad = _make_dtensor(local, (world_size * rows_per_rank, cols), fsdp_mesh)
+        local_norm = torch.linalg.vector_norm(local).item()
+        expected_sq = torch.linalg.vector_norm(local).pow(2)
+        torch.distributed.all_reduce(expected_sq, group=fsdp_mesh.get_group("dp_cp"))
+        expected = expected_sq.sqrt().item()
+
+        observed = _as_float(get_grad_norm_fp32([fsdp_grad], grad_stats_parallel_group=mp_group))
+        observed_with_duplicate_stats_group = _as_float(
+            get_grad_norm_fp32([fsdp_grad], grad_stats_parallel_group=fsdp_mesh.get_group("dp_cp"))
+        )
+
+        assert observed != pytest.approx(local_norm)
+        assert observed == pytest.approx(expected, rel=1e-6, abs=1e-6)
+        assert observed_with_duplicate_stats_group == pytest.approx(expected, rel=1e-6, abs=1e-6)
+
+        if world_size < 4 or world_size % 2 != 0:
+            return
+
+        outer_size = 2
+        inner_size = world_size // outer_size
+        hsdp_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("outer_fsdp_dp", "dp_cp")
+        )
+        inner_group = hsdp_mesh.get_group("dp_cp")
+        inner_rank = torch.distributed.get_rank(inner_group)
+        hsdp_local = torch.full(
+            (rows_per_rank, cols), float(inner_rank + 1), device="cuda", dtype=torch.float32
+        )
+        hsdp_grad = _make_hsdp_dtensor(hsdp_local, (inner_size * rows_per_rank, cols), hsdp_mesh)
+        hsdp_expected_sq = torch.linalg.vector_norm(hsdp_local).pow(2)
+        torch.distributed.all_reduce(hsdp_expected_sq, group=inner_group)
+        hsdp_expected = hsdp_expected_sq.sqrt().item()
+        hsdp_world_expected_sq = torch.linalg.vector_norm(hsdp_local).pow(2)
+        torch.distributed.all_reduce(hsdp_world_expected_sq)
+        hsdp_world_expected = hsdp_world_expected_sq.sqrt().item()
+
+        hsdp_observed = _as_float(
+            get_grad_norm_fp32([hsdp_grad], grad_stats_parallel_group=mp_group)
+        )
+        hsdp_observed_with_duplicate_stats_group = _as_float(
+            get_grad_norm_fp32([hsdp_grad], grad_stats_parallel_group=inner_group)
+        )
+
+        assert hsdp_observed == pytest.approx(hsdp_expected, rel=1e-6, abs=1e-6)
+        assert hsdp_observed_with_duplicate_stats_group == pytest.approx(
+            hsdp_expected, rel=1e-6, abs=1e-6
+        )
+        assert hsdp_observed != pytest.approx(hsdp_world_expected)
+
+        hfsdp_local = torch.full(
+            (rows_per_rank, cols), float(world_rank + 1), device="cuda", dtype=torch.float32
+        )
+        hfsdp_grad = _make_hfsdp_dtensor(hfsdp_local, (world_size * rows_per_rank, cols), hsdp_mesh)
+        hfsdp_expected_sq = torch.linalg.vector_norm(hfsdp_local).pow(2)
+        torch.distributed.all_reduce(hfsdp_expected_sq)
+        hfsdp_expected = hfsdp_expected_sq.sqrt().item()
+
+        hfsdp_observed = _as_float(
+            get_grad_norm_fp32([hfsdp_grad], grad_stats_parallel_group=mp_group)
+        )
+        hfsdp_observed_with_duplicate_stats_group = _as_float(
+            get_grad_norm_fp32([hfsdp_grad], grad_stats_parallel_group=inner_group)
+        )
+
+        assert hfsdp_observed == pytest.approx(hfsdp_expected, rel=1e-6, abs=1e-6)
+        assert hfsdp_observed_with_duplicate_stats_group == pytest.approx(
+            hfsdp_expected, rel=1e-6, abs=1e-6
+        )
+
     def test_step_gathers_only_split_boundary_params(self):
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.tensor import DTensor
@@ -227,7 +360,7 @@ class TestFSDPTensorParallelMuon:
             local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
             param.grad = _make_dtensor(local_grad, full_grad.shape, device_mesh)
 
-        optimizer = _make_fsdp_muon(params, dp_group=dp_group)
+        optimizer = _make_fsdp_muon(params, dp_group=dp_group, fsdp_batched_all_gather=False)
         assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {1}
 
         # Pre-step: grads are DTensors, non-null, non-zero.
@@ -313,7 +446,7 @@ class TestFSDPTensorParallelMuon:
             local_param = _local_slice(full_param, plan, dp_rank).contiguous()
             params.append(nn.Parameter(_make_dtensor(local_param, full_param.shape, device_mesh)))
 
-        optimizer = _make_fsdp_muon(params, dp_group=dp_group)
+        optimizer = _make_fsdp_muon(params, dp_group=dp_group, fsdp_batched_all_gather=False)
 
         assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0, 1, 2}
 
@@ -368,7 +501,7 @@ class TestFSDPTensorParallelMuon:
         for param, (bucket, item_id, offset) in zip(params, bucket_assignments):
             _attach_fake_mfsdp_bucket_metadata(param, bucket, item_id, offset)
 
-        optimizer = _make_fsdp_muon(params, dp_group=dp_group)
+        optimizer = _make_fsdp_muon(params, dp_group=dp_group, fsdp_batched_all_gather=False)
 
         assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {2}
 
@@ -528,6 +661,59 @@ class TestFSDPTensorParallelMuon:
         ), f"generic HFSDP gather mismatch on rank {dp_rank}"
         assert torch.equal(gathered, expected), f"Muon HFSDP gather mismatch on rank {dp_rank}"
 
+    @pytest.mark.skipif(
+        WORLD_SIZE < 4, reason="HFSDP batched gather test requires at least 4 ranks"
+    )
+    def test_hfsdp_batched_gather_uses_multi_stage_path_bitwise(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+            redistribute_uneven_dtensor_to_replicated,
+        )
+
+        dp_size = torch.distributed.get_world_size()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("HFSDP batched gather test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        logical_rank = inner_rank * outer_size + outer_rank
+
+        rows, cols = dp_size * 3 + 5, 4
+        full_update = (
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) + 17
+        )
+        rows_per_logical_rank = [
+            rows // dp_size + (1 if rank < rows % dp_size else 0) for rank in range(dp_size)
+        ]
+        row_start = sum(rows_per_logical_rank[:logical_rank])
+        row_count = rows_per_logical_rank[logical_rank]
+        local_update = full_update[row_start : row_start + row_count].contiguous()
+
+        param = nn.Parameter(
+            _make_hfsdp_dtensor(local_update.clone(), full_update.shape, device_mesh)
+        )
+        optimizer = _make_fsdp_muon(
+            [param], dp_group=torch.distributed.group.WORLD, fsdp_batched_all_gather=True
+        )
+        plan = optimizer._get_uneven_gather_plan(param)
+        assert plan is not None
+        assert len(plan["stages"]) == 2
+
+        def fail_scalar_gather(*_args, **_kwargs):
+            raise AssertionError("HFSDP batched gather should not use the scalar fallback")
+
+        with patch.object(optimizer, "_gather_full_uneven_local_tensor_like", fail_scalar_gather):
+            gathered = optimizer._gather_full_uneven_local_tensors_like([(param, local_update)])[0]
+        ref_dtensor = optimizer._dtensor_from_local_like(param, local_update)
+        expected = redistribute_uneven_dtensor_to_replicated(ref_dtensor)._local_tensor
+
+        assert torch.equal(gathered, expected), "Batched HFSDP gather produced wrong tensor"
+
     @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP cache test requires at least 4 ranks")
     def test_hfsdp_boundary_metadata_collectives_are_cached_across_steps(self):
         from torch.distributed.device_mesh import init_device_mesh
@@ -661,6 +847,282 @@ class TestFSDPTensorParallelMuon:
             optimizer.step()
 
         assert gather_batches == [[(4, cols), (4, cols)]]
+
+    def test_padded_batch_gather_matches_uneven_batch_and_reuses_scratch(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plans = [{0: 2, 1: 3}, {0: 1, 1: 4}]
+        full_grads = [
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) + idx
+            for idx, rows in enumerate([5, 5])
+        ]
+        full_grads_second = [
+            full_grad + 1000 * (idx + 1) for idx, full_grad in enumerate(full_grads)
+        ]
+        params = []
+        items = []
+        items_second = []
+        for full_grad, plan in zip(full_grads, plans):
+            local_value = _local_slice(torch.zeros_like(full_grad), plan, dp_rank).contiguous()
+            param = nn.Parameter(_make_dtensor(local_value, full_grad.shape, device_mesh))
+            local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+            items.append((param, local_grad))
+            params.append(param)
+        for param, full_grad, plan in zip(params, full_grads_second, plans):
+            local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+            items_second.append((param, local_grad))
+
+        with patch.dict(
+            os.environ,
+            {"MUON_FSDP_PADDED_ALL_GATHER": "0", "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000"},
+        ):
+            uneven_optimizer = _make_fsdp_muon(
+                params, dp_group=dp_group, fsdp_batched_all_gather=True
+            )
+            uneven_results = uneven_optimizer._gather_full_uneven_local_tensors_like(items)
+
+        with patch.dict(
+            os.environ,
+            {
+                "MUON_FSDP_PADDED_ALL_GATHER": "1",
+                "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000",
+                "MUON_FSDP_REUSE_GATHER_SCRATCH": "1",
+            },
+        ):
+            padded_optimizer = _make_fsdp_muon(
+                params, dp_group=dp_group, fsdp_batched_all_gather=True
+            )
+            padded_calls = []
+            real_padded_gather = padded_optimizer._all_gather_padded_equal_size
+
+            def counting_padded_gather(*args, **kwargs):
+                padded_calls.append(args[1])
+                return real_padded_gather(*args, **kwargs)
+
+            with patch.object(
+                padded_optimizer, "_all_gather_padded_equal_size", counting_padded_gather
+            ):
+                padded_results = padded_optimizer._gather_full_uneven_local_tensors_like(items)
+                scratch_bytes_after_first = padded_optimizer._fsdp_gather_scratch_cache_bytes()
+                padded_results_second = padded_optimizer._gather_full_uneven_local_tensors_like(
+                    items_second
+                )
+
+        assert len(padded_calls) == 2
+        assert padded_optimizer._fsdp_gather_scratch_cache_bytes() == scratch_bytes_after_first
+
+        for idx, (
+            padded,
+            padded_second,
+            uneven,
+            full_grad,
+            full_grad_second,
+            (_, local_grad),
+        ) in enumerate(
+            zip(
+                padded_results,
+                padded_results_second,
+                uneven_results,
+                full_grads,
+                full_grads_second,
+                items,
+            )
+        ):
+            if local_grad.numel() == 0:
+                assert padded is None
+                assert padded_second is None
+                assert uneven is None
+                continue
+            torch.testing.assert_close(padded, full_grad, atol=0, rtol=0)
+            torch.testing.assert_close(padded_second, full_grad_second, atol=0, rtol=0)
+            torch.testing.assert_close(padded, uneven, atol=0, rtol=0, msg=f"param {idx}")
+
+    def test_gather_scratch_reuse_can_be_disabled(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plan = {0: 2, 1: 3}
+        full_grad = torch.arange(5 * cols, device="cuda", dtype=torch.float32).view(5, cols)
+        local_value = _local_slice(torch.zeros_like(full_grad), plan, dp_rank).contiguous()
+        param = nn.Parameter(_make_dtensor(local_value, full_grad.shape, device_mesh))
+        local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+
+        with patch.dict(
+            os.environ,
+            {
+                "MUON_FSDP_PADDED_ALL_GATHER": "1",
+                "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000",
+                "MUON_FSDP_REUSE_GATHER_SCRATCH": "0",
+            },
+        ):
+            optimizer = _make_fsdp_muon([param], dp_group=dp_group, fsdp_batched_all_gather=True)
+            result = optimizer._gather_full_uneven_local_tensors_like([(param, local_grad)])[0]
+
+        assert optimizer._fsdp_gather_scratch_cache_bytes() == 0
+        if local_grad.numel() == 0:
+            assert result is None
+        else:
+            torch.testing.assert_close(result, full_grad, atol=0, rtol=0)
+
+    def test_padded_batch_gather_respects_padding_threshold(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plan = {0: 1, 1: 5}
+        full_grad = torch.arange(6 * cols, device="cuda", dtype=torch.float32).view(6, cols)
+        local_value = _local_slice(torch.zeros_like(full_grad), plan, dp_rank).contiguous()
+        param = nn.Parameter(_make_dtensor(local_value, full_grad.shape, device_mesh))
+        local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+
+        with patch.dict(
+            os.environ,
+            {"MUON_FSDP_PADDED_ALL_GATHER": "1", "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1.0"},
+        ):
+            optimizer = _make_fsdp_muon([param], dp_group=dp_group, fsdp_batched_all_gather=True)
+
+            def fail_padded_gather(*_args, **_kwargs):
+                raise AssertionError("padding threshold should select the uneven gather path")
+
+            with patch.object(optimizer, "_all_gather_padded_equal_size", fail_padded_gather):
+                result = optimizer._gather_full_uneven_local_tensors_like([(param, local_grad)])[0]
+
+        if local_grad.numel() == 0:
+            assert result is None
+        else:
+            torch.testing.assert_close(result, full_grad, atol=0, rtol=0)
+
+    def test_batched_gather_plan_none_falls_back_to_replicated_dtensor(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        full_grad = torch.arange(5 * 4, device="cuda", dtype=torch.float32).view(5, 4)
+        param = nn.Parameter(
+            _make_replicated_dtensor(full_grad.clone(), full_grad.shape, device_mesh)
+        )
+
+        optimizer = _make_fsdp_muon([param], dp_group=dp_group, fsdp_batched_all_gather=True)
+        result = optimizer._gather_full_uneven_local_tensors_like([(param, full_grad.clone())])[0]
+
+        torch.testing.assert_close(result, full_grad, atol=0, rtol=0)
+
+    def test_batched_gather_partitions_by_dtype(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+        plan = {0: 2, 1: 3}
+        dtypes = [torch.float32, torch.bfloat16]
+        full_grads = [
+            (torch.arange(5 * cols, device="cuda", dtype=torch.float32).view(5, cols) + idx).to(
+                dtype=dtype
+            )
+            for idx, dtype in enumerate(dtypes)
+        ]
+        params = []
+        items = []
+        for full_grad in full_grads:
+            local_value = _local_slice(torch.zeros_like(full_grad), plan, dp_rank).contiguous()
+            param = nn.Parameter(_make_dtensor(local_value, full_grad.shape, device_mesh))
+            local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+            params.append(param)
+            items.append((param, local_grad))
+
+        with patch.dict(
+            os.environ,
+            {"MUON_FSDP_PADDED_ALL_GATHER": "1", "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000"},
+        ):
+            optimizer = _make_fsdp_muon(params, dp_group=dp_group, fsdp_batched_all_gather=True)
+            batch_sizes = []
+            real_batch_gather = optimizer._gather_full_uneven_local_tensor_batch
+
+            def counting_batch_gather(items_arg, results_arg, batch):
+                batch_sizes.append(len(batch["item_indices"]))
+                return real_batch_gather(items_arg, results_arg, batch)
+
+            with patch.object(
+                optimizer, "_gather_full_uneven_local_tensor_batch", counting_batch_gather
+            ):
+                results = optimizer._gather_full_uneven_local_tensors_like(items)
+
+        assert batch_sizes == [1, 1]
+        for result, full_grad, (_, local_grad) in zip(results, full_grads, items):
+            if local_grad.numel() == 0:
+                assert result is None
+                continue
+            assert result.dtype == full_grad.dtype
+            torch.testing.assert_close(result, full_grad, atol=0, rtol=0)
+
+    def test_batched_gather_splits_on_gather_byte_budget(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plans = [{0: 2, 1: 3}, {0: 2, 1: 3}]
+        full_grads = [
+            torch.arange(5 * cols, device="cuda", dtype=torch.float32).view(5, cols) + idx
+            for idx in range(2)
+        ]
+        params = []
+        items = []
+        for full_grad, plan in zip(full_grads, plans):
+            local_value = _local_slice(torch.zeros_like(full_grad), plan, dp_rank).contiguous()
+            param = nn.Parameter(_make_dtensor(local_value, full_grad.shape, device_mesh))
+            local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+            params.append(param)
+            items.append((param, local_grad))
+
+        with patch.dict(
+            os.environ,
+            {
+                "MUON_FSDP_PADDED_ALL_GATHER": "1",
+                "MUON_FSDP_PADDED_ALL_GATHER_PAD_FACTOR": "1000",
+                "MUON_FSDP_BATCH_MAX_GATHER_BYTES": "64",
+            },
+        ):
+            optimizer = _make_fsdp_muon(params, dp_group=dp_group, fsdp_batched_all_gather=True)
+            batch_sizes = []
+            real_batch_gather = optimizer._gather_full_uneven_local_tensor_batch
+
+            def counting_batch_gather(items_arg, results_arg, batch):
+                batch_sizes.append(len(batch["item_indices"]))
+                return real_batch_gather(items_arg, results_arg, batch)
+
+            with patch.object(
+                optimizer, "_gather_full_uneven_local_tensor_batch", counting_batch_gather
+            ):
+                results = optimizer._gather_full_uneven_local_tensors_like(items)
+
+        assert batch_sizes == [1, 1]
+        for result, full_grad, (_, local_grad) in zip(results, full_grads, items):
+            if local_grad.numel() == 0:
+                assert result is None
+            else:
+                torch.testing.assert_close(result, full_grad, atol=0, rtol=0)
 
     def test_boundary_metadata_collectives_are_cached_across_steps(self):
         from torch.distributed.device_mesh import init_device_mesh
@@ -860,6 +1322,133 @@ class TestFSDPTensorParallelMuon:
                     msg=(
                         "Muon+M-FSDP diverged from unsharded Muon "
                         f"on step {step}, param {idx}, rank {dp_rank}"
+                    ),
+                )
+
+    @pytest.mark.skipif(WORLD_SIZE < 4, reason="Hybrid topology numerics test requires 4+ ranks")
+    @pytest.mark.parametrize("topology", ["hsdp", "hfsdp"])
+    def test_hybrid_step_matches_unsharded_muon_optimizer_step_numerics(self, topology):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        world_rank = torch.distributed.get_rank()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("Hybrid topology numerics test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("outer_fsdp_dp", "dp_cp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        optimizer_dp_group = torch.distributed.group.WORLD
+        cols = 4
+        rows_by_param = [dp_size + 3, dp_size * 2 + 1, dp_size + 5]
+        optimizer_kwargs = dict(
+            lr=0.03, momentum=0.25, nesterov=True, weight_decay=0.02, num_ns_steps=3
+        )
+
+        full_params = [
+            (
+                torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols)
+                + 1.7 * (idx + 1)
+            )
+            / (19 + idx)
+            for idx, rows in enumerate(rows_by_param)
+        ]
+        full_grads_by_step = [
+            [
+                (
+                    torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols)
+                    + 0.9 * (idx + 1)
+                    + step
+                )
+                / (29 + idx + step)
+                for idx, rows in enumerate(rows_by_param)
+            ]
+            for step in range(2)
+        ]
+
+        unsharded_params = [nn.Parameter(full_param.clone()) for full_param in full_params]
+        unsharded_optimizer = TensorParallelMuon(
+            params=unsharded_params,
+            pg_collection=None,
+            tp_mode="duplicated",
+            split_qkv=False,
+            **optimizer_kwargs,
+        )
+
+        sharded_params = []
+        local_slice_fns = []
+        for full_param in full_params:
+            if topology == "hsdp":
+                rows_per_inner_rank = [
+                    full_param.shape[0] // inner_size
+                    + (1 if rank < full_param.shape[0] % inner_size else 0)
+                    for rank in range(inner_size)
+                ]
+                row_start = sum(rows_per_inner_rank[:inner_rank])
+                row_count = rows_per_inner_rank[inner_rank]
+                make_dtensor = _make_hsdp_dtensor
+
+                def local_slice(tensor, start=row_start, count=row_count):
+                    return tensor[start : start + count].contiguous()
+
+            else:
+                logical_rank = inner_rank * outer_size + outer_rank
+                rows_per_logical_rank = [
+                    full_param.shape[0] // dp_size
+                    + (1 if rank < full_param.shape[0] % dp_size else 0)
+                    for rank in range(dp_size)
+                ]
+                row_start = sum(rows_per_logical_rank[:logical_rank])
+                row_count = rows_per_logical_rank[logical_rank]
+                make_dtensor = _make_hfsdp_dtensor
+
+                def local_slice(tensor, start=row_start, count=row_count):
+                    return tensor[start : start + count].contiguous()
+
+            local_param = local_slice(full_param)
+            sharded_params.append(
+                nn.Parameter(make_dtensor(local_param, full_param.shape, device_mesh))
+            )
+            local_slice_fns.append(local_slice)
+
+        sharded_optimizer = _make_fsdp_muon(
+            sharded_params, dp_group=optimizer_dp_group, **optimizer_kwargs
+        )
+
+        for step, full_grads in enumerate(full_grads_by_step, start=1):
+            for param, full_grad in zip(unsharded_params, full_grads):
+                param.grad = full_grad.clone()
+            for param, full_grad, local_slice, full_param in zip(
+                sharded_params, full_grads, local_slice_fns, full_params
+            ):
+                local_grad = local_slice(full_grad)
+                make_dtensor = _make_hsdp_dtensor if topology == "hsdp" else _make_hfsdp_dtensor
+                param.grad = make_dtensor(local_grad, full_param.shape, device_mesh)
+
+            unsharded_optimizer.step()
+            sharded_optimizer.step()
+
+            for idx, (sharded_param, unsharded_param, local_slice) in enumerate(
+                zip(sharded_params, unsharded_params, local_slice_fns)
+            ):
+                expected_local = local_slice(unsharded_param.detach())
+                local_value = sharded_param.data.to_local()
+
+                if local_value.numel() == 0:
+                    assert local_value.shape[0] == 0
+                    continue
+
+                torch.testing.assert_close(
+                    local_value,
+                    expected_local,
+                    atol=1e-5,
+                    rtol=1e-4,
+                    msg=(
+                        f"Muon+M-FSDP {topology} diverged from unsharded Muon "
+                        f"on step {step}, param {idx}, rank {world_rank}"
                     ),
                 )
 
