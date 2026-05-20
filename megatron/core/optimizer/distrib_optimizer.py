@@ -676,8 +676,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         self.is_stub_optimizer = False
-        if self.ddp_config.use_megatron_fsdp:
-            # Megatron-FSDP will manage optimizer weights and gradients.
+        if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api:
+            # Megatron-FSDP / FSDP v2 will manage optimizer weights and gradients.
             return
 
         # Model grad buffer ranges.
@@ -783,7 +783,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the standard model/RNG checkpoint file. The parameter and dependent
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
+
+        For Megatron-FSDP / FSDP v2, the full inner optimizer state dict is
+        returned directly because FSDP manages parameter state as DTensors and
+        the standard PyTorch DCP / get_state_dict() APIs expect a complete
+        optimizer state dict.
         """
+        if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api:
+            return self.optimizer.state_dict()
+
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
@@ -867,9 +875,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
-        if self.ddp_config.use_megatron_fsdp:
-            # When using Megatron-FSDP, directly load the optimizer state
-            # into the wrapped optimizer.
+        if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api:
+            # When using Megatron-FSDP / FSDP v2, directly load the optimizer
+            # state into the wrapped optimizer.
             if "param_to_group_meta" in state_dict:
                 state_dict["param_groups"] = self._param2group_meta_to_param_groups(
                     state_dict["param_to_group_meta"], self.optimizer.param_groups
@@ -1455,12 +1463,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
 
         # Handle FSDP DistributedOptimizer States
-        if self.ddp_config.use_megatron_fsdp and sharding_type != "fsdp_dtensor":
+        if (
+            self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api
+        ) and sharding_type != "fsdp_dtensor":
             raise NotImplementedError(
                 f"sharding_type {sharding_type} is not supported with Megatron FSDP."
             )
         if sharding_type == "fsdp_dtensor":
-            # Megatron-FSDP custom sharded state dict construction.
+            # Megatron-FSDP / FSDP v2 custom sharded state dict construction.
             state_dict = self.sharded_param_state_fsdp_dtensor(is_loading)
             return state_dict
 
@@ -1579,7 +1589,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Sharded state dict where each parameter is a separate PyTorch DTensor.
         """
         assert (
-            self.ddp_config.use_megatron_fsdp
+            self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api
         ), "fsdp_dtensor sharding type is only supported with Megatron FSDP."
 
         # Initialize optimizer states with dummy values if loading.

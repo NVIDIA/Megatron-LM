@@ -1429,6 +1429,66 @@ class MegatronFSDP(torch.nn.Module):
         """
         self.param_and_grad_buffer.copy_main_weights_to_model_weights()
 
+    def _compute_per_param_norms(self):
+        """
+        Compute per-parameter L2 norms for params and grads.
+
+        Returns a dict {param_name: {"param_norm": float, "grad_norm": float}}.
+        The norms are globally reduced across DP ranks for direct comparison.
+        """
+        results = {}
+        pg_buffer = self.param_and_grad_buffer
+        param_to_group = pg_buffer.param_to_param_group
+        dp_group = self.dist_index.get_dp_group(is_expert_parallel=False)
+
+        for full_name, param in self.module.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
+            if hasattr(param, '_local_tensor'):
+                local_param = param._local_tensor
+            else:
+                local_param = param
+            if local_param.numel() > 0:
+                results[full_name]["param_norm"] = local_param.float().norm(p=2).item() ** 2
+
+            if param in param_to_group:
+                group = pg_buffer.parameter_groups[param_to_group[param]]
+                if group.requires_grad:
+                    gbuf = (
+                        group.hfsdp_helper_gbuf
+                        if group.hfsdp_helper_gbuf
+                        else group.main_grad_buffer
+                    )
+                    if gbuf is not None and hasattr(gbuf, 'data') and gbuf.data is not None:
+                        item_id = group.param_idx[param]
+                        local_grad = gbuf.get_item(item_id, only_shard=True)
+                        if local_grad.numel() > 0:
+                            results[full_name]["grad_norm"] = (
+                                local_grad.float().norm(p=2).item() ** 2
+                            )
+
+        for param_name in results:
+            for key in ("param_norm", "grad_norm"):
+                t = torch.tensor([results[param_name][key]], device="cuda")
+                torch.distributed.all_reduce(t, group=dp_group)
+                results[param_name][key] = t.sqrt().item()
+        return results
+
+    def _log_per_param_norms(self, iteration: int, prefix: str = ""):
+        """Log per-parameter param and gradient L2 norms via print (rank 0 only)."""
+        norms = self._compute_per_param_norms()
+        if torch.distributed.get_rank() != 0:
+            return
+        for param_name in sorted(norms.keys()):
+            pn = norms[param_name]["param_norm"]
+            gn = norms[param_name]["grad_norm"]
+            logger.info(
+                f"{prefix} iter={iteration} param={param_name} "
+                f"param_norm={pn:.6f} grad_norm={gn:.6f}"
+            )
+
     def broadcast_params(self):
         """
         Syncs parameters across all DP ranks.
