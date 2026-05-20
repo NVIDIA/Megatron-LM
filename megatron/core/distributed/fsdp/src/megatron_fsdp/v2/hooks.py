@@ -45,9 +45,12 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module |
             bwd_pass=False,
         )
 
-    return (hook_module or fsdp_module).register_forward_pre_hook(
-        unshard_param_groups, prepend=True
-    )
+    # In the normal path, the hook is installed on the FSDP module itself.
+    # Fine-grained recompute can replay a child forward without entering the
+    # FSDP module's forward, so the same owner hook may need to be installed
+    # on a child module while still unsharding the owning FSDP module above.
+    module_to_hook = hook_module if hook_module is not None else fsdp_module
+    return module_to_hook.register_forward_pre_hook(unshard_param_groups, prepend=True)
 
 
 def _register_fine_grained_forward_pre_hooks(module: FSDPModule):
