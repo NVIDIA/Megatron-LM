@@ -25,7 +25,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -414,13 +414,7 @@ class GPTModel(LanguageModule):
         if (
             in_inference_mode
             and inference_context is not None
-            and (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
+            and (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context.is_static_batching()
         ):
             current_batch_size = input_ids.shape[0]
@@ -571,6 +565,7 @@ class GPTModel(LanguageModule):
             loss_mask=loss_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
@@ -594,6 +589,7 @@ class GPTModel(LanguageModule):
         loss_mask=None,
         decoder_input=None,
         attention_mask=None,
+        padding_mask=None,
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
@@ -638,6 +634,7 @@ class GPTModel(LanguageModule):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
                 embedding=self.embedding,
                 **(extra_block_kwargs or {}),
             )
