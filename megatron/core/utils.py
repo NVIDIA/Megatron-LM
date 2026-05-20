@@ -38,9 +38,17 @@ try:
     from torch.distributed._tensor import DTensor
     from torch.distributed.tensor.placement_types import Shard
 
+    try:
+        from torch.distributed.tensor.placement_types import _StridedShard
+    except ImportError:
+        _StridedShard = None
+
     HAVE_DTENSOR = True
 except ImportError:
     HAVE_DTENSOR = False
+    DTensor = None
+    Shard = None
+    _StridedShard = None
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
@@ -1050,6 +1058,67 @@ def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
     """Returns the local shard of the given tensor if it is a DTensor."""
     with torch.no_grad():
         return tensor.to_local() if HAVE_DTENSOR and isinstance(tensor, DTensor) else tensor
+
+
+def is_same_process_group(
+    group: torch.distributed.ProcessGroup | None, other: torch.distributed.ProcessGroup | None
+) -> bool:
+    """Returns whether two process groups contain the same ranks."""
+    if group is other:
+        return True
+    if group is None or other is None:
+        return False
+    try:
+        return torch.distributed.get_process_group_ranks(
+            group
+        ) == torch.distributed.get_process_group_ranks(other)
+    except (RuntimeError, ValueError):
+        return False
+
+
+def contains_process_group(
+    groups: list[torch.distributed.ProcessGroup], group: torch.distributed.ProcessGroup | None
+) -> bool:
+    """Returns whether `groups` already contains a process group with `group`'s ranks."""
+    return any(is_same_process_group(group, existing) for existing in groups)
+
+
+def append_unique_process_group(
+    groups: list[torch.distributed.ProcessGroup], group: torch.distributed.ProcessGroup | None
+) -> None:
+    """Appends `group` to `groups` if an equivalent process group is not already present."""
+    if group is None:
+        return
+    if not contains_process_group(groups, group):
+        groups.append(group)
+
+
+def get_dtensor_data_parallel_shard_groups(
+    tensor: "torch.Tensor | DTensor",
+) -> list[torch.distributed.ProcessGroup]:
+    """Return DTensor shard groups that should contribute to global grad stats.
+
+    Megatron-FSDP represents HSDP/HFSDP with DTensors whose FSDP dimensions are named `dp_cp` and
+    optionally `outer_fsdp_dp`, while tensor parallelism uses `tp`. Grad stats should reduce over
+    FSDP shard dimensions and leave tensor/model-parallel reductions to the caller.
+    """
+    if not HAVE_DTENSOR or not isinstance(tensor, DTensor):
+        return []
+
+    shard_placement_types = (Shard,) if _StridedShard is None else (Shard, _StridedShard)
+    mesh = tensor.device_mesh
+    mesh_dim_names = getattr(mesh, "mesh_dim_names", None)
+    groups = []
+    for mesh_dim, placement in enumerate(tensor.placements):
+        if not isinstance(placement, shard_placement_types):
+            continue
+        mesh_dim_name = None
+        if mesh_dim_names is not None and mesh_dim < len(mesh_dim_names):
+            mesh_dim_name = mesh_dim_names[mesh_dim]
+        if mesh_dim_name == "tp":
+            continue
+        append_unique_process_group(groups, mesh.get_group(mesh_dim))
+    return groups
 
 
 def get_data_parallel_group_if_dtensor(
