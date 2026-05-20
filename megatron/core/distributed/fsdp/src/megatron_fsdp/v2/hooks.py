@@ -30,16 +30,41 @@ from .utils import RegisterFSDPBackwardFunction
 logger = logging.getLogger(__name__)
 
 
-def _register_forward_pre_hook(module: FSDPModule):
-    """Register pre-forward hook to unshard parameters."""
+def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module | None = None):
+    """Register a pre-forward hook to unshard parameters for this FSDP unit."""
 
-    def unshard_param_groups(module, *unused):
-        ctx = module._fsdp_root_context
-        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
+    def unshard_param_groups(_hook_module, *unused):
+        ctx = fsdp_module._fsdp_root_context
+        if ctx.backward_phase:
+            fsdp_module.unshard(
+                async_op=ctx.enable_unshard_prefetch,
+                bwd_pass=True,
+            )
+        fsdp_module.unshard(
+            async_op=ctx.enable_unshard_prefetch,
+            bwd_pass=False,
+        )
 
-    module._mfsdp_forward_pre_hook = module.register_forward_pre_hook(
-        unshard_param_groups, prepend=True
-    )
+    # In the normal path, the hook is installed on the FSDP module itself.
+    # Fine-grained recompute can replay a child forward without entering the
+    # FSDP module's forward, so the same owner hook may need to be installed
+    # on a child module while still unsharding the owning FSDP module above.
+    module_to_hook = hook_module if hook_module is not None else fsdp_module
+    return module_to_hook.register_forward_pre_hook(unshard_param_groups, prepend=True)
+
+
+def _register_fine_grained_forward_pre_hooks(module: FSDPModule):
+    """Register pre-forward hooks on this FSDP unit and its owned submodules."""
+
+    nested_fsdp_modules = set()
+    for submodule in module.modules():
+        if submodule is not module and isinstance(submodule, FSDPModule):
+            nested_fsdp_modules.update(submodule.modules())
+
+    for submodule in module.modules():
+        if submodule in nested_fsdp_modules:
+            continue
+        _register_forward_pre_hook(module, hook_module=submodule)
 
 
 def _register_forward_hook(module: FSDPModule):
@@ -108,7 +133,10 @@ def _register_backward_pre_hook(module: FSDPModule):
                     setattr(param, "overwrite_main_grad", True)
         if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
             _register_post_backward_final_callback(module._fsdp_state, module)
-        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
+        module.unshard(
+            async_op=ctx.enable_unshard_prefetch,
+            bwd_pass=True,
+        )
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=pre_backward_hook

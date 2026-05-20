@@ -284,7 +284,7 @@ class FSDPModule(nn.Module):
                 recurse=False,
             )
             init_context = (
-                mp_policy.model_init_context() if mp_policy is not None else nullcontext()
+                mp_policy.model_init_context(m) if mp_policy is not None else nullcontext()
             )
             with init_context:
                 if hasattr(m, "reset_parameters"):
@@ -369,7 +369,11 @@ class FSDPModule(nn.Module):
                 child._fsdp_state._is_root = False
                 setattr(child, "_fsdp_root_context", root_context)
 
-    def unshard(self, async_op: bool = False, bwd_pass: bool = False):
+    def unshard(
+        self,
+        async_op: bool = False,
+        bwd_pass: bool = False,
+    ):
         """
         Unshard parameters by all-gathering from the sharded buffer.
 
@@ -394,8 +398,13 @@ class FSDPModule(nn.Module):
         else:
             prefetch_modules = []
         for module in [self] + prefetch_modules:
-            if ctx.unshard_done_events[id(module)] is not None:
-                continue  # Skip if unshard already issued for this module
+            if all(
+                param_group.has_unsharded_weight_buffers(
+                    bwd_pass=bwd_pass,
+                )
+                for param_group in module._fsdp_param_groups
+            ):
+                continue
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
 
@@ -409,7 +418,9 @@ class FSDPModule(nn.Module):
                         ).any(), f"NaN detected in dist param for parameter {name}"
 
                 with torch.cuda.stream(stream):
-                    param_group.unshard(is_bwd=bwd_pass)
+                    param_group.unshard(
+                        bwd_pass=bwd_pass,
+                    )
 
             # Record event to track when unshard is done for this module
             if async_op:
@@ -558,17 +569,23 @@ class FSDPModule(nn.Module):
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
-        """Scale gradients by a factor (e.g., for loss scaling)."""
+        """Scale optimizer-facing gradients by a factor."""
         ctx = self._fsdp_root_context
         torch.cuda.current_stream().wait_stream(ctx.rs_stream)
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                for dist_grad in param_group.dist_grads:
-                    if dist_grad is None:
+                for dist_param in param_group.dist_params:
+                    grad = getattr(dist_param, "decoupled_grad", None)
+                    if grad is None:
+                        grad = dist_param.grad
+                    if grad is None:
                         continue
-                    dist_grad._local_tensor.mul_(scaling_factor)
+                    if isinstance(grad, DTensor):
+                        grad._local_tensor.mul_(scaling_factor)
+                    else:
+                        grad.mul_(scaling_factor)
 
     def _zero_grad_buffer(self):
         """Zero the gradient buffer for all parameter groups."""

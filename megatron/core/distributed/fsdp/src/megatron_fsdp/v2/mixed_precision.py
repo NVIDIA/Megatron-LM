@@ -7,7 +7,7 @@ config objects belongs in the adapter layer.
 """
 
 import inspect
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from importlib.metadata import version
 from typing import List, Optional, Tuple
@@ -87,6 +87,18 @@ except Exception:
     except Exception:
         QUANTIZED_MODEL_INIT_CLASS = nullcontext
 
+try:
+    from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+except Exception:
+    TransformerEngineBaseModule = None
+
+try:
+    from megatron.core.tensor_parallel import get_cuda_rng_tracker
+except Exception:
+    from ..utils import get_cuda_rng_tracker
+
+from ..utils import _MODEL_PARALLEL_RNG_TRACKER_NAME
+
 if not HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
     try:
         from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
@@ -159,22 +171,35 @@ class FullyShardMixedPrecisionPolicy:
         object.__setattr__(self, "fp8_recipe", self.fp8.recipe)
         object.__setattr__(self, "keep_fp8_transpose_cache", self.fp8.keep_transpose_cache)
 
-    def model_init_context(self):
+    @contextmanager
+    def model_init_context(self, module: Optional[torch.nn.Module] = None):
         """Return the model-init context for mixed precision parameter creation."""
-        if not self.fp8.enabled:
-            return nullcontext()
+        with ExitStack() as stack:
+            if self.fp8.enabled:
+                # TE initializes FP8 parameters while preserving a high-precision value
+                # that can seed the optimizer main-weight buffer.
+                assert (
+                    QUANTIZED_MODEL_INIT_CLASS is not nullcontext
+                ), "Transformer Engine is required for FP8 parameter initialization"
+                args = {"enabled": True}
+                if "preserve_high_precision_init_val" in inspect.signature(
+                    QUANTIZED_MODEL_INIT_CLASS
+                ).parameters:
+                    args["preserve_high_precision_init_val"] = True
+                stack.enter_context(QUANTIZED_MODEL_INIT_CLASS(**args))
 
-        # TE initializes FP8 parameters while preserving a high-precision value
-        # that can seed the optimizer main-weight buffer.
-        assert (
-            QUANTIZED_MODEL_INIT_CLASS is not nullcontext
-        ), "Transformer Engine is required for FP8 parameter initialization"
-        args = {"enabled": True}
-        if "preserve_high_precision_init_val" in inspect.signature(
-            QUANTIZED_MODEL_INIT_CLASS
-        ).parameters:
-            args["preserve_high_precision_init_val"] = True
-        return QUANTIZED_MODEL_INIT_CLASS(**args)
+            if (
+                module is not None
+                and TransformerEngineBaseModule is not None
+                and TE_VERSION is not None
+                and TE_VERSION >= PkgVersion("0.9.0")
+                and not isinstance(module, TransformerEngineBaseModule)
+            ):
+                cuda_rng_tracker = get_cuda_rng_tracker()
+                if _MODEL_PARALLEL_RNG_TRACKER_NAME in cuda_rng_tracker.states_:
+                    stack.enter_context(cuda_rng_tracker.fork())
+
+            yield
 
     def group_key_dtype(self, tensor: torch.Tensor):
         """Return the parameter grouping dtype key."""
@@ -195,6 +220,14 @@ class FullyShardMixedPrecisionPolicy:
     def is_fp8_param(self, tensor: torch.Tensor) -> bool:
         """Return whether ``tensor`` is managed as an FP8 parameter."""
         return is_fp8_param(tensor)
+
+    def fine_grained_forward_hooks_required(self, param_groups) -> bool:
+        """Return whether submodule forward hooks are needed for these parameter groups."""
+        for param_group in param_groups:
+            for param in param_group.params:
+                if self.is_fp8_param(param):
+                    return True
+        return False
 
     @staticmethod
     def model_weight_buffer_dtype(tensor: torch.Tensor) -> torch.dtype:
@@ -265,10 +298,10 @@ class FullyShardMixedPrecisionPolicy:
         model_weight_buffer,
         transpose_weight_buffer=None,
         *,
-        is_bwd: bool = False,
+        bwd_pass: bool = False,
     ) -> List:
-        """Return the model-weight buffers needed for this unshard phase."""
-        if is_bwd and transpose_weight_buffer is not None:
+        """Return the weight buffer needed for forward or backward compute."""
+        if bwd_pass and transpose_weight_buffer is not None:
             return [transpose_weight_buffer]
         return [model_weight_buffer]
 
@@ -304,7 +337,11 @@ class FullyShardMixedPrecisionPolicy:
         ), "Transformer Engine >= 2.0 is required for FP8 dequantize"
         return tensor.dequantize()
 
-    def post_unshard(self, params: List[torch.Tensor], is_bwd: bool = False) -> None:
+    def post_unshard(
+        self,
+        params: List[torch.Tensor],
+        bwd_pass: bool = False,
+    ) -> None:
         """Run post-unshard mixed precision processing for a parameter group."""
         params = [param for param in params if self.is_fp8_param(param)]
         if len(params) == 0:
@@ -314,7 +351,7 @@ class FullyShardMixedPrecisionPolicy:
             # Match v1: forward only rebinds rowwise raw data. Do not mark the
             # MXFP8 columnwise payload unavailable since TE may request the
             # backward workspace from inside the forward call stack.
-            if is_bwd:
+            if bwd_pass:
                 if HAVE_TE_POST_ALL_GATHER_PROCESSING:
                     post_all_gather_processing(params)
                 else:
@@ -337,7 +374,10 @@ class FullyShardMixedPrecisionPolicy:
                     param._create_columnwise()
         for param in params:
             if hasattr(param, "update_usage"):
-                param.update_usage(rowwise_usage=not is_bwd, columnwise_usage=True)
+                param.update_usage(
+                    rowwise_usage=not bwd_pass,
+                    columnwise_usage=True,
+                )
 
     def post_reshard(self, params: List[torch.Tensor]) -> None:
         """Run post-reshard mixed precision processing for a parameter group."""

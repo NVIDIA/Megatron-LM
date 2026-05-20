@@ -207,7 +207,11 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(self, async_op: bool = False, is_bwd: bool = False):
+    def unshard(
+        self,
+        async_op: bool = False,
+        bwd_pass: bool = False,
+    ):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
@@ -218,16 +222,39 @@ class ParameterGroup:
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer,
             self.transpose_weight_buffer,
-            is_bwd=is_bwd,
+            bwd_pass=bwd_pass,
         ):
+            if weight_buffer is None:
+                continue
+            if weight_buffer.is_distributed and weight_buffer.is_unsharded():
+                continue
             _, weight_work = weight_buffer.unshard(
                 async_op=async_op,
             )
             if work is None:
                 work = weight_work
 
-        self.mp_policy.post_unshard(self.params, is_bwd=is_bwd)
+        self.mp_policy.post_unshard(
+            self.params,
+            bwd_pass=bwd_pass,
+        )
         return work
+
+    def has_unsharded_weight_buffers(
+        self,
+        bwd_pass: bool = False,
+    ) -> bool:
+        """Return whether all weight buffers needed for this forward/backward phase are unsharded."""
+        for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
+            self.model_weight_buffer,
+            self.transpose_weight_buffer,
+            bwd_pass=bwd_pass,
+        ):
+            if weight_buffer is None:
+                continue
+            if not weight_buffer.is_unsharded():
+                return False
+        return True
 
     def reshard(self):
         """Reshard model weights by releasing unsharded buffer."""
