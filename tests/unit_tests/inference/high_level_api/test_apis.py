@@ -77,6 +77,18 @@ class TestConstructorValidation:
         with pytest.raises(ValueError, match="requires use_coordinator=True"):
             MegatronAsyncLLM(model=model, tokenizer=tok)
 
+    def test_ep_gt_1_requires_use_coordinator(
+        self, mock_pipeline, fake_model_and_tokenizer, monkeypatch
+    ):
+        """Direct mode with expert_model_parallel_size > 1 must raise --
+        EP routing requires the coordinator."""
+        from megatron.core import parallel_state
+
+        monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 4)
+        model, tok = fake_model_and_tokenizer
+        with pytest.raises(ValueError, match="expert_model_parallel_size > 1"):
+            MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
+
 
 class TestLifecycleGuards:
     """Direct-mode lifecycle guards (``MegatronLLM`` only -- async direct is
