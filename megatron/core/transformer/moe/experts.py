@@ -22,6 +22,7 @@ from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_qui
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -249,7 +250,7 @@ class TEGroupedMLP(MegatronModule):
             set_save_original_input(self.linear_fc2)
 
         # This is to avoid the CPU overhead of multiple d2h copies
-        if self.offload_expert_fc1 and not self.config.fp8:
+        if self.offload_expert_fc1:
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc1)
@@ -302,75 +303,50 @@ class TEGroupedMLP(MegatronModule):
         )
 
     def _is_fused_impl_supported(self) -> bool:
-        """Check if the TE op fuser supports implementing this module.
-
-        Logs a warning for each unsatisfied condition to aid debugging
-        (e.g. when CUDA graph fails because the CuTe DSL fused kernel
-        was not activated and GroupedLinear falls back to tolist()).
-        """
-
-        def _unsupported(reason):
-            logger.warning("TE fused GroupedMLP not available: %s", reason)
-            return False
+        """Check if the TE op fuser supports implementing this module."""
 
         # Check Transformer Engine installation
         if not HAVE_TE:
-            return _unsupported("Transformer Engine is not installed")
+            return False  # Transformer Engine is not available
         try:
             from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
         except ImportError:
-            return _unsupported("TE too old (missing pytorch.ops.GroupedLinear)")
+            return False  # Transformer Engine version is too old
 
         if not is_te_min_version("2.14.0"):
-            return _unsupported("TE version < 2.14.0")
+            return False
 
         # Check for unsupported features
         if self.tp_group.size() > 1:
-            return _unsupported(f"expert TP > 1 (tp_size={self.tp_group.size()})")
+            return False  # Tensor parallelism is not supported
         if self.offload_expert_fc1 or self.offload_moe_act:
-            return _unsupported("fine-grained activation offloading enabled")
+            return False  # Fine-grained activation offloading is not supported
         if self.config.moe_apply_probs_on_input:
-            return _unsupported("moe_apply_probs_on_input enabled")
+            return False  # Pre-multiplying probs is not supported
 
         # Check grouped linear modules
         if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
-            return _unsupported(f"linear_fc1 is {type(self.linear_fc1).__name__}")
+            return False
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
-            return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
+            return False
 
-        # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
-        # Use config.activation_func instead of self.activation_func because when
-        # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
-        if not self.config.gated_linear_unit:
-            return _unsupported("gated_linear_unit not enabled")
-        if self.config.activation_func == F.silu:
-            pass  # SwiGLU — supported
-        elif self.config.activation_func == quick_gelu:
-            try:
-                from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-            except ImportError:
-                return _unsupported("quick_gelu needs TE >= 2.15")
-        else:
-            return _unsupported(f"unsupported activation: {self.config.activation_func}")
+        # Check activation: SwiGLU (ScaledSwiGLU) or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
+        if self.config.gated_linear_unit:
+            if self.activation_func == F.silu:
+                return True
+            if self.activation_func == quick_gelu:
+                try:
+                    from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
+                except ImportError:
+                    return False
+                return True
 
-        # Check TE CuTe DSL fused kernel conditions (must match TE's
-        # fuse_grouped_mlp_ops matching logic)
-        import os
-
-        if os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0") == "0":
-            return _unsupported(
-                "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set — CuTe DSL fused kernel disabled"
-            )
-        if self.config.moe_mlp_glu_interleave_size != 32:
-            return _unsupported(
-                f"moe_mlp_glu_interleave_size={self.config.moe_mlp_glu_interleave_size} "
-                f"(CuTe DSL requires 32)"
-            )
-
-        return True
+        return False
 
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
+
+        assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
 
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
@@ -390,19 +366,26 @@ class TEGroupedMLP(MegatronModule):
         )
         fc1_single_grouped_bias = self.linear_fc1.single_grouped_bias
         fc2_single_grouped_bias = self.linear_fc2.single_grouped_bias
+        # Mirror the wrapper's combined delay-wgrad mode (config.delay_wgrad_compute OR
+        # config.overlap_dispatch_backward_with_experts_wgrad) — see TEGroupedLinear.__init__.
+        # Using config.delay_wgrad_compute alone would silently drop the overlap optimization
+        # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
+        fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
+        fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
 
-        # TODO:ksivamani: Why meta device?
+        # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
+        # Using meta avoids allocating duplicate weights for the fused wrapper.
         op = te.pytorch.ops.GroupedLinear(
             self.linear_fc1.num_gemms,
             self.linear_fc1.in_features,
             self.linear_fc1.out_features,
             bias=self.linear_fc1.use_bias,
-            device=torch.cuda.current_device(),
+            device="meta",
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
             single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
-            delay_wgrad_compute=self.config.delay_wgrad_compute,
+            delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -418,11 +401,11 @@ class TEGroupedMLP(MegatronModule):
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU or clamped quick-GEGL)
+        # Activation and post-multiply probs (SwiGLU or clamped quick-GeGLU)
         glu_interleave = self.config.moe_mlp_glu_interleave_size
-        if self.config.activation_func == F.silu and self.config.gated_linear_unit:
+        if self.activation_func == F.silu and self.config.gated_linear_unit:
             op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
-        elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
+        elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
             clamp = self.config.activation_func_clamp_value
             if clamp is not None:
                 op = te.pytorch.ops.ScaledClampedQGeGLU(
@@ -443,12 +426,12 @@ class TEGroupedMLP(MegatronModule):
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,
             bias=self.linear_fc2.use_bias,
-            device=torch.cuda.current_device(),
+            device="meta",
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
             single_grouped_weight=fc2_single_grouped_weight,
             single_grouped_bias=fc2_single_grouped_bias,
-            delay_wgrad_compute=self.config.delay_wgrad_compute,
+            delay_wgrad_compute=fc2_delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -528,7 +511,6 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = torch.tensor(
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
-        # if the number of tokens is 0, pad the hidden states to 256
 
         if self.config.moe_paged_stash:
             permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
@@ -557,70 +539,24 @@ class TEGroupedMLP(MegatronModule):
                 permuted_probs,  # Scaled SwiGLU
                 tokens_per_expert,  # FC2
             )
+
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
+
         if self.config.moe_paged_stash:
             output = paged_stash_group_commit(output, name="grouped_mlp")
+
         return output
 
-    def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
-        """
-        Applies bias and activation function to the output of linear_fc1.
-        """
-        if self.config.use_te_activation_func:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
-            if permuted_probs is not None:
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * permuted_probs
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
-        elif self.config.bias_activation_fusion:
-            if self.activation_func == F.silu and self.config.gated_linear_unit:
-                # dtype is handled inside the fused kernel
-                intermediate_parallel = weighted_bias_swiglu_impl(
-                    intermediate_parallel,
-                    bias_parallel,
-                    permuted_probs,
-                    self.config.activation_func_fp8_input_store,
-                    self.config.activation_func_clamp_value,
-                )
-            elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
-                intermediate_parallel = weighted_bias_quick_geglu_impl(
-                    intermediate_parallel,
-                    bias_parallel,
-                    permuted_probs,
-                    self.config.activation_func_fp8_input_store,
-                    self.config.glu_linear_offset,
-                    self.config.activation_func_clamp_value,
-                )
-            else:
-                raise ValueError("Only support fusion of swiglu and quick_gelu in TEGroupedMLP.")
-        elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
-            assert bias_parallel is None, "Bias is not supported with fused weighted squared relu."
-            intermediate_parallel = weighted_squared_relu_impl(
-                intermediate_parallel, permuted_probs
-            )
-        else:
-            if self.config.gated_linear_unit:
-
-                def glu(x):
-                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                    if (val := self.config.activation_func_clamp_value) is not None:
-                        x_glu = x_glu.clamp(min=None, max=val)
-                        x_linear = x_linear.clamp(min=-val, max=val)
-                    return self.config.activation_func(x_glu) * (
-                        x_linear + self.config.glu_linear_offset
-                    )
-
-                intermediate_parallel = glu(intermediate_parallel)
-            else:
-                intermediate_parallel = self.activation_func(intermediate_parallel)
-            original_dtype = intermediate_parallel.dtype
-            intermediate_parallel = intermediate_parallel * permuted_probs
-            intermediate_parallel = intermediate_parallel.to(original_dtype)
-        return intermediate_parallel
+    @staticmethod
+    def _remove_glu_interleaving(x: torch.Tensor, interleave_size: int) -> torch.Tensor:
+        """Reorder interleaved GLU blocks so gate and linear halves are contiguous."""
+        shape = x.size()
+        x = x.reshape(-1, shape[-1] // (2 * interleave_size), 2, interleave_size)
+        x = x.transpose(1, 2).contiguous()
+        x = x.view(shape)
+        return x
 
     def forward(
         self,
@@ -673,18 +609,18 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        expert_fc1_manager = off_interface(
+        with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        )
-        with expert_fc1_manager as permuted_local_hidden_states:
+        ) as permuted_local_hidden_states:
             fc1_output, bias_parallel = apply_module(self.linear_fc1)(
                 permuted_local_hidden_states, tokens_per_expert
             )
-        fc1_output = expert_fc1_manager.group_offload(
-            fc1_output,
-            forced_released_tensors=[permuted_local_hidden_states],
-            delay_offload=self.config.delay_offload_until_cuda_graph,
-        )
+        if self.offload_expert_fc1:
+            fc1_output = off_interface.group_commit(
+                fc1_output,
+                name="expert_fc1",
+                forced_released_tensors=[permuted_local_hidden_states],
+            )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
 
@@ -694,25 +630,13 @@ class TEGroupedMLP(MegatronModule):
                 and self.config.moe_mlp_glu_interleave_size is not None
             )
 
-            def remove_glu_interleaving(x: torch.Tensor) -> torch.Tensor:
-                """Reorder tensor so gate and linear units are contiguous.
-
-                Should only be applied if the activation function is
-                an interleaved GLU.
-
-                """
-                shape = x.size()
-                interleave_size = self.config.moe_mlp_glu_interleave_size
-                x = x.reshape(-1, shape[-1] // (2 * interleave_size), 2, interleave_size)
-                x = x.transpose(1, 2).contiguous()
-                x = x.view(shape)
-                return x
-
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
                 if with_glu_interleaving:
-                    intermediate_parallel = remove_glu_interleaving(intermediate_parallel)
+                    intermediate_parallel = self._remove_glu_interleaving(
+                        intermediate_parallel, self.config.moe_mlp_glu_interleave_size
+                    )
                 intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
                     original_dtype = intermediate_parallel.dtype
@@ -726,7 +650,6 @@ class TEGroupedMLP(MegatronModule):
                         bias_parallel,
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
-                        self.config.activation_func_clamp_value,
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
@@ -744,7 +667,9 @@ class TEGroupedMLP(MegatronModule):
             elif (
                 self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
             ):
-                assert bias_parallel is None
+                assert (
+                    bias_parallel is None
+                ), "Bias is not supported with fused weighted squared relu."
                 intermediate_parallel = weighted_squared_relu_impl(
                     intermediate_parallel, permuted_probs
                 )
@@ -753,7 +678,9 @@ class TEGroupedMLP(MegatronModule):
 
                     def glu(x):
                         if with_glu_interleaving:
-                            x = remove_glu_interleaving(x)
+                            x = self._remove_glu_interleaving(
+                                x, self.config.moe_mlp_glu_interleave_size
+                            )
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
@@ -770,28 +697,25 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with moe_act_manager as fc1_output:
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
-                    self.bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
-            with moe_act_manager as fc1_output:
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
-
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
-        output = moe_act_manager.group_offload(
-            output,
-            forced_released_tensors=[fc1_output],
-            delay_offload=self.config.delay_offload_until_cuda_graph,
-        )
+        if self.offload_moe_act:
+            output = off_interface.group_commit(
+                output, name="moe_act", forced_released_tensors=[fc1_output]
+            )
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
@@ -850,7 +774,11 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
-        if self._with_fused_impl and self.config.delay_wgrad_compute:
+        # Match the wrapper's combined delay-wgrad mode used in _make_fused_ops so that
+        # `overlap_dispatch_backward_with_experts_wgrad`-driven runs invoke the deferred
+        # wgrad pass through the fused children instead of falling through to no-op
+        # backward_dw() on linear_fc{1,2} (whose forward never ran in the fused path).
+        if self._with_fused_impl and self.linear_fc1.delay_wgrad_compute:
             if self._fused_ops is not None:
                 (seq,) = self._fused_ops
                 fused_children = list(seq.children())
@@ -1107,7 +1035,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 Required for the FlashInfer CUDA-graphed path, None otherwise.
         """
 
-        if self.training:
+        if not InferenceMode.is_active():
             assert (
                 not self.config.fp8_recipe == "mxfp8"
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
@@ -1149,7 +1077,7 @@ class SequentialMLP(MegatronModule):
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
     def __init__(
         self,
-        num_local_experts,
+        num_local_experts: int,
         config: TransformerConfig,
         submodules: MLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,

@@ -2,9 +2,9 @@
 
 """Unit tests for the resharding planner functions.
 
-These test the TP planners (_plan_multi_dim_lcm, _plan_block_interleaved),
-DP fallback (_finalize_dp_transfers), and descriptor building in isolation
-without requiring distributed init or GPU.
+These test the TP planner (_plan_tp, covering both plain and block-interleaved
+layouts), DP fallback (_finalize_dp_transfers), and descriptor building in
+isolation without requiring distributed init or GPU.
 """
 
 import math
@@ -14,8 +14,7 @@ import pytest
 from megatron.core.resharding.planner import (
     _build_descriptors_for_param,
     _finalize_dp_transfers,
-    _plan_block_interleaved,
-    _plan_multi_dim_lcm,
+    _plan_tp,
 )
 from megatron.core.resharding.utils import ParameterMetadata, ShardingDescriptor
 
@@ -84,7 +83,7 @@ def _verify_full_coverage(ops, dim, expected_full_len):
 
 
 # ===========================================================================
-# _plan_multi_dim_lcm
+# _plan_tp
 # ===========================================================================
 
 
@@ -99,7 +98,7 @@ class TestPlanMultiDimLcm:
         dst = _meta(shape=(64, 128), is_tp=False, tp_ranks=[0])
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[0])
 
-        ops = _plan_multi_dim_lcm("weight", src, dst, [desc], my_global_rank=0)
+        ops = _plan_tp("weight", src, dst, [desc], my_global_rank=0)
         assert len(ops) == 2
         # Should receive from rank 0 and rank 1
         src_ranks = {op[0] for op in ops}
@@ -113,13 +112,13 @@ class TestPlanMultiDimLcm:
         desc = _tp_descriptor(dim=1, src_ranks=[0], dst_ranks=[0, 1])
 
         # Rank 0 receives first half
-        ops_r0 = _plan_multi_dim_lcm("weight", src, dst, [desc], my_global_rank=0)
+        ops_r0 = _plan_tp("weight", src, dst, [desc], my_global_rank=0)
         assert len(ops_r0) == 1
         assert ops_r0[0][0] == 0  # from rank 0
         _verify_full_coverage(ops_r0, dim=1, expected_full_len=64)
 
         # Rank 1 receives second half
-        ops_r1 = _plan_multi_dim_lcm("weight", src, dst, [desc], my_global_rank=1)
+        ops_r1 = _plan_tp("weight", src, dst, [desc], my_global_rank=1)
         assert len(ops_r1) == 1
         assert ops_r1[0][0] == 0  # from rank 0
 
@@ -130,7 +129,7 @@ class TestPlanMultiDimLcm:
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[0, 1, 2, 3])
 
         for rank in range(4):
-            ops = _plan_multi_dim_lcm("weight", src, dst, [desc], my_global_rank=rank)
+            ops = _plan_tp("weight", src, dst, [desc], my_global_rank=rank)
             assert len(ops) >= 1
             _verify_full_coverage(ops, dim=1, expected_full_len=32)
 
@@ -140,7 +139,7 @@ class TestPlanMultiDimLcm:
         dst = _meta(shape=(64, 64), is_tp=True, partition_dim=1, tp_ranks=[0, 1])
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[0, 1])
 
-        ops = _plan_multi_dim_lcm("weight", src, dst, [desc], my_global_rank=0)
+        ops = _plan_tp("weight", src, dst, [desc], my_global_rank=0)
         assert len(ops) == 1
         assert ops[0][0] == 0  # from self
 
@@ -150,14 +149,14 @@ class TestPlanMultiDimLcm:
         dst = _meta(shape=(64, 128), is_tp=False, tp_ranks=[2])
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[2])
 
-        ops = _plan_multi_dim_lcm("weight", src, dst, [desc], my_global_rank=0)
+        ops = _plan_tp("weight", src, dst, [desc], my_global_rank=0)
         assert ops == []
 
     def test_empty_descriptors(self):
         """No descriptors returns empty ops."""
         src = _meta()
         dst = _meta()
-        ops = _plan_multi_dim_lcm("weight", src, dst, [], my_global_rank=0)
+        ops = _plan_tp("weight", src, dst, [], my_global_rank=0)
         assert ops == []
 
     def test_size_mismatch_raises(self):
@@ -167,7 +166,7 @@ class TestPlanMultiDimLcm:
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[0])
 
         with pytest.raises(RuntimeError, match="size mismatch"):
-            _plan_multi_dim_lcm("weight", src, dst, [desc], my_global_rank=0)
+            _plan_tp("weight", src, dst, [desc], my_global_rank=0)
 
     def test_dim0_partition(self):
         """TP on dimension 0 (row-parallel)."""
@@ -175,7 +174,7 @@ class TestPlanMultiDimLcm:
         dst = _meta(shape=(64, 128), is_tp=False, tp_ranks=[0])
         desc = _tp_descriptor(dim=0, src_ranks=[0, 1], dst_ranks=[0])
 
-        ops = _plan_multi_dim_lcm("weight", src, dst, [desc], my_global_rank=0)
+        ops = _plan_tp("weight", src, dst, [desc], my_global_rank=0)
         assert len(ops) == 2
         _verify_full_coverage(ops, dim=0, expected_full_len=64)
 
@@ -187,7 +186,7 @@ class TestPlanMultiDimLcm:
 
         all_ops = []
         for rank in range(2):
-            ops = _plan_multi_dim_lcm("weight", src, dst, [desc], my_global_rank=rank)
+            ops = _plan_tp("weight", src, dst, [desc], my_global_rank=rank)
             all_ops.extend(ops)
 
         # Total transferred elements should equal full tensor size on dim 1
@@ -196,7 +195,7 @@ class TestPlanMultiDimLcm:
 
 
 # ===========================================================================
-# _plan_block_interleaved
+# _plan_tp
 # ===========================================================================
 
 
@@ -213,7 +212,7 @@ class TestPlanBlockInterleaved:
         dst = _meta(shape=(64, 96), is_tp=False, partition_sizes=None, tp_ranks=[0])
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[0])
 
-        ops = _plan_block_interleaved("weight", src, dst, [desc], my_global_rank=0)
+        ops = _plan_tp("weight", src, dst, [desc], my_global_rank=0)
         assert len(ops) > 0
         _verify_full_coverage(ops, dim=1, expected_full_len=96)
 
@@ -225,21 +224,12 @@ class TestPlanBlockInterleaved:
         )
         desc = _tp_descriptor(dim=1, src_ranks=[0], dst_ranks=[0, 1])
 
-        ops_r0 = _plan_block_interleaved("weight", src, dst, [desc], my_global_rank=0)
-        ops_r1 = _plan_block_interleaved("weight", src, dst, [desc], my_global_rank=1)
+        ops_r0 = _plan_tp("weight", src, dst, [desc], my_global_rank=0)
+        ops_r1 = _plan_tp("weight", src, dst, [desc], my_global_rank=1)
         assert len(ops_r0) > 0
         assert len(ops_r1) > 0
         _verify_full_coverage(ops_r0, dim=1, expected_full_len=48)
         _verify_full_coverage(ops_r1, dim=1, expected_full_len=48)
-
-    def test_no_partition_sizes_raises(self):
-        """Both src and dst missing partition_sizes should raise."""
-        src = _meta(shape=(64, 48), is_tp=True, partition_dim=1, tp_ranks=[0, 1])
-        dst = _meta(shape=(64, 96), is_tp=False, tp_ranks=[0])
-        desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[0])
-
-        with pytest.raises(RuntimeError, match="partition_sizes"):
-            _plan_block_interleaved("weight", src, dst, [desc], my_global_rank=0)
 
     def test_rank_not_in_dst(self):
         """Rank not in destination returns empty."""
@@ -249,7 +239,7 @@ class TestPlanBlockInterleaved:
         dst = _meta(shape=(64, 96), tp_ranks=[2])
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[2])
 
-        ops = _plan_block_interleaved("weight", src, dst, [desc], my_global_rank=0)
+        ops = _plan_tp("weight", src, dst, [desc], my_global_rank=0)
         assert ops == []
 
     def test_three_blocks_tp2_to_tp4(self):
@@ -268,7 +258,7 @@ class TestPlanBlockInterleaved:
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[0, 1, 2, 3])
 
         for rank in range(4):
-            ops = _plan_block_interleaved("weight", src, dst, [desc], my_global_rank=rank)
+            ops = _plan_tp("weight", src, dst, [desc], my_global_rank=rank)
             assert len(ops) > 0
             _verify_full_coverage(ops, dim=1, expected_full_len=14)
 

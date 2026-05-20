@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
 
 import dataclasses
 import enum
@@ -43,7 +44,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -865,7 +866,7 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, self.training, is_context_quantized
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
@@ -1708,11 +1709,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
 
             extra_kwargs = _get_extra_te_kwargs(config)
+
             self.delay_wgrad_compute = (
                 self.config.delay_wgrad_compute
                 or self.config.overlap_dispatch_backward_with_experts_wgrad
             )
-
             if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
                     extra_kwargs["delay_wgrad_compute"] = True
@@ -1844,6 +1845,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         setattr(weight, "partition_dim", part_dim)
                         setattr(weight, "partition_stride", 1)
 
+            self._register_load_state_dict_pre_hook(
+                type(self)._normalize_grouped_parameter_keys, with_module=True
+            )
+
             def merge_extra_states(
                 self,
                 state_dict,
@@ -1933,6 +1938,51 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 state_dict[f"{prefix}_extra_state"] = self._encode_extra_state(extra_state)
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
+
+        def _normalize_grouped_parameter_keys(
+            self,
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        ):
+            """Make grouped checkpoint keys compatible across parameter layouts.
+
+            Registered as a load_state_dict pre-hook to bridge checkpoints saved
+            in one layout (single grouped tensor vs per-GEMM indexed tensors)
+            and a model expecting the other.
+            """
+
+            def maybe_remap_param(param_name: str, single_grouped: bool) -> None:
+                grouped_key = f"{prefix}{param_name}"
+                indexed_keys = [
+                    f"{prefix}{param_name}{gemm_idx}" for gemm_idx in range(self.num_gemms)
+                ]
+                has_grouped_key = grouped_key in state_dict
+                has_any_indexed_key = any(key in state_dict for key in indexed_keys)
+                has_all_indexed_keys = all(key in state_dict for key in indexed_keys)
+
+                if single_grouped:
+                    if has_grouped_key or not has_all_indexed_keys:
+                        return
+                    state_dict[grouped_key] = torch.stack(
+                        [state_dict.pop(key) for key in indexed_keys], dim=0
+                    )
+                else:
+                    if has_any_indexed_key or not has_grouped_key:
+                        return
+                    split_tensors = self._split_grouped_checkpoint_tensor(
+                        state_dict.pop(grouped_key), grouped_key
+                    )
+                    for gemm_idx, tensor in enumerate(split_tensors):
+                        state_dict[f"{prefix}{param_name}{gemm_idx}"] = tensor
+
+            maybe_remap_param("weight", getattr(self, "single_grouped_weight", False))
+            if self.use_bias:
+                maybe_remap_param("bias", getattr(self, "single_grouped_bias", False))
 
         def _split_grouped_checkpoint_tensor(
             self, tensor: torch.Tensor, checkpoint_key: str
@@ -2526,6 +2576,31 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     bias = None
 
             return out, bias
+
+        @classmethod
+        def as_mlp_submodule(
+            cls,
+            submodules: MLPSubmodules,
+            config: TransformerConfig,
+            pg_collection: ProcessGroupCollection,
+            is_mtp_layer: bool,
+            is_expert: bool = False,
+            input_size: int | None = None,
+            ffn_hidden_size: int | None = None,
+        ) -> MLP:
+            """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
+            del is_mtp_layer
+            assert hasattr(
+                pg_collection, 'tp'
+            ), 'TP process group is required for TEFusedMLP in TransformerLayer'
+            return cls(
+                config=config,
+                submodules=submodules,
+                tp_group=pg_collection.tp,
+                is_expert=is_expert,
+                input_size=input_size,
+                ffn_hidden_size=ffn_hidden_size,
+            )
 
     class TEFusedDenseMLP(TEFusedMLP):
         """Dense MLP using GroupedLinear(num_groups=1) to trigger

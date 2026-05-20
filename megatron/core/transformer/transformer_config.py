@@ -509,6 +509,10 @@ class TransformerConfig(ModelParallelConfig):
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
+    use_transformer_engine_op_fuser: bool = False
+    """If True, submodules may use Transformer Engine's operation fuser
+    API to enable advanced fusions."""
+
     ####################
     # activation recomputation
     ####################
@@ -932,6 +936,7 @@ class TransformerConfig(ModelParallelConfig):
     block interleaved format. Instead of interpreting the input tensor
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
+
     This data format is experimental and primarily intended to enable
     advanced fused kernels."""
 
@@ -1072,14 +1077,14 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_recompute_layer_num: Optional[int] = None
     """Number of layers per MHC recompute block.
-    
+
     When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
     in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
     layer in the transformer block) will:
     - NOT checkpoint its final MLP BDA
     - Register the unified recompute hook on its MLP BDA output
     - A new CheckpointManager is created for subsequent layers
-    
+
     If None, all layers in the transformer block share a single recompute block.
 
     Must be a positive integer when set."""
@@ -1600,6 +1605,18 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_single_grouped_weight and moe_single_grouped_bias require "
                     f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
+                )
+        if self.moe_single_grouped_weight:
+            # The dist-optimizer's quantized-param shard path on the single-grouped-weight
+            # storage is only validated for fp8 mode with the mxfp8 recipe today; other
+            # combinations have a known numerical issue tracked in upstream PR
+            # NVIDIA/Megatron-LM#4621. Reject at construction time so users don't silently
+            # train on a broken numerical path. (moe_single_grouped_bias is not gated:
+            # biases aren't quantized, so they don't enter the buggy code path.)
+            if self.fp4 or not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "moe_single_grouped_weight is currently supported only with fp8 mode "
+                    "and fp8_recipe='mxfp8'."
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")

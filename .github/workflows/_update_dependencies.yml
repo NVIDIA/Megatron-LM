@@ -117,6 +117,7 @@ jobs:
           base: ${{ env.TARGET_BRANCH }}
           title: ${{ env.title }}
           token: ${{ secrets.PAT }}
+          labels: Run functional tests
           body: |
             🚀 PR to bump `uv.lock` in `${{ inputs.target-branch }}`.  
 

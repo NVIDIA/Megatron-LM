@@ -11,11 +11,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import modelopt.torch.quantization as mtq
 import torch
 from datasets import load_dataset
+from modelopt.torch.utils.plugins import megatron_generate
 from utils import get_hf_tokenizer
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args, get_model, initialize_megatron
@@ -167,7 +167,7 @@ if __name__ == "__main__":
                 )
                 input_ids = encoding["input_ids"]
                 with torch.no_grad():
-                    output_ids = simple_generate(
+                    output_ids = megatron_generate(
                         unwrapped_model,
                         input_ids.cuda(),
                         osl=args.osl,
