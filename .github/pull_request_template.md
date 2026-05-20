@@ -1,3 +1,5 @@
+- [ ] I, the PR author, have personally reviewed every line of this PR.
+
 # What does this PR do ?
 <!-- Add a one line overview of what this PR aims to accomplish. -->
 
