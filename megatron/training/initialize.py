@@ -762,6 +762,21 @@ def _warmup_jit_function(model_config: TransformerConfig, micro_batch_size: int)
     torch.cuda.empty_cache()
 
 
+def destroy_global_state() -> None:
+    """Destroy Megatron global states.
+
+    Cleans up resources used by microbatch calculator, global memory buffer,
+    model parallel groups, and the rerun state machine.
+    """
+    from megatron.core.rerun_state_machine import destroy_rerun_state_machine
+    from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+
+    destroy_num_microbatches_calculator()
+    mpu.destroy_global_memory_buffer()
+    mpu.destroy_model_parallel()
+    destroy_rerun_state_machine()
+
+
 def setup_logging() -> None:
     """Sets the default logging level based on cmdline args and env vars.
 
