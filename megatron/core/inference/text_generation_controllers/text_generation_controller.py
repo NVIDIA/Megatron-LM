@@ -104,7 +104,6 @@ class TextGenerationController:
             self.vocab_size = unwrapped_model.vocab_size
 
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        self.num_mtp_heads = self._get_mtp_num_heads()
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
         if (
@@ -119,23 +118,6 @@ class TextGenerationController:
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
-
-    def _get_mtp_num_heads(self) -> int:
-        """Get the number of MTP depths from the model config.
-
-        When ``mtp_use_repeated_layer`` is enabled a single MTP layer is
-        applied repeatedly, so the number of usable depths equals the
-        configured ``num_speculative_tokens`` rather than the physical
-        layer count stored in ``mtp_num_layers``.
-        """
-        model = self.inference_wrapped_model.model
-        if not (hasattr(model, 'config') and hasattr(model.config, 'mtp_num_layers')):
-            return 0
-        if not model.config.mtp_num_layers:
-            return 0
-        if getattr(model.config, 'mtp_use_repeated_layer', False):
-            return self.num_speculative_tokens
-        return model.config.mtp_num_layers
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -232,7 +214,10 @@ class TextGenerationController:
             max_requests, dtype=torch.int64, device=device
         )
         self._last_accepted_seq_indices = None
-        self._num_mtp_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+        if self.model_config.mtp_use_repeated_layer:
+            self.num_mtp_depths = self.num_speculative_tokens
+        else:
+            self.num_mtp_depths = min(self.num_speculative_tokens, self.model_config.mtp_num_layers or 0)
         self._mtp_token_ids_buf = torch.empty([1, max_requests], dtype=torch.int64, device=device)
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
@@ -843,7 +828,7 @@ class TextGenerationController:
         position_ids_buf[0, active_request_count:] = 0
 
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
-        for depth in range(self._num_mtp_depths):
+        for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
 
             token_ids_buf[0, :active_request_count] = next_token_ids
@@ -1518,7 +1503,7 @@ class TextGenerationController:
         - When PP > 1: participate in the ``broadcast_from_last_pipeline_stage``
           that the real ranks also perform.
         """
-        if self.num_speculative_tokens == 0 or self.num_mtp_heads == 0:
+        if self.num_speculative_tokens == 0 or self.num_mtp_depths == 0:
             return
         if self.model_config.expert_model_parallel_size <= 1:
             return
@@ -1559,7 +1544,7 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
 
-        for depth in range(self._num_mtp_depths):
+        for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
