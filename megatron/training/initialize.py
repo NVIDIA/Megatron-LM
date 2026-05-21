@@ -283,19 +283,21 @@ def _compile_dependencies():
     # Compile dataset C++ code.
     # =========================
     # TODO: move this to ninja
-    if torch.distributed.get_rank() == 0:
-        start_time = time.time()
-        print("> compiling dataset index builder ...")
-        from megatron.core.datasets.utils import compile_helpers
+    if torch.distributed.is_initialized():
+        # Use local rank to ensure each node compiles independently (multi-node without shared filesystem)
+        if get_local_rank_preinit() == 0:
+            start_time = time.time()
+            print("> compiling dataset index builder ...")
+            from megatron.core.datasets.utils import compile_helpers
 
-        compile_helpers()
-        print(
-            ">>> done with dataset index builder. Compilation time: {:.3f} "
-            "seconds".format(time.time() - start_time),
-            flush=True,
-        )
+            compile_helpers()
+            print(
+                ">>> done with dataset index builder. Compilation time: {:.3f} "
+                "seconds".format(time.time() - start_time),
+                flush=True,
+            )
 
-    torch.distributed.barrier()
+        torch.distributed.barrier()
 
 def _initialize_tp_communicators(
     model_config: GPTModelConfig | HybridModelConfig, micro_batch_size: int, ub_shape: list[int] | None=None,
