@@ -1308,6 +1308,15 @@ class MambaMixer(MegatronModule):
             )
             sharded_state_dict.update(module_sharded_sd)
 
+        # Keep DCP keys stable for checkpoints saved before conv params became
+        # direct MambaMixer parameters.
+        conv_checkpoint_key_map = {
+            "conv1d_weight": "conv1d.weight",
+            "conv1d_bias": "conv1d.bias",
+        }
+        for param_name, checkpoint_name in conv_checkpoint_key_map.items():
+            sharded_state_dict[f"{prefix}{param_name}"].key = f"{prefix}{checkpoint_name}"
+
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
         in_proj_dim = (
