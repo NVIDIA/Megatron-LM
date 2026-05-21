@@ -457,16 +457,21 @@ class TopKRouter(Router):
         ):
             aux_loss = aux_loss / self.config.mtp_num_layers
 
-        # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
-        # add the aux loss logging value to other layer's since it is difficult to get the
-        # correct layer_number for MTP. It does not affect the correctness of the calculation
-        # results and the reduced load_balancing_loss logging value.
+        # The tracker has one slot per main decoder layer and one per MTP depth, so its
+        # size is (num_layers + mtp_num_layers). For MTP routers, the slot index must be
+        # in [num_layers + 1, num_layers + mtp_num_layers]. When the MTP block wraps a
+        # plain TransformerLayer, ``self.layer_number`` already equals the MTP depth
+        # (1..mtp_num_layers). When it wraps a HybridStack (e.g. ``*E`` for one depth),
+        # ``self.layer_number`` is the position within the inner HybridStack and can
+        # exceed mtp_num_layers, which would index past the tracker; collapse it to a
+        # valid MTP-depth slot via modulo so the aux loss lands at the right depth.
         num_layers = self.config.num_layers
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
 
         if self.is_mtp_layer:
-            layer_number = self.layer_number + self.config.num_layers
+            mtp_depth = ((self.layer_number - 1) % self.config.mtp_num_layers) + 1
+            layer_number = mtp_depth + self.config.num_layers
         else:
             layer_number = self.layer_number
 
