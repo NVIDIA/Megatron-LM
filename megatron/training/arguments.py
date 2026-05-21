@@ -1119,8 +1119,11 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
-        # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
+        # Optimizer compatibility check. Muon is supported via the
+        # _build_megatron_fsdp_emerging_optimizer path; other emerging
+        # optimizers (Lion, SOAP, adaptive_muon) don't yet have the
+        # FSDP-aware step contract wired up.
+        assert args.optimizer in ('sgd', 'adam', 'muon'), \
             f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         if (
@@ -1553,12 +1556,29 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
 
         if args.use_distributed_optimizer:
-            args.use_layer_wise_distributed_optimizer = True
-            args.use_distributed_optimizer = False
+            # Megatron-FSDP is not compatible with LayerwiseDistributedOptimizer.
+            # Already un-evenly shards parameters, so composing per-parameter
+            # distribution with un-even distribution will assign parameters
+            # to inconsistent DP ranks, e.g. DP ranks with empty parameters
+            # can be incorrectly chosen by the layer-wise distribution.
+            if not args.use_megatron_fsdp:
+                args.use_layer_wise_distributed_optimizer = True
+                args.use_distributed_optimizer = False
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        if args.use_megatron_fsdp:
+            assert args.optimizer == "muon", (
+                "Emerging optimizer with Megatron-FSDP is currently only supported for Muon."
+            )
+            # Megatron-FSDP itself requires `fsdp_dtensor` (asserted above),
+            # so the emerging-optimizer path must accept it here to avoid a
+            # contradictory assertion pair.
+            assert args.ckpt_format == "fsdp_dtensor", (
+                "Emerging optimizer with Megatron-FSDP requires "
+                "--ckpt-format fsdp_dtensor."
+            )
+        else:
+            assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
 
     # Make sure all functionality that requires Gloo process groups is disabled.
@@ -2330,6 +2350,46 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument('--muon-fsdp-batched-all-gather',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Batch Muon+M-FSDP boundary parameter all-gathers by '
+                       'dtype/device/group. This reduces collective count but increases '
+                       'temporary peak memory. Defaults to false.')
+    group.add_argument('--muon-fsdp-reuse-gather-scratch',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Cache and reuse Muon+M-FSDP gather scratch buffers. '
+                       'Defaults to false.')
+    group.add_argument('--muon-fsdp-padded-all-gather',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Use padded equal-size all_gather_into_tensor for Muon+M-FSDP '
+                       'batched gathers when padding overhead is within the configured '
+                       'threshold. Defaults to false.')
+    group.add_argument('--muon-fsdp-padded-all-gather-pad-factor', type=float, default=1.25,
+                       help='Maximum padded-gather size as a multiple of the uneven '
+                       'gathered size for Muon+M-FSDP. Default: 1.25.')
+    group.add_argument('--muon-fsdp-batch-max-gather-bytes', type=int,
+                       default=1024 * 1024 * 1024,
+                       help='Maximum gathered bytes per Muon+M-FSDP batched gather stage. '
+                       'Default: 1073741824.')
+    group.add_argument('--muon-fsdp-padded-all-gather-zero-pad',
+                       action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='Zero-fill unused padding before Muon+M-FSDP padded gathers. '
+                       'Defaults to true.')
+    group.add_argument('--muon-fsdp-fast-reconstruct',
+                       action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='View contiguous gathered Muon+M-FSDP buffers without an '
+                       'additional reconstruction copy. Defaults to true.')
+    group.add_argument('--muon-fsdp-overlap-comm-compute',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Overlap Muon+M-FSDP boundary all-gathers with local '
+                       'Newton-Schulz/update work. Requires batched all-gather. '
+                       'Defaults to false.')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')

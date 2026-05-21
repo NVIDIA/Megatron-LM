@@ -17,9 +17,35 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.core.utils import (
+    append_unique_process_group,
+    get_dtensor_data_parallel_shard_groups,
+    get_pg_size,
+    log_single_rank,
+)
 
 from .optimizer_config import ParamKey, ParamPredicate
+
+try:
+    from torch.distributed.tensor import DTensor as _DTensor
+    from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        _assert_chunks_cover_full_tensor,
+        redistribute_uneven_dtensor_to_replicated,
+        update_uneven_dtensor_chunk_metadata,
+    )
+
+    _HAVE_DTENSOR = True
+except ImportError:
+    _DTensor = None  # type: ignore[assignment,misc]
+    Replicate = None  # type: ignore[assignment,misc]
+    Shard = None  # type: ignore[assignment,misc]
+    _StridedShard = None  # type: ignore[assignment,misc]
+    _assert_chunks_cover_full_tensor = None  # type: ignore[assignment]
+    redistribute_uneven_dtensor_to_replicated = None  # type: ignore[assignment]
+    update_uneven_dtensor_chunk_metadata = None  # type: ignore[assignment]
+    _HAVE_DTENSOR = False
 
 try:
     from emerging_optimizers import registry
@@ -42,6 +68,47 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _should_use_padded_all_gather(rank_total_numels: list[int], pad_factor: float) -> bool:
+    total_numel = sum(rank_total_numels)
+    if total_numel == 0:
+        return False
+    max_rank_numel = max(rank_total_numels)
+    if max_rank_numel == 0 or pad_factor <= 0:
+        return False
+    return max_rank_numel * len(rank_total_numels) <= pad_factor * total_numel
+
+
+def _chunk_infos_are_contiguous_full_order(
+    full_shape: torch.Size, chunk_infos: list[dict[str, Any]]
+) -> bool:
+    """Return whether row-sharded chunks cover `full_shape` in row-major order."""
+    full_shape = torch.Size(full_shape)
+    if full_shape.numel() == 0:
+        return all(chunk_info["numel"] == 0 for chunk_info in chunk_infos)
+
+    expected_flat_start = 0
+    trailing_numel = torch.Size(full_shape[1:]).numel() if len(full_shape) > 1 else 1
+    for chunk_info in chunk_infos:
+        chunk_numel = chunk_info["numel"]
+        if chunk_numel == 0:
+            continue
+
+        offset = tuple(chunk_info["offset"])
+        chunk_shape = torch.Size(chunk_info["shape"])
+        if len(offset) != len(full_shape) or len(chunk_shape) != len(full_shape):
+            return False
+        if len(full_shape) > 1:
+            for dim in range(1, len(full_shape)):
+                if offset[dim] != 0 or chunk_shape[dim] != full_shape[dim]:
+                    return False
+        flat_start = offset[0] * trailing_numel
+        if flat_start != expected_flat_start:
+            return False
+        expected_flat_start += chunk_numel
+
+    return expected_flat_start == full_shape.numel()
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -274,6 +341,1310 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
+
+
+class FSDPTensorParallelMuon(TensorParallelMuon):
+    """TensorParallelMuon for Megatron-FSDP ZeRO-1/2/3.
+
+    M-FSDP shards parameters unevenly across DP ranks; params split at rank
+    boundaries must be gathered before Newton-Schulz orthogonalization. Fully
+    local params are orthogonalized without any collective.
+    """
+
+    def __init__(
+        self,
+        params: ParamsT,
+        dp_group: torch.distributed.ProcessGroup | None = None,
+        fsdp_batched_all_gather: bool = False,
+        fsdp_reuse_gather_scratch: bool = False,
+        fsdp_padded_all_gather: bool = False,
+        fsdp_padded_all_gather_pad_factor: float = 1.25,
+        fsdp_batch_max_gather_bytes: int = 1024 * 1024 * 1024,
+        fsdp_padded_all_gather_zero_pad: bool = True,
+        fsdp_fast_reconstruct: bool = True,
+        fsdp_overlap_comm_compute: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        assert _HAVE_DTENSOR, (
+            "[Megatron-FSDP] torch.distributed.tensor.DTensor "
+            f"is required to use {type(self).__name__}."
+        )
+        self.dp_group = dp_group
+        self.fsdp_batched_all_gather = fsdp_batched_all_gather
+        self.fsdp_reuse_gather_scratch = fsdp_reuse_gather_scratch
+        self.fsdp_padded_all_gather = fsdp_padded_all_gather
+        self.fsdp_padded_all_gather_pad_factor = fsdp_padded_all_gather_pad_factor
+        self.fsdp_batch_max_gather_bytes = fsdp_batch_max_gather_bytes
+        self.fsdp_padded_all_gather_zero_pad = fsdp_padded_all_gather_zero_pad
+        self.fsdp_fast_reconstruct = fsdp_fast_reconstruct
+        self.fsdp_overlap_comm_compute = fsdp_overlap_comm_compute
+        self._boundary_gather_indices_cache: dict[tuple[int, ...], set[int]] = {}
+        self._uneven_gather_plan_cache: dict[int, dict[str, Any]] = {}
+        self._fsdp_gather_scratch_cache: dict[tuple[Any, ...], Any] = {}
+        self._fsdp_comm_stream_cache: dict[torch.device, torch.cuda.Stream] = {}
+        super().__init__(params, **kwargs)
+
+    def _fsdp_gather_scratch_cache_bytes(self) -> int:
+        total = 0
+        for value in self._fsdp_gather_scratch_cache.values():
+            if isinstance(value, torch.Tensor):
+                total += value.numel() * value.element_size()
+            elif isinstance(value, list):
+                total += sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in value
+                    if isinstance(tensor, torch.Tensor)
+                )
+        return total
+
+    def clear_fsdp_gather_scratch_cache(self) -> None:
+        """Clear the gather scratch buffer."""
+        self._fsdp_gather_scratch_cache.clear()
+
+    def _get_fsdp_comm_stream(self, device: torch.device) -> torch.cuda.Stream:
+        cached = self._fsdp_comm_stream_cache.get(device)
+        if cached is None:
+            with torch.cuda.device(device):
+                cached = torch.cuda.Stream()
+            self._fsdp_comm_stream_cache[device] = cached
+        return cached
+
+    def _get_fsdp_gather_scratch_tensor(
+        self, key: tuple[Any, ...], numel: int, *, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        if not self.fsdp_reuse_gather_scratch:
+            return torch.empty(numel, dtype=dtype, device=device)
+
+        cached = self._fsdp_gather_scratch_cache.get(key)
+        if (
+            not isinstance(cached, torch.Tensor)
+            or cached.numel() < numel
+            or cached.dtype != dtype
+            or cached.device != device
+        ):
+            cached = torch.empty(numel, dtype=dtype, device=device)
+            self._fsdp_gather_scratch_cache[key] = cached
+        return cached[:numel]
+
+    def _get_uneven_group_tensors(
+        self,
+        rank_numels: list[int],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        shard_group: torch.distributed.ProcessGroup,
+    ) -> list[torch.Tensor]:
+        if not self.fsdp_reuse_gather_scratch:
+            return [torch.empty(numel, dtype=dtype, device=device) for numel in rank_numels]
+
+        key = ("uneven_group_tensors", id(shard_group), dtype, device, tuple(rank_numels))
+        cached = self._fsdp_gather_scratch_cache.get(key)
+        if not isinstance(cached, list):
+            cached = [torch.empty(numel, dtype=dtype, device=device) for numel in rank_numels]
+            self._fsdp_gather_scratch_cache[key] = cached
+        return cached
+
+    def _candidate_batch_gather_bytes(
+        self, stage_rank_total_numels: list[list[int]], plan: dict[str, Any], *, element_size: int
+    ) -> int:
+        max_stage_bytes = 0
+        for stage_idx, stage in enumerate(plan["stages"]):
+            candidate_rank_total_numels = [
+                stage_rank_total_numels[stage_idx][rank] + stage["rank_numels"][rank]
+                for rank in range(len(stage["rank_numels"]))
+            ]
+            if self.fsdp_padded_all_gather:
+                gathered_numel = max(candidate_rank_total_numels) * len(candidate_rank_total_numels)
+            else:
+                gathered_numel = sum(candidate_rank_total_numels)
+            max_stage_bytes = max(max_stage_bytes, gathered_numel * element_size)
+        return max_stage_bytes
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Callable | None = None) -> float | None:
+        """Muon step for Megatron-FSDP ZeRO-1/2/3.
+
+        Separates collective (AG) and local (NS) work into three phases so that
+        no rank is blocked waiting on another rank computing NS to reach AG:
+          1. Compute momentum updates locally for all params.
+          2. All-gather boundary params — all collectives, no NS interleaved.
+          3. Newton-Schulz + weight update locally for all params.
+        """
+        loss = None if closure is None else closure()
+
+        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
+            for group in self.param_groups:
+                self._init_group(group, skip_non_grad_params=False)
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    self._local_muon_update(p, p.grad, group)
+            return loss
+
+        overlap_enabled = self.fsdp_overlap_comm_compute and self.fsdp_batched_all_gather
+
+        # Track all parameters to update ordered by parameter group index.
+        # (param, pre_ns_grad, is_gathered, lr, group_kwargs)
+        all_updates: list = []
+
+        group_contexts = []
+        for group in self.param_groups:
+            self._init_group(group, skip_non_grad_params=False)
+            group_contexts.append(
+                (
+                    group,
+                    self._get_boundary_gather_param_indices(group),
+                    group["lr"],
+                    {k: v for k, v in group.items() if k != "params"},
+                )
+            )
+
+        early_gather_state = None
+        boundary_update_indices = []
+        if overlap_enabled:
+            # Boundary pre-NS tensors are the only values needed by the
+            # all-gather. Compute them first and launch communication before
+            # spending time on non-boundary momentum and NS work.
+            for group, gather_param_indices, lr, group_kwargs in group_contexts:
+                for param_idx, p in enumerate(group["params"]):
+                    if param_idx not in gather_param_indices:
+                        continue
+                    pre_ns_grad = self._compute_local_pre_ns_grad(p, group, lr)
+                    boundary_update_indices.append(len(all_updates))
+                    all_updates.append((p, pre_ns_grad, True, lr, group_kwargs))
+
+            if boundary_update_indices:
+                early_gather_state = self._start_overlap_boundary_gathers(
+                    all_updates, boundary_update_indices
+                )
+
+        # Phase 1: Compute remaining momentum updates (fully local).
+        for group, gather_param_indices, lr, group_kwargs in group_contexts:
+            for param_idx, p in enumerate(group["params"]):
+                needs_gather = param_idx in gather_param_indices
+                if overlap_enabled and needs_gather:
+                    continue
+                if p._local_tensor.numel() == 0 and not needs_gather:
+                    # If this parameter is not split by Megatron-FSDP,
+                    # and is empty on this DP rank, then we can skip this
+                    # update for all TP ranks, as tensor parallelism uses
+                    # even sharding, so empty implies that FSDP did not
+                    # assign any fraction of the parameter to this DP rank.
+                    continue
+
+                pre_ns_grad = self._compute_local_pre_ns_grad(p, group, lr)
+                all_updates.append((p, pre_ns_grad, needs_gather, lr, group_kwargs))
+
+        # Phase 2: AG all boundary gradients.
+        if not overlap_enabled:
+            boundary_update_indices = [
+                i for i, (_, _, needs_gather, _, _) in enumerate(all_updates) if needs_gather
+            ]
+
+        # Phase 3: NS orthogonalization and weight update (fully local).
+        from emerging_optimizers import utils
+
+        with utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            if overlap_enabled and boundary_update_indices:
+                self._overlap_boundary_gather_and_update(
+                    all_updates, boundary_update_indices, early_gather_state
+                )
+            else:
+                if boundary_update_indices:
+                    boundary_items = [
+                        (all_updates[i][0], all_updates[i][1]) for i in boundary_update_indices
+                    ]
+                    if self.fsdp_batched_all_gather:
+                        gathered_boundary_updates = self._gather_full_uneven_local_tensors_like(
+                            boundary_items
+                        )
+                    else:
+                        gathered_boundary_updates = [
+                            self._gather_full_uneven_local_tensor_like(p, local_tensor)
+                            for p, local_tensor in boundary_items
+                        ]
+                    for i, full_pre_ns_grad in zip(
+                        boundary_update_indices, gathered_boundary_updates
+                    ):
+                        p, _, _, lr, group_kwargs = all_updates[i]
+                        all_updates[i] = (p, full_pre_ns_grad, True, lr, group_kwargs)
+
+                for p, pre_ns_grad, is_gathered, lr, group_kwargs in all_updates:
+                    self._apply_precomputed_muon_update(
+                        p, pre_ns_grad, is_gathered, lr, group_kwargs
+                    )
+
+        return loss
+
+    def _compute_local_pre_ns_grad(
+        self, p: torch.Tensor, group: dict[str, Any], lr: float
+    ) -> torch.Tensor:
+        p_local = p._local_tensor
+        state = self.state[p]
+        mom_local = state["momentum_buffer"]._local_tensor
+
+        grad = p.grad
+        local_grad = grad._local_tensor if grad is not None else torch.zeros_like(mom_local)
+
+        self._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
+        mom_local.lerp_(local_grad, 1 - group["momentum"])
+        if self.nesterov:
+            return local_grad.lerp(mom_local, group["momentum"])
+        return mom_local
+
+    def _apply_precomputed_muon_update(
+        self,
+        p: torch.Tensor,
+        pre_ns_grad: torch.Tensor | None,
+        is_gathered: bool,
+        lr: float,
+        group_kwargs: dict[str, Any],
+    ) -> None:
+        if is_gathered:
+            if pre_ns_grad is None:
+                return
+            orth_update = super(FSDPTensorParallelMuon, self).orthogonalize(
+                p, pre_ns_grad, **group_kwargs
+            )
+            local_update = self._local_shard_from_full_update_like(p, orth_update)
+            self.pre_weight_update_fn_inplace(p._local_tensor, local_update)
+            p._local_tensor.add_(local_update, alpha=-lr)
+            self.post_weight_update_fn_inplace(p._local_tensor)
+            return
+
+        assert pre_ns_grad is not None
+        orth_update = (
+            super(FSDPTensorParallelMuon, self)
+            .orthogonalize(p, pre_ns_grad, **group_kwargs)
+            .to(dtype=p._local_tensor.dtype)
+        )
+        self.pre_weight_update_fn_inplace(p._local_tensor, orth_update)
+        p._local_tensor.add_(orth_update, alpha=-lr)
+        self.post_weight_update_fn_inplace(p._local_tensor)
+
+    def _start_overlap_boundary_gathers(
+        self, all_updates: list, boundary_update_indices: list[int]
+    ) -> dict[str, Any]:
+        boundary_items = [(all_updates[i][0], all_updates[i][1]) for i in boundary_update_indices]
+        gathered_boundary_updates: list[torch.Tensor | None] = [None] * len(boundary_items)
+        completed_item_indices: set[int] = set()
+        batches = self._build_full_uneven_local_tensor_batches(
+            boundary_items, gathered_boundary_updates, completed_item_indices
+        )
+
+        pending = None
+        batch_iter = iter(batches)
+        first_batch = next(batch_iter, None)
+        if first_batch is not None:
+            pending = self._start_gather_full_uneven_local_tensor_batch_async(
+                boundary_items, first_batch
+            )
+
+        return {
+            "boundary_items": boundary_items,
+            "gathered_boundary_updates": gathered_boundary_updates,
+            "completed_item_indices": completed_item_indices,
+            "batch_iter": batch_iter,
+            "pending": pending,
+        }
+
+    def _overlap_boundary_gather_and_update(
+        self,
+        all_updates: list,
+        boundary_update_indices: list[int],
+        gather_state: dict[str, Any] | None = None,
+    ) -> None:
+        if gather_state is None:
+            gather_state = self._start_overlap_boundary_gathers(
+                all_updates, boundary_update_indices
+            )
+
+        boundary_items = gather_state["boundary_items"]
+        gathered_boundary_updates = gather_state["gathered_boundary_updates"]
+        completed_item_indices = gather_state["completed_item_indices"]
+        batch_iter = gather_state["batch_iter"]
+        pending = gather_state["pending"]
+
+        local_updates = [(idx, update) for idx, update in enumerate(all_updates) if not update[2]]
+        local_updates.sort(
+            key=lambda item: self._local_update_work_estimate(item[1][0], item[1][1]), reverse=True
+        )
+        for _, (p, pre_ns_grad, is_gathered, lr, group_kwargs) in local_updates:
+            self._apply_precomputed_muon_update(p, pre_ns_grad, is_gathered, lr, group_kwargs)
+
+        processed_item_indices: set[int] = set()
+
+        def process_completed_items(item_indices: set[int] | list[int]) -> None:
+            for item_idx in item_indices:
+                if item_idx in processed_item_indices:
+                    continue
+                update_idx = boundary_update_indices[item_idx]
+                p, _, _, lr, group_kwargs = all_updates[update_idx]
+                self._apply_precomputed_muon_update(
+                    p, gathered_boundary_updates[item_idx], True, lr, group_kwargs
+                )
+                processed_item_indices.add(item_idx)
+
+        process_completed_items(completed_item_indices)
+
+        for next_batch in batch_iter:
+            assert pending is not None
+            finished_item_indices = self._finish_gather_full_uneven_local_tensor_batch_async(
+                pending, gathered_boundary_updates
+            )
+            pending = self._start_gather_full_uneven_local_tensor_batch_async(
+                boundary_items, next_batch
+            )
+            process_completed_items(finished_item_indices)
+
+        if pending is not None:
+            finished_item_indices = self._finish_gather_full_uneven_local_tensor_batch_async(
+                pending, gathered_boundary_updates
+            )
+            process_completed_items(finished_item_indices)
+        elif len(processed_item_indices) != len(boundary_update_indices):
+            process_completed_items(set(range(len(boundary_update_indices))))
+
+        if len(processed_item_indices) != len(boundary_update_indices):
+            missing = sorted(set(range(len(boundary_update_indices))) - processed_item_indices)
+            raise AssertionError(
+                "Muon+M-FSDP overlap step missed boundary updates: "
+                f"missing_boundary_item_indices={missing}."
+            )
+
+    def _local_update_work_estimate(self, p: torch.Tensor, pre_ns_grad: torch.Tensor | None) -> int:
+        if pre_ns_grad is not None:
+            return pre_ns_grad.numel()
+        return p._local_tensor.numel()
+
+    def _needs_boundary_gather(self, dtensor: torch.Tensor) -> bool:
+        assert isinstance(
+            dtensor, _DTensor
+        ), f"Detected non-DTensor during {type(self).__name__}: {dtensor}"
+        local_tensor = dtensor._local_tensor
+        return local_tensor.numel() > 0 and tuple(dtensor.shape) != tuple(local_tensor.shape)
+
+    def _collect_boundary_indices_across_shard_groups(
+        self, params: list[torch.Tensor], local_indices: list[int]
+    ) -> set[int]:
+        """Propagate boundary-gather decisions over all DTensor FSDP shard dimensions.
+
+        In plain FSDP the optimizer's ``dp_group`` is the only shard group. In
+        HFSDP, however, the optimizer wrapper may be scoped to the inner DP
+        group while a DTensor can also be sharded on the outer DP dimension.
+        Boundary parameters must be selected consistently by every rank that
+        participates in any of the uneven gather stages.
+        """
+        result = set(local_indices)
+
+        shard_groups: list[torch.distributed.ProcessGroup] = []
+        for param in params:
+            if isinstance(param, _DTensor):
+                for shard_group in get_dtensor_data_parallel_shard_groups(param):
+                    append_unique_process_group(shard_groups, shard_group)
+
+        if not shard_groups and self.dp_group is not None:
+            append_unique_process_group(shard_groups, self.dp_group)
+
+        for shard_group in shard_groups:
+            if get_pg_size(shard_group) <= 1:
+                continue
+            gathered_indices: list[list[int] | None] = [None] * get_pg_size(shard_group)
+            torch.distributed.all_gather_object(gathered_indices, sorted(result), group=shard_group)
+            result.update(
+                idx
+                for rank_indices in gathered_indices
+                if rank_indices is not None
+                for idx in rank_indices
+            )
+
+        return result
+
+    def _get_mfsdp_param_layout(self, param: torch.Tensor, param_idx: int):
+        """Return M-FSDP flat-buffer layout metadata for `param`.
+
+        FSDP optimizer params keep a pointer to the original module parameter.
+        M-FSDP attaches the original parameter's backing buffer and item id
+        there, which lets Muon test whether the parameter's flat item interval
+        crosses a shard boundary exactly.
+        """
+        orig_param = getattr(param, "orig_param", None)
+        if orig_param is None:
+            return None
+
+        gbuf = getattr(orig_param, "_gbuf", None)
+        item_id = getattr(orig_param, "_item_id", None)
+        if gbuf is None or item_id is None or not hasattr(gbuf, "item_index_map"):
+            raise AssertionError(
+                "M-FSDP optimizer parameter is missing bucket metadata required "
+                f"for Muon boundary gather detection: param_idx={param_idx}."
+            )
+
+        item_index = gbuf.item_index_map.get(item_id)
+        if (
+            item_index is None
+            or not hasattr(item_index, "global_data_index")
+            or not hasattr(item_index, "size")
+        ):
+            raise AssertionError(
+                "M-FSDP optimizer parameter has invalid bucket item metadata required "
+                f"for Muon boundary gather detection: param_idx={param_idx}, "
+                f"item_id={item_id}."
+            )
+
+        bucket_index = getattr(gbuf, "bucket_index", None)
+        shard_bucket_index = getattr(gbuf, "shard_bucket_index", None)
+        if (
+            bucket_index is None
+            or shard_bucket_index is None
+            or not hasattr(bucket_index, "global_data_index")
+            or not hasattr(bucket_index, "size")
+            or not hasattr(shard_bucket_index, "size")
+        ):
+            raise AssertionError(
+                "M-FSDP optimizer parameter is missing bucket/shard metadata required "
+                f"for Muon boundary gather detection: param_idx={param_idx}."
+            )
+
+        return gbuf, item_index, bucket_index, shard_bucket_index
+
+    def _mfsdp_param_crosses_shard_boundary(self, param: torch.Tensor, param_idx: int) -> bool:
+        """Return whether `param`'s flat M-FSDP item interval spans DP shards."""
+        layout = self._get_mfsdp_param_layout(param, param_idx)
+        if layout is None:
+            raise AssertionError(
+                "Expected M-FSDP parameter metadata while checking Muon boundary "
+                f"gather requirement: param_idx={param_idx}."
+            )
+
+        gbuf, item_index, bucket_index, shard_bucket_index = layout
+        if not getattr(gbuf, "is_data_distributed", True):
+            return False
+
+        item_size = int(item_index.size)
+        if item_size == 0:
+            return False
+
+        bucket_start = int(bucket_index.global_data_index)
+        bucket_size = int(bucket_index.size)
+        shard_size = int(shard_bucket_index.size)
+        if shard_size <= 0 or bucket_size % shard_size != 0:
+            raise AssertionError(
+                "Invalid M-FSDP shard metadata for Muon boundary gather detection: "
+                f"param_idx={param_idx}, bucket_size={bucket_size}, shard_size={shard_size}."
+            )
+
+        item_start = int(item_index.global_data_index)
+        item_end = item_start + item_size
+        if item_start < bucket_start or item_end > bucket_start + bucket_size:
+            raise AssertionError(
+                "M-FSDP item interval falls outside its bucket during Muon boundary "
+                f"gather detection: param_idx={param_idx}, item=({item_start}, {item_end}), "
+                f"bucket=({bucket_start}, {bucket_start + bucket_size})."
+            )
+
+        first_shard = (item_start - bucket_start) // shard_size
+        last_shard = (item_end - 1 - bucket_start) // shard_size
+        crosses_boundary = first_shard != last_shard
+
+        local_tensor = param._local_tensor
+        if local_tensor.numel() > 0:
+            local_is_partial = tuple(param.shape) != tuple(local_tensor.shape)
+            if local_is_partial and not crosses_boundary:
+                # HFSDP can introduce a second sharding dimension after the
+                # flat bucket metadata has identified an inner-DP shard. The
+                # caller globally unions these local split observations so
+                # empty ranks still participate in the required collective.
+                return False
+
+        return crosses_boundary
+
+    def _get_boundary_gather_param_indices(self, group: dict[str, Any]) -> set[int]:
+        """Return globally-agreed parameters whose flat items cross FSDP shard boundaries."""
+        params = group["params"]
+        cache_key = tuple(id(param) for param in params)
+        cached_indices = self._boundary_gather_indices_cache.get(cache_key)
+        if cached_indices is not None:
+            return cached_indices
+
+        has_mfsdp_params = any(getattr(param, "orig_param", None) is not None for param in params)
+        if has_mfsdp_params:
+            local_boundary_indices = []
+            for idx, param in enumerate(params):
+                if getattr(param, "orig_param", None) is None:
+                    raise AssertionError(
+                        "Muon optimizer group mixes M-FSDP params with params lacking "
+                        f"M-FSDP bucket metadata: param_idx={idx}."
+                    )
+                if self._mfsdp_param_crosses_shard_boundary(param, idx):
+                    local_boundary_indices.append(idx)
+                elif self._needs_boundary_gather(param):
+                    local_boundary_indices.append(idx)
+            result = self._collect_boundary_indices_across_shard_groups(
+                params, local_boundary_indices
+            )
+            self._boundary_gather_indices_cache[cache_key] = result
+            return result
+
+        local_boundary_indices = [
+            idx for idx, param in enumerate(params) if self._needs_boundary_gather(param)
+        ]
+        result = self._collect_boundary_indices_across_shard_groups(params, local_boundary_indices)
+        self._boundary_gather_indices_cache[cache_key] = result
+        return result
+
+    def _copy_dtensor_chunk_metadata(self, dst, src) -> None:
+        if hasattr(src._local_tensor, "__create_chunk_list__"):
+            dst._local_tensor.__create_chunk_list__ = src._local_tensor.__create_chunk_list__
+        if hasattr(src._local_tensor, "__create_write_items__"):
+            dst._local_tensor.__create_write_items__ = src._local_tensor.__create_write_items__
+
+    def _dtensor_from_local_like(self, dtensor_ref, local_tensor: torch.Tensor):
+        dtensor = _DTensor.from_local(
+            local_tensor=local_tensor,
+            device_mesh=dtensor_ref.device_mesh,
+            placements=dtensor_ref.placements,
+            shape=dtensor_ref.shape,
+            stride=dtensor_ref.stride(),
+        )
+        self._copy_dtensor_chunk_metadata(dtensor, dtensor_ref)
+        return dtensor
+
+    def _get_uneven_gather_plan(self, dtensor_ref) -> dict[str, Any] | None:
+        """Return static metadata needed to gather a Megatron-FSDP uneven DTensor.
+
+        The parameter layout is fixed after M-FSDP construction, so the chunk
+        offsets/shapes only need to be exchanged once per boundary parameter.
+        """
+        cache_key = id(dtensor_ref)
+        cached_plan = self._uneven_gather_plan_cache.get(cache_key)
+        if cached_plan is not None:
+            return cached_plan
+
+        shard_mesh_dims = []
+        for mesh_dim, placement in enumerate(dtensor_ref.placements):
+            if isinstance(placement, (Shard, _StridedShard)):
+                shard_mesh_dims.append(mesh_dim)
+            elif isinstance(placement, Replicate):
+                continue
+            else:
+                raise ValueError(
+                    f"Unexpected placement {placement} at mesh dimension {mesh_dim}. "
+                    "Expected Shard, _StridedShard, or Replicate."
+                )
+
+        if not shard_mesh_dims:
+            return None
+
+        if not hasattr(dtensor_ref._local_tensor, "__create_chunk_list__"):
+            update_uneven_dtensor_chunk_metadata(dtensor_ref)
+
+        chunk_metadata_list = dtensor_ref._local_tensor.__create_chunk_list__()
+        if len(chunk_metadata_list) != 1:
+            raise ValueError(
+                f"Expected exactly one chunk metadata per rank, got {len(chunk_metadata_list)}."
+            )
+
+        local_tensor = dtensor_ref._local_tensor
+        local_chunk_metadata = chunk_metadata_list[0]
+
+        def _normalize_chunk_info(chunk_info: dict[str, Any]) -> dict[str, Any]:
+            shape = torch.Size(chunk_info["shape"])
+            return {"shape": shape, "offset": tuple(chunk_info["offset"]), "numel": shape.numel()}
+
+        local_chunks_info = [
+            _normalize_chunk_info(
+                {
+                    "shape": torch.Size(local_tensor.shape),
+                    "offset": tuple(local_chunk_metadata.offsets),
+                }
+            )
+        ]
+        stages = []
+        for shard_mesh_dim in shard_mesh_dims:
+            shard_group = dtensor_ref.device_mesh.get_group(shard_mesh_dim)
+            group_chunks_info: list[list[dict[str, Any]] | None] = [None] * shard_group.size()
+            torch.distributed.all_gather_object(
+                group_chunks_info, local_chunks_info, group=shard_group
+            )
+            if any(chunks_info is None for chunks_info in group_chunks_info):
+                raise AssertionError(
+                    "Uneven DTensor gather metadata exchange returned an incomplete result."
+                )
+
+            stage_chunks_info = [
+                [_normalize_chunk_info(chunk_info) for chunk_info in chunks_info]
+                for chunks_info in group_chunks_info
+                if chunks_info is not None
+            ]
+            stages.append(
+                {
+                    "shard_group": shard_group,
+                    "rank_numels": [
+                        sum(chunk_info["numel"] for chunk_info in chunks_info)
+                        for chunks_info in stage_chunks_info
+                    ],
+                }
+            )
+            local_chunks_info = [
+                chunk_info for chunks_info in stage_chunks_info for chunk_info in chunks_info
+            ]
+
+        chunk_infos = local_chunks_info
+        full_shape = torch.Size(dtensor_ref.shape)
+        plan = {
+            "shard_mesh_dims": tuple(shard_mesh_dims),
+            "stages": stages,
+            "chunk_infos": chunk_infos,
+            "full_numel": full_shape.numel(),
+            "is_contiguous_full_order": _chunk_infos_are_contiguous_full_order(
+                full_shape, chunk_infos
+            ),
+        }
+        if len(stages) == 1:
+            plan["shard_group"] = stages[0]["shard_group"]
+        self._uneven_gather_plan_cache[cache_key] = plan
+        return plan
+
+    def _prepare_padded_all_gather_buffers(
+        self,
+        local_buffer: torch.Tensor,
+        rank_total_numels: list[int],
+        shard_group: torch.distributed.ProcessGroup,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        max_rank_numel = max(rank_total_numels)
+        group_size = len(rank_total_numels)
+        if max_rank_numel == 0:
+            raise AssertionError("Cannot padded-all-gather an empty uneven DTensor batch.")
+
+        padded_local_buffer = self._get_fsdp_gather_scratch_tensor(
+            ("padded_local_buffer", id(shard_group), local_buffer.dtype, local_buffer.device),
+            max_rank_numel,
+            dtype=local_buffer.dtype,
+            device=local_buffer.device,
+        )
+        if local_buffer.numel() > 0:
+            padded_local_buffer[: local_buffer.numel()].copy_(local_buffer)
+        if self.fsdp_padded_all_gather_zero_pad and local_buffer.numel() < max_rank_numel:
+            padded_local_buffer[local_buffer.numel() : max_rank_numel].zero_()
+
+        gathered_padded_buffer = self._get_fsdp_gather_scratch_tensor(
+            (
+                "gathered_padded_buffer",
+                id(shard_group),
+                local_buffer.dtype,
+                local_buffer.device,
+                group_size,
+            ),
+            group_size * max_rank_numel,
+            dtype=local_buffer.dtype,
+            device=local_buffer.device,
+        )
+        return padded_local_buffer, gathered_padded_buffer, max_rank_numel
+
+    def _all_gather_padded_equal_size(
+        self,
+        local_buffer: torch.Tensor,
+        rank_total_numels: list[int],
+        shard_group: torch.distributed.ProcessGroup,
+    ) -> tuple[torch.Tensor, int]:
+        padded_local_buffer, gathered_padded_buffer, max_rank_numel = (
+            self._prepare_padded_all_gather_buffers(local_buffer, rank_total_numels, shard_group)
+        )
+        torch.distributed.all_gather_into_tensor(
+            gathered_padded_buffer, padded_local_buffer, group=shard_group
+        )
+        return gathered_padded_buffer, max_rank_numel
+
+    def _reconstruct_full_tensor_from_rank_buffers(
+        self,
+        dtensor_ref,
+        plan: dict[str, Any],
+        rank_buffers: list[torch.Tensor],
+        rank_buffer_offsets: list[int] | None = None,
+    ) -> torch.Tensor:
+        if self.fsdp_fast_reconstruct and plan["is_contiguous_full_order"]:
+            chunks = []
+            assigned_numel = 0
+            for rank, rank_buffer in enumerate(rank_buffers):
+                chunk_info = plan["chunk_infos"][rank]
+                chunk_numel = chunk_info["numel"]
+                if chunk_numel == 0:
+                    continue
+                source_offset = 0 if rank_buffer_offsets is None else rank_buffer_offsets[rank]
+                chunks.append(rank_buffer[source_offset : source_offset + chunk_numel])
+                assigned_numel += chunk_numel
+            if assigned_numel != plan["full_numel"]:
+                raise AssertionError(
+                    "Fast uneven DTensor reconstruction did not cover the full tensor: "
+                    f"assigned={assigned_numel}, expected={plan['full_numel']}."
+                )
+            if assigned_numel == 0:
+                return torch.empty(
+                    dtensor_ref.shape, dtype=rank_buffers[0].dtype, device=rank_buffers[0].device
+                )
+            if len(chunks) == 1:
+                full_flat = chunks[0].clone()
+            else:
+                full_flat = torch.cat(chunks)
+            return full_flat.view(dtensor_ref.shape)
+
+        full_tensor = torch.empty(
+            dtensor_ref.shape, dtype=rank_buffers[0].dtype, device=rank_buffers[0].device
+        )
+        assigned_numel = 0
+        for rank, rank_buffer in enumerate(rank_buffers):
+            chunk_info = plan["chunk_infos"][rank]
+            chunk_numel = chunk_info["numel"]
+            if chunk_numel == 0:
+                continue
+            source_offset = 0 if rank_buffer_offsets is None else rank_buffer_offsets[rank]
+            chunk_shape = chunk_info["shape"]
+            chunk_tensor = rank_buffer[source_offset : source_offset + chunk_numel].view(
+                chunk_shape
+            )
+            slices = tuple(slice(o, o + s) for o, s in zip(chunk_info["offset"], chunk_shape))
+            full_tensor[slices] = chunk_tensor
+            assigned_numel += chunk_numel
+
+        _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
+        return full_tensor
+
+    def _reconstruct_full_tensor_from_flat_buffer(
+        self, dtensor_ref, plan: dict[str, Any], full_flat_buffer: torch.Tensor
+    ) -> torch.Tensor:
+        if full_flat_buffer.numel() != plan["full_numel"]:
+            raise AssertionError(
+                "Uneven DTensor flat reconstruction buffer size mismatch: "
+                f"got {full_flat_buffer.numel()}, expected {plan['full_numel']}."
+            )
+
+        if self.fsdp_fast_reconstruct and plan["is_contiguous_full_order"]:
+            return full_flat_buffer.view(dtensor_ref.shape)
+
+        full_tensor = torch.empty(
+            dtensor_ref.shape, dtype=full_flat_buffer.dtype, device=full_flat_buffer.device
+        )
+        assigned_numel = 0
+        buffer_offset = 0
+        for chunk_info in plan["chunk_infos"]:
+            chunk_shape = chunk_info["shape"]
+            chunk_numel = chunk_info["numel"]
+            gathered_tensor = full_flat_buffer[buffer_offset : buffer_offset + chunk_numel]
+            buffer_offset += chunk_numel
+            offset = chunk_info["offset"]
+            slices = tuple(slice(o, o + s) for o, s in zip(offset, chunk_shape))
+            full_tensor[slices] = gathered_tensor.view(chunk_shape)
+            assigned_numel += chunk_numel
+
+        _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
+        return full_tensor
+
+    def _gather_full_uneven_local_tensor_like(
+        self, dtensor_ref, local_tensor: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Gather a local tensor using the uneven sharding layout of `dtensor_ref`."""
+        plan = self._get_uneven_gather_plan(dtensor_ref)
+        if plan is None:
+            if redistribute_uneven_dtensor_to_replicated is None:
+                raise RuntimeError(
+                    "Megatron-FSDP `redistribute_uneven_dtensor_to_replicated` is required "
+                    "to gather un-evenly sharded parameters for Muon step()."
+                )
+            local_dtensor = self._dtensor_from_local_like(dtensor_ref, local_tensor.contiguous())
+            if not hasattr(local_dtensor._local_tensor, "__create_chunk_list__"):
+                update_uneven_dtensor_chunk_metadata(local_dtensor)
+            full_tensor = redistribute_uneven_dtensor_to_replicated(local_dtensor)._local_tensor
+            self._copy_dtensor_chunk_metadata(dtensor_ref, local_dtensor)
+            return None if local_tensor.numel() == 0 else full_tensor
+
+        local_buffer = local_tensor.contiguous().view(-1)
+        if len(plan["stages"]) == 1:
+            stage = plan["stages"][0]
+            shard_group = stage["shard_group"]
+            group_rank = torch.distributed.get_rank(shard_group)
+            expected_local_numel = stage["rank_numels"][group_rank]
+            if local_buffer.numel() != expected_local_numel:
+                raise AssertionError(
+                    "Uneven DTensor gather local buffer size mismatch: "
+                    f"got {local_buffer.numel()}, expected {expected_local_numel}."
+                )
+            group_tensors = self._get_uneven_group_tensors(
+                stage["rank_numels"],
+                dtype=local_tensor.dtype,
+                device=local_tensor.device,
+                shard_group=shard_group,
+            )
+            torch.distributed.all_gather(group_tensors, local_buffer, group=shard_group)
+
+            if local_tensor.numel() == 0:
+                return None
+
+            return self._reconstruct_full_tensor_from_rank_buffers(dtensor_ref, plan, group_tensors)
+
+        for stage in plan["stages"]:
+            shard_group = stage["shard_group"]
+            group_rank = torch.distributed.get_rank(shard_group)
+            expected_local_numel = stage["rank_numels"][group_rank]
+            if local_buffer.numel() != expected_local_numel:
+                raise AssertionError(
+                    "Uneven DTensor gather local buffer size mismatch: "
+                    f"got {local_buffer.numel()}, expected {expected_local_numel}."
+                )
+            group_tensors = self._get_uneven_group_tensors(
+                stage["rank_numels"],
+                dtype=local_tensor.dtype,
+                device=local_tensor.device,
+                shard_group=shard_group,
+            )
+            torch.distributed.all_gather(group_tensors, local_buffer, group=shard_group)
+            local_buffer = torch.cat(group_tensors)
+
+        if local_tensor.numel() == 0:
+            return None
+
+        return self._reconstruct_full_tensor_from_flat_buffer(dtensor_ref, plan, local_buffer)
+
+    def _build_full_uneven_local_tensor_batches(
+        self,
+        items: list[tuple[torch.Tensor, torch.Tensor]],
+        results: list[torch.Tensor | None],
+        completed_item_indices: set[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        batches: dict[tuple[int, torch.dtype, torch.device], list[dict[str, Any]]] = {}
+
+        for item_idx, (dtensor_ref, local_tensor) in enumerate(items):
+            plan = self._get_uneven_gather_plan(dtensor_ref)
+            if plan is None:
+                results[item_idx] = self._gather_full_uneven_local_tensor_like(
+                    dtensor_ref, local_tensor
+                )
+                if completed_item_indices is not None:
+                    completed_item_indices.add(item_idx)
+                continue
+
+            stage_group_key = tuple(id(stage["shard_group"]) for stage in plan["stages"])
+            key = (stage_group_key, local_tensor.dtype, local_tensor.device)
+            key_batches = batches.setdefault(key, [])
+            element_size = local_tensor.element_size()
+            if not key_batches:
+                key_batches.append(
+                    {
+                        "dtype": local_tensor.dtype,
+                        "device": local_tensor.device,
+                        "item_indices": [],
+                        "plans": [],
+                        "stage_rank_total_numels": [
+                            [0] * len(stage["rank_numels"]) for stage in plan["stages"]
+                        ],
+                    }
+                )
+            batch = key_batches[-1]
+            if batch["item_indices"]:
+                candidate_bytes = self._candidate_batch_gather_bytes(
+                    batch["stage_rank_total_numels"], plan, element_size=element_size
+                )
+                if candidate_bytes > self.fsdp_batch_max_gather_bytes:
+                    batch = {
+                        "dtype": local_tensor.dtype,
+                        "device": local_tensor.device,
+                        "item_indices": [],
+                        "plans": [],
+                        "stage_rank_total_numels": [
+                            [0] * len(stage["rank_numels"]) for stage in plan["stages"]
+                        ],
+                    }
+                    key_batches.append(batch)
+            batch["item_indices"].append(item_idx)
+            batch["plans"].append(plan)
+            for stage_idx, stage in enumerate(plan["stages"]):
+                for rank, rank_numel in enumerate(stage["rank_numels"]):
+                    batch["stage_rank_total_numels"][stage_idx][rank] += rank_numel
+
+        return [batch for key_batches in batches.values() for batch in key_batches]
+
+    def _gather_full_uneven_local_tensors_like(
+        self, items: list[tuple[torch.Tensor, torch.Tensor]]
+    ) -> list[torch.Tensor | None]:
+        """Batch uneven gathers for boundary tensors.
+
+        Each boundary parameter still needs the same logical data as
+        `_gather_full_uneven_local_tensor_like`. Batching concatenates local
+        shards with the same dtype/device/group so the optimizer issues one
+        all-gather per batch instead of one all-gather per boundary parameter.
+        Ranks with empty local shards participate in the collective but do not
+        reconstruct or orthogonalize the full boundary tensor.
+        """
+        results: list[torch.Tensor | None] = [None] * len(items)
+        batches = self._build_full_uneven_local_tensor_batches(items, results)
+
+        for batch in batches:
+            self._gather_full_uneven_local_tensor_batch(items, results, batch)
+
+        return results
+
+    def _gather_full_uneven_local_tensor_batch(
+        self,
+        items: list[tuple[torch.Tensor, torch.Tensor]],
+        results: list[torch.Tensor | None],
+        batch: dict[str, Any],
+    ) -> None:
+        item_indices = batch["item_indices"]
+        plans = batch["plans"]
+        current_buffers = [items[item_idx][1].contiguous().view(-1) for item_idx in item_indices]
+
+        for stage_idx, stage in enumerate(plans[0]["stages"]):
+            stage_state = self._prepare_uneven_gather_stage(
+                current_buffers, plans, batch, stage_idx, stage
+            )
+            pending_stage = self._start_uneven_gather_stage(stage_state, async_op=False)
+            current_buffers = self._finish_uneven_gather_stage(pending_stage)
+
+        self._store_uneven_gather_batch_results(items, results, batch, current_buffers)
+
+    def _prepare_uneven_gather_stage(
+        self,
+        current_buffers: list[torch.Tensor],
+        plans: list[dict[str, Any]],
+        batch: dict[str, Any],
+        stage_idx: int,
+        stage: dict[str, Any],
+    ) -> dict[str, Any]:
+        shard_group = stage["shard_group"]
+        group_size = get_pg_size(shard_group)
+        group_rank = torch.distributed.get_rank(shard_group)
+
+        expected_item_numels = [
+            plan["stages"][stage_idx]["rank_numels"][group_rank] for plan in plans
+        ]
+        expected_local_numel = sum(expected_item_numels)
+        local_buffer = self._get_fsdp_gather_scratch_tensor(
+            ("batch_local_buffer", stage_idx, id(shard_group), batch["dtype"], batch["device"]),
+            expected_local_numel,
+            dtype=batch["dtype"],
+            device=batch["device"],
+        )
+        local_offset = 0
+        for buffer, expected_numel in zip(current_buffers, expected_item_numels):
+            if buffer.numel() != expected_numel:
+                raise AssertionError(
+                    "Batched uneven DTensor gather stage buffer size mismatch: "
+                    f"stage={stage_idx}, got {buffer.numel()}, expected {expected_numel}."
+                )
+            if expected_numel == 0:
+                continue
+            local_buffer[local_offset : local_offset + expected_numel].copy_(buffer)
+            local_offset += expected_numel
+
+        if local_offset != expected_local_numel:
+            raise AssertionError(
+                "Batched uneven DTensor gather local buffer size mismatch: "
+                f"stage={stage_idx}, packed {local_offset}, expected {expected_local_numel}."
+            )
+
+        rank_offsets: list[list[int]] = []
+        rank_total_numels: list[int] = []
+        for rank in range(group_size):
+            offsets = []
+            total_numel = 0
+            for plan in plans:
+                offsets.append(total_numel)
+                total_numel += plan["stages"][stage_idx]["rank_numels"][rank]
+            rank_offsets.append(offsets)
+            rank_total_numels.append(total_numel)
+
+        use_padded_all_gather = (
+            self.fsdp_padded_all_gather
+            and hasattr(torch.distributed, "all_gather_into_tensor")
+            and _should_use_padded_all_gather(
+                rank_total_numels, self.fsdp_padded_all_gather_pad_factor
+            )
+        )
+        return {
+            "batch": batch,
+            "plans": plans,
+            "stage_idx": stage_idx,
+            "shard_group": shard_group,
+            "group_size": group_size,
+            "rank_offsets": rank_offsets,
+            "rank_total_numels": rank_total_numels,
+            "local_buffer": local_buffer,
+            "use_padded_all_gather": use_padded_all_gather,
+        }
+
+    def _start_uneven_gather_stage(
+        self, stage_state: dict[str, Any], *, async_op: bool
+    ) -> dict[str, Any]:
+        device = stage_state["batch"]["device"]
+        comm_stream = None
+        if async_op and device.type == "cuda":
+            with torch.cuda.device(device):
+                comm_stream = self._get_fsdp_comm_stream(device)
+                comm_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(comm_stream):
+                    return self._issue_uneven_gather_stage(
+                        stage_state, async_op=True, comm_stream=comm_stream
+                    )
+        return self._issue_uneven_gather_stage(
+            stage_state, async_op=async_op, comm_stream=comm_stream
+        )
+
+    def _issue_uneven_gather_stage(
+        self, stage_state: dict[str, Any], *, async_op: bool, comm_stream: torch.cuda.Stream | None
+    ) -> dict[str, Any]:
+        batch = stage_state["batch"]
+        shard_group = stage_state["shard_group"]
+        local_buffer = stage_state["local_buffer"]
+        rank_total_numels = stage_state["rank_total_numels"]
+        pending = dict(stage_state)
+        pending["comm_stream"] = comm_stream
+
+        if stage_state["use_padded_all_gather"]:
+            padded_local_buffer, gathered_padded_buffer, max_rank_numel = (
+                self._prepare_padded_all_gather_buffers(
+                    local_buffer, rank_total_numels, shard_group
+                )
+            )
+            pending["padded_local_buffer"] = padded_local_buffer
+            pending["gathered_padded_buffer"] = gathered_padded_buffer
+            pending["max_rank_numel"] = max_rank_numel
+            pending["work"] = torch.distributed.all_gather_into_tensor(
+                gathered_padded_buffer, padded_local_buffer, group=shard_group, async_op=async_op
+            )
+        else:
+            group_tensors = self._get_uneven_group_tensors(
+                rank_total_numels,
+                dtype=batch["dtype"],
+                device=batch["device"],
+                shard_group=shard_group,
+            )
+            pending["group_tensors"] = group_tensors
+            pending["work"] = torch.distributed.all_gather(
+                group_tensors, local_buffer, group=shard_group, async_op=async_op
+            )
+        return pending
+
+    def _wait_uneven_gather_stage(self, pending_stage: dict[str, Any]) -> None:
+        work = pending_stage.get("work")
+        if work is not None:
+            work.wait()
+        comm_stream = pending_stage.get("comm_stream")
+        if comm_stream is not None:
+            device = pending_stage["batch"]["device"]
+            with torch.cuda.device(device):
+                torch.cuda.current_stream().wait_stream(comm_stream)
+
+    def _block_current_stream_on_uneven_gather_stage(self, pending_stage: dict[str, Any]) -> bool:
+        work = pending_stage.get("work")
+        if work is None:
+            return True
+        block_current_stream = getattr(work, "block_current_stream", None)
+        if block_current_stream is None:
+            return False
+        block_current_stream()
+        return True
+
+    def _finish_uneven_gather_stage(self, pending_stage: dict[str, Any]) -> list[torch.Tensor]:
+        self._wait_uneven_gather_stage(pending_stage)
+        return self._unpack_uneven_gather_stage(pending_stage)
+
+    def _unpack_uneven_gather_stage(self, pending_stage: dict[str, Any]) -> list[torch.Tensor]:
+        batch = pending_stage["batch"]
+        plans = pending_stage["plans"]
+        stage_idx = pending_stage["stage_idx"]
+        group_size = pending_stage["group_size"]
+        rank_offsets = pending_stage["rank_offsets"]
+
+        if pending_stage["use_padded_all_gather"]:
+            gathered_padded_buffer = pending_stage["gathered_padded_buffer"]
+            max_rank_numel = pending_stage["max_rank_numel"]
+            rank_buffers = [
+                gathered_padded_buffer[rank * max_rank_numel : (rank + 1) * max_rank_numel]
+                for rank in range(group_size)
+            ]
+        else:
+            rank_buffers = pending_stage["group_tensors"]
+
+        next_buffers = []
+        for batch_item_idx, plan in enumerate(plans):
+            item_numel = sum(plan["stages"][stage_idx]["rank_numels"])
+            if plan["is_contiguous_full_order"]:
+                chunks = []
+                assigned_numel = 0
+                for rank, rank_buffer in enumerate(rank_buffers):
+                    chunk_numel = plan["stages"][stage_idx]["rank_numels"][rank]
+                    if chunk_numel == 0:
+                        continue
+                    source_offset = rank_offsets[rank][batch_item_idx]
+                    chunks.append(rank_buffer[source_offset : source_offset + chunk_numel])
+                    assigned_numel += chunk_numel
+                if assigned_numel != item_numel:
+                    raise AssertionError(
+                        "Batched uneven DTensor stage unpack did not cover the item: "
+                        f"stage={stage_idx}, assigned={assigned_numel}, expected={item_numel}."
+                    )
+                if item_numel == 0:
+                    item_buffer = torch.empty(0, dtype=batch["dtype"], device=batch["device"])
+                elif len(chunks) == 1:
+                    item_buffer = chunks[0].clone()
+                else:
+                    item_buffer = torch.cat(chunks)
+                next_buffers.append(item_buffer)
+                continue
+
+            item_buffer = torch.empty(item_numel, dtype=batch["dtype"], device=batch["device"])
+            item_offset = 0
+            for rank, rank_buffer in enumerate(rank_buffers):
+                chunk_numel = plan["stages"][stage_idx]["rank_numels"][rank]
+                if chunk_numel == 0:
+                    continue
+                source_offset = rank_offsets[rank][batch_item_idx]
+                item_buffer[item_offset : item_offset + chunk_numel].copy_(
+                    rank_buffer[source_offset : source_offset + chunk_numel]
+                )
+                item_offset += chunk_numel
+            if item_offset != item_numel:
+                raise AssertionError(
+                    "Batched uneven DTensor stage unpack did not cover the item: "
+                    f"stage={stage_idx}, assigned={item_offset}, expected={item_numel}."
+                )
+            next_buffers.append(item_buffer)
+
+        return next_buffers
+
+    def _store_uneven_gather_batch_results(
+        self,
+        items: list[tuple[torch.Tensor, torch.Tensor]],
+        results: list[torch.Tensor | None],
+        batch: dict[str, Any],
+        current_buffers: list[torch.Tensor],
+    ) -> list[int]:
+        item_indices = batch["item_indices"]
+        plans = batch["plans"]
+        for batch_item_idx, item_idx in enumerate(item_indices):
+            dtensor_ref, local_tensor = items[item_idx]
+            if local_tensor.numel() == 0:
+                results[item_idx] = None
+                continue
+
+            plan = plans[batch_item_idx]
+            results[item_idx] = self._reconstruct_full_tensor_from_flat_buffer(
+                dtensor_ref, plan, current_buffers[batch_item_idx]
+            )
+        return item_indices
+
+    def _start_gather_full_uneven_local_tensor_batch_async(
+        self, items: list[tuple[torch.Tensor, torch.Tensor]], batch: dict[str, Any]
+    ) -> dict[str, Any]:
+        item_indices = batch["item_indices"]
+        plans = batch["plans"]
+        current_buffers = [items[item_idx][1].contiguous().view(-1) for item_idx in item_indices]
+
+        if batch["device"].type == "cuda" and len(plans[0]["stages"]) > 1:
+            pending_stages = []
+            with torch.cuda.device(batch["device"]):
+                comm_stream = self._get_fsdp_comm_stream(batch["device"])
+                comm_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(comm_stream):
+                    for stage_idx, stage in enumerate(plans[0]["stages"]):
+                        stage_state = self._prepare_uneven_gather_stage(
+                            current_buffers, plans, batch, stage_idx, stage
+                        )
+                        pending_stage = self._issue_uneven_gather_stage(
+                            stage_state, async_op=True, comm_stream=comm_stream
+                        )
+                        if not self._block_current_stream_on_uneven_gather_stage(pending_stage):
+                            if stage_idx == 0:
+                                return {
+                                    "items": items,
+                                    "batch": batch,
+                                    "current_buffers": current_buffers,
+                                    "pending_stage": pending_stage,
+                                }
+                            raise AssertionError(
+                                "Muon+M-FSDP async multi-stage gather requires "
+                                "torch.distributed.Work.block_current_stream()."
+                            )
+                        pending_stages.append(pending_stage)
+                        current_buffers = self._unpack_uneven_gather_stage(pending_stage)
+
+            return {
+                "items": items,
+                "batch": batch,
+                "current_buffers": current_buffers,
+                "pending_stages": pending_stages,
+            }
+
+        stage_state = self._prepare_uneven_gather_stage(
+            current_buffers, plans, batch, 0, plans[0]["stages"][0]
+        )
+        pending_stage = self._start_uneven_gather_stage(stage_state, async_op=True)
+        return {
+            "items": items,
+            "batch": batch,
+            "current_buffers": current_buffers,
+            "pending_stage": pending_stage,
+        }
+
+    def _finish_gather_full_uneven_local_tensor_batch_async(
+        self, pending: dict[str, Any], results: list[torch.Tensor | None]
+    ) -> list[int]:
+        items = pending["items"]
+        batch = pending["batch"]
+        plans = batch["plans"]
+        if "pending_stages" in pending:
+            for pending_stage in pending["pending_stages"]:
+                self._wait_uneven_gather_stage(pending_stage)
+            return self._store_uneven_gather_batch_results(
+                items, results, batch, pending["current_buffers"]
+            )
+
+        current_buffers = self._finish_uneven_gather_stage(pending["pending_stage"])
+
+        for stage_idx in range(1, len(plans[0]["stages"])):
+            stage_state = self._prepare_uneven_gather_stage(
+                current_buffers, plans, batch, stage_idx, plans[0]["stages"][stage_idx]
+            )
+            pending_stage = self._start_uneven_gather_stage(stage_state, async_op=False)
+            current_buffers = self._finish_uneven_gather_stage(pending_stage)
+
+        return self._store_uneven_gather_batch_results(items, results, batch, current_buffers)
+
+    def _local_shard_from_full_update_like(self, dtensor_ref, full_update: torch.Tensor):
+        if not hasattr(dtensor_ref._local_tensor, "__create_chunk_list__"):
+            raise ValueError(
+                f"{dtensor_ref} is not a Megatron-FSDP DTensor parameter "
+                "with DTensor._local_tensor.__create_chunk_list__. "
+                "Verify that `update_uneven_dtensor_chunk_metadata` "
+                "has been called on this uneven DTensor."
+            )
+        shard_metadata = dtensor_ref._local_tensor.__create_chunk_list__()[0]
+        slices = tuple(
+            slice(offset, offset + size)
+            for offset, size in zip(shard_metadata.offsets, shard_metadata.sizes)
+        )
+        return full_update[slices].contiguous().to(dtype=dtensor_ref._local_tensor.dtype)
+
+    @torch.no_grad()  # type: ignore[misc]
+    def _local_muon_update(
+        self, p: torch.Tensor, grad: torch.Tensor, group: dict[str, Any]
+    ) -> None:
+        """Local (non-DP) Muon update – identical to OrthogonalizedOptimizer.step body."""
+        from emerging_optimizers import utils
+
+        state = self.state[p]
+        self._apply_weight_decay_inplace(p, grad, group["lr"], group["weight_decay"])
+        state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
+        if self.nesterov:
+            grad = grad.lerp(state["momentum_buffer"], group["momentum"])
+        else:
+            grad = state["momentum_buffer"]
+        with utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            group_kwargs = {k: v for k, v in group.items() if k != "params"}
+            orth_grad = self.orthogonalize(p, grad, **group_kwargs)
+        self.pre_weight_update_fn_inplace(p, orth_grad)
+        p.add_(orth_grad, alpha=-group["lr"])
+        self.post_weight_update_fn_inplace(p)
 
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):

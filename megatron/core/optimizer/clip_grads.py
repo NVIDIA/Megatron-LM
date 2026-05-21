@@ -49,7 +49,12 @@ except ImportError:
 
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
-from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
+from ..utils import (
+    append_unique_process_group,
+    contains_process_group,
+    get_dtensor_data_parallel_shard_groups,
+    to_local_if_dtensor,
+)
 
 
 def get_grad_norm_fp32(
@@ -59,18 +64,18 @@ def get_grad_norm_fp32(
 ) -> float:
     """Calculate the p-norm of gradients in FP32 precision.
 
-    This function is adapted from `torch.nn.utils.clip_grad.clip_grad_norm_` 
-    and extends it with functionality to handle model-parallel parameters. 
-    It ensures that the norm is correctly computed and reduced across 
-    the specified process group (typically the model-parallel group for 
+    This function is adapted from `torch.nn.utils.clip_grad.clip_grad_norm_`
+    and extends it with functionality to handle model-parallel parameters.
+    It ensures that the norm is correctly computed and reduced across
+    the specified process group (typically the model-parallel group for
     non-distributed optimizers or the entire world for distributed optimizers).
 
     Args:
-        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): An iterable 
+        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): An iterable
             of Tensors or a single Tensor used to calculate the gradient norm.
-        norm_type (Union[int, float]): The type of the p-norm to use. Can be 
+        norm_type (Union[int, float]): The type of the p-norm to use. Can be
             'inf' for infinity norm. Defaults to 2.
-        grad_stats_parallel_group (ProcessGroup, optional): The process group 
+        grad_stats_parallel_group (ProcessGroup, optional): The process group
             used for reducing gradient statistics (e.g., norms and zero counts).
 
     Returns:
@@ -80,9 +85,10 @@ def get_grad_norm_fp32(
     if isinstance(grads_for_norm, torch.Tensor):
         grads_for_norm = [grads_for_norm]
 
-    data_parallel_group = None
+    data_parallel_groups = []
     for grad in grads_for_norm:
-        data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
+        for group in get_dtensor_data_parallel_shard_groups(grad):
+            append_unique_process_group(data_parallel_groups, group)
 
     grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
 
@@ -94,14 +100,16 @@ def get_grad_norm_fp32(
     if norm_type == inf:
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
         total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
-        # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
-        if data_parallel_group:
+        # Take max across all data-parallel shard groups if using FSDP and then all
+        # model-parallel GPUs.
+        for data_parallel_group in data_parallel_groups:
             torch.distributed.all_reduce(
                 total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
             )
-        torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=grad_stats_parallel_group
-        )
+        if not contains_process_group(data_parallel_groups, grad_stats_parallel_group):
+            torch.distributed.all_reduce(
+                total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=grad_stats_parallel_group
+            )
         total_norm = total_norm_cuda[0].item()
 
     else:
@@ -128,14 +136,16 @@ def get_grad_norm_fp32(
                 grad_norm = torch.norm(grad, norm_type)
                 total_norm += grad_norm**norm_type
 
-        # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
-        if data_parallel_group:
+        # Sum across all data-parallel shard groups if using FSDP and then all
+        # model-parallel GPUs.
+        for data_parallel_group in data_parallel_groups:
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
             )
-        torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
-        )
+        if not contains_process_group(data_parallel_groups, grad_stats_parallel_group):
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+            )
         if multi_tensor_scale_tensor_impl is not None:
             total_norm = total_norm.pow(1.0 / norm_type)
         else:
@@ -155,13 +165,13 @@ def clip_grad_by_total_norm_fp32(
     Note that the gradients are modified in-place.
 
     Args:
-        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of 
+        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
             Tensors or a single Tensor that will have gradients normalized.
-        max_norm (Union[int, float]): The maximum permissible total norm 
+        max_norm (Union[int, float]): The maximum permissible total norm
             of the gradients.
         total_norm (float): The current total norm of the gradients.
-        use_decoupled_grad (bool, optional): Whether to read from the 
-            '.decoupled_grad' attribute instead of the standard '.grad'. 
+        use_decoupled_grad (bool, optional): Whether to read from the
+            '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.
     """
     # Grads.
@@ -204,19 +214,19 @@ def count_zeros_fp32(
 ) -> float:
     """Counts the number of zero values in the gradients of the given parameters.
 
-    The count is performed in FP32. This method filters parameters to ensure 
-    gradients are not double-counted by checking if the gradient is not None, 
-    the parameter is not shared, and the parameter is not a replica due 
-    to tensor model parallelism. It also handles parameters managed by 
+    The count is performed in FP32. This method filters parameters to ensure
+    gradients are not double-counted by checking if the gradient is not None,
+    the parameter is not shared, and the parameter is not a replica due
+    to tensor model parallelism. It also handles parameters managed by
     Megatron FSDP specifically.
 
     Args:
-        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of 
+        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
             Tensors or a single Tensor whose gradients will be checked for zeros.
-        grad_stats_parallel_group (ProcessGroup): The process group used for 
+        grad_stats_parallel_group (ProcessGroup): The process group used for
             reducing the zero count across distributed ranks.
-        use_decoupled_grad (bool, optional): If True, reads from the 
-            '.decoupled_grad' attribute instead of the standard '.grad'. 
+        use_decoupled_grad (bool, optional): If True, reads from the
+            '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.
 
     Returns:
@@ -231,43 +241,30 @@ def count_zeros_fp32(
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
     total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
-    data_parallel_group = None
-    use_megatron_fsdp = False
+    data_parallel_groups = []
     for param in parameters:
-        if getattr(param, "__fsdp_param__", False) and param.grad is not None:
-            # If the parameter is managed by Megatron FSDP, we need to handle it differently.
-            use_megatron_fsdp = True
-            grad = param.grad._local_tensor
-            num_zeros = grad.numel() - torch.count_nonzero(grad)
-            total_num_zeros += num_zeros
-            continue
-
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
         grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
         if grad_not_none and is_not_shared and is_not_tp_duplicate:
             grad_obj = getattr(param, grad_attr)
-            data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
+            for group in get_dtensor_data_parallel_shard_groups(grad_obj):
+                append_unique_process_group(data_parallel_groups, group)
             grad = to_local_if_dtensor(grad_obj).detach()
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros = num_zeros + total_num_zeros
 
-    if use_megatron_fsdp and data_parallel_group is not None:
-        raise ValueError(
-            "Unexpected use of Megatron FSDP with data parallel group. "
-            "Please ensure that the parameters are properly managed by Megatron FSDP."
-        )
-
-    # Sum across all data-parallel GPUs if using FSDP.
-    if data_parallel_group:
+    # Sum across all data-parallel shard groups if using FSDP.
+    for data_parallel_group in data_parallel_groups:
         torch.distributed.all_reduce(
             total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
         )
     # Sum across all model-parallel GPUs.
-    torch.distributed.all_reduce(
-        total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
-    )
+    if not contains_process_group(data_parallel_groups, grad_stats_parallel_group):
+        torch.distributed.all_reduce(
+            total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+        )
 
     total_num_zeros = total_num_zeros.item()
 
