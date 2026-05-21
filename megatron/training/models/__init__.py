@@ -23,5 +23,5 @@ __all__ = [
     "MambaModelConfig",
     "MambaModelBuilder",
     "GPTModelConfig",
-    "GPTModelBuilder"
+    "GPTModelBuilder",
 ]

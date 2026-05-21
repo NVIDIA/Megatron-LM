@@ -179,10 +179,10 @@ class GPTModelConfig(ModelConfig):
         try:
             transformer = object.__getattribute__(self, "transformer")
         except AttributeError:
-            raise AttributeError(f"MambaModelConfig has no attribute '{name}'")
+            raise AttributeError(f"GPTModelConfig has no attribute '{name}'")
         if hasattr(transformer, name):
             return getattr(transformer, name)
-        raise AttributeError(f"Neither MambaModelConfig nor TransformerConfig has any attribute '{name}'.")
+        raise AttributeError(f"Neither GPTModelConfig nor TransformerConfig has any attribute '{name}'.")
 
     @override
     def __setattr__(self, name: str, value: Any, /) -> None:
