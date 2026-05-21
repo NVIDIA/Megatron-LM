@@ -41,6 +41,16 @@ except ImportError:
 
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
+    # In batch-invariant mode, route through the BIK pure-torch RMSNorm so
+    # the inference path uses the same kernel as the training-side recompute.
+    # tex.rmsnorm_fwd is empirically batch-invariant for common shapes, but
+    # not contractually so — this branch makes the guarantee explicit.
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+        rmsnorm_batch_invariant,
+    )
+    if is_batch_invariant_mode_enabled():
+        return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
     out, _, _ = tex.rmsnorm_fwd(
