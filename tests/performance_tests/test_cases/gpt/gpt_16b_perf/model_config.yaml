@@ -10,7 +10,10 @@ TP: 1
 PP: 1
 DP: 1
 DATASET: gsm8k
-NUM_OUTPUT_TOKENS: 128
+# OSL=2048 reflects the decode-heavy regime Nemo-RL rollouts care about.
+# With short OSL (128) prefill dominates the per-token average and inflates
+# the TPOT number; at OSL=2048 the decode steady-state shows through.
+NUM_OUTPUT_TOKENS: 2048
 NUM_WARMUP_ITERS: 2
 NUM_TIMED_ITERS: 5
 BATCH_SIZES:
