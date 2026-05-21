@@ -334,6 +334,7 @@ class TEGroupedMLP(MegatronModule):
         use_srelu_fusion = (
             self.config.activation_func == squared_relu
             and self.config.use_fused_weighted_squared_relu
+            and not self.config.gated_linear_unit
         )
         if not (use_glu_fusion or use_srelu_fusion):
             return False
@@ -427,6 +428,7 @@ class TEGroupedMLP(MegatronModule):
         elif (
             self.config.activation_func == squared_relu
             and self.config.use_fused_weighted_squared_relu
+            and not self.config.gated_linear_unit
         ):
             op = te.pytorch.ops.ScaledSReLU()
         else:
