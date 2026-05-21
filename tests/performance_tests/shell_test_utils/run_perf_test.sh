@@ -40,7 +40,9 @@ YQ=/usr/local/bin/yq
 mkdir -p "$RESULTS_ROOT"
 RESULTS_JSON="$RESULTS_ROOT/results.json"
 SERVER_LOG_DIR="$RESULTS_ROOT/server_logs"
-mkdir -p "$SERVER_LOG_DIR"
+ASSETS_ROOT="$(dirname "$RESULTS_ROOT")"
+TORCHRUN_LOG_DIR="$ASSETS_ROOT/logs/1"
+mkdir -p "$SERVER_LOG_DIR" "$TORCHRUN_LOG_DIR"
 # Clean any pre-existing results.json so this run starts fresh.
 rm -f "$RESULTS_JSON"
 
@@ -132,6 +134,9 @@ SERVER_COMMON_ARGS=(
         --nproc-per-node "$WORLD_SIZE" \
         --master_addr "$MASTER_ADDR" \
         --master_port "$MASTER_PORT" \
+        --log-dir "$TORCHRUN_LOG_DIR" \
+        --tee "0:3" \
+        --redirects "3" \
         -m tools.run_dynamic_text_generation_server \
         "${MODEL_ARGS[@]}" \
         "${SERVER_COMMON_ARGS[@]}" \
