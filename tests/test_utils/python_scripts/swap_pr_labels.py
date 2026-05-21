@@ -172,9 +172,9 @@ class PRReviewTracker:
                 headers={"Authorization": f"Bearer {self.token}"},
             )
             resp.raise_for_status()
-            nodes = resp.json()["data"]["repository"]["pullRequest"][
-                "latestOpinionatedReviews"
-            ]["nodes"]
+            nodes = resp.json()["data"]["repository"]["pullRequest"]["latestOpinionatedReviews"][
+                "nodes"
+            ]
             for node in nodes:
                 if node["author"]:
                     reviews[node["author"]["login"]] = node["state"]
