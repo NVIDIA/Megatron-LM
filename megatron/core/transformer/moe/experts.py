@@ -852,19 +852,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 f"--inference-grouped-gemm-backend=torch (BIK is only wired into "
                 f"the TORCH backend); got {self.inference_grouped_gemm_backend}."
             )
-            # EP > 1 inference combine uses ReduceScatter, which sums partial
-            # per-rank topk contribs in NCCL ring order — a different
-            # reduction tree from training's local deterministic_index_add.
-            # This causes bf16 drift between rollout and train-side recompute.
-            # The fix (AllGather raw per-contrib outputs + global deterministic
-            # unpermute) is a follow-up; until then, require EP == 1 for BIK.
-            ep_size = self.ep_group.size()
-            assert ep_size == 1, (
-                f"batch_invariant_mode requires inference EP size == 1; got "
-                f"ep_size={ep_size}. EP > 1 inference combine via ReduceScatter "
-                f"sums partial contribs across ranks in a different order than "
-                f"training's local unpermute, breaking bitwise parity."
-            )
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1003,8 +990,40 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
-        """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
+        """Torch grouped_mm fused MoE forward via mcore_fused_moe.
+
+        BIK + EP > 1 path: skip mcore_fused_moe's internal unpermute, AllGather
+        raw per-contribution expert outputs across EP, and run a single
+        global `deterministic_index_add` on each rank. This makes the
+        topk reduction order identical to training's local unpermute
+        (which sums all K contribs in sorted-index order). The combine
+        ReduceScatter then turns into a slice (handled in the dispatcher).
+        """
         local_expert_start = self.ep_group.rank() * self.num_local_experts
+        ep_size = self.ep_group.size()
+        bik_global_unpermute = (
+            getattr(self.config, "batch_invariant_mode", False) and ep_size > 1
+        )
+
+        if bik_global_unpermute:
+            fc2_output, permuted_probs, permutation_map, n_used = mcore_fused_moe(
+                hidden_states,
+                probs,
+                self._fc1_weight,
+                self._fc2_weight,
+                activation_type=self._mcore_activation_type,
+                num_local_experts=self.num_local_experts,
+                local_expert_start=local_expert_start,
+                valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+                routing_map=routing_map,
+                disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
+                return_pre_unpermute=True,
+            )
+            output = self._bik_global_unpermute(
+                fc2_output, permuted_probs, permutation_map, n_used, hidden_states
+            )
+            return output, None
+
         output = mcore_fused_moe(
             hidden_states,
             probs,
@@ -1019,6 +1038,77 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )
         return output, None
+
+    def _bik_global_unpermute(
+        self, fc2_output, permuted_probs, permutation_map, n_used, hidden_states
+    ):
+        """Cross-EP global deterministic unpermute (BIK + EP > 1).
+
+        Each rank's `(fc2_output, permuted_probs, permutation_map)` carries the
+        per-contribution data its experts produced. We AllGather these across
+        the EP group (with rank offsets baked into permutation_map so indices
+        don't collide), then run a single `deterministic_index_add` on the
+        gathered tensors. Result: every rank holds the same `[max_tokens, H]`
+        full sum, with the *same* reduction tree training would use.
+
+        CG-compat: AllGather is fixed-shape (fc2_output is bounded by
+        max_tokens * topk * alignment); deterministic_index_add has no
+        host syncs.
+        """
+        import torch.distributed as dist
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            deterministic_index_add,
+        )
+
+        ep_size = self.ep_group.size()
+        max_tokens = hidden_states.shape[0]
+        H = hidden_states.shape[-1]
+        N_local = fc2_output.shape[0]  # max bound on this rank's contribs
+
+        # Build the per-rank weighted contribution: fc2_output * permuted_probs
+        # in fp32 to match training's deterministic_index_add accumulator.
+        weighted = (fc2_output.to(torch.float32) *
+                    permuted_probs.to(torch.float32).unsqueeze(-1))
+
+        # AllGather the weighted contribs and permutation_map across EP.
+        # Fixed shapes: every rank contributes exactly N_local rows.
+        gathered_contribs = torch.empty(
+            ep_size * N_local, H, device=fc2_output.device, dtype=torch.float32,
+        )
+        dist.all_gather_into_tensor(gathered_contribs, weighted, group=self.ep_group)
+
+        # permutation_map is int32; AllGather it then mask out invalid (-1)
+        # entries via deterministic_index_add's valid_mask.
+        gathered_perm = torch.empty(
+            ep_size * N_local, device=permutation_map.device, dtype=permutation_map.dtype,
+        )
+        dist.all_gather_into_tensor(gathered_perm, permutation_map, group=self.ep_group)
+
+        # Build a valid-mask: each rank's contribs are valid for positions
+        # [0, n_used_per_rank). We also AllGather n_used (a 1-elem int32) to
+        # know each rank's prefix.
+        n_used_per_rank = torch.empty(
+            ep_size, device=n_used.device, dtype=n_used.dtype,
+        )
+        dist.all_gather_into_tensor(n_used_per_rank, n_used, group=self.ep_group)
+        # Build mask of shape (ep_size * N_local,): True where row index within
+        # rank r is < n_used_per_rank[r].
+        row_within_rank = (
+            torch.arange(N_local, device=fc2_output.device)
+            .unsqueeze(0)
+            .expand(ep_size, N_local)
+        )
+        valid_mask = (
+            (row_within_rank < n_used_per_rank.unsqueeze(-1).to(torch.long))
+            & (gathered_perm.view(ep_size, N_local) >= 0)
+        ).reshape(-1)
+
+        # Global unpermute: sum all gathered contribs into `out[token_id]`.
+        out = torch.zeros(max_tokens, H, device=fc2_output.device, dtype=torch.float32)
+        deterministic_index_add(
+            out, gathered_perm.to(torch.int64), gathered_contribs, valid_mask=valid_mask
+        )
+        return out.to(hidden_states.dtype)
 
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""

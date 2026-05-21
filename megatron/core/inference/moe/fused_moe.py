@@ -105,6 +105,7 @@ def mcore_fused_moe(
     routing_map: torch.Tensor,
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
+    return_pre_unpermute: bool = False,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -217,6 +218,11 @@ def mcore_fused_moe(
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
 
     # --- Post-processing: unpermute ---
+    if return_pre_unpermute:
+        # Caller wants to do the unpermute itself (e.g. EP > 1 BIK path
+        # needs to AllGather raw contribs across EP and run a single global
+        # deterministic_index_add to match training's reduction tree).
+        return fc2_output, permuted_probs, permutation_map, n_used
     return unpermute_tokens(
         fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens, out=out
     )
