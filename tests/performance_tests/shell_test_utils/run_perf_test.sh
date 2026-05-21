@@ -50,20 +50,25 @@ MODEL=$("$YQ" '.MODEL' "$CONFIG_PATH")
 TP=$("$YQ" '.TP // 1' "$CONFIG_PATH")
 PP=$("$YQ" '.PP // 1' "$CONFIG_PATH")
 DP=$("$YQ" '.DP // 1' "$CONFIG_PATH")
+EP=$("$YQ" '.EP // 1' "$CONFIG_PATH")
 NUM_INPUT_TOKENS=$("$YQ" '.NUM_INPUT_TOKENS' "$CONFIG_PATH")
 NUM_OUTPUT_TOKENS=$("$YQ" '.NUM_OUTPUT_TOKENS' "$CONFIG_PATH")
 NUM_WARMUP_ITERS=$("$YQ" '.NUM_WARMUP_ITERS // 2' "$CONFIG_PATH")
 NUM_TIMED_ITERS=$("$YQ" '.NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
 mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 
-WORLD_SIZE=$((TP * PP * DP))
+# For MoE configs, expert-parallelism is orthogonal to DP and reshapes the
+# world size when DP=1. Use the max so dense models keep WORLD_SIZE=TP*PP*DP
+# and MoE-with-DP=1 picks up EP correctly.
+GROUP_SIZE=$((DP > EP ? DP : EP))
+WORLD_SIZE=$((TP * PP * GROUP_SIZE))
 ARGS_FILE="$PERF_DIR/server/model_args/${MODEL}.args"
 if [[ ! -f "$ARGS_FILE" ]]; then
     echo "[run_perf_test] error: model args file $ARGS_FILE not found" >&2
     exit 2
 fi
 
-echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP  world_size=$WORLD_SIZE"
+echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP EP=$EP  world_size=$WORLD_SIZE"
 echo "[run_perf_test] ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
 echo "[run_perf_test] batch sizes: ${BATCH_SIZES[*]}"
 
@@ -133,8 +138,8 @@ SERVER_COMMON_ARGS=(
         --master_addr "$MASTER_ADDR" \
         --master_port "$MASTER_PORT" \
         -m tools.run_dynamic_text_generation_server \
-        "${MODEL_ARGS[@]}" \
         "${SERVER_COMMON_ARGS[@]}" \
+        "${MODEL_ARGS[@]}" \
         > "$SERVER_LOG" 2>&1
 ) &
 SERVER_PGID=$!
