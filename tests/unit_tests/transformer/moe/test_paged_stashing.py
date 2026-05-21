@@ -147,11 +147,6 @@ class MoEModelTestContainer:
         for layer in self.moe_layers:
             layer.zero_grad()
 
-    def __del__(self):
-        torch.distributed.barrier()
-        torch.cuda.synchronize()
-        Utils.destroy_model_parallel()
-
     def destroy(self):
         Utils.destroy_model_parallel()
 
