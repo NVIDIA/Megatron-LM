@@ -303,9 +303,7 @@ def _module_has_any_trainable_parameters(module, pg_collection: ProcessGroupColl
         dtype=torch.int,
     )
     torch.distributed.all_reduce(
-        local_has_params,
-        op=torch.distributed.ReduceOp.MAX,
-        group=pg_collection.intra_dist_opt,
+        local_has_params, op=torch.distributed.ReduceOp.MAX, group=pg_collection.intra_dist_opt
     )
     return bool(local_has_params.item())
 

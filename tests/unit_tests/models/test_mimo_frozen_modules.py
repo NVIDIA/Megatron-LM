@@ -93,13 +93,7 @@ class TestMimoFrozenModules:
         destroy_all_grids()
 
     def _build_mimo(
-        self,
-        encoder_grid,
-        llm_grid,
-        hidden_size=128,
-        num_layers=2,
-        vocab_size=512,
-        seq_len=64,
+        self, encoder_grid, llm_grid, hidden_size=128, num_layers=2, vocab_size=512, seq_len=64
     ):
         # Clear NVTE backend env vars that conftest's set_env fixture pins to '0';
         # GPTModel asserts they are unset or match the chosen attention backend.
@@ -150,9 +144,9 @@ class TestMimoFrozenModules:
         if rank < 4:
             # Encoder ranks
             assert encoder_info.is_active, "Encoder rank should be active for the encoder module"
-            assert encoder_info.optimizer is None, (
-                "Encoder inner optimizer must be skipped when fully frozen"
-            )
+            assert (
+                encoder_info.optimizer is None
+            ), "Encoder inner optimizer must be skipped when fully frozen"
             assert not llm_info.is_active
             assert llm_info.optimizer is None
         else:
@@ -160,9 +154,9 @@ class TestMimoFrozenModules:
             assert not encoder_info.is_active
             assert encoder_info.optimizer is None
             assert llm_info.is_active, "LLM rank should be active for the LLM module"
-            assert llm_info.optimizer is not None, (
-                "LLM inner optimizer must be built when params are trainable"
-            )
+            assert (
+                llm_info.optimizer is not None
+            ), "LLM inner optimizer must be built when params are trainable"
 
         # Smoke step: must not crash under the stub-optimizer plumbing on
         # encoder ranks, nor when no_trainable + trainable groups co-exist.
@@ -196,13 +190,13 @@ class TestMimoFrozenModules:
         llm_info = optimizer.module_infos[MIMO_LANGUAGE_MODULE_KEY]
 
         assert encoder_info.is_active, "All ranks should be active for both modules in colocated"
-        assert encoder_info.optimizer is None, (
-            "Encoder inner optimizer must be skipped on every rank when fully frozen"
-        )
+        assert (
+            encoder_info.optimizer is None
+        ), "Encoder inner optimizer must be skipped on every rank when fully frozen"
         assert llm_info.is_active
-        assert llm_info.optimizer is not None, (
-            "LLM inner optimizer must be built when params are trainable"
-        )
+        assert (
+            llm_info.optimizer is not None
+        ), "LLM inner optimizer must be built when params are trainable"
 
         _populate_synthetic_grads(mimo_model)
         optimizer.step()

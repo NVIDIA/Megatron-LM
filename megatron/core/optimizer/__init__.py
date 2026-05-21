@@ -361,7 +361,9 @@ def _get_param_groups(
     # so we need to align the param groups across ranks, otherwise we may have
     # runtime error when loading the checkpoint or numerical error when resuming training.
     params_key = list(params_map.keys())
-    gathered_params_key = [None for _ in range(torch.distributed.get_world_size(group=process_group))]
+    gathered_params_key = [
+        None for _ in range(torch.distributed.get_world_size(group=process_group))
+    ]
     torch.distributed.all_gather_object(gathered_params_key, params_key, group=process_group)
     for keys in gathered_params_key:
         for key in keys:
@@ -439,7 +441,9 @@ def _get_param_groups_and_buffers(
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
-    param_groups = _get_param_groups(model_chunks, config, config_overrides, process_group=process_group)
+    param_groups = _get_param_groups(
+        model_chunks, config, config_overrides, process_group=process_group
+    )
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
