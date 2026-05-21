@@ -857,33 +857,33 @@ class TestFSDPTensorParallelMuon:
         dp_group = device_mesh.get_group("dp")
         cols = 4
 
-        replicated_param = (
-            torch.arange(4 * cols, device="cuda", dtype=torch.float32).view(4, cols) / 100
-        )
-        replicated_grad = replicated_param + 0.2
+        small_param = torch.arange(2 * cols, device="cuda", dtype=torch.float32).view(2, cols) / 100
+        small_grad = small_param + 0.2
         plan = {0: 2, 1: 4}
         boundary_param = (
             torch.arange(6 * cols, device="cuda", dtype=torch.float32).view(6, cols) / 80
         )
         boundary_grad = boundary_param + 0.3
+        large_param = torch.arange(4 * cols, device="cuda", dtype=torch.float32).view(4, cols) / 70
+        large_grad = large_param + 0.4
 
         local_boundary_param = _local_slice(boundary_param, plan, dp_rank).contiguous()
         params = [
             nn.Parameter(
-                _make_replicated_dtensor(
-                    replicated_param.clone(), replicated_param.shape, device_mesh
-                )
+                _make_replicated_dtensor(small_param.clone(), small_param.shape, device_mesh)
             ),
             nn.Parameter(_make_dtensor(local_boundary_param, boundary_param.shape, device_mesh)),
+            nn.Parameter(
+                _make_replicated_dtensor(large_param.clone(), large_param.shape, device_mesh)
+            ),
         ]
-        params[0].grad = _make_replicated_dtensor(
-            replicated_grad.clone(), replicated_grad.shape, device_mesh
-        )
+        params[0].grad = _make_replicated_dtensor(small_grad.clone(), small_grad.shape, device_mesh)
         params[1].grad = _make_dtensor(
             _local_slice(boundary_grad, plan, dp_rank).contiguous(),
             boundary_grad.shape,
             device_mesh,
         )
+        params[2].grad = _make_replicated_dtensor(large_grad.clone(), large_grad.shape, device_mesh)
 
         optimizer = _make_fsdp_muon(
             params,
@@ -895,9 +895,19 @@ class TestFSDPTensorParallelMuon:
             fsdp_overlap_comm_compute=True,
         )
         events = []
+        real_compute = optimizer._compute_local_pre_ns_grad
         real_start = optimizer._start_gather_full_uneven_local_tensor_batch_async
         real_finish = optimizer._finish_gather_full_uneven_local_tensor_batch_async
         real_apply = optimizer._apply_precomputed_muon_update
+
+        def recording_compute(p, group, lr):
+            if p is params[1]:
+                events.append("compute_boundary")
+            elif p is params[2]:
+                events.append("compute_large_local")
+            else:
+                events.append("compute_small_local")
+            return real_compute(p, group, lr)
 
         def recording_start(*args, **kwargs):
             events.append("start")
@@ -908,10 +918,16 @@ class TestFSDPTensorParallelMuon:
             return real_finish(*args, **kwargs)
 
         def recording_apply(p, pre_ns_grad, is_gathered, lr, group_kwargs):
-            events.append("apply_gathered" if is_gathered else "apply_local")
+            if is_gathered:
+                events.append("apply_gathered")
+            elif p is params[2]:
+                events.append("apply_large_local")
+            else:
+                events.append("apply_small_local")
             return real_apply(p, pre_ns_grad, is_gathered, lr, group_kwargs)
 
         with (
+            patch.object(optimizer, "_compute_local_pre_ns_grad", recording_compute),
             patch.object(
                 optimizer, "_start_gather_full_uneven_local_tensor_batch_async", recording_start
             ),
@@ -922,8 +938,11 @@ class TestFSDPTensorParallelMuon:
         ):
             optimizer.step()
 
-        assert events[0] == "start"
-        assert events.index("start") < events.index("apply_local") < events.index("finish")
+        assert events.index("compute_boundary") < events.index("start")
+        assert events.index("start") < events.index("compute_small_local")
+        assert events.index("start") < events.index("compute_large_local")
+        assert events.index("start") < events.index("apply_large_local") < events.index("finish")
+        assert events.index("apply_large_local") < events.index("apply_small_local")
         assert events.index("finish") < events.index("apply_gathered")
 
     def test_padded_batch_gather_matches_uneven_batch_and_reuses_scratch(self):

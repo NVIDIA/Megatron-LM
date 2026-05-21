@@ -376,6 +376,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         self._boundary_gather_indices_cache: dict[tuple[int, ...], set[int]] = {}
         self._uneven_gather_plan_cache: dict[int, dict[str, Any]] = {}
         self._fsdp_gather_scratch_cache: dict[tuple[Any, ...], Any] = {}
+        self._fsdp_comm_stream_cache: dict[torch.device, torch.cuda.Stream] = {}
         super().__init__(params, **kwargs)
 
     def _fsdp_gather_scratch_cache_bytes(self) -> int:
@@ -394,6 +395,14 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
     def clear_fsdp_gather_scratch_cache(self) -> None:
         """Clear the gather scratch buffer."""
         self._fsdp_gather_scratch_cache.clear()
+
+    def _get_fsdp_comm_stream(self, device: torch.device) -> torch.cuda.Stream:
+        cached = self._fsdp_comm_stream_cache.get(device)
+        if cached is None:
+            with torch.cuda.device(device):
+                cached = torch.cuda.Stream()
+            self._fsdp_comm_stream_cache[device] = cached
+        return cached
 
     def _get_fsdp_gather_scratch_tensor(
         self, key: tuple[Any, ...], numel: int, *, dtype: torch.dtype, device: torch.device
@@ -467,21 +476,50 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     self._local_muon_update(p, p.grad, group)
             return loss
 
+        overlap_enabled = self.fsdp_overlap_comm_compute and self.fsdp_batched_all_gather
+
         # Track all parameters to update ordered by parameter group index.
         # (param, pre_ns_grad, is_gathered, lr, group_kwargs)
         all_updates: list = []
 
-        # Phase 1: Compute momentum updates (fully local).
+        group_contexts = []
         for group in self.param_groups:
             self._init_group(group, skip_non_grad_params=False)
-            gather_param_indices = self._get_boundary_gather_param_indices(group)
-            lr = group["lr"]
-            group_kwargs = {k: v for k, v in group.items() if k != "params"}
+            group_contexts.append(
+                (
+                    group,
+                    self._get_boundary_gather_param_indices(group),
+                    group["lr"],
+                    {k: v for k, v in group.items() if k != "params"},
+                )
+            )
 
+        early_gather_state = None
+        boundary_update_indices = []
+        if overlap_enabled:
+            # Boundary pre-NS tensors are the only values needed by the
+            # all-gather. Compute them first and launch communication before
+            # spending time on non-boundary momentum and NS work.
+            for group, gather_param_indices, lr, group_kwargs in group_contexts:
+                for param_idx, p in enumerate(group["params"]):
+                    if param_idx not in gather_param_indices:
+                        continue
+                    pre_ns_grad = self._compute_local_pre_ns_grad(p, group, lr)
+                    boundary_update_indices.append(len(all_updates))
+                    all_updates.append((p, pre_ns_grad, True, lr, group_kwargs))
+
+            if boundary_update_indices:
+                early_gather_state = self._start_overlap_boundary_gathers(
+                    all_updates, boundary_update_indices
+                )
+
+        # Phase 1: Compute remaining momentum updates (fully local).
+        for group, gather_param_indices, lr, group_kwargs in group_contexts:
             for param_idx, p in enumerate(group["params"]):
-                p_local = p._local_tensor
                 needs_gather = param_idx in gather_param_indices
-                if p_local.numel() == 0 and not needs_gather:
+                if overlap_enabled and needs_gather:
+                    continue
+                if p._local_tensor.numel() == 0 and not needs_gather:
                     # If this parameter is not split by Megatron-FSDP,
                     # and is empty on this DP rank, then we can skip this
                     # update for all TP ranks, as tensor parallelism uses
@@ -489,36 +527,23 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     # assign any fraction of the parameter to this DP rank.
                     continue
 
-                state = self.state[p]
-                mom_local = state["momentum_buffer"]._local_tensor
-
-                grad = p.grad
-                local_grad = grad._local_tensor if grad is not None else torch.zeros_like(mom_local)
-
-                self._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
-                mom_local.lerp_(local_grad, 1 - group["momentum"])
-                if self.nesterov:
-                    pre_ns_grad = local_grad.lerp(mom_local, group["momentum"])
-                else:
-                    pre_ns_grad = mom_local
-
+                pre_ns_grad = self._compute_local_pre_ns_grad(p, group, lr)
                 all_updates.append((p, pre_ns_grad, needs_gather, lr, group_kwargs))
 
         # Phase 2: AG all boundary gradients.
-        boundary_update_indices = [
-            i for i, (_, _, needs_gather, _, _) in enumerate(all_updates) if needs_gather
-        ]
+        if not overlap_enabled:
+            boundary_update_indices = [
+                i for i, (_, _, needs_gather, _, _) in enumerate(all_updates) if needs_gather
+            ]
 
         # Phase 3: NS orthogonalization and weight update (fully local).
         from emerging_optimizers import utils
 
         with utils.fp32_matmul_precision(self.fp32_matmul_prec):
-            if (
-                self.fsdp_overlap_comm_compute
-                and self.fsdp_batched_all_gather
-                and boundary_update_indices
-            ):
-                self._overlap_boundary_gather_and_update(all_updates, boundary_update_indices)
+            if overlap_enabled and boundary_update_indices:
+                self._overlap_boundary_gather_and_update(
+                    all_updates, boundary_update_indices, early_gather_state
+                )
             else:
                 if boundary_update_indices:
                     boundary_items = [
@@ -545,6 +570,22 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                     )
 
         return loss
+
+    def _compute_local_pre_ns_grad(
+        self, p: torch.Tensor, group: dict[str, Any], lr: float
+    ) -> torch.Tensor:
+        p_local = p._local_tensor
+        state = self.state[p]
+        mom_local = state["momentum_buffer"]._local_tensor
+
+        grad = p.grad
+        local_grad = grad._local_tensor if grad is not None else torch.zeros_like(mom_local)
+
+        self._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
+        mom_local.lerp_(local_grad, 1 - group["momentum"])
+        if self.nesterov:
+            return local_grad.lerp(mom_local, group["momentum"])
+        return mom_local
 
     def _apply_precomputed_muon_update(
         self,
@@ -576,9 +617,9 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         p._local_tensor.add_(orth_update, alpha=-lr)
         self.post_weight_update_fn_inplace(p._local_tensor)
 
-    def _overlap_boundary_gather_and_update(
+    def _start_overlap_boundary_gathers(
         self, all_updates: list, boundary_update_indices: list[int]
-    ) -> None:
+    ) -> dict[str, Any]:
         boundary_items = [(all_updates[i][0], all_updates[i][1]) for i in boundary_update_indices]
         gathered_boundary_updates: list[torch.Tensor | None] = [None] * len(boundary_items)
         completed_item_indices: set[int] = set()
@@ -594,9 +635,37 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                 boundary_items, first_batch
             )
 
-        for p, pre_ns_grad, is_gathered, lr, group_kwargs in all_updates:
-            if not is_gathered:
-                self._apply_precomputed_muon_update(p, pre_ns_grad, is_gathered, lr, group_kwargs)
+        return {
+            "boundary_items": boundary_items,
+            "gathered_boundary_updates": gathered_boundary_updates,
+            "completed_item_indices": completed_item_indices,
+            "batch_iter": batch_iter,
+            "pending": pending,
+        }
+
+    def _overlap_boundary_gather_and_update(
+        self,
+        all_updates: list,
+        boundary_update_indices: list[int],
+        gather_state: dict[str, Any] | None = None,
+    ) -> None:
+        if gather_state is None:
+            gather_state = self._start_overlap_boundary_gathers(
+                all_updates, boundary_update_indices
+            )
+
+        boundary_items = gather_state["boundary_items"]
+        gathered_boundary_updates = gather_state["gathered_boundary_updates"]
+        completed_item_indices = gather_state["completed_item_indices"]
+        batch_iter = gather_state["batch_iter"]
+        pending = gather_state["pending"]
+
+        local_updates = [(idx, update) for idx, update in enumerate(all_updates) if not update[2]]
+        local_updates.sort(
+            key=lambda item: self._local_update_work_estimate(item[1][0], item[1][1]), reverse=True
+        )
+        for _, (p, pre_ns_grad, is_gathered, lr, group_kwargs) in local_updates:
+            self._apply_precomputed_muon_update(p, pre_ns_grad, is_gathered, lr, group_kwargs)
 
         processed_item_indices: set[int] = set()
 
@@ -637,6 +706,11 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                 "Muon+M-FSDP overlap step missed boundary updates: "
                 f"missing_boundary_item_indices={missing}."
             )
+
+    def _local_update_work_estimate(self, p: torch.Tensor, pre_ns_grad: torch.Tensor | None) -> int:
+        if pre_ns_grad is not None:
+            return pre_ns_grad.numel()
+        return p._local_tensor.numel()
 
     def _needs_boundary_gather(self, dtensor: torch.Tensor) -> bool:
         assert isinstance(
@@ -976,32 +1050,36 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         rank_buffers: list[torch.Tensor],
         rank_buffer_offsets: list[int] | None = None,
     ) -> torch.Tensor:
-        full_tensor = torch.empty(
-            dtensor_ref.shape, dtype=rank_buffers[0].dtype, device=rank_buffers[0].device
-        )
-        assigned_numel = 0
-
         if self.fsdp_fast_reconstruct and plan["is_contiguous_full_order"]:
-            full_flat = full_tensor.view(-1)
-            dest_offset = 0
+            chunks = []
+            assigned_numel = 0
             for rank, rank_buffer in enumerate(rank_buffers):
                 chunk_info = plan["chunk_infos"][rank]
                 chunk_numel = chunk_info["numel"]
                 if chunk_numel == 0:
                     continue
                 source_offset = 0 if rank_buffer_offsets is None else rank_buffer_offsets[rank]
-                full_flat[dest_offset : dest_offset + chunk_numel].copy_(
-                    rank_buffer[source_offset : source_offset + chunk_numel]
-                )
-                dest_offset += chunk_numel
+                chunks.append(rank_buffer[source_offset : source_offset + chunk_numel])
                 assigned_numel += chunk_numel
             if assigned_numel != plan["full_numel"]:
                 raise AssertionError(
                     "Fast uneven DTensor reconstruction did not cover the full tensor: "
                     f"assigned={assigned_numel}, expected={plan['full_numel']}."
                 )
-            return full_tensor
+            if assigned_numel == 0:
+                return torch.empty(
+                    dtensor_ref.shape, dtype=rank_buffers[0].dtype, device=rank_buffers[0].device
+                )
+            if len(chunks) == 1:
+                full_flat = chunks[0].clone()
+            else:
+                full_flat = torch.cat(chunks)
+            return full_flat.view(dtensor_ref.shape)
 
+        full_tensor = torch.empty(
+            dtensor_ref.shape, dtype=rank_buffers[0].dtype, device=rank_buffers[0].device
+        )
+        assigned_numel = 0
         for rank, rank_buffer in enumerate(rank_buffers):
             chunk_info = plan["chunk_infos"][rank]
             chunk_numel = chunk_info["numel"]
@@ -1288,7 +1366,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         comm_stream = None
         if async_op and device.type == "cuda":
             with torch.cuda.device(device):
-                comm_stream = torch.cuda.Stream()
+                comm_stream = self._get_fsdp_comm_stream(device)
                 comm_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(comm_stream):
                     return self._issue_uneven_gather_stage(
@@ -1377,6 +1455,30 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         next_buffers = []
         for batch_item_idx, plan in enumerate(plans):
             item_numel = sum(plan["stages"][stage_idx]["rank_numels"])
+            if plan["is_contiguous_full_order"]:
+                chunks = []
+                assigned_numel = 0
+                for rank, rank_buffer in enumerate(rank_buffers):
+                    chunk_numel = plan["stages"][stage_idx]["rank_numels"][rank]
+                    if chunk_numel == 0:
+                        continue
+                    source_offset = rank_offsets[rank][batch_item_idx]
+                    chunks.append(rank_buffer[source_offset : source_offset + chunk_numel])
+                    assigned_numel += chunk_numel
+                if assigned_numel != item_numel:
+                    raise AssertionError(
+                        "Batched uneven DTensor stage unpack did not cover the item: "
+                        f"stage={stage_idx}, assigned={assigned_numel}, expected={item_numel}."
+                    )
+                if item_numel == 0:
+                    item_buffer = torch.empty(0, dtype=batch["dtype"], device=batch["device"])
+                elif len(chunks) == 1:
+                    item_buffer = chunks[0].clone()
+                else:
+                    item_buffer = torch.cat(chunks)
+                next_buffers.append(item_buffer)
+                continue
+
             item_buffer = torch.empty(item_numel, dtype=batch["dtype"], device=batch["device"])
             item_offset = 0
             for rank, rank_buffer in enumerate(rank_buffers):
@@ -1428,7 +1530,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         if batch["device"].type == "cuda" and len(plans[0]["stages"]) > 1:
             pending_stages = []
             with torch.cuda.device(batch["device"]):
-                comm_stream = torch.cuda.Stream()
+                comm_stream = self._get_fsdp_comm_stream(batch["device"])
                 comm_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(comm_stream):
                     for stage_idx, stage in enumerate(plans[0]["stages"]):
