@@ -49,6 +49,7 @@ def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
         is_batch_invariant_mode_enabled,
         rmsnorm_batch_invariant,
     )
+
     if is_batch_invariant_mode_enabled():
         return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
     x_shape = x.shape
