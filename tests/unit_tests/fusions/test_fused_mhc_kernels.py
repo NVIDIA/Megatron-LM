@@ -14,15 +14,14 @@ import pytest
 import torch
 from torch import Tensor
 
-from megatron.core.fusions.fused_mhc_kernels import is_cutile_available
 from megatron.core.transformer.hyper_connection import (
     native_h_aggregate,
     native_h_post_bda,
     native_proj_rms,
     native_sinkhorn,
 )
-
-_require_cutile = pytest.mark.skipif(not is_cutile_available(), reason="cuTile not installed")
+from tests.unit_tests.test_utilities import is_cutile_available
+from tests.unit_tests.test_utilities import requires_cutile as _require_cutile
 
 
 @pytest.fixture(autouse=True)

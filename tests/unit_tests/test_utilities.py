@@ -2,6 +2,7 @@
 import os
 from datetime import timedelta
 
+import pytest
 import torch
 from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
@@ -31,6 +32,28 @@ def clear_nvte_env_vars():
     os.environ.pop('NVTE_FLASH_ATTN', None)
     os.environ.pop('NVTE_FUSED_ATTN', None)
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
+
+def is_cutile_available():
+    try:
+        import cuda.tile  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def is_hopper():
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_properties(torch.device("cuda:0")).major == 9
+    )
+
+
+# cuda.tile imports in the 26.04 container on H100, but tileiras rejects sm_90.
+requires_cutile = pytest.mark.skipif(
+    not is_cutile_available() or is_hopper(),
+    reason="cuTile is unavailable or unsupported on Hopper/sm_90 in this container",
+)
 
 
 class Utils:
