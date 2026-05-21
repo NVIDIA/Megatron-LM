@@ -280,7 +280,7 @@ _hybrid_ep_buffer = None
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
-    seq_len: int,
+    num_tokens: int,
     num_local_experts: int,
     num_sms_dispatch_api: Optional[int] = None,
     num_sms_combine_api: Optional[int] = None,
@@ -302,8 +302,8 @@ def init_hybrid_ep_buffer(
             Process group for HybridEP all-to-all communication.
         hidden_dim (int):
             Hidden dimension of the input tensor.
-        seq_len (int):
-            Maximum sequence length of the input tensor.
+        num_tokens (int):
+            Maximum token count of the input tensor.
         num_local_experts (int):
             Number of local experts.
         num_sms_dispatch_api (Optional[int]):
@@ -335,7 +335,7 @@ def init_hybrid_ep_buffer(
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
-        max_num_of_tokens_per_rank=seq_len,
+        max_num_of_tokens_per_rank=num_tokens,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
         **kwargs,
@@ -393,12 +393,12 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_unpermute = None
 
         if _hybrid_ep_buffer is None:
-            seq_len, hidden_dim = x.shape[-2:]
+            num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
                 hidden_dim,
-                seq_len,
+                num_tokens,
                 num_local_experts,
                 num_sms_dispatch_api,
                 num_sms_combine_api,
