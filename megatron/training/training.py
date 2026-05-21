@@ -48,7 +48,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch.distributed
 
@@ -123,9 +123,7 @@ RL_LOGGABLE_TIMER_NAMES = [
 ]
 
 try:
-    from modelopt.torch.distill.plugins.megatron import (
-        get_tensor_shapes_adjust_fn_for_distillation,
-    )
+    from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -187,11 +185,7 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
-from megatron.core.optimizer import (
-    OptimizerConfig,
-    ParamKey,
-    get_megatron_optimizer,
-)
+from megatron.core.optimizer import OptimizerConfig, ParamKey, get_megatron_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.parallel_state import (
     create_all_gather_groups,
@@ -299,23 +293,33 @@ def print_datetime(string, override_timestamp=None):
         time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
-# Per-iteration accumulator for ``sum(L_i ** 2)`` across all real (unpadded)
-# sub-sequences. Lives on GPU as a 1-element fp64 tensor so per-micro-batch
-# updates do NOT force a CPU sync; the only CPU read happens at consume time,
-# after a single all-reduce. ``_seqlen_stats_active`` flips to ``True`` the
-# first time an update lands this iteration, and is the gate that decides
-# whether ``consume_*`` issues a collective at all -- unpacked BSHD runs never
-# call ``update_*`` so the flag stays ``False`` and no collective fires.
-_seqlen_squared_sum_in_iteration: Optional[torch.Tensor] = None
+# Per-iteration packed-sequence (THD) accumulator. The tensor holds TWO stats,
+# both computed from the REAL ``cu_seqlens`` (i.e. unpadded sub-sequence lengths
+# -- ``cu_seqlens_padded`` is intentionally ignored so that neither the
+# per-chunk CP alignment padding nor any end-of-sequence padding is counted as
+# useful work):
+#   index 0 -> ``sum_i(L_i)``   (total real tokens; used for token-linear FLOPs:
+#                               projections, MLP, MoE, MTP, logits)
+#   index 1 -> ``sum_i(L_i**2)`` (used for core-attention FLOPs)
+# Lives on GPU as fp64 so per-micro-batch updates run as fused kernels with
+# no host sync; the only host sync happens once at ``consume`` time after a
+# single 2-element all-reduce. ``_seqlen_stats_active`` flips to ``True`` the
+# first time an update lands this iteration and is the gate that decides
+# whether ``consume_*`` issues a collective at all -- unpacked BSHD runs
+# never call ``update_*`` so the flag stays ``False`` and no collective fires.
+_seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 
 
-def update_seqlen_squared_sum_from_cu_seqlens(cu_seqlens):
-    """Add ``sum(L_i ** 2)`` from one micro-batch's ``cu_seqlens`` to the GPU accumulator.
+def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
+    """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
 
     Args:
-        cu_seqlens: 1-D ``int32`` tensor of cumulative sequence lengths
-            (``[0, L_1, L_1 + L_2, ...]``), as carried by ``PackedSeqParams``.
+        cu_seqlens: 1-D ``int32`` tensor of cumulative REAL (unpadded) sequence
+            lengths (``[0, L_1, L_1 + L_2, ...]``). Pass the unpadded
+            ``cu_seqlens`` rather than ``cu_seqlens_padded`` so the FLOPs
+            metric reports useful work only, not work on CP-alignment or
+            end-of-sequence padding tokens.
 
     Every rank in the same data-parallel group sees the same ``cu_seqlens`` (it is
     broadcast across TP/CP/PP). The per-micro-batch reduction stays on device --
@@ -324,134 +328,161 @@ def update_seqlen_squared_sum_from_cu_seqlens(cu_seqlens):
     the all-reduce; BSHD callers that never invoke this function leave the
     flag at ``False`` and pay zero collective cost.
     """
-    global _seqlen_squared_sum_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
     # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
     # (e.g. unit tests). Production always supplies a CUDA tensor.
-    if _seqlen_squared_sum_in_iteration is None:
+    if _seqlen_stats_in_iteration is None:
         device = (
             torch.device(f'cuda:{torch.cuda.current_device()}')
             if torch.cuda.is_available()
             else cu_seqlens.device
         )
-        _seqlen_squared_sum_in_iteration = torch.zeros(1, dtype=torch.float64, device=device)
+        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
-        device=_seqlen_squared_sum_in_iteration.device, dtype=torch.float64
+        device=_seqlen_stats_in_iteration.device, dtype=torch.float64
     )
-    _seqlen_squared_sum_in_iteration += (seqlens * seqlens).sum()
+    _seqlen_stats_in_iteration[0] += seqlens.sum()
+    _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
     _seqlen_stats_active = True
 
 
-def consume_seqlen_squared_sum_in_iteration():
-    """Read, reset and globally reduce the per-iteration ``sum(L_i ** 2)`` accumulator.
+def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
+    """Read, reset and globally reduce the per-iteration packed-sequence stats.
 
     Returns:
-        ``float`` total ``sum(L_i ** 2)`` across the whole global batch (all DP
-        ranks combined) for packed (THD) iterations, or ``None`` if no update
-        happened this iteration -- the BSHD path. Returning ``None`` lets
-        ``num_floating_point_operations`` fall back to its closed-form
-        ``batch_size * seq_length ** 2`` default without paying for a collective.
+        ``(total_real_tokens, seqlen_squared_sum)`` summed across the whole
+        global batch (all DP ranks combined) for packed (THD) iterations.
+        Both are ``None`` if no update happened this iteration -- the BSHD
+        path -- so the caller forwards them straight to
+        ``num_floating_point_operations`` and takes its closed-form
+        ``batch_size * seq_length`` / ``batch_size * seq_length ** 2`` defaults
+        without paying for a collective.
 
-    Sync cost: exactly one all-reduce of a 1-element ``float64`` tensor, plus
-    one ``.item()`` host sync. Skipped entirely when the flag is ``False``.
+        ``sum(L_i)`` and ``sum(L_i ** 2)`` are mathematically independent (you
+        cannot derive one from the other), so both must be tracked. Computing
+        them in tandem costs essentially nothing: the per-micro-batch updates
+        fuse onto one device tensor and consume issues a single 2-element
+        all-reduce.
+
+    Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
+    host sync (``tolist()``). Skipped entirely when the flag is ``False``.
 
     All ranks within one DP group accumulated identical values (``cu_seqlens`` is
     replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
     factor of ``TP * CP * PP``, which we divide out.
     """
-    global _seqlen_squared_sum_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active
     if not _seqlen_stats_active:
-        # BSHD path: never even allocated the tensor; tell the caller to use
-        # the default (closed-form) ``batch_size * seq_length ** 2``.
-        return None
-    t = _seqlen_squared_sum_in_iteration
+        # BSHD path: never allocated the tensor; tell the caller to use the
+        # closed-form defaults.
+        return None, None
+    t = _seqlen_stats_in_iteration
     if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
         torch.distributed.all_reduce(t)
         tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
         cp_size = max(mpu.get_context_parallel_world_size(), 1)
         pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
-        result = float(t.item()) / (tp_size * cp_size * pp_size)
+        dedup = tp_size * cp_size * pp_size
     else:
         # No model-parallel state -> treat as a single rank, no reduction.
         # This is the standalone unit-test path; production always initializes mpu.
-        result = float(t.item())
+        dedup = 1
+    # Single host sync drains both stats at once.
+    total_real_tokens, seqlen_squared_sum = t.tolist()
     # Reset for the next iteration. Keep the tensor allocated so subsequent
     # iterations reuse it without reallocating.
     t.zero_()
     _seqlen_stats_active = False
-    return result
+    return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
-def num_floating_point_operations(args, batch_size, seqlen_squared_sum_in_batch=None):
+def num_floating_point_operations(
+    args,
+    batch_size,
+    seqlen_squared_sum_in_batch=None,
+    total_real_tokens_in_batch=None,
+):
     """Compute the number of floating-point operations for one global batch.
 
     Args:
         args: Megatron args (provides hidden size, num layers, seq length, ...).
-        batch_size: Global batch size (samples per iteration). Used for token-linear
-            terms whose compute scales with the total number of tokens
-            ``batch_size * args.seq_length`` (projections, MLP, MoE, logits, ...).
-        seqlen_squared_sum_in_batch: Sum of ``L_i ** 2`` across all real
-            (unpadded) sub-sequences in the global batch. For unpacked BSHD this
-            equals ``batch_size * args.seq_length ** 2`` (the default when ``None``
-            is passed). For THD packed sequences it equals the actual ragged
-            ``sum(L_i ** 2)`` and is strictly less than the BSHD value, reflecting
-            the reduced core-attention work due to per-chunk causal masking.
+        batch_size: Global batch size (samples per iteration). Only used to
+            compute the default token counts for the BSHD path -- with THD
+            both ``total_real_tokens_in_batch`` and ``seqlen_squared_sum_in_batch``
+            are passed in explicitly and ``batch_size`` is irrelevant.
+        seqlen_squared_sum_in_batch: ``sum_i(L_i ** 2)`` across all REAL
+            (unpadded) sub-sequences in the global batch. Drives the
+            core-attention L^2 FLOPs. For BSHD this equals
+            ``batch_size * args.seq_length ** 2`` (the default when ``None``).
+            For THD it is the actual ragged sum and is strictly less than the
+            BSHD value, reflecting per-chunk causal masking AND the fact that
+            padding tokens do not contribute to attention scores.
+        total_real_tokens_in_batch: ``sum_i(L_i)``, the TOTAL REAL (unpadded)
+            token count across the global batch. Drives all token-linear FLOPs
+            (QKV+output projections, MLP, MoE, MTP norms/projs, logits). For
+            BSHD this equals ``batch_size * args.seq_length`` (the default when
+            ``None``). For THD it equals the real token count -- strictly less
+            than ``batch_size * args.seq_length`` whenever the dataloader added
+            CP-alignment padding or end-of-sequence padding, so neither kind of
+            padding shows up in the reported FLOPs.
     """
-    # Default: BSHD layout assumption (full causal mask, every sample length = seq_length).
+    # Defaults: BSHD layout assumption (full causal mask, every sample length =
+    # seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
+    # ``seqlen_squared_sum = batch * s^2`` recover the original closed-form.
     if seqlen_squared_sum_in_batch is None:
         seqlen_squared_sum_in_batch = batch_size * args.seq_length * args.seq_length
+    if total_real_tokens_in_batch is None:
+        total_real_tokens_in_batch = batch_size * args.seq_length
 
-    def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
+    def mlp_layer_flops(total_tokens, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
-        return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
+        return 4 * expansion * scale_factor * total_tokens * hidden_size**2
 
-    def moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+    def moe_layer_flops(total_tokens, hidden_size, moe_ffn_hidden_size,
                         shared_expert_ffn_hidden_size, num_experts_routed_to,
                         moe_latent_size=None, swiglu=False):
         """Calculate FLOPs for an MoE layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
         if moe_latent_size is None:
-            routed_flops = (4 * batch_size * seq_len * hidden_size *
+            routed_flops = (4 * total_tokens * hidden_size *
                             moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
         else:
             # Routed experts run on moe_latent_size.
-            routed_flops = (4 * batch_size * seq_len * moe_latent_size *
+            routed_flops = (4 * total_tokens * moe_latent_size *
                             moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
             # Up proj and down proj.
-            routed_flops += (4 * batch_size * seq_len * hidden_size * moe_latent_size)
-        shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+            routed_flops += (4 * total_tokens * hidden_size * moe_latent_size)
+        shared_flops = 4 * total_tokens * hidden_size * shared_expert_ffn_hidden_size * scale_factor
         return routed_flops + shared_flops
 
     def attn_layer_flops(
-        batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8,
-        kv_channels=None, seqlen_squared_sum=None,
+        total_tokens, seqlen_squared_sum, hidden_size, num_heads, gqa=True,
+        gqa_groups=8, kv_channels=None,
     ):
         """Calculate FLOPs for an attention layer.
 
-        The token-linear part (QKV projection + output projection) scales with
-        ``batch_size * seq_len`` (= total tokens) and the core-attention part
-        (``QK^T`` and ``softmax(QK^T) V``) scales with ``sum_i(L_i ** 2)``.
-
-        For BSHD (``seqlen_squared_sum=None``), each of the ``batch_size``
-        samples has length ``seq_len``, so the L^2 term reduces to
-        ``batch_size * seq_len ** 2``. For THD it is the true ragged sum.
+        Two parts:
+          - Token-linear (QKV + output projections): scales with ``total_tokens``
+            (= ``sum_i(L_i)``). Padding tokens are excluded by passing the real
+            (unpadded) token count.
+          - Core attention (``QK^T`` and ``softmax(QK^T) V``): scales with
+            ``seqlen_squared_sum`` (= ``sum_i(L_i ** 2)``).
         """
-        if seqlen_squared_sum is None:
-            seqlen_squared_sum = batch_size * seq_len * seq_len
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
         # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
         # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
-            4 * batch_size * seq_len * hidden_size * p
+            4 * total_tokens * hidden_size * p
             * (hidden_size + hidden_size * (g / num_heads))
             + 2 * seqlen_squared_sum * hidden_size * p
         )
 
-    def mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
+    def mamba_layer_flops(total_tokens, hidden_size, state_dim=16,
                           head_dim=64, num_groups=1, num_heads=128):
         """Calculate FLOPs for a Mamba layer."""
         # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
@@ -464,16 +495,15 @@ def num_floating_point_operations(args, batch_size, seqlen_squared_sum_in_batch=
         return (
             (
                 2
-                * batch_size
-                * seq_len
+                * total_tokens
                 * hidden_size
                 * (2 * d_in + 2 * num_groups * state_dim + nheads)
             )  # in_proj
-            + (7 * batch_size * seq_len * d_in * state_dim)  # scan
-            + (2 * batch_size * seq_len * d_in * hidden_size)  # out_proj
+            + (7 * total_tokens * d_in * state_dim)  # scan
+            + (2 * total_tokens * d_in * hidden_size)  # out_proj
         )
 
-    def gdn_layer_flops(batch_size, seq_len, hidden_size,
+    def gdn_layer_flops(total_tokens, hidden_size,
                         qk_head_dim=128, v_head_dim=128,
                         num_qk_heads=16, num_v_heads=32,
                         conv_kernel_dim=4):
@@ -481,7 +511,7 @@ def num_floating_point_operations(args, batch_size, seqlen_squared_sum_in_batch=
         qk_dim = qk_head_dim * num_qk_heads
         v_dim = v_head_dim * num_v_heads
         return (
-            2 * batch_size * seq_len * (
+            2 * total_tokens * (
                 # in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
                 hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
                 # conv1d
@@ -493,7 +523,7 @@ def num_floating_point_operations(args, batch_size, seqlen_squared_sum_in_batch=
             )
         )
 
-    def hybrid_flops(batch_size, seq_len, hidden_size,
+    def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
                      num_gdn_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
@@ -506,26 +536,25 @@ def num_floating_point_operations(args, batch_size, seqlen_squared_sum_in_batch=
                      gdn_qk_head_dim=128, gdn_v_head_dim=128,
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4,
-                     vocab_size=256000, mtp_num_layers=0,
-                     seqlen_squared_sum=None):
+                     vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
-                num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
-                                                   num_attn_heads, gqa, gqa_groups, kv_channels,
-                                                   seqlen_squared_sum=seqlen_squared_sum) +
-                num_mlp_layers * mlp_layer_flops(batch_size, seq_len, hidden_size,
+                num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
+                                                   hidden_size, num_attn_heads, gqa,
+                                                   gqa_groups, kv_channels) +
+                num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
                                                  mlp_expansion, swiglu) +
-                num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
+                num_mamba_layers * mamba_layer_flops(total_tokens, hidden_size,
                                                      mamba_state_dim, mamba_head_dim,
                                                      mamba_num_groups, mamba_num_heads) +
-                num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                num_moe_layers * moe_layer_flops(total_tokens, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
-                num_gdn_layers * gdn_layer_flops(batch_size, seq_len, hidden_size,
+                num_gdn_layers * gdn_layer_flops(total_tokens, hidden_size,
                                                   gdn_qk_head_dim, gdn_v_head_dim,
                                                   gdn_num_qk_heads, gdn_num_v_heads,
                                                   gdn_conv_kernel_dim) +
-                (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
+                (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
 
@@ -768,9 +797,10 @@ def num_floating_point_operations(args, batch_size, seqlen_squared_sum_in_batch=
         # Core attention (L^2) FLOPs per standard-attention layer.
         self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
 
+        # Token-linear FLOPs scale with the real (unpadded) token count.
+        # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
         total_floating_point_operations = (
-            batch_size
-            * args.seq_length
+            total_real_tokens_in_batch
             * (
                 # MLP
                 forward_backward_expansion_factor
@@ -847,8 +877,8 @@ def num_floating_point_operations(args, batch_size, seqlen_squared_sum_in_batch=
             mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return hybrid_flops(
-            batch_size=batch_size,
-            seq_len=args.seq_length,
+            total_tokens=total_real_tokens_in_batch,
+            seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
             num_mamba_layers=num_mamba_layers,
@@ -878,7 +908,6 @@ def num_floating_point_operations(args, batch_size, seqlen_squared_sum_in_batch=
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
-            seqlen_squared_sum=seqlen_squared_sum_in_batch,
         )
     else:
         # Compute standard Transformer model FLOPs.
@@ -2312,6 +2341,7 @@ def training_log(
     pg_collection=None,
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
+    total_real_tokens_in_batch: float | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2544,7 +2574,10 @@ def training_log(
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
         throughput = num_floating_point_operations(
-            args, batch_size, seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
@@ -3540,13 +3573,19 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        # Drain the per-iteration packed-sequence ``sum(L_i^2)`` accumulator so the
-        # FLOPs computation reflects THD per-chunk causal attention. Returns
-        # ``None`` for unpacked BSHD runs (no collective issued), letting
-        # ``num_floating_point_operations`` fall back to its closed-form default.
-        seqlen_squared_sum_in_batch = consume_seqlen_squared_sum_in_iteration()
+        # Drain the per-iteration packed-sequence stats so the FLOPs computation
+        # reflects THD per-chunk causal attention AND excludes padding tokens
+        # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
+        # runs (no collective issued), letting ``num_floating_point_operations``
+        # fall back to its closed-form defaults.
+        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
+            consume_seqlen_stats_in_iteration()
+        )
         num_floating_point_operations_in_batch = num_floating_point_operations(
-            args, batch_size, seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
@@ -3579,6 +3618,7 @@ def train(
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
         is_first_iteration = False
 

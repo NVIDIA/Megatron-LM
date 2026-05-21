@@ -19,15 +19,15 @@ import torch
 
 import megatron.training.training as training_module
 from megatron.training.training import (
-    consume_seqlen_squared_sum_in_iteration,
+    consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
-    update_seqlen_squared_sum_from_cu_seqlens,
+    update_seqlen_stats_from_cu_seqlens,
 )
 
 
 def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
-    training_module._seqlen_squared_sum_in_iteration = None
+    training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
 
 
@@ -255,9 +255,122 @@ class TestHybridTHDScaling:
         assert flops_doubled - flops_bshd == expected_delta
 
 
+class TestPaddingRemoval:
+    """``total_real_tokens_in_batch`` removes padding from token-linear FLOPs.
+
+    With THD, the dataloader pads sequences for CP alignment and for
+    end-of-sequence packing. The padded slot count (``batch_size *
+    args.seq_length``) over-counts both kinds of padding as useful compute. By
+    threading the real token count ``sum_i(L_i)`` through every token-linear
+    term (MLP, MoE, projections, MTP, logits) we report only useful FLOPs.
+    """
+
+    def test_default_total_tokens_matches_bshd(self):
+        """When ``total_real_tokens_in_batch`` is ``None`` the default is
+        ``batch_size * args.seq_length``, recovering the old BSHD result."""
+        args = _make_gpt_args()
+        batch_size = 8
+        default_flops = num_floating_point_operations(args, batch_size)
+        explicit_flops = num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=batch_size * args.seq_length,
+            seqlen_squared_sum_in_batch=batch_size * args.seq_length * args.seq_length,
+        )
+        assert default_flops == explicit_flops
+
+    def test_lower_total_tokens_reduces_token_linear_flops(self):
+        """Halving the real token count must halve every token-linear term.
+        The core-attention L^2 term is unchanged (we hold ``seqlen_sq`` fixed)."""
+        args = _make_gpt_args()
+        batch_size = 8
+        full_tokens = batch_size * args.seq_length
+        full_sum_sq = batch_size * args.seq_length * args.seq_length
+
+        flops_full = num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=full_tokens,
+            seqlen_squared_sum_in_batch=full_sum_sq,
+        )
+        flops_half = num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=full_tokens // 2,
+            seqlen_squared_sum_in_batch=full_sum_sq,
+        )
+
+        # The token-linear part should halve; the L^2 term is the same in
+        # both calls, so the difference equals 1/2 of the token-linear part.
+        # In particular: flops_full > flops_half AND flops_half > full_sum_sq
+        # contribution alone (because the L^2 term is unaffected).
+        assert flops_half < flops_full
+        # Token-linear part of ``flops_full`` is ``flops_full - L2_contrib``.
+        # ``flops_half`` = (token_linear_full / 2) + L2_contrib.
+        # So ``2 * flops_half - flops_full == L2_contrib``.
+        q_proj_size = args.kv_channels * args.num_attention_heads
+        l2_contrib = 6 * args.num_layers * q_proj_size * full_sum_sq
+        assert 2 * flops_half - flops_full == l2_contrib
+
+    def test_padding_removal_independent_of_attention(self):
+        """Removing only the projection/MLP padding (``total_real_tokens``
+        drops) must NOT change the core-attention contribution. Pin that the
+        two parameters are independent."""
+        args = _make_gpt_args()
+        batch_size = 8
+        full_tokens = batch_size * args.seq_length
+        full_sum_sq = batch_size * args.seq_length * args.seq_length
+
+        # Fix sum_sq (attention work); vary token count (projection work).
+        flops_a = num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=full_tokens,
+            seqlen_squared_sum_in_batch=full_sum_sq,
+        )
+        flops_b = num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=full_tokens * 3 // 4,  # 25% padding
+            seqlen_squared_sum_in_batch=full_sum_sq,
+        )
+        # Difference comes purely from the token-linear delta.
+        per_token_linear_factor = (flops_a - flops_b) / (full_tokens - full_tokens * 3 // 4)
+        # Sanity check it's positive and that a 1-token swing scales linearly.
+        flops_c = num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=full_tokens - 1,
+            seqlen_squared_sum_in_batch=full_sum_sq,
+        )
+        assert flops_a - flops_c == pytest.approx(per_token_linear_factor)
+
+    def test_hybrid_padding_removal(self):
+        """The hybrid path also threads ``total_tokens`` through every layer
+        helper (mamba, gdn, mlp, moe, attn projections, logits)."""
+        args = _make_hybrid_args()
+        batch_size = 4
+        full_tokens = batch_size * args.seq_length
+        full_sum_sq = batch_size * args.seq_length * args.seq_length
+
+        flops_full = num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=full_tokens,
+            seqlen_squared_sum_in_batch=full_sum_sq,
+        )
+        flops_half = num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=full_tokens // 2,
+            seqlen_squared_sum_in_batch=full_sum_sq,
+        )
+        # Token-linear contribution halves; L^2 attention term is unchanged.
+        assert flops_half < flops_full
+
+
 class TestAccumulator:
-    """``update_seqlen_squared_sum_from_cu_seqlens`` and
-    ``consume_seqlen_squared_sum_in_iteration``."""
+    """``update_seqlen_stats_from_cu_seqlens`` and ``consume_seqlen_stats_in_iteration``."""
 
     def setup_method(self):
         _reset_seqlen_accumulator()
@@ -265,48 +378,52 @@ class TestAccumulator:
     def teardown_method(self):
         _reset_seqlen_accumulator()
 
-    def test_update_computes_sum_of_squares(self):
+    def test_update_computes_both_stats(self):
         # cu_seqlens [0, 100, 250, 400] -> lengths [100, 150, 150]
         cu = torch.tensor([0, 100, 250, 400], dtype=torch.int32)
-        update_seqlen_squared_sum_from_cu_seqlens(cu)
-        expected = 100**2 + 150**2 + 150**2
-        # No torch.distributed -> consume returns the raw accumulator.
-        assert consume_seqlen_squared_sum_in_iteration() == expected
+        update_seqlen_stats_from_cu_seqlens(cu)
+        expected_sum = 100 + 150 + 150
+        expected_sum_sq = 100**2 + 150**2 + 150**2
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == expected_sum
+        assert seqlen_squared_sum == expected_sum_sq
 
     def test_update_accumulates_across_microbatches(self):
-        cu1 = torch.tensor([0, 100, 200], dtype=torch.int32)  # 100^2 + 100^2 = 20000
-        cu2 = torch.tensor([0, 50, 250], dtype=torch.int32)  # 50^2 + 200^2 = 42500
-        update_seqlen_squared_sum_from_cu_seqlens(cu1)
-        update_seqlen_squared_sum_from_cu_seqlens(cu2)
-        assert consume_seqlen_squared_sum_in_iteration() == 20000 + 42500
+        cu1 = torch.tensor([0, 100, 200], dtype=torch.int32)  # sum=200, sum^2=20000
+        cu2 = torch.tensor([0, 50, 250], dtype=torch.int32)  # sum=250, sum^2=42500
+        update_seqlen_stats_from_cu_seqlens(cu1)
+        update_seqlen_stats_from_cu_seqlens(cu2)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 200 + 250
+        assert seqlen_squared_sum == 20000 + 42500
 
     def test_consume_resets_accumulator(self):
         cu = torch.tensor([0, 100, 200], dtype=torch.int32)
-        update_seqlen_squared_sum_from_cu_seqlens(cu)
-        _ = consume_seqlen_squared_sum_in_iteration()
+        update_seqlen_stats_from_cu_seqlens(cu)
+        _ = consume_seqlen_stats_in_iteration()
         # After draining, next consume must report BSHD (no work seen) by
-        # returning ``None`` so ``num_floating_point_operations`` takes the
-        # closed-form default.
-        assert consume_seqlen_squared_sum_in_iteration() is None
+        # returning ``(None, None)`` so ``num_floating_point_operations`` takes
+        # the closed-form defaults.
+        assert consume_seqlen_stats_in_iteration() == (None, None)
 
     def test_no_updates_returns_none(self):
         """BSHD path: never calling update must NOT issue a collective. The
-        flag stays ``False`` and consume returns ``None``."""
-        assert consume_seqlen_squared_sum_in_iteration() is None
+        flag stays ``False`` and consume returns ``(None, None)``."""
+        assert consume_seqlen_stats_in_iteration() == (None, None)
         # Flag stayed False -> the GPU tensor was never even allocated.
-        assert training_module._seqlen_squared_sum_in_iteration is None
+        assert training_module._seqlen_stats_in_iteration is None
         assert training_module._seqlen_stats_active is False
 
     def test_update_none_cu_seqlens_is_noop(self):
-        update_seqlen_squared_sum_from_cu_seqlens(None)
+        update_seqlen_stats_from_cu_seqlens(None)
         # Still BSHD (no real update happened).
-        assert consume_seqlen_squared_sum_in_iteration() is None
+        assert consume_seqlen_stats_in_iteration() == (None, None)
         assert training_module._seqlen_stats_active is False
 
     def test_update_single_entry_cu_seqlens_is_noop(self):
         """``cu_seqlens.numel() < 2`` (no real chunks) must be ignored."""
-        update_seqlen_squared_sum_from_cu_seqlens(torch.tensor([0], dtype=torch.int32))
-        assert consume_seqlen_squared_sum_in_iteration() is None
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == (None, None)
         assert training_module._seqlen_stats_active is False
 
     def test_bshd_equivalent_when_chunks_fill_seq_length(self):
@@ -316,9 +433,23 @@ class TestAccumulator:
         # Each "sample" is one packed sequence of one chunk of length s.
         for _ in range(batch_size):
             cu = torch.tensor([0, s], dtype=torch.int32)
-            update_seqlen_squared_sum_from_cu_seqlens(cu)
-        bshd_sum = batch_size * s * s
-        assert consume_seqlen_squared_sum_in_iteration() == bshd_sum
+            update_seqlen_stats_from_cu_seqlens(cu)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == batch_size * s
+        assert seqlen_squared_sum == batch_size * s * s
+
+    def test_unpadded_cu_seqlens_excludes_padding(self):
+        """When the dataloader pads (cu_seqlens_padded > cu_seqlens), passing the
+        REAL cu_seqlens to update() makes both stats reflect only real tokens."""
+        # 2 real chunks of length 100 + 200 = 300 tokens, padded slot of 400.
+        cu_real = torch.tensor([0, 100, 300], dtype=torch.int32)
+        # cu_padded would be [0, 128, 400] in production (chunk pad + end pad),
+        # but the accumulator must only see ``cu_real``.
+        update_seqlen_stats_from_cu_seqlens(cu_real)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        # Real token count, NOT 400 (padded slot size).
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
 
     def test_update_keeps_accumulator_on_gpu_when_input_on_gpu(self):
         """No per-micro-batch CPU sync: the accumulator tensor lives on the
@@ -327,17 +458,18 @@ class TestAccumulator:
         if not torch.cuda.is_available():
             pytest.skip("requires CUDA")
         cu = torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
-        update_seqlen_squared_sum_from_cu_seqlens(cu)
-        tensor = training_module._seqlen_squared_sum_in_iteration
+        update_seqlen_stats_from_cu_seqlens(cu)
+        tensor = training_module._seqlen_stats_in_iteration
         assert tensor is not None
         assert tensor.is_cuda
+        assert tensor.shape == (2,)  # [sum_L, sum_L_sq]
         assert training_module._seqlen_stats_active is True
         # Drain.
-        _ = consume_seqlen_squared_sum_in_iteration()
+        _ = consume_seqlen_stats_in_iteration()
         # Tensor stays allocated for reuse, but the flag flips back to False.
         assert training_module._seqlen_stats_active is False
-        assert training_module._seqlen_squared_sum_in_iteration is not None
-        assert float(training_module._seqlen_squared_sum_in_iteration.item()) == 0.0
+        assert training_module._seqlen_stats_in_iteration is not None
+        assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
 
 
 class TestAccumulatorDistributed:
@@ -370,11 +502,13 @@ class TestAccumulatorDistributed:
 
         # Each rank simulates its own micro-batch with chunks [100, 200].
         cu = torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
-        update_seqlen_squared_sum_from_cu_seqlens(cu)
+        update_seqlen_stats_from_cu_seqlens(cu)
 
-        per_rank = 100**2 + 200**2
-        expected = per_rank * Utils.world_size
-        assert consume_seqlen_squared_sum_in_iteration() == expected
+        per_rank_sum = 100 + 200
+        per_rank_sum_sq = 100**2 + 200**2
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == per_rank_sum * Utils.world_size
+        assert seqlen_squared_sum == per_rank_sum_sq * Utils.world_size
 
     def test_pure_tp_deduplicates(self):
         """All TP ranks have the same cu_seqlens; deduplication divides the world sum."""
@@ -387,19 +521,20 @@ class TestAccumulatorDistributed:
         )
 
         cu = torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
-        update_seqlen_squared_sum_from_cu_seqlens(cu)
+        update_seqlen_stats_from_cu_seqlens(cu)
 
         # All TP ranks updated the same value; after world all_reduce we get
         # TP * (per_rank) and divide by TP -> per_rank.
-        per_rank = 100**2 + 200**2
-        assert consume_seqlen_squared_sum_in_iteration() == per_rank
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
 
     def test_bshd_path_skips_collective(self):
         """If no rank ever calls ``update_*``, ``consume_*`` must return
-        ``None`` *without* issuing any collective. A spy on ``all_reduce``
-        catches a regression that would otherwise hang in production when one
-        rank is in THD mode and another in BSHD (the current contract assumes
-        all ranks agree)."""
+        ``(None, None)`` *without* issuing any collective. A spy on
+        ``all_reduce`` catches a regression that would otherwise hang in
+        production when one rank is in THD mode and another in BSHD (the
+        current contract assumes all ranks agree)."""
         from tests.unit_tests.test_utilities import Utils
 
         if Utils.world_size < 2:
@@ -417,11 +552,11 @@ class TestAccumulatorDistributed:
 
         torch.distributed.all_reduce = spy
         try:
-            result = consume_seqlen_squared_sum_in_iteration()
+            result = consume_seqlen_stats_in_iteration()
         finally:
             torch.distributed.all_reduce = original_all_reduce
 
-        assert result is None
+        assert result == (None, None)
         assert calls == [], "consume must not issue all_reduce when no update happened"
 
 
@@ -488,17 +623,24 @@ class TestAccumulatorTopology:
 
         # Per-DP-group ``cu_seqlens``: a 2-chunk packed sequence whose lengths
         # depend on ``dp_rank`` so that every DP group contributes a DIFFERENT
-        # ``sum(L_i^2)``. Every rank in the same DP group must produce the
-        # same value -- that's what the consume() dedup unwinds.
+        # ``sum(L)`` AND ``sum(L^2)``. Every rank in the same DP group must
+        # produce the same value -- that's what the consume() dedup unwinds.
         len_a = 100 * (dp_rank + 1)
         len_b = 200 * (dp_rank + 1)
         cu = torch.tensor([0, len_a, len_a + len_b], dtype=torch.int32, device='cuda')
-        update_seqlen_squared_sum_from_cu_seqlens(cu)
+        update_seqlen_stats_from_cu_seqlens(cu)
 
-        # Closed-form expected: sum over DP groups of (len_a^2 + len_b^2),
-        # with len_a = 100*(r+1), len_b = 200*(r+1) -> 50000 * (r+1)^2.
-        expected = sum(50000 * (r + 1) ** 2 for r in range(dp_size))
-        result = consume_seqlen_squared_sum_in_iteration()
-        assert result == pytest.approx(expected), (
-            f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: " f"got {result}, expected {expected}"
+        # Closed-form expected: sum over DP groups of (len_a + len_b) and
+        # (len_a^2 + len_b^2). With len_a = 100*(r+1), len_b = 200*(r+1) -->
+        # sum_L per DP = 300*(r+1), sum_L_sq per DP = 50000*(r+1)^2.
+        expected_total_tokens = sum(300 * (r + 1) for r in range(dp_size))
+        expected_sum_sq = sum(50000 * (r + 1) ** 2 for r in range(dp_size))
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == pytest.approx(expected_total_tokens), (
+            f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: "
+            f"got total_real_tokens={total_real_tokens}, expected {expected_total_tokens}"
+        )
+        assert seqlen_squared_sum == pytest.approx(expected_sum_sq), (
+            f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: "
+            f"got seqlen_squared_sum={seqlen_squared_sum}, expected {expected_sum_sq}"
         )
