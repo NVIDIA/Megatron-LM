@@ -24,6 +24,10 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+    rmsnorm_batch_invariant,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
@@ -45,11 +49,6 @@ def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     # the inference path uses the same kernel as the training-side recompute.
     # tex.rmsnorm_fwd is empirically batch-invariant for common shapes, but
     # not contractually so — this branch makes the guarantee explicit.
-    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-        is_batch_invariant_mode_enabled,
-        rmsnorm_batch_invariant,
-    )
-
     if is_batch_invariant_mode_enabled():
         return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
     x_shape = x.shape
