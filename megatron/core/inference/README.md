@@ -79,8 +79,6 @@ Planned new features:
   - *Silent corruption*: `reset()` also sets `self.use_coordinator = False`, which silently re-routes failed-request handling, scheduling notification, and `suspend()`'s state machine to direct-mode branches. Outcome: not-a-hang but wrong behavior, harder to diagnose.
   - The example `offline_inference.py` blocks `--inference-repeat-n > 1` with `--use-coordinator` for these reasons. Direct-mode reset is safe.
 
-- **Async-direct `generate()` is single-caller.** Concurrent `await llm.generate(...)` (e.g. via `asyncio.gather`) in direct mode raises `RuntimeError`. Pass batched prompts instead, or switch to coordinator mode.
-
 - **HTTP frontend is fixed to global rank 0.** There is no per-rank `role` override on `ServeConfig` to host the HTTP server on a non-rank-0 rank or to opt a rank out of HTTP. Control placement via the launcher (e.g., torchrun rank-0 placement), mirroring how vLLM's `--headless` is invoked today.
 
 - **Server returns `"model": "EMPTY"`.** The HTTP frontend doesn't expose a `ServeConfig.model_name` to echo in `/v1/completions` / `/v1/chat/completions` responses, doesn't validate the request `model` field against a configured name, and exposes no `GET /v1/models` discovery endpoint. Clients can still pass any `model` in their request body — the dynamic server ignores it.

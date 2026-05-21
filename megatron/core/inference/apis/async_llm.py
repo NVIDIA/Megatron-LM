@@ -15,15 +15,14 @@ class MegatronAsyncLLM(_MegatronLLMBase):
     """Async high-level inference API for Megatron.
 
     Asyncio-native wrapper over the shared engine + runtime managed by
-    :class:`_MegatronLLMBase` -- see that class for execution modes
-    (direct vs coordinator), caller responsibilities, and the
-    ``model.eval()`` contract.
+    :class:`_MegatronLLMBase` -- see that class for caller responsibilities
+    and the ``model.eval()`` contract. Requires ``use_coordinator=True``;
+    direct mode is rejected at ``__init__`` (see Known Limitations in the
+    package README).
 
     On top of the base, this class provides:
 
-    - ``async generate`` accepting single or batched prompts. In direct mode
-      it is single-caller -- concurrent calls (e.g. via ``asyncio.gather``)
-      raise :class:`RuntimeError`; pass a list of prompts to batch.
+    - ``async generate`` accepting single or batched prompts.
     - ``async`` lifecycle controls: ``pause`` / ``unpause`` / ``suspend`` /
       ``resume`` / ``shutdown`` / ``wait_for_shutdown``.
     - :meth:`serve` for OpenAI-compatible HTTP serving on the primary rank.

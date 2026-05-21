@@ -14,6 +14,8 @@ import concurrent.futures
 import threading
 from typing import Coroutine, List, Optional, Tuple, Union
 
+import torch.distributed as dist
+
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
@@ -282,9 +284,6 @@ class _MegatronLLMBase:
         engine = DynamicInferenceEngine(controller=controller, context=context)
 
         if use_coordinator:
-            # Lazy import so the module imports cleanly without torch installed.
-            import torch.distributed as dist
-
             is_primary_rank = dist.get_rank() == 0
         else:
             is_primary_rank = True
