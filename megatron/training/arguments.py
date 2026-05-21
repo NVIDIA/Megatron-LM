@@ -2384,6 +2384,12 @@ def _add_regularization_args(parser):
                        default=True,
                        help='View contiguous gathered Muon+M-FSDP buffers without an '
                        'additional reconstruction copy. Defaults to true.')
+    group.add_argument('--muon-fsdp-overlap-comm-compute',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Overlap Muon+M-FSDP boundary all-gathers with local '
+                       'Newton-Schulz/update work. Requires batched all-gather. '
+                       'Defaults to false.')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')

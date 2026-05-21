@@ -848,6 +848,84 @@ class TestFSDPTensorParallelMuon:
 
         assert gather_batches == [[(4, cols), (4, cols)]]
 
+    def test_overlap_path_starts_boundary_gather_before_local_updates(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        replicated_param = (
+            torch.arange(4 * cols, device="cuda", dtype=torch.float32).view(4, cols) / 100
+        )
+        replicated_grad = replicated_param + 0.2
+        plan = {0: 2, 1: 4}
+        boundary_param = (
+            torch.arange(6 * cols, device="cuda", dtype=torch.float32).view(6, cols) / 80
+        )
+        boundary_grad = boundary_param + 0.3
+
+        local_boundary_param = _local_slice(boundary_param, plan, dp_rank).contiguous()
+        params = [
+            nn.Parameter(
+                _make_replicated_dtensor(
+                    replicated_param.clone(), replicated_param.shape, device_mesh
+                )
+            ),
+            nn.Parameter(_make_dtensor(local_boundary_param, boundary_param.shape, device_mesh)),
+        ]
+        params[0].grad = _make_replicated_dtensor(
+            replicated_grad.clone(), replicated_grad.shape, device_mesh
+        )
+        params[1].grad = _make_dtensor(
+            _local_slice(boundary_grad, plan, dp_rank).contiguous(),
+            boundary_grad.shape,
+            device_mesh,
+        )
+
+        optimizer = _make_fsdp_muon(
+            params,
+            dp_group=dp_group,
+            fsdp_batched_all_gather=True,
+            fsdp_reuse_gather_scratch=True,
+            fsdp_padded_all_gather=True,
+            fsdp_padded_all_gather_pad_factor=1000,
+            fsdp_overlap_comm_compute=True,
+        )
+        events = []
+        real_start = optimizer._start_gather_full_uneven_local_tensor_batch_async
+        real_finish = optimizer._finish_gather_full_uneven_local_tensor_batch_async
+        real_apply = optimizer._apply_precomputed_muon_update
+
+        def recording_start(*args, **kwargs):
+            events.append("start")
+            return real_start(*args, **kwargs)
+
+        def recording_finish(*args, **kwargs):
+            events.append("finish")
+            return real_finish(*args, **kwargs)
+
+        def recording_apply(p, pre_ns_grad, is_gathered, lr, group_kwargs):
+            events.append("apply_gathered" if is_gathered else "apply_local")
+            return real_apply(p, pre_ns_grad, is_gathered, lr, group_kwargs)
+
+        with (
+            patch.object(
+                optimizer, "_start_gather_full_uneven_local_tensor_batch_async", recording_start
+            ),
+            patch.object(
+                optimizer, "_finish_gather_full_uneven_local_tensor_batch_async", recording_finish
+            ),
+            patch.object(optimizer, "_apply_precomputed_muon_update", recording_apply),
+        ):
+            optimizer.step()
+
+        assert events[0] == "start"
+        assert events.index("start") < events.index("apply_local") < events.index("finish")
+        assert events.index("finish") < events.index("apply_gathered")
+
     def test_padded_batch_gather_matches_uneven_batch_and_reuses_scratch(self):
         from torch.distributed.device_mesh import init_device_mesh
 
@@ -896,14 +974,14 @@ class TestFSDPTensorParallelMuon:
             fsdp_reuse_gather_scratch=True,
         )
         padded_calls = []
-        real_padded_gather = padded_optimizer._all_gather_padded_equal_size
+        real_prepare_padded_buffers = padded_optimizer._prepare_padded_all_gather_buffers
 
-        def counting_padded_gather(*args, **kwargs):
+        def counting_prepare_padded_buffers(*args, **kwargs):
             padded_calls.append(args[1])
-            return real_padded_gather(*args, **kwargs)
+            return real_prepare_padded_buffers(*args, **kwargs)
 
         with patch.object(
-            padded_optimizer, "_all_gather_padded_equal_size", counting_padded_gather
+            padded_optimizer, "_prepare_padded_all_gather_buffers", counting_prepare_padded_buffers
         ):
             padded_results = padded_optimizer._gather_full_uneven_local_tensors_like(items)
             scratch_bytes_after_first = padded_optimizer._fsdp_gather_scratch_cache_bytes()
@@ -994,10 +1072,12 @@ class TestFSDPTensorParallelMuon:
             fsdp_padded_all_gather_pad_factor=1.0,
         )
 
-        def fail_padded_gather(*_args, **_kwargs):
+        def fail_prepare_padded_buffers(*_args, **_kwargs):
             raise AssertionError("padding threshold should select the uneven gather path")
 
-        with patch.object(optimizer, "_all_gather_padded_equal_size", fail_padded_gather):
+        with patch.object(
+            optimizer, "_prepare_padded_all_gather_buffers", fail_prepare_padded_buffers
+        ):
             result = optimizer._gather_full_uneven_local_tensors_like([(param, local_grad)])[0]
 
         if local_grad.numel() == 0:
@@ -1241,7 +1321,8 @@ class TestFSDPTensorParallelMuon:
         final_local1 = params[1].data.to_local()
         torch.testing.assert_close(final_local1, initial_local1, atol=1e-4, rtol=1e-3)
 
-    def test_step_matches_unsharded_muon_optimizer_step_numerics(self):
+    @pytest.mark.parametrize("overlap_comm_compute", [False, True])
+    def test_step_matches_unsharded_muon_optimizer_step_numerics(self, overlap_comm_compute):
         from torch.distributed.device_mesh import init_device_mesh
 
         dp_size = torch.distributed.get_world_size()
@@ -1291,7 +1372,18 @@ class TestFSDPTensorParallelMuon:
             sharded_params.append(
                 nn.Parameter(_make_dtensor(local_param, full_param.shape, device_mesh))
             )
-        sharded_optimizer = _make_fsdp_muon(sharded_params, dp_group=dp_group, **optimizer_kwargs)
+        sharded_optimizer_kwargs = dict(optimizer_kwargs)
+        if overlap_comm_compute:
+            sharded_optimizer_kwargs.update(
+                fsdp_batched_all_gather=True,
+                fsdp_reuse_gather_scratch=True,
+                fsdp_padded_all_gather=True,
+                fsdp_padded_all_gather_pad_factor=1000,
+                fsdp_overlap_comm_compute=True,
+            )
+        sharded_optimizer = _make_fsdp_muon(
+            sharded_params, dp_group=dp_group, **sharded_optimizer_kwargs
+        )
 
         for step, full_grads in enumerate(full_grads_by_step, start=1):
             for param, full_grad in zip(unsharded_params, full_grads):
@@ -1326,7 +1418,10 @@ class TestFSDPTensorParallelMuon:
 
     @pytest.mark.skipif(WORLD_SIZE < 4, reason="Hybrid topology numerics test requires 4+ ranks")
     @pytest.mark.parametrize("topology", ["hsdp", "hfsdp"])
-    def test_hybrid_step_matches_unsharded_muon_optimizer_step_numerics(self, topology):
+    @pytest.mark.parametrize("overlap_comm_compute", [False, True])
+    def test_hybrid_step_matches_unsharded_muon_optimizer_step_numerics(
+        self, topology, overlap_comm_compute
+    ):
         from torch.distributed.device_mesh import init_device_mesh
 
         dp_size = torch.distributed.get_world_size()
@@ -1413,8 +1508,17 @@ class TestFSDPTensorParallelMuon:
             )
             local_slice_fns.append(local_slice)
 
+        sharded_optimizer_kwargs = dict(optimizer_kwargs)
+        if overlap_comm_compute:
+            sharded_optimizer_kwargs.update(
+                fsdp_batched_all_gather=True,
+                fsdp_reuse_gather_scratch=True,
+                fsdp_padded_all_gather=True,
+                fsdp_padded_all_gather_pad_factor=1000,
+                fsdp_overlap_comm_compute=True,
+            )
         sharded_optimizer = _make_fsdp_muon(
-            sharded_params, dp_group=optimizer_dp_group, **optimizer_kwargs
+            sharded_params, dp_group=optimizer_dp_group, **sharded_optimizer_kwargs
         )
 
         for step, full_grads in enumerate(full_grads_by_step, start=1):
@@ -1472,6 +1576,7 @@ class TestFSDPFactoryIntegration:
         assert config.muon_fsdp_batch_max_gather_bytes == 1024 * 1024 * 1024
         assert config.muon_fsdp_padded_all_gather_zero_pad
         assert config.muon_fsdp_fast_reconstruct
+        assert not config.muon_fsdp_overlap_comm_compute
 
     @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
     def test_factory_dispatches_correct_muon_cls(self, strategy):
@@ -1523,6 +1628,7 @@ class TestFSDPFactoryIntegration:
             muon_fsdp_batch_max_gather_bytes=123456,
             muon_fsdp_padded_all_gather_zero_pad=False,
             muon_fsdp_fast_reconstruct=False,
+            muon_fsdp_overlap_comm_compute=True,
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -1570,3 +1676,4 @@ class TestFSDPFactoryIntegration:
             assert base_opt.fsdp_batch_max_gather_bytes == 123456
             assert not base_opt.fsdp_padded_all_gather_zero_pad
             assert not base_opt.fsdp_fast_reconstruct
+            assert base_opt.fsdp_overlap_comm_compute

@@ -754,6 +754,7 @@ def _get_muon_fsdp_kwargs(config: OptimizerConfig) -> dict[str, Any]:
             config, "muon_fsdp_padded_all_gather_zero_pad", True
         ),
         "fsdp_fast_reconstruct": getattr(config, "muon_fsdp_fast_reconstruct", True),
+        "fsdp_overlap_comm_compute": getattr(config, "muon_fsdp_overlap_comm_compute", False),
     }
 
 

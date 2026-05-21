@@ -316,6 +316,11 @@ class OptimizerConfig:
     copy.
     """
 
+    muon_fsdp_overlap_comm_compute: bool = False
+    """If True, overlap Muon+M-FSDP boundary all-gathers with local Newton-Schulz/update work.
+    Requires batched all-gather to take effect. Defaults to False.
+    """
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""
