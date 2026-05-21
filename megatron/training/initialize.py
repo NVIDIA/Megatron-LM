@@ -298,7 +298,7 @@ def _compile_dependencies():
     torch.distributed.barrier()
 
 def _initialize_tp_communicators(
-    model_config: GPTModelConfig | HybridModelConfig, micro_batch_size: int
+    model_config: GPTModelConfig | HybridModelConfig, micro_batch_size: int, ub_shape: list[int] | None=None,
 ) -> None:
     """initializing the communicators with user buffers for high-performance tensor-model-parallel
     communication overlap"""
@@ -324,12 +324,14 @@ def _initialize_tp_communicators(
     else:
         ub_cfgs = {}
 
-    # TODO (@maanug): figure out what to do about this flag
-    if getattr(args, 'decoder_tp_comm_overlap', False):
-        input_shape = [
-            (args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size,
-            args.hidden_size,
-        ]
+    # pretrain_vlm.py can explicitly call _initialize_tp_communicators() with ub_shape set as below
+    # if getattr(args, 'decoder_tp_comm_overlap', False):
+    #     ub_shape = [
+    #         (args.decoder_seq_length * args.micro_batch_size) // args.context_parallel_size,
+    #         args.hidden_size,
+    #     ]
+    if ub_shape is not None:
+        input_shape = ub_shape
     else:
         input_shape = [
             (model_config.seq_length * micro_batch_size) // model_config.context_parallel_size,
