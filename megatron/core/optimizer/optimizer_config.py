@@ -294,6 +294,11 @@ class OptimizerConfig:
     collective count but increases temporary peak memory. Defaults to False.
     """
 
+    muon_fsdp_flat_batched_all_gather: bool = False
+    """If True, use a flattened one-collective Muon+M-FSDP batched gather for eligible multi-stage
+    shard layouts. Defaults to False.
+    """
+
     muon_fsdp_reuse_gather_scratch: bool = False
     """If True, cache and reuse Muon+M-FSDP gather scratch buffers. Defaults to False."""
 

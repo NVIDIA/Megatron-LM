@@ -726,6 +726,301 @@ class TestFSDPTensorParallelMuon:
         assert unpack_calls == len(plan["stages"]) - 1
         assert torch.equal(gathered, expected), "Batched HFSDP gather produced wrong tensor"
 
+    @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP flat gather test requires at least 4 ranks")
+    def test_hfsdp_flat_batched_gather_matches_generic_bitwise(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+            redistribute_uneven_dtensor_to_replicated,
+        )
+
+        dp_size = torch.distributed.get_world_size()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("HFSDP flat gather test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        logical_rank = inner_rank * outer_size + outer_rank
+        cols = 4
+
+        def local_hfsdp_shard(full_tensor):
+            rows_per_logical_rank = [
+                full_tensor.shape[0] // dp_size
+                + (1 if rank < full_tensor.shape[0] % dp_size else 0)
+                for rank in range(dp_size)
+            ]
+            row_start = sum(rows_per_logical_rank[:logical_rank])
+            row_count = rows_per_logical_rank[logical_rank]
+            return full_tensor[row_start : row_start + row_count].contiguous()
+
+        full_updates = [
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) + idx
+            for idx, rows in enumerate([dp_size * 3 + 5, dp_size - 1])
+        ]
+        params = []
+        items = []
+        for full_update in full_updates:
+            local_update = local_hfsdp_shard(full_update)
+            param = nn.Parameter(
+                _make_hfsdp_dtensor(local_update.clone(), full_update.shape, device_mesh)
+            )
+            params.append(param)
+            items.append((param, local_update))
+
+        optimizer = _make_fsdp_muon(
+            params,
+            dp_group=torch.distributed.group.WORLD,
+            fsdp_batched_all_gather=True,
+            fsdp_flat_batched_all_gather=True,
+            fsdp_padded_all_gather=True,
+            fsdp_padded_all_gather_pad_factor=1000,
+        )
+        for param in params:
+            plan = optimizer._get_uneven_gather_plan(param)
+            assert plan is not None
+            flat_plan = optimizer._get_flat_uneven_gather_plan(param, plan)
+            assert flat_plan is not None
+            assert flat_plan["flat_group_size"] == dp_size
+
+        padded_calls = []
+        real_prepare_padded_buffers = optimizer._prepare_padded_all_gather_buffers
+
+        def counting_prepare_padded_buffers(*args, **kwargs):
+            padded_calls.append(args[1])
+            return real_prepare_padded_buffers(*args, **kwargs)
+
+        def fail_staged_batch(*_args, **_kwargs):
+            raise AssertionError("eligible HFSDP flat gather should not use staged batches")
+
+        with (
+            patch.object(optimizer, "_gather_full_uneven_local_tensor_batch", fail_staged_batch),
+            patch.object(
+                optimizer, "_prepare_padded_all_gather_buffers", counting_prepare_padded_buffers
+            ),
+        ):
+            gathered = optimizer._gather_full_uneven_local_tensors_like(items)
+
+        assert len(padded_calls) == 1
+        for result, (param, local_update), full_update in zip(gathered, items, full_updates):
+            ref_dtensor = optimizer._dtensor_from_local_like(param, local_update)
+            expected = redistribute_uneven_dtensor_to_replicated(ref_dtensor)._local_tensor
+            assert torch.equal(expected, full_update)
+            if local_update.numel() == 0:
+                assert result is None
+                continue
+            assert torch.equal(result, expected)
+
+    @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP flat cache test requires at least 4 ranks")
+    def test_hfsdp_flat_gather_metadata_is_cached(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("HFSDP flat gather cache test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        logical_rank = inner_rank * outer_size + outer_rank
+        rows, cols = dp_size * 3 + 5, 4
+        full_update = (
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) + 29
+        )
+        rows_per_logical_rank = [
+            rows // dp_size + (1 if rank < rows % dp_size else 0) for rank in range(dp_size)
+        ]
+        row_start = sum(rows_per_logical_rank[:logical_rank])
+        row_count = rows_per_logical_rank[logical_rank]
+        local_update = full_update[row_start : row_start + row_count].contiguous()
+
+        param = nn.Parameter(
+            _make_hfsdp_dtensor(local_update.clone(), full_update.shape, device_mesh)
+        )
+        optimizer = _make_fsdp_muon(
+            [param],
+            dp_group=torch.distributed.group.WORLD,
+            fsdp_batched_all_gather=True,
+            fsdp_flat_batched_all_gather=True,
+        )
+
+        optimizer._gather_full_uneven_local_tensors_like([(param, local_update)])
+        with patch(
+            "torch.distributed.all_gather_object", wraps=torch.distributed.all_gather_object
+        ) as mocked_all_gather_object:
+            optimizer._gather_full_uneven_local_tensors_like([(param, local_update)])
+
+        assert mocked_all_gather_object.call_count == 0
+
+    @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP flat gather test requires at least 4 ranks")
+    def test_hfsdp_flat_batched_gather_uses_uneven_path_when_padding_too_expensive(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+            redistribute_uneven_dtensor_to_replicated,
+        )
+
+        dp_size = torch.distributed.get_world_size()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("HFSDP flat gather test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        logical_rank = inner_rank * outer_size + outer_rank
+        rows, cols = dp_size * 3 + 1, 4
+        full_update = torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols)
+        rows_per_logical_rank = [
+            rows // dp_size + (1 if rank < rows % dp_size else 0) for rank in range(dp_size)
+        ]
+        row_start = sum(rows_per_logical_rank[:logical_rank])
+        row_count = rows_per_logical_rank[logical_rank]
+        local_update = full_update[row_start : row_start + row_count].contiguous()
+
+        param = nn.Parameter(
+            _make_hfsdp_dtensor(local_update.clone(), full_update.shape, device_mesh)
+        )
+        optimizer = _make_fsdp_muon(
+            [param],
+            dp_group=torch.distributed.group.WORLD,
+            fsdp_batched_all_gather=True,
+            fsdp_flat_batched_all_gather=True,
+            fsdp_padded_all_gather=True,
+            fsdp_padded_all_gather_pad_factor=1.0,
+        )
+
+        def fail_padded_path(*_args, **_kwargs):
+            raise AssertionError("padding threshold should use the uneven flat gather path")
+
+        def fail_staged_batch(*_args, **_kwargs):
+            raise AssertionError("eligible HFSDP flat gather should not use staged batches")
+
+        with (
+            patch.object(optimizer, "_prepare_padded_all_gather_buffers", fail_padded_path),
+            patch.object(optimizer, "_gather_full_uneven_local_tensor_batch", fail_staged_batch),
+        ):
+            result = optimizer._gather_full_uneven_local_tensors_like([(param, local_update)])[0]
+
+        ref_dtensor = optimizer._dtensor_from_local_like(param, local_update)
+        expected = redistribute_uneven_dtensor_to_replicated(ref_dtensor)._local_tensor
+        if local_update.numel() == 0:
+            assert result is None
+        else:
+            assert torch.equal(result, expected)
+
+    @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP flat budget test requires at least 4 ranks")
+    def test_hfsdp_flat_batched_gather_splits_on_gather_byte_budget(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("HFSDP flat budget test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        logical_rank = inner_rank * outer_size + outer_rank
+        rows, cols = dp_size * 3 + 5, 4
+
+        full_updates = [
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) + idx
+            for idx in range(2)
+        ]
+        params = []
+        items = []
+        for full_update in full_updates:
+            rows_per_logical_rank = [
+                rows // dp_size + (1 if rank < rows % dp_size else 0) for rank in range(dp_size)
+            ]
+            row_start = sum(rows_per_logical_rank[:logical_rank])
+            row_count = rows_per_logical_rank[logical_rank]
+            local_update = full_update[row_start : row_start + row_count].contiguous()
+            param = nn.Parameter(
+                _make_hfsdp_dtensor(local_update.clone(), full_update.shape, device_mesh)
+            )
+            params.append(param)
+            items.append((param, local_update))
+
+        first_item_bytes = full_updates[0].numel() * full_updates[0].element_size()
+        optimizer = _make_fsdp_muon(
+            params,
+            dp_group=torch.distributed.group.WORLD,
+            fsdp_batched_all_gather=True,
+            fsdp_flat_batched_all_gather=True,
+            fsdp_batch_max_gather_bytes=first_item_bytes + full_updates[0].element_size(),
+        )
+        batch_sizes = []
+        real_flat_batch_gather = optimizer._gather_flat_full_uneven_local_tensor_batch
+
+        def counting_flat_batch_gather(items_arg, results_arg, batch):
+            batch_sizes.append(len(batch["item_indices"]))
+            return real_flat_batch_gather(items_arg, results_arg, batch)
+
+        def fail_staged_batch(*_args, **_kwargs):
+            raise AssertionError("eligible HFSDP flat gather should not use staged batches")
+
+        with (
+            patch.object(
+                optimizer, "_gather_flat_full_uneven_local_tensor_batch", counting_flat_batch_gather
+            ),
+            patch.object(optimizer, "_gather_full_uneven_local_tensor_batch", fail_staged_batch),
+        ):
+            results = optimizer._gather_full_uneven_local_tensors_like(items)
+
+        assert batch_sizes == [1, 1]
+        for result, full_update, (_, local_update) in zip(results, full_updates, items):
+            if local_update.numel() == 0:
+                assert result is None
+            else:
+                assert torch.equal(result, full_update)
+
+    def test_flat_batched_gather_falls_back_for_single_stage_fsdp(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plan = {0: 2, 1: 3}
+        full_grad = torch.arange(5 * cols, device="cuda", dtype=torch.float32).view(5, cols)
+        local_value = _local_slice(torch.zeros_like(full_grad), plan, dp_rank).contiguous()
+        param = nn.Parameter(_make_dtensor(local_value, full_grad.shape, device_mesh))
+        local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+
+        optimizer = _make_fsdp_muon(
+            [param],
+            dp_group=dp_group,
+            fsdp_batched_all_gather=True,
+            fsdp_flat_batched_all_gather=True,
+        )
+
+        def fail_flat_batch(*_args, **_kwargs):
+            raise AssertionError("single-stage FSDP should use the staged path")
+
+        with patch.object(
+            optimizer, "_gather_flat_full_uneven_local_tensor_batch", fail_flat_batch
+        ):
+            result = optimizer._gather_full_uneven_local_tensors_like([(param, local_grad)])[0]
+
+        if local_grad.numel() == 0:
+            assert result is None
+        else:
+            torch.testing.assert_close(result, full_grad, atol=0, rtol=0)
+
     @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP cache test requires at least 4 ranks")
     def test_hfsdp_boundary_metadata_collectives_are_cached_across_steps(self):
         from torch.distributed.device_mesh import init_device_mesh
@@ -1699,6 +1994,7 @@ class TestFSDPFactoryIntegration:
         config = OptimizerConfig(optimizer="muon")
 
         assert not config.muon_fsdp_batched_all_gather
+        assert not config.muon_fsdp_flat_batched_all_gather
         assert not config.muon_fsdp_reuse_gather_scratch
         assert not config.muon_fsdp_padded_all_gather
         assert config.muon_fsdp_padded_all_gather_pad_factor == 1.25
@@ -1751,6 +2047,7 @@ class TestFSDPFactoryIntegration:
             muon_split_qkv=False,
             muon_extra_scale_factor=1.0,
             muon_fsdp_batched_all_gather=True,
+            muon_fsdp_flat_batched_all_gather=True,
             muon_fsdp_reuse_gather_scratch=True,
             muon_fsdp_padded_all_gather=True,
             muon_fsdp_padded_all_gather_pad_factor=2.0,
@@ -1799,6 +2096,7 @@ class TestFSDPFactoryIntegration:
             assert isinstance(base_opt, FSDPTensorParallelMuon)
             assert base_opt.dp_group is not None
             assert base_opt.fsdp_batched_all_gather
+            assert base_opt.fsdp_flat_batched_all_gather
             assert base_opt.fsdp_reuse_gather_scratch
             assert base_opt.fsdp_padded_all_gather
             assert base_opt.fsdp_padded_all_gather_pad_factor == 2.0

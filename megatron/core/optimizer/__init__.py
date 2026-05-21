@@ -742,6 +742,7 @@ def _get_muon_fsdp_kwargs(config: OptimizerConfig) -> dict[str, Any]:
     """Map Muon+M-FSDP optimizer config fields to FSDPTensorParallelMuon kwargs."""
     return {
         "fsdp_batched_all_gather": getattr(config, "muon_fsdp_batched_all_gather", False),
+        "fsdp_flat_batched_all_gather": getattr(config, "muon_fsdp_flat_batched_all_gather", False),
         "fsdp_reuse_gather_scratch": getattr(config, "muon_fsdp_reuse_gather_scratch", False),
         "fsdp_padded_all_gather": getattr(config, "muon_fsdp_padded_all_gather", False),
         "fsdp_padded_all_gather_pad_factor": getattr(

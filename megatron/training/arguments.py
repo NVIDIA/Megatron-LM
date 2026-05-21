@@ -2356,6 +2356,13 @@ def _add_regularization_args(parser):
                        help='Batch Muon+M-FSDP boundary parameter all-gathers by '
                        'dtype/device/group. This reduces collective count but increases '
                        'temporary peak memory. Defaults to false.')
+    group.add_argument('--muon-fsdp-flat-batched-all-gather',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Use a flattened one-collective Muon+M-FSDP batched gather '
+                       'for eligible multi-stage shard layouts. Requires batched '
+                       'all-gather and falls back to the staged path when ineligible. '
+                       'Defaults to false.')
     group.add_argument('--muon-fsdp-reuse-gather-scratch',
                        action=argparse.BooleanOptionalAction,
                        default=False,
