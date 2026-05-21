@@ -41,7 +41,7 @@ from megatron.training import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
-from megatron.training.config import DistributedInitConfig
+from megatron.training.config import DistributedInitConfig, RNGConfig
 from megatron.training.models import HybridModelConfig, GPTModelConfig
 
 logger = logging.getLogger(__name__)
@@ -152,9 +152,97 @@ def initialize_megatron(
         return None
 
 
-def _compile_dependencies():
+def torch_dist_init(
+    model_config: GPTModelConfig | HybridModelConfig,
+    dist_config: DistributedInitConfig,
+    rng_config: RNGConfig,
+    micro_batch_size: int,
+    num_distributed_optimizer_instances: int,
+    get_embedding_ranks: Callable[[list[int], int | None], list[int]] | None,
+    get_position_embedding_ranks: Callable[[list[int], int | None], list[int]] | None,
+    skip_mpu_initialization: bool,
+    restart_store: torch.distributed.Store | None = None,
+    use_inprocess_restart: bool = False,
+) -> Callable[[], ProcessGroupCollection] | ProcessGroupCollection | None:
+    """Initialize torch.distributed and dependent components.
 
-    args = get_args()
+    Handles the core distributed setup, including process group initialization,
+    MPU (Model Parallel Unit) setup, random seed setting, and optional
+    compilation/warmup steps.
+
+    Args:
+        model_config: Configuration for the specific model (GPTConfig or T5Config).
+        dist_config: Configuration for distributed initialization settings.
+        rng_config: Configuration for random number generation.
+        micro_batch_size: The micro batch size for JIT warmup.
+        num_distributed_optimizer_instances: Number of parallel optimizer instances.
+        get_embedding_ranks: Optional function to determine embedding layer ranks.
+        get_position_embedding_ranks: Optional function to determine position embedding ranks.
+        skip_mpu_initialization: If True, returns a function to finish MPU setup later.
+
+    Returns:
+        An optional callable to finish MPU initialization if skip_mpu_initialization
+        or lazy_mpu_init is True, otherwise None.
+    """
+
+    def finish_mpu_init() -> ProcessGroupCollection:
+        # Pytorch distributed.
+        pg_collection = _initialize_distributed(
+            model_config=model_config.transformer,
+            dist_config=dist_config,
+            num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+            restart_store=restart_store,
+            use_inprocess_restart=use_inprocess_restart,
+        )
+
+        # Random seeds for reproducibility.
+        print_rank_0("> setting random seeds to {} ...".format(rng_config.seed))
+        _set_random_seed(
+            rng_config.seed,
+            pg_collection,
+            rng_config.data_parallel_random_init,
+            rng_config.te_rng_tracker,
+            rng_config.inference_rng_tracker,
+            use_cudagraphable_rng=(model_config.cuda_graph_impl != "none"),
+        )
+
+        if model_config.num_moe_experts is not None:
+            from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+
+            MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
+
+        return pg_collection
+
+    if skip_mpu_initialization:
+        return None
+
+    if dist_config.lazy_mpu_init:
+        # delayed initialization of DDP-related stuff
+        # We only set basic DDP globals
+        mpu.set_tensor_model_parallel_world_size(model_config.tensor_model_parallel_size)
+        # and return function for external DDP manager
+        # to call when it has DDP initialized
+        mpu.set_tensor_model_parallel_rank(safe_get_rank())
+        return finish_mpu_init
+
+    # Megatron's MPU is the master. Complete initialization right away.
+    pg_collection = finish_mpu_init()
+
+    # Autoresume.
+    _init_autoresume()
+
+    # Compile dependencies.
+    _compile_dependencies()
+
+    if model_config.tp_comm_overlap:
+        _initialize_tp_communicators(model_config, micro_batch_size)
+
+    return pg_collection
+
+
+def _compile_dependencies():
 
     # =========================
     # Compile dataset C++ code.
