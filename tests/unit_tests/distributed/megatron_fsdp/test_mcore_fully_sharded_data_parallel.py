@@ -369,6 +369,112 @@ class TestFullyShardedDataParallel:
         ), "MoE model: expt_device_mesh should not be None"
         fsdp_moe.stop_communication()
 
+    def test_fsdp_db_persist_buf_on_alloc_fail(self):
+        """When ``fsdp_double_buffer=True`` and
+        ``fsdp_db_use_persist_buf_on_alloc_fail=True``, asymmetric (non-double-
+        buffered) FSDP unit buckets must be persistently allocated in the
+        ``GlobalMemoryBuffer`` for weights, transpose weights, and main grads,
+        and must remain there after a full training step (i.e. they must NEVER
+        be freed nor fall through to the dynamic backup allocator).
+
+        ``TestModel`` has two ``Linear`` layers of different sizes, so with
+        ``fsdp_unit_modules=[torch.nn.Linear]`` only one FSDP unit fits in the
+        fixed double-buffer pool and the other becomes an "outlier" that
+        exercises the persistent fallback path.
+        """
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+            FixedPoolAllocator,
+        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_global_memory_buffer
+
+        fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_megatron_fsdp=True,
+            fsdp_double_buffer=True,
+            fsdp_db_use_persist_buf_on_alloc_fail=True,
+        )
+
+        input_dim, output_dim = 13, 17
+        model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        transformer_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1
+        )
+        fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=fsdp_config,
+            module=model,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+
+        pgb = fsdp_model.param_and_grad_buffer
+
+        # All three temp allocators should be FixedPoolAllocators when
+        # fsdp_double_buffer=True, otherwise this test wouldn't be exercising
+        # the right code path.
+        assert isinstance(pgb.weight_alloc, FixedPoolAllocator)
+        assert isinstance(pgb.transpose_weight_alloc, FixedPoolAllocator)
+        assert isinstance(pgb.main_grad_alloc, FixedPoolAllocator)
+
+        # Sanity-check that TestModel produced at least one outlier FSDP unit
+        # (i.e. an FSDP unit that does NOT fit in the fixed double-buffer pool
+        # and therefore must take the persistent fallback path).
+        all_unit_ids = set(pgb.weight_alloc.fsdp_unit_buckets.keys())
+        db_unit_ids = set(pgb.weight_alloc.fsdp_double_buffer_units)
+        outlier_unit_ids = all_unit_ids - db_unit_ids
+        assert len(outlier_unit_ids) > 0, (
+            "TestModel should produce at least one asymmetric FSDP unit so "
+            "that the persistent fallback path is exercised."
+        )
+
+        # Run one full training step: forward + backward + optimizer step.
+        optimizer_config = OptimizerConfig(optimizer="adam", lr=1e-3)
+        optimizer = DistributedOptimizer(
+            optimizer=None,
+            config=optimizer_config,
+            grad_scaler=None,
+            init_state_fn=None,
+            model_chunks=[fsdp_model],
+            per_model_buffers={0: [fsdp_model.param_and_grad_buffer]},
+            data_parallel_group=fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=0,
+        )
+
+        inputs = torch.randn(2, input_dim, device="cuda", requires_grad=True)
+        optimizer.zero_grad()
+        out = fsdp_model(inputs)
+        out.sum().backward()
+        optimizer.step()
+        torch.cuda.synchronize()
+        fsdp_model.stop_communication()
+
+        gmb_buffer = get_global_memory_buffer().buffer
+        for alloc_attr in ("weight_alloc", "main_grad_alloc"):
+            alloc = getattr(pgb, alloc_attr)
+            persistent_keys = [
+                k for k in gmb_buffer if k[0].startswith(f"{alloc.name}_not_fit_in_fixed_pool_")
+            ]
+            assert len(persistent_keys) > 0, (
+                f"Expected persistent buffer(s) for outlier FSDP unit(s) "
+                f"under {alloc_attr} (name='{alloc.name}'), but none were "
+                f"found in the GlobalMemoryBuffer after a training step."
+            )
+
+        for alloc_attr in ("weight_alloc", "transpose_weight_alloc", "main_grad_alloc"):
+            alloc = getattr(pgb, alloc_attr)
+            assert len(alloc.backup_allocator.buckets) == 0, (
+                f"{alloc_attr} must never delegate to the dynamic backup "
+                f"allocator when fsdp_db_use_persist_buf_on_alloc_fail=True, "
+                f"but found bucket(s) {list(alloc.backup_allocator.buckets)}."
+            )
+
     # Testing fsdp_double_buffer with and without nccl_ub
     @pytest.mark.parametrize(
         ("dp_size", "nccl_ub", "fsdp_double_buffer", "fsdp_manual_registration"),
