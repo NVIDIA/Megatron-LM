@@ -181,5 +181,5 @@ products:
   - test_case: [gpt_mla_dynamic_inference_tp1_pp1_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
