@@ -136,7 +136,7 @@ class TestSetupLogging:
         finally:
             self._restore_loggers(original_filters, original_level)
 
-    @patch.dict(os.environ, {"MEGATRON_BRIDGE_LOGGING_LEVEL": str(logging.ERROR)}, clear=True)
+    @patch.dict(os.environ, {"MEGATRON_LOGGING_LEVEL": str(logging.ERROR)}, clear=True)
     def test_argument_overrides_env_var(self):
         # Per docstring precedence: argument > env var > default.
         root = logging.getLogger()

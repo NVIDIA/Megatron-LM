@@ -77,7 +77,7 @@ def setup_logging(
 
     Logging Level Precedence:
     1. `logging_level` argument
-    2. Env var `MEGATRON_BRIDGE_LOGGING_LEVEL`
+    2. Env var `MEGATRON_LOGGING_LEVEL`
     3. Default: `logging.INFO`
 
     Args:
@@ -89,7 +89,7 @@ def setup_logging(
                                    for the root logger and loggers starting with 'megatron.bridge'.
     """
     cfg_logging_level = logging_level
-    env_logging_level = os.getenv("MEGATRON_BRIDGE_LOGGING_LEVEL", None)
+    env_logging_level = os.getenv("MEGATRON_LOGGING_LEVEL", None)
 
     logging_level = logging.INFO
     if env_logging_level is not None:
