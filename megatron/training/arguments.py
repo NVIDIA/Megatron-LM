@@ -3132,24 +3132,72 @@ def _add_moe_args(parser):
 
 def _add_mla_args(parser):
     group = parser.add_argument_group(title="mla")
-    group.add_argument('--q-lora-rank', type=int, default=None,
-                       help="Rank of Query tensor's low rank representation.")
-    group.add_argument('--kv-lora-rank', type=int, default=32,
-                       help="Rank of Key and Value tensors' low rank representation.")
-    group.add_argument('--qk-head-dim', type=int, default=128,
-                       help="Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim")
-    group.add_argument('--qk-pos-emb-head-dim', type=int, default=64,
-                       help="Dimension of the position embedding in the QK projection.")
-    group.add_argument('--v-head-dim', type=int, default=128,
-                       help="Dimension of the head in the V projection.")
-    group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
-                       help="Rotary scaling factor for the rotary embeddings.")
-    group.add_argument('--mscale', type=float, default=1.0,
-                       help="Mscale for YaRN RoPE in multi-latent attention.")
-    group.add_argument('--mscale-all-dim', type=float, default=0.0,
-                       help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
-    group.add_argument('--cache-mla-latents', action='store_true', default=False,
-                       help="If set caches the mla down projected latents with mla flash decode.")
+    group.add_argument(
+        '--q-lora-rank',
+        type=int,
+        default=None,
+        help="Rank of Query tensor's low rank representation.",
+    )
+    group.add_argument(
+        '--kv-lora-rank',
+        type=int,
+        default=32,
+        help="Rank of Key and Value tensors' low rank representation.",
+    )
+    group.add_argument(
+        '--qk-head-dim',
+        type=int,
+        default=128,
+        help="Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim",
+    )
+    group.add_argument(
+        '--qk-pos-emb-head-dim',
+        type=int,
+        default=64,
+        help="Dimension of the position embedding in the QK projection.",
+    )
+    group.add_argument(
+        '--v-head-dim', type=int, default=128, help="Dimension of the head in the V projection."
+    )
+    group.add_argument(
+        '--rotary-scaling-factor',
+        type=float,
+        default=1.0,
+        help="Rotary scaling factor for the rotary embeddings.",
+    )
+    group.add_argument(
+        '--original-max-position-embeddings',
+        type=int,
+        default=4096,
+        help="Original maximum position embeddings for the original model, used by yarn.",
+    )
+    group.add_argument(
+        '--mscale', type=float, default=1.0, help="Mscale for YaRN RoPE in multi-latent attention."
+    )
+    group.add_argument(
+        '--mscale-all-dim',
+        type=float,
+        default=0.0,
+        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.",
+    )
+    group.add_argument(
+        '--o-groups',
+        type=int,
+        default=8,
+        help="Number of groups for grouped output (wo_a). 0 = single linear.",
+    )
+    group.add_argument(
+        '--o-lora-rank',
+        type=int,
+        default=1024,
+        help="Low-rank dimension per group for grouped output (wo_a). Used when o-groups > 0.",
+    )
+    group.add_argument(
+        '--cache-mla-latents',
+        action='store_true',
+        default=False,
+        help="If set caches the mla down projected latents with mla flash decode.",
+    )
     group.add_argument(
         '--mla-down-proj-fusion',
         action='store_true',
