@@ -89,6 +89,15 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
     """
     # Collect the number of subsamples from all ranks
     num_local_subsamples = subsample_seqlens.shape[0]
+    if dp_group.size() == 1:
+        seqlens_gathered = subsample_seqlens.cpu().tolist()
+        offsets = torch.tensor([0, num_local_subsamples], dtype=torch.int32)
+        global_ids_this_rank = torch.arange(
+            num_local_subsamples, dtype=torch.int32, device=subsample_seqlens.device
+        )
+        global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(num_local_subsamples)]
+        return global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
+
     local_len = torch.tensor([num_local_subsamples], dtype=torch.int32).cuda()
     dp_subsample_count = [torch.zeros_like(local_len) for _ in range(dp_group.size())]
     torch.distributed.all_gather(dp_subsample_count, local_len, group=dp_group)

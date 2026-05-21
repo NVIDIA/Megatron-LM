@@ -715,7 +715,11 @@ class HybridCPDataLoaderWrapper:
         sequence lengths of all subsamples from all ranks.
         """
         # Collect the number of subsamples from all ranks
-        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
+        num_local_subsamples = subsample_seqlens.shape[0]
+        if self.dp_group.size() == 1:
+            return subsample_seqlens.cpu().tolist(), torch.zeros(1, dtype=torch.int32)
+
+        local_len = torch.tensor([num_local_subsamples], dtype=torch.int32).cuda()
         dp_subsample_count = [torch.zeros_like(local_len) for _ in range(self.dp_group.size())]
         torch.distributed.all_gather(dp_subsample_count, local_len, group=self.dp_group)
 
