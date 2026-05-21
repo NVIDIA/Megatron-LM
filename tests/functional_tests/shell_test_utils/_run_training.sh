@@ -160,7 +160,9 @@ PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+set +x
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
+set -x
 
 ######## Distributed training settings. ########
 echo "------ARGUMENTS for SLURM ---"
@@ -214,7 +216,7 @@ fi
 AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
-fi 
+fi
 
 # Set permissions
 chmod -R g+w $OUTPUT_PATH

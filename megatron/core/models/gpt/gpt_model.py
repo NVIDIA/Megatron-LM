@@ -145,7 +145,10 @@ class GPTModel(LanguageModule):
         self.rotary_scaling = rope_scaling
         self.mtp_block_spec = mtp_block_spec
         self.mtp_process = mtp_block_spec is not None and mtp_on_this_rank(
-            self.config, ignore_virtual=False, vp_stage=vp_stage
+            layout=self.config.pipeline_model_parallel_layout,
+            mtp_num_layers=self.config.mtp_num_layers,
+            ignore_virtual=False,
+            vp_stage=vp_stage,
         )
 
         if self.pre_process or self.mtp_process:
@@ -467,6 +470,7 @@ class GPTModel(LanguageModule):
             vp_size=self.config.virtual_pipeline_model_parallel_size,
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+            max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
