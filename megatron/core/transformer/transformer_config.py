@@ -1143,7 +1143,7 @@ class TransformerConfig(ModelParallelConfig):
 
     Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
     negative = actual-max; scale = abs(factor)."""
-    
+
     fine_grained_offloading_max_inflight_offloads: Optional[int] = None
     """Per fine-grained offloading group name, max number of inflight offloads for that name not
     yet joined on the main stream (wait_event on D2H). The same cap applies to every name (e.g.,
