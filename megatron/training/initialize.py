@@ -41,7 +41,7 @@ from megatron.training import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
-from megatron.training.config import DistributedInitConfig, RNGConfig
+from megatron.training.config import DistributedInitConfig, RNGConfig, RerunStateMachineConfig
 from megatron.training.models import HybridModelConfig, GPTModelConfig
 
 logger = logging.getLogger(__name__)
@@ -240,6 +240,41 @@ def torch_dist_init(
         _initialize_tp_communicators(model_config, micro_batch_size)
 
     return pg_collection
+
+
+def init_rerun_state(rerun_state_machine_config: RerunStateMachineConfig) -> None:
+    """Initialize the rerun state machine for result validation or stats.
+
+    Sets up state saving and restoration functions, particularly for RNG trackers.
+
+    Args:
+        rerun_state_machine_config: Configuration for the rerun state machine.
+    """
+    from megatron.core.rerun_state_machine import (
+        RerunDiagnostic,
+        RerunErrorInjector,
+        RerunMode,
+        get_rerun_state_machine,
+        initialize_rerun_state_machine,
+    )
+
+    def state_save_func():
+        return {"rng_tracker_states": tensor_parallel.get_cuda_rng_tracker().get_states()}
+
+    def state_restore_func(state_dict):
+        if state_dict["rng_tracker_states"]:
+            tensor_parallel.get_cuda_rng_tracker().set_states(state_dict["rng_tracker_states"])
+
+    initialize_rerun_state_machine(
+        state_save_func=state_save_func,
+        state_restore_func=state_restore_func,
+        mode=RerunMode(rerun_state_machine_config.rerun_mode),
+        error_injector=RerunErrorInjector(
+            error_injection_rate=rerun_state_machine_config.error_injection_rate,
+            error_injection_type=RerunDiagnostic(rerun_state_machine_config.error_injection_type),
+        ),
+        result_rejected_tracker_filename=rerun_state_machine_config.result_rejected_tracker_filename,
+    )
 
 
 def _compile_dependencies():
