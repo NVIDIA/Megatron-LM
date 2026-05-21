@@ -37,6 +37,7 @@ except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
+from megatron.core.parallel_state import get_context_parallel_group
 from utils import get_hf_tokenizer
 
 from megatron.core.utils import get_batch_on_this_cp_rank
@@ -364,7 +365,9 @@ if __name__ == "__main__":
             batch_size=args.calib_batch_size,
         )
         for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
-            sample = get_batch_on_this_cp_rank(sample)
+            sample = get_batch_on_this_cp_rank(
+                sample, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            )
             megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 
     unwrapped_model = unwrap_model(model)[0]

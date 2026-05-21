@@ -27,11 +27,7 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
-from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    unwrap_model,
-)
+from megatron.training.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_TE:
@@ -156,16 +152,6 @@ def set_bias_value(dense_model):
             value = torch.randn(value.shape)
             state_dict[name] = value
     dense_model[0].load_state_dict(state_dict, strict=True)
-
-
-def get_batch(data_iterator):
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
-        return None, None, None, None, None
-
-    batch = get_batch_on_this_tp_rank(data_iterator)
-    batch = get_batch_on_this_cp_rank(batch)
-
-    return batch.values()
 
 
 class TestGPTModel:
