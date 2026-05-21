@@ -348,25 +348,31 @@ class GatedDeltaNet(MegatronModule):
 
         # CP All to All: CP to HP
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
-            outputs = []
-            for qkvzba_i in unpacked_qkvzba:
-                qkvzba_i = tensor_a2a_cp2hp(
-                    qkvzba_i,
-                    seq_dim=0,
-                    head_dim=-1,
-                    cp_group=self.pg_collection.cp,
-                    split_sections=[
-                        self.qk_dim_local_tp,
-                        self.qk_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.num_value_heads // self.tp_size,
-                        self.num_value_heads // self.tp_size,
-                    ],
+            # Batched: one a2a on the full local THD tensor, then one local
+            # permutation that reorders rank-grouped output into per-sequence
+            # natural order. The permutation also folds in the per-sequence
+            # `_undo_attention_load_balancing`, so it's disabled inside the
+            # a2a call.
+            qkvzba = tensor_a2a_cp2hp(
+                qkvzba,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.pg_collection.cp,
+                split_sections=[
+                    self.qk_dim_local_tp,
+                    self.qk_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.num_value_heads // self.tp_size,
+                    self.num_value_heads // self.tp_size,
+                ],
+                undo_attention_load_balancing=False,
+            )
+            if self.cp_size > 1:
+                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
+                    cu_seqlens_q, self.cp_size, seq_len
                 )
-                outputs.append(qkvzba_i)
-            qkvzba = torch.cat(outputs, dim=0)
+                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
         else:
             qkvzba = tensor_a2a_cp2hp(
                 qkvzba,
@@ -495,14 +501,15 @@ class GatedDeltaNet(MegatronModule):
 
             # CP all to all: HP to CP
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                unpacked_norm_out = _unpack_sequence(norm_out_hp, cu_seqlens_q, dim=0)
-                outputs = []
-                for norm_out_i in unpacked_norm_out:
-                    norm_out_i = tensor_a2a_hp2cp(
-                        norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                    )
-                    outputs.append(norm_out_i)
-                norm_out = torch.cat(outputs, dim=0)
+                if self.cp_size > 1:
+                    norm_out_hp = norm_out_hp.index_select(0, thd_cp_a2a_inv)
+                norm_out = tensor_a2a_hp2cp(
+                    norm_out_hp,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=self.pg_collection.cp,
+                    redo_attention_load_balancing=False,
+                )
             else:
                 norm_out = tensor_a2a_hp2cp(
                     norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
@@ -591,7 +598,7 @@ class GatedDeltaNet(MegatronModule):
 
     def _resolve_cu_seqlens(
         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
-    ):
+    ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
@@ -713,7 +720,8 @@ class GatedDeltaNet(MegatronModule):
         self.out_proj.backward_dw()
 
 
-def _unpack_sequence(x, cu_seqlens, dim=1):
+# Used by tests/unit_tests/ssm/test_gated_delta_net.py
+def _unpack_sequence(x, cu_seqlens, dim=1) -> list[torch.Tensor]:
     unpacked_x = []
     cu_seqlens_list = cu_seqlens.tolist()
     num_seqs = len(cu_seqlens_list) - 1
@@ -723,6 +731,46 @@ def _unpack_sequence(x, cu_seqlens, dim=1):
         chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
         unpacked_x.append(x[tuple(chunked_index)])
     return unpacked_x
+
+
+def _build_thd_cp_a2a_perm(
+    cu_seqlens: torch.Tensor, cp_size: int, t_global: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cu = cu_seqlens.to(dtype=torch.long)
+    t_local = t_global // cp_size
+
+    positions = torch.arange(t_global, device=cu.device)
+    seq_idx = torch.bucketize(positions, cu[1:], right=True)
+    seq_lens = torch.diff(cu)
+    halves = seq_lens // (2 * cp_size)  # per-sequence half-chunk size
+    local_starts = cu[:-1] // cp_size
+    global_starts = cu[:-1]
+
+    half_i = halves[seq_idx]
+    pos_in_seq = positions - global_starts[seq_idx]
+
+    natural_chunk = pos_in_seq // half_i  # in [0, 2*cp)
+    offset = pos_in_seq - natural_chunk * half_i
+
+    # Invert the ordering produced by `_undo_attention_load_balancing`:
+    #   natural_chunk < cp:   load_balanced = 2 * natural_chunk
+    #   natural_chunk >= cp:  load_balanced = 4*cp - 2*natural_chunk - 1
+    lb_chunk = torch.where(
+        natural_chunk < cp_size, 2 * natural_chunk, 4 * cp_size - 2 * natural_chunk - 1
+    )
+
+    # In the per-sequence load-balanced layout each rank owns load-balanced
+    # chunks (2r) and (2r+1), in that order, of every sequence.
+    rank = lb_chunk // 2
+    half_within_rank = lb_chunk - 2 * rank
+    k = half_within_rank * half_i + offset
+
+    idx = rank * t_local + local_starts[seq_idx] + k
+
+    inv = torch.empty_like(idx)
+    inv[idx] = positions
+
+    return idx, inv
 
 
 ####################

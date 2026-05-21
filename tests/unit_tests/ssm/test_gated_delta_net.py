@@ -17,7 +17,13 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import (
+    GatedDeltaNet,
+    _build_thd_cp_a2a_perm,
+    _unpack_sequence,
+    tensor_a2a_cp2hp,
+    tensor_a2a_hp2cp,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
@@ -488,3 +494,189 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         micro_batch_size=4,
         sequence_packing=sequence_packing,
     )
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.internal
+class TestBatchedThdAllToAll:
+    """Verify batched-a2a + permute matches the per-sequence loop in GDN."""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, cp_size):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+        )
+        model_parallel_cuda_manual_seed(123)
+        self.cp_size = cp_size
+        self.cp_group = parallel_state.get_context_parallel_group()
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _per_seq_a2a_cp2hp(local_t, cu_seqlens, cp_group, split_sections=None):
+        cp_size = cp_group.size()
+        unpacked = _unpack_sequence(local_t, cu_seqlens // cp_size, dim=0)
+        outputs = []
+        for x in unpacked:
+            outputs.append(
+                tensor_a2a_cp2hp(
+                    x,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=cp_group,
+                    split_sections=split_sections,
+                    undo_attention_load_balancing=True,
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def _per_seq_a2a_hp2cp(global_t, cu_seqlens, cp_group, split_sections=None):
+        unpacked = _unpack_sequence(global_t, cu_seqlens, dim=0)
+        outputs = []
+        for x in unpacked:
+            outputs.append(
+                tensor_a2a_hp2cp(
+                    x,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=cp_group,
+                    split_sections=split_sections,
+                    redo_attention_load_balancing=True,
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
+    # ---- Optimized: single a2a + production permutation helper ----
+
+    @staticmethod
+    def _batched_a2a_cp2hp(local_t, cu_seqlens, cp_group, split_sections=None):
+        cp_size = cp_group.size()
+        t_global = int(cu_seqlens[-1].item())
+        naive = tensor_a2a_cp2hp(
+            local_t,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=cp_group,
+            split_sections=split_sections,
+            undo_attention_load_balancing=False,
+        )
+        idx, _ = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, t_global)
+        return naive.index_select(0, idx)
+
+    @staticmethod
+    def _batched_a2a_hp2cp(global_t, cu_seqlens, cp_group, split_sections=None):
+        cp_size = cp_group.size()
+        t_global = int(cu_seqlens[-1].item())
+        _, inv = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, t_global)
+        permuted = global_t.index_select(0, inv)
+        return tensor_a2a_hp2cp(
+            permuted,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=cp_group,
+            split_sections=split_sections,
+            redo_attention_load_balancing=False,
+        )
+
+    # ---- Tests ----
+
+    @pytest.mark.parametrize(
+        "cu_seqlens",
+        [
+            (0, 32, 64),  # 2 equal sequences
+            (0, 32, 64, 96, 128),  # 4 equal sequences (matches existing THD test)
+            (0, 16, 48, 80),  # 3 unequal sequences
+        ],
+    )
+    def test_cp2hp_batched_matches_per_seq(self, cu_seqlens):
+        cu = torch.tensor(cu_seqlens, dtype=torch.long, device=torch.cuda.current_device())
+        if ((cu[1:] - cu[:-1]) % self.cp_size != 0).any():
+            pytest.skip(f"cu_seqlens {cu_seqlens} not divisible by cp_size {self.cp_size}")
+
+        T_global = cu_seqlens[-1]
+        T_local = T_global // self.cp_size
+        hidden = 32
+        torch.manual_seed(42 + self.cp_size)
+        local_t = (
+            torch.rand(T_local, 1, hidden, device=torch.cuda.current_device())
+            .bfloat16()
+            .contiguous()
+        )
+
+        out_ref = self._per_seq_a2a_cp2hp(local_t, cu, self.cp_group)
+        out_opt = self._batched_a2a_cp2hp(local_t, cu, self.cp_group)
+
+        rank = torch.distributed.get_rank()
+        assert out_opt.shape == out_ref.shape, (out_opt.shape, out_ref.shape)
+        # Both paths apply the same a2a kernel; only the surrounding pack/cat
+        # differs. Equality should be bitwise.
+        torch.testing.assert_close(
+            out_opt,
+            out_ref,
+            atol=0.0,
+            rtol=0.0,
+            msg=lambda m: f"Batched CP->HP mismatch on rank={rank}: {m}",
+        )
+
+    @pytest.mark.parametrize("cu_seqlens", [(0, 32, 64), (0, 32, 64, 96, 128), (0, 16, 48, 80)])
+    def test_hp2cp_batched_matches_per_seq(self, cu_seqlens):
+        cu = torch.tensor(cu_seqlens, dtype=torch.long, device=torch.cuda.current_device())
+        if ((cu[1:] - cu[:-1]) % self.cp_size != 0).any():
+            pytest.skip(f"cu_seqlens {cu_seqlens} not divisible by cp_size {self.cp_size}")
+
+        T_global = cu_seqlens[-1]
+        hidden = 32
+        # Hidden must be divisible by cp_size for the HP-sharded input layout.
+        assert hidden % self.cp_size == 0
+        h_local = hidden // self.cp_size
+        torch.manual_seed(42 + self.cp_size)
+        global_t = (
+            torch.rand(T_global, 1, h_local, device=torch.cuda.current_device())
+            .bfloat16()
+            .contiguous()
+        )
+
+        out_ref = self._per_seq_a2a_hp2cp(global_t, cu, self.cp_group)
+        out_opt = self._batched_a2a_hp2cp(global_t, cu, self.cp_group)
+
+        rank = torch.distributed.get_rank()
+        assert out_opt.shape == out_ref.shape, (out_opt.shape, out_ref.shape)
+        torch.testing.assert_close(
+            out_opt,
+            out_ref,
+            atol=0.0,
+            rtol=0.0,
+            msg=lambda m: f"Batched HP->CP mismatch on rank={rank}: {m}",
+        )
+
+    @pytest.mark.parametrize("cu_seqlens", [(0, 32, 64, 96, 128)])
+    def test_cp2hp_hp2cp_round_trip(self, cu_seqlens):
+        """cp2hp followed by hp2cp on the batched path should be the identity."""
+        cu = torch.tensor(cu_seqlens, dtype=torch.long, device=torch.cuda.current_device())
+        if ((cu[1:] - cu[:-1]) % self.cp_size != 0).any():
+            pytest.skip(f"cu_seqlens {cu_seqlens} not divisible by cp_size {self.cp_size}")
+
+        T_global = cu_seqlens[-1]
+        T_local = T_global // self.cp_size
+        hidden = 32
+        torch.manual_seed(7)
+        local_t = (
+            torch.rand(T_local, 1, hidden, device=torch.cuda.current_device())
+            .bfloat16()
+            .contiguous()
+        )
+
+        mid = self._batched_a2a_cp2hp(local_t, cu, self.cp_group)
+        back = self._batched_a2a_hp2cp(mid, cu, self.cp_group)
+
+        torch.testing.assert_close(
+            back,
+            local_t,
+            atol=0.0,
+            rtol=0.0,
+            msg=lambda m: f"Batched cp2hp -> hp2cp not identity: {m}",
+        )
