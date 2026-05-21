@@ -160,7 +160,9 @@ PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+set +x
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
+set -x
 
 ######## Distributed training settings. ########
 echo "------ARGUMENTS for SLURM ---"
@@ -187,10 +189,14 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
+FT_LAUNCHER_ARGS=(
+    --max-restarts=3
+)
+
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
     if [[ "$LAUNCHER" == "ft_launcher" ]]; then
-        ft_launcher ${DISTRIBUTED_ARGS[@]} \
+        ft_launcher ${DISTRIBUTED_ARGS[@]} ${FT_LAUNCHER_ARGS[@]} \
             --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
     else
         uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
@@ -198,7 +204,7 @@ if [[ "$IS_NEMO_TEST" == "true" ]]; then
     fi
 else
     if [[ "$LAUNCHER" == "ft_launcher" ]]; then
-        ft_launcher ${DISTRIBUTED_ARGS[@]} \
+        ft_launcher ${DISTRIBUTED_ARGS[@]} ${FT_LAUNCHER_ARGS[@]} \
             $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
     else
         uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
@@ -210,7 +216,7 @@ fi
 AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
-fi 
+fi
 
 # Set permissions
 chmod -R g+w $OUTPUT_PATH

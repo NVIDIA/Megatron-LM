@@ -13,6 +13,7 @@ import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
@@ -21,11 +22,11 @@ from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelop
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
-from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
+from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
+from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-
-from megatron.post_training.utils import print_distributed_quant_summary
 
 
 def count_parameters_in_layer(model, layer_name):
@@ -104,6 +105,13 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
 
     args_dict = vars(get_args()).copy()
     del args_dict["kv_channels"]  # not recalculated if present
+    # Setting teacher Flextron fields to false if training with Flextron, can be overridden
+    if "flextron" in args_dict:
+        config["flextron"] = False
+    if "enable_router" in args_dict:
+        config["enable_router"] = False
+    if "freeze_model" in args_dict:
+        config["freeze_model"] = False
     args_dict.update(config)
 
     # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
@@ -114,7 +122,7 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     return Namespace(**args_dict)
 
 
-def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
+def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
     """Teacher model creator."""
     args = get_args()
 
@@ -141,19 +149,10 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
                 use_arbitrary_attention_mask=False,
             )
         teacher = MCoreGPTModel(config=config, **model_kwargs)
+
     _add_load_convert_hooks(teacher)
 
-    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
-    # [WAR]: load checkpoint will check checkpoint's saved args and rng state if not finetune.
-    # To avoid error out on loading teacher's checkpoint, we temporarily set args.finetune to
-    # True while loading the teacher checkpoint.
-    original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
-    args.finetune = True
-    if args.export_kd_teacher_ckpt_format is not None:
-        args.ckpt_format = args.export_kd_teacher_ckpt_format
-    load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
-    args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
-    print_rank_0("...teacher loaded successfully.")
+    # NOTE: Checkpoint loading now handled in `megatron/training/checkpointing.py`.
 
     return teacher
 
@@ -165,8 +164,17 @@ def modelopt_gpt_hybrid_builder(
     vp_stage=None,
     config=None,
     pg_collection=None,
+    *,
+    disable_moe_grouped_gemm: bool = False,
 ) -> MCoreGPTModel | MCoreHybridModel:
     """Builds the model.
+
+    Args:
+        disable_moe_grouped_gemm: Force the export spec to use SequentialMLP (per-expert
+            linears) instead of the default TEGroupedMLP. Pruning sets this so
+            ``mtp.prune`` can operate on individual expert linears; quantize / generate /
+            finetune leave the default so MoE quantization (e.g. QuantTEGroupedMLP) works
+            and TP+EP > 1 doesn't trip the QuantSequentialMLP unsupported-combo check.
 
     Args:
         args (Namespace): The arguments namespace.
@@ -203,10 +211,6 @@ def modelopt_gpt_hybrid_builder(
 
     if vp_stage is not None:
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
-    if args.use_legacy_models:
-        raise ValueError(
-            "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
-        )
     if args.spec is not None:
         raise ValueError("ModelOpt integration does not support custom args.spec.")
 
@@ -227,6 +231,19 @@ def modelopt_gpt_hybrid_builder(
             transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
                 config=config,
                 use_te=args.transformer_impl == "transformer_engine",
+            )
+        elif args.export_default_te_spec:
+            # Use the canonical full Transformer Engine spec (mirrors gpt_builder) instead
+            # of the modelopt-customized spec. Required by pruning, which operates on the
+            # un-customized layer graph. ``disable_moe_grouped_gemm`` (set by prune.py)
+            # forces SequentialMLP so mtp.prune can act on individual expert linears.
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                config.num_moe_experts,
+                not disable_moe_grouped_gemm,
+                config.qk_layernorm,
+                config.multi_latent_attention,
+                config.experimental_attention_variant,
+                qk_l2_norm=config.qk_l2_norm,
             )
         else:
             if config.context_parallel_size > 1:
@@ -269,7 +286,6 @@ def modelopt_gpt_hybrid_builder(
                 DeprecationWarning,
                 stacklevel=2,
             )
-        from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 
         if args.export_default_te_spec and args.export_te_mcore_model:
             logging.getLogger(__name__).warning(
@@ -278,9 +294,14 @@ def modelopt_gpt_hybrid_builder(
             )
             args.export_te_mcore_model = False
 
+        # Default to grouped MLP for the export spec (matches the pre-modernization
+        # behavior of get_hybrid_stack_modelopt_spec — its factory default is True).
+        # ``disable_moe_grouped_gemm`` (set by prune.py) forces SequentialMLP so
+        # mtp.prune can act on individual expert linears.
         hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model,
             use_default_te_spec=args.export_default_te_spec,
+            moe_grouped_gemm=not disable_moe_grouped_gemm,
         )
         model_kwargs = {
             "hybrid_stack_spec": hybrid_stack_spec,
@@ -347,7 +368,7 @@ def modelopt_gpt_hybrid_builder(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
         )
         kd_config = {
-            "teacher_model": _load_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
+            "teacher_model": _build_teacher_model(teacher_config, teacher_config_raw, model_kwargs),
             "criterion": distill_cfg.criterion,
             "loss_balancer": distill_cfg.loss_balancer,
         }
@@ -358,7 +379,7 @@ def modelopt_gpt_hybrid_builder(
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
         # Also remove KD mode state to prevent issues with re-conversion after restore.
         mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
-    
+
     print_distributed_quant_summary(model)
     return model
 
