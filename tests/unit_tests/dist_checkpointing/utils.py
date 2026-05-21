@@ -177,11 +177,38 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
 
 
 def setup_model_and_optimizer(
-    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True, optimizer='adam'
+    seed,
+    tp,
+    pp,
+    initialize_fn=initialize_gpt_model,
+    bf16=True,
+    dist_opt=True,
+    optimizer='adam',
+    use_param_layout=False,
 ):
+    optimizer_type = optimizer
+    use_layer_wise = False
+    if optimizer_type == 'dist_muon':
+        optimizer = 'muon'
+        use_layer_wise = True
+    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
+        use_layer_wise = True
+
+    # When use_layer_wise is True and use_param_layout is False, route DDP
+    # construction through the legacy path (no precomputed param layout, no
+    # ``use_distributed_optimizer=True`` flip). LayerWiseDistributedOptimizer
+    # then syncs via its legacy ``allgather_params()`` codepath rather than
+    # ``start_param_sync``.
+    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
+    ddp_use_layer_wise = use_layer_wise and use_param_layout
+
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.use_distributed_optimizer = ddp_use_dist_opt
+        mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        if ddp_use_layer_wise:
+            mock_args.optimizer = optimizer
         model = get_model(
             partial(
                 initialize_fn,
@@ -193,19 +220,10 @@ def setup_model_and_optimizer(
             )
         )
 
-    optimizer_type = optimizer
-    use_layer_wise = False
-    if optimizer_type == 'dist_muon':
-        optimizer = 'muon'
-        use_layer_wise = True
-    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
-        use_layer_wise = True
-        dist_opt = False
-
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
     )
@@ -217,12 +235,25 @@ def setup_model_and_optimizer(
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
+    def _init_states(optimizer):
+        # In hybrid LayerWise + DistOpt mode the top-level ChainedOptimizer
+        # wraps another ChainedOptimizer (LayerWise) alongside DistOpt; recurse
+        # so the Muon Float16 sub-optimizers inside LayerWise still get their
+        # state seeded. Optimizers without ``init_state_fn`` (DistOpt) seed
+        # their state elsewhere and are skipped here.
+        if isinstance(optimizer, ChainedOptimizer):
+            for child_optimizer in optimizer.chained_optimizers:
+                _init_states(child_optimizer)
+            return
+        if not hasattr(optimizer, 'init_state_fn'):
+            return
+        if not hasattr(optimizer, 'optimizer'):
+            optimizer.init_state_fn(optimizer)
+        else:
+            optimizer.init_state_fn(optimizer.optimizer)
+
     if isinstance(optimizer, ChainedOptimizer):
-        for opt in optimizer.chained_optimizers:
-            if not hasattr(opt, 'optimizer'):
-                opt.init_state_fn(opt)
-            else:
-                opt.init_state_fn(opt.optimizer)
+        _init_states(optimizer)
     else:
         for group in optimizer.optimizer.param_groups:
             for p in group['params']:
@@ -272,10 +303,27 @@ def setup_moe_model_and_optimizer(
     use_grouped_mlp=False,
     use_glu=False,
     optimizer='adam',
+    use_param_layout=False,
 ):
+    optimizer_type = optimizer
+    use_layer_wise = False
+    if optimizer_type == 'dist_muon':
+        optimizer = 'muon'
+        use_layer_wise = True
+    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
+        use_layer_wise = True
+
+    # See setup_model_and_optimizer for the use_param_layout semantics.
+    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
+    ddp_use_layer_wise = use_layer_wise and use_param_layout
+
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.use_distributed_optimizer = ddp_use_dist_opt
+        mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        if ddp_use_layer_wise:
+            mock_args.optimizer = optimizer
         model = get_model(
             partial(
                 initialize_fn,
@@ -292,19 +340,10 @@ def setup_moe_model_and_optimizer(
             )
         )
 
-    optimizer_type = optimizer
-    use_layer_wise = False
-    if optimizer_type == 'dist_muon':
-        optimizer = 'muon'
-        use_layer_wise = True
-    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
-        use_layer_wise = True
-        dist_opt = False
-
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
     )

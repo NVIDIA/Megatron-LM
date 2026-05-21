@@ -2,6 +2,7 @@
 
 import os
 import sys
+import types
 
 import pytest
 import torch
@@ -129,6 +130,101 @@ class TestMultiTokenPredictionLayer:
             assert num_weights == 29664 * config.mtp_num_layers
         elif tp == 4:
             assert num_weights == 15216 * config.mtp_num_layers
+
+    def test_get_embeddings_rolls_padding_mask(self):
+        """Test that _get_embeddings rolls padding_mask alongside input ids."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp_layer = mtp.layers[0]
+
+        seq_len = 6
+        batch_size = 2
+        input_ids = torch.tensor([[1, 2, 3, 4, 0, 0], [5, 6, 7, 0, 0, 0]], dtype=torch.int64)
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
+        padding_mask = torch.tensor(
+            [[True, True, True, True, False, False], [True, True, True, False, False, False]]
+        )
+        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
+
+        def fake_embedding(input_ids, position_ids):
+            return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
+
+        rolled_input_ids, rolled_position_ids, rolled_padding_mask, _, _ = (
+            mtp_layer._get_embeddings(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+                embedding=fake_embedding,
+                hidden_states=hidden_states,
+                packed_seq_params=None,
+            )
+        )
+
+        expected_input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
+        expected_position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
+        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
+
+        assert torch.equal(rolled_input_ids, expected_input_ids)
+        assert torch.equal(rolled_position_ids, expected_position_ids)
+        assert torch.equal(rolled_padding_mask, expected_padding_mask)
+
+    def test_forward_propagates_rolled_padding_mask(self, monkeypatch):
+        """Test forward passes rolled padding_mask to transformer path."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp_layer = mtp.layers[0]
+
+        seq_len = 4
+        batch_size = 2
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.int64)
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
+        padding_mask = torch.tensor([[True, True, True, False], [True, True, False, False]])
+        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
+        attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool)
+        seen = {}
+
+        def fake_embedding(input_ids, position_ids):
+            return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
+
+        def fake_proj_and_transformer_layer(
+            self,
+            hidden_states,
+            decoder_input,
+            attention_mask=None,
+            padding_mask=None,
+            context=None,
+            context_mask=None,
+            rotary_pos_emb=None,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            attention_bias=None,
+            inference_params=None,
+            packed_seq_params=None,
+            sequence_len_offset=None,
+        ):
+            seen["padding_mask"] = padding_mask
+            return hidden_states
+
+        monkeypatch.setattr(
+            mtp_layer,
+            "_proj_and_transformer_layer",
+            types.MethodType(fake_proj_and_transformer_layer, mtp_layer),
+        )
+
+        _, _, _, returned_padding_mask = mtp_layer.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            embedding=fake_embedding,
+        )
+
+        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
+        assert torch.equal(seen["padding_mask"], expected_padding_mask)
+        assert torch.equal(returned_padding_mask, expected_padding_mask)
 
 
 class TestMultiTokenPrediction:
@@ -525,6 +621,53 @@ class TestMultiTokenPrediction:
         loss.backward()
 
         # Verify gradients exist
+        for name, param in gpt_model[0].named_parameters():
+            assert param.main_grad is not None, f"Gradient missing for {name}"
+
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    def test_packed_sequences_with_full_recompute(self):
+        """MTP + packed sequences + full activation recomputation.
+
+        Regression: MTP._checkpointed_forward used to forward
+        ``packed_seq_params`` (a non-tensor PackedSeqParams object) directly
+        to ``tensor_parallel.checkpoint``. CheckpointFunction.save_for_backward
+        only accepts tensors and ``None``, so this raised
+        ``TypeError: save_for_backward can only save variables, but argument
+        N is of type PackedSeqParams``. Non-tensor kwargs must be captured
+        by closure, not forwarded as args.
+        """
+        seq_lengths = [16, 24, 12]
+        total_seq_length = sum(seq_lengths)
+
+        args = self.create_test_args(
+            tp=1, cp=1, sequence_length=total_seq_length, micro_batch_size=1, full_recompute=True
+        )
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+
+        batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+        gpt_model, _, _ = setup_model_and_optimizer(
+            self.model_provider, ModelType.encoder_or_decoder
+        )
+
+        output = gpt_model[0].forward(
+            input_ids=batch['tokens'],
+            position_ids=batch['position_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels'],
+            loss_mask=batch['loss_mask'],
+            packed_seq_params=batch['packed_seq_params'],
+        )
+
+        # Backward must run end-to-end through the recomputed MTP layer.
+        loss = output.mean()
+        loss.backward()
+
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
 

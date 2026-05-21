@@ -360,6 +360,35 @@ def _replace_prefix_tokens(
     return previous_turn_token_ids + current_turn_additional_token_ids
 
 
+def _coerce_to_token_id_list(result):
+    """Convert the return value of `tokenizer.apply_chat_template` to `list[int]`.
+
+    transformers >= 5.x.x sometimes returns a `BatchEncoding` object instead of a `list[int]`.
+    """
+    # BatchEncoding / dict-like with input_ids
+    if isinstance(result, dict) or hasattr(result, "input_ids"):
+        ids = result["input_ids"]
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return list(ids)
+    # Fast-tokenizer Encoding object
+    if hasattr(result, "ids"):
+        ids = result.ids
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        return list(ids)
+    # Raw tensor / ndarray
+    if hasattr(result, "tolist"):
+        ids = result.tolist()
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return ids
+    # Plain list
+    return list(result)
+
+
 try:
     import orjson
 
@@ -433,12 +462,14 @@ try:
                 hasattr(tokenizer, 'apply_chat_template')
                 and getattr(tokenizer, "chat_template", None) is not None
             ):
-                prompt_tokens = tokenizer.apply_chat_template(
-                    template_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    tools=template_tools,
-                    **chat_template_kwargs,
+                prompt_tokens = _coerce_to_token_id_list(
+                    tokenizer.apply_chat_template(
+                        template_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=template_tools,
+                        **chat_template_kwargs,
+                    )
                 )
                 # transformers 5.x returns BatchEncoding here, but the rest of this
                 # path (and msgpack in inference_client) expects list[int].
@@ -483,12 +514,14 @@ try:
                         ]
 
                         # Get the templated tokenization of just the previous generation
-                        retokenized_previous_turn_token_ids = tokenizer.apply_chat_template(
-                            messages_to_last_assistant_message,
-                            tokenize=True,
-                            add_generation_prompt=False,
-                            tools=template_tools,
-                            **chat_template_kwargs,
+                        retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
+                            tokenizer.apply_chat_template(
+                                messages_to_last_assistant_message,
+                                tokenize=True,
+                                add_generation_prompt=False,
+                                tools=template_tools,
+                                **chat_template_kwargs,
+                            )
                         )
                         if hasattr(retokenized_previous_turn_token_ids, 'input_ids'):
                             retokenized_previous_turn_token_ids = list(
@@ -707,6 +740,9 @@ try:
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
             message["generation_log_probs"] = result.get("generated_log_probs", [])
+            message["policy_epoch"] = result["policy_epoch"]
+            message["kv_cache_epoch"] = result["kv_cache_epoch"]
+            message["num_evictions"] = sum(1 for e in result["events"] if e.get("type") == "EVICT")
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -735,11 +771,6 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
-            choice_data["policy_epoch"] = result["policy_epoch"]
-            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
-            choice_data["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
             if current_app.config['verbose']:
                 logging.info(_redact_token_id_lists_for_logging(result))
 
