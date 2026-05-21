@@ -208,6 +208,16 @@ class _ParamAndGradBucketGroup:
                 not self.ddp_config.reduce_scatter_with_fp32_accumulation
             ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
 
+        reduction_collective = (
+            "reduce-scatter" if self.ddp_config.use_distributed_optimizer else "all-reduce"
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Using {reduction_collective} for gradient reductions because "
+            f"{self.ddp_config.use_distributed_optimizer=}",
+        )
+
         global dist_reduce_scatter_func
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
             dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
@@ -355,8 +365,9 @@ class _ParamAndGradBucketGroup:
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
         if not self.ddp_config.use_distributed_optimizer:
-            # Layer-wise optimizer path: use all_gather for variable-size
-            # param gather.
+            # Legacy layer-wise optimizer path: use all_gather for variable-size
+            # param gather.  Once all layerwise call sites set
+            # ddp_config.use_distributed_optimizer=True, this branch can be removed.
             #
             # Each rank may own a different number of params per bucket, so
             # layerwise_param_flat_sizes can vary across ranks.  PyTorch's NCCL
@@ -807,15 +818,22 @@ def group_params_for_buffers(
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
         is_expert_parallel = not getattr(param, 'allreduce', True)
+        is_managed_by_layer_wise_optimizer = getattr(
+            param, 'is_managed_by_layer_wise_optimizer', False
+        )
 
-        key = BufferKey(param_dtype, grad_dtype, is_expert_parallel)
+        key = BufferKey(
+            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+        )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
         key_to_params[key] = param_list
 
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
-        offset_key = BufferKey(param.dtype, grad_dtype, is_expert_parallel)
+        offset_key = BufferKey(
+            param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+        )
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1
         indices = key_to_indices.get(key, [])
@@ -1005,6 +1023,7 @@ class _ParamAndGradBuffer:
         self.param_data = None
         self.grad_data = None
         self.extra_main_grads = []
+        self.nccl_mem_pool = None
 
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
@@ -1012,6 +1031,7 @@ class _ParamAndGradBuffer:
             pool = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
+            self.nccl_mem_pool = pool
             mem_alloc_context = functools.partial(
                 nccl_allocator.nccl_mem,
                 pool,
@@ -1492,12 +1512,16 @@ def partition_buckets(
     if len(buffers) == 0:
         return []
 
-    dtype_to_buffer_map = {}
+    # At most one fp8 (uint8) buffer is allowed; Cases 2 and 3 below branch on
+    # whether one is present. Non-uint8 dtypes can legitimately appear in
+    # multiple buffers (e.g. LayerWise-managed bf16 weights + Adam-managed bf16
+    # biases share the bf16 ``param_dtype`` but live in separate buffers), so
+    # the uniqueness check is restricted to uint8.
+    fp8_buffer = None
     for buffer in buffers:
-        dtype = buffer.param_dtype
-        # Make sure that the param_dtype of any two buffers is different.
-        assert dtype not in dtype_to_buffer_map
-        dtype_to_buffer_map[dtype] = buffer
+        if buffer.param_dtype == torch.uint8:
+            assert fp8_buffer is None
+            fp8_buffer = buffer
 
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
     if force_single_bucket_group:
@@ -1516,7 +1540,7 @@ def partition_buckets(
         )
         return [bucket_group]
 
-    if torch.uint8 not in dtype_to_buffer_map:
+    if fp8_buffer is None:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
         #         only one bucket.
         bucket_groups = []
@@ -1540,7 +1564,6 @@ def partition_buckets(
                     non_fp8_buckets.append(bucket)
 
         bucket_groups = []
-        fp8_buffer = dtype_to_buffer_map[torch.uint8]
         for bucket in fp8_buffer.buckets:
             if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
                 # reduce_scatter_with_fp32_accumulation requires exactly one bucket

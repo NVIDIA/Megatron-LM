@@ -229,10 +229,12 @@ class SharedExpertMLP(MLP):
                 self.gate_score = torch.nn.functional.sigmoid(logits)
             if self.config.sequence_parallel:
                 self.cached_fc1_input = gather_from_sequence_parallel_region(
-                    input, tensor_parallel_output_grad=True
+                    input, tensor_parallel_output_grad=True, group=self.tp_group
                 )
             else:
-                self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
+                self.cached_fc1_input = copy_to_tensor_model_parallel_region(
+                    input, group=self.tp_group
+                )
             set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
 
     @overlap_state_check(
@@ -321,11 +323,11 @@ class SharedExpertMLP(MLP):
         with torch.cuda.stream(self.stream):
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output, group=self.tp_group
                 )
             else:
                 self.cached_output = reduce_from_tensor_model_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output, group=self.tp_group
                 )
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)
