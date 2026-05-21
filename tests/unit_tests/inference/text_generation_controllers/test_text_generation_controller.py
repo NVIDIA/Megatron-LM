@@ -1393,6 +1393,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         self.text_generation_controller.num_speculative_tokens = 2
+        self.text_generation_controller.num_mtp_heads = 2
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
         ctx.total_request_count = 2
         ctx.paused_request_count = 0

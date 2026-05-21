@@ -212,8 +212,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0:
             assert (
                 model_config.mtp_use_repeated_layer
-                or self.num_speculative_tokens <= (model_config.mtp_num_layers or 0)
-            ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP layers {model_config.mtp_num_layers or 0}"
+                or self.num_speculative_tokens <= self.controller.num_mtp_heads
+            ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -358,7 +358,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # decoder graphs within the same loop rather than in a separate pass.
         unwrapped = unwrap_model(controller.inference_wrapped_model.model)
         mtp_warmup_enabled = (
-            controller.num_mtp_depths > 0
+            controller.num_mtp_heads > 0
             and (controller.num_speculative_tokens or 0) > 0
             and hasattr(unwrapped, 'mtp')
         )
@@ -366,7 +366,7 @@ class DynamicInferenceEngine(AbstractEngine):
             tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
             sp_enabled = model_config.sequence_parallel and tp_size > 1
             mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
-            mtp_warmup_depths = range(controller.num_mtp_depths) if mtp_pass_depth else [None]
+            mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
             mtp_seen_batch_sizes = set()
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
