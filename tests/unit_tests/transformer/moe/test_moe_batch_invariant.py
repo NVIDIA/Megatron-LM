@@ -315,5 +315,3 @@ def test_tegroupedmlp_invariance_under_permutation(_moe_env):
         f"MoE output not invariant to batch permutation; max abs diff: "
         f"{(y_ref.float() - y_unperm.float()).abs().max().item()}"
     )
-
-
