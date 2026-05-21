@@ -15,7 +15,7 @@ from megatron.core.msc_utils import open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 
-from megatron.core._slurm_utils import resolve_slurm_local_rank, resolve_slurm_master_port, resolve_slurm_master_addr
+from megatron.core._slurm_utils import resolve_slurm_local_rank
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -600,47 +600,3 @@ def get_local_rank_preinit() -> int:
 
     warnings.warn("Could not determine local rank from LOCAL_RANK or SLURM_LOCALID. Defaulting to local rank 0.")
     return 0
-
-
-def get_master_addr_safe() -> str:
-    """Get the master address for distributed initialization.
-
-    Fallback order:
-    1. MASTER_ADDR environment variable (torchrun/torchelastic)
-    2. SLURM_NODELIST parsed (SLURM)
-    3. Default: localhost (with warning)
-
-    Returns:
-        The master node address.
-    """
-    if "MASTER_ADDR" in os.environ:
-        return os.environ["MASTER_ADDR"]
-
-    slurm_addr = resolve_slurm_master_addr()
-    if slurm_addr is not None:
-        return slurm_addr
-
-    warnings.warn("Could not determine master address from MASTER_ADDR or SLURM_NODELIST. Defaulting to 'localhost'.")
-    return "localhost"
-
-
-def get_master_port_safe() -> int:
-    """Get the master port for distributed initialization.
-
-    Fallback order:
-    1. MASTER_PORT environment variable (torchrun/torchelastic)
-    2. SLURM job-based port (SLURM_JOB_ID derived)
-    3. Default: 29500 (with warning)
-
-    Returns:
-        The master port.
-    """
-    if "MASTER_PORT" in os.environ:
-        return int(os.environ["MASTER_PORT"])
-
-    slurm_port = resolve_slurm_master_port()
-    if slurm_port is not None:
-        return slurm_port
-
-    warnings.warn("Could not determine master port from MASTER_PORT or SLURM environment. Defaulting to 29500.")
-    return 29500
