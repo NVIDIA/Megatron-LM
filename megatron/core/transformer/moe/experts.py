@@ -852,6 +852,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 f"--inference-grouped-gemm-backend=torch (BIK is only wired into "
                 f"the TORCH backend); got {self.inference_grouped_gemm_backend}."
             )
+            # EP > 1 inference combine uses ReduceScatter, which sums partial
+            # per-rank topk contribs in NCCL ring order — a different
+            # reduction tree from training's local deterministic_index_add.
+            # This causes bf16 drift between rollout and train-side recompute.
+            # The fix (AllGather raw per-contrib outputs + global deterministic
+            # unpermute) is a follow-up; until then, require EP == 1 for BIK.
+            ep_size = self.ep_group.size()
+            assert ep_size == 1, (
+                f"batch_invariant_mode requires inference EP size == 1; got "
+                f"ep_size={ep_size}. EP > 1 inference combine via ReduceScatter "
+                f"sums partial contribs across ranks in a different order than "
+                f"training's local unpermute, breaking bitwise parity."
+            )
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""

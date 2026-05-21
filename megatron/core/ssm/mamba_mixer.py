@@ -1145,21 +1145,28 @@ class MambaMixer(MegatronModule):
         batch_indices: Optional[torch.Tensor],
         ssm_state: torch.Tensor,
     ) -> torch.Tensor:
-        """Per-request buffered `chunk_scan` for decode, bitwise to a full scan.
+        """CG-compat batched buffered `chunk_scan` for decode, bitwise to a full scan.
 
         Default decode uses `selective_state_update`, which differs from
         `mamba_chunk_scan_combined` in bf16 by ~6e-5. Single-token
         `chunk_scan(new_tok, init=ssm_state)` also drifts (~2.4e-4) because
         its intra-chunk position differs from the full scan's. Calling
         `chunk_scan(buffer ⊕ new_tok, init=ssm_state)` where the buffer is
-        the prefill's partial-chunk tail (seeded by
-        `_bik_seed_decode_buffers`) restores the same intra-chunk position
-        and gives bitwise-identical output. When the buffer fills to
-        `chunk_size`, we snapshot the returned state as the new ssm_state
-        and reset the buffer.
+        the prefill's partial-chunk tail (seeded by `_bik_seed_decode_buffers`)
+        restores the same intra-chunk position and gives bitwise-identical
+        output. When the buffer fills to `chunk_size`, we snapshot the
+        returned state as the new ssm_state and reset the buffer.
 
-        CG-incompat: per-request `.item()` host syncs prevent CUDA-graph
-        capture. Use `--cuda-graph-impl=none` for hybrid models under BIK.
+        Vectorization: a single batched chunk_scan over the full
+        (max_batch, chunk_size, ...) persistent buffer. We rely on the scan
+        being causal — y[slot, cnt[slot]] only depends on positions
+        0..cnt[slot] in the buffer, so stale data at positions > cnt[slot]
+        doesn't corrupt the new token's output. Final states are only used
+        for slots that filled their chunk this step (cnt+1 == chunk_size),
+        where the entire buffer is fresh and final_states is the boundary
+        state we want.
+
+        No host syncs → CG-capturable.
         """
         B = rearrange(B, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
         C = rearrange(C, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
@@ -1186,85 +1193,98 @@ class MambaMixer(MegatronModule):
             "(no speculative decoding)."
         )
 
-        # Allocate buffers lazily (already done by prefill in the normal
-        # flow; this covers requests that reach decode without a prefill
-        # pass through this layer in the current process).
+        max_batch = ssm_state.shape[0]
         self._bik_ensure_chunk_buffers(
-            ssm_state.shape[0],
-            nh,
-            p,
-            ng,
-            n,
-            dev,
-            x.dtype,
-            dt.dtype,
-            B.dtype,
-            C.dtype,
+            max_batch, nh, p, ng, n, dev,
+            x.dtype, dt.dtype, B.dtype, C.dtype,
             z.dtype if z is not None else x.dtype,
         )
 
+        # --- Slot indices + active mask ---
         if batch_indices is not None:
-            slots = batch_indices.to(torch.long)
+            slots_raw = batch_indices.to(torch.long)
         else:
-            slots = torch.arange(B_dec, device=dev, dtype=torch.long)
+            slots_raw = torch.arange(B_dec, device=dev, dtype=torch.long)
+        is_active = slots_raw >= 0                          # (B_dec,)
+        slots = slots_raw.clamp(min=0)                      # (B_dec,) safe for indexing
 
-        outs = []
-        for i in range(B_dec):
-            slot = slots[i].item()
-            if slot < 0:
-                # Padding / inactive batch slot.
-                outs.append(torch.zeros(1, 1, nh, p, device=dev, dtype=x.dtype))
-                continue
-            cnt = int(self._bik_chunk_count[slot].item())
+        # Each batch position's current write-cursor (per-slot count).
+        cnt_per_batch = self._bik_chunk_count[slots].to(torch.long)  # (B_dec,)
 
-            # Write the new token directly into the persistent buffer at
-            # position `cnt`, then slice out the first cnt+1 tokens. Slicing
-            # the first dim (slot:slot+1) of a contiguous (max_batch, buf_len,
-            # …) tensor yields a contiguous (1, cnt+1, …) tensor — what the
-            # kernel needs without a copy.
-            self._bik_chunk_x_buf[slot, cnt] = x[i, 0]
-            self._bik_chunk_dt_buf[slot, cnt] = dt[i, 0]
-            self._bik_chunk_B_buf[slot, cnt] = B[i, 0]
-            self._bik_chunk_C_buf[slot, cnt] = C[i, 0]
-            if z is not None:
-                self._bik_chunk_z_buf[slot, cnt] = z[i, 0]
+        # --- Write new tokens into persistent buffer at (slot, cnt[slot]) ---
+        # For inactive batch positions (slot<0 → clamped to 0), guard the
+        # write with a torch.where so we don't clobber slot 0's data.
+        def _safe_write(buf: torch.Tensor, new_vals: torch.Tensor) -> None:
+            # buf: (max_batch, chunk_size, *trailing); new_vals: (B_dec, *trailing)
+            old_vals = buf[slots, cnt_per_batch]
+            mask = is_active.view([-1] + [1] * (new_vals.ndim - 1))
+            buf[slots, cnt_per_batch] = torch.where(mask, new_vals, old_vals)
 
-            x_buf = self._bik_chunk_x_buf[slot : slot + 1, : cnt + 1]
-            dt_buf = self._bik_chunk_dt_buf[slot : slot + 1, : cnt + 1]
-            B_buf = self._bik_chunk_B_buf[slot : slot + 1, : cnt + 1]
-            C_buf = self._bik_chunk_C_buf[slot : slot + 1, : cnt + 1]
-            z_buf = self._bik_chunk_z_buf[slot : slot + 1, : cnt + 1] if z is not None else None
+        _safe_write(self._bik_chunk_x_buf, x[:, 0])
+        _safe_write(self._bik_chunk_dt_buf, dt[:, 0])
+        _safe_write(self._bik_chunk_B_buf, B[:, 0])
+        _safe_write(self._bik_chunk_C_buf, C[:, 0])
+        if z is not None:
+            _safe_write(self._bik_chunk_z_buf, z[:, 0])
 
-            init = (
-                None
-                if bool(self._bik_state_is_zero[slot])
-                else (ssm_state[slot : slot + 1].contiguous())
-            )
-            y_run, new_state = mamba_chunk_scan_combined(
-                x_buf,
-                dt_buf,
-                A,
-                B_buf,
-                C_buf,
-                self.chunk_size,
-                D=D,
-                z=z_buf,
-                dt_bias=dt_bias,
-                dt_softplus=True,
-                initial_states=init,
-                return_final_states=True,
-            )
-            outs.append(y_run[:, -1:])
+        # --- Mask initial state to zero where _bik_state_is_zero ---
+        # (per-slot: True means "treat as zero initial state on this scan call")
+        init = ssm_state * (~self._bik_state_is_zero).view(-1, 1, 1, 1).to(ssm_state.dtype)
 
-            if cnt + 1 == self.chunk_size:
-                # Run ended on a chunk boundary — snapshot state, reset buffer.
-                ssm_state[slot] = new_state.squeeze(0).to(ssm_state.dtype)
-                self._bik_chunk_count[slot] = 0
-                self._bik_state_is_zero[slot] = False
-            else:
-                self._bik_chunk_count[slot] = cnt + 1
+        # --- Single batched chunk_scan over the full (max_batch, chunk_size, ...) ---
+        z_full = self._bik_chunk_z_buf if z is not None else None
+        y_full, new_state_full = mamba_chunk_scan_combined(
+            self._bik_chunk_x_buf,
+            self._bik_chunk_dt_buf,
+            A,
+            self._bik_chunk_B_buf,
+            self._bik_chunk_C_buf,
+            self.chunk_size,
+            D=D,
+            z=z_full,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            initial_states=init.contiguous(),
+            return_final_states=True,
+        )
+        # y_full: (max_batch, chunk_size, nh, p)
+        # new_state_full: (max_batch, nh, p, n)
 
-        y = torch.cat(outs, dim=0)  # (B_dec, 1, H, P)
+        # --- Per-batch y extraction: y[slot, cnt[slot]] ---
+        y_per_batch = y_full[slots, cnt_per_batch]            # (B_dec, nh, p)
+        y_per_batch = y_per_batch * is_active.view(-1, 1, 1).to(y_per_batch.dtype)
+        y = y_per_batch.unsqueeze(1)                          # (B_dec, 1, nh, p)
+
+        # --- Per-slot state updates (vectorized via torch.where masking) ---
+        # A slot "crosses" the chunk boundary on this step iff cnt+1==chunk_size.
+        # Crossed: snapshot final state, reset cnt to 0, clear state_is_zero.
+        # Uncrossed: cnt+=1, state_is_zero unchanged.
+        # Inactive batch positions: no update.
+        crossed_per_batch = (cnt_per_batch + 1 == self.chunk_size) & is_active  # (B_dec,)
+        new_cnt_per_batch = torch.where(
+            crossed_per_batch, torch.zeros_like(cnt_per_batch), cnt_per_batch + 1
+        )
+        new_szero_per_batch = torch.where(
+            crossed_per_batch,
+            torch.zeros_like(crossed_per_batch),
+            self._bik_state_is_zero[slots],
+        )
+
+        # Apply to the persistent buffers, gated by is_active (so we don't
+        # touch slots not in this decode batch).
+        old_cnt = self._bik_chunk_count[slots]
+        self._bik_chunk_count[slots] = torch.where(
+            is_active, new_cnt_per_batch.to(torch.int32), old_cnt
+        )
+        old_szero = self._bik_state_is_zero[slots]
+        self._bik_state_is_zero[slots] = torch.where(is_active, new_szero_per_batch, old_szero)
+
+        # ssm_state: snapshot only at slots that crossed AND are active.
+        snapshot_mask = (is_active & crossed_per_batch).view(-1, 1, 1, 1)
+        old_state = ssm_state[slots]
+        new_state_dtype = new_state_full[slots].to(ssm_state.dtype)
+        ssm_state[slots] = torch.where(snapshot_mask, new_state_dtype, old_state)
+
         return rearrange(y, "b s h p -> b s (h p)")
 
     def train(self, mode: bool = True):

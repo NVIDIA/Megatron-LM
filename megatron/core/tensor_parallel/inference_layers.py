@@ -415,11 +415,20 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
         # (world_size times smaller on dim 0) is too.
+        # Under BIK we force the NCCL fallback: multimem reduce sums across
+        # ranks via hardware multicast atomics whose ordering doesn't match
+        # NCCL's ring-traversal order, so it drifts vs training (which uses
+        # NCCL RS under sequence parallelism). NCCL RS is deterministic for a
+        # fixed topology and matches training bitwise.
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            is_batch_invariant_mode_enabled,
+        )
         can_use_nvls = (
             self.triton_nvls_kernels_allowed
             and x.dtype == torch.bfloat16
             and are_tensors_nvls_eligible(x)
             and symm_mem_buffer["handle"] is not None
+            and not is_batch_invariant_mode_enabled()
         )
 
         if can_use_nvls:
@@ -542,7 +551,17 @@ def inference_reduce_scatter_to_sequence_parallel_region(
         config, 'inference_disable_triton_nvls_kernels', False
     )
 
-    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+    # Under BIK, drop the NVLS multimem path: its cross-rank reduction order
+    # differs from NCCL's ring traversal, so it drifts vs training (which
+    # uses NCCL RS under sequence parallelism).
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+    )
+    if (
+        triton_nvls_kernels_allowed
+        and SymmetricMemoryManager.is_initialized("tp")
+        and not is_batch_invariant_mode_enabled()
+    ):
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
         symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
 
