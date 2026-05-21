@@ -7,7 +7,6 @@ from megatron.core.inference.contexts.fused_kv_append_kernel import (
     HAVE_TRITON,
     triton_append_key_value_cache,
 )
-
 from megatron.core.inference.contexts.gpu_view import ContextGPUView
 
 
