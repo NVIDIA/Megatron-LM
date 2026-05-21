@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-import copy
+import os
 import random
 
 import numpy as np
@@ -695,26 +695,35 @@ class TestMegatronFSDPE2E:
         Raises:
             ValueError: If batch-size arithmetic or other setup assumptions (e.g., divisibility) are violated.
         """
-        # Configuration parameters with defaults
-        VOCAB_SIZE = kwargs.get("vocab_size", 100)
-        MAX_SEQ_LEN = kwargs.get("seq_length", 128)
-        MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
-        GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
-        NUM_TRAINING_STEPS = kwargs.get("train_iters", 20)
-        TP = kwargs.get("tensor_model_parallel_size", 1)
-        PP = kwargs.get("pipeline_model_parallel_size", 1)
-        VPP = kwargs.get("num_layers_per_virtual_pipeline_stage", None)
-        EP = kwargs.get("expert_model_parallel_size", 1)
-        ETP = kwargs.get("expert_tensor_parallel_size", 1)
-        OUTER_DP = kwargs.get("num_distributed_optimizer_instances", 1)
+        cfg = dict(
+            vocab_size=100,
+            padded_vocab_size=100,
+            seq_length=128,
+            micro_batch_size=2,
+            global_batch_size=32,
+            train_iters=20,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            num_layers_per_virtual_pipeline_stage=None,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            num_distributed_optimizer_instances=1,
+        )
+        cfg.update(kwargs)
+        cfg["sequence_parallel"] = cfg["tensor_model_parallel_size"] > 1
+
+        if cfg.get("use_megatron_fsdp", False) or cfg.get("use_torch_fsdp2", False):
+            os.environ.pop("CUDA_DEVICE_MAX_CONNECTIONS", None)
+        elif cfg["tensor_model_parallel_size"] > 1 or cfg.get("context_parallel_size", 1) > 1:
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=TP,
-            pipeline_model_parallel_size=PP,
-            expert_model_parallel_size=EP,
-            expert_tensor_parallel_size=ETP,
-            num_distributed_optimizer_instances=OUTER_DP,
+            tensor_model_parallel_size=cfg["tensor_model_parallel_size"],
+            pipeline_model_parallel_size=cfg["pipeline_model_parallel_size"],
+            expert_model_parallel_size=cfg["expert_model_parallel_size"],
+            expert_tensor_parallel_size=cfg["expert_tensor_parallel_size"],
+            num_distributed_optimizer_instances=cfg["num_distributed_optimizer_instances"],
         )
         DP_GROUP = mpu.get_data_parallel_group()
 
@@ -723,20 +732,9 @@ class TestMegatronFSDPE2E:
 
         # Create model and optimizer
         model_chunks, optim = make_moe_args_model_and_optimizer(
-            ut_filename="test_mcore_fully_sharded_data_parallel.py",
-            micro_batch_size=MICRO_BATCH_SIZE,
-            global_batch_size=GLOBAL_BATCH_SIZE,
-            vocab_size=VOCAB_SIZE,
-            padded_vocab_size=VOCAB_SIZE,
-            seq_length=MAX_SEQ_LEN,
-            sequence_parallel=TP > 1,
-            tensor_model_parallel_size=TP,
-            pipeline_model_parallel_size=PP,
-            num_layers_per_virtual_pipeline_stage=VPP,
-            train_iters=NUM_TRAINING_STEPS,
-            **kwargs,
+            ut_filename="test_mcore_fully_sharded_data_parallel.py", **cfg
         )
-        megatron_fsdp_te_fused_adam = kwargs.get("use_megatron_fsdp", False) and kwargs.get(
+        megatron_fsdp_te_fused_adam = cfg.get("use_megatron_fsdp", False) and cfg.get(
             "use_precision_aware_optimizer", False
         )
         if megatron_fsdp_te_fused_adam:
@@ -755,27 +753,29 @@ class TestMegatronFSDPE2E:
         # Prepare data iterator
         data_iterator = make_gpt_mock_data_iterator(
             dp_group=DP_GROUP,
-            vocab_size=VOCAB_SIZE,
-            sequence_length=MAX_SEQ_LEN,
-            batch_size=MICRO_BATCH_SIZE,
-            num_samples=GLOBAL_BATCH_SIZE * NUM_TRAINING_STEPS,
+            vocab_size=cfg["vocab_size"],
+            sequence_length=cfg["seq_length"],
+            batch_size=cfg["micro_batch_size"],
+            num_samples=cfg["global_batch_size"] * cfg["train_iters"],
         )
 
         outputs = []
 
         # Training loop
-        for _ in range(NUM_TRAINING_STEPS):
+        for _ in range(cfg["train_iters"]):
             optim.zero_grad()
             output = pretrain_forward_backward(
                 model=model_chunks,
                 data_iterator=data_iterator,
-                sequence_length=MAX_SEQ_LEN,
-                micro_batch_size=MICRO_BATCH_SIZE,
-                num_micro_batches=GLOBAL_BATCH_SIZE // MICRO_BATCH_SIZE // DP_GROUP.size(),
+                sequence_length=cfg["seq_length"],
+                micro_batch_size=cfg["micro_batch_size"],
+                num_micro_batches=(
+                    cfg["global_batch_size"] // cfg["micro_batch_size"] // DP_GROUP.size()
+                ),
             )
             # Check that at least one non-null / non-zero gradient
             # exists when using Megatron-FSDP.
-            if kwargs.get("use_megatron_fsdp", False):
+            if cfg.get("use_megatron_fsdp", False):
                 grad_attr = "decoupled_grad" if megatron_fsdp_te_fused_adam else "grad"
                 assert any(
                     [
@@ -799,9 +799,14 @@ class TestMegatronFSDPE2E:
     @pytest.mark.parametrize(
         "nd_topology",
         [
-            pytest.param({"TP": 2}, id="TP2"),
-            pytest.param({"EP": 2, "ETP": 2}, id="EP2_ETP2"),
-            pytest.param({"OUTER_DP": 2, "EP": 2}, id="OUTER_DP2_EP2"),
+            pytest.param({"tensor_model_parallel_size": 2}, id="TP2"),
+            pytest.param(
+                {"expert_model_parallel_size": 2, "expert_tensor_parallel_size": 2}, id="EP2_ETP2"
+            ),
+            pytest.param(
+                {"num_distributed_optimizer_instances": 2, "expert_model_parallel_size": 2},
+                id="OUTER_DP2_EP2",
+            ),
         ],
     )
     @pytest.mark.parametrize(
@@ -815,7 +820,6 @@ class TestMegatronFSDPE2E:
                     fp8="e4m3",
                     fp8_param_gather=True,
                     bf16=True,
-                    num_distributed_optimizer_instances=2,
                     outer_dp_sharding_strategy="optim",
                 ),
                 id="optim_grads_params_mxfp8_double_buffer",
@@ -864,12 +868,22 @@ class TestMegatronFSDPE2E:
         ):
             pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
 
+        # HFSDP outer-shard strategies (e.g., "optim") require an actual outer-DP
+        # group; skip combinations where the topology doesn't supply one.
+        if (
+            spec_configs.get("outer_dp_sharding_strategy", "no_shard") != "no_shard"
+            and nd_topology.get("num_distributed_optimizer_instances", 1) <= 1
+        ):
+            pytest.skip(
+                "HFSDP outer-shard strategy requires num_distributed_optimizer_instances > 1"
+            )
+
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
-            distopt_spec_configs = copy.deepcopy(spec_configs)
-            distopt_spec_configs["fp8_param_gather"] = False
+            distopt_kwargs = {**spec_configs, **nd_topology}
+            distopt_kwargs["fp8_param_gather"] = False
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                use_distributed_optimizer=True, **distopt_spec_configs
+                use_distributed_optimizer=True, **distopt_kwargs
             )
 
         outputs = TestMegatronFSDPE2E._training_loop(
@@ -877,7 +891,7 @@ class TestMegatronFSDPE2E:
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
-            **spec_configs,
+            **{**spec_configs, **nd_topology},
         )
         reference_outputs = ref_cache[nd_topology_str]
 

@@ -3707,7 +3707,10 @@ class GradReducePipeline:
         if outer_fsdp_group_grad_reduce:
             # Wait on the DP-Shard reduction before further reduction.
             self.outer_fsdp_group_grad_reduce_stream.wait_stream(reduce_scatter_stream)
-            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group()
+            is_expert_parallel = self.buffer.parameter_groups[bucket_group[0]].is_expert_param
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=is_expert_parallel
+            )
             with torch.cuda.stream(self.outer_fsdp_group_grad_reduce_stream):
                 with _coalescing_manager(outer_fsdp_group):
                     # List of gradient accumulation closure tasks.
