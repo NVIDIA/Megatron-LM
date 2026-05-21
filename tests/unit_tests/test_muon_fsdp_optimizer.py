@@ -707,11 +707,23 @@ class TestFSDPTensorParallelMuon:
         def fail_scalar_gather(*_args, **_kwargs):
             raise AssertionError("HFSDP batched gather should not use the scalar fallback")
 
-        with patch.object(optimizer, "_gather_full_uneven_local_tensor_like", fail_scalar_gather):
+        unpack_calls = 0
+        real_unpack_stage = optimizer._unpack_uneven_gather_stage
+
+        def counting_unpack_stage(*args, **kwargs):
+            nonlocal unpack_calls
+            unpack_calls += 1
+            return real_unpack_stage(*args, **kwargs)
+
+        with (
+            patch.object(optimizer, "_gather_full_uneven_local_tensor_like", fail_scalar_gather),
+            patch.object(optimizer, "_unpack_uneven_gather_stage", counting_unpack_stage),
+        ):
             gathered = optimizer._gather_full_uneven_local_tensors_like([(param, local_update)])[0]
         ref_dtensor = optimizer._dtensor_from_local_like(param, local_update)
         expected = redistribute_uneven_dtensor_to_replicated(ref_dtensor)._local_tensor
 
+        assert unpack_calls == len(plan["stages"]) - 1
         assert torch.equal(gathered, expected), "Batched HFSDP gather produced wrong tensor"
 
     @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP cache test requires at least 4 ranks")
@@ -1089,6 +1101,51 @@ class TestFSDPTensorParallelMuon:
             torch.testing.assert_close(padded, full_grad, atol=0, rtol=0)
             torch.testing.assert_close(padded_second, full_grad_second, atol=0, rtol=0)
             torch.testing.assert_close(padded, uneven, atol=0, rtol=0, msg=f"param {idx}")
+
+    def test_batched_gather_reconstructs_final_stage_without_item_unpack(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plans = [{0: 2, 1: 3}, {0: 1, 1: 4}]
+        full_grads = [
+            torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols) + idx
+            for idx, rows in enumerate([5, 5])
+        ]
+        params = []
+        items = []
+        for full_grad, plan in zip(full_grads, plans):
+            local_value = _local_slice(torch.zeros_like(full_grad), plan, dp_rank).contiguous()
+            param = nn.Parameter(_make_dtensor(local_value, full_grad.shape, device_mesh))
+            local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+            params.append(param)
+            items.append((param, local_grad))
+
+        optimizer = _make_fsdp_muon(
+            params,
+            dp_group=dp_group,
+            fsdp_batched_all_gather=True,
+            fsdp_padded_all_gather=True,
+            fsdp_padded_all_gather_pad_factor=1000,
+            fsdp_reuse_gather_scratch=True,
+            fsdp_fast_reconstruct=True,
+        )
+
+        def fail_unpack_stage(*_args, **_kwargs):
+            raise AssertionError("single-stage batched gather should reconstruct from final stage")
+
+        with patch.object(optimizer, "_unpack_uneven_gather_stage", fail_unpack_stage):
+            results = optimizer._gather_full_uneven_local_tensors_like(items)
+
+        for result, full_grad, (_, local_grad) in zip(results, full_grads, items):
+            if local_grad.numel() == 0:
+                assert result is None
+                continue
+            torch.testing.assert_close(result, full_grad, atol=0, rtol=0)
 
     def test_gather_scratch_reuse_can_be_disabled(self):
         from torch.distributed.device_mesh import init_device_mesh

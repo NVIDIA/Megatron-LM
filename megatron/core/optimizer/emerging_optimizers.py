@@ -984,6 +984,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                         sum(chunk_info["numel"] for chunk_info in chunks_info)
                         for chunks_info in stage_chunks_info
                     ],
+                    "rank_chunk_counts": [len(chunks_info) for chunks_info in stage_chunks_info],
                 }
             )
             local_chunks_info = [
@@ -1017,16 +1018,19 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         if max_rank_numel == 0:
             raise AssertionError("Cannot padded-all-gather an empty uneven DTensor batch.")
 
-        padded_local_buffer = self._get_fsdp_gather_scratch_tensor(
-            ("padded_local_buffer", id(shard_group), local_buffer.dtype, local_buffer.device),
-            max_rank_numel,
-            dtype=local_buffer.dtype,
-            device=local_buffer.device,
-        )
-        if local_buffer.numel() > 0:
-            padded_local_buffer[: local_buffer.numel()].copy_(local_buffer)
-        if self.fsdp_padded_all_gather_zero_pad and local_buffer.numel() < max_rank_numel:
-            padded_local_buffer[local_buffer.numel() : max_rank_numel].zero_()
+        if local_buffer.numel() == max_rank_numel:
+            padded_local_buffer = local_buffer
+        else:
+            padded_local_buffer = self._get_fsdp_gather_scratch_tensor(
+                ("padded_local_buffer", id(shard_group), local_buffer.dtype, local_buffer.device),
+                max_rank_numel,
+                dtype=local_buffer.dtype,
+                device=local_buffer.device,
+            )
+            if local_buffer.numel() > 0:
+                padded_local_buffer[: local_buffer.numel()].copy_(local_buffer)
+            if self.fsdp_padded_all_gather_zero_pad:
+                padded_local_buffer[local_buffer.numel() : max_rank_numel].zero_()
 
         gathered_padded_buffer = self._get_fsdp_gather_scratch_tensor(
             (
@@ -1055,6 +1059,24 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             gathered_padded_buffer, padded_local_buffer, group=shard_group
         )
         return gathered_padded_buffer, max_rank_numel
+
+    def _flatten_tensor_for_uneven_gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.is_contiguous():
+            return tensor.view(-1)
+        return tensor.reshape(-1)
+
+    def _rank_buffers_from_pending_uneven_gather_stage(
+        self, pending_stage: dict[str, Any]
+    ) -> list[torch.Tensor]:
+        group_size = pending_stage["group_size"]
+        if pending_stage["use_padded_all_gather"]:
+            gathered_padded_buffer = pending_stage["gathered_padded_buffer"]
+            max_rank_numel = pending_stage["max_rank_numel"]
+            return [
+                gathered_padded_buffer[rank * max_rank_numel : (rank + 1) * max_rank_numel]
+                for rank in range(group_size)
+            ]
+        return pending_stage["group_tensors"]
 
     def _reconstruct_full_tensor_from_rank_buffers(
         self,
@@ -1140,6 +1162,89 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
         return full_tensor
 
+    def _reconstruct_full_tensor_from_final_stage_buffers(
+        self,
+        dtensor_ref,
+        plan: dict[str, Any],
+        stage_idx: int,
+        rank_buffers: list[torch.Tensor],
+        rank_buffer_offsets: list[int],
+    ) -> torch.Tensor:
+        if stage_idx != len(plan["stages"]) - 1:
+            raise AssertionError(
+                "Direct uneven DTensor reconstruction requires the final gather stage: "
+                f"got stage={stage_idx}, final={len(plan['stages']) - 1}."
+            )
+
+        stage = plan["stages"][stage_idx]
+        if len(rank_buffers) != len(stage["rank_numels"]):
+            raise AssertionError(
+                "Uneven DTensor reconstruction rank buffer count mismatch: "
+                f"got {len(rank_buffers)}, expected {len(stage['rank_numels'])}."
+            )
+
+        rank_chunk_counts = stage["rank_chunk_counts"]
+        if self.fsdp_fast_reconstruct and plan["is_contiguous_full_order"]:
+            chunks = []
+            assigned_numel = 0
+            for rank, rank_buffer in enumerate(rank_buffers):
+                rank_numel = stage["rank_numels"][rank]
+                if rank_numel == 0:
+                    continue
+                source_offset = rank_buffer_offsets[rank]
+                chunks.append(rank_buffer[source_offset : source_offset + rank_numel])
+                assigned_numel += rank_numel
+            if assigned_numel != plan["full_numel"]:
+                raise AssertionError(
+                    "Fast batched uneven DTensor reconstruction did not cover the full tensor: "
+                    f"assigned={assigned_numel}, expected={plan['full_numel']}."
+                )
+            if assigned_numel == 0:
+                return torch.empty(
+                    dtensor_ref.shape, dtype=rank_buffers[0].dtype, device=rank_buffers[0].device
+                )
+            if len(chunks) == 1:
+                full_flat = chunks[0].clone()
+            else:
+                full_flat = torch.cat(chunks)
+            return full_flat.view(dtensor_ref.shape)
+
+        full_tensor = torch.empty(
+            dtensor_ref.shape, dtype=rank_buffers[0].dtype, device=rank_buffers[0].device
+        )
+        assigned_numel = 0
+        chunk_info_idx = 0
+        for rank, rank_buffer in enumerate(rank_buffers):
+            source_offset = rank_buffer_offsets[rank]
+            expected_source_end = source_offset + stage["rank_numels"][rank]
+            for _ in range(rank_chunk_counts[rank]):
+                chunk_info = plan["chunk_infos"][chunk_info_idx]
+                chunk_info_idx += 1
+                chunk_shape = chunk_info["shape"]
+                chunk_numel = chunk_info["numel"]
+                if chunk_numel == 0:
+                    continue
+                gathered_tensor = rank_buffer[source_offset : source_offset + chunk_numel]
+                source_offset += chunk_numel
+                offset = chunk_info["offset"]
+                slices = tuple(slice(o, o + s) for o, s in zip(offset, chunk_shape))
+                full_tensor[slices] = gathered_tensor.view(chunk_shape)
+                assigned_numel += chunk_numel
+            if source_offset != expected_source_end:
+                raise AssertionError(
+                    "Batched uneven DTensor reconstruction consumed an unexpected rank size: "
+                    f"rank={rank}, consumed={source_offset - rank_buffer_offsets[rank]}, "
+                    f"expected={stage['rank_numels'][rank]}."
+                )
+
+        if chunk_info_idx != len(plan["chunk_infos"]):
+            raise AssertionError(
+                "Batched uneven DTensor reconstruction consumed an unexpected chunk count: "
+                f"consumed={chunk_info_idx}, expected={len(plan['chunk_infos'])}."
+            )
+        _assert_chunks_cover_full_tensor(dtensor_ref.shape, plan["chunk_infos"], assigned_numel)
+        return full_tensor
+
     def _gather_full_uneven_local_tensor_like(
         self, dtensor_ref, local_tensor: torch.Tensor
     ) -> torch.Tensor | None:
@@ -1158,7 +1263,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             self._copy_dtensor_chunk_metadata(dtensor_ref, local_dtensor)
             return None if local_tensor.numel() == 0 else full_tensor
 
-        local_buffer = local_tensor.contiguous().view(-1)
+        local_buffer = self._flatten_tensor_for_uneven_gather(local_tensor)
         if len(plan["stages"]) == 1:
             stage = plan["stages"][0]
             shard_group = stage["shard_group"]
@@ -1291,16 +1396,23 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
     ) -> None:
         item_indices = batch["item_indices"]
         plans = batch["plans"]
-        current_buffers = [items[item_idx][1].contiguous().view(-1) for item_idx in item_indices]
+        current_buffers = [
+            self._flatten_tensor_for_uneven_gather(items[item_idx][1]) for item_idx in item_indices
+        ]
+        final_stage_idx = len(plans[0]["stages"]) - 1
 
         for stage_idx, stage in enumerate(plans[0]["stages"]):
             stage_state = self._prepare_uneven_gather_stage(
                 current_buffers, plans, batch, stage_idx, stage
             )
             pending_stage = self._start_uneven_gather_stage(stage_state, async_op=False)
+            if stage_idx == final_stage_idx:
+                self._wait_uneven_gather_stage(pending_stage)
+                self._store_uneven_gather_batch_results_from_stage(
+                    items, results, batch, pending_stage
+                )
+                return
             current_buffers = self._finish_uneven_gather_stage(pending_stage)
-
-        self._store_uneven_gather_batch_results(items, results, batch, current_buffers)
 
     def _prepare_uneven_gather_stage(
         self,
@@ -1318,29 +1430,39 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             plan["stages"][stage_idx]["rank_numels"][group_rank] for plan in plans
         ]
         expected_local_numel = sum(expected_item_numels)
-        local_buffer = self._get_fsdp_gather_scratch_tensor(
-            ("batch_local_buffer", stage_idx, id(shard_group), batch["dtype"], batch["device"]),
-            expected_local_numel,
-            dtype=batch["dtype"],
-            device=batch["device"],
-        )
-        local_offset = 0
-        for buffer, expected_numel in zip(current_buffers, expected_item_numels):
-            if buffer.numel() != expected_numel:
+
+        if len(current_buffers) == 1:
+            local_buffer = current_buffers[0]
+            if local_buffer.numel() != expected_local_numel:
                 raise AssertionError(
                     "Batched uneven DTensor gather stage buffer size mismatch: "
-                    f"stage={stage_idx}, got {buffer.numel()}, expected {expected_numel}."
+                    f"stage={stage_idx}, got {local_buffer.numel()}, expected "
+                    f"{expected_local_numel}."
                 )
-            if expected_numel == 0:
-                continue
-            local_buffer[local_offset : local_offset + expected_numel].copy_(buffer)
-            local_offset += expected_numel
-
-        if local_offset != expected_local_numel:
-            raise AssertionError(
-                "Batched uneven DTensor gather local buffer size mismatch: "
-                f"stage={stage_idx}, packed {local_offset}, expected {expected_local_numel}."
+        else:
+            local_buffer = self._get_fsdp_gather_scratch_tensor(
+                ("batch_local_buffer", stage_idx, id(shard_group), batch["dtype"], batch["device"]),
+                expected_local_numel,
+                dtype=batch["dtype"],
+                device=batch["device"],
             )
+            local_offset = 0
+            for buffer, expected_numel in zip(current_buffers, expected_item_numels):
+                if buffer.numel() != expected_numel:
+                    raise AssertionError(
+                        "Batched uneven DTensor gather stage buffer size mismatch: "
+                        f"stage={stage_idx}, got {buffer.numel()}, expected {expected_numel}."
+                    )
+                if expected_numel == 0:
+                    continue
+                local_buffer[local_offset : local_offset + expected_numel].copy_(buffer)
+                local_offset += expected_numel
+
+            if local_offset != expected_local_numel:
+                raise AssertionError(
+                    "Batched uneven DTensor gather local buffer size mismatch: "
+                    f"stage={stage_idx}, packed {local_offset}, expected {expected_local_numel}."
+                )
 
         rank_offsets: list[list[int]] = []
         rank_total_numels: list[int] = []
@@ -1452,18 +1574,8 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         batch = pending_stage["batch"]
         plans = pending_stage["plans"]
         stage_idx = pending_stage["stage_idx"]
-        group_size = pending_stage["group_size"]
         rank_offsets = pending_stage["rank_offsets"]
-
-        if pending_stage["use_padded_all_gather"]:
-            gathered_padded_buffer = pending_stage["gathered_padded_buffer"]
-            max_rank_numel = pending_stage["max_rank_numel"]
-            rank_buffers = [
-                gathered_padded_buffer[rank * max_rank_numel : (rank + 1) * max_rank_numel]
-                for rank in range(group_size)
-            ]
-        else:
-            rank_buffers = pending_stage["group_tensors"]
+        rank_buffers = self._rank_buffers_from_pending_uneven_gather_stage(pending_stage)
 
         next_buffers = []
         for batch_item_idx, plan in enumerate(plans):
@@ -1533,15 +1645,45 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             )
         return item_indices
 
+    def _store_uneven_gather_batch_results_from_stage(
+        self,
+        items: list[tuple[torch.Tensor, torch.Tensor]],
+        results: list[torch.Tensor | None],
+        batch: dict[str, Any],
+        pending_stage: dict[str, Any],
+    ) -> list[int]:
+        item_indices = batch["item_indices"]
+        plans = batch["plans"]
+        stage_idx = pending_stage["stage_idx"]
+        rank_offsets = pending_stage["rank_offsets"]
+        rank_buffers = self._rank_buffers_from_pending_uneven_gather_stage(pending_stage)
+
+        for batch_item_idx, item_idx in enumerate(item_indices):
+            dtensor_ref, local_tensor = items[item_idx]
+            if local_tensor.numel() == 0:
+                results[item_idx] = None
+                continue
+
+            rank_buffer_offsets = [
+                rank_offsets[rank][batch_item_idx] for rank in range(pending_stage["group_size"])
+            ]
+            results[item_idx] = self._reconstruct_full_tensor_from_final_stage_buffers(
+                dtensor_ref, plans[batch_item_idx], stage_idx, rank_buffers, rank_buffer_offsets
+            )
+        return item_indices
+
     def _start_gather_full_uneven_local_tensor_batch_async(
         self, items: list[tuple[torch.Tensor, torch.Tensor]], batch: dict[str, Any]
     ) -> dict[str, Any]:
         item_indices = batch["item_indices"]
         plans = batch["plans"]
-        current_buffers = [items[item_idx][1].contiguous().view(-1) for item_idx in item_indices]
+        current_buffers = [
+            self._flatten_tensor_for_uneven_gather(items[item_idx][1]) for item_idx in item_indices
+        ]
 
         if batch["device"].type == "cuda" and len(plans[0]["stages"]) > 1:
             pending_stages = []
+            final_stage_idx = len(plans[0]["stages"]) - 1
             with torch.cuda.device(batch["device"]):
                 comm_stream = self._get_fsdp_comm_stream(batch["device"])
                 comm_stream.wait_stream(torch.cuda.current_stream())
@@ -1553,6 +1695,9 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                         pending_stage = self._issue_uneven_gather_stage(
                             stage_state, async_op=True, comm_stream=comm_stream
                         )
+                        if stage_idx == final_stage_idx:
+                            pending_stages.append(pending_stage)
+                            break
                         if not self._block_current_stream_on_uneven_gather_stage(pending_stage):
                             if stage_idx == 0:
                                 return {
@@ -1571,20 +1716,15 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             return {
                 "items": items,
                 "batch": batch,
-                "current_buffers": current_buffers,
-                "pending_stages": pending_stages,
+                "pending_stages": pending_stages[:-1],
+                "final_pending_stage": pending_stages[-1],
             }
 
         stage_state = self._prepare_uneven_gather_stage(
             current_buffers, plans, batch, 0, plans[0]["stages"][0]
         )
         pending_stage = self._start_uneven_gather_stage(stage_state, async_op=True)
-        return {
-            "items": items,
-            "batch": batch,
-            "current_buffers": current_buffers,
-            "pending_stage": pending_stage,
-        }
+        return {"items": items, "batch": batch, "pending_stage": pending_stage}
 
     def _finish_gather_full_uneven_local_tensor_batch_async(
         self, pending: dict[str, Any], results: list[torch.Tensor | None]
@@ -1592,11 +1732,20 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         items = pending["items"]
         batch = pending["batch"]
         plans = batch["plans"]
-        if "pending_stages" in pending:
+        if "final_pending_stage" in pending:
             for pending_stage in pending["pending_stages"]:
                 self._wait_uneven_gather_stage(pending_stage)
-            return self._store_uneven_gather_batch_results(
-                items, results, batch, pending["current_buffers"]
+            final_pending_stage = pending["final_pending_stage"]
+            self._wait_uneven_gather_stage(final_pending_stage)
+            return self._store_uneven_gather_batch_results_from_stage(
+                items, results, batch, final_pending_stage
+            )
+
+        final_stage_idx = len(plans[0]["stages"]) - 1
+        if final_stage_idx == 0:
+            self._wait_uneven_gather_stage(pending["pending_stage"])
+            return self._store_uneven_gather_batch_results_from_stage(
+                items, results, batch, pending["pending_stage"]
             )
 
         current_buffers = self._finish_uneven_gather_stage(pending["pending_stage"])
@@ -1606,9 +1755,14 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                 current_buffers, plans, batch, stage_idx, plans[0]["stages"][stage_idx]
             )
             pending_stage = self._start_uneven_gather_stage(stage_state, async_op=False)
+            if stage_idx == final_stage_idx:
+                self._wait_uneven_gather_stage(pending_stage)
+                return self._store_uneven_gather_batch_results_from_stage(
+                    items, results, batch, pending_stage
+                )
             current_buffers = self._finish_uneven_gather_stage(pending_stage)
 
-        return self._store_uneven_gather_batch_results(items, results, batch, current_buffers)
+        raise AssertionError("Batched uneven DTensor gather did not reach its final stage.")
 
     def _local_shard_from_full_update_like(self, dtensor_ref, full_update: torch.Tensor):
         if not hasattr(dtensor_ref._local_tensor, "__create_chunk_list__"):
@@ -1623,7 +1777,12 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             slice(offset, offset + size)
             for offset, size in zip(shard_metadata.offsets, shard_metadata.sizes)
         )
-        return full_update[slices].contiguous().to(dtype=dtensor_ref._local_tensor.dtype)
+        local_update = full_update[slices]
+        if not local_update.is_contiguous():
+            local_update = local_update.contiguous()
+        if local_update.dtype != dtensor_ref._local_tensor.dtype:
+            local_update = local_update.to(dtype=dtensor_ref._local_tensor.dtype)
+        return local_update
 
     @torch.no_grad()  # type: ignore[misc]
     def _local_muon_update(
