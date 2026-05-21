@@ -1097,7 +1097,8 @@ def pretrain(
     timestamp_after_in_job_setup = time.time()
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
+    pg_collection = initialize_megatron(
+        cfg=cfg_container,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
