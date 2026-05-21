@@ -337,6 +337,11 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
 
+    apply_dsa_kernel_fusion: bool = False
+    """If True, use fused DSA sparse-attention kernels (FlashMLA forward + cuDNN DSA backward,
+    indexer scoring, and top-K selection). Requires ``flash_mla`` and ``nvidia-cudnn-frontend``
+    with CuTe-DSL support. When False, falls back to unfused PyTorch implementations."""
+
     ####################
     # linear attention
     ####################
@@ -1441,6 +1446,35 @@ class TransformerConfig(ModelParallelConfig):
             ), "DSv4 Hybrid Attention only supports TP size 1."
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
+
+            if self.apply_dsa_kernel_fusion:
+                _flash_mla_available = True
+                try:
+                    from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+                except ImportError:
+                    _flash_mla_available = False
+
+                _cudnn_dsa_available = True
+                try:
+                    from cudnn import DSA  # noqa: F401
+                except ImportError:
+                    _cudnn_dsa_available = False
+
+                if not _flash_mla_available or not _cudnn_dsa_available:
+                    missing = []
+                    if not _flash_mla_available:
+                        missing.append(
+                            "flash_mla (install from "
+                            "https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"
+                        )
+                    if not _cudnn_dsa_available:
+                        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
+                    raise ValueError(
+                        f"apply_dsa_kernel_fusion requires fused DSA kernels, but the "
+                        f"following packages are not available: {', '.join(missing)}. "
+                        f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
+                        f"PyTorch fallback."
+                    )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling

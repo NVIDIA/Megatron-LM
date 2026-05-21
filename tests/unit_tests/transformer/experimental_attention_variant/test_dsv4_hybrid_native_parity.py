@@ -30,6 +30,7 @@ _UNFUSED_SIMILARITY_EPS = 2.3e-5
 def _native_q_rms_norm(query: torch.Tensor, eps: float) -> torch.Tensor:
     return query * torch.rsqrt(query.square().mean(-1, keepdim=True) + eps)
 
+
 _DSV4_VARIANTS = {
     "flash": {
         "hidden_size": 4096,
@@ -56,15 +57,15 @@ _DSV4_VARIANTS = {
 }
 
 _DSA_BACKENDS = [
-    pytest.param("fused", False, id="fused"),
-    pytest.param("unfused", True, id="unfused"),
+    pytest.param("fused", True, id="fused"),
+    pytest.param("unfused", False, id="unfused"),
 ]
 
 _CASE_SEQLENS = [2048, 4096, 8192]
 
 
 def _make_config(
-    variant: str, compress_ratio: int, force_unfused_dsa: bool = False
+    variant: str, compress_ratio: int, apply_dsa_kernel_fusion: bool = False
 ) -> MLATransformerConfig:
     shape = _DSV4_VARIANTS[variant]
     mcore_ratio = 0 if compress_ratio == 1 else compress_ratio
@@ -126,8 +127,8 @@ def _make_config(
         delay_wgrad_compute=False,
         tp_comm_overlap=False,
         softmax_scale=None,
+        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
     )
-    config.force_unfused_dsa = force_unfused_dsa
     return config
 
 
@@ -215,9 +216,7 @@ def _native_sparse_attn(
     kv_t = kv_full.permute(1, 0, 2)
     safe_indices = topk_indices.clamp(min=0).long()
     gather_index = safe_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-    kv_gathered = torch.gather(
-        kv_t.unsqueeze(1).expand(-1, sq, -1, -1), dim=2, index=gather_index
-    )
+    kv_gathered = torch.gather(kv_t.unsqueeze(1).expand(-1, sq, -1, -1), dim=2, index=gather_index)
 
     q = query.permute(1, 2, 0, 3).float()
     scores = torch.einsum("bnsh,bskh->bnsk", q, kv_gathered.float()) * softmax_scale
@@ -284,7 +283,9 @@ def _native_fused_sparse_indexer_loss(
 
 
 class NativeCompressor(nn.Module):
-    def __init__(self, config: MLATransformerConfig, compress_ratio: int, head_dim: int, rotate: bool):
+    def __init__(
+        self, config: MLATransformerConfig, compress_ratio: int, head_dim: int, rotate: bool
+    ):
         super().__init__()
         self.compress_ratio = compress_ratio
         self.head_dim = head_dim
@@ -292,11 +293,15 @@ class NativeCompressor(nn.Module):
         self.coff = 1 + int(self.overlap)
         self.rotate = rotate
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
-        self.rope_base = config.csa_compress_rotary_base if compress_ratio > 1 else config.rotary_base
+        self.rope_base = (
+            config.csa_compress_rotary_base if compress_ratio > 1 else config.rotary_base
+        )
 
         self.linear_wkv = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.linear_wgate = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
-        self.ape = nn.Parameter(torch.empty(compress_ratio, self.coff * head_dim, dtype=torch.float32))
+        self.ape = nn.Parameter(
+            torch.empty(compress_ratio, self.coff * head_dim, dtype=torch.float32)
+        )
         self.norm = nn.RMSNorm(head_dim, eps=config.layernorm_epsilon)
 
     def _overlap_transform(self, tensor: torch.Tensor, fill_value: float = 0) -> torch.Tensor:
@@ -354,15 +359,13 @@ class NativeCSAIndexer(nn.Module):
         self.index_topk = config.dsa_indexer_topk
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
         self.softmax_scale = self.index_head_dim**-0.5
-        self.force_unfused_dsa = config.force_unfused_dsa
+        self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
         self.rope_base = config.csa_compress_rotary_base
 
         self.linear_wq_b = nn.Linear(
             config.q_lora_rank, self.index_n_heads * self.index_head_dim, bias=False
         )
-        self.linear_weights_proj = nn.Linear(
-            config.hidden_size, self.index_n_heads, bias=False
-        )
+        self.linear_weights_proj = nn.Linear(config.hidden_size, self.index_n_heads, bias=False)
         self.compressor = NativeCompressor(
             config=config, compress_ratio=compress_ratio, head_dim=self.index_head_dim, rotate=True
         )
@@ -387,7 +390,7 @@ class NativeCSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         q, k, weights = self.forward_before_topk(x, qr)
         weights_scaled = weights.float() * self.softmax_scale
-        if not self.force_unfused_dsa:
+        if self.apply_dsa_kernel_fusion:
             weights_scaled = weights_scaled.to(weights.dtype).float()
         scores = torch.einsum("sbhd,tbd->sbht", q.float(), k.float())
         scores = torch.relu(scores) * weights_scaled.unsqueeze(-1)
@@ -398,7 +401,9 @@ class NativeCSAIndexer(nn.Module):
         valid_per_query = (
             torch.arange(1, sq + 1, device=x.device).unsqueeze(0) // self.compress_ratio
         ).clamp(max=n_compressed)
-        invalid = torch.arange(n_compressed, device=x.device).view(1, 1, -1) >= valid_per_query.unsqueeze(-1)
+        invalid = torch.arange(n_compressed, device=x.device).view(
+            1, 1, -1
+        ) >= valid_per_query.unsqueeze(-1)
         scores = scores.masked_fill(invalid.expand_as(scores), float("-inf"))
 
         topk = min(self.index_topk, n_compressed)
@@ -417,18 +422,25 @@ class NativeCompressedSparseAttention(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self.indexer_loss_coeff = config.dsa_indexer_loss_coeff
         self.indexer_use_sparse_loss = config.dsa_indexer_use_sparse_loss
-        self.force_unfused_dsa = config.force_unfused_dsa
+        self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
 
         self.attn_sink = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.compressor = (
-            NativeCompressor(config=config, compress_ratio=compress_ratio, head_dim=self.head_dim, rotate=False)
+            NativeCompressor(
+                config=config, compress_ratio=compress_ratio, head_dim=self.head_dim, rotate=False
+            )
             if compress_ratio > 1
             else None
         )
         self.indexer = NativeCSAIndexer(config, compress_ratio) if compress_ratio == 4 else None
 
     def forward(
-        self, query: torch.Tensor, key: torch.Tensor, x: torch.Tensor, qr: torch.Tensor, pg_collection
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        pg_collection,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         sq, batch_size, _, _ = query.size()
         kv = key.squeeze(-2)
@@ -450,13 +462,15 @@ class NativeCompressedSparseAttention(nn.Module):
         if self.compress_ratio > 1 and n_compressed > 0:
             offset = sq
             if self.indexer is not None:
-                q_idx, k_idx, weights_idx, index_scores, topk_compressed = self.indexer(x.detach(), qr.detach())
-                topk_compressed_for_attn = torch.where(topk_compressed >= 0, topk_compressed + offset, -1)
+                q_idx, k_idx, weights_idx, index_scores, topk_compressed = self.indexer(
+                    x.detach(), qr.detach()
+                )
+                topk_compressed_for_attn = torch.where(
+                    topk_compressed >= 0, topk_compressed + offset, -1
+                )
 
-                if self.force_unfused_dsa:
-                    key_for_loss = compressed_kv.unsqueeze(2).expand(
-                        -1, -1, self.num_heads, -1
-                    )
+                if not self.apply_dsa_kernel_fusion:
+                    key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
                     causal_mask = (
                         torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(sq, -1)
                     )
@@ -493,7 +507,7 @@ class NativeCompressedSparseAttention(nn.Module):
                 topk_compressed_for_attn = _get_compress_topk_idxs(
                     self.compress_ratio, batch_size, sq, offset, query.device
                 )
-            if self.indexer is not None and not self.force_unfused_dsa:
+            if self.indexer is not None and self.apply_dsa_kernel_fusion:
                 topk_idxs = torch.cat([topk_compressed_for_attn, window_idxs], dim=-1)
             else:
                 topk_idxs = torch.cat([window_idxs, topk_compressed_for_attn], dim=-1)
@@ -513,7 +527,9 @@ class NativeDSv4HybridAttention(nn.Module):
         self.head_dim = config.v_head_dim
         self.pos_dim = config.qk_pos_emb_head_dim
         self.nope_dim = config.v_head_dim - config.qk_pos_emb_head_dim
-        self.rope_base = config.csa_compress_rotary_base if compress_ratio > 1 else config.rotary_base
+        self.rope_base = (
+            config.csa_compress_rotary_base if compress_ratio > 1 else config.rotary_base
+        )
 
         self.linear_q_down_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.layernorm_epsilon)
@@ -527,9 +543,13 @@ class NativeDSv4HybridAttention(nn.Module):
         self.linear_o_group_proj = nn.Parameter(
             torch.empty(config.o_groups * config.o_lora_rank, group_in)
         )
-        self.linear_proj = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.linear_proj = nn.Linear(
+            config.o_groups * config.o_lora_rank, config.hidden_size, bias=False
+        )
 
-    def forward(self, hidden_states: torch.Tensor, pg_collection) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(
+        self, hidden_states: torch.Tensor, pg_collection
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         sq, batch_size, _ = hidden_states.size()
         freqs_cis = _precompute_freqs_cis(self.pos_dim, sq, hidden_states.device, self.rope_base)
 
@@ -550,7 +570,9 @@ class NativeDSv4HybridAttention(nn.Module):
 
         core_out = core_out.view(sq, batch_size, self.num_heads, self.head_dim)
         out_content, out_rotary = torch.split(core_out, [self.nope_dim, self.pos_dim], dim=-1)
-        core_out = torch.cat([out_content, _apply_rotary_emb(out_rotary, freqs_cis, inverse=True)], dim=-1)
+        core_out = torch.cat(
+            [out_content, _apply_rotary_emb(out_rotary, freqs_cis, inverse=True)], dim=-1
+        )
         core_out = core_out.view(sq, batch_size, -1)
 
         core_out = core_out.view(sq, batch_size, self.config.o_groups, -1)
@@ -572,9 +594,7 @@ def _tensor_sim(a: torch.Tensor, b: torch.Tensor) -> float:
     return (2.0 * (a * b).sum() / denom).item() if denom else 1.0
 
 
-def _assert_similarity(
-    a: torch.Tensor, b: torch.Tensor, label: str, eps: float
-):
+def _assert_similarity(a: torch.Tensor, b: torch.Tensor, label: str, eps: float):
     assert torch.isfinite(a).all()
     assert torch.isfinite(b).all()
     cosine_sim = _cosine_sim(a, b)
@@ -588,9 +608,9 @@ def _copy_real_params_to_native(real_layer: nn.Module, native_layer: nn.Module):
     for name, native_param in native_layer.named_parameters():
         assert name in real_params, f"Missing real parameter for native parameter {name}"
         real_param = real_params[name]
-        assert native_param.shape == real_param.shape, (
-            f"Shape mismatch for {name}: native={native_param.shape}, real={real_param.shape}"
-        )
+        assert (
+            native_param.shape == real_param.shape
+        ), f"Shape mismatch for {name}: native={native_param.shape}, real={real_param.shape}"
         native_param.data = real_param.data.to(
             device=native_param.device, dtype=real_param.dtype
         ).clone()
@@ -599,16 +619,12 @@ def _copy_real_params_to_native(real_layer: nn.Module, native_layer: nn.Module):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
-@pytest.mark.parametrize(("backend", "force_unfused_dsa"), _DSA_BACKENDS)
+@pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
 @pytest.mark.parametrize("variant", ["flash", "pro"])
 @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
 @pytest.mark.parametrize("seqlen", _CASE_SEQLENS)
 def test_dsv4_hybrid_attention_matches_native_reference(
-    variant: str,
-    compress_ratio: int,
-    seqlen: int,
-    backend: str,
-    force_unfused_dsa: bool,
+    variant: str, compress_ratio: int, seqlen: int, backend: str, apply_dsa_kernel_fusion: bool
 ):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
@@ -617,10 +633,10 @@ def test_dsv4_hybrid_attention_matches_native_reference(
         model_parallel_cuda_manual_seed(_SEED)
 
         config = _make_config(
-            variant, compress_ratio, force_unfused_dsa=force_unfused_dsa
+            variant, compress_ratio, apply_dsa_kernel_fusion=apply_dsa_kernel_fusion
         )
         similarity_eps = (
-            _UNFUSED_SIMILARITY_EPS if force_unfused_dsa else _FUSED_SIMILARITY_EPS
+            _UNFUSED_SIMILARITY_EPS if not apply_dsa_kernel_fusion else _FUSED_SIMILARITY_EPS
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())

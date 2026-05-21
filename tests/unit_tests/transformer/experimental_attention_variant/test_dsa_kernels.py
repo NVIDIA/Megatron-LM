@@ -110,7 +110,7 @@ class TestLocalToGlobalFlat:
             (1, 4, 5, False),  # b=1 identity case
             (2, 3, 4, False),  # basic multi-batch
             (3, 5, 4, False),  # larger batch (stresses the formula)
-            (2, 3, 6, True),   # invalid entries interleaved with valid ones
+            (2, 3, 6, True),  # invalid entries interleaved with valid ones
         ],
         ids=['b1_identity', 'basic', 'larger_b', 'with_invalid'],
     )
@@ -129,7 +129,7 @@ class TestLocalToGlobalFlat:
         permuted = local.permute(1, 0, 2).reshape(sq * b, topk)
         batch_ids = (torch.arange(sq * b) % b).unsqueeze(1)
         expected = torch.where(
-            permuted >= 0, permuted * b + batch_ids, torch.full_like(permuted, -1),
+            permuted >= 0, permuted * b + batch_ids, torch.full_like(permuted, -1)
         ).int()
         assert torch.equal(out, expected)
 
@@ -154,8 +154,8 @@ class TestBuildFlatTopkIdxs:
         "group_specs",
         [
             # Each spec is a list of (topk_i, with_invalid) for each group.
-            [(4, False)],                   # single group, all valid
-            [(2, False), (3, False)],       # two groups, all valid
+            [(4, False)],  # single group, all valid
+            [(2, False), (3, False)],  # two groups, all valid
         ],
         ids=['single_group', 'two_groups'],
     )
@@ -200,9 +200,7 @@ class TestBuildFlatTopkIdxs:
         ]
         total_topk = sum(t for t, _ in group_specs)
 
-        flat, length = build_flat_topk_idxs(
-            *groups, batch_size=b, seqlen_kv=512, compact=True,
-        )
+        flat, length = build_flat_topk_idxs(*groups, batch_size=b, seqlen_kv=512, compact=True)
 
         assert flat.shape == (sq * b, total_topk)
         assert flat.dtype == torch.int32
@@ -232,12 +230,8 @@ class TestBuildFlatTopkIdxs:
         """
         # ---- (a) dispatch via mocked compactify --------------------------
         b, sq, topk = 2, 3, 4
-        local = _make_local_idxs(b, sq, topk, with_invalid=True).to(
-            torch.int32, copy=False,
-        ).cuda()
-        compact_indices = torch.full(
-            (sq * b, topk), 99, dtype=torch.int32, device='cuda',
-        )
+        local = _make_local_idxs(b, sq, topk, with_invalid=True).to(torch.int32, copy=False).cuda()
+        compact_indices = torch.full((sq * b, topk), 99, dtype=torch.int32, device='cuda')
         topk_length = torch.full((sq * b,), 7, dtype=torch.int32, device='cuda')
 
         captured = {}
@@ -250,18 +244,16 @@ class TestBuildFlatTopkIdxs:
         fake_dsa.compactify_wrapper.side_effect = fake_compactify
         dk._DSA = fake_dsa
 
-        flat, length = build_flat_topk_idxs(
-            local, batch_size=b, seqlen_kv=512, compact=True,
-        )
+        flat, length = build_flat_topk_idxs(local, batch_size=b, seqlen_kv=512, compact=True)
         fake_dsa.compactify_wrapper.assert_called_once()
         kernel_input = captured['input']
         assert kernel_input.shape == (sq * b, topk), "(a) wrapper input shape"
         assert kernel_input.dtype == torch.int32, "(a) wrapper input dtype"
         assert kernel_input.is_cuda, "(a) wrapper input not on CUDA"
         expected_input = local_to_global_flat(local, b, seqlen_kv=512)
-        assert torch.equal(kernel_input, expected_input), (
-            "(a) wrapper input != local_to_global_flat(local)"
-        )
+        assert torch.equal(
+            kernel_input, expected_input
+        ), "(a) wrapper input != local_to_global_flat(local)"
         assert flat is compact_indices, "(a) returned flat is not the kernel output"
         assert length is topk_length, "(a) returned length is not the kernel output"
 
@@ -281,18 +273,17 @@ class TestBuildFlatTopkIdxs:
         local_b = _make_local_idxs(b2, sq2, 4, with_invalid=False) + 200
 
         flat_cpu, len_cpu = build_flat_topk_idxs(
-            local_a, local_b, batch_size=b2, seqlen_kv=512, compact=True,
+            local_a, local_b, batch_size=b2, seqlen_kv=512, compact=True
         )
         flat_cuda, len_cuda = build_flat_topk_idxs(
-            local_a.cuda(), local_b.cuda(),
-            batch_size=b2, seqlen_kv=512, compact=True,
+            local_a.cuda(), local_b.cuda(), batch_size=b2, seqlen_kv=512, compact=True
         )
-        assert torch.equal(flat_cpu, flat_cuda.cpu()), (
-            "(b) flat tensor differs between CPU fallback and cuDNN kernel"
-        )
-        assert torch.equal(len_cpu, len_cuda.cpu()), (
-            "(b) length tensor differs between CPU fallback and cuDNN kernel"
-        )
+        assert torch.equal(
+            flat_cpu, flat_cuda.cpu()
+        ), "(b) flat tensor differs between CPU fallback and cuDNN kernel"
+        assert torch.equal(
+            len_cpu, len_cuda.cpu()
+        ), "(b) length tensor differs between CPU fallback and cuDNN kernel"
 
 
 # ---------------------------------------------------------------------------
@@ -317,13 +308,13 @@ class TestKLLossFromTargetPredict:
         # ---- (a) scalar/dtype + identity: KL(p || p) == 0 -----------------
         identical = torch.softmax(torch.randn(b, sq, topk), dim=-1)
         loss_identical = _kl_loss_from_target_predict(
-            identical, identical.clone(), topk_indices, loss_coeff=1.0,
+            identical, identical.clone(), topk_indices, loss_coeff=1.0
         )
         assert loss_identical.shape == torch.Size([]), "identity: not scalar"
         assert loss_identical.dtype == torch.float32, "identity: not fp32"
-        assert torch.allclose(loss_identical, torch.tensor(0.0), atol=1e-6), (
-            f"identity: KL(p || p) != 0 (got {loss_identical.item()})"
-        )
+        assert torch.allclose(
+            loss_identical, torch.tensor(0.0), atol=1e-6
+        ), f"identity: KL(p || p) != 0 (got {loss_identical.item()})"
 
         # ---- (b) non-negativity + linearity in loss_coeff -----------------
         target = torch.softmax(torch.randn(b, sq, topk), dim=-1)
@@ -331,9 +322,9 @@ class TestKLLossFromTargetPredict:
         loss_1 = _kl_loss_from_target_predict(target, predict, topk_indices, loss_coeff=1.0)
         loss_3 = _kl_loss_from_target_predict(target, predict, topk_indices, loss_coeff=3.0)
         assert loss_1.item() >= 0.0, f"non-negativity: got {loss_1.item()}"
-        assert torch.allclose(loss_3, 3.0 * loss_1, atol=1e-5, rtol=1e-5), (
-            f"linearity: 3*loss_1 = {3*loss_1.item()} vs loss_3 = {loss_3.item()}"
-        )
+        assert torch.allclose(
+            loss_3, 3.0 * loss_1, atol=1e-5, rtol=1e-5
+        ), f"linearity: 3*loss_1 = {3*loss_1.item()} vs loss_3 = {loss_3.item()}"
 
         # ---- (c) invalid-row masking --------------------------------------
         # Construct deterministic distributions with strictly-positive per-row KL.
@@ -350,31 +341,25 @@ class TestKLLossFromTargetPredict:
         # smaller KL sum, same denominator (mean over all (B, S_q)).
         idx_partial = idx_all_valid.clone()
         idx_partial[:, 0, :] = -1
-        loss_partial = _kl_loss_from_target_predict(
-            t_inv, p_inv, idx_partial, loss_coeff=1.0,
-        )
-        assert loss_partial.item() < loss_full.item(), (
-            f"partial-invalid: {loss_partial.item()} should be < {loss_full.item()}"
-        )
+        loss_partial = _kl_loss_from_target_predict(t_inv, p_inv, idx_partial, loss_coeff=1.0)
+        assert (
+            loss_partial.item() < loss_full.item()
+        ), f"partial-invalid: {loss_partial.item()} should be < {loss_full.item()}"
 
         # All-invalid → loss exactly 0.
         idx_all_invalid = torch.full_like(idx_all_valid, -1)
-        loss_zero = _kl_loss_from_target_predict(
-            t_inv, p_inv, idx_all_invalid, loss_coeff=1.0,
-        )
+        loss_zero = _kl_loss_from_target_predict(t_inv, p_inv, idx_all_invalid, loss_coeff=1.0)
         assert loss_zero.item() == 0.0, f"all-invalid: got {loss_zero.item()}"
 
         # ---- (d) analytical formula: target = δ_0, predict = uniform(1/K) -
         # per-row KL = log(K); mean = log(K); loss = coeff * log(K).
         target_d = _peaked_dist(b, sq, topk, 'cpu', peak_idx=0)
         predict_d = torch.full((b, sq, topk), 1.0 / topk, dtype=torch.float32)
-        loss_d = _kl_loss_from_target_predict(
-            target_d, predict_d, topk_indices, loss_coeff=2.5,
-        )
+        loss_d = _kl_loss_from_target_predict(target_d, predict_d, topk_indices, loss_coeff=2.5)
         expected = 2.5 * math.log(topk)
-        assert torch.allclose(loss_d, torch.tensor(expected), rtol=1e-5, atol=1e-5), (
-            f"analytical: {loss_d.item()} vs expected {expected}"
-        )
+        assert torch.allclose(
+            loss_d, torch.tensor(expected), rtol=1e-5, atol=1e-5
+        ), f"analytical: {loss_d.item()} vs expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -384,14 +369,15 @@ class TestKLLossFromTargetPredict:
 
 _LAZY_IMPORT_CASES = [
     pytest.param(
-        'flash_mla', 'flash_mla_sparse_fwd', _ensure_flash_mla,
-        '_flash_mla_sparse_fwd', "FlashMLA is required",
+        'flash_mla',
+        'flash_mla_sparse_fwd',
+        _ensure_flash_mla,
+        '_flash_mla_sparse_fwd',
+        "FlashMLA is required",
         id='flash_mla',
     ),
     pytest.param(
-        'cudnn', 'DSA', _ensure_dsa_namespace,
-        '_DSA', "cudnn-frontend DSA",
-        id='cudnn_dsa',
+        'cudnn', 'DSA', _ensure_dsa_namespace, '_DSA', "cudnn-frontend DSA", id='cudnn_dsa'
     ),
 ]
 
@@ -406,7 +392,7 @@ class TestLazyKernelImports:
     """
 
     def test_lazy_import_raises_and_caches(
-        self, reset_lazy_kernel_state, module_name, attr_name, ensure_fn, slot_name, error_match,
+        self, reset_lazy_kernel_state, module_name, attr_name, ensure_fn, slot_name, error_match
     ):
         # ---- (a) raises informative ImportError when the module is absent --
         # Setting ``sys.modules[name] = None`` makes ``import name`` fail.
@@ -421,17 +407,17 @@ class TestLazyKernelImports:
 
         with patch.dict(sys.modules, {module_name: fake_module}):
             ensure_fn()
-            assert getattr(dk, slot_name) is sentinel, (
-                f"(b) {module_name}: ensure_fn() did not bind sentinel"
-            )
+            assert (
+                getattr(dk, slot_name) is sentinel
+            ), f"(b) {module_name}: ensure_fn() did not bind sentinel"
 
         # Second call must be a no-op — even after the sys.modules entry is gone.
         with patch.dict(sys.modules, {}, clear=False):
             sys.modules.pop(module_name, None)
             ensure_fn()
-            assert getattr(dk, slot_name) is sentinel, (
-                f"(b) {module_name}: cached sentinel was lost on 2nd call"
-            )
+            assert (
+                getattr(dk, slot_name) is sentinel
+            ), f"(b) {module_name}: cached sentinel was lost on 2nd call"
 
 
 # ---------------------------------------------------------------------------
@@ -443,8 +429,7 @@ class TestGetTopkAlignment:
     """Architecture-dependent alignment for FlashMLA top-K padding."""
 
     @pytest.mark.parametrize(
-        "sm_major, expected",
-        [(7, 128), (8, 128), (9, 128), (10, 64), (12, 64), (13, 64)],
+        "sm_major, expected", [(7, 128), (8, 128), (9, 128), (10, 64), (12, 64), (13, 64)]
     )
     def test_alignment_per_sm(self, sm_major, expected):
         """SM10x and newer use 64-byte TopK alignment; older arches use 128."""
@@ -545,35 +530,31 @@ class TestDsaFwdFlashMla:
         # ---- (a) padding + numerical pass-through ------------------------
         TopK_unpadded = 5
         expected_padded = ((TopK_unpadded + align - 1) // align) * align
-        topk_idxs = torch.arange(
-            total_sq * TopK_unpadded, dtype=torch.int32, device='cuda',
-        ).view(total_sq, TopK_unpadded)
+        topk_idxs = torch.arange(total_sq * TopK_unpadded, dtype=torch.int32, device='cuda').view(
+            total_sq, TopK_unpadded
+        )
 
         stub = _make_flash_mla_stub(d_v=D)
         dk._flash_mla_sparse_fwd = stub
 
-        out, lse, lse_indexer = _dsa_fwd_flash_mla(
-            q, kv, topk_idxs, softmax_scale=0.5, d_v=D,
-        )
+        out, lse, lse_indexer = _dsa_fwd_flash_mla(q, kv, topk_idxs, softmax_scale=0.5, d_v=D)
         assert lse_indexer is None, "(a) lse_indexer should be None when indexer_topk=0"
         assert torch.equal(out, stub.last_out), "(a) out is not pass-through"
         assert torch.equal(lse, stub.last_lse), "(a) lse is not pass-through"
 
         called_args = stub.call_args.args
         kv_3d, indices_arg = called_args[1], called_args[2]
-        assert kv_3d.shape == (8, 1, D), (
-            f"(a) KV shape {tuple(kv_3d.shape)} != (8, 1, {D})"
-        )
+        assert kv_3d.shape == (8, 1, D), f"(a) KV shape {tuple(kv_3d.shape)} != (8, 1, {D})"
         assert indices_arg.shape == (total_sq, 1, expected_padded), (
             f"(a) indices shape {tuple(indices_arg.shape)} != "
             f"({total_sq}, 1, {expected_padded})"
         )
         if expected_padded > TopK_unpadded:
-            assert torch.all(indices_arg[..., TopK_unpadded:] == -1), (
-                "(a) padded slots should be -1"
-            )
+            assert torch.all(
+                indices_arg[..., TopK_unpadded:] == -1
+            ), "(a) padded slots should be -1"
         assert torch.equal(
-            indices_arg[..., :TopK_unpadded].squeeze(1), topk_idxs,
+            indices_arg[..., :TopK_unpadded].squeeze(1), topk_idxs
         ), "(a) original entries should survive padding unchanged"
 
         # ---- (b–d) indexer_topk branches ---------------------------------
@@ -584,33 +565,27 @@ class TestDsaFwdFlashMla:
         dk._flash_mla_sparse_fwd = stub
 
         # (b) indexer_topk == 0
-        _, _, lse_idx_b = _dsa_fwd_flash_mla(
-            q, kv, topk_idxs_aligned, 0.5, indexer_topk=0,
-        )
+        _, _, lse_idx_b = _dsa_fwd_flash_mla(q, kv, topk_idxs_aligned, 0.5, indexer_topk=0)
         assert lse_idx_b is None, "(b) indexer_topk=0 must yield lse_indexer=None"
 
         # (c) 0 < indexer_topk < TopK
         _, lse_c, lse_idx_c = _dsa_fwd_flash_mla(
-            q, kv, topk_idxs_aligned, 0.5, indexer_topk=TopK // 2,
+            q, kv, topk_idxs_aligned, 0.5, indexer_topk=TopK // 2
         )
         assert lse_idx_c is not None, "(c) lse_indexer should be present"
-        assert torch.equal(lse_idx_c, stub.last_lse_indexer), (
-            "(c) lse_indexer should be kernel pass-through"
-        )
-        assert not torch.equal(lse_idx_c, lse_c), (
-            "(c) wrapper silently swapped lse_indexer for lse"
-        )
+        assert torch.equal(
+            lse_idx_c, stub.last_lse_indexer
+        ), "(c) lse_indexer should be kernel pass-through"
+        assert not torch.equal(lse_idx_c, lse_c), "(c) wrapper silently swapped lse_indexer for lse"
 
         # (d) indexer_topk == TopK -> fallback to lse.clone()
-        _, lse_d, lse_idx_d = _dsa_fwd_flash_mla(
-            q, kv, topk_idxs_aligned, 0.5, indexer_topk=TopK,
-        )
-        assert torch.equal(lse_idx_d, lse_d), (
-            "(d) lse_indexer should equal lse on TopK-cap fallback"
-        )
-        assert lse_idx_d.data_ptr() != lse_d.data_ptr(), (
-            "(d) fallback should be a clone, not an alias"
-        )
+        _, lse_d, lse_idx_d = _dsa_fwd_flash_mla(q, kv, topk_idxs_aligned, 0.5, indexer_topk=TopK)
+        assert torch.equal(
+            lse_idx_d, lse_d
+        ), "(d) lse_indexer should equal lse on TopK-cap fallback"
+        assert (
+            lse_idx_d.data_ptr() != lse_d.data_ptr()
+        ), "(d) fallback should be a clone, not an alias"
 
         # ---- (e) topk_length + indexer_topk > 0 is rejected --------------
         # Use CPU tensors here — the assert fires before any kernel call.
@@ -663,8 +638,10 @@ class TestIndexerTopk:
 
         def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
             captured['indexer_forward'] = {
-                'q_shape': q_bshd.shape, 'k_shape': k_bshd.shape,
-                'w_shape': w_bsh.shape, 'ratio': ratio,
+                'q_shape': q_bshd.shape,
+                'k_shape': k_bshd.shape,
+                'w_shape': w_bsh.shape,
+                'ratio': ratio,
             }
             return {'scores': scores}
 
@@ -672,7 +649,9 @@ class TestIndexerTopk:
             captured['filtered_topk'] = {
                 'scores_shape': scores_flat.shape,
                 'seq_lens_shape': seq_lens.shape,
-                'top_k': top_k, 'next_n': next_n, 'return_val': return_val,
+                'top_k': top_k,
+                'next_n': next_n,
+                'return_val': return_val,
             }
             n_rows = scores_flat.shape[0]
             return {'indices': torch.zeros(n_rows, top_k, dtype=torch.int32, device='cuda')}
@@ -683,7 +662,7 @@ class TestIndexerTopk:
         dk._DSA = fake_dsa
 
         topk_indices, topk_length = indexer_topk(
-            q_indexer, k_indexer, weights, topk=topk, ratio=ratio,
+            q_indexer, k_indexer, weights, topk=topk, ratio=ratio
         )
 
         assert topk_indices.shape == (b, sq, topk), "(a) topk_indices shape"
@@ -691,22 +670,29 @@ class TestIndexerTopk:
         assert topk_length.shape == (b, sq), "(a) topk_length shape"
         assert topk_length.dtype == torch.int32, "(a) topk_length dtype"
         # BSHD / BSD layouts handed to the kernels.
-        assert captured['indexer_forward']['q_shape'] == (b, sq, idx_nh, idx_hd), (
-            "(a) indexer_forward q_shape"
-        )
-        assert captured['indexer_forward']['k_shape'] == (b, sk, 1, idx_hd), (
-            "(a) indexer_forward k_shape (must be unsqueezed h_kv=1)"
-        )
-        assert captured['indexer_forward']['w_shape'] == (b, sq, idx_nh), (
-            "(a) indexer_forward w_shape"
-        )
+        assert captured['indexer_forward']['q_shape'] == (
+            b,
+            sq,
+            idx_nh,
+            idx_hd,
+        ), "(a) indexer_forward q_shape"
+        assert captured['indexer_forward']['k_shape'] == (
+            b,
+            sk,
+            1,
+            idx_hd,
+        ), "(a) indexer_forward k_shape (must be unsqueezed h_kv=1)"
+        assert captured['indexer_forward']['w_shape'] == (
+            b,
+            sq,
+            idx_nh,
+        ), "(a) indexer_forward w_shape"
         assert captured['indexer_forward']['ratio'] == ratio, "(a) ratio kwarg"
-        assert captured['filtered_topk']['scores_shape'] == (b * sq, sk), (
-            "(a) topK scores_flat shape"
-        )
-        assert captured['filtered_topk']['seq_lens_shape'] == (b * sq,), (
-            "(a) topK seq_lens shape"
-        )
+        assert captured['filtered_topk']['scores_shape'] == (
+            b * sq,
+            sk,
+        ), "(a) topK scores_flat shape"
+        assert captured['filtered_topk']['seq_lens_shape'] == (b * sq,), "(a) topK seq_lens shape"
         assert captured['filtered_topk']['top_k'] == min(topk, sk), "(a) top_k kwarg"
         assert captured['filtered_topk']['next_n'] == 1, "(a) next_n kwarg"
         assert captured['filtered_topk']['return_val'] is False, "(a) return_val kwarg"
@@ -754,11 +740,11 @@ class TestIndexerTopk:
         dk._DSA = fake_dsa_c
 
         indexer_topk(q3, k3, w3, topk=sk3, ratio=4, indexer_softmax_scale=scale)
-        expected_w = (w3.float() * scale).to(torch.bfloat16).permute(1, 0, 2).reshape(
-            b3, sq3, idx_nh3,
+        expected_w = (
+            (w3.float() * scale).to(torch.bfloat16).permute(1, 0, 2).reshape(b3, sq3, idx_nh3)
         )
         assert torch.allclose(
-            captured_w['w'].float(), expected_w.float(), atol=1e-2, rtol=1e-2,
+            captured_w['w'].float(), expected_w.float(), atol=1e-2, rtol=1e-2
         ), "(c) weights were not pre-scaled by indexer_softmax_scale"
 
 
@@ -789,9 +775,7 @@ class TestDsaSparseAttn:
         skv = 6
         TopK = _get_topk_alignment()
 
-        query = torch.randn(
-            sq, b, np_, d, dtype=torch.bfloat16, device='cuda', requires_grad=True,
-        )
+        query = torch.randn(sq, b, np_, d, dtype=torch.bfloat16, device='cuda', requires_grad=True)
         kv = torch.randn(skv, b, d, dtype=torch.bfloat16, device='cuda', requires_grad=True)
         attn_sink = torch.zeros(np_, dtype=torch.float32, device='cuda', requires_grad=True)
         topk_idxs = torch.zeros(sq * b, TopK, dtype=torch.int32, device='cuda')
@@ -804,7 +788,9 @@ class TestDsaSparseAttn:
         d_sink_kernel = torch.full((np_,), 11.0, dtype=torch.float32, device='cuda')
         fake_dsa = MagicMock()
         fake_dsa.sparse_attention_backward_wrapper.return_value = {
-            'dq': dq_kernel, 'dkv': dkv_kernel, 'd_sink': d_sink_kernel,
+            'dq': dq_kernel,
+            'dkv': dkv_kernel,
+            'd_sink': d_sink_kernel,
         }
         dk._flash_mla_sparse_fwd = flash_stub
         dk._DSA = fake_dsa
@@ -814,9 +800,7 @@ class TestDsaSparseAttn:
         # ---- (a) forward ------------------------------------------------
         assert out.shape == (sq, b, np_ * d), "(a) forward shape"
         assert out.dtype == torch.bfloat16, "(a) forward dtype"
-        expected_out = flash_stub.last_out.reshape(sq, b, np_, d).reshape(
-            sq, b, np_ * d,
-        )
+        expected_out = flash_stub.last_out.reshape(sq, b, np_, d).reshape(sq, b, np_ * d)
         assert torch.equal(out, expected_out), "(a) forward value pass-through"
 
         # ---- (b) backward -----------------------------------------------
@@ -825,11 +809,9 @@ class TestDsaSparseAttn:
         assert kv.grad is not None, "(b) kv.grad missing"
         assert attn_sink.grad is not None, "(b) attn_sink.grad missing"
         assert torch.equal(
-            query.grad, dq_kernel.reshape(sq, b, np_, d),
+            query.grad, dq_kernel.reshape(sq, b, np_, d)
         ), "(b) query.grad mis-reshaped"
-        assert torch.equal(
-            kv.grad, dkv_kernel.reshape(skv, b, d),
-        ), "(b) kv.grad mis-reshaped"
+        assert torch.equal(kv.grad, dkv_kernel.reshape(skv, b, d)), "(b) kv.grad mis-reshaped"
         assert torch.equal(attn_sink.grad, d_sink_kernel), "(b) attn_sink.grad mismatch"
         fake_dsa.sparse_attention_backward_wrapper.assert_called_once()
 
@@ -871,7 +853,7 @@ def _install_full_dsa_mock(
 
     if predict_fn is None:
         predict_fn = lambda B, S, K, dev: torch.full(
-            (B, S, K), 1.0 / max(K, 1), dtype=torch.float32, device=dev,
+            (B, S, K), 1.0 / max(K, 1), dtype=torch.float32, device=dev
         )
     if target_fn is None:
         target_fn = predict_fn
@@ -879,16 +861,14 @@ def _install_full_dsa_mock(
     fake_dsa = MagicMock(name='_DSA_full_stub')
 
     def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
-        return {
-            'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)
-        }
+        return {'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)}
 
     fake_dsa.indexer_forward_wrapper.side_effect = fake_indexer_forward
 
     def fake_filtered_topk(scores_flat, seq_lens, top_k, next_n, return_val):
         return {
             'indices': torch.zeros(
-                scores_flat.shape[0], top_k, dtype=torch.int32, device=scores_flat.device,
+                scores_flat.shape[0], top_k, dtype=torch.int32, device=scores_flat.device
             )
         }
 
@@ -916,8 +896,16 @@ def _install_full_dsa_mock(
     fake_dsa.sparse_attention_backward_wrapper.side_effect = fake_sparse_attn_backward
 
     def fake_indexer_grad_backward(
-        q_idx_bshd, w_bsh, k_idx_bsd, attn_score, index_score, topk_indices,
-        sm_scale, loss_coeff, grad_loss, block_I,
+        q_idx_bshd,
+        w_bsh,
+        k_idx_bsd,
+        attn_score,
+        index_score,
+        topk_indices,
+        sm_scale,
+        loss_coeff,
+        grad_loss,
+        block_I,
     ):
         return {
             'd_index_q': torch.full_like(q_idx_bshd, d_index_q_value),
@@ -970,34 +958,30 @@ def _install_full_dsa_mock_dense(
 
     if target_score_fn is None:
         target_score_fn = lambda B, S, K, dev: torch.full(
-            (B, S, K), 1.0 / max(K, 1), dtype=torch.float32, device=dev,
+            (B, S, K), 1.0 / max(K, 1), dtype=torch.float32, device=dev
         )
     if target_l1norm_fn is None:
-        target_l1norm_fn = lambda B, S, K, dev: torch.ones(
-            (B, S), dtype=torch.float32, device=dev,
-        )
+        target_l1norm_fn = lambda B, S, K, dev: torch.ones((B, S), dtype=torch.float32, device=dev)
     if predict_score_fn is None:
         predict_score_fn = lambda B, S, K, dev: torch.zeros(
-            (B, S, K), dtype=torch.float32, device=dev,
+            (B, S, K), dtype=torch.float32, device=dev
         )
     if predict_lse_fn is None:
         predict_lse_fn = lambda B, S, K, dev: torch.full(
-            (B, S), float(math.log(max(K, 1))), dtype=torch.float32, device=dev,
+            (B, S), float(math.log(max(K, 1))), dtype=torch.float32, device=dev
         )
 
     fake_dsa = MagicMock(name='_DSA_full_dense_stub')
 
     def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
-        return {
-            'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)
-        }
+        return {'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)}
 
     fake_dsa.indexer_forward_wrapper.side_effect = fake_indexer_forward
 
     def fake_filtered_topk(scores_flat, seq_lens, top_k, next_n, return_val):
         return {
             'indices': torch.zeros(
-                scores_flat.shape[0], top_k, dtype=torch.int32, device=scores_flat.device,
+                scores_flat.shape[0], top_k, dtype=torch.int32, device=scores_flat.device
             )
         }
 
@@ -1031,9 +1015,18 @@ def _install_full_dsa_mock_dense(
     fake_dsa.sparse_attention_backward_wrapper.side_effect = fake_sparse_attn_backward
 
     def fake_dense_indexer_grad_backward(
-        q_idx_bshd, w_bsh, k_idx_bsd,
-        attn_score, attn_l1norm, index_score, index_lse,
-        sm_scale, loss_coeff, grad_loss, ratio, block_I,
+        q_idx_bshd,
+        w_bsh,
+        k_idx_bsd,
+        attn_score,
+        attn_l1norm,
+        index_score,
+        index_lse,
+        sm_scale,
+        loss_coeff,
+        grad_loss,
+        ratio,
+        block_I,
     ):
         return {
             'd_index_q': torch.full_like(q_idx_bshd, d_index_q_value),
@@ -1041,9 +1034,7 @@ def _install_full_dsa_mock_dense(
             'd_index_k': torch.full_like(k_idx_bsd, d_index_k_value),
         }
 
-    fake_dsa.dense_indexer_backward_wrapper.side_effect = (
-        fake_dense_indexer_grad_backward
-    )
+    fake_dsa.dense_indexer_backward_wrapper.side_effect = fake_dense_indexer_grad_backward
 
     flash_stub = _make_flash_mla_stub(d_v=d)
 
@@ -1058,9 +1049,7 @@ class TestFusedIndexerSparseAttn:
     """
 
     # Common shapes shared across the forward tests.
-    SHAPES = dict(
-        sq=4, b=2, np_=2, d=512, skv=8, n_comp=4, idx_nh=4, idx_hd=64,
-    )
+    SHAPES = dict(sq=4, b=2, np_=2, d=512, skv=8, n_comp=4, idx_nh=4, idx_hd=64)
 
     def _make_inputs(self, *, requires_grad=False):
         """Build the seven differentiable + one non-differentiable inputs."""
@@ -1080,14 +1069,17 @@ class TestFusedIndexerSparseAttn:
         if requires_grad:
             attn_sink = attn_sink.detach().clone().requires_grad_(True)
         window_idxs = torch.zeros(s['b'], s['sq'], win_topk, dtype=torch.int32, device='cuda')
-        q_indexer = make(
-            s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, rg=True,
-        )
+        q_indexer = make(s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, rg=True)
         k_indexer = make(s['n_comp'], s['b'], s['idx_hd'], dtype=torch.bfloat16, rg=True)
         weights = make(s['sq'], s['b'], s['idx_nh'], dtype=torch.bfloat16, rg=True)
         return dict(
-            query=query, kv_full=kv_full, attn_sink=attn_sink, window_idxs=window_idxs,
-            q_indexer=q_indexer, k_indexer=k_indexer, weights=weights,
+            query=query,
+            kv_full=kv_full,
+            attn_sink=attn_sink,
+            window_idxs=window_idxs,
+            q_indexer=q_indexer,
+            k_indexer=k_indexer,
+            weights=weights,
         )
 
     @pytest.mark.parametrize(
@@ -1106,9 +1098,7 @@ class TestFusedIndexerSparseAttn:
         ids=['identical_dists', 'coeff_zero', 'analytical_kl', 'linearity_x2'],
     )
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_indexer_loss_formula(
-        self, loss_coeff, target_kind, expected, reset_lazy_kernel_state,
-    ):
+    def test_indexer_loss_formula(self, loss_coeff, target_kind, expected, reset_lazy_kernel_state):
         """All four loss-property cases share one fixture:
 
         * KL is zero when target == predict,
@@ -1120,32 +1110,39 @@ class TestFusedIndexerSparseAttn:
         s = self.SHAPES
         topk = 2  # = effective_topk = min(indexer_topk, n_comp); appears as K
         target_fn = (
-            _uniform_dist if target_kind == 'uniform'
+            _uniform_dist
+            if target_kind == 'uniform'
             else (lambda B, S, K, dev: _peaked_dist(B, S, K, dev, peak_idx=0))
         )
 
         inputs = self._make_inputs()
         _install_full_dsa_mock(
-            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'],
-            n_comp=s['n_comp'], idx_nh=s['idx_nh'],
-            predict_fn=_uniform_dist, target_fn=target_fn,
+            b=s['b'],
+            sq=s['sq'],
+            np_=s['np_'],
+            d=s['d'],
+            n_comp=s['n_comp'],
+            idx_nh=s['idx_nh'],
+            predict_fn=_uniform_dist,
+            target_fn=target_fn,
         )
 
         _, indexer_loss = fused_indexer_sparse_attn(
             **inputs,
-            indexer_topk=topk, ratio=4, softmax_scale=0.5, loss_coeff=loss_coeff,
-            sparse_loss=True, kv_offset=s['skv'] - s['n_comp'],
+            indexer_topk=topk,
+            ratio=4,
+            softmax_scale=0.5,
+            loss_coeff=loss_coeff,
+            sparse_loss=True,
+            kv_offset=s['skv'] - s['n_comp'],
         )
 
         assert torch.allclose(
-            indexer_loss, torch.tensor(expected, device='cuda'),
-            rtol=1e-5, atol=1e-5,
+            indexer_loss, torch.tensor(expected, device='cuda'), rtol=1e-5, atol=1e-5
         ), f"got {indexer_loss.item()}, expected {expected}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_sparse_path_fwd_output_bwd_grads_and_topk_clamp(
-        self, reset_lazy_kernel_state,
-    ):
+    def test_sparse_path_fwd_output_bwd_grads_and_topk_clamp(self, reset_lazy_kernel_state):
         """Combined coverage for the sparse-loss path's three non-numerical
         properties (assertion blocks self-label on failure):
 
@@ -1163,20 +1160,23 @@ class TestFusedIndexerSparseAttn:
         # ---- (a) forward pass-through (no grads needed) ------------------
         inputs = self._make_inputs()
         _, flash_stub_a = _install_full_dsa_mock(
-            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'],
-            n_comp=s['n_comp'], idx_nh=s['idx_nh'],
+            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
         output_a, _ = fused_indexer_sparse_attn(
             **inputs,
-            indexer_topk=2, ratio=4, softmax_scale=0.5,
-            indexer_softmax_scale=0.125, loss_coeff=0.0,
-            sparse_loss=True, kv_offset=s['skv'] - s['n_comp'],
+            indexer_topk=2,
+            ratio=4,
+            softmax_scale=0.5,
+            indexer_softmax_scale=0.125,
+            loss_coeff=0.0,
+            sparse_loss=True,
+            kv_offset=s['skv'] - s['n_comp'],
         )
         assert output_a.shape == (s['sq'], s['b'], s['np_'] * s['d']), "(a) shape"
         assert output_a.dtype == torch.bfloat16, "(a) dtype"
-        expected_a = flash_stub_a.last_out.reshape(
-            s['sq'], s['b'], s['np_'], s['d'],
-        ).reshape(s['sq'], s['b'], s['np_'] * s['d'])
+        expected_a = flash_stub_a.last_out.reshape(s['sq'], s['b'], s['np_'], s['d']).reshape(
+            s['sq'], s['b'], s['np_'] * s['d']
+        )
         assert torch.equal(output_a, expected_a), "(a) forward value pass-through"
 
         # ---- (b) backward grad propagation -------------------------------
@@ -1184,21 +1184,37 @@ class TestFusedIndexerSparseAttn:
         dk._flash_mla_sparse_fwd = None
         inputs_b = self._make_inputs(requires_grad=True)
         _install_full_dsa_mock(
-            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'],
-            n_comp=s['n_comp'], idx_nh=s['idx_nh'],
-            dq_value=7.0, dkv_value=-3.0, d_sink_value=11.0,
-            d_index_q_value=0.5, d_weights_value=-0.25, d_index_k_value=1.5,
+            b=s['b'],
+            sq=s['sq'],
+            np_=s['np_'],
+            d=s['d'],
+            n_comp=s['n_comp'],
+            idx_nh=s['idx_nh'],
+            dq_value=7.0,
+            dkv_value=-3.0,
+            d_sink_value=11.0,
+            d_index_q_value=0.5,
+            d_weights_value=-0.25,
+            d_index_k_value=1.5,
         )
         output_b, indexer_loss_b = fused_indexer_sparse_attn(
             **inputs_b,
-            indexer_topk=2, ratio=4, softmax_scale=0.5,
-            indexer_softmax_scale=0.125, loss_coeff=1.0,
-            sparse_loss=True, kv_offset=s['skv'] - s['n_comp'],
+            indexer_topk=2,
+            ratio=4,
+            softmax_scale=0.5,
+            indexer_softmax_scale=0.125,
+            loss_coeff=1.0,
+            sparse_loss=True,
+            kv_offset=s['skv'] - s['n_comp'],
         )
         (output_b.sum() + indexer_loss_b).backward()
         for name, value in [
-            ('query', 7.0), ('kv_full', -3.0), ('attn_sink', 11.0),
-            ('q_indexer', 0.5), ('k_indexer', 1.5), ('weights', -0.25),
+            ('query', 7.0),
+            ('kv_full', -3.0),
+            ('attn_sink', 11.0),
+            ('q_indexer', 0.5),
+            ('k_indexer', 1.5),
+            ('weights', -0.25),
         ]:
             grad = inputs_b[name].grad
             assert grad is not None, f"(b) {name}: missing grad"
@@ -1212,19 +1228,21 @@ class TestFusedIndexerSparseAttn:
         dk._flash_mla_sparse_fwd = None
         inputs_c = self._make_inputs()
         fake_dsa_c, _ = _install_full_dsa_mock(
-            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'],
-            n_comp=s['n_comp'], idx_nh=s['idx_nh'],
+            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
         fused_indexer_sparse_attn(
             **inputs_c,
             indexer_topk=999,  # > n_comp
-            ratio=4, softmax_scale=0.5, loss_coeff=0.0,
-            sparse_loss=True, kv_offset=s['skv'] - s['n_comp'],
+            ratio=4,
+            softmax_scale=0.5,
+            loss_coeff=0.0,
+            sparse_loss=True,
+            kv_offset=s['skv'] - s['n_comp'],
         )
         topk_call = fake_dsa_c.indexer_top_k_wrapper.call_args
-        assert topk_call.kwargs['top_k'] == s['n_comp'], (
-            f"(c) top_k clamp: got {topk_call.kwargs['top_k']}, expected {s['n_comp']}"
-        )
+        assert (
+            topk_call.kwargs['top_k'] == s['n_comp']
+        ), f"(c) top_k clamp: got {topk_call.kwargs['top_k']}, expected {s['n_comp']}"
 
 
 # ---------------------------------------------------------------------------
@@ -1239,9 +1257,7 @@ class TestDenseFusedIndexerSparseAttn:
     :class:`FusedIndexerSparseAttnFunc`.
     """
 
-    SHAPES = dict(
-        sq=4, b=2, np_=2, d=512, skv=8, n_comp=4, idx_nh=4, idx_hd=64,
-    )
+    SHAPES = dict(sq=4, b=2, np_=2, d=512, skv=8, n_comp=4, idx_nh=4, idx_hd=64)
 
     def _make_inputs(self, *, requires_grad=False):
         s = self.SHAPES
@@ -1260,14 +1276,17 @@ class TestDenseFusedIndexerSparseAttn:
         if requires_grad:
             attn_sink = attn_sink.detach().clone().requires_grad_(True)
         window_idxs = torch.zeros(s['b'], s['sq'], win_topk, dtype=torch.int32, device='cuda')
-        q_indexer = make(
-            s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, rg=True,
-        )
+        q_indexer = make(s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, rg=True)
         k_indexer = make(s['n_comp'], s['b'], s['idx_hd'], dtype=torch.bfloat16, rg=True)
         weights = make(s['sq'], s['b'], s['idx_nh'], dtype=torch.bfloat16, rg=True)
         return dict(
-            query=query, kv_full=kv_full, attn_sink=attn_sink, window_idxs=window_idxs,
-            q_indexer=q_indexer, k_indexer=k_indexer, weights=weights,
+            query=query,
+            kv_full=kv_full,
+            attn_sink=attn_sink,
+            window_idxs=window_idxs,
+            q_indexer=q_indexer,
+            k_indexer=k_indexer,
+            weights=weights,
         )
 
     @pytest.mark.parametrize(
@@ -1287,7 +1306,7 @@ class TestDenseFusedIndexerSparseAttn:
     )
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dense_indexer_loss_formula(
-        self, loss_coeff, target_kind, expected, reset_lazy_kernel_state,
+        self, loss_coeff, target_kind, expected, reset_lazy_kernel_state
     ):
         """``_kl_loss_from_dense_scores`` is the dense analogue of
         ``_kl_loss_from_target_predict``. Verifies the same four KL
@@ -1306,22 +1325,25 @@ class TestDenseFusedIndexerSparseAttn:
 
         if target_kind == 'uniform':
             target_score_fn = lambda B, S, K, dev: torch.full(
-                (B, S, K), 1.0 / max(K, 1), dtype=torch.float32, device=dev,
+                (B, S, K), 1.0 / max(K, 1), dtype=torch.float32, device=dev
             )
         else:
+
             def target_score_fn(B, S, K, dev):
                 t = torch.zeros((B, S, K), dtype=torch.float32, device=dev)
                 t[..., 0] = 1.0
                 return t
 
-        target_l1norm_fn = lambda B, S, K, dev: torch.ones(
-            (B, S), dtype=torch.float32, device=dev,
-        )
+        target_l1norm_fn = lambda B, S, K, dev: torch.ones((B, S), dtype=torch.float32, device=dev)
 
         inputs = self._make_inputs()
         _install_full_dsa_mock_dense(
-            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'],
-            n_comp=s['n_comp'], idx_nh=s['idx_nh'],
+            b=s['b'],
+            sq=s['sq'],
+            np_=s['np_'],
+            d=s['d'],
+            n_comp=s['n_comp'],
+            idx_nh=s['idx_nh'],
             target_score_fn=target_score_fn,
             target_l1norm_fn=target_l1norm_fn,
             # predict_score_fn / predict_lse_fn defaults give uniform predict.
@@ -1329,14 +1351,16 @@ class TestDenseFusedIndexerSparseAttn:
 
         _, indexer_loss = fused_indexer_sparse_attn(
             **inputs,
-            indexer_topk=2, ratio=4, softmax_scale=0.5,
+            indexer_topk=2,
+            ratio=4,
+            softmax_scale=0.5,
             loss_coeff=loss_coeff,
-            sparse_loss=False, kv_offset=s['skv'] - s['n_comp'],
+            sparse_loss=False,
+            kv_offset=s['skv'] - s['n_comp'],
         )
 
         assert torch.allclose(
-            indexer_loss, torch.tensor(expected, device='cuda'),
-            rtol=1e-5, atol=1e-5,
+            indexer_loss, torch.tensor(expected, device='cuda'), rtol=1e-5, atol=1e-5
         ), f"got {indexer_loss.item()}, expected {expected}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1362,14 +1386,17 @@ class TestDenseFusedIndexerSparseAttn:
         # ---- (a) forward kernel selection + arg shapes -------------------
         inputs_a = self._make_inputs()
         fake_dsa_a, _ = _install_full_dsa_mock_dense(
-            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'],
-            n_comp=s['n_comp'], idx_nh=s['idx_nh'],
+            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
         fused_indexer_sparse_attn(
             **inputs_a,
-            indexer_topk=2, ratio=ratio, softmax_scale=softmax_scale,
-            indexer_softmax_scale=idx_scale, loss_coeff=loss_coeff,
-            sparse_loss=False, kv_offset=s['skv'] - s['n_comp'],
+            indexer_topk=2,
+            ratio=ratio,
+            softmax_scale=softmax_scale,
+            indexer_softmax_scale=idx_scale,
+            loss_coeff=loss_coeff,
+            sparse_loss=False,
+            kv_offset=s['skv'] - s['n_comp'],
         )
         fake_dsa_a.dense_indexer_score_recompute_wrapper.assert_called_once()
         fake_dsa_a.dense_attn_score_recompute_wrapper.assert_called_once()
@@ -1378,35 +1405,38 @@ class TestDenseFusedIndexerSparseAttn:
 
         idx_call = fake_dsa_a.dense_indexer_score_recompute_wrapper.call_args
         q_arg, k_arg, w_arg = idx_call.args
-        assert q_arg.shape == (s['b'], s['sq'], s['idx_nh'], s['idx_hd']), (
-            "(a) dense indexer score: q shape"
-        )
+        assert q_arg.shape == (
+            s['b'],
+            s['sq'],
+            s['idx_nh'],
+            s['idx_hd'],
+        ), "(a) dense indexer score: q shape"
         # K is unsqueezed to 4-D (B, S_k, H_kv=1, D) for the dense forward.
-        assert k_arg.shape == (s['b'], s['n_comp'], 1, s['idx_hd']), (
-            "(a) dense indexer score: k shape (must be unsqueezed h_kv=1)"
-        )
-        assert w_arg.shape == (s['b'], s['sq'], s['idx_nh']), (
-            "(a) dense indexer score: w shape"
-        )
+        assert k_arg.shape == (
+            s['b'],
+            s['n_comp'],
+            1,
+            s['idx_hd'],
+        ), "(a) dense indexer score: k shape (must be unsqueezed h_kv=1)"
+        assert w_arg.shape == (s['b'], s['sq'], s['idx_nh']), "(a) dense indexer score: w shape"
         assert idx_call.kwargs['qhead_per_kv_head'] == s['idx_nh']
         assert idx_call.kwargs['ratio'] == ratio
         # ``indexer_softmax_scale`` forwarded to the kernel; weights-scaling
         # trick handled separately in ``_sbhd_to_bshd_indexer_inputs``.
-        assert idx_call.kwargs['sm_scale'] == idx_scale, (
-            "(a) dense indexer score: sm_scale forwarded"
-        )
+        assert (
+            idx_call.kwargs['sm_scale'] == idx_scale
+        ), "(a) dense indexer score: sm_scale forwarded"
 
         attn_call = fake_dsa_a.dense_attn_score_recompute_wrapper.call_args
         q_attn, k_attn, lse_arg, sm_arg = attn_call.args
-        assert q_attn.shape == (s['b'], s['sq'], s['np_'], s['d']), (
-            "(a) dense attn score: q shape"
-        )
-        assert k_attn.shape == (s['b'], s['n_comp'], 1, s['d']), (
-            "(a) dense attn score: k shape (h_kv=1)"
-        )
-        assert lse_arg.shape == (s['b'], s['sq'], s['np_']), (
-            "(a) dense attn score: lse shape"
-        )
+        assert q_attn.shape == (s['b'], s['sq'], s['np_'], s['d']), "(a) dense attn score: q shape"
+        assert k_attn.shape == (
+            s['b'],
+            s['n_comp'],
+            1,
+            s['d'],
+        ), "(a) dense attn score: k shape (h_kv=1)"
+        assert lse_arg.shape == (s['b'], s['sq'], s['np_']), "(a) dense attn score: lse shape"
         assert sm_arg == softmax_scale, "(a) dense attn score: positional softmax_scale"
         assert attn_call.kwargs['qhead_per_kv_head'] == s['np_']
         assert attn_call.kwargs['ratio'] == ratio
@@ -1416,16 +1446,28 @@ class TestDenseFusedIndexerSparseAttn:
         dk._flash_mla_sparse_fwd = None
         inputs_b = self._make_inputs(requires_grad=True)
         fake_dsa_b, _ = _install_full_dsa_mock_dense(
-            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'],
-            n_comp=s['n_comp'], idx_nh=s['idx_nh'],
-            dq_value=7.0, dkv_value=-3.0, d_sink_value=11.0,
-            d_index_q_value=0.5, d_weights_value=-0.25, d_index_k_value=1.5,
+            b=s['b'],
+            sq=s['sq'],
+            np_=s['np_'],
+            d=s['d'],
+            n_comp=s['n_comp'],
+            idx_nh=s['idx_nh'],
+            dq_value=7.0,
+            dkv_value=-3.0,
+            d_sink_value=11.0,
+            d_index_q_value=0.5,
+            d_weights_value=-0.25,
+            d_index_k_value=1.5,
         )
         output, indexer_loss = fused_indexer_sparse_attn(
             **inputs_b,
-            indexer_topk=2, ratio=ratio, softmax_scale=softmax_scale,
-            indexer_softmax_scale=idx_scale, loss_coeff=loss_coeff,
-            sparse_loss=False, kv_offset=s['skv'] - s['n_comp'],
+            indexer_topk=2,
+            ratio=ratio,
+            softmax_scale=softmax_scale,
+            indexer_softmax_scale=idx_scale,
+            loss_coeff=loss_coeff,
+            sparse_loss=False,
+            kv_offset=s['skv'] - s['n_comp'],
         )
         (output.sum() + indexer_loss).backward()
 
@@ -1437,14 +1479,18 @@ class TestDenseFusedIndexerSparseAttn:
         assert ig_call.kwargs['loss_coeff'] == loss_coeff, "(b) loss_coeff not threaded"
 
         for name, value in [
-            ('query', 7.0), ('kv_full', -3.0), ('attn_sink', 11.0),
-            ('q_indexer', 0.5), ('k_indexer', 1.5), ('weights', -0.25),
+            ('query', 7.0),
+            ('kv_full', -3.0),
+            ('attn_sink', 11.0),
+            ('q_indexer', 0.5),
+            ('k_indexer', 1.5),
+            ('weights', -0.25),
         ]:
             grad = inputs_b[name].grad
             assert grad is not None, f"(b) {name}: missing grad"
-            assert torch.equal(grad, torch.full_like(inputs_b[name], value)), (
-                f"(b) {name}: grad does not equal full({value})"
-            )
+            assert torch.equal(
+                grad, torch.full_like(inputs_b[name], value)
+            ), f"(b) {name}: grad does not equal full({value})"
 
 
 # ---------------------------------------------------------------------------
@@ -1506,9 +1552,9 @@ def _ratio_causal_valid_mask(sq: int, sk: int, ratio: int, device) -> torch.Tens
 
 
 def _ref_indexer_full_score(
-    q_bshd_fp32: torch.Tensor,   # (B, Sq, H, D)
-    k_bsd_fp32: torch.Tensor,    # (B, Sk, D)  — MQA
-    w_bsh_fp32: torch.Tensor,    # (B, Sq, H)
+    q_bshd_fp32: torch.Tensor,  # (B, Sq, H, D)
+    k_bsd_fp32: torch.Tensor,  # (B, Sk, D)  — MQA
+    w_bsh_fp32: torch.Tensor,  # (B, Sq, H)
     sm_scale: float,
     ratio: int,
 ) -> torch.Tensor:
@@ -1528,9 +1574,9 @@ def _ref_indexer_full_score(
 
 
 def _ref_attn_full_score(
-    q_bshd_fp32: torch.Tensor,   # (B, Sq, H, D)
-    k_bsd_fp32: torch.Tensor,    # (B, Sk, D)  — MQA
-    lse_bshq_fp32: torch.Tensor, # (B, Sq, H)
+    q_bshd_fp32: torch.Tensor,  # (B, Sq, H, D)
+    k_bsd_fp32: torch.Tensor,  # (B, Sk, D)  — MQA
+    lse_bshq_fp32: torch.Tensor,  # (B, Sq, H)
     softmax_scale: float,
     ratio: int,
 ) -> torch.Tensor:
@@ -1549,9 +1595,7 @@ def _ref_attn_full_score(
     return torch.where(valid, s, torch.zeros_like(s))
 
 
-def _ref_indexer_predict_sparse(
-    q_bshd_fp32, k_bsd_fp32, w_bsh_fp32, topk_indices, sm_scale,
-):
+def _ref_indexer_predict_sparse(q_bshd_fp32, k_bsd_fp32, w_bsh_fp32, topk_indices, sm_scale):
     """Reference for ``sparse_indexer_score_recompute_wrapper.predict``.
 
     Compute the full-KV indexer score, gather ``topk_indices``, softmax
@@ -1567,9 +1611,7 @@ def _ref_indexer_predict_sparse(
     return torch.softmax(s_topk, dim=-1)
 
 
-def _ref_attn_target_sparse(
-    q_bshd_fp32, k_bsd_fp32, lse_bsh_fp32, topk_indices, softmax_scale,
-):
+def _ref_attn_target_sparse(q_bshd_fp32, k_bsd_fp32, lse_bsh_fp32, topk_indices, softmax_scale):
     """Reference for ``sparse_attn_score_recompute_wrapper.target``.
 
     Per-head ``exp(QK*scale - LSE)``, sum over heads, gather topK,
@@ -1588,8 +1630,12 @@ def _ref_attn_target_sparse(
 
 
 def _ref_dense_indexer_loss(
-    q_indexer_bshd_fp32, k_indexer_bsd_fp32, w_bsh_fp32,
-    q_attn_bshd_fp32, k_attn_bsd_fp32, lse_bshq_fp32,
+    q_indexer_bshd_fp32,
+    k_indexer_bsd_fp32,
+    w_bsh_fp32,
+    q_attn_bshd_fp32,
+    k_attn_bsd_fp32,
+    lse_bshq_fp32,
     indexer_softmax_scale: float,
     attn_softmax_scale: float,
     ratio: int,
@@ -1601,17 +1647,15 @@ def _ref_dense_indexer_loss(
     eps = torch.finfo(torch.float32).tiny
     # Per-(b,q,k) raw scores via the same formulas the kernels use.
     attn_scores = _ref_attn_full_score(
-        q_attn_bshd_fp32, k_attn_bsd_fp32, lse_bshq_fp32,
-        attn_softmax_scale, ratio,
+        q_attn_bshd_fp32, k_attn_bsd_fp32, lse_bshq_fp32, attn_softmax_scale, ratio
     )  # (B, Sq, Sk) head-summed, ratio-masked, zeros at masked positions.
     index_scores = _ref_indexer_full_score(
-        q_indexer_bshd_fp32, k_indexer_bsd_fp32, w_bsh_fp32,
-        indexer_softmax_scale, ratio,
+        q_indexer_bshd_fp32, k_indexer_bsd_fp32, w_bsh_fp32, indexer_softmax_scale, ratio
     )  # (B, Sq, Sk) ReLU·W, ratio-masked, -inf at masked positions.
 
     # L1-norm denom for target; LSE for predict.
-    attn_denom = attn_scores.sum(dim=-1)                       # (B, Sq)
-    index_lse = torch.logsumexp(index_scores, dim=-1)          # (B, Sq), -inf for fully-masked rows
+    attn_denom = attn_scores.sum(dim=-1)  # (B, Sq)
+    index_lse = torch.logsumexp(index_scores, dim=-1)  # (B, Sq), -inf for fully-masked rows
 
     row_valid = (attn_denom > eps) & torch.isfinite(index_lse)
 
@@ -1628,24 +1672,20 @@ def _ref_dense_indexer_loss(
     # positions) so their KL contribution should be 0; explicitly mask.
     position_valid = torch.isfinite(index_scores)
     log_predict = torch.where(
-        position_valid,
-        index_scores - safe_lse.unsqueeze(-1),
-        torch.zeros_like(index_scores),
+        position_valid, index_scores - safe_lse.unsqueeze(-1), torch.zeros_like(index_scores)
     )
     contributions = target_clamped * (torch.log(target_clamped) - log_predict)
-    contributions = torch.where(
-        position_valid, contributions, torch.zeros_like(contributions),
-    )
+    contributions = torch.where(position_valid, contributions, torch.zeros_like(contributions))
     kl_per_row = contributions.sum(dim=-1)
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
     return loss_coeff * kl_per_row.mean()
 
 
 def _ref_sparse_attn_forward(
-    q_flat_bf16: torch.Tensor,           # (total_Sq, H, D)
-    kv_flat_bf16: torch.Tensor,          # (total_Skv, D) — K=V, MQA
-    attn_sink_fp32: torch.Tensor,        # (H,)
-    topk_idxs: torch.Tensor,             # (total_Sq, topk) int32, global
+    q_flat_bf16: torch.Tensor,  # (total_Sq, H, D)
+    kv_flat_bf16: torch.Tensor,  # (total_Skv, D) — K=V, MQA
+    attn_sink_fp32: torch.Tensor,  # (H,)
+    topk_idxs: torch.Tensor,  # (total_Sq, topk) int32, global
     softmax_scale: float,
     d_v: int,
 ):
@@ -1671,9 +1711,7 @@ def _ref_sparse_attn_forward(
     k_gathered = kv_fp32[safe]  # (total_Sq, topk, D)
 
     qk = torch.einsum('ihd,ikd->ihk', q_fp32, k_gathered) * softmax_scale  # (Sq, H, topk)
-    qk = torch.where(
-        valid.unsqueeze(1).expand(-1, H, -1), qk, torch.full_like(qk, float('-inf')),
-    )
+    qk = torch.where(valid.unsqueeze(1).expand(-1, H, -1), qk, torch.full_like(qk, float('-inf')))
     sink = attn_sink_fp32.view(1, H, 1).expand(total_Sq, H, 1)  # logit
     logits = torch.cat([qk, sink], dim=-1)  # (Sq, H, topk + 1)
     probs = torch.softmax(logits, dim=-1)  # numerically stable
@@ -1700,14 +1738,20 @@ def _ref_sparse_attn_forward(
 # hits. ``ratio=1`` (standard upper-triangular causal) keeps the math simple
 # and ensures every row has at least one valid KV position.
 _REAL_SHAPES_SPARSE = dict(
-    b=2, sq=128, sk=128, n_comp=128,
-    np_=32, d=512,
-    idx_nh=32, idx_hd=128,
+    b=2,
+    sq=128,
+    sk=128,
+    n_comp=128,
+    np_=32,
+    d=512,
+    idx_nh=32,
+    idx_hd=128,
     # topk = lcm(64, 128) = 128 satisfies SparseScoreRecomputeSm100's
     # `topk % n_block_size == 0` (64 for score_type=attention, 128 for indexer).
-    topk=128, ratio=1,
-    softmax_scale=512 ** -0.5,
-    indexer_softmax_scale=128 ** -0.5,
+    topk=128,
+    ratio=1,
+    softmax_scale=512**-0.5,
+    indexer_softmax_scale=128**-0.5,
 )
 
 
@@ -1732,12 +1776,10 @@ def _build_real_score_inputs(s, *, with_lse: bool = True, with_topk: bool = True
     if with_lse:
         # LSE = logsumexp(QK*scale, dim=Sk) with the kernel's ratio mask.
         # Real LSE input avoids exp(-inf - finite) underflow during reference.
-        qk = torch.einsum(
-            'bqhd,bkd->bqhk', q_attn.float(), k_attn.float(),
-        ) * s['softmax_scale']
-        valid = _ratio_causal_valid_mask(
-            s['sq'], s['sk'], s['ratio'], qk.device,
-        ).view(1, s['sq'], 1, s['sk'])
+        qk = torch.einsum('bqhd,bkd->bqhk', q_attn.float(), k_attn.float()) * s['softmax_scale']
+        valid = _ratio_causal_valid_mask(s['sq'], s['sk'], s['ratio'], qk.device).view(
+            1, s['sq'], 1, s['sk']
+        )
         qk_masked = torch.where(valid, qk, torch.full_like(qk, float('-inf')))
         out['lse'] = torch.logsumexp(qk_masked, dim=-1).clamp(min=-1e30).contiguous()
 
@@ -1746,9 +1788,7 @@ def _build_real_score_inputs(s, *, with_lse: bool = True, with_topk: bool = True
         # interleaved to exercise the invalid-slot path.
         topk = s['topk']
         torch.manual_seed(123)
-        idxs = torch.randint(
-            0, s['sk'], (s['b'], s['sq'], topk), dtype=torch.int32, device=dev,
-        )
+        idxs = torch.randint(0, s['sk'], (s['b'], s['sq'], topk), dtype=torch.int32, device=dev)
         # Mark a few slots invalid (-1) to test the topk_indices < 0 path.
         invalid = torch.rand(s['b'], s['sq'], topk, device=dev) < 0.1
         idxs = torch.where(invalid, torch.full_like(idxs, -1), idxs)
@@ -1768,12 +1808,7 @@ class TestRealKernelScoreHelpers:
     # call + ref + assertion; it returns nothing on success.
     @pytest.mark.parametrize(
         "case",
-        [
-            'sparse_indexer_predict',
-            'sparse_attn_target',
-            'dense_indexer_score',
-            'dense_attn_score',
-        ],
+        ['sparse_indexer_predict', 'sparse_attn_target', 'dense_indexer_score', 'dense_attn_score'],
     )
     def test_real_score_helper(self, case, reset_lazy_kernel_state):
         # SM gate per case: dense kernels are SM100-only, sparse are SM90+.
@@ -1796,19 +1831,16 @@ class TestRealKernelScoreHelpers:
             scale = s['indexer_softmax_scale']
             w_scaled = (x['w'].float() * scale).to(x['w'].dtype)
             out = _dk._compute_indexer_predict(
-                x['q_idx'], x['k_idx'], w_scaled, x['topk'],
-                qhead_per_kv_head=s['idx_nh'],
+                x['q_idx'], x['k_idx'], w_scaled, x['topk'], qhead_per_kv_head=s['idx_nh']
             )
             ref = _ref_indexer_predict_sparse(
-                x['q_idx'].float(), x['k_idx'].float(), w_scaled.float(),
-                x['topk'], sm_scale=1.0,
+                x['q_idx'].float(), x['k_idx'].float(), w_scaled.float(), x['topk'], sm_scale=1.0
             )
             # Softmax outputs in [0, 1]; bf16 element-wise noise can break
             # absolute tolerance, so compare directions via cosine similarity.
             assert out.shape == ref.shape == (s['b'], s['sq'], s['topk'])
             cos = torch.nn.functional.cosine_similarity(
-                out.flatten().unsqueeze(0).float(),
-                ref.flatten().unsqueeze(0).float(),
+                out.flatten().unsqueeze(0).float(), ref.flatten().unsqueeze(0).float()
             ).item()
             assert cos > 0.99, (
                 f"{case}: cos sim = {cos:.4f}, "
@@ -1817,18 +1849,23 @@ class TestRealKernelScoreHelpers:
 
         elif case == 'sparse_attn_target':
             out = _dk._compute_attn_target(
-                x['q_attn'], x['k_attn'], x['lse'], x['topk'],
+                x['q_attn'],
+                x['k_attn'],
+                x['lse'],
+                x['topk'],
                 softmax_scale=s['softmax_scale'],
                 qhead_per_kv_head=s['np_'],
             )
             ref = _ref_attn_target_sparse(
-                x['q_attn'].float(), x['k_attn'].float(), x['lse'],
-                x['topk'], softmax_scale=s['softmax_scale'],
+                x['q_attn'].float(),
+                x['k_attn'].float(),
+                x['lse'],
+                x['topk'],
+                softmax_scale=s['softmax_scale'],
             )
             assert out.shape == ref.shape == (s['b'], s['sq'], s['topk'])
             cos = torch.nn.functional.cosine_similarity(
-                out.flatten().unsqueeze(0).float(),
-                ref.flatten().unsqueeze(0).float(),
+                out.flatten().unsqueeze(0).float(), ref.flatten().unsqueeze(0).float()
             ).item()
             assert cos > 0.99, (
                 f"{case}: cos sim = {cos:.4f}, "
@@ -1837,58 +1874,69 @@ class TestRealKernelScoreHelpers:
 
         elif case == 'dense_indexer_score':
             out, denom = _dk._compute_dense_indexer_score(
-                x['q_idx'], x['k_idx'].unsqueeze(2), x['w'],
+                x['q_idx'],
+                x['k_idx'].unsqueeze(2),
+                x['w'],
                 qhead_per_kv_head=s['idx_nh'],
                 indexer_softmax_scale=s['indexer_softmax_scale'],
                 ratio=s['ratio'],
             )
             ref_out = _ref_indexer_full_score(
-                x['q_idx'].float(), x['k_idx'].float(), x['w'].float(),
-                sm_scale=s['indexer_softmax_scale'], ratio=s['ratio'],
+                x['q_idx'].float(),
+                x['k_idx'].float(),
+                x['w'].float(),
+                sm_scale=s['indexer_softmax_scale'],
+                ratio=s['ratio'],
             )
             ref_denom = torch.logsumexp(ref_out, dim=-1)
             assert out.shape == ref_out.shape == (s['b'], s['sq'], s['sk'])
             assert denom.shape == ref_denom.shape == (s['b'], s['sq'])
             # Raw fp32 score sums: relative tolerance dominates. Compare
             # only valid positions (masked = -inf in both, NaN under sub).
-            valid = _ratio_causal_valid_mask(
-                s['sq'], s['sk'], s['ratio'], out.device,
-            ).unsqueeze(0).expand_as(out)
+            valid = (
+                _ratio_causal_valid_mask(s['sq'], s['sk'], s['ratio'], out.device)
+                .unsqueeze(0)
+                .expand_as(out)
+            )
             diff = torch.where(valid, (out - ref_out).abs(), torch.zeros_like(out))
             scale = ref_out.where(valid, torch.zeros_like(ref_out)).abs().max().item()
-            assert diff.max().item() <= max(5e-2, 5e-2 * scale), (
-                f"{case}: max abs diff = {diff.max().item():.3e}, scale = {scale:.3e}"
-            )
+            assert diff.max().item() <= max(
+                5e-2, 5e-2 * scale
+            ), f"{case}: max abs diff = {diff.max().item():.3e}, scale = {scale:.3e}"
             row_valid = torch.isfinite(ref_denom)
             assert torch.allclose(
-                denom[row_valid], ref_denom[row_valid], atol=5e-3, rtol=5e-2,
+                denom[row_valid], ref_denom[row_valid], atol=5e-3, rtol=5e-2
             ), f"{case}: LSE max abs diff = {(denom - ref_denom)[row_valid].abs().max().item():.3e}"
 
         elif case == 'dense_attn_score':
             out, denom = _dk._compute_dense_attn_score(
-                x['q_attn'], x['k_attn'].unsqueeze(2), x['lse'],
+                x['q_attn'],
+                x['k_attn'].unsqueeze(2),
+                x['lse'],
                 qhead_per_kv_head=s['np_'],
                 softmax_scale=s['softmax_scale'],
                 ratio=s['ratio'],
             )
             ref_out = _ref_attn_full_score(
-                x['q_attn'].float(), x['k_attn'].float(), x['lse'],
-                softmax_scale=s['softmax_scale'], ratio=s['ratio'],
+                x['q_attn'].float(),
+                x['k_attn'].float(),
+                x['lse'],
+                softmax_scale=s['softmax_scale'],
+                ratio=s['ratio'],
             )
             ref_denom = ref_out.sum(dim=-1)
             assert out.shape == ref_out.shape == (s['b'], s['sq'], s['sk'])
             assert denom.shape == ref_denom.shape == (s['b'], s['sq'])
-            valid = _ratio_causal_valid_mask(
-                s['sq'], s['sk'], s['ratio'], out.device,
-            ).unsqueeze(0).expand_as(out)
+            valid = (
+                _ratio_causal_valid_mask(s['sq'], s['sk'], s['ratio'], out.device)
+                .unsqueeze(0)
+                .expand_as(out)
+            )
             diff = torch.where(valid, (out - ref_out).abs(), torch.zeros_like(out))
             # exp(QK*scale - LSE) outputs in (0, ~1]: absolute dominates.
-            assert diff.max().item() <= 5e-3, (
-                f"{case}: max abs diff = {diff.max().item():.3e}"
-            )
+            assert diff.max().item() <= 5e-3, f"{case}: max abs diff = {diff.max().item():.3e}"
             assert torch.allclose(denom, ref_denom, atol=5e-3, rtol=5e-2), (
-                f"{case}: denom max abs diff = "
-                f"{(denom - ref_denom).abs().max().item():.3e}"
+                f"{case}: denom max abs diff = " f"{(denom - ref_denom).abs().max().item():.3e}"
             )
 
         else:
@@ -1920,24 +1968,32 @@ class TestRealKernelKLLossDense:
         loss_coeff = 0.5
 
         index_score, index_lse = _compute_dense_indexer_score(
-            x['q_idx'], x['k_idx'].unsqueeze(2), x['w'],
+            x['q_idx'],
+            x['k_idx'].unsqueeze(2),
+            x['w'],
             qhead_per_kv_head=s['idx_nh'],
             indexer_softmax_scale=s['indexer_softmax_scale'],
             ratio=s['ratio'],
         )
         attn_score, attn_l1norm = _compute_dense_attn_score(
-            x['q_attn'], x['k_attn'].unsqueeze(2), x['lse'],
+            x['q_attn'],
+            x['k_attn'].unsqueeze(2),
+            x['lse'],
             qhead_per_kv_head=s['np_'],
             softmax_scale=s['softmax_scale'],
             ratio=s['ratio'],
         )
 
         loss_actual = _kl_loss_from_dense_scores(
-            attn_score, attn_l1norm, index_score, index_lse, loss_coeff,
+            attn_score, attn_l1norm, index_score, index_lse, loss_coeff
         )
         loss_ref = _ref_dense_indexer_loss(
-            x['q_idx'].float(), x['k_idx'].float(), x['w'].float(),
-            x['q_attn'].float(), x['k_attn'].float(), x['lse'],
+            x['q_idx'].float(),
+            x['k_idx'].float(),
+            x['w'].float(),
+            x['q_attn'].float(),
+            x['k_attn'].float(),
+            x['lse'],
             indexer_softmax_scale=s['indexer_softmax_scale'],
             attn_softmax_scale=s['softmax_scale'],
             ratio=s['ratio'],
@@ -1973,22 +2029,29 @@ class TestRealKernelIndexerTopk:
         # batch-aware ``seq_lens.repeat(b)`` and the ``(b*sq, sk) → (b, sq,
         # topk)`` reshape inside ``_indexer_topk_bshd``.
         s = dict(
-            b=2, sq=128, idx_nh=32, idx_hd=128, sk=128,
-            indexer_topk=8, ratio=4,
-            indexer_softmax_scale=128 ** -0.5,
+            b=2,
+            sq=128,
+            idx_nh=32,
+            idx_hd=128,
+            sk=128,
+            indexer_topk=8,
+            ratio=4,
+            indexer_softmax_scale=128**-0.5,
         )
         torch.manual_seed(0)
         dev = 'cuda'
         q_indexer = torch.randn(
-            s['sq'], s['b'], s['idx_nh'], s['idx_hd'],
-            dtype=torch.bfloat16, device=dev,
+            s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev
         )
         k_indexer = torch.randn(s['sk'], s['b'], s['idx_hd'], dtype=torch.bfloat16, device=dev)
         weights = torch.randn(s['sq'], s['b'], s['idx_nh'], dtype=torch.bfloat16, device=dev)
 
         topk_indices, topk_length = indexer_topk(
-            q_indexer, k_indexer, weights,
-            topk=s['indexer_topk'], ratio=s['ratio'],
+            q_indexer,
+            k_indexer,
+            weights,
+            topk=s['indexer_topk'],
+            ratio=s['ratio'],
             indexer_softmax_scale=s['indexer_softmax_scale'],
         )
         assert topk_indices.shape == (s['b'], s['sq'], s['indexer_topk'])
@@ -2000,8 +2063,7 @@ class TestRealKernelIndexerTopk:
         k_bsd = k_indexer.permute(1, 0, 2).contiguous().float()
         w_bsh = weights.permute(1, 0, 2).contiguous().float()
         ref_scores = _ref_indexer_full_score(
-            q_bshd, k_bsd, w_bsh,
-            sm_scale=s['indexer_softmax_scale'], ratio=s['ratio'],
+            q_bshd, k_bsd, w_bsh, sm_scale=s['indexer_softmax_scale'], ratio=s['ratio']
         )  # (B, Sq, Sk), -inf at masked positions
 
         # For each row, count valid positions (un-masked). topk_length should
@@ -2042,10 +2104,7 @@ class TestRealKernelDsaSparseAttn:
     pure-PyTorch sparse-attn reference (``_ref_sparse_attn_forward``).
     """
 
-    SHAPES = dict(
-        b=2, sq=128, np_=64, d=512, skv=128,
-        topk=32, softmax_scale=512 ** -0.5,
-    )
+    SHAPES = dict(b=2, sq=128, np_=64, d=512, skv=128, topk=32, softmax_scale=512**-0.5)
 
     def _make_inputs(self, *, requires_grad: bool):
         s = self.SHAPES
@@ -2066,17 +2125,14 @@ class TestRealKernelDsaSparseAttn:
         # standard causal mask (index <= q_idx).
         torch.manual_seed(1)
         topk_local = torch.randint(
-            0, s['skv'], (s['b'], s['sq'], s['topk']),
-            dtype=torch.int64, device=dev,
+            0, s['skv'], (s['b'], s['sq'], s['topk']), dtype=torch.int64, device=dev
         )
         q_idx = torch.arange(s['sq'], device=dev).view(1, -1, 1)
         topk_local = torch.minimum(topk_local, q_idx)
         global_idxs = local_to_global_flat(topk_local, s['b'], s['skv']).contiguous()
         return query, kv, attn_sink, global_idxs
 
-    def test_real_dsa_sparse_attn_fwd_bwd_matches_reference(
-        self, reset_lazy_kernel_state,
-    ):
+    def test_real_dsa_sparse_attn_fwd_bwd_matches_reference(self, reset_lazy_kernel_state):
         """Forward output AND backward gradients (dq, dkv, d_sink) must
         match a pure-PyTorch sparse-attn reference. Combining both checks
         in one test halves cuDNN compile time vs running them separately,
@@ -2087,9 +2143,7 @@ class TestRealKernelDsaSparseAttn:
 
         # ---- Real path: forward + backward via dsa_sparse_attn ----
         query, kv, attn_sink, global_idxs = self._make_inputs(requires_grad=True)
-        out = dsa_sparse_attn(
-            query, kv, attn_sink, global_idxs, softmax_scale=s['softmax_scale'],
-        )
+        out = dsa_sparse_attn(query, kv, attn_sink, global_idxs, softmax_scale=s['softmax_scale'])
         torch.manual_seed(7)
         upstream = torch.randn_like(out)
         (out * upstream).sum().backward()
@@ -2103,11 +2157,15 @@ class TestRealKernelDsaSparseAttn:
         q_flat = query_ref.reshape(s['sq'] * s['b'], s['np_'], s['d'])
         kv_flat = kv_ref.reshape(s['skv'] * s['b'], s['d'])
         ref_out_flat, _ = _ref_sparse_attn_forward(
-            q_flat, kv_flat, attn_sink_ref, global_idxs,
-            softmax_scale=s['softmax_scale'], d_v=s['d'],
+            q_flat,
+            kv_flat,
+            attn_sink_ref,
+            global_idxs,
+            softmax_scale=s['softmax_scale'],
+            d_v=s['d'],
         )
         ref_out = ref_out_flat.reshape(s['sq'], s['b'], s['np_'], s['d']).reshape(
-            s['sq'], s['b'], s['np_'] * s['d'],
+            s['sq'], s['b'], s['np_'] * s['d']
         )
         (ref_out * upstream).sum().backward()
 
@@ -2117,8 +2175,7 @@ class TestRealKernelDsaSparseAttn:
         # tensor's direction via cosine similarity instead.
         def _cos(a, b):
             return torch.nn.functional.cosine_similarity(
-                a.flatten().unsqueeze(0).float(),
-                b.flatten().unsqueeze(0).float(),
+                a.flatten().unsqueeze(0).float(), b.flatten().unsqueeze(0).float()
             ).item()
 
         assert out_actual.shape == ref_out.shape
@@ -2156,11 +2213,19 @@ class TestRealKernelFusedIndexerSparseAttn:
     # DsaSparseAttn real-kernel test). n_comp must be ≥ indexer_topk; skv ≥
     # n_comp so kv_offset = skv - n_comp > 0 still exercises the offset path.
     SHAPES = dict(
-        b=2, sq=128, np_=64, d=512, skv=640, n_comp=512,
-        idx_nh=32, idx_hd=128, indexer_topk=512, ratio=4,
+        b=2,
+        sq=128,
+        np_=64,
+        d=512,
+        skv=640,
+        n_comp=512,
+        idx_nh=32,
+        idx_hd=128,
+        indexer_topk=512,
+        ratio=4,
         win_topk=8,
-        softmax_scale=512 ** -0.5,
-        indexer_softmax_scale=128 ** -0.5,
+        softmax_scale=512**-0.5,
+        indexer_softmax_scale=128**-0.5,
     )
 
     def test_real_fused_dense_loss_matches_reference(self, reset_lazy_kernel_state):
@@ -2182,11 +2247,10 @@ class TestRealKernelFusedIndexerSparseAttn:
         attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev)
         torch.manual_seed(1)
         win_idxs = torch.randint(
-            0, s['sq'], (s['b'], s['sq'], s['win_topk']),
-            dtype=torch.int32, device=dev,
+            0, s['sq'], (s['b'], s['sq'], s['win_topk']), dtype=torch.int32, device=dev
         )
         q_indexer = torch.randn(
-            s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev,
+            s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev
         )
         k_indexer = torch.randn(s['n_comp'], s['b'], s['idx_hd'], dtype=torch.bfloat16, device=dev)
         weights = torch.randn(s['sq'], s['b'], s['idx_nh'], dtype=torch.bfloat16, device=dev)
@@ -2194,9 +2258,15 @@ class TestRealKernelFusedIndexerSparseAttn:
 
         # Real path.
         _, indexer_loss = fused_indexer_sparse_attn(
-            query, kv_full, attn_sink, win_idxs,
-            q_indexer, k_indexer, weights,
-            indexer_topk=s['indexer_topk'], ratio=s['ratio'],
+            query,
+            kv_full,
+            attn_sink,
+            win_idxs,
+            q_indexer,
+            k_indexer,
+            weights,
+            indexer_topk=s['indexer_topk'],
+            ratio=s['ratio'],
             softmax_scale=s['softmax_scale'],
             indexer_softmax_scale=s['indexer_softmax_scale'],
             loss_coeff=loss_coeff,
@@ -2233,35 +2303,30 @@ class TestRealKernelFusedIndexerSparseAttn:
         # path consumes internally.
         effective_topk = min(s['indexer_topk'], s['n_comp'])
         q_idx_bshd_bf, k_idx_bsd_bf, _, w_bsh_scaled_bf = _sbhd_to_bshd_indexer_inputs(
-            q_indexer, k_indexer, weights, s['indexer_softmax_scale'],
+            q_indexer, k_indexer, weights, s['indexer_softmax_scale']
         )
         topk_indices_cmp, _ = _indexer_topk_bshd(
-            q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_scaled_bf,
-            effective_topk, s['ratio'],
+            q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_scaled_bf, effective_topk, s['ratio']
         )
-        compress_topk_idxs = torch.where(
-            topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1,
-        )
+        compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1)
         combined_local = torch.cat([compress_topk_idxs, win_idxs], dim=-1)
         global_idxs = local_to_global_flat(combined_local, s['b'], s['skv'])
         q_flat = query.reshape(s['sq'] * s['b'], s['np_'], s['d'])
         kv_flat = kv_full.reshape(s['skv'] * s['b'], s['d'])
         _, _, lse_indexer = _dsa_fwd_flash_mla(
-            q_flat, kv_flat, global_idxs, s['softmax_scale'],
-            attn_sink=attn_sink, topk_length=None,
+            q_flat,
+            kv_flat,
+            global_idxs,
+            s['softmax_scale'],
+            attn_sink=attn_sink,
+            topk_length=None,
             indexer_topk=effective_topk,
         )
-        lse_indexer_bsqh = (
-            lse_indexer.reshape(s['sq'], s['b'], s['np_']).permute(1, 0, 2)
-        )
+        lse_indexer_bsqh = lse_indexer.reshape(s['sq'], s['b'], s['np_']).permute(1, 0, 2)
 
         # Attention path: exp(QK*scale - lse_indexer), head-summed. No mask.
-        qk_attn = torch.einsum(
-            'bqhd,bkd->bqhk', q_attn_bshd, k_attn_bsd,
-        ) * s['softmax_scale']
-        attn_score_ref = torch.exp(
-            qk_attn - lse_indexer_bsqh.unsqueeze(-1)
-        ).sum(dim=2)
+        qk_attn = torch.einsum('bqhd,bkd->bqhk', q_attn_bshd, k_attn_bsd) * s['softmax_scale']
+        attn_score_ref = torch.exp(qk_attn - lse_indexer_bsqh.unsqueeze(-1)).sum(dim=2)
         attn_l1norm_ref = attn_score_ref.sum(dim=-1)
 
         # Indexer path: ReLU(QK_indexer) * W head-summed. The fused path
@@ -2273,13 +2338,13 @@ class TestRealKernelFusedIndexerSparseAttn:
         # that here so the reference matches the fused-path output; revisit
         # if the upstream pre-scale + kernel-scale duplication is fixed.
         qk_idx = torch.einsum('bqhd,bkd->bqhk', q_idx_bshd, k_idx_bsd)
-        idx_score_ref = (
-            torch.relu(qk_idx) * w_bsh.unsqueeze(-1)
-        ).sum(dim=2) * (s['indexer_softmax_scale'] ** 2)
+        idx_score_ref = (torch.relu(qk_idx) * w_bsh.unsqueeze(-1)).sum(dim=2) * (
+            s['indexer_softmax_scale'] ** 2
+        )
         idx_lse_ref = torch.logsumexp(idx_score_ref, dim=-1)
 
         loss_ref = _kl_loss_from_dense_scores(
-            attn_score_ref, attn_l1norm_ref, idx_score_ref, idx_lse_ref, loss_coeff,
+            attn_score_ref, attn_l1norm_ref, idx_score_ref, idx_lse_ref, loss_coeff
         )
         assert torch.allclose(indexer_loss, loss_ref, atol=5e-2, rtol=1e-1), (
             f"actual = {indexer_loss.item():.6f}, ref = {loss_ref.item():.6f}, "
