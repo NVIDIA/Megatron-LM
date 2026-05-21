@@ -2684,12 +2684,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # No _mxfp8_weight0 pre-computation to avoid ~28 GB persistent FP8 tensors.
             fused_impl.append(op)
 
-            if tp_world_size > 1:
-                if self.linear_fc2.sequence_parallel:
-                    fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
-                else:
-                    fused_impl.append(te.pytorch.ops.AllReduce(tp_group))
-
             self._register_hooks_on_fused_impl(fused_impl)
             return fused_impl
 
