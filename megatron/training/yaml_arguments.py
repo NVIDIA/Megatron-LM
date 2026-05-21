@@ -326,7 +326,6 @@ def validate_yaml(args, defaults={}):
     
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:
-        assert args.spec is None, "Model Spec must be None when using MoEs"
         if args.model_parallel.tensor_model_parallel_size > 1:
             assert args.model_parallel.sequence_parallel, \
                 "When using MoE and tensor parallelism, sequence parallelism must be used."
