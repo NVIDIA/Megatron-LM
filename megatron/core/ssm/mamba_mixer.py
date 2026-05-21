@@ -1310,10 +1310,7 @@ class MambaMixer(MegatronModule):
 
         # Keep DCP keys stable for checkpoints saved before conv params became
         # direct MambaMixer parameters.
-        conv_checkpoint_key_map = {
-            "conv1d_weight": "conv1d.weight",
-            "conv1d_bias": "conv1d.bias",
-        }
+        conv_checkpoint_key_map = {"conv1d_weight": "conv1d.weight", "conv1d_bias": "conv1d.bias"}
         for param_name, checkpoint_name in conv_checkpoint_key_map.items():
             sharded_state_dict[f"{prefix}{param_name}"].key = f"{prefix}{checkpoint_name}"
 
