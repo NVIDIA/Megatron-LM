@@ -1141,7 +1141,13 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-    
+
+        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+            raise ValueError(
+                "Meta device initialization (init_model_with_meta_device=True) is not "
+                "supported or necessary for the 'no_shard' / 0 sharding strategy."
+            )
+
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
         # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
