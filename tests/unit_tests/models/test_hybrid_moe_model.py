@@ -70,7 +70,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cuda_graph_impl": "none",
     "cuda_graph_retain_backward_graph": False,
     "cuda_graph_modules": [],
-    "cuda_graph_use_single_mempool": False,
+    "cuda_graph_use_single_mempool": True,
     "cuda_graph_scope": None,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
@@ -289,6 +289,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fine_grained_activation_offloading": False,
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],
+    "fine_grained_offloading_max_inflight_offloads": None,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_cuda_graph_scope": {
