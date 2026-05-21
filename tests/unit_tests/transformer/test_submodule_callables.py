@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from megatron.core.models.gpt.fine_grained_callables import build_layer_callables
+from megatron.core.models.common.fine_grained_callables import build_layer_callables
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -15,6 +15,7 @@ from tests.unit_tests.a2a_overlap.utils import (
     compare_captures,
     deterministic_mode,
     get_test_config,
+    get_valid_flex_dispatcher_backend,
     get_valid_token_dispatcher_types,
     reset_model,
 )
@@ -65,7 +66,7 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
 
     output_tensors = []
     # get callables
-    callables, dw = build_layer_callables(model)
+    callables, dw, _is_moe, _num_local_experts = build_layer_callables(model)
     attn, dispatch, moe, combine, post_process = callables
     assert post_process is None
     dummy_model = DummyState()
@@ -137,7 +138,7 @@ class TestTransformerLayerSubmoduleCallables:
             "moe_permute_fusion": permute_fusion,
         }
         if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
         config = get_test_config(extra_kwargs=extra_kwargs, moe_grouped_gemm=grouped_gemm)
         microbatches = 4
         with deterministic_mode():
