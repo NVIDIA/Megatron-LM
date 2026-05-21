@@ -53,7 +53,10 @@ from typing import Any, Dict, Optional, Tuple
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    tag_params_for_buffer_routing,
+)
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 
 from .log_handler import CustomHandler
@@ -1564,6 +1567,11 @@ def wrap_model_chunks_with_ddp(
         if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
             ddp_config.use_distributed_optimizer = True
             compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            # Tag params so DDP buffer grouping routes LayerWise-managed matrices
+            # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
+            # everything else (embeddings, biases, layernorm) to a separate
+            # DistOpt-style buffer.
+            tag_params_for_buffer_routing(model_chunks)
         elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
         else:
@@ -1790,7 +1798,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 use_layer_wise_distributed_optimizer=getattr(
                     args, 'use_layer_wise_distributed_optimizer', False
                 ),
-                use_layer_wise_param_layout=False,
+                use_layer_wise_param_layout=getattr(
+                    args, 'use_layer_wise_param_layout', True
+                ),
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
@@ -3256,9 +3266,17 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "full_iteration":
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=args.cuda_graph_use_single_mempool,
+        )
     if args.optimizer_cuda_graph:
-        optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        optimizer.step = OptimizerCudaGraphWrapper(
+            optimizer.step,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=args.cuda_graph_use_single_mempool,
+        )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3795,7 +3813,11 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "full_iteration":
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=args.cuda_graph_use_single_mempool,
+        )
 
     if has_nvidia_modelopt:
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
