@@ -176,3 +176,10 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  # MLA dynamic inference (cache_mla_latents path, FlashInfer-backed).
+  # Random-init small MLA model; uses the standard dynamic-inference runner.
+  - test_case: [gpt_mla_dynamic_inference_tp1_pp1_logitsmatch_zmq]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
