@@ -494,6 +494,10 @@ class TransformerConfig(ModelParallelConfig):
     the number of transformer layers to recompute within each pipeline stage.  Must be None for
     'selective' activation checkpointing."""
 
+    skip_final_recompute: bool = False
+    """If True, skip checkpointing the final full-recompute unit in each pipeline stage. Its
+    activations are retained from the forward pass because backward consumes them first."""
+
     distribute_saved_activations: Optional[bool] = False
     """If True, distribute recomputed activations across the model parallel group."""
 
@@ -1486,6 +1490,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.cpu_offloading and self.recompute_granularity is not None:
             raise ValueError(
                 "CPU offloading does not work when activation recomputation is enabled"
+            )
+
+        if self.skip_final_recompute and self.recompute_granularity != "full":
+            raise ValueError(
+                "skip_final_recompute is only supported with full activation recomputation."
             )
 
         if self.recompute_granularity is not None:
