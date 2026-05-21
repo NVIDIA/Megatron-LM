@@ -145,10 +145,18 @@ def mcore_fused_moe(
     # Fused quant kernels only apply to MXFP8 path
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
 
-    assert not (use_mxfp8 and is_batch_invariant_mode_enabled()), (
-        "Batch-invariant MoE is bf16-only. MXFP8 inference cannot be made "
-        "bitwise-identical to bf16 training. Disable mxfp8 or batch_invariant_mode."
-    )
+    if is_batch_invariant_mode_enabled():
+        # BIK intercepts the bf16 grouped GEMM path (`_bf16_grouped_mm` →
+        # `grouped_gemm_batch_invariant`). The MXFP8 path uses
+        # `scaled_grouped_mm` and is not BIK-instrumented.
+        assert not use_mxfp8, (
+            "batch_invariant_mode requires the bf16 grouped GEMM path; got "
+            "MXFP8 weights. Disable mxfp8 or batch_invariant_mode."
+        )
+        assert HAVE_GROUPED_MM, (
+            "batch_invariant_mode requires torch.nn.functional.grouped_mm "
+            "(PyTorch 2.10+). Upgrade torch or disable batch_invariant_mode."
+        )
 
     if use_mxfp8:
         assert (

@@ -840,6 +840,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
 
+        # BIK only instruments the TORCH backend (mcore_fused_moe → bf16
+        # grouped GEMM → grouped_gemm_batch_invariant). FlashInfer and vLLM
+        # backends use their own Triton/atomic_add combine kernels that we
+        # do not intercept.
+        if getattr(config, "batch_invariant_mode", False):
+            assert (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
+            ), (
+                f"batch_invariant_mode requires "
+                f"--inference-grouped-gemm-backend=torch (BIK is only wired into "
+                f"the TORCH backend); got {self.inference_grouped_gemm_backend}."
+            )
+
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
         assert (
