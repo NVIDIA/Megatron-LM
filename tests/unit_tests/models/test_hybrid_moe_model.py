@@ -70,7 +70,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cuda_graph_impl": "none",
     "cuda_graph_retain_backward_graph": False,
     "cuda_graph_modules": [],
-    "cuda_graph_use_single_mempool": False,
+    "cuda_graph_use_single_mempool": True,
     "cuda_graph_scope": None,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
