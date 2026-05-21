@@ -388,6 +388,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 for k, v in state.items():
                     if not isinstance(v, torch.Tensor):
                         continue
+                    v = _to_local_if_dtensor(v)
+                    if v.numel() == param.numel() and v.shape != param.shape:
+                        v = v.view_as(param)
                     orig_param = self.inner_param_to_orig_param.get(param, param)
                     if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
                         self.state[orig_param][k] = state[k] = v.to("cpu")
@@ -399,7 +402,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             return
         for param, v in self.state.items():
             fp32_param = self.param_to_fp32_param[param]
-            fp32_param.data.copy_(v["master_param"])
+            master_param = v.get("master_param")
+            if master_param is None:
+                master_param = _to_local_if_dtensor(param)
+            else:
+                master_param = _to_local_if_dtensor(master_param)
+            fp32_param.data.copy_(master_param)
 
     def update_fp32_param_by_new_param(self):
         """

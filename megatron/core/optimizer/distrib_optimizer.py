@@ -36,6 +36,28 @@ except ImportError:
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
+try:
+    from torch.distributed._tensor import DTensor
+    from torch.distributed.checkpoint.metadata import (
+        ChunkStorageMetadata,
+        MetadataIndex,
+        TensorProperties,
+    )
+    from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+        make_fsdp_dtensor,
+    )
+except ImportError:
+    ChunkStorageMetadata = None
+    DTensor = None
+    MetadataIndex = None
+    TensorProperties = None
+    TensorWriteData = None
+    WriteItem = None
+    WriteItemType = None
+    make_fsdp_dtensor = None
+
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
@@ -1594,14 +1616,166 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Get the optimizer's parameter groups in distributed key value format.
         param_to_group_meta = self._param_groups_to_param2group_meta(self.optimizer.param_groups)
 
-        # Remap state to use order indices as keys
-        packed_state = {
-            (self._param_name(k) if isinstance(k, torch.Tensor) else k): v
-            for k, v in self.state.items()
-        }
+        # Remap state to use parameter names as keys. HybridDeviceOptimizer keeps
+        # CPU-offloaded optimizer tensors as FSDP-local plain tensors; wrap them
+        # back into FSDP DTensors so DCP saves shard metadata instead of treating
+        # each local shard as replicated data. Its fp32 master params duplicate
+        # Megatron-FSDP's model-state main weights, so they are intentionally not
+        # stored in the optimizer state.
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            packed_state = self._pack_hybrid_optimizer_fsdp_state_dict()
+        else:
+            packed_state = {
+                (self._param_name(k) if isinstance(k, torch.Tensor) else k): v
+                for k, v in self.state.items()
+            }
 
         state_dict = {"state": packed_state, "param_to_group_meta": param_to_group_meta}
         return state_dict
+
+    def _pack_hybrid_optimizer_fsdp_state_dict(self) -> dict[str, Any]:
+        """Pack HybridDeviceOptimizer state in a deterministic cross-rank order."""
+        packed_state = {}
+        packed_params = set()
+
+        named_params = []
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                named_params.append((self._param_name(param), param))
+
+        for param_name, param in sorted(named_params, key=lambda item: item[0]):
+            param_state = self.state.get(param, {})
+            packed_param_state = self._pack_hybrid_optimizer_fsdp_state(
+                param, param_name, param_state
+            )
+            if packed_param_state:
+                packed_state[param_name] = packed_param_state
+            if param in self.state:
+                packed_params.add(param)
+
+        # Preserve any non-parameter state if a future optimizer adds it. Tensor
+        # parameter state must be packed above so all ranks present the same
+        # deterministic parameter order to DCP.
+        for key, state in self.state.items():
+            if isinstance(key, torch.Tensor):
+                assert key in packed_params, (
+                    f"Optimizer state for parameter {self._param_name(key)} is not in "
+                    "HybridDeviceOptimizer param_groups."
+                )
+                continue
+            packed_state[key] = state
+
+        return packed_state
+
+    def _pack_hybrid_optimizer_fsdp_state(
+        self, param: torch.nn.Parameter, param_name: str, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Convert HybridDeviceOptimizer FSDP-local tensor state to DTensors."""
+        if (
+            make_fsdp_dtensor is None
+            or DTensor is None
+            or ChunkStorageMetadata is None
+            or MetadataIndex is None
+            or TensorProperties is None
+            or TensorWriteData is None
+            or WriteItem is None
+            or WriteItemType is None
+        ):
+            raise RuntimeError("Megatron-FSDP DTensor support is required for fsdp_dtensor.")
+
+        packed_state = {}
+        is_expert_param = "mlp.experts" in param_name
+        fsdp_local_numel = param.megatron_fsdp_slice.stop - param.megatron_fsdp_slice.start
+
+        expected_tensor_state_dtypes = {}
+        if self.config.optimizer == "adam":
+            expected_tensor_state_dtypes = {
+                "exp_avg": self.config.exp_avg_dtype,
+                "exp_avg_sq": self.config.exp_avg_sq_dtype,
+            }
+        tensor_state_keys = {
+            key
+            for key, value in state.items()
+            if key != "master_param"
+            and isinstance(value, torch.Tensor)
+            and not isinstance(value, DTensor)
+            and value.dim() > 0
+        }
+        key_order = sorted((set(state) - {"master_param"}) | set(expected_tensor_state_dtypes))
+
+        for key in key_order:
+            value = state.get(key)
+            if value is None and key in expected_tensor_state_dtypes:
+                value = torch.zeros(
+                    (fsdp_local_numel,), dtype=expected_tensor_state_dtypes[key], device="cpu"
+                )
+
+            if (
+                isinstance(value, torch.Tensor)
+                and not isinstance(value, DTensor)
+                and (key in tensor_state_keys or key in expected_tensor_state_dtypes)
+            ):
+                assert value.numel() == fsdp_local_numel, (
+                    f"HybridDeviceOptimizer state {key} for {param_name} must be the "
+                    f"FSDP-local shard (expected numel={fsdp_local_numel}, "
+                    f"got {value.numel()})."
+                )
+                flat_param = torch.empty(param.numel(), device="meta")
+                try:
+                    value = make_fsdp_dtensor(
+                        value.data.view(-1),
+                        flat_param,
+                        dist_index=param.megatron_fsdp_dist_index,
+                        is_expert_param=is_expert_param,
+                        run_check=False,
+                        update_uneven_dtensor_chunk_meta=False,
+                    )
+                    self._set_flat_fsdp_dtensor_chunk_metadata(
+                        value, param.megatron_fsdp_slice
+                    )
+                except Exception as exc:
+                    rank = torch.distributed.get_rank()
+                    raise RuntimeError(
+                        f"Failed to pack HybridDeviceOptimizer state '{key}' for "
+                        f"FSDP parameter '{param_name}' on rank {rank}."
+                    ) from exc
+            packed_state[key] = value
+
+        return packed_state
+
+    @staticmethod
+    def _set_flat_fsdp_dtensor_chunk_metadata(tensor: DTensor, fsdp_slice: slice) -> None:
+        """Attach DCP chunk metadata for a flat FSDP-local shard without collectives."""
+        local_numel = fsdp_slice.stop - fsdp_slice.start
+        chunk_meta = ChunkStorageMetadata(
+            offsets=(fsdp_slice.start,),
+            sizes=(local_numel,),
+        )
+
+        def _chunk_list_closure(chunk_metadata):
+            return lambda: [chunk_metadata]
+
+        def _write_items_closure(chunk_metadata):
+            def _write_items(fqn: str, dtensor: DTensor) -> list[WriteItem]:
+                if dtensor.to_local().numel() == 0:
+                    return []
+
+                return [
+                    WriteItem(
+                        type=WriteItemType.SHARD,
+                        index=MetadataIndex(fqn, chunk_metadata.offsets),
+                        tensor_data=TensorWriteData(
+                            chunk=chunk_metadata,
+                            properties=TensorProperties.create_from_tensor(dtensor.to_local()),
+                            size=dtensor.size(),
+                        ),
+                    )
+                ]
+
+            return _write_items
+
+        tensor._local_tensor.__create_chunk_list__ = _chunk_list_closure(chunk_meta)
+        tensor._local_tensor.__create_write_items__ = _write_items_closure(chunk_meta)
 
     def sharded_param_state_dp_zero(
         self,
