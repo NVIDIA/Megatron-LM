@@ -224,6 +224,7 @@ class MlpBuilder(Protocol):
         config: TransformerConfig,
         pg_collection: ProcessGroupCollection,
         is_mtp_layer: bool,
+        name: str | None = None,
     ) -> MlpInterface: ...
 
 

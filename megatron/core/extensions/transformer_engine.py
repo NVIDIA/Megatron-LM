@@ -2667,6 +2667,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             is_expert: bool = False,
             input_size: int | None = None,
             ffn_hidden_size: int | None = None,
+            name: str | None = None,
         ) -> MLP:
             """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
             del is_mtp_layer
@@ -2680,6 +2681,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 is_expert=is_expert,
                 input_size=input_size,
                 ffn_hidden_size=ffn_hidden_size,
+                name=name,
             )
 
 else:

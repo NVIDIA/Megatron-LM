@@ -92,6 +92,7 @@ class ExpertsBuilder(Protocol):
         /,
         *,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> ExpertsInterface: ...
 
 
@@ -111,7 +112,12 @@ class SharedExpertsBuilder(Protocol):
     """Protocol for building the shared experts used in an MoELayer."""
 
     def __call__(
-        self, *, config: TransformerConfig, pg_collection: ProcessGroupCollection | None, gate: bool
+        self,
+        *,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection | None,
+        gate: bool,
+        name: str | None = None,
     ) -> SharedExpertsInterface: ...
 
 
