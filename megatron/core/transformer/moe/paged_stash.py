@@ -147,7 +147,22 @@ def _paged_stash_copy_kernel(
     BLOCK_SIZE: tl.constexpr,
     HAS_HOST_BUFFER: tl.constexpr,
 ):
-    """Copy tokens to paged stash: try CUDA first (fast path), then host if CUDA full."""
+    """Stash variable-length MoE activations into a paged buffer (CUDA, or pinned host).
+
+    Uses a custom Triton kernel because the token count is only known at runtime and
+    lives on device. Page allocation from the circular freelist, page_record metadata,
+    and the activation copy are fused in one GPU launch to avoid host sync and keep
+    stash CUDA-graph friendly. Fixed-size pages reduce fragmentation vs oversized
+    static expert buffers.
+
+    Per launch (program 0 handles metadata; all programs run the copy):
+        1. If overflow is already set, restore freelist heads and return.
+        2. Compute pages needed from num_tokens. Try the CUDA freelist; if full, try
+           the host freelist when available; otherwise set overflow and return.
+        3. Copy tokens in parallel: resolve page_id per token, record page_ids in
+           page_record, write hidden vectors into the chosen CUDA or host pages.
+        4. Program 0 writes updated freelist heads for the caller to copy_ back.
+    """
     pid = tl.program_id(axis=0)
     num_blocks = tl.num_programs(axis=0)
 
@@ -263,7 +278,20 @@ def _paged_stash_pop_kernel(
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Reload tokens from paged stash; CUDA path fast, host path when spilled_to_host."""
+    """Restore variable-length MoE activations from a paged buffer (CUDA, or pinned host).
+
+    Inverse of _paged_stash_copy_kernel. Uses a custom Triton kernel for the same
+    reasons: runtime token count and stash metadata live on device, so the reload,
+    page_record lookup, and freelist recycle must fuse on-GPU without host sync.
+
+    Per launch (program 0 handles metadata; all programs run the copy):
+        1. If overflow is already set, restore freelist tails and return.
+        2. Read spilled_to_host from the matching stash: CUDA buffer by default, host
+           buffer when the forward stash spilled to pinned memory.
+        3. Copy tokens in parallel: look up page_id from page_record, read hidden
+           vectors from the stash pages into dst, return each page_id to the freelist.
+        4. Program 0 writes updated freelist tails for the caller to copy_ back.
+    """
     pid = tl.program_id(axis=0)
     num_blocks = tl.num_programs(axis=0)
 
@@ -1366,7 +1394,20 @@ class PagedStashRunner:
             self.stash_manager.release_stash_buffers()
 
     def __call__(self, *args, **kwargs):
-        """Run the paged stash"""
+        """Training-step wrapper with fallback when static-buffer paths overflow.
+
+        The first attempt runs forward/backward with a static HybridEP receive budget
+        (moe_expert_rank_capacity_factor) and paged stashing enabled. If either the
+        HybridEP permute buffer is over budget (tokens dropped) or the paged stash
+        buffer overflows, this wrapper retries once in synced dropless mode: no static
+        limit on HybridEP (capacity factor cleared, dynamic permuted size via CPU sync)
+        and no paged stash (moe_paged_stash disabled).
+
+        At most two attempts. Each attempt prefetches microbatches, runs the schedule,
+        then all-reduces stash overflow, HybridEP over-budget, and host spill across ranks.
+        On success, restore capacity factor and moe_paged_stash for the next step.
+        On overflow, prepare_for_rerun resets grads and the CUDA graph before retry.
+        """
         assert len(args) == 0, 'forward_backward_func does not accept positional args'
         assert all(
             [
@@ -1400,7 +1441,6 @@ class PagedStashRunner:
             result = self.forward_backward_func(*args, **kwargs)
 
             stash_overflow_ranks, overbudget_ranks, host_spill_ranks = self.check_moe_overflow()
-            # if no overflow, set the expert_rank_capacity_factor to the original value
             if stash_overflow_ranks == 0 and overbudget_ranks == 0:
                 if host_spill_ranks > 0:
                     log_single_rank(
@@ -1411,6 +1451,9 @@ class PagedStashRunner:
                         "Consider increasing moe_paged_stash_buffer_size_factor_cuda for "
                         "potentially better performance.",
                     )
+                # Restore moe_expert_rank_capacity_factor on every HybridEP MoE layer so the
+                # next step uses the static dispatch budget again (cleared by prepare_for_rerun
+                # on a failed retry).
                 for mlp in self.moe_layers:
                     if hasattr(mlp, 'token_dispatcher') and hasattr(
                         mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
@@ -1421,7 +1464,7 @@ class PagedStashRunner:
                 self._set_moe_paged_stash_all(saved_moe_paged_stash)
                 break
 
-            # if overflow or overbudget, set the expert_rank_capacity_factor to None
+            # Overflow or over-budget: prepare_for_rerun clears capacity factor and paged stash.
             if overbudget_ranks > 0:
                 log_single_rank(
                     logger,
