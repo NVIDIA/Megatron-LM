@@ -17,7 +17,12 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.core.utils import (
+    append_unique_process_group,
+    get_dtensor_data_parallel_shard_groups,
+    get_pg_size,
+    log_single_rank,
+)
 
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -719,6 +724,42 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         local_tensor = dtensor._local_tensor
         return local_tensor.numel() > 0 and tuple(dtensor.shape) != tuple(local_tensor.shape)
 
+    def _collect_boundary_indices_across_shard_groups(
+        self, params: list[torch.Tensor], local_indices: list[int]
+    ) -> set[int]:
+        """Propagate boundary-gather decisions over all DTensor FSDP shard dimensions.
+
+        In plain FSDP the optimizer's ``dp_group`` is the only shard group. In
+        HFSDP, however, the optimizer wrapper may be scoped to the inner DP
+        group while a DTensor can also be sharded on the outer DP dimension.
+        Boundary parameters must be selected consistently by every rank that
+        participates in any of the uneven gather stages.
+        """
+        result = set(local_indices)
+
+        shard_groups: list[torch.distributed.ProcessGroup] = []
+        for param in params:
+            if isinstance(param, _DTensor):
+                for shard_group in get_dtensor_data_parallel_shard_groups(param):
+                    append_unique_process_group(shard_groups, shard_group)
+
+        if not shard_groups and self.dp_group is not None:
+            append_unique_process_group(shard_groups, self.dp_group)
+
+        for shard_group in shard_groups:
+            if get_pg_size(shard_group) <= 1:
+                continue
+            gathered_indices: list[list[int] | None] = [None] * get_pg_size(shard_group)
+            torch.distributed.all_gather_object(gathered_indices, sorted(result), group=shard_group)
+            result.update(
+                idx
+                for rank_indices in gathered_indices
+                if rank_indices is not None
+                for idx in rank_indices
+            )
+
+        return result
+
     def _get_mfsdp_param_layout(self, param: torch.Tensor, param_idx: int):
         """Return M-FSDP flat-buffer layout metadata for `param`.
 
@@ -828,8 +869,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
 
         has_mfsdp_params = any(getattr(param, "orig_param", None) is not None for param in params)
         if has_mfsdp_params:
-            result = set()
-            local_split_indices = []
+            local_boundary_indices = []
             for idx, param in enumerate(params):
                 if getattr(param, "orig_param", None) is None:
                     raise AssertionError(
@@ -837,46 +877,19 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
                         f"M-FSDP bucket metadata: param_idx={idx}."
                     )
                 if self._mfsdp_param_crosses_shard_boundary(param, idx):
-                    result.add(idx)
+                    local_boundary_indices.append(idx)
                 elif self._needs_boundary_gather(param):
-                    local_split_indices.append(idx)
-            if self.dp_group is not None and get_pg_size(self.dp_group) > 1:
-                gathered_local_split_indices: list[list[int] | None] = [None] * get_pg_size(
-                    self.dp_group
-                )
-                torch.distributed.all_gather_object(
-                    gathered_local_split_indices, local_split_indices, group=self.dp_group
-                )
-                result.update(
-                    idx
-                    for rank_indices in gathered_local_split_indices
-                    if rank_indices is not None
-                    for idx in rank_indices
-                )
-            else:
-                result.update(local_split_indices)
+                    local_boundary_indices.append(idx)
+            result = self._collect_boundary_indices_across_shard_groups(
+                params, local_boundary_indices
+            )
             self._boundary_gather_indices_cache[cache_key] = result
             return result
 
         local_boundary_indices = [
             idx for idx, param in enumerate(params) if self._needs_boundary_gather(param)
         ]
-
-        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
-            result = set(local_boundary_indices)
-            self._boundary_gather_indices_cache[cache_key] = result
-            return result
-
-        gathered_indices: list[list[int] | None] = [None] * get_pg_size(self.dp_group)
-        torch.distributed.all_gather_object(
-            gathered_indices, local_boundary_indices, group=self.dp_group
-        )
-        result = {
-            idx
-            for rank_indices in gathered_indices
-            if rank_indices is not None
-            for idx in rank_indices
-        }
+        result = self._collect_boundary_indices_across_shard_groups(params, local_boundary_indices)
         self._boundary_gather_indices_cache[cache_key] = result
         return result
 

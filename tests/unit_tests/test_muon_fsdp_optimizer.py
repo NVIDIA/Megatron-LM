@@ -804,6 +804,59 @@ class TestFSDPTensorParallelMuon:
         assert optimizer._mfsdp_param_crosses_shard_boundary(param, 0) is False
         assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0}
 
+    @pytest.mark.skipif(WORLD_SIZE < 4, reason="HFSDP boundary test requires at least 4 ranks")
+    def test_hfsdp_boundary_detector_uses_dtensor_shard_groups_not_optimizer_dp_group(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        outer_size = 2
+        inner_size = dp_size // outer_size
+        if dp_size % outer_size != 0:
+            pytest.skip("HFSDP boundary test requires an even world size")
+
+        device_mesh = init_device_mesh(
+            "cuda", (outer_size, inner_size), mesh_dim_names=("outer_fsdp_dp", "dp_cp")
+        )
+        outer_rank, inner_rank = device_mesh.get_coordinate()
+        logical_rank = inner_rank * outer_size + outer_rank
+
+        rows, cols = dp_size * 2 + 1, 4
+        full_param = torch.zeros(rows, cols, device="cuda")
+        rows_per_logical_rank = [
+            rows // dp_size + (1 if rank < rows % dp_size else 0) for rank in range(dp_size)
+        ]
+        row_start = sum(rows_per_logical_rank[:logical_rank])
+        row_count = rows_per_logical_rank[logical_rank]
+        local_param = full_param[row_start : row_start + row_count].contiguous()
+        param = nn.Parameter(_make_hfsdp_dtensor(local_param, full_param.shape, device_mesh))
+
+        # The fake flat bucket metadata says the item does not cross an inner
+        # FSDP boundary. The DTensor itself is sharded on both inner and outer
+        # HFSDP dimensions, so boundary-index agreement must not be limited to
+        # the optimizer's inner-DP group.
+        bucket = _make_fake_mfsdp_bucket(
+            bucket_id=0,
+            dp_rank=torch.distributed.get_rank(),
+            dp_size=dp_size,
+            shard_size=full_param.numel() * 2,
+        )
+        _attach_fake_mfsdp_bucket_metadata(param, bucket, item_id=0, offset=0)
+
+        inner_group = device_mesh.get_group("dp_cp")
+        optimizer = _make_fsdp_muon([param], dp_group=inner_group)
+
+        seen_group_ranks = []
+        real_all_gather_object = torch.distributed.all_gather_object
+
+        def recording_all_gather_object(output_list, obj, group=None):
+            seen_group_ranks.append(tuple(torch.distributed.get_process_group_ranks(group)))
+            return real_all_gather_object(output_list, obj, group=group)
+
+        with patch("torch.distributed.all_gather_object", recording_all_gather_object):
+            assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0}
+
+        assert len(set(seen_group_ranks)) == 2
+
     def test_step_batches_multiple_split_boundary_params(self):
         from torch.distributed.device_mesh import init_device_mesh
 
