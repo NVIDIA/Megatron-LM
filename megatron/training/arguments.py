@@ -2765,6 +2765,17 @@ def _add_distributed_args(parser):
                        dest='align_param_gather')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--no-use-layer-wise-param-layout',
+                       action='store_false',
+                       dest='use_layer_wise_param_layout',
+                       help='Opt out of the precomputed LayerWise param layout. When set, '
+                       'falls back to the legacy LayerWise ping-pong path: all params '
+                       '(including non-Muon embeddings, biases, layernorm) live in a single '
+                       'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
+                       'The default (precomputed layout) routes non-Muon params through a '
+                       'separate DistributedOptimizer with byte-level sharding, which is faster '
+                       'and uses less padding but produces different bf16 reduction ordering '
+                       'and so will not match legacy-path loss curves bit-for-bit.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'
