@@ -715,7 +715,6 @@ def fully_shard(
         fsdp_double_buffer=fsdp_double_buffer,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
-        enable_fine_grained_param_gather=enable_fine_grained_param_gather,
         use_decoupled_grad=use_decoupled_grad,
     )
 
