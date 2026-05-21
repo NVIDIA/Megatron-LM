@@ -11,6 +11,8 @@ from typing import Callable
 
 import numpy as np
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
+from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
+from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.utils.common_utils import get_local_rank_preinit
 import torch
 import torch.nn.functional as F
@@ -32,7 +34,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
-from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version, get_pg_rank
+from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version, get_pg_rank, configure_nvtx_profiling
 from megatron.training import (
     get_adlr_autoresume,
     get_args,
@@ -43,113 +45,96 @@ from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 from megatron.training.config import DistributedInitConfig, RNGConfig, RerunStateMachineConfig
 from megatron.training.models import HybridModelConfig, GPTModelConfig
+from megatron.training.utils.log_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
 
 def initialize_megatron(
-    allow_no_cuda=False,
-    skip_mpu_initialization=False,
-    get_embedding_ranks=None,
-    get_position_embedding_ranks=None,
-    store=None,
-):
-    """Set global variables, initialize distributed, and
-    set autoresume and random seeds.
-    `allow_no_cuda` should not be set unless using megatron for cpu only
-    data processing. In general this arg should not be set unless you know
-    what you are doing.
-    Returns a function to finalize distributed env initialization
-    (optionally, only when args.lazy_mpu_init == True)
+    cfg: PretrainConfigContainer,
+    allow_no_cuda: bool = False,
+    skip_mpu_initialization: bool = False,
+    get_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
+    get_position_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
+    store: torch.distributed.Store | None = None,
+) -> Callable[[], ProcessGroupCollection] | ProcessGroupCollection | None:
+    """Initialize Megatron core components and distributed setup.
+
+    Sets up logging, initializes distributed environment (torch.distributed),
+    configures microbatch calculator, and sets random seeds.
+
+    Args:
+        cfg: The main configuration container.
+        allow_no_cuda: If True, allows initialization without CUDA. Should not
+            be set unless using megatron for cpu only data processing. In
+            general this arg should not be set unless you know what you are doing.
+        skip_mpu_initialization: If True, skips MPU initialization (for external managers).
+        get_embedding_ranks: Optional function to determine embedding layer ranks.
+        get_position_embedding_ranks: Optional function to determine position embedding ranks.
+        store: Optional store for in-process restart.
+
+    Returns:
+        An optional callable to finish MPU initialization if lazy_mpu_init is True,
+        otherwise None.
     """
+
     if not allow_no_cuda:
         # Make sure cuda is available.
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
-    args = get_args()
+    model_config = cfg.model
+    dist_config = cfg.dist
+    rng_config = cfg.rng
+    rerun_state_machine_config = cfg.rerun_state_machine
+    train_config = cfg.train
+    logger_config = cfg.logger
+    ckpt_config = cfg.checkpoint
+    use_inprocess_restart = store is not None
 
     # set logging level
-    setup_logging()
-
-    if args.async_save and args.use_persistent_ckpt_worker:
-        init_persistent_async_worker(args.rank, 'forkserver')
-
-    # init rerun state
-    def state_save_func():
-        return {'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
-
-    def state_restore_func(state_dict):
-        if state_dict['rng_tracker_states']:
-            tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
-
-    args = get_args()
-    initialize_rerun_state_machine(
-        state_save_func=state_save_func,
-        state_restore_func=state_restore_func,
-        mode=RerunMode(args.rerun_mode),
-        error_injector=RerunErrorInjector(
-            error_injection_rate=args.error_injection_rate,
-            error_injection_type=RerunDiagnostic(args.error_injection_type),
-        ),
-        result_rejected_tracker_filename=args.result_rejected_tracker_filename,
+    setup_logging(
+        logging_level=logger_config.logging_level,
+        filter_warning=logger_config.filter_warnings,
+        modules_to_filter=logger_config.modules_to_filter,
+        set_level_for_all_loggers=logger_config.set_level_for_all_loggers,
     )
 
-    if args.batch_invariant_mode:
+    if ckpt_config.async_save and ckpt_config.use_persistent_ckpt_worker:
+        init_persistent_async_worker(safe_get_rank(), 'forkserver')
+
+    # Configure NVTX profiling if requested
+    if cfg.profiling is not None and cfg.profiling.nvtx_ranges:
+        configure_nvtx_profiling(enabled=True)
+
+    init_num_microbatches_calculator(
+        safe_get_rank(),
+        train_config.rampup_batch_size,
+        train_config.global_batch_size,
+        train_config.micro_batch_size,
+        cfg.data_parallel_size,
+        train_config.decrease_batch_size_if_needed,
+    )
+
+    # init rerun global state
+    init_rerun_state(rerun_state_machine_config)
+
+    if model_config.transformer.batch_invariant_mode:
         print_rank_0("Enabling batch invariant mode globally")
         enable_batch_invariant_mode()
 
     # torch.distributed initialization
-    def finish_mpu_init():
-        args = get_args()
-        # Pytorch distributed.
-        _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store)
-
-        # Random seeds for reproducibility.
-        print_rank_0("> setting random seeds to {} ...".format(args.seed))
-        _set_random_seed(
-            args.seed,
-            args.data_parallel_random_init,
-            args.te_rng_tracker,
-            args.inference_rng_tracker,
-            use_cudagraphable_rng=args.cuda_graph_impl != "none",
-        )
-
-        # Setup MoE aux loss scale value.
-        if args.num_experts is not None:
-            from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
-
-            MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
-
-    if skip_mpu_initialization:
-        return None
-
-    args = get_args()
-    if args.lazy_mpu_init:
-        # TODO is this still a necessary option?
-        args.use_cpu_initialization = True
-        # delayed initialization of DDP-related stuff
-        # We only set basic DDP globals
-        mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
-        # and return function for external DDP manager
-        # to call when it has DDP initialized
-        mpu.set_tensor_model_parallel_rank(args.rank)
-        return finish_mpu_init
-    else:
-        # Megatron's MPU is the master. Complete initialization right away.
-        finish_mpu_init()
-
-        # Autoresume.
-        _init_autoresume()
-
-        # Compile dependencies.
-        _compile_dependencies()
-
-        if args.tp_comm_overlap:
-            # TODO: Should this be activated with just decoder-tp-comm-overlap too?
-            _initialize_tp_communicators()
-
-        # No continuation function
-        return None
+    return torch_dist_init(
+        model_config=model_config,
+        dist_config=dist_config,
+        rng_config=rng_config,
+        micro_batch_size=train_config.micro_batch_size,
+        num_distributed_optimizer_instances=cfg.ddp.num_distributed_optimizer_instances,
+        get_embedding_ranks=get_embedding_ranks,
+        get_position_embedding_ranks=get_position_embedding_ranks,
+        skip_mpu_initialization=skip_mpu_initialization,
+        restart_store=store,
+        use_inprocess_restart=use_inprocess_restart,
+    )
 
 
 def torch_dist_init(
@@ -902,27 +887,3 @@ def destroy_global_state() -> None:
     mpu.destroy_global_memory_buffer()
     mpu.destroy_model_parallel()
     destroy_rerun_state_machine()
-
-
-def setup_logging() -> None:
-    """Sets the default logging level based on cmdline args and env vars.
-
-    Precedence:
-    1. Command line argument `--logging-level`
-    2. Env var `MEGATRON_LOGGING_LEVEL`
-    3. Default logging level (INFO)
-
-    Returns: None
-    """
-    args = get_args()
-    logging_level = None
-    env_logging_level = os.getenv('MEGATRON_LOGGING_LEVEL', None)
-    if env_logging_level is not None:
-        logging_level = int(env_logging_level)
-    if args.logging_level is not None:
-        logging_level = args.logging_level
-
-    if logging_level is not None:
-        if is_rank0():
-            logger.info(f'Setting logging level to {logging_level}')
-        logging.getLogger().setLevel(logging_level)
