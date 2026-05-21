@@ -2561,8 +2561,10 @@ class MLATransformerConfig(TransformerConfig):
 
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
-       This is only for the dynamic inference backend and requires that 
-       Flash MLA is installed."""
+       This is only for the dynamic inference backend and requires FlashInfer
+       (the path runs through ``flashinfer.mla.BatchMLAPagedAttentionWrapper``,
+       which handles both decode and incremental prefill in compressed-KV
+       space)."""
 
     mla_down_proj_fusion: bool = False
     """Enable fused q/kv down-projection and fused input layernorm when backend supports.

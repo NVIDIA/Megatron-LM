@@ -58,9 +58,11 @@ except ImportError:
 
 try:
     import flashinfer  # type: ignore # pylint: disable=unused-import
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
     HAVE_FLASHINFER = True
 except ImportError:
+    BatchMLAPagedAttentionWrapper = None  # type: ignore[assignment,misc]
     HAVE_FLASHINFER = False
 
 try:
@@ -390,7 +392,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.block_size_tokens = inference_config.block_size_tokens
         if self.cache_mla_latent:
             #   one vector  c_t  (rank)  +  optional RoPE phase slice
-            self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
+            self.mla_kv_lora_rank = model_config.kv_lora_rank
+            self.mla_qk_pos_emb_head_dim = model_config.qk_pos_emb_head_dim
+            self.kv_reduced_dim = self.mla_kv_lora_rank + self.mla_qk_pos_emb_head_dim
             self.block_size_bytes = (
                 kv_dtype_size_bytes
                 * self.num_attention_layers
@@ -691,6 +695,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
         self.initialize_all_tensors()
+
+        # FlashInfer MLA paged-attention wrappers (one per CUDA-graph shape + eager).
+        # Allocated last because they depend on the bookkeeping/metadata config that
+        # initialize_all_tensors() finalizes.
+        if self.cache_mla_latent:
+            self._build_mla_paged_attention_wrappers()
 
         # Print info.
         active_blocks = self.kv_block_allocator.active_count
@@ -1545,6 +1555,131 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.memory_buffer[1, attention_layer_number],
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
+
+    def _build_mla_paged_attention_wrappers(self):
+        """Allocate FlashInfer ``BatchMLAPagedAttentionWrapper`` instances.
+
+        One wrapper is created per entry in ``cuda_graph_batch_dimensions_list``
+        (each with pre-allocated ``qo_indptr``/``kv_indptr``/``kv_indices``/
+        ``kv_len_arr`` buffers sized to that shape) plus one eager wrapper for
+        steps that don't hit a CUDA-graph shape. All wrappers share a single
+        128MB float workspace buffer.
+
+        Called once from ``__init__`` when ``cache_mla_latent=True``.
+        """
+        assert HAVE_FLASHINFER, (
+            "cache_mla_latents requires flashinfer-python. " "Install via the `dev` or `lts` extra."
+        )
+        device = torch.cuda.current_device()
+        # 128MB shared workspace, per FlashInfer's recommended sizing.
+        self._mla_workspace_buffer = torch.empty(
+            128 * 1024 * 1024, dtype=torch.uint8, device=device
+        )
+
+        self._mla_graph_wrappers: Dict[Tuple[int, int, int], "BatchMLAPagedAttentionWrapper"] = {}
+        for batch_dim in self.cuda_graph_batch_dimensions_list:
+            batch_size = batch_dim.req_count
+            qo_indptr_buf = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
+            kv_indptr_buf = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
+            kv_indices_buf = torch.empty(
+                max(1, batch_size * self.max_kv_block_count), dtype=torch.int32, device=device
+            )
+            kv_len_arr_buf = torch.empty(batch_size, dtype=torch.int32, device=device)
+            wrapper = BatchMLAPagedAttentionWrapper(
+                self._mla_workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=qo_indptr_buf,
+                kv_indptr=kv_indptr_buf,
+                kv_indices=kv_indices_buf,
+                kv_len_arr=kv_len_arr_buf,
+                backend="auto",
+            )
+            self._mla_graph_wrappers[
+                (batch_dim.token_count, batch_dim.prefill_req_count, batch_dim.decode_req_count)
+            ] = wrapper
+
+        self._mla_eager_wrapper = BatchMLAPagedAttentionWrapper(
+            self._mla_workspace_buffer, use_cuda_graph=False, backend="auto"
+        )
+
+    def mla_paged_attention(
+        self, layer_number: int, q_nope: Tensor, q_pe: Tensor, softmax_scale: float
+    ) -> Tensor:
+        """Run FlashInfer MLA paged attention on the active MLA latent cache.
+
+        Args:
+            layer_number: Local (PP-adjusted) 1-indexed layer number, same
+                convention as :meth:`key_value_cache`.
+            q_nope: Query in compressed-KV space, shape
+                ``[total_query_tokens, num_heads, kv_lora_rank]``. The caller is
+                responsible for the absorption ``einsum("thd,hdc->thc", q_no_pe,
+                up_k_weight)`` before calling this.
+            q_pe: RoPE-applied query slice, shape
+                ``[total_query_tokens, num_heads, qk_pos_emb_head_dim]``.
+            softmax_scale: Scalar multiplier for QK softmax (mscale already
+                applied if YaRN is enabled).
+
+        Returns:
+            Attention output in latent space, shape
+            ``[total_query_tokens, num_heads, kv_lora_rank]``. Callers map back
+            to ``v_head_dim`` by einsum with ``up_v_weight``.
+        """
+        assert self.cache_mla_latent, "mla_paged_attention requires cache_mla_latents=True"
+        assert self.active_attn_metadata is not None
+
+        attention_layer_number = self.layer_map[layer_number - 1]
+        page_size = self.block_size_tokens
+
+        if self.using_cuda_graph_this_step():
+            key = (
+                self.padded_batch_dimensions.token_count,
+                self.padded_batch_dimensions.prefill_req_count,
+                self.padded_batch_dimensions.decode_req_count,
+            )
+            wrapper = self._mla_graph_wrappers[key]
+        else:
+            wrapper = self._mla_eager_wrapper
+
+        # The CPU mirrors mirror_initialize_attention_state() refreshes per step
+        # already cover the indptr / kv-length / block-table data FlashInfer
+        # needs; convert MCore's [batch, max_kv_blocks] block_table (with -1
+        # sentinels) to FlashInfer's flat (kv_indices, kv_indptr) form.
+        batch_size = self.padded_batch_dimensions.req_count
+        qo_indptr = self._cpu_mha_cu_query_seq_lengths[: batch_size + 1].clone()
+        kv_len_arr = self._cpu_mha_kv_seq_lengths[:batch_size].clone()
+        kv_block_counts = (kv_len_arr + page_size - 1) // page_size
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
+        if batch_size > 0:
+            kv_indptr[1:] = torch.cumsum(kv_block_counts, dim=0)
+        total_blocks = int(kv_indptr[-1].item())
+        kv_indices = torch.empty(max(1, total_blocks), dtype=torch.int32)
+        for i in range(batch_size):
+            nb = int(kv_block_counts[i].item())
+            if nb == 0:
+                continue
+            start = int(kv_indptr[i].item())
+            kv_indices[start : start + nb] = self._cpu_mha_block_table[i, :nb]
+
+        layer_buf = self.memory_buffer[attention_layer_number]
+        ckv_cache = layer_buf[..., : self.mla_kv_lora_rank]
+        kpe_cache = layer_buf[..., self.mla_kv_lora_rank :]
+        num_heads = q_nope.shape[1]
+
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            num_heads,
+            self.mla_kv_lora_rank,
+            self.mla_qk_pos_emb_head_dim,
+            page_size,
+            True,  # causal
+            softmax_scale,
+            q_nope.dtype,
+            layer_buf.dtype,
+        )
+        return wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache)
 
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False
