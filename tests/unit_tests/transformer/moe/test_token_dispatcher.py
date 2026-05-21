@@ -107,8 +107,7 @@ class MoEModelTestContainer:
         )
         assert isinstance(submodules, MoESubmodules)
         new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = MoELayer(new_config, submodules).cuda().to(dtype=self.test_dtype)
-        moe_layer.set_layer_number(0)
+        moe_layer = MoELayer(new_config, submodules, layer_number=0).cuda().to(dtype=self.test_dtype)
         return moe_layer
 
     def __del__(self):
