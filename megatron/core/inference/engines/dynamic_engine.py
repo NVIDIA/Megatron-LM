@@ -1225,7 +1225,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip prefill requests: MTP heads only propose speculative tokens
                 # for decode requests, so counting prefill requests would inflate
                 # the denominator and artificially deflate the acceptance rate.
-                if not is_prefill and len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
+                if (
+                    not is_prefill
+                    and len(request.generated_tokens) > 0
+                    and self.num_speculative_tokens > 0
+                ):
                     actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
                     for pos in range(actual_proposed):
                         self._spec_tokens_proposed_per_pos[pos] += 1
@@ -1989,15 +1993,12 @@ class DynamicInferenceEngine(AbstractEngine):
                             * 100.0
                         )
                         per_pos_rates.append("t%d=%.1f%%" % (pos + 1, pos_rate))
-                output_str += (
-                    " ... spec (cumul): accept %.1f%% (%d/%d in %d steps) [%s]"
-                    % (
-                        spec_rate,
-                        total_accepted,
-                        total_proposed,
-                        self._spec_steps,
-                        ", ".join(per_pos_rates),
-                    )
+                output_str += " ... spec (cumul): accept %.1f%% (%d/%d in %d steps) [%s]" % (
+                    spec_rate,
+                    total_accepted,
+                    total_proposed,
+                    self._spec_steps,
+                    ", ".join(per_pos_rates),
                 )
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
                 output_str += " ... prefix cache (cumul): %d hits, %d blocks matched" % (

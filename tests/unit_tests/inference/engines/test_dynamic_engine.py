@@ -3372,7 +3372,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             logits[:, :, 0] = 100.0
             return hidden_states, logits
 
-
         unwrapped_model.forward = mock_mtp_forward
         unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
@@ -3384,7 +3383,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Add first request and run through prefill + some decode steps.
         env.engine.add_request(
             request_id=0,
-            prompt=torch.randint(0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'),
+            prompt=torch.randint(
+                0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'
+            ),
             sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
         )
 
@@ -3395,18 +3396,20 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         # Step 2: decode for request 0 — should count spec tokens.
         env.engine.step_modern()
-        assert sum(env.engine._spec_tokens_proposed_per_pos) > proposed_after_prefill, (
-            "Decode step should have incremented _spec_tokens_proposed_per_pos"
-        )
-        assert sum(env.engine._spec_tokens_accepted_per_pos) > accepted_after_prefill, (
-            "With deterministic mock, decode step should have accepted spec tokens"
-        )
+        assert (
+            sum(env.engine._spec_tokens_proposed_per_pos) > proposed_after_prefill
+        ), "Decode step should have incremented _spec_tokens_proposed_per_pos"
+        assert (
+            sum(env.engine._spec_tokens_accepted_per_pos) > accepted_after_prefill
+        ), "With deterministic mock, decode step should have accepted spec tokens"
 
         # Now add a second request while request 0 is decoding.
         # The next step is a mixed prefill (req 1) + decode (req 0) step.
         env.engine.add_request(
             request_id=1,
-            prompt=torch.randint(0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'),
+            prompt=torch.randint(
+                0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'
+            ),
             sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
         )
 
@@ -3436,15 +3439,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         # With deterministic mock (all tokens accepted), acceptance rate should be 100%.
         acceptance_rate = total_accepted / total_proposed
-        assert acceptance_rate == 1.0, (
-            f"Expected 100% acceptance with deterministic mock, got {acceptance_rate * 100:.1f}%"
-        )
+        assert (
+            acceptance_rate == 1.0
+        ), f"Expected 100% acceptance with deterministic mock, got {acceptance_rate * 100:.1f}%"
 
         # With deterministic mock, every position should have 100% acceptance.
         for pos in range(test_config.num_speculative_tokens):
-            assert env.engine._spec_tokens_proposed_per_pos[pos] > 0, (
-                f"Position {pos} should have proposals"
-            )
+            assert (
+                env.engine._spec_tokens_proposed_per_pos[pos] > 0
+            ), f"Position {pos} should have proposals"
             pos_rate = (
                 env.engine._spec_tokens_accepted_per_pos[pos]
                 / env.engine._spec_tokens_proposed_per_pos[pos]
@@ -3453,7 +3456,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"Expected 100% acceptance at position {pos} with deterministic mock, "
                 f"got {pos_rate * 100:.1f}%"
             )
-
 
     @pytest.mark.internal
     @pytest.mark.skipif(
