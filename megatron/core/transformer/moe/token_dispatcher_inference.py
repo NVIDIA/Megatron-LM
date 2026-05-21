@@ -472,6 +472,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
+        # Rank inside pg_collection.tp — the *standard* TP group that SP shards
+        # the routing map along. Base class self.tp_rank is the expt_tp rank,
+        # which is not what we want for the SP padding offset.
+        self.sp_rank = get_pg_rank(pg_collection.tp)
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
         # When shared_expert_overlap is enabled, the shared expert forward is launched
@@ -530,8 +534,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         # Mask out CUDA-graph padding rows of the local routing map so the AGV
         # propagates -1 into agv_r for those slots; padding tokens then route
-        # to no expert. _real_token_count_tensor is wired by the context.
-        mask_routing_padding(self.routing_map, self.__class__._real_token_count_tensor)
+        # to no expert. _real_token_count_tensor is wired by the context and
+        # holds the *global* unpadded token count, so we pass self.sp_rank to
+        # shift local rows into the global frame for the comparison.
+        mask_routing_padding(
+            self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
+        )
 
         agv_h = self.__class__._symm_agv_hidden
         agv_r = self.__class__._symm_agv_routing

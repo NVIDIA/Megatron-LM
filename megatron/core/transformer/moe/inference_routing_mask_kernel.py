@@ -35,9 +35,6 @@ except ImportError:
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": 8}),
-        triton.Config({"BLOCK_M": 16}),
-        triton.Config({"BLOCK_M": 32}),
-        triton.Config({"BLOCK_M": 64}),
         triton.Config({"BLOCK_M": 128})
     ],
     key=["total_rows", "TOPK"],
@@ -47,6 +44,7 @@ def _mask_routing_padding_kernel(
     routing_map_ptr,          # int64* [total_rows, topk]
     real_token_count_ptr,     # int32* [1]
     total_rows: tl.int32,
+    tp_rank: tl.int32,        # SP/TP rank — local row r maps to global row r + tp_rank*total_rows
     TOPK: tl.constexpr,       # actual topk
     BLOCK_M: tl.constexpr,    # rows per program (autotuned)
     BLOCK_TOPK: tl.constexpr, # next_power_of_2(TOPK), column block
@@ -57,7 +55,9 @@ def _mask_routing_padding_kernel(
 
     real_count = tl.load(real_token_count_ptr).to(tl.int32)
 
-    row_mask = (rows >= real_count) & (rows < total_rows)
+    # real_count is in the global (pre-SP-shard) frame; rows is local to this SP rank.
+    global_rows = rows + tp_rank * total_rows
+    row_mask = (global_rows >= real_count) & (rows < total_rows)
 
     cols = tl.arange(0, BLOCK_TOPK)
     col_mask = cols < TOPK
@@ -69,15 +69,21 @@ def _mask_routing_padding_kernel(
     tl.store(routing_map_ptr + offs, neg_one, mask=mask)
 
 
-def mask_routing_padding(routing_map: Tensor, real_token_count_tensor: Tensor) -> None:
+def mask_routing_padding(
+    routing_map: Tensor, real_token_count_tensor: Tensor, tp_rank: int = 0
+) -> None:
     """In-place fill -1 into ``routing_map[real_token_count:, :]``.
 
     Args:
         routing_map: ``[N, topk]`` int64 local routing map. ``N`` is the
             (possibly CUDA-graph-padded) local token count.
         real_token_count_tensor: ``[1]`` int32 GPU tensor holding the real
-            (unpadded) token count for this step. Read inside the kernel so
-            the mask boundary moves correctly across CUDA-graph replays.
+            (unpadded) token count for this step, in the global (pre-SP-shard)
+            frame. Read inside the kernel so the mask boundary moves correctly
+            across CUDA-graph replays.
+        tp_rank: This rank's index in the SP/TP group. Local row ``r`` is
+            row ``r + tp_rank * N`` in the global frame; the kernel uses this
+            offset to compare against ``real_token_count_tensor``.
     """
     assert routing_map.is_cuda, "routing_map must be on CUDA"
     assert routing_map.dim() == 2, f"expected 2D routing_map, got {routing_map.shape}"
@@ -95,6 +101,7 @@ def mask_routing_padding(routing_map: Tensor, real_token_count_tensor: Tensor) -
         routing_map,
         real_token_count_tensor,
         total_rows=total_rows,
+        tp_rank=tp_rank,
         TOPK=topk,
         BLOCK_TOPK=BLOCK_TOPK,
     )

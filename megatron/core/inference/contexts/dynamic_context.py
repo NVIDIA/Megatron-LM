@@ -2074,6 +2074,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self.batch_dimensions = batch_dimensions
+        # Real (unpadded) token count for the MoE routing mask. Zero on steps
+        # where this rank has no real work — CUDA-graph capture (warmup) or a
+        # dummy expert-parallel step — so MoE dispatch masks every token out.
+        if construct_graph_dimensions is not None or is_expert_parallel_dummy_cuda_graph_step:
+            self.real_token_count = 0
+        else:
+            self.real_token_count = batch_dimensions.token_count
 
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
@@ -2359,8 +2366,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Real (unpadded) token count for this step. CUDA-graph replay pads
         # the token dim to a captured size; MoE routing reads this on GPU to
-        # drop the padding tokens before dispatching to experts.
-        self._staging_real_token_count[0] = self.batch_dimensions.token_count
+        # drop the padding tokens before dispatching to experts. Set to 0 on
+        # CUDA-graph capture / dummy EP steps so all tokens are masked out.
+        self._staging_real_token_count[0] = self.real_token_count
 
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
