@@ -19,7 +19,6 @@ from megatron.training.utils.common_utils import (
     is_first_or_last_pipeline_stage,
     get_device_arch_version,
     get_blend_and_blend_per_split,
-    get_batch_on_this_tp_rank,
     update_use_dist_ckpt,
     to_empty_if_meta_device,
     get_nvtx_range,
