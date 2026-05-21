@@ -2282,25 +2282,26 @@ class TransformerConfig(ModelParallelConfig):
                         )
 
             if self.fine_grained_activation_offloading:
-                assert self.cuda_graph_impl == "transformer_engine" or (
-                    self.cuda_graph_impl == "local"
-                    and self.cuda_graph_scope == [CudaGraphScope.full_iteration]
-                ), (
+                assert self.cuda_graph_impl in ("transformer_engine", "full_iteration"), (
                     "fine-grained activation offloading is only supported with "
                     "transformer_engine CUDA graph implementation or local CUDA graph "
                     "implementation with full_iteration scope."
                 )
                 assert (
-                    CudaGraphScope.moe not in self.cuda_graph_scope
+                    CudaGraphModule.moe not in self.cuda_graph_modules
                 ), "Token-drop MoE is temporarily not supported with activation offloading."
                 assert self.cuda_graph_warmup_steps > 0, (
                     "cuda_graph_warmup_steps must be greater than 0 when enabling "
                     "fine-grained activation offloading."
                 )
-                if CudaGraphScope.full_iteration in self.cuda_graph_scope:
-                    assert self.fine_grained_offloading_max_inflight_offloads is not None, (
-                        "fine_grained_offloading_max_inflight_offloads must be set when using "
-                        "fine-grained activation offloading with full-iteration CUDA graphs "
+                if self.cuda_graph_impl == "full_iteration":
+                    assert (
+                        self.fine_grained_offloading_max_inflight_offloads is not None
+                        and self.fine_grained_offloading_max_inflight_offloads >= 0
+                    ), (
+                        "fine_grained_offloading_max_inflight_offloads must be a non-negative "
+                        "integer when using fine-grained activation offloading with "
+                        "full-iteration CUDA graphs"
                     )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
