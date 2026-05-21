@@ -15,7 +15,7 @@ except ImportError:
 
 def _to_local_if_dtensor(tensor):
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        return tensor.to_local()
+        return tensor._local_tensor
     return tensor
 
 
