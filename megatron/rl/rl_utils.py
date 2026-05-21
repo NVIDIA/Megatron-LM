@@ -1990,7 +1990,6 @@ def megatron_rl_inference_mode(
 
     # Use local CUDA graphs during rollout inference. An empty module list preserves
     # full-layer capture when the configured inference scope is layer.
-    # Respect `--cuda-graph-impl=none` (parity runs) by leaving the impl alone.
     model[0].config.cuda_graph_modules = []
     if args.cuda_graph_impl != "none":
         model[0].config.cuda_graph_impl = "local"
