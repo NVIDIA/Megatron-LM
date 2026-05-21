@@ -106,6 +106,17 @@ class TextGenerationController:
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
+        if not self.num_speculative_tokens:
+            self.num_mtp_depths = 0
+        else:
+            assert self.model_config.mtp_num_layers and self.model_config.mtp_num_layers >= 1, (
+                "mtp_num_layers must be >= 1 when num_speculative_tokens > 0"
+            )
+            if self.model_config.mtp_use_repeated_layer:
+                self.num_mtp_depths = self.num_speculative_tokens
+            else:
+                self.num_mtp_depths = min(self.num_speculative_tokens, self.model_config.mtp_num_layers)
+
         if (
             self.model_config.cuda_graph_impl == "local"
             and self.model_config.expert_model_parallel_size > 1
@@ -214,10 +225,6 @@ class TextGenerationController:
             max_requests, dtype=torch.int64, device=device
         )
         self._last_accepted_seq_indices = None
-        if self.model_config.mtp_use_repeated_layer:
-            self.num_mtp_depths = self.num_speculative_tokens
-        else:
-            self.num_mtp_depths = min(self.num_speculative_tokens, self.model_config.mtp_num_layers or 0)
         self._mtp_token_ids_buf = torch.empty([1, max_requests], dtype=torch.int64, device=device)
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
