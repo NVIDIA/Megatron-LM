@@ -431,10 +431,18 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
     """
     metadata = {}
 
-    if args.use_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
+    # ``use_layer_wise_distributed_optimizer`` shares the DistOpt sub-optimizer
+    # for non-Muon params (embeddings, biases, layernorm, ...), so it needs the
+    # same sharding-type metadata even though the parser flips
+    # ``use_distributed_optimizer`` off in that mode.
+    has_distributed_optimizer = args.use_distributed_optimizer or getattr(
+        args, 'use_layer_wise_distributed_optimizer', False
+    )
+
+    if has_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
         metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
 
-    if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+    if has_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
         if args.dist_ckpt_optim_fully_reshardable:
             metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
             metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
