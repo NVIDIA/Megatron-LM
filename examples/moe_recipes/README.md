@@ -26,21 +26,21 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>256</td>
       <td>1/8/32/1/1</td>
       <td>1/2048/4096</td>
-      <td>DeepEP<br>MoE overlap</td>
+      <td>DeepEP; EP overlap</td>
     </tr>
     <tr>
       <td><a href="deepseek_v3/gb200/mxfp8_256GPU_TP1PP4EP64.yaml">GB200 MXFP8</a></td>
       <td>256</td>
       <td>1/4/64/1/1</td>
       <td>1/8192/4096</td>
-      <td>HybridEP<br>partial CG<br>MoE overlap<br>offload</td>
+      <td>HybridEP; partial CG; EP overlap; offload</td>
     </tr>
     <tr>
       <td><a href="deepseek_v3/gb300/mxfp8_256GPU_TP1PP4EP64.yaml">GB300 MXFP8</a></td>
       <td>256</td>
       <td>1/4/64/1/1</td>
       <td>1/8192/4096</td>
-      <td>HybridEP<br>partial CG<br>MoE overlap</td>
+      <td>HybridEP; partial CG; EP overlap</td>
     </tr>
     <tr>
       <td><a href="deepseek_v3/h100/bf16_1024GPU_TP1PP16EP64.yaml">H100 BF16</a></td>
@@ -54,7 +54,7 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1024</td>
       <td>2/8/64/1/1</td>
       <td>1/8192/4096</td>
-      <td>DeepEP<br>MoE overlap</td>
+      <td>DeepEP; EP overlap</td>
     </tr>
     <tr>
       <td rowspan="4">Qwen3-235B-A22B</td>
@@ -62,28 +62,28 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>128</td>
       <td>1/1/64/1/1</td>
       <td>1/8192/4096</td>
-      <td>paged stash<br>full CG<br>HybridEP<br>MoE overlap</td>
+      <td>paged stash; full CG; HybridEP; EP overlap</td>
     </tr>
     <tr>
       <td><a href="qwen3_235b/gb200/mxfp8_128GPU_TP1PP1EP64_partial_cg_overlap.yaml">GB200 MXFP8 partial CG</a></td>
       <td>128</td>
       <td>1/1/64/1/1</td>
       <td>1/8192/4096</td>
-      <td>partial CG<br>HybridEP<br>MoE overlap</td>
+      <td>partial CG; HybridEP; EP overlap</td>
     </tr>
     <tr>
       <td><a href="qwen3_235b/gb300/mxfp8_128GPU_TP1PP1EP64_paged_stash_full_cg.yaml">GB300 MXFP8 full CG</a></td>
       <td>128</td>
       <td>1/1/64/1/1</td>
       <td>1/8192/4096</td>
-      <td>paged stash<br>full CG<br>HybridEP<br>MoE overlap</td>
+      <td>paged stash; full CG; HybridEP; EP overlap</td>
     </tr>
     <tr>
       <td><a href="qwen3_235b/h100/bf16_256GPU_TP2PP8EP32.yaml">H100 BF16</a></td>
       <td>256</td>
       <td>2/8/32/1/1</td>
       <td>1/2048/4096</td>
-      <td>router/preprocess CG<br>HybridEP<br>MoE overlap</td>
+      <td>router/preprocess CG; HybridEP; EP overlap</td>
     </tr>
   </tbody>
 </table>
