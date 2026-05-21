@@ -431,10 +431,18 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
     """
     metadata = {}
 
-    if args.use_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
+    # ``use_layer_wise_distributed_optimizer`` shares the DistOpt sub-optimizer
+    # for non-Muon params (embeddings, biases, layernorm, ...), so it needs the
+    # same sharding-type metadata even though the parser flips
+    # ``use_distributed_optimizer`` off in that mode.
+    has_distributed_optimizer = args.use_distributed_optimizer or getattr(
+        args, 'use_layer_wise_distributed_optimizer', False
+    )
+
+    if has_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
         metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
 
-    if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+    if has_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
         if args.dist_ckpt_optim_fully_reshardable:
             metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
             metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
@@ -1554,6 +1562,8 @@ def load_args_from_checkpoint(
     _set_arg('moe_token_dispatcher_type', force=False)
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
+    _set_arg('moe_single_grouped_weight', force=True)
+    _set_arg('moe_single_grouped_bias', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
     _set_arg('moe_router_score_function', force=True)
     _set_arg('moe_router_enable_expert_bias', force=True)

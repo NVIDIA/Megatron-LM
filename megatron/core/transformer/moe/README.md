@@ -259,7 +259,7 @@ After establishing a working parallel configuration, profile your training to id
 | Optimization | Config |
 |--------------|--------|
 | Disable Python GC | `--manual-gc --manual-gc-interval 100` |
-| Enable CUDA Graphs | `--cuda-graph-impl transformer_engine --cuda-graph-scope attn moe_router moe_preprocess` |
+| Enable CUDA Graphs | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router moe_preprocess` |
 | Reduce kernel launches | Decrease TP size or increase micro-batch size |
 
 #### Computation Bottleneck
@@ -499,14 +499,19 @@ FP8 training provides benefits across all three performance walls:
 
 
 ### CUDA Graph
-CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are two implementations:
+CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are three implementations:
 
-1. `--cuda-graph-impl=local`: Captures cuda graphs using the MCore-internal cuda graph manager.
-2. `--cuda-graph-impl=transformer_engine`: Captures cuda graphs using the TE `make_graphed_callables()` interface.
+1. `--cuda-graph-impl=local`: Captures per-layer cuda graphs using the MCore-internal cuda graph manager.
+2. `--cuda-graph-impl=transformer_engine`: Captures per-layer cuda graphs using the TE `make_graphed_callables()` interface.
+3. `--cuda-graph-impl=full_iteration`: Captures the whole training/evaluation forward-backward iteration as a single cuda graph.
+
+For inference, CUDA graph scope is controlled separately with
+`--inference-cuda-graph-scope=layer|block` together with
+`--cuda-graph-impl=local`.
 
 To use `--cuda-graph-impl=transformer_engine`, the user should call related methods `TECudaGraphHelper.create_cudagraphs()` and `TECudaGraphHelper.cuda_graph_set_manual_hooks()` in the training script. Please refer to the usage in `megatron/training/training.py`.
 
-For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-scope=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-scope`.
+For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-modules=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-modules`.
 
 ## MoE Arguments Reference
 ### Core Arguments
