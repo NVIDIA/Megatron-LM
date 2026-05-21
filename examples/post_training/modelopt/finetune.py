@@ -29,6 +29,8 @@ from megatron.training.utils import (
 )
 from utils import get_hf_tokenizer
 from model_provider import model_provider
+from megatron.core.parallel_state import get_context_parallel_group
+
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"
@@ -435,7 +437,7 @@ def get_batch(data_iterator):
         batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:args.seq_length]
 
     # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch)
+    batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=get_context_parallel_group())
 
     return batch
 
