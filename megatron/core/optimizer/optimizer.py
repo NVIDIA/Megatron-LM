@@ -1286,28 +1286,37 @@ class ChainedOptimizer(MegatronOptimizer):
         success = True
         # With MXFP8 grad-buffer reuse and non-overlap param gather, each DistOpt stages
         # its own updated main-param shards into its param buffers during step. However,
-        # param sync is a DDP model-chunk operation: model_chunk.start_param_sync() gathers
-        # both dense and expert bucket groups, copies gathered values into model weights,
-        # and zeros the shared MXFP8 param/grad buffers. For MoE, dense and expert DistOpts
-        # may share the same model chunk, so defer param sync until all chained optimizers
-        # have staged their params, then sync each model chunk once.
+        # param sync is a DDP bucket-group operation that copies gathered values into model
+        # weights and zeros the shared MXFP8 param/grad buffers. For MoE, dense and expert
+        # DistOpts may share the same model chunk, so defer param sync until all chained
+        # optimizers have staged their params, then sync each DistOpt-managed bucket group once.
         defer_param_sync = (
             self.config.reuse_grad_buf_for_mxfp8_param_ag and not self.config.overlap_param_gather
         )
-        deferred_model_chunks = []
-        deferred_model_chunk_ids = set()
+        deferred_bucket_groups = []
+        deferred_bucket_group_ids = set()
 
         if defer_param_sync:
             from .distrib_optimizer import DistributedOptimizer
+            from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
 
             for optimizer in self.chained_optimizers:
                 if isinstance(optimizer, DistributedOptimizer):
                     optimizer._defer_param_sync = True
                     for model_chunk in optimizer.model_chunks:
-                        model_chunk_id = id(model_chunk)
-                        if model_chunk_id not in deferred_model_chunk_ids:
-                            deferred_model_chunk_ids.add(model_chunk_id)
-                            deferred_model_chunks.append(model_chunk)
+                        for bucket_group in (
+                            model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+                        ):
+                            if not bucket_group.buckets:
+                                continue
+                            if _bucket_is_managed_by_layer_wise_optimizer(
+                                bucket_group.buckets[0], default_for_untagged=False
+                            ):
+                                continue
+                            bucket_group_id = id(bucket_group)
+                            if bucket_group_id not in deferred_bucket_group_ids:
+                                deferred_bucket_group_ids.add(bucket_group_id)
+                                deferred_bucket_groups.append((model_chunk, bucket_group))
 
         try:
             for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
@@ -1322,14 +1331,14 @@ class ChainedOptimizer(MegatronOptimizer):
                     if hasattr(optimizer, '_defer_param_sync'):
                         optimizer._defer_param_sync = False
 
-        if defer_param_sync and success:
+        if defer_param_sync and success and deferred_bucket_groups:
             timers = self.config.timers
             if timers is not None:
                 timers('params-all-gather', log_level=1).start(
                     barrier=self.config.barrier_with_L1_time
                 )
-            for model_chunk in deferred_model_chunks:
-                model_chunk.start_param_sync()
+            for model_chunk, bucket_group in deferred_bucket_groups:
+                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
             if timers is not None:
                 timers('params-all-gather').stop()
 
