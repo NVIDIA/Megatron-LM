@@ -15,6 +15,7 @@ from megatron.core.transformer.moe.paged_stash import (
     paged_stash_init_chunk_handler,
     paged_stash_reset,
 )
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
@@ -136,7 +137,7 @@ class MoEModelTestContainer:
         quantization_context = get_fp8_context(self.config, layer_number, is_init=True)
         with quantization_context:
             moe_layer = (
-                MoELayer(self.config, transformer_layer_spec.submodules.mlp.submodules)
+                MoELayer(self.config, get_submodules(transformer_layer_spec.submodules.mlp))
                 .cuda()
                 .to(dtype=self.test_dtype)
             )
