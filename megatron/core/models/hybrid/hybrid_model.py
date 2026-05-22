@@ -382,8 +382,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
-            return super().__call__(*args, **kwargs)[0]
-        return super().__call__(*args, **kwargs)
+            result = super().__call__(*args, **kwargs)[0]
+        else:
+            result = super().__call__(*args, **kwargs)
+        if isinstance(result, tuple):
+            logits, hidden_states = result
+            self._decoder_hidden_states_cache = hidden_states
+            return logits
+        return result
 
     def create_mcore_cudagraph_manager(self, config):
         """
@@ -526,10 +532,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if not self.post_process:
             return hidden_states
 
+        decoder_hidden_states_for_mtp = None
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
             if in_inference_mode or is_spec_decode:
-                self._decoder_hidden_states_cache = hidden_states
+                decoder_hidden_states_for_mtp = hidden_states
             else:
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
@@ -585,7 +592,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if labels is None:
             # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
+            logits = logits.transpose(0, 1).contiguous()
+            if decoder_hidden_states_for_mtp is not None:
+                return logits, decoder_hidden_states_for_mtp
+            return logits
 
         loss = self.compute_language_model_loss(labels, logits)
 
