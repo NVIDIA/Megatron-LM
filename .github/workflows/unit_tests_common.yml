@@ -99,7 +99,6 @@ jobs:
             path: "tests/unit_tests/export/ tests/unit_tests/post_training/ tests/unit_tests/tokenizers/ tests/unit_tests/utils/"
             description: "Other tests (export, post_training, tokenizers, utils)"
     name: unit-${{ inputs.device }}-${{ matrix.test_group.name }}
-    if: ${{ matrix.test_group.cuda_only != true || inputs.platform == 'cuda' }}
     container:
       image: ${{ inputs.image }}
       ports:
@@ -109,6 +108,7 @@ jobs:
     steps:
       - name: Checkout Source Code (attempt 1)
         id: checkout1
+        if: ${{ matrix.test_group.cuda_only != true || inputs.platform == 'cuda' }}
         uses: actions/checkout@v4
         continue-on-error: true
         with:
@@ -117,7 +117,7 @@ jobs:
           
       - name: Checkout Source Code (attempt 2)
         id: checkout2
-        if: steps.checkout1.outcome == 'failure'
+        if: ${{ (matrix.test_group.cuda_only != true || inputs.platform == 'cuda') && steps.checkout1.outcome == 'failure' }}
         uses: actions/checkout@v4
         continue-on-error: true
         with:
@@ -126,13 +126,14 @@ jobs:
 
       - name: Checkout Source Code (attempt 3)
         id: checkout3
-        if: steps.checkout2.outcome == 'failure'
+        if: ${{ (matrix.test_group.cuda_only != true || inputs.platform == 'cuda') && steps.checkout2.outcome == 'failure' }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           set-safe-directory: true
 
       - name: Setup Python environment
+        if: ${{ matrix.test_group.cuda_only != true || inputs.platform == 'cuda' }}
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
@@ -171,6 +172,7 @@ jobs:
 
       - name: Run unit tests - ${{ matrix.test_group.name }}
         id: unit_test
+        if: ${{ matrix.test_group.cuda_only != true || inputs.platform == 'cuda' }}
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
@@ -250,6 +252,7 @@ jobs:
 
       - name: Upload Coverage Report
         uses: actions/upload-artifact@v4
+        if: ${{ matrix.test_group.cuda_only != true || inputs.platform == 'cuda' }}
         continue-on-error: true
         with:
           name: coverage-${{ inputs.platform }}-${{ inputs.device }}-${{ matrix.test_group.name }}
@@ -257,6 +260,7 @@ jobs:
 
       - name: Upload Coverage Report to FlagCICD
         uses: flagos-ai/FlagOps/actions/post-pytest-report@v2
+        if: ${{ matrix.test_group.cuda_only != true || inputs.platform == 'cuda' }}
         continue-on-error: true
         env:
           NO_PROXY: "flagcicd-inner.flagos.net"
