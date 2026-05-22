@@ -1,14 +1,15 @@
-# Single-GPU inference perf tests. For 8-GPU variants, see gpt-perf-dp8.yaml.
+# 8-GPU (EP=8) inference perf tests for hybrid MoE models. Exercises the
+# MoE router/dispatcher path on top of mamba state evolution.
 type: basic
 format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
   name: '{test_case}_{environment}_{platforms}'
-  model: gpt
+  model: hybrid
   build: mcore-pyt-{environment}
   nodes: 1
-  gpus: 1
+  gpus: 8
   n_repeat: 1
   platforms: dgx_h100
   time_limit: 3600
@@ -28,15 +29,15 @@ spec:
     cd /opt/megatron-lm
 
     ARGUMENTS=(
-        "CONFIG_PATH=tests/performance_tests/test_cases/gpt/{test_case}/model_config.yaml"
+        "CONFIG_PATH=tests/performance_tests/test_cases/hybrid/{test_case}/model_config.yaml"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts/"
         "RESULTS_ROOT={assets_dir}/perf_results"
     )
 
-    GPUS_PER_NODE=1 bash ./tests/performance_tests/shell_test_utils/run_perf_test.sh ${{ARGUMENTS[@]}}
+    GPUS_PER_NODE=8 bash ./tests/performance_tests/shell_test_utils/run_perf_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [gpt_16b_perf]
+  - test_case: [hybrid_nanov3_3b_perf]
     products:
       - environment: [dev]
         scope: [mr]
