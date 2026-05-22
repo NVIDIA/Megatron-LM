@@ -23,7 +23,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
 )
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 
 
 def build_mtp_layer_callables(layer):
@@ -45,6 +45,27 @@ def build_mtp_layer_callables(layer):
     def submodule_mtp_pre_dispatch_forward(node, hidden_states):
         # MTP Block Preprocess
         if node.is_first_layer:
+            # Apply the main decoder's final_norm if this VPP chunk owns it but
+            # holds no main HybridStack layers — without this, ``_maybe_apply_final_norm``
+            # never fires for the main path and the unnormalized hidden_states feed
+            # straight into the LM head (lm_loss explodes by ~10x; grads diverge).
+            # Restricted to HybridModel because GPT models go through a different
+            # MTP wiring path. Must run before ``torch.chunk`` so every chunk —
+            # including the main-decoder slice consumed by the LM head — sees
+            # the norm; the MTP slices then go through MTP's own ``hnorm`` as usual.
+            from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+            model = node.chunk_state.model
+            if isinstance(model, HybridModel) and len(model.decoder.layers) == 0:
+                final_norm = getattr(model.decoder, "final_norm", None) or getattr(
+                    model.decoder, "final_layernorm", None
+                )
+                if final_norm is not None:
+                    hidden_states = final_norm(hidden_states)
+                    hidden_states = make_viewless_tensor(
+                        inp=hidden_states, requires_grad=True, keep_graph=True
+                    )
+
             offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
             hidden_states = node.chunk_state.mtp_hidden_states[offset]
