@@ -1042,18 +1042,29 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _bik_global_unpermute(
         self, fc2_output, permuted_probs, permutation_map, n_used, hidden_states
     ):
-        """Cross-EP global deterministic unpermute (BIK + EP > 1).
+        """AllToAll-padded cross-EP deterministic unpermute (BIK + EP > 1).
 
-        Each rank's `(fc2_output, permuted_probs, permutation_map)` carries the
-        per-contribution data its experts produced. We AllGather these across
-        the EP group (with rank offsets baked into permutation_map so indices
-        don't collide), then run a single `deterministic_index_add` on the
-        gathered tensors. Result: every rank holds the same `[max_tokens, H]`
-        full sum, with the *same* reduction tree training would use.
+        Each rank's contribs (fc2_output * permuted_probs in fp32) are routed
+        directly to the rank that owns their destination token: one fixed-shape
+        AllToAll-single instead of broadcast. Each rank then runs a *local*
+        deterministic_index_add over the received contribs, producing the same
+        result training would.
 
-        CG-compat: AllGather is fixed-shape (fc2_output is bounded by
-        max_tokens * topk * alignment); deterministic_index_add has no
-        host syncs.
+        Versus AllGather + global unpermute:
+          * Bandwidth: each contrib travels exactly once instead of ep_size
+            times → ~ep_size× less data crosses the network.
+          * Memory: send/recv buffers are O(N_local) per rank instead of
+            O(ep_size · N_local) → ~ep_size/2× smaller.
+
+        Per-token K-contrib sum order matches training because:
+          1. stable argsort by dest_rank groups same-dest contribs in their
+             original (expert-sorted) order within each src→dest bucket;
+          2. AllToAll-single packs receive buffer in source-rank-major order;
+          3. deterministic_index_add sorts by (token_id, position) — same
+             secondary key (source-rank major) the training combine produces.
+
+        CG-compat: all shapes are static (bincount uses minlength=ep_size+1;
+        AllToAll-single uses equal chunks per rank).
         """
         import torch.distributed as dist
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -1061,54 +1072,101 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
 
         ep_size = self.ep_group.size()
+        rank = self.ep_group.rank()
         max_tokens = hidden_states.shape[0]
         H = hidden_states.shape[-1]
-        N_local = fc2_output.shape[0]  # max bound on this rank's contribs
+        N_local = fc2_output.shape[0]
+        local_tokens = max_tokens // ep_size
+        device = fc2_output.device
 
-        # Build the per-rank weighted contribution: fc2_output * permuted_probs
-        # in fp32 to match training's deterministic_index_add accumulator.
+        # Per-destination bucket size: in balanced routing each src→dest pair
+        # carries at most N_local/ep_size contribs. Slack for per-expert
+        # alignment padding (16-aligned blocks).
+        max_per_dest = (N_local + ep_size - 1) // ep_size + self.num_local_experts * 32
+
+        # fp32 weighted contribution (matches training accumulator dtype).
         weighted = (fc2_output.to(torch.float32) *
                     permuted_probs.to(torch.float32).unsqueeze(-1))
 
-        # AllGather the weighted contribs and permutation_map across EP.
-        # Fixed shapes: every rank contributes exactly N_local rows.
-        gathered_contribs = torch.empty(
-            ep_size * N_local, H, device=fc2_output.device, dtype=torch.float32,
+        # dest_rank[i] = home rank of contrib i's destination token; ep_size = drop.
+        perm_long = permutation_map.to(torch.long)
+        dest_rank = torch.where(
+            perm_long < 0,
+            torch.full_like(perm_long, ep_size),
+            perm_long // local_tokens,
         )
-        dist.all_gather_into_tensor(gathered_contribs, weighted, group=self.ep_group)
+        pos_idx = torch.arange(N_local, device=device, dtype=torch.long)
+        # Rows past n_used are alignment padding — mark them as drop too.
+        dest_rank = torch.where(
+            pos_idx < n_used.to(torch.long),
+            dest_rank,
+            torch.full_like(dest_rank, ep_size),
+        )
+        local_token_id = torch.where(
+            perm_long < 0,
+            torch.zeros_like(perm_long),
+            perm_long % local_tokens,
+        ).to(torch.float32)
 
-        # permutation_map is int32; AllGather it then mask out invalid (-1)
-        # entries via deterministic_index_add's valid_mask.
-        gathered_perm = torch.empty(
-            ep_size * N_local, device=permutation_map.device, dtype=permutation_map.dtype,
-        )
-        dist.all_gather_into_tensor(gathered_perm, permutation_map, group=self.ep_group)
+        # Stable sort by dest_rank groups same-dest contribs while preserving
+        # their original (expert-sorted) order — this is the secondary sort
+        # key that lets us match training bitwise.
+        sort_idx = torch.argsort(dest_rank, stable=True)
+        sorted_dest = dest_rank[sort_idx]
+        sorted_weighted = weighted[sort_idx]
+        sorted_local_id = local_token_id[sort_idx]
 
-        # Build a valid-mask: each rank's contribs are valid for positions
-        # [0, n_used_per_rank). We also AllGather n_used (a 1-elem int32) to
-        # know each rank's prefix.
-        n_used_per_rank = torch.empty(
-            ep_size, device=n_used.device, dtype=n_used.dtype,
-        )
-        dist.all_gather_into_tensor(n_used_per_rank, n_used, group=self.ep_group)
-        # Build mask of shape (ep_size * N_local,): True where row index within
-        # rank r is < n_used_per_rank[r].
-        row_within_rank = (
-            torch.arange(N_local, device=fc2_output.device)
-            .unsqueeze(0)
-            .expand(ep_size, N_local)
-        )
-        valid_mask = (
-            (row_within_rank < n_used_per_rank.unsqueeze(-1).to(torch.long))
-            & (gathered_perm.view(ep_size, N_local) >= 0)
-        ).reshape(-1)
+        # Position within bucket: sorted-order index minus its bucket's start.
+        counts = torch.bincount(dest_rank, minlength=ep_size + 1)
+        offsets = torch.cat([
+            torch.zeros(1, device=device, dtype=counts.dtype),
+            counts.cumsum(0)[:-1],
+        ])
+        position_in_bucket = pos_idx - offsets[sorted_dest]
 
-        # Global unpermute: sum all gathered contribs into `out[token_id]`.
-        out = torch.zeros(max_tokens, H, device=fc2_output.device, dtype=torch.float32)
+        # Any contrib that would exceed max_per_dest is redirected to the
+        # ep_size (drop) bucket and dropped by the AllToAll send slice.
+        in_bounds = position_in_bucket < max_per_dest
+        safe_dest = torch.where(in_bounds, sorted_dest,
+                                torch.full_like(sorted_dest, ep_size))
+        safe_pos = position_in_bucket.clamp(max=max_per_dest - 1)
+
+        # Pack contribs into [ep_size+1, max_per_dest, H+1]. Last column carries
+        # the destination's local_token_id; -1 marks an empty slot.
+        send_buf = torch.zeros(
+            ep_size + 1, max_per_dest, H + 1, device=device, dtype=torch.float32,
+        )
+        send_buf[..., H] = -1.0
+        send_buf[safe_dest, safe_pos, :H] = sorted_weighted
+        send_buf[safe_dest, safe_pos, H] = sorted_local_id
+
+        # AllToAll-single: send only the ep_size real buckets (drop slot is skipped).
+        send_for_a2a = send_buf[:ep_size].contiguous()
+        recv_buf = torch.empty_like(send_for_a2a)
+        dist.all_to_all_single(recv_buf, send_for_a2a, group=self.ep_group)
+
+        # Flatten source-rank-major so the secondary sort matches training.
+        recv_flat = recv_buf.reshape(-1, H + 1)
+        recv_weighted = recv_flat[:, :H]
+        recv_local_id_fp = recv_flat[:, H]
+        valid_mask = recv_local_id_fp >= 0.0
+        recv_local_id = torch.where(
+            valid_mask, recv_local_id_fp, torch.zeros_like(recv_local_id_fp),
+        ).to(torch.int64)
+
+        # Local deterministic_index_add over received contribs.
+        local_out = torch.zeros(local_tokens, H, device=device, dtype=torch.float32)
         deterministic_index_add(
-            out, gathered_perm.to(torch.int64), gathered_contribs, valid_mask=valid_mask
+            local_out, recv_local_id, recv_weighted, valid_mask=valid_mask,
         )
-        return out.to(hidden_states.dtype)
+
+        # Return as [max_tokens, H] so the dispatcher's slice extracts our part.
+        # Non-local positions are uninitialized but ignored by the slice.
+        full = torch.empty(max_tokens, H, device=device, dtype=hidden_states.dtype)
+        full[rank * local_tokens : (rank + 1) * local_tokens] = local_out.to(
+            hidden_states.dtype
+        )
+        return full
 
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
