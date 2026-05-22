@@ -3338,7 +3338,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_requests=0,  # Added manually below to stagger prefill vs decode
             min_prompt_length=4,
             max_prompt_length=4,
-            num_tokens_to_generate=4,
+            num_tokens_to_generate=10,
             num_speculative_tokens=2,
             materialize_only_last_token_logits=False,
             model_provider="gpt",
@@ -3364,7 +3364,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3386,7 +3388,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             prompt=torch.randint(
                 0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'
             ),
-            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=-1),
         )
 
         # Step 1: prefill for request 0 — should NOT count as a spec step.
@@ -3415,7 +3417,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             prompt=torch.randint(
                 0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'
             ),
-            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=-1),
         )
 
         proposed_before_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
