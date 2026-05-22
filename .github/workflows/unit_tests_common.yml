@@ -37,6 +37,7 @@ jobs:
     runs-on: ${{ fromJson(inputs.runs_on) }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         test_group:
           - name: core
