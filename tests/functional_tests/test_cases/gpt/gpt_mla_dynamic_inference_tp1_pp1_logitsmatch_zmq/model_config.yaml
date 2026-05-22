@@ -9,16 +9,24 @@ MODEL_ARGS:
   # Tokenizer / data
   --tokenizer-type: NullTokenizer
   --vocab-size: 1024
-  # Model architecture (matches gpt3_mcore_te_tp2_pp2_mla shape with smaller TP/PP).
+  # Model architecture. FlashInfer's MLA wrapper has supported-dimensions
+  # constraints (see flashinfer.mla.supported_mla_head_dimensions); using the
+  # ``smaller_mla_dimensions`` set (qk_nope=64, qk_rope=64, v=128, kv_lora=256)
+  # to stay within the validated kernel envelope on SM90.
   --num-layers: 4
-  --hidden-size: 512
+  --hidden-size: 1024
   --num-attention-heads: 8
   --multi-latent-attention: true
-  --q-lora-rank: 192
-  --kv-lora-rank: 64
-  --qk-head-dim: 16
-  --qk-pos-emb-head-dim: 8
-  --v-head-dim: 16
+  --q-lora-rank: 256
+  --kv-lora-rank: 256
+  --qk-head-dim: 64
+  --qk-pos-emb-head-dim: 64
+  --v-head-dim: 128
+  # cache_mla_latents=True + prepare_for_absorption requires the fused
+  # column_parallel_layer_norm_linear layer, which is only built when
+  # qk_layernorm=True (otherwise linear_kv_up_proj is plain TEColumnParallelLinear
+  # without an `eps` attr to split out).
+  --qk-layernorm: true
   --seq-length: 1024
   --max-position-embeddings: 1024
   --inference-max-seq-length: 1024
@@ -30,7 +38,10 @@ MODEL_ARGS:
   --attention-backend: flash
   --cache-mla-latents: true
   --inference-dynamic-batching-block-size: 64
-  --inference-dynamic-batching-buffer-size-gb: 4
+  # Small model → cheap per-request KV → without these bounds the buffer
+  # math computes max_requests in the 6-digit range, overrunning max_tokens.
+  --inference-dynamic-batching-buffer-size-gb: 0.5
+  --inference-dynamic-batching-max-requests: 32
   --use-mcore-models: true
   --ckpt-format: torch_dist
   --bf16: true
@@ -54,5 +65,8 @@ MODEL_ARGS:
   # natural tokenizer anyway, so we pass synthetic ID sequences.
   --prompts: "5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80"
 METRICS:
+  # Token-level determinism is the meaningful signal for a random-init MLA
+  # path test. ``logprobs`` are excluded because random-init bf16 weights
+  # produce per-token logits large enough to overflow softmax in places,
+  # giving NaN logprobs that the ``math.isclose`` comparator can't match.
   - "generated_tokens"
-  - "logprobs"

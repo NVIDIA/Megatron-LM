@@ -1661,8 +1661,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             kv_indices[start : start + nb] = self._cpu_mha_block_table[i, :nb]
 
         layer_buf = self.memory_buffer[attention_layer_number]
-        ckv_cache = layer_buf[..., : self.mla_kv_lora_rank]
-        kpe_cache = layer_buf[..., self.mla_kv_lora_rank :]
+        # FlashInfer reads ckv/kpe as contiguous [num_pages, page_size, head_dim_*]
+        # tensors. Slicing the last dim of layer_buf produces non-contiguous
+        # views, which FlashInfer interprets with the original stride and
+        # silently reads garbage (followed by CUDA illegal memory access).
+        # ``.contiguous()`` copies each view per layer per step. The cleaner
+        # long-term fix is to allocate ckv and kpe as separate buffers in
+        # ``_allocate_memory_buffer`` -- TODO once the path is validated.
+        ckv_cache = layer_buf[..., : self.mla_kv_lora_rank].contiguous()
+        kpe_cache = layer_buf[..., self.mla_kv_lora_rank :].contiguous()
         num_heads = q_nope.shape[1]
 
         wrapper.plan(
