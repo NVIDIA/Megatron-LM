@@ -139,6 +139,24 @@ class GatedDeltaNet(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
+        if self.cp_size > 1:
+            head_perm = _build_head_perm_for_split_sections(
+                [
+                    self.qk_dim_local_tp,
+                    self.qk_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.num_value_heads // self.tp_size,
+                    self.num_value_heads // self.tp_size,
+                ],
+                self.cp_size,
+                torch.cuda.current_device(),
+            )
+        else:
+            head_perm = None
+        # Registered as a non-persistent buffer to exclude it from state_dict
+        self.register_buffer("_thd_head_perm", head_perm, persistent=False)
+
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
         # We may remove this restriction in the future.
@@ -347,25 +365,19 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
+        if self.cp_size > 1:
+            qkvzba = qkvzba.index_select(-1, self._thd_head_perm)
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            # Batched: one a2a on the full local THD tensor, then one local
-            # permutation that reorders rank-grouped output into per-sequence
-            # natural order. The permutation also folds in the per-sequence
-            # `_undo_attention_load_balancing`, so it's disabled inside the
-            # a2a call.
+            # Batched: one a2a on the full local THD tensor, then two local
+            # permutations -- one on the head dim (so a single fused no-split
+            # a2a still produces the per-channel scatter layout) and one on
+            # the seq dim (rank-grouped -> per-seq natural order, also folds
+            # in `_undo_attention_load_balancing`).
             qkvzba = tensor_a2a_cp2hp(
                 qkvzba,
                 seq_dim=0,
                 head_dim=-1,
                 cp_group=self.pg_collection.cp,
-                split_sections=[
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
                 undo_attention_load_balancing=False,
             )
             if self.cp_size > 1:
@@ -375,18 +387,7 @@ class GatedDeltaNet(MegatronModule):
                 qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
         else:
             qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=self.pg_collection.cp,
-                split_sections=[
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
+                qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
             )
 
         # Transpose: s b x --> b s x
@@ -771,6 +772,23 @@ def _build_thd_cp_a2a_perm(
     inv[idx] = positions
 
     return idx, inv
+
+
+def _build_head_perm_for_split_sections(
+    split_sections: List[int], cp_size: int, device: torch.device
+) -> torch.Tensor:
+    assert all(
+        s % cp_size == 0 for s in split_sections
+    ), f"split_sections {split_sections} must be divisible by cp_size {cp_size} for GDN"
+    offset = 0
+    parts = []
+    for s in split_sections:
+        parts.append(
+            torch.arange(offset, offset + s, device=device, dtype=torch.long).view(cp_size, -1)
+        )
+        offset += s
+
+    return torch.cat(parts, dim=-1).view(-1)
 
 
 ####################
