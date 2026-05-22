@@ -687,9 +687,10 @@ def process_mtp_loss(
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
+            # Safe divide without sync: mask numerator when num_tokens==0, divide by clamp(min=1)
             mtp_loss_for_log = (
-                torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
-            )
+                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
+            ) / num_tokens.clamp(min=1)
             MTPLossLoggingHelper.save_loss_to_tracker(
                 mtp_loss_for_log,
                 mtp_layer_number,
@@ -749,7 +750,12 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
@@ -828,6 +834,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
             tp_group=pg_collection.tp if pg_collection is not None else None,
+            name=(name + ".eh_proj") if name is not None else None,
         )
 
         # Build inner layers: two possible paths
@@ -847,6 +854,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
@@ -860,6 +868,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
                 pg_collection=pg_collection,
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
 
         self.final_layernorm = self.submodules.layer_norm(
@@ -1432,7 +1441,12 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
@@ -1453,6 +1467,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.mtp_num_depths = mtp_num_depths
         self.hybrid_submodules = hybrid_submodules
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
+        self.name = name
 
         vp_size = config.virtual_pipeline_model_parallel_size
         assert is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size), (
@@ -1495,6 +1510,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=self.mtp_layer_pattern,
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
@@ -1512,6 +1528,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     hybrid_submodules=hybrid_submodules,
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
