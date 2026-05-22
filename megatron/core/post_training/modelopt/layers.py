@@ -124,6 +124,7 @@ class Linear(torch.nn.Linear):
         tp_comm_buffer_name: str = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,  # Not used
     ):
         self.config = config
         self.tp_group = tp_group
