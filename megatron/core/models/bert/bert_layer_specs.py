@@ -55,9 +55,9 @@ def get_bert_layer_with_transformer_engine_submodules() -> TransformerLayerSubmo
         )
 
     return TransformerLayerSubmodules(
-        self_attention=ModuleSpec(
-            module=SelfAttention,
-            params={"attn_mask_type": AttnMaskType.padding},
+        self_attention=partial(
+            SelfAttention,
+            attn_mask_type=AttnMaskType.padding,
             submodules=SelfAttentionSubmodules(
                 linear_qkv=not_none(TELayerNormColumnParallelLinear),
                 core_attention=not_none(TEDotProductAttention),
@@ -105,9 +105,9 @@ bert_layer_local_spec = ModuleSpec(
     module=TransformerLayer,
     submodules=TransformerLayerSubmodules(
         input_layernorm=LNImpl,
-        self_attention=ModuleSpec(
-            module=SelfAttention,
-            params={"attn_mask_type": AttnMaskType.padding},
+        self_attention=partial(
+            SelfAttention,
+            attn_mask_type=AttnMaskType.padding,
             submodules=SelfAttentionSubmodules(
                 linear_qkv=ColumnParallelLinear,
                 core_attention=DotProductAttention,

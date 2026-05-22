@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-
+from functools import partial
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -25,6 +25,7 @@ from megatron.core.transformer.transformer_block import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     MlpBuilder,
+    SelfAttentionBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
@@ -56,29 +57,28 @@ except ImportError:
 
 
 def get_gated_delta_net_module_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
-) -> ModuleSpec:
+    config: TransformerConfig, backend: BackendSpecProvider | None = None
+) -> tuple[SelfAttentionBuilder, bool]:
     """Build module spec for GatedDeltaNet attention."""
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
-    attention = ModuleSpec(
-        module=GatedDeltaNet,
+    attention = partial(
+        GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
             out_proj=backend.row_parallel_linear(),
         ),
-        metainfo={"fuse_input_layernorm": True},
     )
-    return attention
+    return attention, True
 
 
 def get_dsa_module_spec_for_backend(
-    config: TransformerConfig, backend: BackendSpecProvider = None
-) -> ModuleSpec:
+    config: TransformerConfig, backend: BackendSpecProvider | None = None
+) -> tuple[SelfAttentionBuilder, bool]:
     """Helper function to get module spec for Sparse Attention."""
     assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
     assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -111,9 +111,9 @@ def get_dsa_module_spec_for_backend(
         ),
     )
 
-    attention = ModuleSpec(
-        module=MLASelfAttention,
-        params={"attn_mask_type": AttnMaskType.causal},
+    attention = partial(
+        MLASelfAttention,
+        attn_mask_type=AttnMaskType.causal,
         submodules=MLASelfAttentionSubmodules(
             linear_q_proj=backend.column_parallel_linear(),
             linear_q_down_proj=backend.linear(),
@@ -125,16 +125,19 @@ def get_dsa_module_spec_for_backend(
             q_layernorm=IdentityOp,
             kv_layernorm=IdentityOp,
         ),
-        metainfo={"fuse_input_layernorm": False},
     )
 
-    return attention
+    return attention, False
 
 
 def get_experimental_attention_variant_module_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
-) -> ModuleSpec:
-    """Helper function to get module spec for experimental attention variant"""
+    config: TransformerConfig, backend: BackendSpecProvider | None = None
+) -> tuple[SelfAttentionBuilder, bool]:
+    """Helper function to get module spec for experimental attention variant.
+
+    Returns:
+        A tuple of (self attention module spec, whether to fuse input layernorm)
+    """
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
@@ -200,16 +203,18 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         experimental_attention_pattern = [1] * config.num_layers
 
     if 1 in experimental_attention_pattern:
-        experimental_attention_spec = get_experimental_attention_variant_module_spec(
+        experimental_attention_spec, experimental_fuse_input_layernorm = (
+            get_experimental_attention_variant_module_spec(config=config, backend=backend)
+        )
+    else:
+        experimental_attention_spec, experimental_fuse_input_layernorm = IdentityOp, False
+
+    if 0 in experimental_attention_pattern:
+        standard_attention_spec, standard_fuse_input_layernorm = _get_self_attention_module_spec(
             config=config, backend=backend
         )
     else:
-        experimental_attention_spec = None
-
-    if 0 in experimental_attention_pattern:
-        standard_attention_spec = _get_self_attention_module_spec(config=config, backend=backend)
-    else:
-        standard_attention_spec = None
+        standard_attention_spec, standard_fuse_input_layernorm = IdentityOp, False
 
     # Get MLP patterns and specs
     if config.num_moe_experts is not None:
@@ -235,10 +240,10 @@ def get_transformer_block_with_experimental_attention_variant_spec(
     rms_norm = config.normalization == "RMSNorm"
     layer_specs = []
     for layer_number in range(config.num_layers):
-        attention = (
-            experimental_attention_spec
+        attention, fuse_input_layernorm = (
+            (experimental_attention_spec, experimental_fuse_input_layernorm)
             if experimental_attention_pattern[layer_number] == 1
-            else standard_attention_spec
+            else (standard_attention_spec, standard_fuse_input_layernorm)
         )
         mlp = moe_layer_spec if moe_layer_pattern[layer_number] == 1 else dense_mlp_layer_spec
         fuse_pre_mlp_layernorm = (
@@ -248,7 +253,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         )
         input_layernorm = (
             IdentityOp
-            if attention.metainfo["fuse_input_layernorm"]
+            if fuse_input_layernorm
             else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         )
         pre_mlp_layernorm = (
@@ -389,19 +394,25 @@ def _get_backend_spec_provider(config: TransformerConfig) -> BackendSpecProvider
 
 
 def _get_self_attention_module_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
-) -> ModuleSpec:
+    config: TransformerConfig, backend: BackendSpecProvider | None = None
+) -> tuple[SelfAttentionBuilder | type[IdentityOp], bool]:
     """Get non-experimental self-attention module spec.
     For hybrid models that mix experimental and non-experimental attention architectures.
 
-    Warning: This function may be deprecated in the future."""
+    Warning: This function may be deprecated in the future.
+
+    Returns:
+        A tuple of (self attention module spec, whether to fuse input layernorm)
+    """
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
 
-    layer_spec = get_gpt_layer_with_transformer_engine_spec(
+    attn_spec = get_gpt_layer_with_transformer_engine_submodules(
         num_experts=config.num_moe_experts,
         moe_grouped_gemm=config.moe_grouped_gemm,
         qk_layernorm=config.qk_layernorm,
@@ -412,14 +423,11 @@ def _get_self_attention_module_spec(
         use_kitchen_attention=config.use_kitchen_attention,
         kitchen_attention_backend=config.kitchen_attention_backend,
         mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
-    )
-    attn_spec = layer_spec.submodules.self_attention
+    ).self_attention
     if config.multi_latent_attention:
-        attn_spec.metainfo["fuse_input_layernorm"] = False
+        return attn_spec, False
     else:
-        attn_spec.metainfo["fuse_input_layernorm"] = backend.fuse_layernorm_and_linear()
-
-    return attn_spec
+        return attn_spec, backend.fuse_layernorm_and_linear()
 
 
 def _get_dense_mlp_module_spec(

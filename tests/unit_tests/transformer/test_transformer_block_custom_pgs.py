@@ -35,63 +35,6 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from tests.unit_tests.test_utilities import Utils
 
 
-class HeterogenousTransformerLayer(TransformerLayer):
-    """A transformer layer that supports different process groups for attention and MLP.
-
-    This specialized transformer layer implementation allows independent parallelism
-    strategies for the self-attention and MLP components
-
-    Implementation details:
-    - Uses identity operations as placeholders during initialization
-    - Replaces the placeholder modules with properly configured attention and MLP
-      using their respective process groups
-    - Requires process groups to be specified in the submodule parameters
-
-    Args:
-        config (TransformerConfig): Configuration for the transformer layer
-        submodules (TransformerLayerSubmodules): Submodule specifications with process group params
-        layer_number (int, optional): Index of this layer. Defaults to 1.
-        hidden_dropout (float, optional): Override dropout rate. Defaults to None.
-        pg_collection (ProcessGroupCollection, optional): Default process groups. Defaults to None.
-        vp_stage (int, optional): Virtual pipeline stage. Defaults to None.
-    """
-
-    def __init__(
-        self,
-        config: TransformerConfig,
-        submodules: TransformerLayerSubmodules,
-        layer_number: int = 1,
-        hidden_dropout: float | None = None,
-        pg_collection: ProcessGroupCollection | None = None,
-        vp_stage: int | None = None,
-    ):
-        # Temporarily replace attention with IdentityOp,
-        # This is a temporary workaround for the test until we have a better interface
-        # will rebuild them with custom process groups after super init
-        def _modify_submodules(submodules: TransformerLayerSubmodules):
-            submodules.self_attention = IdentityOp
-            return submodules
-
-        original_attention = submodules.self_attention
-        new_submodules = _modify_submodules(copy.copy(submodules))
-
-        super().__init__(
-            config=config,
-            submodules=new_submodules,
-            layer_number=layer_number,
-            hidden_dropout=hidden_dropout,
-            pg_collection=pg_collection,
-            vp_stage=vp_stage,
-        )
-
-        assert (
-            'pg_collection' in submodules.self_attention.params
-        ), "pg_collection should be in the params of the submodules"
-        self.self_attention = build_module(
-            original_attention, config=self.config, layer_number=layer_number
-        )
-
-
 def create_reference_mlp(hidden_size, ffn_hidden_size, seed=12345):
     """Create a reference MLP with full unsharded weights.
 
@@ -178,18 +121,32 @@ def _gpt_te_layer_spec_with_hetro_pgs(
             tp_group=mlp_pg_collection.tp,
         )
 
-    return ModuleSpec(
-        module=HeterogenousTransformerLayer,
-        submodules=TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal, "pg_collection": attn_pg_collection},
-                submodules=SelfAttentionSubmodules(
-                    linear_qkv=TELayerNormColumnParallelLinear,
-                    core_attention=TEDotProductAttention,
-                    linear_proj=TERowParallelLinear,
-                ),
+    def build_self_attention(
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection,
+        layer_number: int,
+        pp_layer_offset: int | None,
+        cp_comm_type: str | None,
+    ):
+        del pg_collection
+        return SelfAttention(
+            config,
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=TELayerNormColumnParallelLinear,
+                core_attention=TEDotProductAttention,
+                linear_proj=TERowParallelLinear,
             ),
+            layer_number=layer_number,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=attn_pg_collection,
+            pp_layer_offset=pp_layer_offset,
+            cp_comm_type=cp_comm_type,
+        )
+
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            self_attention=build_self_attention,
             self_attn_bda=get_bias_dropout_add,
             pre_mlp_layernorm=IdentityOp,
             mlp=build_mlp,

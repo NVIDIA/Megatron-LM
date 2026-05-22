@@ -16,7 +16,11 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import (
+    SelfAttentionInterface,
+    TransformerLayer,
+    TransformerLayerSubmodules,
+)
 from megatron.core.typed_torch import not_none
 
 if HAVE_TE:
@@ -78,9 +82,9 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=not_none(norm),
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": attn_mask_type},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=attn_mask_type,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
@@ -108,9 +112,9 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": attn_mask_type},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=attn_mask_type,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
@@ -154,9 +158,9 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
             attention_layer=ModuleSpec(
                 module=TransformerLayer,
                 submodules=TransformerLayerSubmodules(
-                    self_attention=ModuleSpec(
-                        module=SelfAttention,
-                        params={"attn_mask_type": attn_mask_type},
+                    self_attention=partial(
+                        SelfAttention,
+                        attn_mask_type=attn_mask_type,
                         submodules=SelfAttentionSubmodules(
                             linear_qkv=not_none(TELayerNormColumnParallelLinear),
                             core_attention=not_none(TEDotProductAttention),

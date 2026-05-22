@@ -1,34 +1,20 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from unittest import mock
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.models.common.embeddings.rope_utils import (
-    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
-)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import set_args
-from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
-from tests.unit_tests.dist_checkpointing import (
-    TempNamedDir,
-    init_basic_mock_args,
-    init_checkpointing_mock_args,
-)
+from megatron.core.transformer.spec_utils import get_submodules
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -92,9 +78,11 @@ class TestGatedDeltaNet:
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
         )
-        gdn_submodules = get_experimental_attention_variant_module_spec(
+        self_attn_builder, _ = get_experimental_attention_variant_module_spec(
             config=self.transformer_config
-        ).submodules
+        )
+        gdn_submodules = get_submodules(self_attn_builder)
+        assert isinstance(gdn_submodules, GatedDeltaNetSubmodules)
 
         self.gdn = GatedDeltaNet(
             self.transformer_config,

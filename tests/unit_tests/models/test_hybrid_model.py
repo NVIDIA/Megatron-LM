@@ -17,6 +17,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -371,7 +372,7 @@ class TestHybridQKLayernorm:
         from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
         from megatron.core.transformer.enums import AttnMaskType
         from megatron.core.transformer.identity_op import IdentityOp
-        from megatron.core.transformer.spec_utils import ModuleSpec
+        from megatron.core.transformer.spec_utils import get_submodules
         from megatron.core.transformer.transformer_layer import (
             TransformerLayer,
             TransformerLayerSubmodules,
@@ -379,12 +380,14 @@ class TestHybridQKLayernorm:
 
         # Build a spec that explicitly sets q/k layernorm to IdentityOp
         spec = copy.deepcopy(hybrid_stack_spec)
-        spec.submodules.attention_layer.submodules.self_attention.submodules.q_layernorm = (
-            IdentityOp
-        )
-        spec.submodules.attention_layer.submodules.self_attention.submodules.k_layernorm = (
-            IdentityOp
-        )
+        hybrid_submodules = get_submodules(spec)
+        assert isinstance(hybrid_submodules, HybridStackSubmodules)
+        attention_layer_submodules = get_submodules(hybrid_submodules.attention_layer)
+        assert isinstance(attention_layer_submodules, TransformerLayerSubmodules)
+        self_attention_submodules = get_submodules(attention_layer_submodules.self_attention)
+        assert isinstance(self_attention_submodules, SelfAttentionSubmodules)
+        self_attention_submodules.q_layernorm = IdentityOp
+        self_attention_submodules.k_layernorm = IdentityOp
 
         config = TransformerConfig(
             num_layers=3,

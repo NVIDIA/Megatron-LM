@@ -111,9 +111,9 @@ def get_gpt_layer_with_inference_submodules(
         )
         return TransformerLayerSubmodules(
             input_layernorm=backend.layer_norm(has_residual=True),
-            self_attention=ModuleSpec(
-                module=MLASelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                MLASelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=MLASelfAttentionSubmodules(
                     linear_q_proj=backend.column_parallel_linear(),
                     linear_q_down_proj=backend.linear(),
@@ -134,9 +134,9 @@ def get_gpt_layer_with_inference_submodules(
     else:
         qk_norm = backend.layer_norm(for_qk=True)
         return TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_layer_norm_linear(),
                     core_attention=backend.core_attention(),
@@ -258,9 +258,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
             )
             return TransformerLayerSubmodules(
                 input_layernorm=input_layernorm,
-                self_attention=ModuleSpec(
-                    module=FusedMLASelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
+                self_attention=partial(
+                    FusedMLASelfAttention,
+                    attn_mask_type=AttnMaskType.causal,
                     submodules=MLASelfAttentionSubmodules(
                         linear_q_proj=backend.column_parallel_linear(),
                         linear_qkv_down_proj=down_proj_linear,
@@ -288,9 +288,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
             )
         return TransformerLayerSubmodules(
             input_layernorm=backend.layer_norm(has_residual=True),
-            self_attention=ModuleSpec(
-                module=MLASelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                MLASelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=MLASelfAttentionSubmodules(
                     linear_q_proj=backend.column_parallel_linear(),
                     linear_q_down_proj=backend.linear(),
@@ -311,9 +311,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
     else:
         qk_norm = backend.layer_norm(for_qk=True)
         return TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_layer_norm_linear(),
                     core_attention=backend.core_attention(),
@@ -408,9 +408,9 @@ def get_gpt_layer_local_submodules(
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return TransformerLayerSubmodules(
             input_layernorm=layer_norm,
-            self_attention=ModuleSpec(
-                module=MLASelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                MLASelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=MLASelfAttentionSubmodules(
                     linear_q_proj=backend.column_parallel_linear(),
                     linear_q_down_proj=backend.column_parallel_linear(),
@@ -431,9 +431,9 @@ def get_gpt_layer_local_submodules(
     else:
         return TransformerLayerSubmodules(
             input_layernorm=layer_norm,
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+            self_attention=partial(
+                SelfAttention,
+                attn_mask_type=AttnMaskType.causal,
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),

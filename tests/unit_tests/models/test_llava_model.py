@@ -17,7 +17,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
+from megatron.core.transformer.spec_utils import ModuleSpec, get_param, get_submodules, set_param
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
@@ -592,17 +592,21 @@ class TestLLaVAModelTokenParallel:
         language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
         # SP/CP either requires user to ensure token lengths do not require padding OR change mask type to padding
         if (
-            language_layer_submodules.self_attention.params.get('attn_mask_type', '')
+            get_param(language_layer_submodules.self_attention, 'attn_mask_type')
             == AttnMaskType.causal
         ):
-            language_layer_submodules.self_attention.params['attn_mask_type'] = (
-                AttnMaskType.padding_causal
+            set_param(
+                language_layer_submodules.self_attention,
+                'attn_mask_type',
+                AttnMaskType.padding_causal,
             )
         elif (
-            language_layer_submodules.self_attention.params.get('attn_mask_type', '')
+            get_param(language_layer_submodules.self_attention, 'attn_mask_type')
             == AttnMaskType.no_mask
         ):
-            language_layer_submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
+            set_param(
+                language_layer_submodules.self_attention, 'attn_mask_type', AttnMaskType.padding
+            )
 
         vision_layer_spec = ModuleSpec(
             module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
