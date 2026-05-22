@@ -79,9 +79,10 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             return False
 
     class FakeScaledSwiGLU(torch.nn.Module):
-        def __init__(self, glu_interleave_size):
+        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
@@ -283,9 +284,10 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
             return False
 
     class FakeScaledSwiGLU(torch.nn.Module):
-        def __init__(self, glu_interleave_size):
+        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
@@ -313,6 +315,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
         gated_linear_unit=True,
     )
     module.activation_func = F.silu
+    module.activation_recompute = True
     module.linear_fc1 = FakeGroupedLinear(
         2,
         4,
@@ -343,6 +346,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
 
     assert ops[0].weight is module.linear_fc1.weight
     assert ops[1].glu_interleave_size == 8
+    assert ops[1].activation_recompute_in_mlp is True
     assert ops[2].weight0 is module.linear_fc2.weight0
     assert ops[2].weight1 is module.linear_fc2.weight1
     assert ops[2].bias0 is module.linear_fc2.bias0
@@ -383,18 +387,22 @@ def _make_fake_te_namespace():
             return False
 
     class FakeScaledSwiGLU(torch.nn.Module):
-        def __init__(self, glu_interleave_size):
+        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
     class FakeScaledClampedQGeGLU(torch.nn.Module):
-        def __init__(self, glu_interleave_size, limit=None):
+        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False, limit=None):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
             self.limit = limit
 
     class FakeScaledSReLU(torch.nn.Module):
-        pass
+        def __init__(self, *, activation_recompute_in_mlp=False):
+            super().__init__()
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
@@ -432,6 +440,7 @@ def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
         gated_linear_unit=True,
     )
     module.activation_func = quick_gelu
+    module.activation_recompute = True
     common = dict(
         device="cuda",
         dtype=torch.bfloat16,
@@ -450,6 +459,7 @@ def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
     activation = ops[1]
     assert type(activation).__name__ == "FakeScaledClampedQGeGLU"
     assert activation.glu_interleave_size == 4
+    assert activation.activation_recompute_in_mlp is True
     assert activation.limit == 7.0
 
 
@@ -469,6 +479,7 @@ def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch)
         use_fused_weighted_squared_relu=True,
     )
     module.activation_func = squared_relu
+    module.activation_recompute = True
     common = dict(
         device="cuda",
         dtype=torch.bfloat16,
@@ -485,6 +496,7 @@ def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch)
     ops = module._make_fused_ops()
 
     assert type(ops[1]).__name__ == "FakeScaledSReLU"
+    assert ops[1].activation_recompute_in_mlp is True
 
 
 def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch):

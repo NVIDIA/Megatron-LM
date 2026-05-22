@@ -415,22 +415,33 @@ class TEGroupedMLP(MegatronModule):
 
         # Activation and post-multiply probs (SwiGLU, clamped quick-GeGLU, or SReLU)
         glu_interleave = self.config.moe_mlp_glu_interleave_size
+        activation_recompute_in_mlp = bool(getattr(self, "activation_recompute", False))
         if self.config.activation_func == F.silu and self.config.gated_linear_unit:
-            op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
+            op = te.pytorch.ops.ScaledSwiGLU(
+                glu_interleave_size=glu_interleave,
+                activation_recompute_in_mlp=activation_recompute_in_mlp,
+            )
         elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
             clamp = self.config.activation_func_clamp_value
             if clamp is not None:
                 op = te.pytorch.ops.ScaledClampedQGeGLU(
-                    glu_interleave_size=glu_interleave, limit=clamp
+                    glu_interleave_size=glu_interleave,
+                    activation_recompute_in_mlp=activation_recompute_in_mlp,
+                    limit=clamp,
                 )
             else:
-                op = te.pytorch.ops.ScaledClampedQGeGLU(glu_interleave_size=glu_interleave)
+                op = te.pytorch.ops.ScaledClampedQGeGLU(
+                    glu_interleave_size=glu_interleave,
+                    activation_recompute_in_mlp=activation_recompute_in_mlp,
+                )
         elif (
             self.config.activation_func == squared_relu
             and self.config.use_fused_weighted_squared_relu
             and not self.config.gated_linear_unit
         ):
-            op = te.pytorch.ops.ScaledSReLU()
+            op = te.pytorch.ops.ScaledSReLU(
+                activation_recompute_in_mlp=activation_recompute_in_mlp
+            )
         else:
             raise RuntimeError(
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
