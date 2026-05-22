@@ -15,6 +15,9 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_allocation import is_layer_group
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.pipeline_parallel.utils import ScheduleNode
 from megatron.core.transformer.transformer_layer import make_viewless_tensor
 
@@ -211,7 +214,28 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
     shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
     output = layer.mlp.combine(output)
     output = layer.mlp.postprocess(output, shared_expert_output)
-    output = layer._forward_post_mlp((output, None), residual)
+    # Inline bda instead of calling ``layer._forward_post_mlp`` so we can skip
+    # the redundant ``discard_output_and_register_recompute(mlp_output_with_bias[0])``
+    # that ``_forward_post_mlp`` would otherwise issue. The pre_mlp_layernorm recompute
+    # is already registered on ``expert_output`` inside ``_run_moe_experts``; the second
+    # hook on the combine-slot ``mlp_output_with_bias[0]`` is not only unnecessary but
+    # harmful in the bracketed-hybrid case (``[*E]``): it fires during combine_bwd's
+    # autograd backward and triggers the LN recompute ahead of attention's backward
+    # in the same pre_dispatch slot, corrupting attention gradients (grad_norm explodes
+    # from iter 2). GPT's ``submodule_combine_forward`` likewise inlines bda and does
+    # not call ``_forward_post_mlp`` for the same reason.
+    mlp_output_with_bias = (output, None)
+    with layer.bias_dropout_add_exec_handler():
+        output = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
+            mlp_output_with_bias, residual, layer.hidden_dropout
+        )
+    if layer.offload_mlp_norm:
+        output = off_interface.group_commit(
+            output, name="mlp_norm", forced_released_tensors=[residual]
+        )
+    output = make_viewless_tensor(
+        inp=output, requires_grad=output.requires_grad, keep_graph=True
+    )
 
     node.layer_state.residual.record_stream(torch.cuda.current_stream())
     if shared_expert_output is not None:
