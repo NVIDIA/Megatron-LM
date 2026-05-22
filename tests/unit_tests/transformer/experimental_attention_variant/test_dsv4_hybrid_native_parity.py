@@ -690,6 +690,13 @@ def test_dsv4_hybrid_attention_matches_native_reference(
     apply_dsa_kernel_fusion: bool,
     calculate_per_token_loss: bool,
 ):
+    major, _ = torch.cuda.get_device_capability()
+    if major < 10:
+        if apply_dsa_kernel_fusion:
+            pytest.skip("fused DSA kernels require SM100+ GPU now")
+        if seqlen > 4096:
+            pytest.skip("seqlen > 4096 may OOM on Hopper")
+
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
         torch.manual_seed(_SEED)

@@ -1851,9 +1851,7 @@ class TestRealKernelScoreHelpers:
         ['sparse_indexer_predict', 'sparse_attn_target', 'dense_indexer_score', 'dense_attn_score'],
     )
     def test_real_score_helper(self, case, reset_lazy_kernel_state):
-        # SM gate per case: dense kernels are SM100-only, sparse are SM90+.
-        sm_min = 10 if case.startswith('dense_') else 9
-        _skip_if_real_kernels_unavailable(sm_min=sm_min)
+        _skip_if_real_kernels_unavailable(sm_min=10)
 
         s = _REAL_SHAPES_SPARSE
         # Each case needs a different combination of the input fixture.
@@ -2178,7 +2176,7 @@ class TestRealKernelDsaSparseAttn:
         in one test halves cuDNN compile time vs running them separately,
         since they share the same kernel cache key.
         """
-        _skip_if_real_kernels_unavailable(sm_min=9, need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
         s = self.SHAPES
 
         # ---- Real path: forward + backward via dsa_sparse_attn ----
