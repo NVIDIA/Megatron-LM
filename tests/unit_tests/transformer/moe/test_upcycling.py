@@ -131,12 +131,13 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
     return args
 
 
-def set_upcycling_args(ep, granularity, num_experts=8):
+def set_upcycling_args(ep, granularity, num_experts=8, moe_layer_freq=1):
     args = get_args()
     args.moe_use_upcycling = True
     args.num_experts = num_experts
     args.expert_model_parallel_size = ep
     args.moe_upcycling_granularity = granularity
+    args.moe_layer_freq = moe_layer_freq
     dense_ffn_hidden_size = args.ffn_hidden_size
     args.ffn_hidden_size = dense_ffn_hidden_size // args.moe_upcycling_granularity
     args.moe_ffn_hidden_size = dense_ffn_hidden_size // args.moe_upcycling_granularity
@@ -165,10 +166,15 @@ class TestGPTModel:
         destroy_num_microbatches_calculator()
 
     @pytest.mark.parametrize(
-        ('tp_ep', 'granularity', 'grouped_gemm', 'swiglu', 'squared_relu'),
-        [pytest.param((1, 1), 1, False, False, False)],
+        ('tp_ep', 'granularity', 'grouped_gemm', 'swiglu', 'squared_relu', 'moe_layer_freq'),
+        [
+            pytest.param((1, 1), 1, False, False, False, 1),
+            pytest.param((1, 1), 1, False, False, False, [0, 1], id="mixed_dense_moe"),
+        ],
     )
-    def test_upcycling_Local(self, tp_ep, granularity, grouped_gemm, swiglu, squared_relu):
+    def test_upcycling_Local(
+        self, tp_ep, granularity, grouped_gemm, swiglu, squared_relu, moe_layer_freq
+    ):
         tp = tp_ep[0]
         ep = tp_ep[1]
         args = create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te=False)
@@ -200,7 +206,7 @@ class TestGPTModel:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp, expert_model_parallel_size=ep
         )
-        set_upcycling_args(ep, granularity, num_experts=2)
+        set_upcycling_args(ep, granularity, num_experts=2, moe_layer_freq=moe_layer_freq)
         # model_parallel_cuda_manual_seed(_SEED+1)
         moe_model = get_model(model_provider, ModelType.encoder_or_decoder)
 
