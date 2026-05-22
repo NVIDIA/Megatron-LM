@@ -301,10 +301,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.resume_request_ids = None
 
         # Speculative decoding acceptance tracking (per-position).
-        # Each list has length num_speculative_tokens; index i tracks position i+1
+        # Each tensor has length num_speculative_tokens; index i tracks position i+1
         # (i.e. the i-th draft token proposed by the MTP head).
-        self._spec_tokens_proposed_per_pos = [0] * self.num_speculative_tokens
-        self._spec_tokens_accepted_per_pos = [0] * self.num_speculative_tokens
+        self._spec_tokens_proposed_per_pos = torch.zeros(self.num_speculative_tokens, dtype=torch.int64)
+        self._spec_tokens_accepted_per_pos = torch.zeros(self.num_speculative_tokens, dtype=torch.int64)
         self._spec_steps = 0
 
         # Prefix caching tracking.
@@ -1231,10 +1231,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     and self.num_speculative_tokens > 0
                 ):
                     actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    for pos in range(actual_proposed):
-                        self._spec_tokens_proposed_per_pos[pos] += 1
-                        if pos < len(accepted_tokens_list) and accepted_tokens_list[pos] != -1:
-                            self._spec_tokens_accepted_per_pos[pos] += 1
+                    self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
+                    accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
+                    self._spec_tokens_accepted_per_pos[:actual_proposed] += (accepted_t != -1).long()
 
                 if request_id in finished_request_ids:
                     # Reconstruct routing from per-block storage before popping.
