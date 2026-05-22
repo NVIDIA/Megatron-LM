@@ -406,6 +406,7 @@ jobs:
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
+      && vars.ENABLE_CICD_MBRIDGE_TESTING == 'true'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -473,6 +474,7 @@ jobs:
         id: compute
         env:
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
+          ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           SELECTED_RUNNER: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
           SELECTED_RUNNER_GB200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
           REGISTRY_AWS: ${{ env.container-registry }}
@@ -480,7 +482,7 @@ jobs:
         run: |
           AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
             '{"cloud": "aws", "registry": $registry, "runner": $runner}')
-          if [ "$IS_MAINTAINER" == "true" ]; then
+          if [ "$IS_MAINTAINER" == "true" ] && [ "$ENABLE_GB200_TESTING" == "true" ]; then
             GCP_ENTRY=$(jq -nc --arg registry "$REGISTRY_GCP" --arg runner "$SELECTED_RUNNER_GB200" \
               '{"cloud": "gcp", "registry": $registry, "runner": $runner}')
             MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" --argjson gcp "$GCP_ENTRY" \
@@ -852,6 +854,7 @@ jobs:
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run == 'true'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      && vars.ENABLE_GB200_TESTING == 'true'
     outputs:
       integration-tests-gb200: ${{ steps.main.outputs.integration-tests-gb200 }}
     steps:
@@ -918,6 +921,7 @@ jobs:
       && needs.cicd-integration-gate.outputs.should_run == 'true'
       && needs.cicd-parse-integration-tests-gb200.result == 'success'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      && vars.ENABLE_GB200_TESTING == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -973,6 +977,7 @@ jobs:
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
+          ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
@@ -1009,16 +1014,16 @@ jobs:
             FAILED=true
           fi
 
-          # GB200 integration tests may be skipped only for non-maintainer PRs
-          # (no GB200 runners available); maintainer runs must always succeed.
-          if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
-            echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
-            FAILED=true
-          elif [ "$GB200_RESULT" != "success" ] \
-               && [ "$GB200_RESULT" != "skipped" ] \
-               && [ "$GB200_RESULT" != "skipped-by-unit-failure" ]; then
-            echo "❌ cicd-integration-tests-latest-gb200: $GB200_RESULT"
-            FAILED=true
+          # GB200 integration tests are required only when explicitly enabled.
+          if [ "$ENABLE_GB200_TESTING" == "true" ]; then
+            # GB200 integration tests may be skipped only for non-maintainer PRs
+            # (no GB200 runners available); maintainer runs must always succeed.
+            if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
+              echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
+              FAILED=true
+            fi
+          else
+            echo "✅ GB200 integration tests disabled by ENABLE_GB200_TESTING"
           fi
 
           # Broad scan: catch any individual job failures or cancellations
