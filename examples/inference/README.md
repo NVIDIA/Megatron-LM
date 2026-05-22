@@ -18,7 +18,9 @@ This guide provides an example for Megatron Core for running model inference.
 <br>
 
 #### 1. Quickstart
-This example runs statically-batched inference on a model trained using Megatron Core. The entrypoint is [gpt_static_inference.py](./gpt/gpt_static_inference.py). A similar workflow can be adapted for [gpt_dynamic_inference.py](./gpt/gpt_dynamic_inference.py).
+This example runs dynamically-batched (continuous-batching) inference on a model trained using Megatron Core. The entrypoint is [gpt_dynamic_inference.py](./gpt/gpt_dynamic_inference.py).
+
+> **Note**: The legacy `StaticInferenceEngine` and `MCoreEngine` alias were removed in favor of `DynamicInferenceEngine`, which subsumes both static and continuous batching.
 
 <br>
 
@@ -44,22 +46,25 @@ The model provider function supports both MCore and Legacy models.
 ```
 
 ***STEP 3 - Choose an engine***
-Text generation requires an inference engine, which includes a scheduler. The default engine is the [Megatron Core engine](../../megatron/core/inference/engine/mcore_engine.py) with a [text generation controller](../../megatron/core/inference/text_generation_controllers/text_generation_controller.py). TRTLLMEngine will be supported in the future.
+Text generation requires an inference engine, which includes a scheduler. The default engine is [DynamicInferenceEngine](../../megatron/core/inference/engines/dynamic_engine.py) with a [text generation controller](../../megatron/core/inference/text_generation_controllers/text_generation_controller.py).
 ```python
-    # Create an inference wrapper to setup the model.
-    inference_wrapped_model = GPTInferenceWrapper(model, args)
-    
+    # Build a dynamic inference context (paged KV cache + scheduler).
+    inference_context = DynamicInferenceContext(
+        model_config=model.config,
+        inference_config=inference_config,
+    )
+
+    # Create an inference wrapper to set up the model.
+    inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
+
     # Define a sampling loop.
     text_generation_controller = TextGenerationController(
-        inference_wrapped_model=inference_wrapped_model, 
-        tokenizer=tokenizer
+        inference_wrapped_model=inference_wrapped_model,
+        tokenizer=tokenizer,
     )
-    
-    # Create a static or dynamic inference engine.
-    inference_engine = StaticInferenceEngine(
-        text_generation_controller=text_generation_controller, 
-        max_batch_size=args.max_batch_size
-)
+
+    # Create the inference engine.
+    inference_engine = DynamicInferenceEngine(text_generation_controller, inference_context)
 ```
 
 ***STEP 4 - Run text generation***
@@ -129,7 +134,7 @@ INFERENCE_SPECIFIC_ARGS=(
     --max-batch-size 4
 )
 
-torchrun --nproc-per-node=4 examples/inference/gpt/gpt_static_inference.py \
+torchrun --nproc-per-node=4 examples/inference/gpt/gpt_dynamic_inference.py \
     ${TOKENIZER_ARGS[@]} \
     ${MODEL_ARGS[@]} \
     ${INFERENCE_SPECIFIC_ARGS[@]} \
@@ -150,20 +155,18 @@ NOTE: Other parameters which can be customized for inference:
 
 
 #### 2. Control Flow in the MCore Backend
-An example of inference with static batching is provided in [gpt_static_inference.py](./gpt/gpt_static_inference.py).
-* [mcore_engine](../../megatron/core/inference/engines/mcore_engine.py) **generate()** function is called with the input prompts.
-* The `Scheduler` in the engine will add these prompts to the [active requests] pool (../../megatron/core/inference/inference_request.py) until max batch size is hit. Remaining requests will be added to the waiting requests pool. 
-* The engine will run until all requests (waiting + active) are completed. 
-    * The active requests are passed into  **generate_all_output_tokens_static_batch()** of the text generation controller . 
-    * This function uses the **prep_model_for_inference()** method of the [model_inference_wrappers](../../megatron/core/inference/model_inference_wrappers/abstract_model_inference_wrapper.py) and runs an autoregressive sampling loop
-    * In the autoregressive loop, the **get_batch_for_context_window()** method of the inference wrapper is called to slice out the input tokens and masks
-    * Input tokens and masks are passed it into the **run_one_forward_step()** method, which calls the model `.forward()` method to get the output logits
-    * Output logits are synchronized across all pipeline parallel ranks
-    * The text generation controller obtains the log probabilities and samples tokens based on the strategy defined in the sampling parameters.
-    * The sampled tokens are then appended to the input prompt tokens for the next iteration 
-    * The **update_generation_status()** method of the text generation controller checks which prompts have finished generating or hit a stop condition
-    * After the inference loop, the result is detokenized and stored as an attribute of the InferenceRequest. These requests are marked as completed. 
-    * The **update_requests_pool()** method of the scheduler moves completed requests into the completed request pool and waiting requests into the active request pool
+An example of inference with dynamic (continuous) batching is provided in [gpt_dynamic_inference.py](./gpt/gpt_dynamic_inference.py).
+* [DynamicInferenceEngine](../../megatron/core/inference/engines/dynamic_engine.py) **generate()** function is called with the input prompts.
+* The engine's scheduler admits prompts up to the paged-KV-cache capacity and steps the active batch each iteration.
+* Each engine **step()** drives one prefill/decode pass through the model:
+    * The active requests are passed through the text generation controller's dynamic batching path.
+    * **prep_model_for_inference()** of the [model_inference_wrappers](../../megatron/core/inference/model_inference_wrappers/abstract_model_inference_wrapper.py) is called to set up the forward pass.
+    * **get_batch_for_context_window()** slices the input tokens and masks.
+    * Inputs are passed to **run_one_forward_step()**, which calls the model `.forward()` method to get the output logits.
+    * Output logits are synchronized across pipeline-parallel ranks.
+    * The text generation controller obtains log probabilities and samples tokens based on the strategy defined in the sampling parameters.
+    * Sampled tokens are appended to each request and the dynamic context advances its KV cache.
+    * **update_generation_status()** checks which requests have finished or hit a stop condition. Completed requests are moved to the completed pool and pending requests are admitted.
 
 <br>
 
@@ -171,7 +174,7 @@ An example of inference with static batching is provided in [gpt_static_inferenc
 
 The inference pipeline supports three levels of customization:
 
-* **Inference engine** - The MCore Engine supports static and dynamic batching. Modify this to add a new backend.
+* **Inference engine** - DynamicInferenceEngine handles continuous batching with paged KV cache. Modify this to add a new backend.
 * **Text generation controller** - The main sampling loop. Customize this to support alternative tokenization or implement a new sampling strategy.
 * **Inference Wrapped Model** - Change this to support a new model.
 * **Modify Inference Parameters** - Change this to update top_p, top_k, number of tokens to be generated, temperature, and other sampling parameters.
@@ -227,14 +230,6 @@ class TextGenerationController:
         """Function to check which prompts have reached an end condition
 
         We check which prompts have reached an end condition and set the corresponding flags of the is_generation_done_tensor to True . The generated sequence lengths increases as we keep generating, until that prompts hits an eod condition. The generation started status tensor helps us determine which prompts have started generating
-        """
-
-    def generate_all_output_tokens_static_batch(
-        self, active_requests: OrderedDict[int, InferenceRequest],
-    ) -> OrderedDict[int, InferenceRequest]:
-        """Utility to generate all the output tokens and probabilities for the prompts .
-
-        This utility generates the output tokens for a static batch. It runs the forward steps till all prompts complete generation, updates the status of these requests to completed, adds the generated result and returns these requests
         """
 
     def detokenize_generations(self, prompt_tokens_with_generated_tokens: torch.Tensor) -> str:

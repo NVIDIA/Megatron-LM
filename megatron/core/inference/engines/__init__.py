@@ -2,4 +2,3 @@
 
 from .abstract_engine import AbstractEngine
 from .dynamic_engine import DynamicInferenceEngine, EngineSuspendedError
-from .static_engine import StaticInferenceEngine

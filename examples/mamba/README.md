@@ -35,19 +35,7 @@ the one described in the technical report.
 
 ## Text Generation
 
-Use [`run_text_gen_server_8b.sh`](./run_text_gen_server_8b.sh) to start a text
-generation server using an 8B hybrid checkpoint. This is configured to run the
-8B hybrid model described in the technical report, with tensor model parallel
-set to 1.
-
-The arguments in the script will need to be changed if using a checkpoint with a
-different model parallel configuration or other differences, such as model
-architecture. For example, to run the 8B pure Mamba-2 model, change
-`--hybrid-layer-pattern` to use only `M` symbols (e.g., 56 `M`s for the 8B
-model), or remove it entirely.
-
-Use [`run_text_gen_server_8b_gpt3.sh`](./run_text_gen_server_8b_gpt3.sh) to start
-a text generation server using the 8B reference Transformer checkpoint.
+For hybrid (Mamba) text generation use [`tools/run_dynamic_text_generation_server.py`](../../tools/run_dynamic_text_generation_server.py), which is backed by `DynamicInferenceEngine`. See [examples/inference/README.md](../inference/README.md) for the dynamic-inference quickstart.
 
 ## Checkpoint Formats
 
