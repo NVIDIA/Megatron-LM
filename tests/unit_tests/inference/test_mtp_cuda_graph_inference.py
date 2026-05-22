@@ -33,16 +33,26 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
+)
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
 
@@ -1098,3 +1108,175 @@ class TestMTPCudaGraphExpertParallel:
 
         assert h_out.shape == (tp_size, 1, self.HIDDEN_SIZE)
         assert logits.shape == (tp_size, 1, self.VOCAB_SIZE)
+
+
+# --------------------------------------------------------------------------- #
+#  TestMTPBlockScopeCudaGraph (TP = 1)
+# --------------------------------------------------------------------------- #
+
+
+def _build_hybrid_stack_spec():
+    """Build a minimal HybridStack spec using local (non-TE) modules."""
+    attention_layer_spec = get_gpt_layer_local_spec()
+
+    backend = LocalSpecProvider()
+    norm_impl = backend.layer_norm()
+    col_linear_impl = backend.column_parallel_linear()
+
+    mtp_layer_spec = ModuleSpec(
+        module=MultiTokenPredictionLayer,
+        submodules=MultiTokenPredictionLayerSubmodules(
+            enorm=norm_impl,
+            hnorm=norm_impl,
+            eh_proj=col_linear_impl,
+            mtp_model_layer=None,
+            layer_norm=norm_impl,
+        ),
+    )
+    mtp_block_spec = ModuleSpec(
+        module=MultiTokenPredictionBlock,
+        submodules=MultiTokenPredictionBlockSubmodules(layer_specs=[mtp_layer_spec]),
+    )
+
+    return ModuleSpec(
+        module=HybridStack,
+        submodules=HybridStackSubmodules(
+            attention_layer=attention_layer_spec,
+            mtp_block_spec=mtp_block_spec,
+        ),
+    )
+
+
+class TestMTPBlockScopeCudaGraph:
+    """Tests that block-scope CUDA graphs correctly propagate decoder hidden
+    states for MTP inference.
+
+    When ``inference_cuda_graph_scope='block'``, the entire model forward is
+    captured as a single CUDA graph.  The ``_decoder_hidden_states_cache``
+    attribute must be set *outside* the graphed forward so that it is available
+    on every replay, not just during capture.
+    """
+
+    HIDDEN_SIZE = 32
+    VOCAB_SIZE = 100
+    MAX_SEQ_LEN = 64
+    NUM_LAYERS = 4
+    NUM_ATTN_HEADS = 4
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        delete_cuda_graphs()
+
+    def _build_model(self, *, inference_cuda_graph_scope='block'):
+        """Build a HybridModel with MTP and block-scope CUDA graph support."""
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        config = TransformerConfig(
+            num_layers=self.NUM_LAYERS,
+            hidden_size=self.HIDDEN_SIZE,
+            num_attention_heads=self.NUM_ATTN_HEADS,
+            use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            pipeline_dtype=torch.bfloat16,
+            mtp_num_layers=1,
+            cuda_graph_impl="local",
+            inference_cuda_graph_scope=inference_cuda_graph_scope,
+        )
+        hybrid_stack_spec = _build_hybrid_stack_spec()
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=self.VOCAB_SIZE,
+            max_sequence_length=self.MAX_SEQ_LEN,
+            parallel_output=True,
+            pre_process=True,
+            post_process=True,
+            hybrid_layer_pattern="****/*",
+            position_embedding_type='rope',
+        ).cuda()
+        for param in model.parameters():
+            param.data = param.data.to(config.params_dtype)
+        model.eval()
+        return model
+
+    def _build_engine(self, *, inference_cuda_graph_scope='block'):
+        """Build a DynamicInferenceEngine with block-scope CUDA graphs."""
+        delete_cuda_graphs()
+        model = self._build_model(inference_cuda_graph_scope=inference_cuda_graph_scope)
+        config = model.config
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=self.MAX_SEQ_LEN,
+                buffer_size_gb=0.5,
+                materialize_only_last_token_logits=False,
+                num_speculative_tokens=1,
+                block_size_tokens=256,
+                max_requests=16,
+                num_cuda_graphs=-1,
+                sampling_backend='torch',
+            ),
+        )
+        wrapped = GPTInferenceWrapper(model, context)
+        wrapped.model_is_pipeline_parallel = False
+        mock_tokenizer = mock.Mock()
+        ctrl = TextGenerationController(inference_wrapped_model=wrapped, tokenizer=mock_tokenizer)
+        engine = DynamicInferenceEngine(ctrl, context)
+        return engine
+
+    @pytest.mark.parametrize("inference_cuda_graph_scope", ['block', 'none'])
+    @torch.inference_mode()
+    def test_decoder_hidden_states_cache_set_after_forward(self, inference_cuda_graph_scope):
+        """_decoder_hidden_states_cache is set after model forward in both
+        graph-capture and graph-replay steps, for both block-scope and eager."""
+        engine = self._build_engine(inference_cuda_graph_scope=inference_cuda_graph_scope)
+        ctrl = engine.controller
+        context = engine.context
+        model = ctrl.inference_wrapped_model.model
+        unwrapped = unwrap_model(model)
+
+        prompt_length = 10
+        req = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.arange(prompt_length, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=20),
+        )
+        context.add_request(req)
+        context.initialize_attention_state()
+
+        active_mask = torch.ones(1, device='cuda', dtype=torch.int32)
+        new_tokens = torch.zeros(1, device='cuda', dtype=torch.int64)
+        new_spec = torch.zeros(1, 1, device='cuda', dtype=torch.int64)
+        context.update_requests(
+            active_requests_mask=active_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_spec,
+        )
+        context.initialize_attention_state()
+
+        for step in range(3):
+            if hasattr(unwrapped, '_decoder_hidden_states_cache'):
+                del unwrapped._decoder_hidden_states_cache
+
+            inference_input = ctrl.inference_wrapped_model.get_batch_for_context_window()
+            ctrl.inference_wrapped_model._forward(inference_input)
+
+            assert hasattr(unwrapped, '_decoder_hidden_states_cache'), (
+                f"Step {step}: _decoder_hidden_states_cache not set after "
+                f"forward (scope={inference_cuda_graph_scope})"
+            )
+            cache = unwrapped._decoder_hidden_states_cache
+            assert cache is not None
+            assert cache.shape[-1] == self.HIDDEN_SIZE
