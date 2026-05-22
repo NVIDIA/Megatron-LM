@@ -258,9 +258,7 @@ class TestComputeDSAIndexerLoss:
                 calculate_per_token_loss=True,
             )
 
-            assert torch.allclose(
-                loss_sum, loss_mean * (batch_size * seqlen), rtol=1e-3, atol=1e-3
-            )
+            assert torch.allclose(loss_sum, loss_mean * (batch_size * seqlen), rtol=1e-3, atol=1e-3)
 
 
 class TestDSAIndexerLossAutoScaler:

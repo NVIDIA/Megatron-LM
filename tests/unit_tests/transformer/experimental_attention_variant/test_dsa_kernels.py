@@ -369,15 +369,9 @@ class TestKLLossFromTargetPredict:
         predict = torch.softmax(torch.randn(b, sq, topk), dim=-1)
         topk_indices = torch.zeros(b, sq, topk, dtype=torch.int32)
 
-        loss_mean = _kl_loss_from_target_predict(
-            target, predict, topk_indices, loss_coeff=0.5
-        )
+        loss_mean = _kl_loss_from_target_predict(target, predict, topk_indices, loss_coeff=0.5)
         loss_sum = _kl_loss_from_target_predict(
-            target,
-            predict,
-            topk_indices,
-            loss_coeff=0.5,
-            calculate_per_token_loss=True,
+            target, predict, topk_indices, loss_coeff=0.5, calculate_per_token_loss=True
         )
 
         assert torch.allclose(loss_sum, loss_mean * (b * sq), rtol=1e-5, atol=1e-5)
