@@ -9,14 +9,17 @@ from typing import Any
 
 import torch
 
-from megatron.core._slurm_utils import resolve_slurm_world_size
+from megatron.core._slurm_utils import resolve_slurm_rank, resolve_slurm_world_size
 
 
 def safe_get_rank() -> int:
-    """Safely get the rank of the current process.
+    """Get the distributed rank safely, even if torch.distributed is not initialized.
 
-    Returns the rank from torch.distributed if initialized, otherwise falls back
-    to the RANK environment variable, defaulting to 0.
+    Fallback order:
+    1. torch.distributed.get_rank() (if initialized)
+    2. RANK environment variable (torchrun/torchelastic)
+    3. SLURM_PROCID environment variable (SLURM)
+    4. Default: 0 (with warning)
 
     Returns:
         int: The rank of the current process.
@@ -26,7 +29,18 @@ def safe_get_rank() -> int:
 
     # If torch.distributed is not initialized, try to read environment variables.
     try:
-        return int(os.environ.get("RANK", 0))
+        if "RANK" in os.environ:
+            return int(os.environ["RANK"])
+
+        slurm_rank = resolve_slurm_rank()
+        if slurm_rank is not None:
+            return slurm_rank
+
+        warnings.warn(
+            "Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. "
+            "Defaulting to rank 0."
+        )
+        return 0
     except (ValueError, TypeError):
         return 0
 
