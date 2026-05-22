@@ -454,9 +454,7 @@ class TEGroupedMLP(MegatronModule):
             and self.config.use_fused_weighted_squared_relu
             and not self.config.gated_linear_unit
         ):
-            op = te.pytorch.ops.ScaledSReLU(
-                activation_recompute_in_mlp=activation_recompute_in_mlp
-            )
+            op = te.pytorch.ops.ScaledSReLU(activation_recompute_in_mlp=activation_recompute_in_mlp)
         else:
             raise RuntimeError(
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
