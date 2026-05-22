@@ -144,6 +144,7 @@ class MultiLatentAttention(Attention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ) -> None:
         # TODO(nschank): Restructure so that the Attention initializer knows which specific
         # submodules it will construct, so that MLASelfAttentionSubmodules honors that interface.
@@ -155,6 +156,7 @@ class MultiLatentAttention(Attention):
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            name=name,
         )
         self.config: MLATransformerConfig
 
@@ -227,6 +229,7 @@ class MultiLatentAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            name=(name + ".linear_proj") if name is not None else None,
         )
 
         if (
@@ -477,6 +480,7 @@ class MLASelfAttention(MultiLatentAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -490,6 +494,7 @@ class MLASelfAttention(MultiLatentAttention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            name=name,
         )
 
         if self.config.q_lora_rank is None:
@@ -505,6 +510,7 @@ class MLASelfAttention(MultiLatentAttention):
                 skip_bias_add=False,
                 is_expert=False,
                 tp_comm_buffer_name='q_proj',
+                name=(name + ".linear_q_proj") if name is not None else None,
             )
 
         else:
@@ -536,6 +542,7 @@ class MLASelfAttention(MultiLatentAttention):
                     if q_down_proj_kwargs.get('parallel_mode') != 'duplicated'
                     else None
                 ),
+                name=(name + ".linear_q_down_proj") if name is not None else None,
                 **q_down_proj_kwargs,
             )
 
@@ -551,6 +558,7 @@ class MLASelfAttention(MultiLatentAttention):
                 is_expert=False,
                 tp_comm_buffer_name='q_up_proj',
                 tp_group=pg_collection.tp,
+                name=(name + ".linear_q_up_proj") if name is not None else None,
             )
 
         kv_down_proj_kwargs = {}
@@ -581,6 +589,7 @@ class MLASelfAttention(MultiLatentAttention):
                 if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
                 else None
             ),
+            name=(name + ".linear_kv_down_proj") if name is not None else None,
             **kv_down_proj_kwargs,
         )
 
@@ -596,6 +605,7 @@ class MLASelfAttention(MultiLatentAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
+            name=(name + ".linear_kv_up_proj") if name is not None else None,
         )
 
         if self.config.q_lora_rank is not None:
@@ -1213,6 +1223,8 @@ class FusedMLASelfAttention(MLASelfAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -1226,6 +1238,8 @@ class FusedMLASelfAttention(MLASelfAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
+            name=name,
         )
 
         assert self.config.q_lora_rank is not None, (
@@ -1262,6 +1276,7 @@ class FusedMLASelfAttention(MLASelfAttention):
                 if qkv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
                 else None
             ),
+            name=(name + ".linear_qkv_down_proj") if name is not None else None,
             **qkv_down_proj_kwargs,
         )
 
@@ -1277,6 +1292,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             is_expert=False,
             tp_comm_buffer_name='q_up_proj',
             tp_group=pg_collection.tp,
+            name=(name + ".linear_q_up_proj") if name is not None else None,
         )
 
         self.linear_kv_up_proj = build_module(
@@ -1291,6 +1307,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
+            name=(name + ".linear_kv_up_proj") if name is not None else None,
         )
 
         self.q_layernorm = submodules.q_layernorm(
