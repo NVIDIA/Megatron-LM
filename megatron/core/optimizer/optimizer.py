@@ -1348,9 +1348,7 @@ class ChainedOptimizer(MegatronOptimizer):
         """Start param sync for deferred bucket groups."""
         timers = self.config.timers
         if timers is not None:
-            timers('params-all-gather', log_level=1).start(
-                barrier=self.config.barrier_with_L1_time
-            )
+            timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
         for model_chunk, bucket_group in deferred_bucket_groups:
             model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
         if timers is not None:
