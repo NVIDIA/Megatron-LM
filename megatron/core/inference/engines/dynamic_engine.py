@@ -221,8 +221,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
-        self.disable_ep_consensus = inference_config.disable_ep_consensus
-        self.ep_consensus_interval = inference_config.ep_consensus_interval
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
@@ -625,8 +623,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # initialize zmq-based EP communicator
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
-        self._ep_consensus_loop_counter = 0
-        self._last_ep_consensus: tuple[int, bool] = (0, False)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
@@ -2349,50 +2345,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    if self.disable_ep_consensus:
-                        # Skip the EP consensus all-reduce; act on local state only.
-                        # NOTE: even with no consensus we must still participate in EP
-                        # collectives (NCCL all-to-all, etc.) every iteration. A peer with
-                        # real work will block at its all-to-all kernel waiting for this
-                        # rank, so when there is no local work we run dummy_forward()
-                        # rather than sleeping. Sleeping here would deadlock EP > 1.
-                        if self.state == EngineState.PAUSING:
-                            await self._world_barrier()
-                            self.state = EngineState.PAUSED
-                            self._state_events[EngineState.PAUSED].set()
-                        elif local_pending > 0:
-                            await self.async_step()
-                        else:
-                            self.step_start_event.record()
-                            nvtx_range_push("EP-dummy-forward")
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            nvtx_range_pop("EP-dummy-forward")
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
-                            # The consensus path yields via _ep_establish_consensus;
-                            # without it we must still let other coroutines (signal
-                            # delivery, request scheduling) run between steps.
-                            await asyncio.sleep(0)
-                        continue
-                    global_work_from_last_consensus, _ = self._last_ep_consensus
-                    if (
-                        global_work_from_last_consensus == 0
-                        or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
-                    ):
-                        # selectively enter ep_establish_consensus if
-                        # 1. there is no global work -> engine is idle. At any step in the future
-                        #    one of the ranks can receive work. So we should be eagerly checking for that
-                        # 2. it has been 20 steps since we last established consensus, and that consensus
-                        #    had some work.
-                        # In the worst case, this delays pausing by 20 steps which is around
-                        # 200-400 milliseconds.
-                        self._last_ep_consensus = await self._ep_establish_consensus(
-                            local_pending, signal_consensus=(self.state == EngineState.PAUSING)
-                        )
-                    global_work, all_pausing = self._last_ep_consensus
-                    self._ep_consensus_loop_counter += 1
+                    global_work, all_pausing = await self._ep_establish_consensus(
+                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                    )
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
@@ -2425,10 +2380,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.state = EngineState.RUNNING
                     self._state_events[EngineState.PAUSED].clear()
                     self._state_events[EngineState.RUNNING].set()
-                    # The cache from the PAUSING phase still has all_pausing=True;
-                    # without this reset the next RUNNING iteration would skip
-                    # consensus, read the stale flag, and immediately re-pause.
-                    self._last_ep_consensus = (0, False)
 
                 elif self.state == EngineState.SUSPENDING:
                     await self._world_barrier()
