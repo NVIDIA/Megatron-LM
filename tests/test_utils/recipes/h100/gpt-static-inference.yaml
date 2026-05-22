@@ -50,8 +50,8 @@ spec:
         "OUTPUT_PATH={assets_dir}"
         "INFERENCE_OUTPUT_PATH={assets_dir}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
