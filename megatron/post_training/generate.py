@@ -65,6 +65,10 @@ def simple_generate(
         else:
             tokens = input_ids
 
+        if calibration_mode:
+            _forward_step_func({"tokens": tokens}, model)
+            continue
+
         logits_and_extras = get_forward_backward_func()(
             forward_step_func=_forward_step_func,
             data_iterator=[{"tokens": tokens}],
@@ -76,9 +80,6 @@ def simple_generate(
             forward_only=True,
             collect_non_loss_data=True,
         )
-
-        if calibration_mode:
-            continue  # avoid unnecessary computation
 
         if mpu.is_pipeline_last_stage():
             logits = gather_from_tensor_model_parallel_region(logits_and_extras[0])
