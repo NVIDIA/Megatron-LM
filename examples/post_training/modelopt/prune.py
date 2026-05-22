@@ -243,6 +243,8 @@ if __name__ == "__main__":
             num_samples=args.calib_size,
             seq_length=args.calib_max_sequence_length,
             batch_size=1,
+            # pack=True uses Megatron pretraining-style global-stream document packing
+            pack=True,
         )
     else:
         # modelopt 0.44 fallback: inline pack=True (concatenate raw samples into a single

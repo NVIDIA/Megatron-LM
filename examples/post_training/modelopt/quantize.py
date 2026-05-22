@@ -377,6 +377,8 @@ if __name__ == "__main__":
             num_samples=args.calib_size,
             seq_length=args.calib_max_sequence_length,
             batch_size=args.calib_batch_size,
+            # pack=True uses Megatron pretraining-style global-stream document packing
+            pack=True,
         )
     else:
         def _dataset_forward_loop_func(model):
