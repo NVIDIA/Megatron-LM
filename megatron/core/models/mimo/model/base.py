@@ -298,9 +298,14 @@ class MimoModel(MegatronModule):
         batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
         input_ids_text = input_ids[batch_idx, seq_idx].unsqueeze(0)
 
-        position_ids_text = (
-            position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
-        )
+        if position_ids is None:
+            position_ids_text = None
+        elif position_ids.dim() == 3:
+            # Multimodal RoPE can carry [rope_dim, batch, seq] ids. Text
+            # embedding lookup only needs a single absolute position channel.
+            position_ids_text = position_ids[0, batch_idx, seq_idx].unsqueeze(0)
+        else:
+            position_ids_text = position_ids[batch_idx, seq_idx].unsqueeze(0)
 
         text_embeddings = (
             unwrap_model(self.language_model)
@@ -464,8 +469,10 @@ class MimoModel(MegatronModule):
             )
 
             lm_output = self.language_model(
-                input_ids=None,
-                position_ids=None,
+                # Keep ids available even when decoder_input is pre-combined:
+                # models such as Qwen3-VL still need position_ids for mRoPE.
+                input_ids=input_ids,
+                position_ids=position_ids,
                 decoder_input=combined_embeddings,
                 labels=labels,
                 attention_mask=attention_mask,
@@ -481,8 +488,9 @@ class MimoModel(MegatronModule):
                     underlying_lm.set_input_tensor(hidden_states)
 
             lm_output = self.language_model(
-                input_ids=None,
-                position_ids=None,
+                # Non-first PP stages may still need position_ids for RoPE.
+                input_ids=input_ids,
+                position_ids=position_ids,
                 decoder_input=None,
                 labels=labels,
                 attention_mask=attention_mask,
@@ -618,8 +626,10 @@ class MimoModel(MegatronModule):
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
-            input_ids=None,
-            position_ids=None,
+            # Keep ids available even when decoder_input is pre-combined:
+            # models such as Qwen3-VL still need position_ids for mRoPE.
+            input_ids=input_ids,
+            position_ids=position_ids,
             decoder_input=combined_embeddings,
             labels=labels,
             attention_mask=None,
