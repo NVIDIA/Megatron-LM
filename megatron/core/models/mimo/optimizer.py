@@ -401,6 +401,11 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                     model_chunks=[module],
                     pg_collection=pg_collection,
                     use_gloo_process_groups=False,
+                    # MIMO non-colocated: each module's get_megatron_optimizer
+                    # runs only on its own ranks, so the param-group key
+                    # all-gather inside _get_param_groups must be scoped to
+                    # that module's optimizer group rather than WORLD.
+                    param_group_process_group=pg_collection.intra_dist_opt,
                 )
 
         module_infos[module_name] = ModuleOptimizerInfo(
