@@ -329,9 +329,12 @@ def _native_unfused_sparse_indexer_loss(
     predict = predict * idx_row_mask.float()
 
     target = attention_probs.sum(dim=1)
-    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
-    kl_per_element = target * (torch.log(target + 1e-10) - torch.log(predict + 1e-10))
-    kl_per_row = kl_per_element.sum(dim=-1)
+    target = target / target.sum(dim=-1, keepdim=True)
+    eps = torch.finfo(torch.float32).tiny
+    target = target.clamp(min=eps)
+    predict = predict.clamp(min=eps)
+    kl_per_row = (target * (torch.log(target) - torch.log(predict))).sum(dim=-1)
+    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
     loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
     return loss * loss_coeff
 
