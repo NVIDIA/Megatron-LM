@@ -694,7 +694,7 @@ if __name__ == "__main__":
 
             def forward_loop(model):
                 for sample in tqdm(calib_dataloader, disable=torch.distributed.get_rank()):
-                    _run_calib_step(model, sample, tokenizer.pad_token_id)
+                    _calib_forward_step(iter([sample]), model, tokenizer.pad_token_id, with_labels=False)
 
             mtq.quantize(unwrapped_model, mtq_config, forward_loop)
 
