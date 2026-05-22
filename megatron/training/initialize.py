@@ -609,13 +609,6 @@ def _initialize_distributed(
         if model_config.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
 
-        # Ensure MASTER_ADDR and MASTER_PORT are set for distributed initialization
-        # These may come from torchrun, SLURM, or defaults
-        if "MASTER_ADDR" not in os.environ:
-            os.environ["MASTER_ADDR"] = get_master_addr_safe()
-        if "MASTER_PORT" not in os.environ:
-            os.environ["MASTER_PORT"] = str(get_master_port_safe())
-
         _setup_flight_recorder_env(dist_config)
 
         # Call the init process
