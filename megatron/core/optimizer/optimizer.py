@@ -1280,7 +1280,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
         return found_inf_flag
 
-    def _step_chained_optimizers(self) -> bool:
+    def _step(self) -> bool:
         """Step all optimizers in this chain."""
         success = True
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
@@ -1358,7 +1358,7 @@ class ChainedOptimizer(MegatronOptimizer):
         """Step optimizers with MXFP8 param sync deferred until all steps finish."""
         deferred_bucket_groups = self._enable_deferred_mxfp8_param_sync()
         try:
-            success = self._step_chained_optimizers()
+            success = self._step()
         finally:
             self._disable_deferred_mxfp8_param_sync()
 
@@ -1372,7 +1372,7 @@ class ChainedOptimizer(MegatronOptimizer):
         """Step the optimizer with ready gradients, return successful."""
         if self._should_defer_mxfp8_param_sync():
             return self._step_with_deferred_mxfp8_param_sync()
-        return self._step_chained_optimizers()
+        return self._step()
 
     def grads_states_parallel_group_is_shared(self):
         """Check if all optimizers share the same gradient statistics parallel group."""
