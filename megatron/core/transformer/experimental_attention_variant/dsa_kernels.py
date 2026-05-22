@@ -254,6 +254,7 @@ class SparseAttnFunc(torch.autograd.Function):
         softmax_scale: float,
         indexer_topk: int,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+        """Run FlashMLA sparse-attention forward and save tensors for backward."""
         out, lse, lse_indexer = _dsa_fwd_flash_mla(
             q,
             kv,
@@ -271,6 +272,7 @@ class SparseAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO, d_lse, d_lse_indexer):
+        """Compute sparse-attention backward via cuDNN DSA wrapper."""
         _ensure_dsa_namespace()
 
         q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
@@ -715,6 +717,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         kv_offset: int,
         calculate_per_token_loss: bool,
     ) -> Tuple[Tensor, Tensor]:
+        """Fused forward: indexer scoring, sparse attention, and indexer-loss computation."""
         _ensure_dsa_namespace()
 
         sq, b, np_, d = query.shape
@@ -867,6 +870,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_loss):
+        """Backward for sparse attention and indexer loss."""
         # Saved-tensor layout depends on the loss variant; unpack the common
         # prefix first, then the variant-specific tail.
         saved = ctx.saved_tensors
