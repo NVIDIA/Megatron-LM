@@ -910,7 +910,7 @@ def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=F
         print(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
               f'at {save_path}', flush=True)
         if log_progress:
-            append_to_progress_log(args.save, f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
+            append_to_progress_log(save_path, f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
     except Exception as e:
         print(f'  encountered exception "{e}" when trying to delete checkpoint from '
               f'iteration {iteration_to_delete:7d} at {save_path}', flush=True)
