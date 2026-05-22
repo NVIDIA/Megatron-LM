@@ -55,7 +55,16 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 # Higher PP ranks have fewer microbatches in flight, so offloading less
 # reduces overhead without increasing peak memory.
 --delta-offload-bytes-across-pp-ranks 1073741824
+
+# Optional: cap inflight D2H offloads per offload group to N (omit or None in most setups).
+# Required as a non-None non-negative integer when fine-grained activation offloading is used with
+# local full-iteration CUDA graphs (full_iteration in cuda_graph_scope); see prose below.
+--fine-grained-offloading-max-inflight-offloads <N>
 ```
+
+`TransformerConfig.fine_grained_offloading_max_inflight_offloads` caps, per offload group (for example `moe_act`, `qkv_linear`), how many D2H copies may be in flight before a main-stream `wait_event`. `0` waits after each offload; larger values allow more overlap; `None` skips these joins.
+
+With full-iteration CUDA graphs (local graph impl, `full_iteration` in `cuda_graph_scope`) and fine-grained activation offloading enabled, set it to a non-None integer: that path does not rely on `record_stream`, so explicit joins are required.
 
 ### CUDA Graph Integration
 

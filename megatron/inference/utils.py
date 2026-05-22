@@ -25,6 +25,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_model
 from megatron.training import get_args
@@ -347,7 +348,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs
-            if args.cuda_graph_impl == "local"
+            if args.inference_cuda_graph_scope != InferenceCudaGraphScope.none
             else None
         ),
         max_requests=args.inference_dynamic_batching_max_requests,
@@ -356,6 +357,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         kv_cache_management_mode=KVCacheManagementMode(args.rl_kv_cache_management_mode),
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
+        cuda_graph_all_prefills=args.inference_cuda_graph_all_prefills,
         static_kv_memory_pointers=args.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
         mamba_inference_state_config=mamba_inference_state_config,

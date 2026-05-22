@@ -23,9 +23,10 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import cat_with_oom_fallback
+from megatron.core.transformer.utils import cat_with_oom_fallback, sharded_state_dict_default
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
@@ -348,7 +349,9 @@ class MLP(MegatronModule):
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
+            sub_sd = sharded_state_dict_default(
+                module, f"{prefix}{name}.", sharded_offsets, metadata
+            )
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
@@ -361,6 +364,31 @@ class MLP(MegatronModule):
     def backward_dw(self):
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
+
+    @classmethod
+    def as_mlp_submodule(
+        cls,
+        submodules: MLPSubmodules,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection,
+        is_mtp_layer: bool,
+        is_expert: bool = False,
+        input_size: int | None = None,
+        ffn_hidden_size: int | None = None,
+    ) -> MLP:
+        """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
+        del is_mtp_layer
+        assert hasattr(
+            pg_collection, 'tp'
+        ), 'TP process group is required for MLP in TransformerLayer'
+        return cls(
+            config=config,
+            submodules=submodules,
+            tp_group=pg_collection.tp,
+            is_expert=is_expert,
+            input_size=input_size,
+            ffn_hidden_size=ffn_hidden_size,
+        )
 
 
 # pylint: disable=missing-function-docstring

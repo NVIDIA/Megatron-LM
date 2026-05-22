@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
 from functools import partial
@@ -10,7 +10,6 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -169,10 +168,7 @@ class GraphableMegatronModule(MegatronModule):
         assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
 
         # Enable cuda graphs.
-        if (
-            config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in config.cuda_graph_scope
-        ):
+        if config.cuda_graph_impl == "local":
             if hasattr(self, "create_mcore_cudagraph_manager"):
                 self.create_mcore_cudagraph_manager(config)
             else:
