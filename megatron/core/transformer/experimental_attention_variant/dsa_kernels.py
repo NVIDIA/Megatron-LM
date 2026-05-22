@@ -520,15 +520,20 @@ def _compute_attn_target(
 
 
 def _kl_loss_from_target_predict(
-    target: Tensor, predict: Tensor, topk_indices: Tensor, loss_coeff: float
+    target: Tensor,
+    predict: Tensor,
+    topk_indices: Tensor,
+    loss_coeff: float,
+    calculate_per_token_loss: bool = False,
 ) -> Tensor:
-    """KL(target || predict) averaged over ``(B, S_q)`` and scaled by loss_coeff.
+    """KL(target || predict) reduced over ``(B, S_q)`` and scaled by loss_coeff.
 
     Rows with no valid top-K positions (early query rows with ratio causal
     masking) contribute 0 to the loss — the sparse score kernels produce
     garbage for those rows, mirroring ``compute_dsa_indexer_loss``'s
-    ``row_valid`` handling. The mean is taken over all ``(B, S_q)``
-    positions (matching the reference's ``kl_per_element.sum(-1).mean()``).
+    ``row_valid`` handling. The default mean is taken over all ``(B, S_q)``
+    positions. Per-token-loss mode returns a raw local sum so finalize can
+    apply the global token divisor.
     """
     eps = _CLIP_PROB_MIN
     t = target.clamp(min=eps)
@@ -537,7 +542,8 @@ def _kl_loss_from_target_predict(
 
     row_valid = (topk_indices >= 0).any(dim=-1)  # (B, S_q)
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
-    return loss_coeff * kl_per_row.mean()
+    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    return loss_coeff * loss
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +625,7 @@ def _kl_loss_from_dense_scores(
     index_score: Tensor,
     index_lse: Tensor,
     loss_coeff: float,
+    calculate_per_token_loss: bool = False,
 ) -> Tensor:
     """KL(target || predict) over the **full** KV axis, averaged over ``(B, S_q)``.
 
@@ -650,7 +657,8 @@ def _kl_loss_from_dense_scores(
         dim=-1
     )  # (B, S_q)
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
-    return loss_coeff * kl_per_row.mean()
+    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    return loss_coeff * loss
 
 
 class FusedIndexerSparseAttnFunc(torch.autograd.Function):
@@ -705,6 +713,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         loss_coeff: float,
         sparse_loss: bool,
         kv_offset: int,
+        calculate_per_token_loss: bool,
     ) -> Tuple[Tensor, Tensor]:
         _ensure_dsa_namespace()
 
@@ -769,7 +778,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
             if loss_coeff > 0:
                 indexer_loss = _kl_loss_from_target_predict(
-                    target, predict, topk_indices_cmp, loss_coeff
+                    target, predict, topk_indices_cmp, loss_coeff, calculate_per_token_loss
                 )
             else:
                 indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
@@ -810,7 +819,12 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
             if loss_coeff > 0:
                 indexer_loss = _kl_loss_from_dense_scores(
-                    attn_score, attn_l1norm, index_score, index_lse, loss_coeff
+                    attn_score,
+                    attn_l1norm,
+                    index_score,
+                    index_lse,
+                    loss_coeff,
+                    calculate_per_token_loss,
                 )
             else:
                 indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
@@ -836,6 +850,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.indexer_softmax_scale = indexer_softmax_scale
         ctx.loss_coeff = loss_coeff
+        ctx.calculate_per_token_loss = calculate_per_token_loss
         ctx.ratio = ratio
         ctx.sq = sq
         ctx.b = b
@@ -882,9 +897,12 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         d_sink = attn_bwd["d_sink"]
 
         # ---- 2. Indexer backward. -----------------------------------------
-        # Both branches share: ``grad_scale = loss_coeff * grad_loss / (B * S_q)``
-        # is folded inside the kernel, matching the ``.mean()`` reduction
-        # applied to the KL tensor in the forward.
+        # The cuDNN indexer backward wrappers fold in ``1 / (B * S_q)``. For
+        # raw-sum per-token loss, compensate here and let finalize_model_grads
+        # apply the global token divisor later.
+        indexer_loss_coeff = ctx.loss_coeff
+        if ctx.calculate_per_token_loss:
+            indexer_loss_coeff = indexer_loss_coeff * (ctx.b * ctx.sq)
         if ctx.sparse_loss:
             # ``target`` and ``predict`` are mutated in-place by the kernel's
             # score-grad stage; clone to keep them intact in case anyone else
@@ -901,7 +919,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 index_score,
                 topk_indices_cmp,
                 sm_scale=ctx.indexer_softmax_scale,
-                loss_coeff=ctx.loss_coeff,
+                loss_coeff=indexer_loss_coeff,
                 grad_loss=grad_loss,
                 block_I=128,
             )
@@ -923,7 +941,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 index_score_c,
                 index_lse,
                 sm_scale=ctx.indexer_softmax_scale,
-                loss_coeff=ctx.loss_coeff,
+                loss_coeff=indexer_loss_coeff,
                 grad_loss=grad_loss,
                 ratio=ctx.ratio,
                 block_I=128,
@@ -939,7 +957,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
         # Grads: query, kv_full, attn_sink, window_idxs, q_indexer, k_indexer,
         #   weights, indexer_topk, ratio, softmax_scale, indexer_softmax_scale,
-        #   loss_coeff, sparse_loss, kv_offset
+        #   loss_coeff, sparse_loss, kv_offset, calculate_per_token_loss
         return (
             grad_query,
             grad_kv_full,
@@ -948,6 +966,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -973,6 +992,7 @@ def fused_indexer_sparse_attn(
     loss_coeff: float = 0.0,
     sparse_loss: bool = False,
     kv_offset: int = 0,
+    calculate_per_token_loss: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -1003,6 +1023,8 @@ def fused_indexer_sparse_attn(
             :class:`FusedIndexerSparseAttnFunc` for the full data flow
             of each variant.
         kv_offset:    start of compressed region within ``kv_full``.
+        calculate_per_token_loss: if True, report raw local KL sum and
+            compensate the cuDNN backward wrappers' local averaging.
 
     Returns:
         ``(output, indexer_loss)`` where ``output`` is ``(sq, b, np * d_v)``
@@ -1023,6 +1045,7 @@ def fused_indexer_sparse_attn(
         loss_coeff,
         sparse_loss,
         kv_offset,
+        calculate_per_token_loss,
     )
 
 

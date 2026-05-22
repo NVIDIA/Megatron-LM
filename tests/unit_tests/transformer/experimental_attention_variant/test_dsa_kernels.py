@@ -36,6 +36,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
     _ensure_dsa_namespace,
     _ensure_flash_mla,
     _get_topk_alignment,
+    _kl_loss_from_dense_scores,
     _kl_loss_from_target_predict,
     build_flat_topk_idxs,
     dsa_sparse_attn,
@@ -360,6 +361,51 @@ class TestKLLossFromTargetPredict:
         assert torch.allclose(
             loss_d, torch.tensor(expected), rtol=1e-5, atol=1e-5
         ), f"analytical: {loss_d.item()} vs expected {expected}"
+
+    def test_per_token_loss_reports_raw_sum(self):
+        torch.manual_seed(1)
+        b, sq, topk = 2, 5, 4
+        target = torch.softmax(torch.randn(b, sq, topk), dim=-1)
+        predict = torch.softmax(torch.randn(b, sq, topk), dim=-1)
+        topk_indices = torch.zeros(b, sq, topk, dtype=torch.int32)
+
+        loss_mean = _kl_loss_from_target_predict(
+            target, predict, topk_indices, loss_coeff=0.5
+        )
+        loss_sum = _kl_loss_from_target_predict(
+            target,
+            predict,
+            topk_indices,
+            loss_coeff=0.5,
+            calculate_per_token_loss=True,
+        )
+
+        assert torch.allclose(loss_sum, loss_mean * (b * sq), rtol=1e-5, atol=1e-5)
+
+
+class TestKLLossFromDenseScores:
+    def test_per_token_loss_reports_raw_sum(self):
+        b, sq, sk = 2, 5, 4
+        loss_coeff = 0.5
+
+        attn_score = _peaked_dist(b, sq, sk, 'cpu', peak_idx=0)
+        attn_l1norm = torch.ones(b, sq, dtype=torch.float32)
+        index_score = torch.zeros(b, sq, sk, dtype=torch.float32)
+        index_lse = torch.full((b, sq), math.log(sk), dtype=torch.float32)
+
+        loss_mean = _kl_loss_from_dense_scores(
+            attn_score, attn_l1norm, index_score, index_lse, loss_coeff
+        )
+        loss_sum = _kl_loss_from_dense_scores(
+            attn_score,
+            attn_l1norm,
+            index_score,
+            index_lse,
+            loss_coeff,
+            calculate_per_token_loss=True,
+        )
+
+        assert torch.allclose(loss_sum, loss_mean * (b * sq), rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

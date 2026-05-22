@@ -736,6 +736,7 @@ class CompressedSparseAttention(MegatronModule):
                             causal_mask,
                             getattr(self.config, "dsa_indexer_use_sparse_loss", True),
                             self.indexer.pg_collection,
+                            self.config.calculate_per_token_loss,
                         )
                         if indexer_loss_coeff > 0:
                             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -801,6 +802,7 @@ class CompressedSparseAttention(MegatronModule):
                         indexer_loss_coeff,
                         sparse_loss=getattr(self.config, "dsa_indexer_use_sparse_loss", True),
                         kv_offset=offset,
+                        calculate_per_token_loss=self.config.calculate_per_token_loss,
                     )
                     nvtx_range_pop("sparse_attn_kernel")
                     if indexer_loss_coeff > 0:

@@ -212,6 +212,56 @@ class TestComputeDSAIndexerLoss:
         assert loss_sparse >= 0
         assert loss_dense >= 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dsa_indexer_loss_per_token_scale(self, seqlen_and_topk):
+        batch_size = 2
+        seqlen = seqlen_and_topk[0]
+        num_heads = 4
+        head_dim = 128
+        index_topk = seqlen_and_topk[1]
+
+        index_scores = torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32).cuda()
+        causal_mask = torch.triu(
+            torch.full(
+                (seqlen, seqlen), float('-inf'), dtype=torch.float32, device=index_scores.device
+            ),
+            diagonal=1,
+        )
+        masked_index_scores = index_scores + causal_mask
+        topk_k = min(index_topk, seqlen)
+        topk_indices = masked_index_scores.topk(topk_k, dim=-1)[1]
+
+        query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        key = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        softmax_scale = head_dim**-0.5
+
+        for sparse_loss in [False, True]:
+            loss_mean = compute_dsa_indexer_loss(
+                index_scores=index_scores.clone(),
+                topk_indices=topk_indices,
+                query=query,
+                key=key,
+                softmax_scale=softmax_scale,
+                loss_coeff=1.0,
+                sparse_loss=sparse_loss,
+                pg_collection=self.pg_collection,
+            )
+            loss_sum = compute_dsa_indexer_loss(
+                index_scores=index_scores.clone(),
+                topk_indices=topk_indices,
+                query=query,
+                key=key,
+                softmax_scale=softmax_scale,
+                loss_coeff=1.0,
+                sparse_loss=sparse_loss,
+                pg_collection=self.pg_collection,
+                calculate_per_token_loss=True,
+            )
+
+            assert torch.allclose(
+                loss_sum, loss_mean * (batch_size * seqlen), rtol=1e-3, atol=1e-3
+            )
+
 
 class TestDSAIndexerLossAutoScaler:
     """Test DSAIndexerLossAutoScaler autograd function."""
@@ -290,7 +340,8 @@ class TestFusedDSAIndexerLossGradient:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_fused_indexer_loss_gradient_matches_autograd(self):
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    def test_fused_indexer_loss_gradient_matches_autograd(self, calculate_per_token_loss):
         """
         Test that the manually written backward in FusedDSAIndexerLoss produces
         the same gradients as PyTorch autograd on the unfused implementation.
@@ -305,7 +356,10 @@ class TestFusedDSAIndexerLossGradient:
 
         for seqlen, index_topk in [[16, 8], [32, 16], [64, 32]]:
             for sparse_loss in [False, True]:
-                tag = f"[seqlen={seqlen}, topk={index_topk}, sparse={sparse_loss}]"
+                tag = (
+                    f"[seqlen={seqlen}, topk={index_topk}, sparse={sparse_loss}, "
+                    f"per_token={calculate_per_token_loss}]"
+                )
                 torch.manual_seed(42)
 
                 q_ref = (
@@ -351,6 +405,7 @@ class TestFusedDSAIndexerLossGradient:
                     loss_coeff=loss_coeff,
                     sparse_loss=sparse_loss,
                     pg_collection=self.pg_collection,
+                    calculate_per_token_loss=calculate_per_token_loss,
                 )
                 loss_ref.backward()
 
@@ -375,6 +430,7 @@ class TestFusedDSAIndexerLossGradient:
                     mask,
                     sparse_loss,
                     self.pg_collection,
+                    calculate_per_token_loss,
                 )
                 loss_fused.backward()
 
@@ -472,6 +528,7 @@ class TestFusedDSAIndexerLossGradientTP:
                 mask,
                 sparse_loss,
                 pg_collection_tp1,
+                False,
             )
             loss_tp1.backward()
 
@@ -528,6 +585,7 @@ class TestFusedDSAIndexerLossGradientTP:
                     mask,
                     sparse_loss,
                     pg_collection_tpn,
+                    False,
                 )
                 loss_tpn.backward()
 

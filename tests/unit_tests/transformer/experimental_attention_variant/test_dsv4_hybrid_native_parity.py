@@ -15,7 +15,6 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.experimental_attention_variant.dsa import compute_dsa_indexer_loss
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
@@ -65,7 +64,10 @@ _CASE_SEQLENS = [2048, 4096, 8192]
 
 
 def _make_config(
-    variant: str, compress_ratio: int, apply_dsa_kernel_fusion: bool = False
+    variant: str,
+    compress_ratio: int,
+    apply_dsa_kernel_fusion: bool = False,
+    calculate_per_token_loss: bool = False,
 ) -> MLATransformerConfig:
     shape = _DSV4_VARIANTS[variant]
     mcore_ratio = 0 if compress_ratio == 1 else compress_ratio
@@ -91,6 +93,7 @@ def _make_config(
         dsa_indexer_topk=shape["dsa_indexer_topk"],
         dsa_indexer_loss_coeff=0.01,
         dsa_indexer_use_sparse_loss=True,
+        calculate_per_token_loss=calculate_per_token_loss,
         add_bias_linear=False,
         bf16=True,
         params_dtype=torch.bfloat16,
@@ -241,6 +244,7 @@ def _native_fused_sparse_indexer_loss(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     loss_coeff: float,
+    calculate_per_token_loss: bool,
 ) -> torch.Tensor:
     batch_size, seqlen, topk = topk_indices.size()
     num_heads, head_dim = query.size(2), query.size(3)
@@ -279,7 +283,57 @@ def _native_fused_sparse_indexer_loss(
     predict = predict.clamp(min=eps)
     kl_per_row = (target * (torch.log(target) - torch.log(predict))).sum(dim=-1)
     kl_per_row = torch.where(row_valid.squeeze(-1), kl_per_row, torch.zeros_like(kl_per_row))
-    return loss_coeff * kl_per_row.mean()
+    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    return loss_coeff * loss
+
+
+def _native_unfused_sparse_indexer_loss(
+    index_scores: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    sparse_loss: bool,
+    causal_mask: torch.Tensor,
+    calculate_per_token_loss: bool,
+) -> torch.Tensor:
+    sq, batch_size, num_heads, _ = query.size()
+    sk = compressed_kv.size(0)
+    mask = causal_mask.to(dtype=torch.float32)
+
+    attention_scores = torch.einsum(
+        "sbhd,tbd->bhst", query.detach().float(), compressed_kv.detach().float()
+    )
+    attention_scores = attention_scores * softmax_scale
+    attention_scores = attention_scores + mask.view(batch_size, 1, sq, sk)
+    index_scores = index_scores + mask
+
+    if sparse_loss:
+        index_mask = torch.full(
+            (batch_size, sq, sk), float("-inf"), dtype=torch.float32, device=index_scores.device
+        ).scatter_(-1, topk_indices.clamp(min=0), 0)
+        attention_scores = attention_scores + index_mask.view(batch_size, 1, sq, sk)
+        index_scores = index_scores + index_mask
+
+    row_valid = (mask > float("-inf")).any(dim=-1)
+    attn_row_mask = row_valid.view(batch_size, 1, sq, 1)
+    idx_row_mask = row_valid.view(batch_size, sq, 1)
+
+    attention_scores = attention_scores.masked_fill(~attn_row_mask, 0.0)
+    index_scores = index_scores.masked_fill(~idx_row_mask, 0.0)
+
+    attention_probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32)
+    predict = F.softmax(index_scores, dim=-1, dtype=torch.float32)
+    attention_probs = attention_probs * attn_row_mask.float()
+    predict = predict * idx_row_mask.float()
+
+    target = attention_probs.sum(dim=1)
+    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+    kl_per_element = target * (torch.log(target + 1e-10) - torch.log(predict + 1e-10))
+    kl_per_row = kl_per_element.sum(dim=-1)
+    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    return loss * loss_coeff
 
 
 class NativeCompressor(nn.Module):
@@ -422,6 +476,7 @@ class NativeCompressedSparseAttention(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self.indexer_loss_coeff = config.dsa_indexer_loss_coeff
         self.indexer_use_sparse_loss = config.dsa_indexer_use_sparse_loss
+        self.calculate_per_token_loss = config.calculate_per_token_loss
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
 
         self.attn_sink = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
@@ -470,7 +525,6 @@ class NativeCompressedSparseAttention(nn.Module):
                 )
 
                 if not self.apply_dsa_kernel_fusion:
-                    key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
                     causal_mask = (
                         torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(sq, -1)
                     )
@@ -482,16 +536,16 @@ class NativeCompressedSparseAttention(nn.Module):
                         .unsqueeze(0)
                         .expand(batch_size, -1, -1)
                     )
-                    indexer_loss = compute_dsa_indexer_loss(
+                    indexer_loss = _native_unfused_sparse_indexer_loss(
                         index_scores,
-                        topk_compressed.clamp(min=0),
+                        topk_compressed,
                         query.detach(),
-                        key_for_loss.detach(),
+                        compressed_kv.detach(),
                         self.softmax_scale,
                         self.indexer_loss_coeff,
                         self.indexer_use_sparse_loss,
-                        pg_collection,
-                        causal_mask_override=causal_mask,
+                        causal_mask,
+                        self.calculate_per_token_loss,
                     )
                 else:
                     indexer_loss = _native_fused_sparse_indexer_loss(
@@ -502,6 +556,7 @@ class NativeCompressedSparseAttention(nn.Module):
                         self.attn_sink,
                         self.softmax_scale,
                         self.indexer_loss_coeff,
+                        self.calculate_per_token_loss,
                     )
             else:
                 topk_compressed_for_attn = _get_compress_topk_idxs(
@@ -623,8 +678,14 @@ def _copy_real_params_to_native(real_layer: nn.Module, native_layer: nn.Module):
 @pytest.mark.parametrize("variant", ["flash", "pro"])
 @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
 @pytest.mark.parametrize("seqlen", _CASE_SEQLENS)
+@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
 def test_dsv4_hybrid_attention_matches_native_reference(
-    variant: str, compress_ratio: int, seqlen: int, backend: str, apply_dsa_kernel_fusion: bool
+    variant: str,
+    compress_ratio: int,
+    seqlen: int,
+    backend: str,
+    apply_dsa_kernel_fusion: bool,
+    calculate_per_token_loss: bool,
 ):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
@@ -633,7 +694,10 @@ def test_dsv4_hybrid_attention_matches_native_reference(
         model_parallel_cuda_manual_seed(_SEED)
 
         config = _make_config(
-            variant, compress_ratio, apply_dsa_kernel_fusion=apply_dsa_kernel_fusion
+            variant,
+            compress_ratio,
+            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            calculate_per_token_loss=calculate_per_token_loss,
         )
         similarity_eps = (
             _UNFUSED_SIMILARITY_EPS if not apply_dsa_kernel_fusion else _FUSED_SIMILARITY_EPS
