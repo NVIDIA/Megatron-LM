@@ -36,6 +36,7 @@ spec:
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
     set -euo pipefail
+    : "${RUN_ID:=pr-$$}"
     ls
     cd /opt/megatron-lm
 
