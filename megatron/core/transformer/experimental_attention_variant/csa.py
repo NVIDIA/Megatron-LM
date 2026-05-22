@@ -785,7 +785,7 @@ class CompressedSparseAttention(MegatronModule):
                         x_det, qr_det, packed_seq_params
                     )
                     nvtx_range_pop("compressed_indices")
-                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+                    indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
                     nvtx_range_push("sparse_attn_kernel")
                     output, indexer_loss = fused_indexer_sparse_attn(
                         query,
@@ -809,7 +809,7 @@ class CompressedSparseAttention(MegatronModule):
                         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                             loss=indexer_loss,
                             layer_number=self.layer_number,
-                            num_layers=self.config.num_layers,
+                            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
                         )
                 else:
                     # Path C: separate indexer fwd (no loss) + sparse attn (compact)
