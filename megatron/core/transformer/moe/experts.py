@@ -108,6 +108,7 @@ class GroupedLinearFc1Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> GroupedLinearFc1Interface:
         """Builds a linear_fc1 layer for TEGroupedMLP."""
         ...
@@ -144,6 +145,7 @@ class GroupedLinearFc2Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> GroupedLinearFc2Interface:
         """Builds a linear_fc2 layer for TEGroupedMLP."""
         ...
@@ -179,7 +181,12 @@ class TEGroupedMLP(MegatronModule):
         config: TransformerConfig,
         submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
@@ -206,6 +213,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc1',
             pg_collection=pg_collection,
+            name=(name + ".linear_fc1") if name is not None else None,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -228,6 +236,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc2',
             pg_collection=pg_collection,
+            name=(name + ".linear_fc2") if name is not None else None,
         )
 
         self.offload_expert_fc1 = (
@@ -817,6 +826,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         config: TransformerConfig,
         submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
         # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
         super().__init__(
@@ -824,6 +834,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             config=config,
             submodules=submodules,
             pg_collection=pg_collection,
+            name=name,
         )
 
         # Concatenated weights are built lazily on first forward to ensure
@@ -1079,6 +1090,7 @@ class SequentialMLP(MegatronModule):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
 
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
@@ -1098,13 +1110,14 @@ class SequentialMLP(MegatronModule):
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
         self.dp_group = pg_collection.expt_dp
 
-        for _ in range(self.num_local_experts):
+        for expert_idx in range(self.num_local_experts):
             expert = MLP(
                 self.config,
                 submodules,
                 ffn_hidden_size=self.config.moe_ffn_hidden_size,
                 is_expert=True,
                 tp_group=pg_collection.expt_tp,
+                name=(name + f".local_experts.{expert_idx}") if name is not None else None,
             )
             self.local_experts.append(expert)
 

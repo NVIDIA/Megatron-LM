@@ -33,6 +33,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import QuantizationConfig
+from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -64,7 +65,7 @@ from megatron.core.utils import (
 
 try:
     import transformer_engine as te
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast, fp8_model_init
 
     HAVE_TE = True
 except ImportError:
@@ -123,6 +124,14 @@ class TEQuantizationRecipe:
     """
     If an amax reduction is applicable, such as in per-tensor quantization recipe,
     whether to reduce only along TP groups.
+    """
+    fp8_param: bool = False
+    """
+    If cast the initialized parameters to fp8 precision and all-gather weights in FP8.
+    """
+    fp4_param: bool = False
+    """
+    If cast the initialized parameters to fp4 precision and all-gather weights in FP4.
     """
 
     @classmethod
@@ -204,6 +213,61 @@ class TEQuantizationParams:
             )
         else:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
+
+
+def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+    if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
+        enabled = False
+        quant_recipe = None
+    elif qrecipe.fp8_quantization_recipe is not None:
+        enabled = qrecipe.fp8_param
+        if qrecipe.fp8_format == "e4m3":
+            fp8_format = te.common.recipe.Format.E4M3
+        elif qrecipe.fp8_format == "hybrid":
+            fp8_format = te.common.recipe.Format.HYBRID
+        else:
+            raise ValueError(f"Unhandled fp8_format {qrecipe.fp8_format}")
+
+        if qrecipe.fp8_quantization_recipe == Fp8Recipe.custom:
+            from megatron.core.fp8_utils import _get_custom_recipe
+
+            assert qrecipe.custom_recipe_factory is not None
+            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+        elif qrecipe.fp8_quantization_recipe == Fp8Recipe.tensorwise:
+            quant_recipe = te.common.recipe.Float8CurrentScaling(fp8_format=fp8_format)
+        elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
+            quant_recipe = te.common.recipe.Float8BlockScaling(fp8_format=fp8_format)
+        elif qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8:
+            quant_recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=fp8_format)
+        else:
+            raise ValueError(f"Unhandled fp8 recipe: {qrecipe.fp8_quantization_recipe}")
+    else:
+        # Fp4 configured.
+        enabled = qrecipe.fp4_param
+        if qrecipe.fp4_quantization_recipe == Fp4Recipe.custom:
+            from megatron.core.fp8_utils import _get_custom_recipe
+
+            assert qrecipe.custom_recipe_factory is not None
+            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+        elif qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
+            quant_recipe = te.common.recipe.NVFP4BlockScaling()
+        else:
+            raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
+
+    return fp8_model_init(
+        enabled=enabled,
+        recipe=quant_recipe,
+        preserve_high_precision_init_val=torch.is_grad_enabled(),
+    )
+
+
+def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+    if qparams is None:
+        return nullcontext()
+    elif not training and qparams.evaluation_recipe is not None:
+        return _get_fp8_model_init_for_quant_recipe(qparams.evaluation_recipe)
+    else:
+        return _get_fp8_model_init_for_quant_recipe(qparams.training_recipe)
 
 
 def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
@@ -686,7 +750,7 @@ class TELinear(te.pytorch.Linear):
         output_size: int,
         *,
         parallel_mode: Optional[str],
-        config: ModelParallelConfig,
+        config: TransformerConfig,
         init_method: Callable,
         bias: bool,
         skip_bias_add: bool,
@@ -695,7 +759,12 @@ class TELinear(te.pytorch.Linear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -817,24 +886,31 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
-        super().__init__(
-            in_features=input_size,
-            out_features=output_size,
-            sequence_parallel=self.config.sequence_parallel,
-            fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            # Pass None if not initialized for backward compatibility with the ckpt converter.
-            tp_group=tp_group_for_te if torch.distributed.is_initialized() else None,
-            tp_size=tp_size,
-            get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-            ),
-            init_method=condition_init_method(config, init_method),
-            bias=bias,
-            return_bias=self.te_return_bias,
-            parallel_mode=te_parallel_mode,
-            **extra_kwargs,
-        )
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self.finish_init(quant_config)
+        init_quant_context = _get_fp8_model_init_for_quant_params(
+            self.te_quant_params, torch.is_grad_enabled()
+        )
+
+        with init_quant_context:
+            super().__init__(
+                in_features=input_size,
+                out_features=output_size,
+                sequence_parallel=self.config.sequence_parallel,
+                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                # Pass None if not initialized for backward compatibility with the ckpt converter.
+                tp_group=tp_group_for_te if torch.distributed.is_initialized() else None,
+                tp_size=tp_size,
+                get_rng_state_tracker=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                init_method=condition_init_method(config, init_method),
+                bias=bias,
+                return_bias=self.te_return_bias,
+                parallel_mode=te_parallel_mode,
+                **extra_kwargs,
+            )
 
         for param in self.parameters():
             if is_expert:
@@ -927,7 +1003,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1020,30 +1101,37 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         self.stride = stride
 
-        super().__init__(
-            in_features=input_size,
-            out_features=output_size,
-            eps=self.config.layernorm_epsilon,
-            sequence_parallel=self.config.sequence_parallel,
-            fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            tp_group=tp_group if torch.distributed.is_initialized() else None,
-            tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-            ),
-            init_method=(
-                condition_init_method(config, init_method)
-                if not config.use_cpu_initialization
-                else lambda w: None
-            ),
-            bias=bias,
-            return_bias=self.te_return_bias,
-            parallel_mode="column",
-            return_layernorm_output=False,
-            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            **extra_kwargs,
-        )
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self.finish_init(quant_config)
+        init_quant_context = _get_fp8_model_init_for_quant_params(
+            self.te_quant_params, torch.is_grad_enabled()
+        )
+
+        with init_quant_context:
+            super().__init__(
+                in_features=input_size,
+                out_features=output_size,
+                eps=self.config.layernorm_epsilon,
+                sequence_parallel=self.config.sequence_parallel,
+                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                tp_group=tp_group if torch.distributed.is_initialized() else None,
+                tp_size=self.config.tensor_model_parallel_size,
+                get_rng_state_tracker=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                init_method=(
+                    condition_init_method(config, init_method)
+                    if not config.use_cpu_initialization
+                    else lambda w: None
+                ),
+                bias=bias,
+                return_bias=self.te_return_bias,
+                parallel_mode="column",
+                return_layernorm_output=False,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                **extra_kwargs,
+            )
 
         # Set proper partition_stride
         setattr(self.weight, 'partition_stride', stride)
@@ -1144,7 +1232,7 @@ class TEColumnParallelLinear(TELinear):
         input_size: int,
         output_size: int,
         *,
-        config: ModelParallelConfig,
+        config: TransformerConfig,
         init_method: Callable,
         gather_output: bool,
         bias: bool,
@@ -1154,7 +1242,12 @@ class TEColumnParallelLinear(TELinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1186,6 +1279,7 @@ class TEColumnParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
+            name=name,
         )
 
         # Set proper partition_stride
@@ -1254,7 +1348,7 @@ class TERowParallelLinear(TELinear):
         input_size: int,
         output_size: int,
         *,
-        config: ModelParallelConfig,
+        config: TransformerConfig,
         init_method: Callable,
         bias: bool,
         input_is_parallel: bool,
@@ -1262,7 +1356,12 @@ class TERowParallelLinear(TELinear):
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1294,6 +1393,7 @@ class TERowParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
+            name=name,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -1695,7 +1795,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool = False,
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
+            name: str | None = None,
         ):
+            """
+            Args:
+                name (str | None): module instance name passed top-down from its paranet module
+            """
             self.config = config
 
             # TE returns a zero length Tensor when bias=False and
@@ -1764,24 +1869,32 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     config, "moe_single_grouped_bias", False
                 )
 
-            super().__init__(
-                num_gemms=num_gemms,
-                in_features=input_size,
-                out_features=output_size,
-                sequence_parallel=self.config.sequence_parallel,
-                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-                tp_group=tp_group_for_te if torch.distributed.is_initialized() else None,
-                tp_size=tp_size,
-                get_rng_state_tracker=(
-                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-                ),
-                init_method=condition_init_method(config, init_method),
-                bias=bias,
-                return_bias=self.te_return_bias,
-                parallel_mode=parallel_mode,
-                **extra_kwargs,
-            )
             self.te_quant_params: Optional[TEQuantizationParams] = None
+            quant_config = get_quant_config_or_none(name, config.quant_recipe)
+            self.finish_init(quant_config)
+            init_quant_context = _get_fp8_model_init_for_quant_params(
+                self.te_quant_params, torch.is_grad_enabled()
+            )
+
+            with init_quant_context:
+                super().__init__(
+                    num_gemms=num_gemms,
+                    in_features=input_size,
+                    out_features=output_size,
+                    sequence_parallel=self.config.sequence_parallel,
+                    fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                    tp_group=tp_group_for_te if torch.distributed.is_initialized() else None,
+                    tp_size=tp_size,
+                    get_rng_state_tracker=(
+                        get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                    ),
+                    init_method=condition_init_method(config, init_method),
+                    bias=bias,
+                    return_bias=self.te_return_bias,
+                    parallel_mode=parallel_mode,
+                    **extra_kwargs,
+                )
+
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
@@ -2166,7 +2279,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
+            name: str | None = None,
         ):
+            """
+            Args:
+                name (str | None): module instance name passed top-down from its paranet module
+            """
             super().__init__(
                 num_gemms=num_gemms,
                 input_size=input_size,
@@ -2179,6 +2297,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 pg_collection=pg_collection,
+                name=name,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -2212,7 +2331,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
+            name: str | None = None,
         ):
+            """
+            Args:
+                name (str | None): module instance name passed top-down from its paranet module
+            """
             super().__init__(
                 num_gemms=num_gemms,
                 input_size=input_size,
@@ -2225,6 +2349,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 pg_collection=pg_collection,
+                name=name,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -2542,6 +2667,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             is_expert: bool = False,
             input_size: int | None = None,
             ffn_hidden_size: int | None = None,
+            name: str | None = None,
         ) -> MLP:
             """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
             del is_mtp_layer
@@ -2555,6 +2681,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 is_expert=is_expert,
                 input_size=input_size,
                 ffn_hidden_size=ffn_hidden_size,
+                name=name,
             )
 
 else:
