@@ -3364,7 +3364,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
