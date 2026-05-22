@@ -1,46 +1,50 @@
 {
   "batch_1": {
     "batch_size": 1,
-    "num_input_tokens": 512,
+    "dataset": "gsm8k",
+    "num_input_tokens_avg": 60.2,
     "num_output_tokens": 128,
     "num_iters": 5,
-    "throughput_tok_per_sec": 37.529906418816665,
-    "avg_latency_ms": 3410.5498243123293,
-    "p50_latency_ms": 3414.4981070421636,
-    "p99_latency_ms": 3416.3351953029633,
-    "tpot_ms_per_tok": 26.645416826795554
+    "throughput_tok_per_sec": 38.16568346861343,
+    "avg_latency_ms": 3353.7510838359594,
+    "p50_latency_ms": 3345.5649770330638,
+    "p99_latency_ms": 3380.324238911271,
+    "tpot_ms_per_tok": 26.201548331300728
   },
   "batch_8": {
     "batch_size": 8,
-    "num_input_tokens": 512,
+    "dataset": "gsm8k",
+    "num_input_tokens_avg": 59.625,
     "num_output_tokens": 128,
     "num_iters": 5,
-    "throughput_tok_per_sec": 291.8183959930783,
-    "avg_latency_ms": 3507.079070620239,
-    "p50_latency_ms": 3465.222094208002,
-    "p99_latency_ms": 3623.947192914784,
-    "tpot_ms_per_tok": 27.414310097810812
+    "throughput_tok_per_sec": 302.74426211997957,
+    "avg_latency_ms": 3380.2406550908927,
+    "p50_latency_ms": 3364.5363999530673,
+    "p99_latency_ms": 3439.708017045632,
+    "tpot_ms_per_tok": 26.424943429083214
   },
   "batch_32": {
     "batch_size": 32,
-    "num_input_tokens": 512,
+    "dataset": "gsm8k",
+    "num_input_tokens_avg": 62.475,
     "num_output_tokens": 128,
     "num_iters": 5,
-    "throughput_tok_per_sec": 1111.1065377733298,
-    "avg_latency_ms": 3679.9507213494508,
-    "p50_latency_ms": 3695.062874816358,
-    "p99_latency_ms": 3709.825834259391,
-    "tpot_ms_per_tok": 28.800118541403208
+    "throughput_tok_per_sec": 1211.147008516413,
+    "avg_latency_ms": 3377.5188652565703,
+    "p50_latency_ms": 3367.9910679347813,
+    "p99_latency_ms": 3441.8616080656648,
+    "tpot_ms_per_tok": 26.421235221641837
   },
   "batch_128": {
     "batch_size": 128,
-    "num_input_tokens": 512,
+    "dataset": "gsm8k",
+    "num_input_tokens_avg": 61.75,
     "num_output_tokens": 128,
     "num_iters": 5,
-    "throughput_tok_per_sec": 3582.8349807822524,
-    "avg_latency_ms": 4495.833022887382,
-    "p50_latency_ms": 4497.306297998875,
-    "p99_latency_ms": 4597.334167920053,
-    "tpot_ms_per_tok": 35.72589881659951
+    "throughput_tok_per_sec": 4458.541557256171,
+    "avg_latency_ms": 3652.4659513921506,
+    "p50_latency_ms": 3593.510515987873,
+    "p99_latency_ms": 3797.184966970235,
+    "tpot_ms_per_tok": 28.708939539137646
   }
 }
