@@ -401,7 +401,7 @@ class TestPartitionAdapterApplyContextParallel:
         sharded = {'embeddings': embeddings[:, :4, :]}
         captured = {}
 
-        def mock_fn(batch, **kwargs):
+        def mock_fn(batch):
             captured.update(batch)
             return sharded
 
