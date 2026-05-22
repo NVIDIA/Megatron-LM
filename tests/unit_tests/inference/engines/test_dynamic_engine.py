@@ -3390,9 +3390,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
 
         # Step 1: prefill for request 0 — should NOT count as a spec step.
+        # The controller returns accepted_tokens=None for prefill-only batches
+        # (num_decode_requests == 0), so the engine must not increment any stats.
         env.engine.step_modern()
         proposed_after_prefill = sum(env.engine._spec_tokens_proposed_per_pos)
         accepted_after_prefill = sum(env.engine._spec_tokens_accepted_per_pos)
+        assert proposed_after_prefill == 0, "Prefill step should not propose any spec tokens"
+        assert accepted_after_prefill == 0, "Prefill step should not accept any spec tokens"
+        assert env.engine._spec_steps == 0, "Prefill step should not count as a spec step"
 
         # Step 2: decode for request 0 — should count spec tokens.
         env.engine.step_modern()

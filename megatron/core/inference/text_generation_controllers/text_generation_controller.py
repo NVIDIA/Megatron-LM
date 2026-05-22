@@ -1810,6 +1810,14 @@ class TextGenerationController:
                         )
             range_pop()
 
+            # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
+            # resets num_prefill_requests to 0, which would make num_decode_requests
+            # always equal to the full active count.
+            num_decode_requests = context.num_decode_requests
+            if self.num_speculative_tokens > 0:
+                # Prefill-only batches must not have any accepted speculative tokens.
+                assert num_decode_requests > 0 or (self._accepted_tokens_per_request == -1).all()
+
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
@@ -1826,7 +1834,7 @@ class TextGenerationController:
                 "accepted_tokens": (
                     # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
                     self._accepted_tokens_per_request.clone()
-                    if self.num_speculative_tokens > 0
+                    if self.num_speculative_tokens > 0 and num_decode_requests > 0
                     else None
                 ),
                 "log_probs": log_probs,
