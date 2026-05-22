@@ -374,7 +374,30 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
-        if grad_output.dim() > 2:
+        # For Megatron's [s, b, h] layout, .transpose(0, 1) recovers the
+        # contiguous [b, s, h] storage as a free view, so we can flatten
+        # to 2D and route through a single regular GEMM (avoids a
+        # batched-GEMM dispatch whose int32 strideA can overflow at long
+        # sequence × large out-per-partition). Other 3D layouts fall back
+        # to an explicit reshape (which copies if non-contiguous).
+        if grad_output.dim() == 3:
+            swapped = grad_output.transpose(0, 1)
+            if swapped.is_contiguous():
+                seq_len, batch_size, in_features = grad_output.shape
+                grad_input = (
+                    swapped.reshape(batch_size * seq_len, in_features)
+                    .matmul(weight)
+                    .view(batch_size, seq_len, -1)
+                    .transpose(0, 1)
+                )
+            else:
+                in_features = grad_output.shape[-1]
+                grad_input = (
+                    grad_output.reshape(-1, in_features)
+                    .matmul(weight)
+                    .view(*grad_output.shape[:-1], -1)
+                )
+        elif grad_output.dim() > 2:
             # Work around PyTorch matmul not folding some size-1 leading dims to mm.
             # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
             grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))

@@ -70,3 +70,44 @@ def test_LinearWithFrozenWeight_3d_input_matches_torch_linear():
     assert torch.allclose(input_data.grad, expected_input.grad)
 
     Utils.destroy_model_parallel()
+
+
+def test_LinearWithFrozenWeight_3d_non_contiguous_grad_output():
+    """Backward must handle a 3D non-contiguous grad_output without
+    crashing in the batched-GEMM dispatch."""
+    Utils.initialize_model_parallel(1, 1)
+
+    seq_length, batch_size, in_features, out_features = 4, 2, 8, 6
+
+    # [B, S, K] contig leaf; transpose downstream so backward produces a
+    # non-contiguous [S, B, K] grad_output into the linear.
+    input_bsk = torch.arange(
+        batch_size * seq_length * in_features, dtype=torch.float32
+    ).reshape(batch_size, seq_length, in_features).cuda()
+    input_bsk.requires_grad = True
+    input_sbk = input_bsk.transpose(0, 1)
+    assert not input_sbk.is_contiguous()
+
+    weight = torch.ones((out_features, in_features)).cuda()
+    bias = torch.zeros(out_features).cuda()
+
+    output_parallel = linear_with_frozen_weight(
+        input_sbk,
+        weight,
+        bias,
+        False,  # gradient_accumulation_fusion
+        False,  # allreduce_dgrad
+        False,  # sequence_parallel
+        None,  # grad_output_buffer
+        None,  # wgrad_deferral_limit
+    )
+    output = gather_from_tensor_model_parallel_region(output_parallel)
+    output.transpose(0, 1).sum().backward()
+
+    # weight=ones means each input element contributes once per output
+    # column, so its grad equals the number of output columns.
+    expected_grad = torch.full_like(input_bsk, float(out_features))
+    assert input_bsk.grad is not None
+    assert torch.allclose(input_bsk.grad, expected_grad)
+
+    Utils.destroy_model_parallel()
