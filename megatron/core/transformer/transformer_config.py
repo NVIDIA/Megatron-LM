@@ -370,6 +370,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    use_fused_pre_gated_delta_rule: bool = False
+    """Use the placeholder fused pre-gated-delta-rule path in GatedDeltaNet."""
+
     ####################
     # initialization
     ####################

@@ -17,6 +17,7 @@ from torch import Tensor
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.fusions.fused_pre_gated_delta_rule import fused_pre_gated_delta_rule
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -122,6 +123,11 @@ class GatedDeltaNet(MegatronModule):
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
+        self.use_fused_pre_gated_delta_rule = config.use_fused_pre_gated_delta_rule
+        if self.use_fused_pre_gated_delta_rule:
+            assert (
+                self.cp_size == 1
+            ), "Fused pre_gated_delta_rule does not support context parallelism yet."
 
         # Attributes from config
         self.config = config
@@ -300,6 +306,14 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
+        if self.use_fused_pre_gated_delta_rule:
+            assert (
+                self.cp_size == 1
+            ), "Fused pre_gated_delta_rule does not support context parallelism yet."
+            assert (
+                packed_seq_params is None
+            ), "Fused pre_gated_delta_rule does not support packed sequence yet."
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
@@ -373,6 +387,68 @@ class GatedDeltaNet(MegatronModule):
                     self.num_value_heads // self.tp_size,
                 ],
             )
+
+        if self.use_fused_pre_gated_delta_rule:
+            nvtx_range_push(suffix="fused_pre_gated_delta_rule")
+            query, key, value, gate, beta, g = self._fused_pre_gated_delta_rule(
+                qkvzba, cu_seqlens_q=cu_seqlens_q
+            )
+            nvtx_range_pop(suffix="fused_pre_gated_delta_rule")
+        else:
+            nvtx_range_push(suffix="pre_gated_delta_rule")
+            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+                qkvzba, batch, seq_len, cu_seqlens_q=cu_seqlens_q
+            )
+            nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, last_recurrent_state = self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
+        norm_out = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out = norm_out.reshape(batch, seq_len, -1)
+        norm_out = norm_out.transpose(0, 1).contiguous()
+
+        # CP all to all: HP to CP
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
+            outputs = []
+            for norm_out_i in unpacked_norm_out:
+                norm_out_i = tensor_a2a_hp2cp(
+                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+                )
+                outputs.append(norm_out_i)
+            norm_out = torch.cat(outputs, dim=0)
+        else:
+            norm_out = tensor_a2a_hp2cp(
+                norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+            )
+
+        # Output projection
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        return out, out_bias
+
+    def pre_gated_delta_rule(self, qkvzba, batch, seq_len, cu_seqlens_q=None):
+        """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
 
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
@@ -459,51 +535,25 @@ class GatedDeltaNet(MegatronModule):
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
+        return query, key, value, gate, beta, g
+
+    def _fused_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None):
+        """Call the placeholder fused pre-GDR wrapper."""
+
+        assert self.cp_size == 1, "Fused pre_gated_delta_rule does not support CP yet."
+        return fused_pre_gated_delta_rule(
+            qkvzba,
+            self.conv1d.weight,
+            self.conv1d.bias if self.conv_bias else None,
+            self.A_log,
+            self.dt_bias,
+            num_key_heads=self.qk_dim_local_tp // self.key_head_dim,
+            num_value_heads=self.v_dim_local_tp // self.value_head_dim,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            use_qk_l2norm=self.use_qk_l2norm,
             cu_seqlens=cu_seqlens_q,
         )
-        nvtx_range_pop(suffix="gated_delta_rule")
-
-        # RMSNorm
-        nvtx_range_push(suffix="gated_norm")
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
-
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()
-
-        # CP all to all: HP to CP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
-            outputs = []
-            for norm_out_i in unpacked_norm_out:
-                norm_out_i = tensor_a2a_hp2cp(
-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                )
-                outputs.append(norm_out_i)
-            norm_out = torch.cat(outputs, dim=0)
-        else:
-            norm_out = tensor_a2a_hp2cp(
-                norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-            )
-
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        return out, out_bias
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):

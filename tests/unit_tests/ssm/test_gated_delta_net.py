@@ -309,6 +309,101 @@ class TestGatedDeltaNet:
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
+class TestFusedPreGatedDeltaRule:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        self.pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        self.unfused_gdn = self._build_gdn(use_fused_pre_gated_delta_rule=False)
+        self.fused_gdn = self._build_gdn(use_fused_pre_gated_delta_rule=True)
+        self.fused_gdn.load_state_dict(self.unfused_gdn.state_dict())
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def _build_gdn(self, use_fused_pre_gated_delta_rule: bool):
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            linear_conv_kernel_dim=2,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            num_layers=1,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=8,
+            activation_func=F.silu,
+            bf16=True,
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            transformer_impl="transformer_engine",
+            deterministic_mode=True,
+            use_fused_pre_gated_delta_rule=use_fused_pre_gated_delta_rule,
+        )
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=transformer_config
+        ).submodules
+        gdn = GatedDeltaNet(
+            transformer_config,
+            submodules=gdn_submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=self.pg_collection,
+        )
+        return gdn.cuda().bfloat16()
+
+    def test_fused_and_unfused_forward_match(self):
+        hidden_states = torch.randn(
+            (32, 2, self.unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            unfused_output, unfused_bias = self.unfused_gdn(hidden_states, None)
+            fused_output, fused_bias = self.fused_gdn(hidden_states, None)
+
+        torch.testing.assert_close(fused_output, unfused_output, atol=1e-3, rtol=1e-3)
+        assert fused_bias == unfused_bias
+
+    def test_fused_and_unfused_pre_gated_delta_rule_match(self):
+        batch = 2
+        seq_len = 32
+        hidden_states = torch.randn(
+            (seq_len, batch, self.unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            qkvzba, _ = self.unfused_gdn.in_proj(hidden_states)
+            unfused_outputs = self.unfused_gdn.pre_gated_delta_rule(qkvzba, batch, seq_len)
+            fused_outputs = self.fused_gdn._fused_pre_gated_delta_rule(qkvzba)
+
+        for fused, unfused in zip(fused_outputs, unfused_outputs):
+            torch.testing.assert_close(fused, unfused, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
 class TestGDNCuSeqlensResolve:
 
     @pytest.fixture
