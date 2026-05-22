@@ -85,8 +85,6 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  # - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #       platforms: [dgx_h100]
+  # Throughput coverage for this 583M dynamic-batching DP=8 config now lives at
+  # tests/performance_tests/test_cases/gpt/gpt_583m_perf/ — see
+  # skills/run-performance-tests/SKILL.md for the harness it runs under.
