@@ -1,13 +1,157 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 
 from megatron.core import fp8_utils
+from megatron.core.enums import Fp8Recipe
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_resolve_callable_from_python_import_path_success():
+    fn = fp8_utils._resolve_callable_from_python_import_path("math.sqrt")
+
+    assert fn(9) == 3
+
+
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        ("", "non-empty string"),
+        ("math", "Expected 'pkg.mod.func'"),
+        ("missing_module.sqrt", "Failed to import module"),
+        ("math.missing_attr", "Attribute 'missing_attr' not found"),
+        ("math.pi", "is not callable"),
+    ],
+)
+def test_resolve_callable_from_python_import_path_errors(path, message):
+    with pytest.raises(ValueError, match=message):
+        fp8_utils._resolve_callable_from_python_import_path(path)
+
+
+def test_get_fp8_align_size():
+    assert fp8_utils.get_fp8_align_size(Fp8Recipe.mxfp8) == 32
+    assert fp8_utils.get_fp8_align_size(Fp8Recipe.delayed) == 16
+
+
+def test_fp8_tensor_type_helpers(monkeypatch):
+    class FakeFloat8Tensor:
+        pass
+
+    class FakeMXFP8Tensor:
+        pass
+
+    float8_tensor = FakeFloat8Tensor()
+    mxfp8_tensor = FakeMXFP8Tensor()
+
+    monkeypatch.setattr(fp8_utils, "HAVE_TE_FP8_TENSOR_CLASS", True)
+    monkeypatch.setattr(fp8_utils, "FP8_TENSOR_CLASS", FakeFloat8Tensor)
+    monkeypatch.setattr(fp8_utils, "HAVE_TE_MXFP8TENSOR", True)
+    monkeypatch.setattr(fp8_utils, "MXFP8Tensor", FakeMXFP8Tensor, raising=False)
+
+    assert fp8_utils.is_float8tensor(float8_tensor)
+    assert not fp8_utils.is_float8tensor(object())
+    assert fp8_utils.is_mxfp8tensor(mxfp8_tensor)
+    assert not fp8_utils.is_mxfp8tensor(object())
+
+
+def test_dequantize_fp8_tensor_dispatches_by_te_version(monkeypatch):
+    tensor = Mock()
+
+    monkeypatch.setattr(fp8_utils, "is_te_min_version", lambda version: True)
+    fp8_utils.dequantize_fp8_tensor(tensor)
+    tensor.dequantize.assert_called_once_with()
+
+    tensor = Mock()
+    monkeypatch.setattr(fp8_utils, "is_te_min_version", lambda version: False)
+    fp8_utils.dequantize_fp8_tensor(tensor)
+    tensor.from_float8.assert_called_once_with()
+
+
+def test_parallel_linear_type_helpers(monkeypatch):
+    class FakeColumn:
+        pass
+
+    class FakeRow:
+        pass
+
+    class FakeTEColumn:
+        pass
+
+    class FakeTELayerNormColumn:
+        pass
+
+    class FakeTERow:
+        pass
+
+    monkeypatch.setattr(fp8_utils, "ColumnParallelLinear", FakeColumn)
+    monkeypatch.setattr(fp8_utils, "RowParallelLinear", FakeRow)
+    monkeypatch.setattr(fp8_utils, "TEColumnParallelLinear", FakeTEColumn, raising=False)
+    monkeypatch.setattr(
+        fp8_utils, "TELayerNormColumnParallelLinear", FakeTELayerNormColumn, raising=False
+    )
+    monkeypatch.setattr(fp8_utils, "TERowParallelLinear", FakeTERow, raising=False)
+
+    monkeypatch.setattr(fp8_utils, "HAVE_TE", False)
+    assert fp8_utils.is_column_parallel_linear(FakeColumn())
+    assert fp8_utils.is_row_parallel_linear(FakeRow())
+    assert not fp8_utils.is_column_parallel_linear(FakeTEColumn())
+    assert not fp8_utils.is_row_parallel_linear(FakeTERow())
+
+    monkeypatch.setattr(fp8_utils, "HAVE_TE", True)
+    assert fp8_utils.is_column_parallel_linear(FakeTEColumn())
+    assert fp8_utils.is_column_parallel_linear(FakeTELayerNormColumn())
+    assert fp8_utils.is_row_parallel_linear(FakeTERow())
+
+
+def test_interface_functions_delegate_to_selected_implementations(monkeypatch):
+    modify_impl = Mock()
+    quantize_impl = Mock()
+    correct_impl = Mock()
+    post_all_gather = Mock()
+
+    monkeypatch.setattr(fp8_utils, "_modify_underlying_storage_impl", modify_impl)
+    monkeypatch.setattr(fp8_utils, "_quantize_param_shard_impl", quantize_impl)
+    monkeypatch.setattr(fp8_utils, "_correct_amax_history_if_needed_impl", correct_impl)
+    monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", post_all_gather)
+
+    fp8_utils.modify_underlying_storage("tensor", "raw")
+    fp8_utils.quantize_param_shard(["model"], ["main"], [0], "group", ["fsdp"])
+    fp8_utils.correct_amax_history_if_needed(["module"])
+    fp8_utils.post_all_gather_processing(["param"])
+
+    modify_impl.assert_called_once_with("tensor", "raw")
+    quantize_impl.assert_called_once_with(["model"], ["main"], [0], "group", ["fsdp"])
+    correct_impl.assert_called_once_with(["module"])
+    post_all_gather.assert_called_once_with(["param"])
+
+
+def test_post_all_gather_processing_noops_without_te_helper(monkeypatch):
+    monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", None)
+
+    assert fp8_utils.post_all_gather_processing(["param"]) is None
+
+
+def test_is_first_last_bf16_layer():
+    config = SimpleNamespace(
+        first_last_layers_bf16=True,
+        num_layers_at_start_in_bf16=2,
+        num_layers_at_end_in_bf16=1,
+        num_layers=6,
+    )
+
+    assert fp8_utils.is_first_last_bf16_layer(config, 0)
+    assert fp8_utils.is_first_last_bf16_layer(config, 1)
+    assert not fp8_utils.is_first_last_bf16_layer(config, 2)
+    assert fp8_utils.is_first_last_bf16_layer(config, 5)
+    assert not fp8_utils.is_first_last_bf16_layer(config, -1)
+
+    config.first_last_layers_bf16 = False
+    assert not fp8_utils.is_first_last_bf16_layer(config, 0)
 
 
 class MockTELinear(nn.Module):

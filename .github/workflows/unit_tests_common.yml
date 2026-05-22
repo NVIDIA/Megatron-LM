@@ -42,9 +42,10 @@ jobs:
           - name: core
             path: "tests/unit_tests/test_*.py"
             description: "Core unit tests"
-          # - name: transformer
-          #   path: "tests/unit_tests/transformer/"
-          #   description: "Transformer tests"
+          - name: transformer
+            path: "tests/unit_tests/transformer/"
+            description: "Transformer tests"
+            cuda_only: true
           - name: models
             path: "tests/unit_tests/models/"
             description: "Model tests"
@@ -66,10 +67,39 @@ jobs:
           - name: fusions
             path: "tests/unit_tests/fusions/"
             description: "Fusion tests"
+          - name: inference
+            path: "tests/unit_tests/inference/"
+            description: "Inference tests"
+            cuda_only: true
+          - name: ssm
+            path: "tests/unit_tests/ssm/"
+            description: "SSM tests"
+            cuda_only: true
+          - name: optimizer
+            path: "tests/unit_tests/optimizer/"
+            description: "Optimizer tests"
+            cuda_only: true
+          - name: resharding
+            path: "tests/unit_tests/resharding/"
+            description: "Resharding tests"
+            cuda_only: true
+          - name: rl
+            path: "tests/unit_tests/rl/"
+            description: "RL tests"
+            cuda_only: true
+          - name: a2a_overlap
+            path: "tests/unit_tests/a2a_overlap/"
+            description: "A2A overlap tests"
+            cuda_only: true
+          - name: extension
+            path: "tests/unit_tests/extension/"
+            description: "Extension tests"
+            cuda_only: true
           - name: others
             path: "tests/unit_tests/export/ tests/unit_tests/post_training/ tests/unit_tests/tokenizers/ tests/unit_tests/utils/"
-            description: "Other tests (a2a_overlap, export, post_training, tokenizers, utils)"
+            description: "Other tests (export, post_training, tokenizers, utils)"
     name: unit-${{ inputs.device }}-${{ matrix.test_group.name }}
+    if: ${{ matrix.test_group.cuda_only != true || inputs.platform == 'cuda' }}
     container:
       image: ${{ inputs.image }}
       ports:
@@ -192,14 +222,18 @@ jobs:
 
           # Coverage setup
           COVERAGE_DIR="$GITHUB_WORKSPACE/coverage-report"
+          COVERAGE_SOURCE="$GITHUB_WORKSPACE"
+          COVERAGE_INCLUDE="megatron/*"
           RUNNER_CMD="-m pytest"
           MARKER_OPTS=()
           if [ "$PLATFORM" = "cuda" ]; then
             MARKER_OPTS=(-m "not flaky_in_dev")
+            COVERAGE_SOURCE="$GITHUB_WORKSPACE/megatron/core"
+            COVERAGE_INCLUDE="megatron/core/*"
           fi
           mkdir -p "$COVERAGE_DIR"
           printf '[run]\nparallel = true\nsource = %s\ndata_file = %s/.coverage\n' \
-            "$GITHUB_WORKSPACE" "$COVERAGE_DIR" > "$COVERAGE_DIR/.coveragerc"
+            "$COVERAGE_SOURCE" "$COVERAGE_DIR" > "$COVERAGE_DIR/.coveragerc"
           RUNNER_CMD="-m coverage run --rcfile=$COVERAGE_DIR/.coveragerc -m pytest"
           
           torchrun --nproc_per_node=$NUM_GPUS $RUNNER_CMD -v $FINAL_TEST_PATH $IGNORE_OPTS "${MARKER_OPTS[@]}" -p no:randomly
@@ -208,7 +242,7 @@ jobs:
           # Combine coverage fragments and generate JSON report
           coverage combine --rcfile="$COVERAGE_DIR/.coveragerc" "$COVERAGE_DIR" 2>/dev/null || true
           coverage json --rcfile="$COVERAGE_DIR/.coveragerc" \
-            -o "$COVERAGE_DIR/coverage-${{ inputs.platform }}-${{ inputs.device }}-${{ matrix.test_group.name }}.json" --include="megatron/*" 2>/dev/null || true
+            -o "$COVERAGE_DIR/coverage-${{ inputs.platform }}-${{ inputs.device }}-${{ matrix.test_group.name }}.json" --include="$COVERAGE_INCLUDE" 2>/dev/null || true
 
           echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
           exit $exit_code
