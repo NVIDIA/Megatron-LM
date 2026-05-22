@@ -24,12 +24,19 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    learned_output_contract,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -174,6 +181,12 @@ class HyperConnectionHybridLayer(MegatronModule):
         # `dropout_prob=0.0` already disables dropout regardless of training mode;
         # `training=self.training` is more semantically accurate than hard-coding
         # False during a training-mode forward.
+        is_last_in_recompute_block = bool(
+            mhc_recompute_manager is not None
+            and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
+        )
+        mhc_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
+
         hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
             h_res,
             residual,
@@ -182,7 +195,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             dropout_prob=0.0,
             training=self.training,
             fused=False,
-            manager=mhc_recompute_manager,
+            manager=mhc_bda_manager,
         )
         # In `HyperConnectionTransformerLayer` the n-stream output stays in compute
         # dtype because the post-attention `x` is in compute dtype. In the hybrid
@@ -344,6 +357,18 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+        if self.config.enable_hyper_connections and self.post_process:
+            hc_mult = self.config.num_residual_streams
+            hc_dim = self.config.hidden_size * hc_mult
+            self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
+            self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
+            self.hc_head_scale = nn.Parameter(torch.ones(1))
+            nn.init.xavier_uniform_(self.hc_head_fn)
+            if self.config.sequence_parallel:
+                setattr(self.hc_head_fn, 'sequence_parallel', True)
+                setattr(self.hc_head_base, 'sequence_parallel', True)
+                setattr(self.hc_head_scale, 'sequence_parallel', True)
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -566,8 +591,13 @@ class HybridStack(MegatronModule):
                 )
 
         if self.config.enable_hyper_connections and self.post_process:
-            hidden_states = HyperConnectionModule.output_contract(
-                hidden_states, self.config.num_residual_streams
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.config.num_residual_streams,
+                self.config.layernorm_epsilon,
             )
 
         # Final layer norm.
@@ -604,6 +634,7 @@ class HybridStack(MegatronModule):
             dict: The sharded state dictionary for the current object.
         """
 
+        sharded_offsets = sharded_offsets or ()
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
 
@@ -637,6 +668,20 @@ class HybridStack(MegatronModule):
                         tp_group=self.tp_group,
                     )
                 )
+
+        local_state_dict: dict = {}
+        self._save_to_state_dict(local_state_dict, '', keep_vars=True)
+        if local_state_dict:
+            metadata = ensure_metadata_has_dp_cp_group(metadata)
+            sharded_state_dict.update(
+                make_sharded_tensors_for_checkpoint(
+                    local_state_dict,
+                    prefix,
+                    sharded_offsets=sharded_offsets or (),
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            )
 
         return sharded_state_dict
 

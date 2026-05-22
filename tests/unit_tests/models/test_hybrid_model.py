@@ -119,8 +119,75 @@ class TestHybridModel:
         )
 
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in model.decoder.layers)
+        assert model.decoder.hc_head_fn.shape == (
+            model_config.num_residual_streams,
+            model_config.hidden_size * model_config.num_residual_streams,
+        )
+        assert model.decoder.hc_head_base.shape == (model_config.num_residual_streams,)
+        assert model.decoder.hc_head_scale.shape == (1,)
+        assert "decoder.hc_head_fn" in model.state_dict()
+        decoder_sharded_state = model.decoder.sharded_state_dict(prefix="decoder.", metadata={})
+        assert "decoder.hc_head_fn" in decoder_sharded_state
+        assert "decoder.hc_head_base" in decoder_sharded_state
+        assert "decoder.hc_head_scale" in decoder_sharded_state
         num_weights = sum([p.numel() for p in model.parameters()])
         assert num_weights > sum([p.numel() for p in self.model.parameters()])
+
+    def test_hyper_connection_recompute_skips_boundary_bda_checkpoint(self, monkeypatch):
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=3,
+        )
+        layer = HyperConnectionHybridLayer(
+            config=model_config, layer=_DummyHybridLayer(model_config, layer_number=1)
+        )
+        hidden_states = torch.randn(
+            4, 2, model_config.hidden_size * model_config.num_residual_streams, requires_grad=True
+        )
+        manager = type("_FakeManager", (), {})()
+        manager.is_last_layer_in_recompute_block = True
+        seen_bda_managers = []
+
+        def fake_hyper_connection_forward(hidden_states, mhc_recompute_manager=None):
+            assert mhc_recompute_manager is manager
+            s, b, _ = hidden_states.shape
+            n = model_config.num_residual_streams
+            c = model_config.hidden_size
+            aggregated = hidden_states.view(s, b, n, c).mean(dim=2)
+            h_res = torch.empty(s, b, n, n, dtype=hidden_states.dtype)
+            h_post = torch.empty(s, b, n, dtype=hidden_states.dtype)
+            return aggregated, h_res, h_post
+
+        def fake_fused_h_res_h_post_bda(
+            h_res,
+            original_residual,
+            h_post,
+            layer_output_with_bias,
+            dropout_prob,
+            training,
+            fused,
+            manager=None,
+        ):
+            seen_bda_managers.append(manager)
+            return original_residual
+
+        monkeypatch.setattr(layer.hyper_connection, "forward", fake_hyper_connection_forward)
+        monkeypatch.setattr(
+            layer.hyper_connection, "fused_h_res_h_post_bda", fake_fused_h_res_h_post_bda
+        )
+
+        output, _ = layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
+        assert output is hidden_states
+        assert seen_bda_managers == [None]
+
+        manager.is_last_layer_in_recompute_block = False
+        layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
+        assert seen_bda_managers[-1] is manager
 
     def test_forward_with_hyper_connections(self):
         model_config = TransformerConfig(
