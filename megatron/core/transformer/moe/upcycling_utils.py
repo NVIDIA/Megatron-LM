@@ -1,12 +1,15 @@
 # Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
 """ Helpers for converting a dense model to a MoE model in runtime """
 import copy
+import logging
 from enum import Enum
 
 import torch
 
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
+
+logger = logging.getLogger(__name__)
 
 ExpertsType = Enum('ExpertsType', ('SequentialMLP', 'TEGroupedMLP'))
 ActivationFuncName = Enum('ActivationFuncName', ('gelu', 'silu', 'squared_relu'))
@@ -218,10 +221,11 @@ def _convert_to_moe_state_dict(moe_model, dense_model):
             value = src_dict[key]
             new_value = value_process_func(value)
             new_key = key.replace(key_replace_old, key_replace_new)
-            if (
-                new_key in dist_dict
-            ):  # Skip keys absent in target (e.g. dense layers in mixed dense/MoE)
+            if new_key in dist_dict:
                 dist_dict[new_key] = new_value.clone() if hasattr(new_value, 'clone') else new_value
+            else:
+                # Key absent in target (e.g. dense layers in mixed dense/MoE model).
+                logger.debug("upcycling: skipping key %s (absent in target)", new_key)
         return
 
     _convert_key_value(
@@ -260,10 +264,11 @@ def _convert_to_moe_state_dict(moe_model, dense_model):
             params = value_process_func(param)
             for idx in range(num_local_experts):
                 new_key = key.replace(key_replace_old, key_replace_new).format(idx)
-                if (
-                    new_key in dist_dict
-                ):  # Skip keys absent in target (e.g. dense layers in mixed dense/MoE)
+                if new_key in dist_dict:
                     dist_dict[new_key] = params[ep_rank * num_local_experts + idx]
+                else:
+                    # Key absent in target (e.g. dense layers in mixed dense/MoE model).
+                    logger.debug("upcycling: skipping expert key %s (absent in target)", new_key)
         return
 
     if experts_type == ExpertsType.SequentialMLP:
