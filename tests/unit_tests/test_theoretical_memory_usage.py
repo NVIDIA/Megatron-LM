@@ -67,10 +67,69 @@ def test_compute_weight_and_optimizer_memory_validates_moe_pattern_length():
         tmu.compute_weight_and_optimizer_memory(args)
 
 
+def test_compute_weight_and_optimizer_memory_covers_moe_mtp_and_verbose_paths(capsys):
+    args = _args(
+        num_experts=2,
+        moe_layer_freq=1,
+        swiglu=True,
+        moe_shared_expert_intermediate_size=8,
+        mtp_num_layers=1,
+        normalization="RMSNorm",
+        pipeline_model_parallel_size=2,
+        tensor_model_parallel_size=2,
+    )
+
+    result = tmu.compute_weight_and_optimizer_memory(args, verbose=True)
+
+    assert result > 0
+    output = capsys.readouterr().out
+    assert "Number of parameters in mtp block" in output
+    assert "Number of parameters in other shards" in output
+
+
+def test_compute_weight_and_optimizer_memory_covers_untied_embedding_shard():
+    args = _args(untie_embeddings_and_output_weights=True, pipeline_model_parallel_size=1)
+
+    untied_memory = tmu.compute_weight_and_optimizer_memory(args)
+    tied_memory = tmu.compute_weight_and_optimizer_memory(
+        _args(untie_embeddings_and_output_weights=False, pipeline_model_parallel_size=1)
+    )
+
+    assert untied_memory > tied_memory
+
+
+@pytest.mark.parametrize("q_lora_rank", [None, 2])
+def test_compute_weight_and_optimizer_memory_covers_multi_latent_attention(q_lora_rank):
+    args = _args(
+        multi_latent_attention=True,
+        q_lora_rank=q_lora_rank,
+        normalization="RMSNorm",
+        group_query_attention=False,
+    )
+
+    assert tmu.compute_weight_and_optimizer_memory(args) > 0
+
+
 def test_compute_activation_memory_with_sequence_parallel_formula():
     args = _args()
 
     assert tmu.compute_activation_memory(args, num_microbatches=None) == pytest.approx(27008.0)
+
+
+def test_compute_activation_memory_covers_interleaved_verbose_path(capsys):
+    args = _args(pipeline_model_parallel_size=4, virtual_pipeline_model_parallel_size=2)
+
+    assert tmu.compute_activation_memory(args, num_microbatches=None, verbose=True) > 0
+    output = capsys.readouterr().out
+    assert "Activation memory footprint per transformer layer" in output
+    assert "Memory penalty from interleaved schedule" in output
+
+
+def test_compute_activation_memory_covers_non_interleaved_pipeline_verbose_path(capsys):
+    args = _args(pipeline_model_parallel_size=4, virtual_pipeline_model_parallel_size=None)
+
+    assert tmu.compute_activation_memory(args, num_microbatches=None, verbose=True) > 0
+    assert "Number of in-flight microbatches: 4" in capsys.readouterr().out
 
 
 def test_compute_activation_memory_without_sequence_parallel_formula():
@@ -81,6 +140,15 @@ def test_compute_activation_memory_without_sequence_parallel_formula():
     )
 
 
+def test_compute_activation_memory_without_sp_covers_interleaved_verbose_path(capsys):
+    args = _args(pipeline_model_parallel_size=4, virtual_pipeline_model_parallel_size=2)
+
+    assert tmu.compute_activation_memory_without_sp(args, num_microbatches=None, verbose=True) > 0
+    output = capsys.readouterr().out
+    assert "Activation memory footprint per transformer layer" in output
+    assert "Memory penalty from interleaved schedule" in output
+
+
 def test_compute_activation_memory_applies_pipeline_discount():
     args = _args(pipeline_model_parallel_size=4)
 
@@ -88,6 +156,13 @@ def test_compute_activation_memory_applies_pipeline_discount():
     discounted_memory = tmu.compute_activation_memory_without_sp(args, num_microbatches=2)
 
     assert discounted_memory == pytest.approx(full_memory * 0.5)
+
+
+def test_compute_activation_memory_without_sp_covers_non_interleaved_pipeline_verbose_path(capsys):
+    args = _args(pipeline_model_parallel_size=4, virtual_pipeline_model_parallel_size=None)
+
+    assert tmu.compute_activation_memory_without_sp(args, num_microbatches=None, verbose=True) > 0
+    assert "Number of in-flight microbatches: 4" in capsys.readouterr().out
 
 
 def test_report_theoretical_memory_dispatches_to_sp_path(monkeypatch, capsys):
@@ -108,6 +183,26 @@ def test_report_theoretical_memory_dispatches_to_sp_path(monkeypatch, capsys):
         )
     )
     assert "compute_activation_memory with SP" in capsys.readouterr().out
+
+
+def test_report_theoretical_memory_dispatches_to_without_sp_path(monkeypatch, capsys):
+    args = _args(sequence_parallel=False, recompute_granularity="full")
+
+    monkeypatch.setattr(tmu, "compute_weight_and_optimizer_memory", lambda *a, **k: 10)
+    monkeypatch.setattr(tmu, "compute_activation_memory", lambda *a, **k: 999)
+    monkeypatch.setattr(tmu, "compute_activation_memory_without_sp", lambda *a, **k: 20)
+    monkeypatch.setattr(tmu, "print_rank_0", lambda message: print(message))
+
+    result = tmu.report_theoretical_memory(args)
+
+    assert result == pytest.approx(
+        (
+            10 / tmu.NUM_BYTES_IN_MEGABYTE,
+            20 / tmu.NUM_BYTES_IN_MEGABYTE,
+            30 / tmu.NUM_BYTES_IN_MEGABYTE,
+        )
+    )
+    assert "compute_activation_memory_without_sp" in capsys.readouterr().out
 
 
 def test_report_theoretical_memory_skips_hybrid_model(capsys):
