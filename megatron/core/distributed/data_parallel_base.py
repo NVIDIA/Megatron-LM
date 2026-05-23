@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import contextmanager
+from typing import Optional
 
 import torch
 
@@ -46,7 +47,7 @@ class _BaseDataParallel(MegatronModule):
         """Scale all gradients inside the buffers by `scaling_factor`."""
         pass
 
-    def finish_grad_sync(self):
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
         for all model gradients.
