@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for the experimental minimal Megatron-FSDP path."""
+"""Unit tests for the minimal Megatron-FSDP path."""
 
 import gc
 import os
@@ -17,6 +17,7 @@ from torch.distributed.tensor import DTensor
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     FsdpModule,
+    ParameterGroup,
     Placements,
     fully_shard,
 )
@@ -108,6 +109,32 @@ class NonLeafViewModel(nn.Module):
         return SaveNonLeafWeightView.apply(x, self.weight.view_as(self.weight))
 
 
+class ConstantMetaModel(nn.Module):
+    """Model whose meta parameter is initialized by reset_parameters()."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(4, 4, device="meta"))
+
+    def reset_parameters(self) -> None:
+        """Initialize the weight to a deterministic value."""
+        self.weight.fill_(3.0)
+
+
+class MixedMetaRealModel(nn.Module):
+    """Model with unsupported mixed meta and real direct parameters."""
+
+    def __init__(self, device: torch.device) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(4, 4, device="meta"))
+        self.bias = nn.Parameter(torch.ones(4, device=device))
+
+    def reset_parameters(self) -> None:
+        """Initialize parameters."""
+        self.weight.fill_(1.0)
+        self.bias.zero_()
+
+
 def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
@@ -120,9 +147,13 @@ def _full_named_parameters(module: nn.Module) -> dict[str, torch.Tensor]:
         prefix = f"{module_name}." if module_name else ""
         for group in child.parameter_groups():
             full_weight = group.main_weight.redistribute([Flat()]).allgather(0)
-            for index, name in enumerate(group.parameters):
+            for index, name in enumerate(group.sharded_parameters):
                 result[f"{prefix}{name}"] = full_weight.get_tensor(index).detach().clone()
     return result
+
+
+def _full_model_weight(group: ParameterGroup) -> torch.Tensor:
+    return group.model_weight.redistribute([Flat()]).allgather(0).get_tensor(0)
 
 
 @pytest.mark.distributed
@@ -171,8 +202,10 @@ def test_nested_fully_shard_excludes_child_owned_parameters(setup: DistributedSe
     fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    inner_names = [name for group in model.inner.parameter_groups() for name in group.parameters]
-    outer_names = [name for group in model.parameter_groups() for name in group.parameters]
+    inner_names = [
+        name for group in model.inner.parameter_groups() for name in group.sharded_parameters
+    ]
+    outer_names = [name for group in model.parameter_groups() for name in group.sharded_parameters]
 
     assert inner_names == ["weight"]
     assert outer_names == ["bias"]
@@ -214,6 +247,32 @@ def test_default_main_buffer_dtypes_follow_policy_contract(setup: DistributedSet
 
 
 @pytest.mark.distributed
+def test_full_mesh_is_distinct_from_dbuffer_dp_submesh(setup: DistributedSetup):
+    """ParameterGroup keeps the full mesh while DBuffers use only DP axes."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (1, setup.world_size), mesh_dim_names=("tp", "dp"))
+    placements = Placements(
+        dp_axes=["dp"], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+    )
+    model = nn.Linear(4, 4, bias=False).to(setup.device)
+
+    fully_shard(model, mesh=mesh, placements=placements)
+
+    (group,) = model.parameter_groups()
+    assert group.mesh is mesh
+    assert group.dp_mesh.ndim == 1
+    assert group.dp_mesh.size() == setup.world_size
+    assert group.main_weight.mesh is group.dp_mesh
+    assert group.model_weight.mesh is group.dp_mesh
+    assert group.main_grad is not None
+    assert group.main_grad.mesh is group.dp_mesh
+    assert isinstance(model.weight, DTensor)
+    assert model.weight.device_mesh is group.dp_mesh
+
+
+@pytest.mark.distributed
 def test_sharded_parameter_contract_uses_dtensors(setup: DistributedSetup):
     """Resting sharded parameters and gradients should be DTensors."""
     if setup.world_size < 2:
@@ -221,9 +280,12 @@ def test_sharded_parameter_contract_uses_dtensors(setup: DistributedSetup):
 
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     model = nn.Linear(4, 4, bias=False).to(setup.device)
+    original_weight = model.weight
 
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
+    (group,) = model.parameter_groups()
+    assert group.unsharded_parameters["weight"] is original_weight
     assert isinstance(model.weight, DTensor)
     assert isinstance(model.weight.data, DTensor)
     model(torch.randn(2, 4, device=setup.device)).sum().backward()
@@ -238,15 +300,30 @@ def test_meta_parameters_initialize_with_reset_parameters(setup: DistributedSetu
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    model = nn.Linear(4, 4, bias=False, device="meta")
+    model = ConstantMetaModel()
 
-    fully_shard(model, mesh=mesh, placements=_flat_placements(), init_model_with_meta_device=True)
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert isinstance(model.weight, DTensor)
     assert not model.weight.to_local().is_meta
     (group,) = model.parameter_groups()
-    assert not group.main_weight.local_buffer.is_meta
-    assert group.main_weight.local_buffer.numel() > 0
+    assert not group.model_weight.local_buffer.is_meta
+    assert group.model_weight.local_buffer.numel() > 0
+    full_weight = _full_model_weight(group)
+    torch.testing.assert_close(full_weight, torch.full_like(full_weight, 3.0))
+
+
+@pytest.mark.distributed
+def test_meta_parameters_reject_mixed_direct_parameters(setup: DistributedSetup):
+    """A module cannot mix meta and real direct parameters when reset is required."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = MixedMetaRealModel(setup.device)
+
+    with pytest.raises(ValueError, match="mixes meta and non-meta direct parameters"):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
 
 @pytest.mark.distributed
@@ -265,19 +342,19 @@ def test_non_leaf_parameter_view_survives_storage_resize(setup: DistributedSetup
     x = torch.randn(8, device=setup.device, requires_grad=True)
     loss = model(x).sum()
 
-    assert group._full_weight is not None
-    assert group._full_weight.local_buffer.untyped_storage().nbytes() == 0
+    assert group._unsharded_model_weight is not None
+    assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
     loss.backward()
 
     assert group.main_grad is not None
-    assert group._full_weight is not None
-    assert group._full_weight.local_buffer.untyped_storage().nbytes() == 0
+    assert group._unsharded_model_weight is not None
+    assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
 
 @pytest.mark.distributed
 def test_experimental_fully_shard_reduces_peak_training_memory(setup: DistributedSetup):
-    """Per-layer experimental FSDP should reduce peak CUDA memory during a train step."""
+    """Per-layer FSDP should reduce peak CUDA memory during a train step."""
     if setup.world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
     if setup.device.type != "cuda":
@@ -285,7 +362,7 @@ def test_experimental_fully_shard_reduces_peak_training_memory(setup: Distribute
 
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     dim = 1024
-    layers = 8
+    layers = 16
     batch = 8
 
     torch.manual_seed(4321)
@@ -309,6 +386,8 @@ def test_experimental_fully_shard_reduces_peak_training_memory(setup: Distribute
     )
     for layer in model:
         fully_shard(layer, mesh=mesh, placements=_flat_placements())
+    gc.collect()
+    torch.cuda.empty_cache()
 
     x = torch.randn(batch, dim, device=setup.device)
     torch.cuda.reset_peak_memory_stats(setup.device)
