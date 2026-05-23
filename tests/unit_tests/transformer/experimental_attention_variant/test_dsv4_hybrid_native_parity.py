@@ -15,6 +15,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
@@ -696,6 +697,8 @@ def test_dsv4_hybrid_attention_matches_native_reference(
             pytest.skip("fused DSA kernels require SM100+ GPU now")
         if seqlen > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper")
+
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
 
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:

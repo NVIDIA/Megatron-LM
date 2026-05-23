@@ -322,6 +322,8 @@ class TestDSAIndexerLossAutoScaler:
             atol=0,
         ), f"Gradient should be scaled by loss scale, expected {expected_grad_per_element}, got {dummy_input.grad[0].item()}"
 
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+
 
 class TestFusedDSAIndexerLossGradient:
     """Test that FusedDSAIndexerLoss manual backward matches autograd backward."""
