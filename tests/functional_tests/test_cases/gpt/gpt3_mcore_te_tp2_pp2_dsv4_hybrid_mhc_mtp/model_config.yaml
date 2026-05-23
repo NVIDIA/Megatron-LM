@@ -23,6 +23,7 @@ MODEL_ARGS:
   --csa-window-size: 128
   --csa-compress-ratios: ([0,4,128,4,0])
   --csa-compress-rotary-base: 40000
+  --no-dsa-kernel-fusion: true
   --attention-backend: fused
   --enable-hyper-connections: true
   --num-residual-streams: 4
