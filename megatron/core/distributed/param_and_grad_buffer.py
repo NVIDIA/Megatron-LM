@@ -723,19 +723,20 @@ class _ParamAndGradBucketGroup:
         communication call to complete. When ddp_config.overlap_grad_reduce is set to False,
         makes synchronous call.
 
-        Idempotent: a second call within the same iteration is a no-op. This lets a
-        successor bucket group early-drain its predecessor at dispatch time (see
-        `previous_grad_reduce_bucket_group`) while still allowing the end-of-step
-        finalize loop to call this on every bucket without double-waiting.
+        Under overlap_grad_reduce this method is idempotent within an iteration: a
+        second call is a no-op. This lets a successor bucket group early-drain its
+        predecessor at dispatch time (see `previous_grad_reduce_bucket_group`) while
+        still allowing the end-of-step finalize loop to call this on every bucket
+        without double-waiting. The non-overlap path preserves its original
+        per-call dispatch+wait behaviour because it has no predecessor draining.
         """
-        if self.grad_reduce_finished:
-            return
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
             self._copy_back_extra_main_grads()
-            self.grad_reduce_finished = True
+            return
+        if self.grad_reduce_finished:
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
