@@ -37,7 +37,7 @@ def _make_gdn2(tp_size=1, cp_size=1, sp=False, allow_neg_eigval=False):
         num_layers=1,
         normalization="RMSNorm",
         use_cpu_initialization=True,
-        layernorm_zero_centered_gamma=True,
+        layernorm_zero_centered_gamma=False,
         num_attention_heads=8,
         activation_func=F.silu,
         bf16=True,
