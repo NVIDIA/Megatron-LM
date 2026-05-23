@@ -64,6 +64,8 @@ except ImportError as import_megatron_fsdp_error:
 
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 
+from .checkpoint import _propagate_chunk_metadata_to_state_dict
+
 logger = logging.getLogger(__name__)
 
 
@@ -209,7 +211,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config
-
         self.sync_rng_states_across_tp_group()
         self._set_dist_param_unique_name()
 
@@ -381,7 +382,16 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.broadcast_params = noop
         self.synchronize_param_gather = synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = module.state_dict
-        self.state_dict_for_save_checkpoint = lambda *args, **kwargs: module.state_dict()
+        self.state_dict_for_save_checkpoint = lambda *args, **kwargs: self.state_dict()
+
+        # Register state dict post-hook on the root module to propagate
+        # chunk metadata (``__create_chunk_list__``) from model params to
+        # the DTensors in the state dict.  The hook receives the complete
+        # state dict so all parameter names can be matched in one pass.
+        def _post_hook(module, state_dict, prefix, local_metadata):
+            _propagate_chunk_metadata_to_state_dict(module, state_dict)
+
+        self.module.register_state_dict_post_hook(_post_hook)
 
         if torch.distributed.get_rank() == 0:
             self.module._log_parameter_groups()

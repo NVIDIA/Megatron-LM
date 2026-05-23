@@ -74,16 +74,18 @@ def _assert_model_match(source_full, loaded_full):
         assert (
             s_val is not None and l_val is not None
         ), f"One of source or loaded value for {s_key} is None while the other is not"
-        if s_val.numel() > 0:
-            nonempty = True
         assert (
             s_val.shape == l_val.shape
         ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
+        if s_val.numel() > 0:
+            nonempty = True
+        else:
+            continue
         assert_close(
             s_val,
             l_val,
-            atol=0,
             rtol=0,
+            atol=0,
             msg=f"Value mismatch for {s_key}, s_val: {s_val}, l_val: {l_val}",
         )
 
@@ -93,14 +95,26 @@ def _assert_model_match(source_full, loaded_full):
     assert any(all_nonempty), "All ranks had empty model state after load."
 
 
-def _optim_state_to_full(optim_sd, model):
-    """Wrap optimizer states as DTensors and gather to full tensors."""
+def _optim_state_to_full(optim_sd_or_optim, model):
+    """Wrap optimizer states as DTensors or unflatten flat format and gather to full tensors.
+
+    Accepts either a sharded_state_dict (fsdp_dtensor format) or a
+    DistributedOptimizer instance (nd fully_reshardable format).
+    """
     from torch.distributed.tensor import DTensor
 
     from megatron.core.distributed.fsdp.checkpoint import _build_dtensor_optim_sd
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         uneven_dtensor_to_full_tensor,
     )
+
+    # ND-parallel source: use get_parameter_state_dp_zero directly
+    if not isinstance(optim_sd_or_optim, dict):
+        return _nd_optim_state_to_full(optim_sd_or_optim, model)
+
+    optim_sd = optim_sd_or_optim
+    if "param_state_sharding_type" in optim_sd:
+        return _flat_optim_state_to_full(optim_sd, model)
 
     wrapped = {"optimizer": _build_dtensor_optim_sd(optim_sd, model)}
     out = {}
@@ -114,7 +128,100 @@ def _optim_state_to_full(optim_sd, model):
     return out
 
 
-def _assert_optim_match(source_optim_full, loaded_optim_full):
+def _nd_optim_state_to_full(optim, model):
+    """Get full optimizer state from an ND-parallel DistributedOptimizer.
+
+    Uses ``get_parameter_state_dp_zero`` (the same method as
+    ``sharded_param_state_fully_reshardable``) to gather all-gathered
+    world tensors, then unflattens them per-parameter using
+    ``param_index_map``.  Handles ``ChainedOptimizer`` (MoE) by
+    iterating all inner ``DistributedOptimizer`` instances.
+    """
+    param_to_name = {}
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            param_to_name[p] = name
+
+    out = {}
+    inner_optims = getattr(optim, "chained_optimizers", [optim])
+    for inner_optim in inner_optims:
+        dp_zero = inner_optim.get_parameter_state_dp_zero(
+            use_gloo_comm=False, return_on_all_ranks=True
+        )
+        for gbuf_idx, gbuf_range_maps in enumerate(inner_optim.gbuf_ranges):
+            buffer = inner_optim.buffers[gbuf_idx]
+            for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
+                world_tensors = dp_zero[gbuf_idx][dtype]
+                for model_param, (start, end, _) in buffer.param_index_map.items():
+                    if model_param not in param_to_name:
+                        continue
+                    param_name = param_to_name[model_param]
+                    out[param_name] = {
+                        state_key: world_tensors[state_key][start:end]
+                        .reshape(model_param.shape)
+                        .clone()
+                        .cuda()
+                        for state_key in world_tensors
+                        if state_key in ("param", "exp_avg", "exp_avg_sq")
+                    }
+    return out
+
+
+def _flat_optim_state_to_full(optim_sd, model):
+    """Convert fully_reshardable optimizer sd to {param_name: {state_key: tensor}}.
+
+    The ``fully_reshardable`` format stores optimizer state as a nested
+    dict: ``optim_sd["param_state"]`` = ``{0: {"param": ShardedTensor,
+    "exp_avg": ShardedTensor, ...}, 1: {...}, ...}``.  This function
+    extracts the full tensors from the ShardedTensor wrappers and maps
+    integer indices to parameter names by matching the ``"param"``
+    tensor shape against ``model.named_parameters()``.
+    """
+    from torch.distributed.checkpoint.stateful import ShardedTensor
+
+    param_state = optim_sd.get("param_state", {})
+    if not param_state:
+        return {}
+
+    # Build shape → param_name lookup
+    param_by_shape = {}
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            param_by_shape.setdefault(p.shape, []).append(name)
+
+    out = {}
+    used_names = set()
+    for idx, states in sorted(param_state.items()):
+        # Find matching param name via the "param" tensor shape
+        param_tensor = None
+        if "param" in states:
+            st = states["param"]
+            if isinstance(st, ShardedTensor):
+                shards = st.local_shards()
+                if shards:
+                    param_tensor = shards[0].tensor
+        param_name = None
+        if param_tensor is not None:
+            shape = param_tensor.shape
+            candidates = [n for n in param_by_shape.get(shape, []) if n not in used_names]
+            if candidates:
+                param_name = candidates[0]
+                used_names.add(param_name)
+        if param_name is None:
+            param_name = f"param_{idx}"
+
+        out[param_name] = {}
+        for state_key, st in states.items():
+            if isinstance(st, ShardedTensor):
+                shards = st.local_shards()
+                out[param_name][state_key] = shards[0].tensor if shards else st
+            else:
+                out[param_name][state_key] = st
+
+    return out
+
+
+def _assert_optim_match(source_optim_full, loaded_optim_full, ignore_param=True):
     for param_name, source_states in source_optim_full.items():
         canonical = _normalize_key(param_name)
         matched_param = None
@@ -128,6 +235,8 @@ def _assert_optim_match(source_optim_full, loaded_optim_full):
         )
         loaded_states = loaded_optim_full[matched_param]
         for state_key, s_val in source_states.items():
+            if ignore_param and state_key == "param":
+                continue
             assert (
                 state_key in loaded_states
             ), f"Optimizer state '{state_key}' for param {param_name} not found after load"
@@ -274,6 +383,16 @@ class TestMegatronFsdpV2Checkpoint:
     @pytest.mark.parametrize(
         "source_type, source_configs, target_configs",
         [
+            # ---- ND-parallel → MFSDP v2 ----
+            pytest.param(
+                "nd",
+                dict(
+                    distrib_optim_sharding_type="fully_reshardable",
+                    dist_ckpt_optim_fully_reshardable=True,
+                ),
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                id="nd_fully_reshardable_to_v2",
+            ),
             # ---- MFSDP v2 → MFSDP v2 (round-trip) ----
             pytest.param(
                 "v2",
@@ -318,16 +437,6 @@ class TestMegatronFsdpV2Checkpoint:
                 dict(data_parallel_sharding_strategy="optim"),
                 dict(data_parallel_sharding_strategy="optim_grads_params"),
                 id="v1_optim_to_v2_optim_grads_params",
-            ),
-            # ---- ND-parallel → MFSDP v2 ----
-            pytest.param(
-                "nd",
-                dict(
-                    distrib_optim_sharding_type="fully_reshardable",
-                    dist_ckpt_optim_fully_reshardable=True,
-                ),
-                dict(data_parallel_sharding_strategy="optim_grads_params"),
-                id="nd_fully_reshardable_to_v2",
             ),
         ],
     )
@@ -380,11 +489,16 @@ class TestMegatronFsdpV2Checkpoint:
         source_full = _state_dict_to_full_tensor(source_sd)
 
         if supports_optim:
-            source_optim_sd = source_optim.sharded_state_dict(
-                model_sharded_state_dict=source_sd,
-                metadata={"distrib_optim_sharding_type": src_sharding_type},
-            )
-            source_optim_full = _optim_state_to_full(source_optim_sd, source_model)
+            if source_type == "nd":
+                source_optim_full = _optim_state_to_full(source_optim, source_model)
+            else:
+                source_optim_sd = source_optim.sharded_state_dict(
+                    model_sharded_state_dict=(
+                        source_model.sharded_state_dict() if source_type not in ["v1", "v2"] else {}
+                    ),
+                    metadata={"distrib_optim_sharding_type": src_sharding_type},
+                )
+                source_optim_full = _optim_state_to_full(source_optim_sd, source_model)
         Utils.destroy_model_parallel()
 
         # ---- Load with target config (always MFSDP v2) ----

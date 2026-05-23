@@ -1211,7 +1211,7 @@ def _load_non_persistent_base_checkpoint(
             )
         return _load_global_dist_base_checkpoint(
             non_persistent_global_dir, args, rank0, sharded_state_dict, non_persistent_iteration, False,
-            checkpointing_context=checkpointing_context
+            checkpointing_context=checkpointing_context,
         )
     elif args.non_persistent_ckpt_type == "local":
         intermediate_state_dict, checkpoint_name = checkpointing_context[
@@ -1227,59 +1227,10 @@ def _load_non_persistent_base_checkpoint(
         raise NotImplementedError(f"Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})")
 
 
-def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict):
+def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict, strict=True):
     """Load a torch_dist checkpoint into a Megatron FSDP v2 skeleton via DCP."""
-    import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint import FileSystemReader
-    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
-
-    reader = FileSystemReader(checkpoint_name)
-    metadata = reader.read_metadata().state_dict_metadata
-
-    v2_model = v2_state_dict["model"]
-    v2_by_canonical = {}
-    for v2_key, v2_val in v2_model.items():
-        canonical = v2_key
-        while canonical.startswith("module."):
-            canonical = canonical[len("module."):]
-        v2_by_canonical[canonical] = v2_val
-
-    mapped_model = {}
-    for td_key, td_meta in metadata.items():
-        canonical = td_key
-        if canonical in v2_by_canonical:
-            mapped_model[td_key] = v2_by_canonical[canonical]
-            continue
-        canonical = _normalize_torch_dist_key(td_key)
-        if canonical in v2_by_canonical:
-            mapped_model[td_key] = v2_by_canonical[canonical]
-
-    mapped_sd = {"model": mapped_model}
-    dcp.load(
-        state_dict=mapped_sd,
-        checkpoint_id=checkpoint_name,
-        planner=DefaultLoadPlanner(allow_partial_load=True),
-    )
-
-    # Now that the model state dict has been loaded, we can copy over the rest of
-    # the information from the torch_dist checkpoint.
-    common_info = dist_checkpointing.load_common_state_dict(checkpoint_name)
-    v2_state_dict.update(common_info)
-
-    return v2_state_dict
-
-
-def _normalize_torch_dist_key(key):
-    """Normalize a torch_dist checkpoint key to canonical form.
-
-    Handles structural differences between torch_dist and v2 key naming,
-    e.g. ``experts.experts.`` → ``experts.``, ``transformer_layer`` → ``mtp_model_layer``.
-    """
-    if ".mlp.experts.experts." in key:
-        key = key.replace(".mlp.experts.experts.", ".mlp.experts.")
-    if ".transformer_layer." in key:
-        key = key.replace(".transformer_layer.", ".mtp_model_layer.")
-    return key
+    from megatron.core.distributed.fsdp.checkpoint import load_torch_dist_into_fsdp_v2
+    return load_torch_dist_into_fsdp_v2(args, checkpoint_name, v2_state_dict, strict=strict)
 
 
 def _load_global_dist_base_checkpoint(
@@ -1294,7 +1245,7 @@ def _load_global_dist_base_checkpoint(
     if args.use_megatron_fsdp_v2:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         state_dict = _load_torch_dist_into_megatron_fsdp_v2(
-            args, checkpoint_name, sharded_state_dict
+            args, checkpoint_name, sharded_state_dict, strict=True
         )
         return state_dict, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
 
@@ -1913,6 +1864,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 gen_sd_opt_param_scheduler = opt_param_scheduler
 
         optim_sd_kwargs = dict(metadata=_build_sharded_state_dict_metadata(args), is_loading=True)
+
         state_dict = generate_state_dict(
             args,
             model=model,
