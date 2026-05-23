@@ -167,9 +167,9 @@ def _gpt_te_layer_spec_with_hetro_pgs(
 ):
 
     def build_mlp(
-        config: TransformerConfig, pg_collection: ProcessGroupCollection, is_mtp_layer: bool
+        config: TransformerConfig, pg_collection: ProcessGroupCollection, is_mtp_layer: bool, name=None
     ):
-        del pg_collection, is_mtp_layer
+        del pg_collection, is_mtp_layer, name
         return MLP(
             config,
             submodules=MLPSubmodules(
