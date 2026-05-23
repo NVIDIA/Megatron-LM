@@ -5,14 +5,13 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_experimental_attention_variant_module_spec,
-)
+from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net_2 import (
     HAVE_FLA,
     HAVE_GDN2_KERNEL,
     GatedDeltaNet2,
+    GatedDeltaNet2Submodules,
     chunk_gdn2,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -49,7 +48,12 @@ def _make_gdn2(tp_size=1, cp_size=1, sp=False, allow_neg_eigval=False):
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
     )
-    submodules = get_experimental_attention_variant_module_spec(config=config).submodules
+    backend = LocalSpecProvider()
+    submodules = GatedDeltaNet2Submodules(
+        in_proj=backend.column_parallel_linear(),
+        out_norm=backend.layer_norm(rms_norm=True, for_qk=False),
+        out_proj=backend.row_parallel_linear(),
+    )
 
     module = GatedDeltaNet2(
         config,
