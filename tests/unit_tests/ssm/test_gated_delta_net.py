@@ -498,23 +498,23 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
     )
 
 
-@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("cp_size", [2, 4], scope="class")
 @pytest.mark.internal
 class TestFusedThdAllToAll:
     """Verify fused 1 AllToAll + permute matches the per-sequence, per-channel loop in GDN."""
 
-    @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self, cp_size):
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request, cp_size):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
             context_parallel_size=cp_size,
         )
         model_parallel_cuda_manual_seed(123)
-        self.cp_size = cp_size
-        self.cp_group = parallel_state.get_context_parallel_group()
-
-    def teardown_method(self):
+        # Attach on the class so every test method can read self.cp_*.
+        request.cls.cp_size = cp_size
+        request.cls.cp_group = parallel_state.get_context_parallel_group()
+        yield
         Utils.destroy_model_parallel()
 
     @staticmethod
@@ -598,7 +598,6 @@ class TestFusedThdAllToAll:
         ],
     )
     @pytest.mark.parametrize("split_sections", [(8, 8, 4, 4, 4, 4)])
-    @pytest.mark.skip
     def test_cp2hp_batched_matches_per_seq(self, cu_seqlens, split_sections):
         cu = torch.tensor(cu_seqlens, dtype=torch.long, device=torch.cuda.current_device())
         if (torch.diff(cu) % self.cp_size != 0).any():
@@ -653,7 +652,6 @@ class TestFusedThdAllToAll:
         assert torch.equal(out_fused, out_ref), f"Batched HP->CP mismatch on rank={rank}"
 
     @pytest.mark.parametrize("cu_seqlens", [(0, 32, 64, 96, 128)])
-    @pytest.mark.skip
     def test_cp2hp_hp2cp_round_trip(self, cu_seqlens):
         """cp2hp followed by hp2cp on the batched path should be the identity."""
         cu = torch.tensor(cu_seqlens, dtype=torch.long, device=torch.cuda.current_device())
