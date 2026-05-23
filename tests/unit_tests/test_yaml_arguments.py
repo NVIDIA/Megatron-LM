@@ -127,9 +127,6 @@ def test_validate_yaml_basic_iteration_config(monkeypatch):
         distribute_saved_activations=False,
         num_layers_per_pipeline_stage=None,
         make_vocab_size_divisible_by=128,
-        tensor_model_parallel_size=None,
-        pipeline_model_parallel_size=None,
-        virtual_pipeline_model_parallel_size=None,
     )
 
     validated = yaml_arguments.validate_yaml(args)
