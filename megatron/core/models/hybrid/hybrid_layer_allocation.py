@@ -16,13 +16,14 @@ class Symbols:
 
     MAMBA = "M"
     GDN = 'G'
+    GDN2 = 'N'
     ATTENTION = "*"
     DS_ATTENTION = "D"
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, GDN2, ATTENTION, DS_ATTENTION, MLP, MOE}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:

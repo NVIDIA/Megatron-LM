@@ -8,6 +8,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validat
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net_2 import HAVE_FLA, HAVE_GDN2_KERNEL, GatedDeltaNet2
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -18,6 +19,8 @@ from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+HAVE_GDN2 = HAVE_FLA and HAVE_GDN2_KERNEL
 
 
 @pytest.mark.internal
@@ -227,6 +230,22 @@ class TestHybridBlock:
         layers = block.layers
         assert isinstance(layers[0], TransformerLayer)
         assert isinstance(layers[0].self_attention, GatedDeltaNet)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, SelfAttention)
+        assert isinstance(layers[2], MambaLayer)
+
+    def test_gdn2_layer_types(self):
+        """
+        Make sure that N creates a TransformerLayer wrapping GatedDeltaNet2,
+        while * creates a TransformerLayer wrapping SelfAttention.
+        """
+        if not HAVE_GDN2:
+            pytest.skip("A GDN2 chunk_gdn2 kernel is not installed.")
+        layer_pattern = Symbols.GDN2 + Symbols.ATTENTION + Symbols.MAMBA
+        block = self.get_hybrid_block(layer_pattern)
+        layers = block.layers
+        assert isinstance(layers[0], TransformerLayer)
+        assert isinstance(layers[0].self_attention, GatedDeltaNet2)
         assert isinstance(layers[1], TransformerLayer)
         assert isinstance(layers[1].self_attention, SelfAttention)
         assert isinstance(layers[2], MambaLayer)
