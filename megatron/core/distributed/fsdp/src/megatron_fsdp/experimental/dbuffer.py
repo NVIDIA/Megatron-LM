@@ -116,6 +116,20 @@ class DBuffer:
         """Device of the local buffer."""
         return self.local_buffer.device
 
+    def reallocate_storage(self) -> None:
+        """Restore the local buffer's backing storage to its logical size."""
+        self._resize_storage(self.local_buffer.numel())
+
+    def release_storage(self) -> None:
+        """Release local buffer storage without replacing the Storage object."""
+        # Autograd may save views that share this Storage object. Resizing the
+        # existing Storage releases the allocation while preserving those aliases
+        # for a later reallocate_storage().
+        self._resize_storage(0)
+
+    def _resize_storage(self, numel: int) -> None:
+        self.local_buffer.untyped_storage().resize_(numel * self.local_buffer.element_size())
+
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""
         tensor_start = self.layout.tensor_to_offset[tensor_index]
