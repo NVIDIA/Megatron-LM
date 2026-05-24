@@ -97,7 +97,6 @@ def test_validate_yaml_basic_iteration_config(monkeypatch):
             moe_pad_expert_input_to_capacity=False,
             moe_token_dispatcher_type="allgather",
             num_moe_experts=None,
-            sequence_parallel=False,
             persist_layer_norm=True,
             distribute_saved_activations=False,
             recompute_granularity=None,
@@ -121,10 +120,7 @@ def test_validate_yaml_basic_iteration_config(monkeypatch):
         create_attention_mask_in_dataloader=True,
         use_cpu_initialization=None,
         lazy_mpu_init=None,
-        recompute_granularity=None,
-        recompute_method=None,
         recompute_num_layers=None,
-        distribute_saved_activations=False,
         num_layers_per_pipeline_stage=None,
         make_vocab_size_divisible_by=128,
     )
