@@ -66,10 +66,7 @@ class TestTELinearCrossEntropyModuleRejections:
 
     def _kwargs(self, **overrides):
         kwargs = dict(
-            input_size=8,
-            output_size=16,
-            config=_fake_config(),
-            init_method=lambda w: None,
+            input_size=8, output_size=16, config=_fake_config(), init_method=lambda w: None
         )
         kwargs.update(overrides)
         return kwargs
@@ -113,10 +110,7 @@ class TestGPTModelOutputLayerSelection:
     def test_default_uses_column_parallel_linear(self):
         """Without fp8_output_proj, the LM head is the plain ColumnParallelLinear."""
         config = TransformerConfig(
-            num_layers=2,
-            hidden_size=12,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
         model = GPTModel(
             config=config,
