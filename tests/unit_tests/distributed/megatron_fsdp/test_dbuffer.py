@@ -233,6 +233,24 @@ def test_distribute_tensors_moves_inputs_to_mesh_device(distributed_setup):
 
 
 @pytest.mark.distributed
+def test_distribute_tensors_detaches_and_contiguizes_inputs(distributed_setup):
+    """distribute_tensors treats input tensors as detached contiguous values."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    parameter = torch.nn.Parameter(
+        torch.arange(12, dtype=torch.float32, device=distributed_setup.device).view(3, 4).t()
+    )
+
+    buffer = DBuffer.distribute_tensors([parameter], mesh, [Replicate()])
+
+    assert not parameter.is_contiguous()
+    assert buffer.get_local_tensor(0).is_contiguous()
+    assert not buffer.local_buffer.requires_grad
+    torch.testing.assert_close(
+        buffer.get_local_tensor(0), parameter.detach().contiguous(), rtol=0, atol=0
+    )
+
+
+@pytest.mark.distributed
 def test_sharded_allgather_round_trip(distributed_setup):
     """Sharded buffers round-trip through all-gather as contiguous tensor fragments."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
