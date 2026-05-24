@@ -108,11 +108,13 @@ class TELinearCrossEntropyModule(TEColumnParallelLinear):
         )
 
     def get_extra_state(self):
+        """Return no extra state for the MXFP8 output projection."""
         # MXFP8 has no persistent recipe state; keep LM head _extra_state empty
         # so GPTModel.sharded_state_dict's no-extra-state invariant still holds.
         return None
 
     def set_extra_state(self, state):
+        """This function is a no-op."""
         return
 
     def forward(
