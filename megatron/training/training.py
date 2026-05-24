@@ -2884,13 +2884,15 @@ def training_log(
             track_names.append("z_loss")
 
         if is_hybrid_model(args):
-            from operator import itemgetter
-
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols,
-                get_hybrid_layer_counts,
+                parse_hybrid_pattern,
             )
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+
+            # track_moe_metrics adds mtp_num_layers below, so only count main decoder MoE layers
+            # here. Counting the full unified pattern would double count MTP MoE layers.
+            main_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern).main_pattern
+            layers = main_pattern.count(Symbols.MOE) if main_pattern is not None else 0
         else:
             layers = args.num_layers
 
