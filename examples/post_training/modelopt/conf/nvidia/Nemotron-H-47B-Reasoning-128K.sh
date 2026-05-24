@@ -33,5 +33,5 @@ MODEL_ARGS=" \
     --max-position-embeddings 8192 \
     --tokenizer-type HuggingFaceTokenizer \
     --use-mcore-models \
-    --export-model-type MambaModel \
+    --export-model-type HybridModel \
 "

@@ -21,7 +21,9 @@ try:
 except ImportError:
     HAVE_NVSHMEM = False
 
-import torch.cuda.nvtx as nvtx
+import torch
+
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from .core import GPUResourceManager, KernelLauncher, PipelineExecutor
 from .logger import PELogger
@@ -116,6 +118,12 @@ class RemoteCopyService:
 
         # Allocate double-buffered send/recv slots
         self.buffer_manager.allocate()
+        # The .zero_() calls inside allocate() go to the default CUDA stream.
+        # Sync it now so the zeros are fully committed before any NVShmem
+        # operations (which bypass CUDA streams via RDMA) touch the buffers.
+        # Without this, a still-running zero() can race with the first
+        # nvshmem.core.put() and overwrite received data.
+        torch.cuda.synchronize()
 
         # Barrier to ensure all PEs complete buffer allocation before proceeding
         nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
@@ -143,10 +151,10 @@ class RemoteCopyService:
             self.gpu_resources.unpack_stream,
             self.gpu_resources.send_stream,
             self.gpu_resources.copy_stream,
-            self.gpu_resources.torch_pack_stream,
-            self.gpu_resources.torch_unpack_stream,
-            self.gpu_resources.torch_send_stream,
-            self.gpu_resources.torch_copy_stream,
+            self.gpu_resources.torch_pack_stream_wrapper,
+            self.gpu_resources.torch_unpack_stream_wrapper,
+            self.gpu_resources.torch_send_stream_wrapper,
+            self.gpu_resources.torch_copy_stream_wrapper,
         )
 
         # Synchronize all NVSHMEM streams before returning
@@ -290,7 +298,7 @@ class RemoteCopyService:
         PELogger.info(f"Starting execution: {self.num_iterations} iterations")
 
         # Start timing
-        nvtx.range_push("RemoteCopyService.run_total")
+        nvtx_range_push("RemoteCopyService.run_total")
 
         # Global barrier before execution
         PELogger.debug("Barrier: Synchronizing all PEs before execution")
@@ -298,9 +306,9 @@ class RemoteCopyService:
         self.gpu_resources.send_stream.sync()
 
         # Execute pipelined communication
-        nvtx.range_push("execute_pipeline")
+        nvtx_range_push("execute_pipeline")
         self.pipeline_executor.execute_pipeline(self.iter_schedules, self.num_iterations)
-        nvtx.range_pop()  # execute_pipeline
+        nvtx_range_pop("execute_pipeline")
 
         # Global barrier after execution
         PELogger.debug("Barrier: Synchronizing all PEs after pipeline")
@@ -310,7 +318,7 @@ class RemoteCopyService:
         self.pipeline_executor.process_self_moves(self.send_requests, self.receive_requests)
 
         # End timing range
-        nvtx.range_pop()  # RemoteCopyService.run_total
+        nvtx_range_pop("RemoteCopyService.run_total")
 
     def clear_requests(self) -> None:
         """

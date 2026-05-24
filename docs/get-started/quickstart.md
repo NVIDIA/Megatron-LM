@@ -7,54 +7,40 @@
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
 
-# Quick Start
+# Your First Training Run
 
-## Quick Installation
+This guide walks you through running your first training jobs with Megatron Core. Make sure you have completed [installation](install.md) before proceeding.
 
-Install Megatron Core with pip:
+## Minimal Training Example
 
-1. Install Megatron Core with required dependencies:
-
-    ```bash
-    pip install --no-build-isolation megatron-core[mlm,dev]
-    ```
-
-2. Clone repository for examples:
-
-    ```bash
-    git clone https://github.com/NVIDIA/Megatron-LM.git
-    cd Megatron-LM
-    pip install --no-build-isolation .[mlm,dev]
-    ```
-
-That's it! You're ready to start training.
-
-## Your First Training Run
-
-### Simple Training Example
+Run a minimal distributed training loop with mock data on 2 GPUs:
 
 ```bash
-# Distributed training example (2 GPUs, mock data)
 torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 ```
 
-### LLaMA-3 Training Example
+## LLaMA-3 Training Example
+
+Train an LLaMA-3 8B model with FP8 precision on 8 GPUs using mock data:
 
 ```bash
-# 8 GPUs, FP8 precision, mock data
-./examples/llama/train_llama3_8b_fp8.sh
+./examples/llama/train_llama3_8b_h100_fp8.sh
 ```
 
 ## Data Preparation
 
-### JSONL Data Format
+To train on your own data, Megatron expects preprocessed binary files (`.bin` and `.idx`).
+
+### 1. Prepare a JSONL File
+
+Each line should contain a `text` field:
 
 ```json
 {"text": "Your training text here..."}
 {"text": "Another training sample..."}
 ```
 
-### Basic Preprocessing
+### 2. Preprocess the Data
 
 ```bash
 python tools/preprocess_data.py \
@@ -70,7 +56,7 @@ python tools/preprocess_data.py \
 
 - `--input`: Path to input JSON/JSONL file
 - `--output-prefix`: Prefix for output binary files (.bin and .idx)
-- `--tokenizer-type`: Tokenizer type (`HuggingFaceTokenizer`, `GPT2BPETokenizer`, etc.)
+- `--tokenizer-type`: Tokenizer type (`HuggingFaceTokenizer`, `GPT2BPETokenizer`, and so on)
 - `--tokenizer-model`: Path to tokenizer model file
 - `--workers`: Number of parallel workers for processing
 - `--append-eod`: Add end-of-document token
@@ -79,4 +65,4 @@ python tools/preprocess_data.py \
 
 - Explore [Parallelism Strategies](../user-guide/parallelism-guide.md) to scale your training
 - Learn about [Data Preparation](../user-guide/data-preparation.md) best practices
-- Check out [Advanced Features](../user-guide/features/index.md) for advanced capabilities
+- Check out [Advanced Features](../user-guide/features/index.md)

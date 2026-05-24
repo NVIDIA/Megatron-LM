@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
@@ -24,19 +24,33 @@ class MambaInferenceStateConfig:
     layer_type_list: List[str]
     """
     A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
-    See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list of symbols.
+    See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
-    mamba_conv_states_shape: Tuple[int]
+    conv_states_shape: Tuple[int]
     """Mamba conv states shape per request."""
 
-    mamba_ssm_states_shape: Tuple[int]
-    """Mamba ssm states shape per request."""
+    ssm_states_shape: Tuple[int]
+    """Mamba SSM states shape per request."""
+
+    conv_states_dtype: torch.dtype
+    """The dtype to use for the Mamba conv state tensor. Defaults to the model dtype."""
+
+    ssm_states_dtype: torch.dtype
+    """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
+
+    mamba_chunk_size: int = 128
+    """The chunk size used by the Mamba SSM Triton kernels."""
 
     @classmethod
-    def from_model(cls, model: MegatronModule) -> Optional["MambaInferenceStateConfig"]:
+    def from_model(
+        cls,
+        model: MegatronModule,
+        conv_states_dtype: Optional[torch.dtype] = None,
+        ssm_states_dtype: Optional[torch.dtype] = None,
+    ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -44,10 +58,22 @@ class MambaInferenceStateConfig:
             (mamba_conv_states_shape, mamba_ssm_states_shape) = (
                 decoder.mamba_state_shapes_per_request()
             )
+            if conv_states_dtype is None:
+                conv_states_dtype = model.config.params_dtype
+            if ssm_states_dtype is None:
+                ssm_states_dtype = model.config.params_dtype
+            mamba_chunk_size = 128
+            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
+                    mamba_chunk_size = layer.mixer.chunk_size
+                    break
             return cls(
                 layer_type_list=layer_type_list,
-                mamba_conv_states_shape=mamba_conv_states_shape,
-                mamba_ssm_states_shape=mamba_ssm_states_shape,
+                conv_states_shape=mamba_conv_states_shape,
+                ssm_states_shape=mamba_ssm_states_shape,
+                conv_states_dtype=conv_states_dtype,
+                ssm_states_dtype=ssm_states_dtype,
+                mamba_chunk_size=mamba_chunk_size,
             )
         return None
 
@@ -100,7 +126,7 @@ class InferenceConfig:
     """
 
     # =================================
-    # KV cache config
+    # KV cache and Mamba states config
     # =================================
     block_size_tokens: int = 256
     """Size of KV cache block size."""
@@ -120,6 +146,9 @@ class InferenceConfig:
         - uvm 0: buffer_size_gb (paused buffer is inclusive)
         - uvm 1: buffer_size_gb + paused_buffer_size_gb
     """
+
+    mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
+    """The Mamba inference state config if the model is a hybrid model."""
 
     mamba_memory_ratio: Optional[float] = None
     """
@@ -159,8 +188,12 @@ class InferenceConfig:
     # =================================
     num_cuda_graphs: Optional[int] = None
     """
-    Maximum number of cuda graphs to capture, where the cuda graph batch sizes range from 1 to
-    `max_requests`. Due to rounding, the actual number of cuda graphs may not equal this argument.
+    Maximum number of cuda graphs to capture.
+    Graph token counts are spaced from 1 up to a per-graph-type budget:
+      - Decode-only graphs are always bounded by `max_requests * (num_speculative_tokens + 1)`.
+      - Prefill/mixed graphs share that same bound by default,
+        or extend up to `max_tokens` when `cuda_graph_all_prefills` is set.
+    Due to rounding, the actual number of cuda graphs may not equal this argument.
     """
 
     cuda_graph_mixed_prefill_count: Optional[int] = 16
@@ -171,6 +204,14 @@ class InferenceConfig:
     use_cuda_graphs_for_non_decode_steps: bool = True
     """
     Whether to use CUDA graphs for non-decode steps.
+    """
+
+    cuda_graph_all_prefills: bool = False
+    """
+    Whether prefill/mixed CUDA graphs should span up to `max_tokens`.
+    When False (default), prefill/mixed graphs are bounded by the same token limit as decode graphs:
+    `max_requests * (num_speculative_tokens + 1)`.
+    When True, prefill/mixed graph capture is extended to cover the full `max_tokens` budget.
     """
 
     static_kv_memory_pointers: bool = False
@@ -186,9 +227,6 @@ class InferenceConfig:
     # =================================
     max_sequence_length: int = 2560
     """Max possible sequence length (prompt + output) that will occur."""
-
-    mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
-    """The Mamba inference state config if the model is a hybrid model."""
 
     pg_collection: Optional[ProcessGroupCollection] = None
     """A `ProcessGroupCollection` for distributed execution."""
@@ -211,6 +249,9 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
+    num_speculative_tokens: int = 0
+    """The number of speculative tokens to generate for decode steps."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
@@ -230,6 +271,18 @@ class InferenceConfig:
 
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
+
+    prefix_caching_routing_alpha: float = 0.5
+    """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
+    Higher alpha favors prefix cache hits; lower alpha favors load balance.
+    Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    prefix_caching_mamba_gb: Optional[float] = None
+    """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
+    on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
+    at a single block boundary. When set, Mamba states at KV divergence and last-aligned
+    block boundaries are cached and reused across requests with matching prefixes."""
 
     # =================================
     # Logging config
@@ -256,8 +309,57 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
-    request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
+    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
+    """Which sampling kernels to use during inference."""
+
+    request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
-    consisting of the string label, the target dtype, and whether to store the data on GPU.
+    consisting of the string label and the target dtype.
     """
+
+    use_synchronous_zmq_collectives: bool = False
+    """Whether to use synchronous ZMQ collectives for inference. If True, the
+    all_reduce_max operation will be performed synchronously, which can help reduce
+    performance variability for MoEs.
+    """
+
+    disable_ep_consensus: bool = False
+    """If True, the engine skips the EP-group consensus all-reduce in
+    `run_engine_with_coordinator` and decides whether to step based on local
+    state alone. The rank still calls `controller.dummy_forward()` whenever
+    `local_pending == 0`, so EP collectives (NCCL all-to-all, etc.) stay in
+    sync — without this, a peer running a real forward would deadlock waiting
+    on this rank's all-to-all participation. Trades off the consensus
+    all-reduce CPU cost for unconditional dummy_forwards on idle ranks.
+    """
+
+    ep_consensus_interval: int = 20
+    """How many steps to skip between EP-consensus all-reduces when the engine
+    has pending work. Consensus is always run immediately when there is no
+    global work (to detect new arrivals quickly); this interval only applies
+    to the busy case, where skipping avoids per-step all-reduce overhead.
+    In the worst case, pausing is delayed by this many steps (~10–20 ms per
+    step at typical decode throughput).
+    """
+
+    verbose: InitVar[bool] = False
+    """Whether to log detailed context configuration at initialization.
+    This is an InitVar and is not stored as a field on the config."""
+
+    def __post_init__(self, verbose: bool):
+        self._verbose = verbose
+        if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
+            raise ValueError(
+                f"prefix_caching_routing_alpha must be in [0, 1], "
+                f"got {self.prefix_caching_routing_alpha}"
+            )
+
+        if self.sampling_backend == 'flashinfer':
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    "sampling_backend='flashinfer' requires the flashinfer package; "
+                    "install it or set sampling_backend='torch'."
+                ) from e

@@ -9,6 +9,7 @@ import warnings
 from collections import defaultdict
 from typing import List
 
+from megatron.training.arguments import parse_and_validate_args
 import torch
 import torch.distributed as dist
 
@@ -24,6 +25,7 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.core.utils import configure_nvtx_profiling
 
 # pylint: disable=line-too-long
 
@@ -76,7 +78,7 @@ async def main(
 
     # Create client and run example.
     if dist.get_rank() == 0:
-        client = InferenceClient(dp_addr)  # submits requests to the inference coordinator
+        client = InferenceClient(dp_addr, deserialize=True)  # submits requests to the inference coordinator
         client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
@@ -145,8 +147,7 @@ async def main(
             json_results = {}
             throughputs = []
 
-            for record in results:
-                req = record.merge()
+            for req in results:
                 result_dict = {
                     "input_prompt": req.prompt,
                     "generated_text": req.generated_text.replace("\n", "\\n"),
@@ -169,8 +170,7 @@ async def main(
         else:
             print("Results:")
             unique_prompt_map = defaultdict(list)
-            for record in results:
-                req = record.merge()
+            for req in results:
                 unique_prompt_map[req.prompt].append(req)
             for idx, (prompt_text, reqs) in enumerate(unique_prompt_map.items()):
                 print(
@@ -204,12 +204,13 @@ if __name__ == "__main__":
     # enable inference mode in the very beginning as some fp8 optimizations
     # check for it.
     with torch.inference_mode():
-        initialize_megatron(
+        args = parse_and_validate_args(
             extra_args_provider=add_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
+        initialize_megatron()
+        configure_nvtx_profiling(True)
 
-        args = get_args()
         tokenizer = get_tokenizer()
 
         # Sampling params.

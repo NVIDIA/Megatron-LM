@@ -16,10 +16,11 @@ class Headers(Enum):
     UNPAUSE = auto()
     SUSPEND = auto()
     RESUME = auto()
-    INCREMENT_STALENESS = auto()
+    SET_GENERATION_EPOCH = auto()
     STOP = auto()
     DISCONNECT = auto()
     SHUTDOWN = auto()
+    TP_BROADCAST = auto()
 
 
 class UnknownHeaderError(Exception):

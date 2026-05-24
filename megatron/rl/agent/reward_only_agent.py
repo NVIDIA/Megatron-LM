@@ -43,7 +43,9 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         """Return validation or train dataset."""
         raise NotImplementedError("Derived class must implement get_dataset.")
 
-    async def get_reward(self, response: str, golden: Any) -> float:
+    async def get_reward(
+        self, response: str, golden: Any, finish_reason: str
+    ) -> float:
         """Given the LLM response and the golden data, provide a reward."""
         raise NotImplementedError("Derived class must implement get_reward")
 
@@ -99,25 +101,23 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             ]
             rollout = TokenRollout(
                 trajectory=[response.token_ids],
-                reward=await self.get_reward(response_text, golden),
+                reward=await self.get_reward(response_text, golden, response.finish_reason),
                 logprobs=[logprobs],
                 generation_mask=[generation_mask],
                 env_id=self.env_id,
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
-                policy_staleness=[response.policy_staleness],
-                kv_cache_staleness=[response.kv_cache_staleness],
-                completed_at_step=[response.completed_at_step],
+                policy_epoch=[response.policy_epoch],
+                kv_cache_epoch=[response.kv_cache_epoch],
                 num_evictions=[response.num_evictions],
             )
         else:
             rollout = Rollout(
                 trajectory=[raw_text],
-                reward=await self.get_reward(response_text, golden),
+                reward=await self.get_reward(response_text, golden, response.finish_reason),
                 env_id=self.env_id,
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
-                policy_staleness=[response.policy_staleness],
-                kv_cache_staleness=[response.kv_cache_staleness],
-                completed_at_step=[response.completed_at_step],
+                policy_epoch=[response.policy_epoch],
+                kv_cache_epoch=[response.kv_cache_epoch],
                 num_evictions=[response.num_evictions],
             )
 
@@ -161,7 +161,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             env_id=self.env_id,
             prompt=[prompt] if isinstance(prompt, LLMChatMessage) else prompt,
             response=response.response,
-            reward=await self.get_reward(response_text, golden),
+            reward=await self.get_reward(response_text, golden, response.finish_reason),
             problem_id=golden['problem_id'] if 'problem_id' in golden else None,
         )
 

@@ -14,9 +14,11 @@ from modelopt.torch.speculative.plugins.megatron_eagle import MegatronARValidati
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import get_mtbench_chat_data
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
+from utils import get_hf_tokenizer
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
@@ -88,14 +90,12 @@ def report_current_memory_info():
 
 
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_ar_validation_args,
-        args_defaults={
+    parse_and_validate_args(extra_args_provider=add_ar_validation_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        },
-    )
+        })
+    initialize_megatron()
 
     check_arguments()
 
@@ -114,10 +114,8 @@ if __name__ == "__main__":
     else:
         ground_truth = [None for _ in range(len(prompts))]
 
-    tokenizer = get_tokenizer()._tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    tokenizer = get_hf_tokenizer()
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
 
     report_current_memory_info()
 

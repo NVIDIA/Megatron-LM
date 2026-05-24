@@ -165,9 +165,11 @@ def _multimem_reduce_scatter_kernel(
     NUMEL_PER_THREAD: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    REDUCE_F32: tl.constexpr = False,
 ):
     """
     Triton kernel to perform multicast reduce-scatter over nvlink using multimem instructions.
+    When REDUCE_F32=True, uses fp32 reduction instead of bf16x2 reduction.
     """
     symm_mem_sync(
         signal_pad_ptrs,
@@ -196,7 +198,7 @@ def _multimem_reduce_scatter_kernel(
             multicast_ptr.to(tl.pointer_type(tl.uint64)) + (RANK * numel_per_rank + offsets) * 2
         )
         local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
-        (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True)
+        (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
         st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
@@ -328,10 +330,16 @@ def multimem_reduce_scatter(
     Multicast reduce-scatter for a single tensor.
     Input tensor must be a symmetric memory buffer.
     Output tensor can be a regular torch tensor.
+    Supports bfloat16 and float32 dtypes.
     """
     assert HAVE_TRITON, "Triton is required for multimem reduce-scatter."
-    assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
-    assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
+    assert input_tensor.dtype in (
+        torch.bfloat16,
+        torch.float32,
+    ), f"Only bfloat16 and float32 are supported, got {input_tensor.dtype}"
+    assert (
+        input_tensor.dtype == output_tensor.dtype
+    ), f"Input and output dtypes must match: {input_tensor.dtype} vs {output_tensor.dtype}"
     assert are_tensors_nvls_eligible(
         output_tensor
     ), "Output tensor must be 16-byte divisible on Hopper+ for NVLS."
@@ -340,6 +348,7 @@ def multimem_reduce_scatter(
         and input_tensor.numel() // output_tensor.numel() == symm_mem_hdl.world_size
     ), "Input numel must be exactly world_size * output numel for reduce-scatter."
 
+    reduce_f32 = input_tensor.dtype == torch.float32
     numel_per_thread, num_blocks, config = _kernel_launch_config(
         output_tensor.element_size(), input_tensor.numel(), symm_mem_hdl.world_size, **kwargs
     )
@@ -353,6 +362,7 @@ def multimem_reduce_scatter(
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
         num_warps=config["num_warps"],
+        REDUCE_F32=reduce_f32,
     )
 
     return output_tensor

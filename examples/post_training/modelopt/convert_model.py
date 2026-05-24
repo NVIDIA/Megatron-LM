@@ -19,7 +19,7 @@ from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import (
     report_current_memory_info,
     to_empty_if_meta,
@@ -27,11 +27,11 @@ from megatron.post_training.utils import (
 from megatron.training import get_args
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
 ALGO_TO_CONFIG = {
-    "eagle1": mtsp.config.EAGLE1_DEFAULT_CFG,
     "eagle3": mtsp.config.EAGLE3_DEFAULT_CFG,
     "eagle-mtp": mtsp.config.EAGLE_MTP_DEFAULT_CFG,
 }
@@ -49,7 +49,7 @@ def add_convert_args(parser):
     group.add_argument(
         '--algorithm',
         type=str,
-        choices=["medusa", "eagle1", "eagle3", "None"],
+        choices=["eagle3", "None"],
         default="None",
         help='Chosing between different speculative decoding algorithms. Default is None.',
     )
@@ -59,6 +59,12 @@ def add_convert_args(parser):
         default=None,
         help="EAGLE architecture config. If not given, "
         "a default config will be use. If provided, it will overwrite the default config.",
+    )
+    group.add_argument(
+        "--mix-hidden-states",
+        type=bool,
+        default=False,
+        help="Whether to mix hidden states from previous TTT step.",
     )
 
     add_modelopt_args(parser)
@@ -97,14 +103,12 @@ def check_arguments():
 
 
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_convert_args,
-        args_defaults={
+    parse_and_validate_args(extra_args_provider=add_convert_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        },
-    )
+        })
+    initialize_megatron()
     check_arguments()
 
     args = get_args()
@@ -124,7 +128,7 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
     )
     report_current_memory_info()
 
@@ -149,7 +153,7 @@ if __name__ == "__main__":
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)
 
-    if args.algorithm in ("eagle1", "eagle3"):
+    if args.algorithm == "eagle3":
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]
         if args.eagle_config:
             with open(args.eagle_config) as f:
@@ -158,6 +162,8 @@ if __name__ == "__main__":
 
         if args.export_offline_model:
             mtsp_config["config"]["eagle_offline"] = True
+        if args.mix_hidden_states:
+            mtsp_config["config"]["eagle_mix_hidden_states"] = True
 
         unwrapped_model = mtsp.convert(unwrapped_model, mtsp_config)
 
@@ -166,10 +172,6 @@ if __name__ == "__main__":
             if eagle_module is not None:
                 mcore_eagle_state_dict = torch.load(args.extra_model_path)
                 eagle_module.load_state_dict(mcore_eagle_state_dict, strict=False)
-
-    elif args.algorithm == "medusa":
-        config = {"medusa_num_heads": args.export_num_medusa_heads, "medusa_num_layers": 1}
-        unwrapped_model = mtsp.convert(unwrapped_model, [("medusa", config)])
 
     print_rank_0(f"Converted Model:\n {model}")
     torch.distributed.barrier()

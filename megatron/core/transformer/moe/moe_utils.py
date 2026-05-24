@@ -8,20 +8,23 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+from megatron.core.tensor_parallel import (
+    get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name,
+    get_expert_parallel_rng_tracker_name,
+)
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api, is_te_min_version
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         fused_compute_score_for_moe_aux_loss,
         fused_moe_aux_loss,
@@ -34,10 +37,19 @@ try:
         fused_unpermute,
         te_general_gemm,
     )
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    (
+        fused_compute_score_for_moe_aux_loss,
+        fused_moe_aux_loss,
+        fused_permute,
+        fused_permute_and_pad_with_probs,
+        fused_permute_with_probs,
+        fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_with_probs,
+        fused_topk_with_score_function,
+        fused_unpermute,
+        te_general_gemm,
+    ) = (None, None, None, None, None, None, None, None, None, None)
 
 
 # MOE logging
@@ -295,7 +307,7 @@ def permute(
     fused: bool = False,
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
-    align_size: int = -1,
+    align_size: int = 0,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -357,7 +369,11 @@ def permute(
                 "fused_permute_with_probs typically requires TE >= 2.1.0, and "
                 "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
             )
-        if fused_permute_and_pad_with_probs is not None and tokens_per_expert is not None:
+        if (
+            fused_permute_and_pad_with_probs is not None
+            and tokens_per_expert is not None
+            and align_size > 0
+        ):
             return fused_permute_and_pad_with_probs(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )
@@ -393,17 +409,22 @@ def permute(
             # get probs from indices
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
     else:
+        assert (
+            num_out_tokens is not None
+        ), "num_out_tokens is required for the argsort-based permute"
+
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
 
-        # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
-        token_indices = (
-            torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
-        )
-        sorted_indices = token_indices.masked_select(routing_map)
+        # Use argsort to get indices of non-zero entries in row-major order.
+        # This is equivalent to masked_select but produces fixed-shape output,
+        # making it compatible with CUDA graph capture.
+        flat_sorted = routing_map.reshape(-1).argsort(descending=True, stable=True)
+        flat_sorted = flat_sorted[:num_out_tokens]
+        sorted_indices = flat_sorted % num_tokens
 
         if probs is not None:
-            permuted_probs = probs.T.contiguous().masked_select(routing_map)
+            permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
@@ -675,8 +696,8 @@ def topk_routing_with_score_function(
         group_topk (int, optional): Number of selected groups for each token. Defaults to None.
         scaling_factor (float, optional): Scaling factor of routing score in top-k selection.
                                          Defaults to None.
-        score_function (str, optional): The score function to use. Can be either "softmax" or
-                                        "sigmoid". Defaults to "softmax".
+        score_function (str, optional): The score function to use. Can be "softmax", "sigmoid"
+                                        or "sqrtsoftplus". Defaults to "softmax".
         expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
                                               Defaults to None.
         fused (bool, optional): Whether to use the fused version. Defaults to False.
@@ -709,6 +730,11 @@ def topk_routing_with_score_function(
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
                 "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
+            )
+        if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
+            raise ValueError(
+                "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
+                "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
         return fused_topk_with_score_function(
             logits=logits,
@@ -750,7 +776,8 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
-            return torch.topk(scores, k=topk, dim=1)
+            # Sorting top-k turned off during inference
+            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active
@@ -762,19 +789,26 @@ def topk_routing_with_score_function(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
 
+    # Precision notes:
+    # - Logits are converted to fp32 for score functions.
+    # - All the intermediate calculations are in fp32.
+    # - The final probs are casted to the same dtype as the logits.
     if score_function == "softmax":
         if use_pre_softmax:
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
-    elif score_function == "sigmoid":
-        scores = torch.sigmoid(logits.float()).type_as(logits)
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    elif score_function in ("sigmoid", "sqrtsoftplus"):
+        if score_function == "sigmoid":
+            scores = torch.sigmoid(logits.float())
+        else:
+            scores = torch.nn.functional.softplus(logits.float()).sqrt()
         if expert_bias is not None:
-            scores_for_routing = scores + expert_bias
+            scores_for_routing = scores + expert_bias.float()
             _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
-            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            scores = torch.gather(scores, dim=1, index=top_indices)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
@@ -783,6 +817,8 @@ def topk_routing_with_score_function(
 
     if scaling_factor:
         probs = probs * scaling_factor
+
+    probs = probs.type_as(logits)
 
     if dense_output:
         return probs, top_indices
@@ -818,7 +854,8 @@ def compute_routing_scores_for_aux_loss(
     Args:
         logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
         topk (int): The number of top-k indices to compute.
-        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
+        score_function (str): The score function to use. Can be "softmax", "sigmoid"
+                              or "sqrtsoftplus".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
         padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                Shape in [num_tokens]. True for valid tokens,
@@ -832,6 +869,11 @@ def compute_routing_scores_for_aux_loss(
             raise ValueError(
                 "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
             )
+        if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
+            raise ValueError(
+                "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
+                "Please upgrade Transformer Engine or disable moe_router_fusion."
+            )
         routing_map, scores = fused_compute_score_for_moe_aux_loss(
             logits=logits, topk=topk, score_function=score_function
         )
@@ -839,8 +881,10 @@ def compute_routing_scores_for_aux_loss(
         if score_function == "softmax":
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif score_function == "sigmoid":
-            # Cast logits to float32 before sigmoid for stability
-            scores = torch.sigmoid(logits.to(torch.float32))
+            scores = torch.sigmoid(logits.float())
+            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        elif score_function == "sqrtsoftplus":
+            scores = torch.nn.functional.softplus(logits.float()).sqrt()
             scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
@@ -1117,7 +1161,10 @@ def track_moe_metrics(
 
 
 def get_updated_expert_bias(
-    tokens_per_expert: torch.Tensor, expert_bias: torch.Tensor, expert_bias_update_rate: float
+    tokens_per_expert: torch.Tensor,
+    expert_bias: torch.Tensor,
+    expert_bias_update_rate: float,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
 
@@ -1125,17 +1172,21 @@ def get_updated_expert_bias(
         tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
         expert_bias (torch.Tensor): The bias for each expert.
         expert_bias_udpate_rate (float): The update rate for the expert bias.
+        tp_dp_cp_group (torch.distributed.ProcessGroup, optional): The group spanning the tensor,
+            data, and context parallel ranks that share the router expert-bias update.
 
     Returns:
         torch.Tensor: The updated expert bias.
     """
     with torch.no_grad():
-        # All Reduce Across TPxCPxDP group
-        torch.distributed.all_reduce(
-            tokens_per_expert,
+        if tp_dp_cp_group is None:
             # TODO(Hepteract): delete the usage of the global parallel_state.
-            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
-        )
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+
+        # All Reduce Across TPxCPxDP group
+        torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
@@ -1222,6 +1273,55 @@ def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
         torch.Tensor: The random logits.
     """
     return RandomSTE.apply(logits)
+
+
+@internal_api
+class RandomSTEShared(torch.autograd.Function):
+    """
+    Straight-Through Estimator(STE) function that returns random values
+    with a shared seed across all ranks.
+    When std < 0, caches and reuses values per layer.
+    """
+
+    _cache = {}
+
+    @staticmethod
+    def forward(ctx, logits, std, layer_number):
+        """Forward pass: apply random bias to logits."""
+        # Check cache if reuse mode (negative std)
+        if std < 0 and layer_number in RandomSTEShared._cache:
+            return logits + RandomSTEShared._cache[layer_number]
+
+        # Generate random bias with shared seed across all ranks
+        with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+            bias = torch.empty(logits.shape[-1], device=logits.device, dtype=logits.dtype).normal_(
+                std=abs(std)
+            )
+
+        # Cache if reuse mode
+        if std < 0 and layer_number is not None:
+            RandomSTEShared._cache[layer_number] = bias
+
+        return logits + bias
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: pass through gradients."""
+        return grad_output, None, None
+
+
+def apply_biased_logits(logits, std, layer_number=None):
+    """
+    Apply random bias to logits. All ranks get the same random values.
+
+    Args:
+        logits: Input logits tensor [num_tokens, num_experts]
+        std: Standard deviation for random bias. If negative, generate once
+             per layer and reuse (using abs(std) as actual std).
+        layer_number: Layer number for caching when std is negative.
+    """
+    logits = apply_random_logits(logits)
+    return RandomSTEShared.apply(logits, std, layer_number)
 
 
 class RouterGatingLinearFunction(torch.autograd.Function):
@@ -1336,11 +1436,31 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
+    # CUTLASS kernel for grouped GEMM assumes 256 alignment.
+    if config.use_transformer_engine_op_fuser:
+        return 256
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
-    elif config.fp4:
+    if config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    return 16
+    # Only FP8 or FP4 requires padding. Defaults to 0.
+    return 0
+
+
+def skip_routed_expert_padding(config: TransformerConfig) -> bool:
+    """Whether the expert module should skip quantization padding.
+
+    Returns True when padding is already applied by the router or the
+    HybridEP dispatcher.
+    """
+    if config.moe_router_padding_for_quantization:
+        return True
+    if (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+    ):
+        return True
+    return False
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -1511,13 +1631,13 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         ):
             if (
                 step_condition == "route"
-                and CudaGraphScope.moe_router in moe_layer.config.cuda_graph_scope
-                and CudaGraphScope.moe_preprocess not in moe_layer.config.cuda_graph_scope
+                and CudaGraphModule.moe_router in moe_layer.config.cuda_graph_modules
+                and CudaGraphModule.moe_preprocess not in moe_layer.config.cuda_graph_modules
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "route", **kwargs)
             elif (
                 step_condition == "preprocess"
-                and CudaGraphScope.moe_preprocess in moe_layer.config.cuda_graph_scope
+                and CudaGraphModule.moe_preprocess in moe_layer.config.cuda_graph_modules
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "preprocess", **kwargs)
 
