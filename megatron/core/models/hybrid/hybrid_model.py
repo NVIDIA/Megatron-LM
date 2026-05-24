@@ -21,8 +21,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -203,7 +204,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
             # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
             # stage separate from loss) to be supported in the hybrid model.
-            and mtp_on_this_rank(self.config, ignore_virtual=False, vp_stage=self.vp_stage)
+            and mtp_on_this_rank(
+                layout=self.config.pipeline_model_parallel_layout,
+                mtp_num_layers=self.config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=self.vp_stage,
+            )
         )
 
         # megatron core pipelining currently depends on model type
@@ -260,6 +266,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
+            name="decoder",
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -279,6 +286,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
+                name="mtp",
             )
             self._setup_mtp_cuda_graphs()
 
@@ -331,6 +339,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             vp_size=self.config.virtual_pipeline_model_parallel_size,
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+            max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
@@ -343,6 +352,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
 
+    def preprocess_for_paged_stash(self):
+        """Preprocess for paged stash."""
+        return paged_stash_init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size, vp_stage=self.vp_stage
+        )
+
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """
         Check if we should call the local cudagraph path.
@@ -354,7 +369,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -374,7 +389,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         """
         Create the cudagraph manager for the full iteration inference scope
         """
-        if CudaGraphScope.full_iteration_inference in config.cuda_graph_scope:
+        if config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
             self.cudagraph_manager = CudaGraphManager(config)
@@ -405,6 +420,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
+
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
