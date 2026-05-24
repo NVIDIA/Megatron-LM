@@ -2889,12 +2889,38 @@ def training_log(
                 parse_hybrid_pattern,
             )
 
-            # track_moe_metrics adds mtp_num_layers below, so only count main decoder MoE layers
-            # here. Counting the full unified pattern would double count MTP MoE layers.
-            main_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern).main_pattern
-            layers = main_pattern.count(Symbols.MOE) if main_pattern is not None else 0
+            parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+            main_pattern = parsed_pattern.main_pattern or ""
+            mtp_pattern = parsed_pattern.mtp_pattern or ""
+            main_moe_layers = main_pattern.count(Symbols.MOE)
+            mtp_moe_layers_per_depth = mtp_pattern.count(Symbols.MOE)
+            if parsed_pattern.mtp_num_depths > 0 and mtp_moe_layers_per_depth > 0:
+                mtp_moe_layers = (
+                    mtp_moe_layers_per_depth
+                    if args.mtp_use_repeated_layer
+                    else mtp_moe_layers_per_depth * parsed_pattern.mtp_num_depths
+                )
+            else:
+                mtp_moe_layers = 0
+            num_moe_layers = main_moe_layers + mtp_moe_layers
         else:
-            layers = args.num_layers
+            if args.moe_layer_freq is None:
+                moe_layer_pattern = [1] * args.num_layers
+            elif isinstance(args.moe_layer_freq, int):
+                moe_layer_pattern = [
+                    1 if (i % args.moe_layer_freq == 0) else 0 for i in range(args.num_layers)
+                ]
+            elif isinstance(args.moe_layer_freq, list):
+                moe_layer_pattern = args.moe_layer_freq
+            else:
+                raise ValueError(f"Invalid moe_layer_freq: {args.moe_layer_freq}")
+            main_moe_layers = sum(moe_layer_pattern)
+            mtp_moe_layers = 0
+            if args.mtp_num_layers and moe_layer_pattern[-1]:
+                mtp_moe_layers = 1 if args.mtp_use_repeated_layer else args.mtp_num_layers
+            num_moe_layers = main_moe_layers + mtp_moe_layers
+
+        layers = args.num_layers + (args.mtp_num_layers or 0)
 
         moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
@@ -2905,8 +2931,8 @@ def training_log(
             force_initialize=True,
             track_names=track_names,
             num_layers=layers,
+            num_moe_layers=num_moe_layers,
             moe_layer_freq=args.moe_layer_freq,
-            mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )

@@ -678,6 +678,8 @@ class TopKRouter(Router):
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
 
+            # TODO: repeated-MTP z_loss is scaled after MoEAuxLossAutoScaler.apply(), so this
+            # adjusts logging only; move the scaling above the attach point if z_loss is used.
             # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times.
             # To avoid accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers
             # so the total loss is correct.
