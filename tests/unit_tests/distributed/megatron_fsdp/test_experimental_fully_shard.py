@@ -19,6 +19,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpModule,
     ParameterGroup,
     Placements,
+    Replicate,
     fully_shard,
 )
 
@@ -247,14 +248,17 @@ def test_default_main_buffer_dtypes_follow_policy_contract(setup: DistributedSet
 
 
 @pytest.mark.distributed
-def test_full_mesh_is_distinct_from_dbuffer_dp_submesh(setup: DistributedSetup):
-    """ParameterGroup keeps the full mesh while DBuffers use only DP axes."""
+def test_full_mesh_is_used_for_dbuffers(setup: DistributedSetup):
+    """This version uses the full mesh for DBuffer storage."""
     if setup.world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(setup.device.type, (1, setup.world_size), mesh_dim_names=("tp", "dp"))
     placements = Placements(
-        dp_axes=["dp"], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+        dp_axes=["tp", "dp"],
+        parameter=[Replicate(), Flat()],
+        gradient=[Replicate(), Flat()],
+        optimizer=[Replicate(), Flat()],
     )
     model = nn.Linear(4, 4, bias=False).to(setup.device)
 
@@ -262,14 +266,12 @@ def test_full_mesh_is_distinct_from_dbuffer_dp_submesh(setup: DistributedSetup):
 
     (group,) = model.parameter_groups()
     assert group.mesh is mesh
-    assert group.dp_mesh.ndim == 1
-    assert group.dp_mesh.size() == setup.world_size
-    assert group.main_weight.mesh is group.dp_mesh
-    assert group.model_weight.mesh is group.dp_mesh
+    assert group.main_weight.mesh is mesh
+    assert group.model_weight.mesh is mesh
     assert group.main_grad is not None
-    assert group.main_grad.mesh is group.dp_mesh
+    assert group.main_grad.mesh is mesh
     assert isinstance(model.weight, DTensor)
-    assert model.weight.device_mesh is group.dp_mesh
+    assert model.weight.device_mesh is mesh
 
 
 @pytest.mark.distributed
@@ -291,6 +293,30 @@ def test_sharded_parameter_contract_uses_dtensors(setup: DistributedSetup):
     model(torch.randn(2, 4, device=setup.device)).sum().backward()
     assert isinstance(model.weight, DTensor)
     assert isinstance(model.weight.grad, DTensor)
+    assert original_weight.grad is None
+
+
+@pytest.mark.distributed
+def test_backward_averages_across_dp_and_accumulates_across_calls(setup: DistributedSetup):
+    """Each backward averages over DP ranks; repeated backwards accumulate by summing."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = nn.Linear(1, setup.world_size, bias=False).to(setup.device)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    x = torch.full((1, 1), float(setup.rank + 1), device=setup.device)
+    model(x).sum().backward()
+    model(x).sum().backward()
+
+    assert isinstance(model.weight.grad, DTensor)
+    local_grad = model.weight.grad.to_local()
+    expected = torch.full_like(local_grad, float(setup.world_size + 1))
+    torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
 
 
 @pytest.mark.distributed
@@ -311,6 +337,22 @@ def test_meta_parameters_initialize_with_reset_parameters(setup: DistributedSetu
     assert group.model_weight.local_buffer.numel() > 0
     full_weight = _full_model_weight(group)
     torch.testing.assert_close(full_weight, torch.full_like(full_weight, 3.0))
+
+
+@pytest.mark.distributed
+def test_model_weight_alias_is_rejected(setup: DistributedSetup):
+    """Model weights cannot alias the unsharded parameter buffer."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    placements = Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Flat()], optimizer=[Flat()]
+    )
+    model = nn.Linear(4, 4, bias=False).to(setup.device)
+
+    with pytest.raises(AssertionError, match="storage is resized and released"):
+        fully_shard(model, mesh=mesh, placements=placements)
 
 
 @pytest.mark.distributed

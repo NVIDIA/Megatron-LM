@@ -15,9 +15,10 @@
 """Minimal per-module Megatron-FSDP implementation."""
 
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed import DeviceMesh
 
@@ -48,6 +49,20 @@ class Placements:
                 raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
 
 
+def has_grad(parameters: Iterable[nn.Parameter]) -> bool:
+    """Return whether parameters have gradients, requiring all-or-none state."""
+    has_any_grad = False
+    has_any_missing_grad = False
+    for parameter in parameters:
+        if parameter.grad is None:
+            has_any_missing_grad = True
+        else:
+            has_any_grad = True
+    if has_any_grad and has_any_missing_grad:
+        raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
+    return has_any_grad
+
+
 class ParameterGroup:
     """A dtype and requires-grad homogeneous group of FSDP-owned parameters."""
 
@@ -55,7 +70,6 @@ class ParameterGroup:
     sharded_parameters: dict[str, nn.Parameter]
     unsharded_parameters: dict[str, nn.Parameter]
     mesh: DeviceMesh
-    dp_mesh: DeviceMesh
     dtype: torch.dtype
     requires_grad: bool
     main_weight: DBuffer
@@ -76,22 +90,26 @@ class ParameterGroup:
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
             parameters: Root-module-relative FQNs and their parameters.
-            mesh: Full device mesh. DBuffer storage is built on the DP submesh.
+            mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
         """
+        # ---------------------------------------------------------------------
+        # Validate group inputs and mesh contract
+        # ---------------------------------------------------------------------
         if not parameters:
             raise ValueError("ParameterGroup requires at least one parameter.")
 
-        dp_mesh = _dp_submesh(mesh, placements.dp_axes)
+        axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
+        assert axis_indices == tuple(range(mesh.ndim)), (
+            "FSDP requires dp_axes to match every mesh axis in mesh order for now."
+        )
 
-        # Python dicts preserve insertion order, so values() defines the stable
-        # tensor order used by each DBuffer built from this group.
+        # ---------------------------------------------------------------------
+        # Record shared metadata
+        # ---------------------------------------------------------------------
         self.owning_module = owning_module
-        self.sharded_parameters = {}
-        self.unsharded_parameters = {}
         self.mesh = mesh
-        self.dp_mesh = dp_mesh
         first_parameter = next(iter(parameters.values()))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
@@ -109,32 +127,38 @@ class ParameterGroup:
                     f"Expected parameter {name!r} to have requires_grad={self.requires_grad}, "
                     f"got {parameter.requires_grad}."
                 )
-        main_weight_dtype = mixed_precision_policy.main_params_dtype
-        if main_weight_dtype is None:
-            raise ValueError(
-                "FSDP requires a main weight dtype; set MixedPrecisionPolicy.main_params_dtype."
-            )
-        main_grad_dtype = mixed_precision_policy.main_grads_dtype
-        if main_grad_dtype is None:
-            main_grad_dtype = self.dtype
+
+        # ---------------------------------------------------------------------
+        # Initialize DBuffers from original parameter values
+        # ---------------------------------------------------------------------
+        # Python dicts preserve insertion order, so values() defines the stable
+        # tensor order used by each DBuffer built from this group.
+        self._unsharded_model_weight = DBuffer.distribute_tensors(
+            parameters.values(),
+            mesh=self.mesh,
+            placements=[Replicate()] * self.mesh.ndim,
+        )
         # Scratch initialization starts from model weights. Checkpoint loading will
         # eventually initialize main weights first and derive model weights from them.
-        self.model_weight = DBuffer.distribute_tensors(
-            [parameter.detach().contiguous() for parameter in parameters.values()],
-            mesh=self.dp_mesh,
-            placements=placements.parameter,
+        self.model_weight = self._unsharded_model_weight.redistribute(placements.parameter)
+        model_weight_storage = self.model_weight.local_buffer.untyped_storage()
+        unsharded_model_weight_storage = self._unsharded_model_weight.local_buffer.untyped_storage()
+        assert model_weight_storage.data_ptr() != unsharded_model_weight_storage.data_ptr(), (
+            "model_weight must not share storage with _unsharded_model_weight because "
+            "_unsharded_model_weight storage is resized and released after resharding."
         )
+
+        main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
-            [
-                parameter.detach().to(dtype=main_weight_dtype).contiguous()
-                for parameter in parameters.values()
-            ],
-            mesh=self.dp_mesh,
+            [parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()],
+            mesh=self.mesh,
             placements=placements.optimizer,
         )
+
+        main_grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
         self.main_grad = (
             DBuffer(
-                mesh=self.dp_mesh,
+                mesh=self.mesh,
                 placements=placements.gradient,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=main_grad_dtype,
@@ -143,14 +167,12 @@ class ParameterGroup:
             if self.requires_grad
             else None
         )
-        self._unsharded_model_weight = DBuffer(
-            mesh=self.dp_mesh,
-            placements=[Replicate()] * self.dp_mesh.ndim,
-            tensor_shapes=self.model_weight.layout.tensor_shapes,
-            dtype=self.model_weight.local_buffer.dtype,
-            device=self.model_weight.local_buffer.device,
-        )
 
+        # ---------------------------------------------------------------------
+        # Build parameter maps for module swapping
+        # ---------------------------------------------------------------------
+        self.sharded_parameters = {}
+        self.unsharded_parameters = {}
         for index, (name, parameter) in enumerate(parameters.items()):
             parameter.data = self._unsharded_model_weight.get_tensor(index)
             parameter.grad = None
@@ -161,6 +183,10 @@ class ParameterGroup:
             )
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
             self.sharded_parameters[name] = sharded_parameter
+
+        # ---------------------------------------------------------------------
+        # Install resting sharded parameters
+        # ---------------------------------------------------------------------
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
 
@@ -183,7 +209,9 @@ class ParameterGroup:
         with torch.autograd._unsafe_preserve_version_counter(
             self._unsharded_model_weight.local_buffer
         ):
-            self.model_weight.fully_allgather_into(self._unsharded_model_weight)
+            self.model_weight.redistribute(
+                self._unsharded_model_weight.placements, out=self._unsharded_model_weight
+            )
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
@@ -191,47 +219,34 @@ class ParameterGroup:
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
 
-    def reduce_gradients(self, average: bool = True) -> None:
-        """Reduce full local gradients into the persistent sharded gradient buffer."""
-        if not self.requires_grad:
-            return
+    def reduce_gradients(self) -> None:
+        """Reduce full local gradients into sharded parameter gradients."""
         assert self.main_grad is not None
 
-        accumulate = self.has_sharded_grad()
         full_grads: list[torch.Tensor] = []
         for name, parameter in self.unsharded_parameters.items():
             if parameter.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
-            full_grads.append(
-                parameter.grad.detach().to(dtype=self.main_grad.local_buffer.dtype).contiguous()
-            )
+            full_grads.append(parameter.grad.to(dtype=self.main_grad.local_buffer.dtype))
 
         partial_grad = DBuffer.distribute_tensors(
-            full_grads, mesh=self.dp_mesh, placements=[Partial()] * self.dp_mesh.ndim
+            full_grads,
+            mesh=self.mesh,
+            placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
         )
-        reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-        if average:
-            reduced_grad.local_buffer.div_(self.dp_mesh.size())
 
-        if accumulate:
+        sharded_parameters = self.sharded_parameters.values()
+        if has_grad(sharded_parameters):
+            reduced_grad = partial_grad.redistribute(self.main_grad.placements)
             self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
         else:
-            self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
+            partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
+            for index, parameter in enumerate(sharded_parameters):
+                parameter.grad = self.main_grad.get_dtensor(index)
 
         for parameter in self.unsharded_parameters.values():
             parameter.grad = None
-        self.install_sharded_gradients()
 
-    def has_sharded_grad(self) -> bool:
-        """Return whether persistent sharded gradients are currently materialized."""
-        return any(parameter.grad is not None for parameter in self.sharded_parameters.values())
-
-    def install_sharded_gradients(self) -> None:
-        """Install sharded DTensor gradients backed by main_grad."""
-        if self.main_grad is None:
-            return
-        for index, parameter in enumerate(self.sharded_parameters.values()):
-            parameter.grad = self.main_grad.get_dtensor(index)
 
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
@@ -239,7 +254,7 @@ class FsdpModule:
     _parameter_groups: tuple[ParameterGroup, ...]
     _ready_grad_params: set[nn.Parameter]
     _registered_grad_param_ids: set[int]
-    _trainable_param_count: int
+    num_trainable_params: int
 
     def __init__(
         self, mesh: DeviceMesh, placements: Placements, mixed_precision_policy: MixedPrecisionPolicy
@@ -259,7 +274,7 @@ class FsdpModule:
         self._parameter_groups = tuple(parameter_groups)
         self._ready_grad_params: set[nn.Parameter] = set()
         self._registered_grad_param_ids: set[int] = set()
-        self._trainable_param_count = sum(
+        self.num_trainable_params = sum(
             len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
@@ -284,7 +299,7 @@ class FsdpModule:
     def _make_grad_hook(self, parameter: nn.Parameter) -> Callable[[nn.Parameter], None]:
         def grad_hook(_parameter: nn.Parameter) -> None:
             self._ready_grad_params.add(parameter)
-            if len(self._ready_grad_params) == self._trainable_param_count:
+            if len(self._ready_grad_params) == self.num_trainable_params:
                 self.post_backward()
 
         return grad_hook
@@ -309,9 +324,9 @@ class FsdpModule:
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
         for group in self._parameter_groups:
-            group.reduce_gradients()
+            if group.requires_grad:
+                group.reduce_gradients()
             group.reshard_parameters()
-            group.install_sharded_gradients()
         self._ready_grad_params.clear()
 
     def parameter_groups(self) -> tuple[ParameterGroup, ...]:
@@ -362,28 +377,6 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
     if dim_names is None or axis not in dim_names:
         raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
     return dim_names.index(axis)
-
-
-def _dp_submesh(mesh: DeviceMesh, dp_axes: Sequence[MeshAxis]) -> DeviceMesh:
-    if not dp_axes:
-        raise ValueError("FSDP requires at least one DP mesh axis.")
-
-    axis_indices = tuple(_axis_index(mesh, axis) for axis in dp_axes)
-    if len(set(axis_indices)) != len(axis_indices):
-        raise ValueError(f"Duplicate DP mesh axes are not allowed: {tuple(dp_axes)!r}.")
-
-    if axis_indices == tuple(range(mesh.ndim)):
-        return mesh
-
-    dim_names = mesh.mesh_dim_names
-    if dim_names is None:
-        raise ValueError(
-            "Slicing a DP submesh from a full mesh requires named mesh dimensions unless "
-            "dp_axes covers every mesh axis in mesh order."
-        )
-
-    dp_axis_names = tuple(dim_names[index] for index in axis_indices)
-    return mesh[dp_axis_names[0] if len(dp_axis_names) == 1 else dp_axis_names]
 
 
 def _mesh_device(mesh: DeviceMesh) -> torch.device:
