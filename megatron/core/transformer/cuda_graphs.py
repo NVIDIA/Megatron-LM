@@ -2454,7 +2454,10 @@ class TECudaGraphHelper:
                 kwargs['fp8_recipe'] = (
                     get_fp8_recipe(self.config) if self.config.fp8 else get_fp4_recipe(self.config)
                 )
-                kwargs['fp8_weight_caching'] = True
+                # TE's cached FP8 weights assume graph replay sees the same parameter storage
+                # that was used during capture. Megatron-FSDP FP8 param gather swaps gathered
+                # parameter views around graph boundaries, so quantized weights must be refreshed.
+                kwargs['fp8_weight_caching'] = not getattr(self.config, 'fp8_param', False)
                 if is_te_min_version("1.14.0") and parallel_state.model_parallel_is_initialized():
                     kwargs['fp8_group'] = parallel_state.get_amax_reduction_group(
                         with_context_parallel=True, tp_only_amax_red=self.config.tp_only_amax_red
