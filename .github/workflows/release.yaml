@@ -83,8 +83,9 @@ jobs:
       && !(needs.pre-flight.outputs.docs_only == 'true'
            || needs.pre-flight.outputs.is_merge_group == 'true'
            || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@d8ca5ec4a4c4242d0bc2438aa838adebd83e05c4
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@46808077ddf43d9815a3df66223a90bb09ab3a3e
     with:
+      release-branch-pattern: "core_[rv][0-9]*.[0-9]*.[0-9]*"
       release-ref: ${{ inputs.release-ref || github.sha }}
       validate-only: ${{ github.event_name != 'workflow_dispatch' }}
       dry-run: ${{ inputs.dry-run || false }}
