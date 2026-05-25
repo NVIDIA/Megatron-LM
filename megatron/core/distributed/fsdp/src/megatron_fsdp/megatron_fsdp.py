@@ -877,6 +877,37 @@ class MegatronFSDP(torch.nn.Module):
 
                     current_param.get_main_grad = main_grad_getter.__get__(current_param)
 
+        def _mirror_fsdp_tree_param_attrs(module: nn.Module, canonical_params):
+            """Mirror canonical FSDP params onto direct owner modules in a module tree."""
+            param_to_direct_module = getattr(
+                self.param_and_grad_buffer, "param_to_direct_module", None
+            )
+            if param_to_direct_module is None:
+                _mirror_fsdp_param_attrs(module, canonical_params)
+                return
+
+            direct_modules = []
+            seen_modules = set()
+            for param in canonical_params:
+                entry = param_to_direct_module.get(param)
+                if entry is None:
+                    continue
+                _, direct_module = entry
+                if not (direct_module is module or is_submodule(direct_module, module)):
+                    continue
+                if id(direct_module) in seen_modules:
+                    continue
+                seen_modules.add(id(direct_module))
+                direct_modules.append(direct_module)
+
+            if not direct_modules:
+                _mirror_fsdp_param_attrs(module, canonical_params)
+                return
+
+            for direct_module in direct_modules:
+                direct_params = _get_canonical_module_params(direct_module, recurse=False)
+                _mirror_fsdp_param_attrs(direct_module, direct_params)
+
         @torch.compiler.disable
         def _pre_forward_param_unshard(
             module: nn.Module, *unused, force_disable_prefetch: bool = False
@@ -922,7 +953,7 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
             if use_canonical_params:
-                _mirror_fsdp_param_attrs(module, param_list)
+                _mirror_fsdp_tree_param_attrs(module, param_list)
             return None
 
         def _make_forward_pre_hook():
@@ -1061,7 +1092,7 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
                 bwd=True,
             )
-            _mirror_fsdp_param_attrs(module, param_list)
+            _mirror_fsdp_tree_param_attrs(module, param_list)
 
         self._root_pre_backward_hook_issued = False
 
