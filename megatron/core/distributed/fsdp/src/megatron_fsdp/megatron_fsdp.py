@@ -603,6 +603,12 @@ class MegatronFSDP(torch.nn.Module):
                 - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
                 the FP8 transpose cache associated with the module’s parameters.
             """
+            if (
+                bool(int(os.environ.get("MCORE_FSDP_KEEP_CUDAGRAPH_PARAMS_UNTIL_BWD", "0")))
+                and (is_graph_capturing() or bool(getattr(module, "cuda_graphs", None)))
+            ):
+                return
+
             params = (
                 _get_canonical_module_params(module, recurse=True)
                 if (
