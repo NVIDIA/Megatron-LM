@@ -49,26 +49,13 @@ class Placements:
                 raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
 
 
-def has_grad(parameters: Iterable[nn.Parameter]) -> bool:
-    """Return whether parameters have gradients, requiring all-or-none state."""
-    has_any_grad = False
-    has_any_missing_grad = False
-    for parameter in parameters:
-        if parameter.grad is None:
-            has_any_missing_grad = True
-        else:
-            has_any_grad = True
-    if has_any_grad and has_any_missing_grad:
-        raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
-    return has_any_grad
-
-
 class ParameterGroup:
     """A dtype and requires-grad homogeneous group of FSDP-owned parameters."""
 
     owning_module: nn.Module
-    sharded_parameters: dict[str, nn.Parameter]
-    unsharded_parameters: dict[str, nn.Parameter]
+    parameter_names: tuple[str, ...]
+    sharded_parameters: tuple[nn.Parameter, ...]
+    unsharded_parameters: tuple[nn.Parameter, ...]
     mesh: DeviceMesh
     dtype: torch.dtype
     requires_grad: bool
@@ -110,6 +97,7 @@ class ParameterGroup:
         # ---------------------------------------------------------------------
         self.owning_module = owning_module
         self.mesh = mesh
+        self.parameter_names = tuple(parameters)
         first_parameter = next(iter(parameters.values()))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
@@ -131,8 +119,8 @@ class ParameterGroup:
         # ---------------------------------------------------------------------
         # Initialize DBuffers from original parameter values
         # ---------------------------------------------------------------------
-        # Python dicts preserve insertion order, so values() defines the stable
-        # tensor order used by each DBuffer built from this group.
+        # Python dicts preserve insertion order, so parameter_names and
+        # parameters.values() define the same stable DBuffer tensor order.
         self._unsharded_model_weight = DBuffer.distribute_tensors(
             parameters.values(),
             mesh=self.mesh,
@@ -150,7 +138,7 @@ class ParameterGroup:
 
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
-            [parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()],
+            (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
             mesh=self.mesh,
             placements=placements.optimizer,
         )
@@ -169,20 +157,28 @@ class ParameterGroup:
         )
 
         # ---------------------------------------------------------------------
-        # Build parameter maps for module swapping
+        # Build parameter tuples for module swapping
         # ---------------------------------------------------------------------
-        self.sharded_parameters = {}
-        self.unsharded_parameters = {}
-        for index, (name, parameter) in enumerate(parameters.items()):
+        sharded_parameters: list[nn.Parameter] = []
+        unsharded_parameters: list[nn.Parameter] = []
+        grad_dtype = self.main_grad.local_buffer.dtype if self.requires_grad else None
+        for index, parameter in enumerate(parameters.values()):
             parameter.data = self._unsharded_model_weight.get_tensor(index)
             parameter.grad = None
+            if grad_dtype:
+                parameter.grad_dtype = grad_dtype
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
-            self.unsharded_parameters[name] = parameter
+            unsharded_parameters.append(parameter)
+
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
+            if grad_dtype:
+                sharded_parameter.grad_dtype = grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
-            self.sharded_parameters[name] = sharded_parameter
+            sharded_parameters.append(sharded_parameter)
+        self.sharded_parameters = tuple(sharded_parameters)
+        self.unsharded_parameters = tuple(unsharded_parameters)
 
         # ---------------------------------------------------------------------
         # Install resting sharded parameters
@@ -190,8 +186,8 @@ class ParameterGroup:
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
 
-    def _set_module_parameters(self, parameters: dict[str, nn.Parameter]) -> None:
-        for name, parameter in parameters.items():
+    def _set_module_parameters(self, parameters: tuple[nn.Parameter, ...]) -> None:
+        for name, parameter in zip(self.parameter_names, parameters, strict=True):
             module, parameter_name = _get_parameter_owner(self.owning_module, name)
             module._parameters[parameter_name] = parameter
 
@@ -223,28 +219,47 @@ class ParameterGroup:
         """Reduce full local gradients into sharded parameter gradients."""
         assert self.main_grad is not None
 
-        full_grads: list[torch.Tensor] = []
-        for name, parameter in self.unsharded_parameters.items():
+        def has_grad(parameters: Iterable[nn.Parameter]) -> bool:
+            has_any_grad = False
+            has_any_missing_grad = False
+            for parameter in parameters:
+                if parameter.grad is None:
+                    has_any_missing_grad = True
+                else:
+                    has_any_grad = True
+            if has_any_grad and has_any_missing_grad:
+                raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
+            return has_any_grad
+
+        grads: list[torch.Tensor] = []
+        for name, parameter in zip(self.parameter_names, self.unsharded_parameters, strict=True):
             if parameter.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
-            full_grads.append(parameter.grad.to(dtype=self.main_grad.local_buffer.dtype))
+            assert parameter.grad.dtype == self.main_grad.local_buffer.dtype, (
+                "FSDP unsharded parameter grad dtype should be guaranteed by grad_dtype: "
+                f"parameter {name!r} has grad dtype {parameter.grad.dtype}, "
+                f"expected main_grad dtype {self.main_grad.local_buffer.dtype}."
+            )
+            grads.append(parameter.grad)
 
         partial_grad = DBuffer.distribute_tensors(
-            full_grads,
+            grads,
             mesh=self.mesh,
             placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
         )
 
-        sharded_parameters = self.sharded_parameters.values()
-        if has_grad(sharded_parameters):
+        # zero_grad(set_to_none=True) clears sharded parameter grads, so the next
+        # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
+        # leaves sharded grads installed, so this backward accumulates into main_grad.
+        if has_grad(self.sharded_parameters):
             reduced_grad = partial_grad.redistribute(self.main_grad.placements)
             self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
         else:
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-            for index, parameter in enumerate(sharded_parameters):
+            for index, parameter in enumerate(self.sharded_parameters):
                 parameter.grad = self.main_grad.get_dtensor(index)
 
-        for parameter in self.unsharded_parameters.values():
+        for parameter in self.unsharded_parameters:
             parameter.grad = None
 
 
@@ -252,9 +267,8 @@ class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
 
     _parameter_groups: tuple[ParameterGroup, ...]
-    _ready_grad_params: set[nn.Parameter]
-    _registered_grad_param_ids: set[int]
-    num_trainable_params: int
+    _ready_grad_parameters: set[nn.Parameter]
+    num_training_parameters: int
 
     def __init__(
         self, mesh: DeviceMesh, placements: Placements, mixed_precision_policy: MixedPrecisionPolicy
@@ -272,9 +286,8 @@ class FsdpModule:
             for group_parameters in _group_parameters(owned_parameters)
         ]
         self._parameter_groups = tuple(parameter_groups)
-        self._ready_grad_params: set[nn.Parameter] = set()
-        self._registered_grad_param_ids: set[int] = set()
-        self.num_trainable_params = sum(
+        self._ready_grad_parameters = set()
+        self.num_training_parameters = sum(
             len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
@@ -283,33 +296,29 @@ class FsdpModule:
         self.register_forward_pre_hook(lambda _module, _args: self.pre_forward())
         self.register_forward_hook(lambda _module, _args, _output: self.post_forward())
         self.register_full_backward_pre_hook(lambda _module, _grad_output: self.pre_backward())
-
-    def _register_grad_hooks(self) -> None:
-        """Register post-accumulate hooks on full-size autograd leaf parameters."""
+        # Gradient reduction is parameter-completion based: once every owned
+        # Parameter has accumulated its grad, this FSDP unit can reduce and
+        # reshard. Module full-backward hooks can fire before that when module
+        # inputs do not require grad.
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
-            for parameter in group.unsharded_parameters.values():
-                parameter_id = id(parameter)
-                if parameter_id in self._registered_grad_param_ids:
-                    continue
+            for parameter in group.unsharded_parameters:
                 parameter.register_post_accumulate_grad_hook(self._make_grad_hook(parameter))
-                self._registered_grad_param_ids.add(parameter_id)
 
     def _make_grad_hook(self, parameter: nn.Parameter) -> Callable[[nn.Parameter], None]:
         def grad_hook(_parameter: nn.Parameter) -> None:
-            self._ready_grad_params.add(parameter)
-            if len(self._ready_grad_params) == self.num_trainable_params:
+            self._ready_grad_parameters.add(parameter)
+            if len(self._ready_grad_parameters) == self.num_training_parameters:
                 self.post_backward()
 
         return grad_hook
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute."""
-        self._ready_grad_params.clear()
+        self._ready_grad_parameters.clear()
         for group in self._parameter_groups:
             group.unshard_parameters()
-        self._register_grad_hooks()
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -327,7 +336,7 @@ class FsdpModule:
             if group.requires_grad:
                 group.reduce_gradients()
             group.reshard_parameters()
-        self._ready_grad_params.clear()
+        self._ready_grad_parameters.clear()
 
     def parameter_groups(self) -> tuple[ParameterGroup, ...]:
         """Return parameter groups owned by this FSDP unit."""
@@ -413,11 +422,13 @@ def _materialize_and_collect_owned_parameters(
             # Module.to_empty doesn't necessarily reuse Parameters so collects direct parameters again.
             direct_parameters = list(submodule.named_parameters(recurse=False))
 
-        for local_param_name, parameter in direct_parameters:
-            param_fqn = f"{submodule_fqn}.{local_param_name}" if submodule_fqn else local_param_name
+        for local_parameter_name, parameter in direct_parameters:
+            parameter_fqn = (
+                f"{submodule_fqn}.{local_parameter_name}" if submodule_fqn else local_parameter_name
+            )
             if hasattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR):
-                raise ValueError(f"Parameter {param_fqn!r} is already owned by an FSDP unit.")
-            parameters[param_fqn] = parameter
+                raise ValueError(f"Parameter {parameter_fqn!r} is already owned by an FSDP unit.")
+            parameters[parameter_fqn] = parameter
 
         for child_name, child_module in submodule.named_children():
             if isinstance(child_module, FsdpModule):
