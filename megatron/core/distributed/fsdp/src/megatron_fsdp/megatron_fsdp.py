@@ -1299,7 +1299,9 @@ class MegatronFSDP(torch.nn.Module):
                 # Only register grad acc hook for parameters that require gradients.
                 if not param.requires_grad:
                     continue
-                if self.report_nan_in_param_grad:
+                if bool(
+                    int(os.environ.get("MCORE_FSDP_REPORT_NAN_IN_INCOMING_AUTOGRAD_GRAD", "0"))
+                ):
 
                     def _make_incoming_grad_nan_hook(param):
                         def _hook(grad):
