@@ -1,0 +1,262 @@
+DEPENDENCIES:
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.03-py3
+  dockerfile: |
+    # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+    # IMAGE_NAME: gb200-gb300-2604
+
+    ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.03-py3
+    FROM ${FROM_IMAGE_NAME} AS base
+
+    ENV SHELL=/bin/bash
+    ENV DEBIAN_FRONTEND=noninteractive
+
+    ARG YQ_VERSION=4.27.5
+    # TE commit 2026-04-22
+    ARG TE_COMMIT="0be9046db16d75bd41301750949a928aa667b47c"
+    # 100a = SM100a (GB200), 103a = SM103a (GB300)
+    ARG NVTE_CUDA_ARCHS="100a;103a"
+
+    # Install system dependencies
+    RUN bash -ex <<"EOF"
+        rm -rf /opt/megatron-lm
+        apt-get update
+        apt-get install -y --no-install-recommends git curl gettext sudo
+        ARCH=$(uname -m)
+        case "${ARCH}" in
+          "x86_64") YQ_ARCH=amd64 ;;
+          "aarch64") YQ_ARCH=arm64 ;;
+          *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;;
+        esac
+        wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/bin/yq
+        chmod +x /usr/bin/yq
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+    EOF
+
+    # Install Megatron-Core dependencies (mlm + dev + test groups from pyproject.toml)
+    RUN bash -ex <<"EOF"
+        unset PIP_CONSTRAINT
+        pip install \
+            sentencepiece tiktoken transformers accelerate \
+            wandb einops tqdm datasets nvtx \
+            flask-restful flask[async] fastapi hypercorn \
+            nltk wrapt pydantic pyyaml omegaconf \
+            pytest==8.3.5 pytest-mock pytest-cov pytest-random-order pytest-asyncio \
+            coverage tensorboard
+    EOF
+
+    # Install latest cuDNN (libcudnn9-cuda-13) from NVIDIA's CUDA apt repo.
+    # cuda-keyring is arch-independent; repo path selects sbsa on aarch64 and x86_64 on amd64.
+    RUN bash -ex <<"EOF"
+        ARCH=$(uname -m)
+        case "${ARCH}" in
+          "x86_64") REPO_ARCH=x86_64 ;;
+          "aarch64") REPO_ARCH=sbsa ;;
+          *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;;
+        esac
+        apt-get update
+        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${REPO_ARCH}/cuda-keyring_1.1-1_all.deb
+        dpkg -i cuda-keyring_1.1-1_all.deb
+        rm cuda-keyring_1.1-1_all.deb
+        apt-get update
+        apt-get install -y --no-install-recommends libcudnn9-cuda-13
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+    EOF
+
+    # Install TransformerEngine
+    RUN unset PIP_CONSTRAINT && \
+        NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" NVTE_BUILD_THREADS_PER_JOB=8 NVTE_FRAMEWORK=pytorch \
+        pip install --no-build-isolation --no-cache-dir \
+        "git+https://github.com/NVIDIA/TransformerEngine.git@${TE_COMMIT}"
+
+    # Install Flash Attention 4, CUTLASS DSL, and cuDNN frontend with CuTe DSL support.
+    # Keep cudnn-frontend at 1.22.1: 1.23.0 removes the c_dtype kwarg from
+    # grouped_gemm_quant_wrapper_sm100, which current TE/MCore still pass.
+    RUN pip install --no-cache-dir flash-attn-4==4.0.0b10 "nvidia-cutlass-dsl[cu13]==4.4.2" && \
+        pip install --no-cache-dir --no-deps "nvidia-cudnn-frontend==1.22.1"
+
+    # Install FlashMLA (DeepSeek MLA kernels; SM90 path disabled for Blackwell-only builds)
+    RUN FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
+        CFLAGS="-I${CUDA_HOME}/include/cccl" CXXFLAGS="-I${CUDA_HOME}/include/cccl" \
+        pip install --no-cache-dir --no-build-isolation \
+        git+https://github.com/deepseek-ai/FlashMLA.git
+
+    # Install DeepEP (single-node mode), matching upstream megatron-moe-scripts
+    # Dockerfile.gb. The multi-node HybridEP path (HYBRID_EP_MULTINODE=1) currently
+    # fails to build because DeepEP@1b8f4679 pulls in nixl.h, so build this image
+    # with --target base to skip the hybridep stage below.
+    ARG HEP_COMMIT="1b8f467965bb818bf2f6511e06993f5607e1721f"
+    RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git /workspace/DeepEP && \
+        cd /workspace/DeepEP && git checkout ${HEP_COMMIT} && \
+        TORCH_CUDA_ARCH_LIST="10.0" pip install --no-build-isolation . && \
+        rm -rf /root/.cache /tmp/*
+
+    # =========================
+    # Option 1: HybridEP (multi-node) — currently broken: DeepEP@1b8f4679 pulls in
+    # nixl.h, which isn't available in this container. Kept for reference; do NOT
+    # build with `--target hybridep` until NIXL is staged into the build context.
+    # =========================
+    FROM base AS hybridep
+
+    RUN bash -ex <<"EOF"
+        cd /workspace
+        git clone https://github.com/linux-rdma/rdma-core.git
+        cd rdma-core && git checkout tags/v60.0 && sh build.sh
+        apt-get update
+        apt-get install -y --no-install-recommends libnvidia-ml-dev
+        git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+        # HybridEP commit pinned (2026-04-16)
+        cd DeepEP && git checkout 1b8f467965bb818bf2f6511e06993f5607e1721f
+        RDMA_CORE_HOME=/workspace/rdma-core/build HYBRID_EP_MULTINODE=1 \
+            TORCH_CUDA_ARCH_LIST="10.0" MAX_JOBS=8 \
+            pip install --no-build-isolation .
+        apt-get purge -y libnvidia-ml-dev
+        apt-get autoremove -y
+        rm -rf /root/.cache /tmp/* /var/lib/apt/lists/*
+    EOF
+
+    WORKDIR /workspace/
+ENV_VARS:
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NCCL_NVLS_ENABLE: '0'
+  NCCL_GRAPH_REGISTER: 0
+  NVTE_FUSED_ATTN: '1'
+  NVTE_NORM_FWD_USE_CUDNN: '1'
+  NVTE_NORM_BWD_USE_CUDNN: '1'
+  CUDA_DEVICE_MAX_CONNECTIONS: '32'
+  NVTE_FWD_LAYERNORM_SM_MARGIN: '24'
+  NVTE_BWD_LAYERNORM_SM_MARGIN: '24'
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: '64'
+  USE_MNNVL: '1'
+  NUM_OF_STAGES_DISPATCH_API: '10'
+  NUM_OF_IN_FLIGHT_S2G_DISPATCH_API: '8'
+ARGS:
+  tokenizer_type: HuggingFaceTokenizer
+  tokenizer_model: unsloth/DeepSeek-V3
+  num_layers: 61
+  hidden_size: 7168
+  ffn_hidden_size: 18432
+  num_attention_heads: 128
+  kv_channels: 128
+  max_position_embeddings: 4096
+  normalization: RMSNorm
+  norm_epsilon: 1e-6
+  swiglu: true
+  disable_bias_linear: true
+  untie_embeddings_and_output_weights: true
+  position_embedding_type: rope
+  rotary_base: 10000
+  make_vocab_size_divisible_by: 3232
+  multi_latent_attention: true
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_head_dim: 128
+  qk_pos_emb_head_dim: 64
+  v_head_dim: 128
+  rotary_scaling_factor: 40
+  mscale: 1.0
+  mscale_all_dim: 1.0
+  qk_layernorm: true
+  num_experts: 256
+  moe_layer_freq: ([0]*3+[1]*58)
+  moe_ffn_hidden_size: 2048
+  moe_shared_expert_intermediate_size: 2048
+  moe_router_load_balancing_type: seq_aux_loss
+  moe_router_topk: 8
+  moe_router_pre_softmax: true
+  moe_aux_loss_coeff: 1e-4
+  moe_router_group_topk: 4
+  moe_router_num_groups: 8
+  moe_router_topk_scaling_factor: 2.5
+  moe_router_score_function: sigmoid
+  moe_router_enable_expert_bias: true
+  moe_router_bias_update_rate: 1e-3
+  mtp_num_layers: 1
+  mtp_loss_scaling_factor: 0.1
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  mock_data: true
+  seq_length: 4096
+  moe_router_force_load_balancing: true
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 4
+  expert_model_parallel_size: 64
+  context_parallel_size: 1
+  expert_tensor_parallel_size: 1
+  pipeline_model_parallel_layout: Et*4|(tttt|)*14tmL
+  use_distributed_optimizer: true
+  sequence_parallel: true
+  delay_wgrad_compute: true
+  overlap_moe_expert_parallel_comm: true
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_hybridep_num_sms: 32
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  moe_router_fusion: true
+  moe_router_dtype: fp32
+  cuda_graph_impl: transformer_engine
+  cuda_graph_scope:
+  - attn
+  - moe_router
+  - moe_preprocess
+  te_rng_tracker: true
+  cuda_graph_warmup_steps: 1
+  use_mcore_models: true
+  use_flash_attn: true
+  transformer_impl: transformer_engine
+  micro_batch_size: 1
+  global_batch_size: 8192
+  train_samples: 585937500
+  exit_duration_in_mins: 220
+  no_save_optim: true
+  no_check_for_nan_in_loss_and_grad: true
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: te
+  no_create_attention_mask_in_dataloader: true
+  manual_gc: true
+  manual_gc_interval: 10
+  lr: 3.9e-06
+  min_lr: 3.9e-07
+  lr_warmup_init: 3.9e-07
+  lr_decay_style: cosine
+  lr_decay_samples: 584765624
+  lr_warmup_samples: 1536000
+  weight_decay: 0.1
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  bf16: true
+  fp8_recipe: mxfp8
+  fp8_format: e4m3
+  fp8_param_gather: true
+  reuse_grad_buf_for_mxfp8_param_ag: true
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  use_precision_aware_optimizer: true
+  main_grads_dtype: fp32
+  main_params_dtype: fp32
+  exp_avg_dtype: bf16
+  exp_avg_sq_dtype: bf16
+  moe_router_padding_for_quantization: true
+  init_method_std: 0.02
+  eval_iters: 32
+  eval_interval: 200
+  finetune: false
+  no_load_optim: true
+  no_load_rng: true
+  auto_detect_ckpt_format: true
+  load: ${LOAD_PATH}
+  save_interval: 500
+  dist_ckpt_strictness: log_all
+  log_throughput: true
+  log_interval: 1
+  log_timers_to_tensorboard: true
+  log_memory_to_tensorboard: true
+  log_validation_ppl_to_tensorboard: true
+  logging_level: 40
+  tensorboard_dir: ${OUTPUT_PATH}/tensorboard
+  wandb_exp_name: DeepSeek-V3-GB300-MXFP8-TP1PP4EP64-GBS8192
+  enable_experimental: true
