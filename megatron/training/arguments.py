@@ -2710,6 +2710,11 @@ def _add_distributed_args(parser):
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
+    group.add_argument('--fsdp-all-gather-in-start-param-sync',
+                       action=argparse.BooleanOptionalAction, default=True,
+                       help='If set, Megatron FSDP starts the first parameter all-gather in '
+                       'start_param_sync. Use --no-fsdp-all-gather-in-start-param-sync to '
+                       'let forward pre-hooks issue the first all-gather instead.')
     group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
                        default=False, help='If set, overlap param all-gather of first bucket with optimizer step.')
     group.add_argument('--no-align-param-gather', action='store_false',
