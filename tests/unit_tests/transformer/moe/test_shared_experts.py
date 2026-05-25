@@ -274,10 +274,10 @@ class TestSharedExperts:
             "activation_func_clamp_value_shared_expert may not be plumbed through."
         )
 
-        # Verify activation_func_clamp_value (routed-expert setting) does NOT clamp
-        # the shared expert when activation_func_clamp_value_shared_expert is None.
-        # The shared-expert outputs should match between the unclamped run above
-        # and a run that sets only the routed-expert clamp.
+        # When activation_func_clamp_value_shared_expert is None, the shared expert
+        # should fall back to activation_func_clamp_value (per the field's docstring).
+        # A layer with shared=clamp_value should therefore produce the same shared-
+        # expert output as a layer with shared=None and routed=clamp_value.
         model_parallel_cuda_manual_seed(123)
         moe_layer_routed_only = self.get_moe_layer(
             moe_shared_expert_overlap=False,
@@ -291,21 +291,37 @@ class TestSharedExperts:
         se_input = (
             torch.randn((4, 2, self.config.hidden_size), device="cuda", dtype=torch.bfloat16) * 5.0
         )
-        se_out_unclamped = moe_layer_unclamped.shared_experts(se_input)
-        se_out_routed_only = moe_layer_routed_only.shared_experts(se_input)
+        se_out_shared_clamp = moe_layer_no_overlap.shared_experts(se_input)
+        se_out_routed_fallback = moe_layer_routed_only.shared_experts(se_input)
         torch.testing.assert_close(
-            se_out_unclamped,
-            se_out_routed_only,
+            se_out_shared_clamp,
+            se_out_routed_fallback,
             msg=(
-                "activation_func_clamp_value should not affect shared experts when "
-                "activation_func_clamp_value_shared_expert is None."
+                "activation_func_clamp_value_shared_expert=None should fall back to "
+                "activation_func_clamp_value for the shared expert."
             ),
         )
 
-        # And conversely, setting only activation_func_clamp_value_shared_expert
-        # should change the shared-expert output relative to the fully-unclamped run.
-        se_out_se_clamp = moe_layer_no_overlap.shared_experts(se_input)
-        assert not torch.allclose(se_out_unclamped, se_out_se_clamp), (
-            "activation_func_clamp_value_shared_expert had no observable effect on "
-            "shared-expert output when set in isolation."
+        # When both are set, activation_func_clamp_value_shared_expert must override
+        # activation_func_clamp_value for the shared expert: a layer with only the
+        # shared clamp set should match a layer that additionally sets the routed
+        # clamp to a much larger (essentially no-op) value.
+        model_parallel_cuda_manual_seed(123)
+        moe_layer_override = self.get_moe_layer(
+            moe_shared_expert_overlap=False,
+            moe_token_dispatcher_type="alltoall",
+            activation_func_clamp_value=100.0,
+            activation_func_clamp_value_shared_expert=clamp_value,
+            bias_activation_fusion=bias_activation_fusion,
+        ).to(dtype=torch.bfloat16)
+        moe_layer_override.load_state_dict(moe_layer_overlap.state_dict())
+
+        se_out_override = moe_layer_override.shared_experts(se_input)
+        torch.testing.assert_close(
+            se_out_shared_clamp,
+            se_out_override,
+            msg=(
+                "activation_func_clamp_value_shared_expert should override "
+                "activation_func_clamp_value for the shared expert when both are set."
+            ),
         )

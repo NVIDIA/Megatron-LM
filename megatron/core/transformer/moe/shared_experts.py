@@ -183,7 +183,23 @@ class SharedExpertMLP(MLP):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
-        output, _ = super().forward(hidden_states)
+        # ``MLP.forward`` (called via ``super().forward``) reads
+        # ``self.config.activation_func_clamp_value``. To honor
+        # ``activation_func_clamp_value_shared_expert`` for the shared expert (and
+        # the documented fallback to ``activation_func_clamp_value`` when it is
+        # None), temporarily override the field on this instance's config (which
+        # is a private deepcopy and is not shared with routed experts) and
+        # restore it after ``super().forward`` returns.
+        shared_clamp = self.config.activation_func_clamp_value_shared_expert
+        if shared_clamp is not None:
+            original_clamp = self.config.activation_func_clamp_value
+            self.config.activation_func_clamp_value = shared_clamp
+            try:
+                output, _ = super().forward(hidden_states)
+            finally:
+                self.config.activation_func_clamp_value = original_clamp
+        else:
+            output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
@@ -289,7 +305,9 @@ class SharedExpertMLP(MLP):
 
                     def glu(x):
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                        if (val := self.config.activation_func_clamp_value_shared_expert) is not None:
+                        if (
+                            val := self.config.activation_func_clamp_value_shared_expert
+                        ) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
                             x_linear = x_linear.clamp(min=-val, max=val)
                         return self.config.activation_func(x_glu) * (
