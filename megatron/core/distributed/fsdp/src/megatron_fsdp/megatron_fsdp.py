@@ -716,6 +716,18 @@ class MegatronFSDP(torch.nn.Module):
             assert isinstance(module, tuple(fsdp_unit_modules))
             assert self.data_parallel_sharding_strategy == "optim_grads_params"
 
+            # CUDA graph replay may bypass per-parameter post-accumulate hooks for
+            # parameters owned by the graphed FSDP unit. Process any remaining
+            # gradients before the unit's parameter buckets can be released/reused.
+            if bool(getattr(module, "cuda_graphs", None)):
+                pending_params = [
+                    param
+                    for param in _get_canonical_module_params(module, recurse=True)
+                    if param in self._params_require_handle_grad
+                ]
+                if pending_params:
+                    _process_post_backward_gradients(pending_params)
+
             # Release parameters for this module after backward.
             release_module_parameters(module, bwd=True)
             release_module_parameters(module, bwd=False)
