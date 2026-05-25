@@ -98,6 +98,7 @@ dev = [
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
+    "nvidia-cudnn-frontend==1.24.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -168,7 +169,7 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform"]
+no_pypi_wheels = ["emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform", "flash_mla"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
@@ -178,6 +179,7 @@ no-build-isolation-package = [
     "transformer-engine",
     "transformer-engine-torch",
     "fast-hadamard-transform",
+    "flash_mla",
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
@@ -193,7 +195,7 @@ override-dependencies = [
 [tool.uv.sources]
 
 flash_mla = [
-    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
+    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" },
 ]
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
