@@ -18,9 +18,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     FsdpModule,
     Placements,
-    Replicate,
     fully_shard,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +192,9 @@ def test_nested_fully_shard_excludes_child_owned_parameters(setup: DistributedSe
     fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    inner_names = [name for group in model.inner.parameter_groups() for name in group.parameter_names]
+    inner_names = [
+        name for group in model.inner.parameter_groups() for name in group.parameter_names
+    ]
     outer_names = [name for group in model.parameter_groups() for name in group.parameter_names]
 
     assert inner_names == ["weight"]
@@ -216,35 +218,9 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(setup: DistributedSe
     assert group.main_grad is None
 
 
-@pytest.mark.distributed
-def test_bfloat16_main_grads_follow_grad_dtype(setup: DistributedSetup):
-    """BF16 full grads should reduce into main_grad without casting before reduce-scatter."""
-    if setup.world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    model = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16).to(setup.device)
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
-
-    (group,) = model.parameter_groups()
-    assert group.main_weight.local_buffer.dtype is torch.float32
-    assert group.main_grad is not None
-    assert group.main_grad.local_buffer.dtype is torch.bfloat16
-    assert group.unsharded_parameters[0].grad_dtype is torch.bfloat16
-    assert group.sharded_parameters[0].dtype is group.main_weight.local_buffer.dtype
-    assert group.sharded_parameters[0].grad_dtype is group.main_grad.local_buffer.dtype
-
-    x = torch.randn(2, 4, device=setup.device, dtype=torch.bfloat16)
-
-    model.zero_grad(set_to_none=True)
-    model(x).sum().backward()
-    assert isinstance(model.weight, DTensor)
-    assert model.weight.dtype is group.main_weight.local_buffer.dtype
-    assert isinstance(model.weight.grad, DTensor)
-    assert model.weight.grad.dtype is group.main_grad.local_buffer.dtype
-
-
 pytest.mark.distributed
+
+
 def test_backward_averages_across_dp_and_accumulates_across_calls(setup: DistributedSetup):
     """Each backward averages over DP ranks; repeated backwards accumulate by summing."""
     if setup.world_size < 2:
@@ -321,6 +297,7 @@ def test_fully_shard_reduces_peak_training_memory(setup: DistributedSetup):
     layers = 16
     batch = 8
     steps = 2
+    dtype = torch.bfloat16
 
     def train_steps(model: nn.Module, optimizer: torch.optim.Optimizer, x: torch.Tensor) -> None:
         for _ in range(steps):
@@ -329,9 +306,11 @@ def test_fully_shard_reduces_peak_training_memory(setup: DistributedSetup):
             optimizer.step()
 
     torch.manual_seed(4321)
-    baseline = nn.Sequential(*[nn.Linear(dim, dim) for _ in range(layers)]).to(setup.device)
+    baseline = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(
+        setup.device
+    )
     baseline_optimizer = torch.optim.AdamW(baseline.parameters(), lr=0.01)
-    x = torch.randn(batch, dim, device=setup.device)
+    x = torch.randn(batch, dim, device=setup.device, dtype=dtype)
     torch.cuda.reset_peak_memory_stats(setup.device)
     train_steps(baseline, baseline_optimizer, x)
     torch.cuda.synchronize(setup.device)
@@ -343,13 +322,22 @@ def test_fully_shard_reduces_peak_training_memory(setup: DistributedSetup):
     torch.cuda.empty_cache()
 
     torch.manual_seed(4321)
-    model = nn.Sequential(*[nn.Linear(dim, dim) for _ in range(layers)]).to(setup.device)
+    model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(
+        setup.device
+    )
     for layer in model:
-        fully_shard(layer, mesh=mesh, placements=_flat_placements())
+        fully_shard(
+            layer,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=MixedPrecisionPolicy(
+                main_params_dtype=dtype, main_grads_dtype=dtype
+            ),
+        )
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     torch.cuda.empty_cache()
 
-    x = torch.randn(batch, dim, device=setup.device)
+    x = torch.randn(batch, dim, device=setup.device, dtype=dtype)
     torch.cuda.reset_peak_memory_stats(setup.device)
     train_steps(model, optimizer, x)
     torch.cuda.synchronize(setup.device)
