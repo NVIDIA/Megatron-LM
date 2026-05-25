@@ -108,7 +108,12 @@ class SharedExpertMLP(MLP):
         submodules: MLPSubmodules,
         gate: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
@@ -119,6 +124,7 @@ class SharedExpertMLP(MLP):
             config=config,
             submodules=submodules,
             tp_group=pg_collection.tp,
+            name=name,
             gtp_group=pg_collection.gtp,
         )
 

@@ -81,16 +81,6 @@ _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
 
 
-def _set_skip_fp8_weight_update_tensor(value):
-    """Compat shim — TE main removed FP8GlobalStateManager.set_skip_fp8_weight_update_tensor
-    in favor of direct access to quantization_state.skip_fp8_weight_update_tensor.
-    """
-    qstate = FP8GlobalStateManager.quantization_state
-    if qstate.skip_fp8_weight_update_tensor is None:
-        qstate.skip_fp8_weight_update_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-    qstate.skip_fp8_weight_update_tensor.fill_(value)
-
-
 _GTP_PHASE2_COMPLETION_EVENTS: List[torch.cuda.Event] = []
 
 
@@ -101,6 +91,30 @@ def get_gtp_phase2_completion_events() -> List[torch.cuda.Event]:
     ensuring captured main_grad.add_ on runner.stream has completed.
     """
     return _GTP_PHASE2_COMPLETION_EVENTS
+
+
+def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
+    """Toggle TE's FP8 "skip weight refresh" flag between microbatches.
+
+    TE 2.15 (PR #2759) moved this flag from a classmethod on FP8GlobalStateManager
+    to a dataclass field on FP8GlobalStateManager.quantization_state, with no
+    shim. This helper handles both layouts.
+    """
+    if not HAVE_TE_GRAPHS:
+        return
+
+    # TE <= 2.14: classmethod setter still exists.
+    if hasattr(FP8GlobalStateManager, "set_skip_fp8_weight_update_tensor"):
+        FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(skip)
+        return
+
+    # TE >= 2.15: write the dataclass field directly. Allocate the persistent
+    # 1-element CUDA scalar once so its data pointer stays valid across
+    # cudagraph replays, then fill the value in place.
+    qstate = FP8GlobalStateManager.quantization_state
+    if qstate.skip_fp8_weight_update_tensor is None:
+        qstate.skip_fp8_weight_update_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+    qstate.skip_fp8_weight_update_tensor.fill_(skip)
 
 
 # Freeze GC during capture.

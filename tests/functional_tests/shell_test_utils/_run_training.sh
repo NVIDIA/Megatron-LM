@@ -160,7 +160,9 @@ PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+set +x
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
+set -x
 
 ######## Distributed training settings. ########
 echo "------ARGUMENTS for SLURM ---"
@@ -168,10 +170,14 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+NODE_RANK=${SLURM_NODEID:-${NODE_RANK:-0}}
 LAST_RANK=$((GPUS_PER_NODE - 1))
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
+
+if [[ -n "${RUN_CI_PHASE_INDEX:-}" ]]; then
+    MASTER_PORT=$((MASTER_PORT + RUN_CI_PHASE_INDEX))
+fi
 
 # Read launcher type from model config (default: torchrun)
 LAUNCHER=$(/usr/local/bin/yq '.LAUNCHER // "torchrun"' "$TRAINING_PARAMS_PATH")
@@ -214,7 +220,7 @@ fi
 AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
-fi 
+fi
 
 # Set permissions
 chmod -R g+w $OUTPUT_PATH

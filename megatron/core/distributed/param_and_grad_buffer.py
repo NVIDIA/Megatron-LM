@@ -267,6 +267,38 @@ class _ParamAndGradBucketGroup:
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
 
+    def _post_param_sync(self):
+        """Run post-processing after param all-gather completes."""
+        if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            for bucket in self.buckets:
+                is_bf16_weight_bucket = False
+                for param in bucket.params:
+                    # Skip copying since bf16 weights in the mxfp8 model
+                    # are already mapped to param.data.
+                    if not is_float8tensor(param):
+                        is_bf16_weight_bucket = True
+                        break
+                    param_start, param_end = bucket.param_to_index[param]
+                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                    param.data.copy_(param_slice.view(param.data.shape))
+                if is_bf16_weight_bucket:
+                    continue
+                # All-gathered params are not needed after being copied to param.data.
+                # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
+                # We cannot zero out the entire grad buffer because one grad buffer may
+                # correspond to multiple param buffers. If we zero out the entire grad buffer,
+                # it would clear the data of those param buffers that have not yet completed AG.
+                bucket.param_data.zero_()
+            return
+
+        quantized_params = []
+        for bucket in self.buckets:
+            for param in bucket.params:
+                if is_float8tensor(param) or is_nvfp4tensor(param):
+                    quantized_params.append(param)
+        if len(quantized_params) > 0:
+            post_all_gather_processing(quantized_params)
+
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
         Make sure norm of grads in bucket are not NaN prior to data-parallel
@@ -325,6 +357,7 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                self._post_param_sync()
                 return
         else:
             assert self.param_gather_handle is None
@@ -344,6 +377,8 @@ class _ParamAndGradBucketGroup:
             dp_size = self.intra_distributed_optimizer_instance_size
             if dp_size == 1:
                 # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
+                if force_sync and self.ddp_config.overlap_param_gather:
+                    self._post_param_sync()
                 self.param_gather_dispatched = True
                 return
             local_rank = self.intra_distributed_optimizer_instance_rank
@@ -441,6 +476,8 @@ class _ParamAndGradBucketGroup:
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
                 self.param_gather_handle = None
+        if force_sync and self.ddp_config.overlap_param_gather:
+            self._post_param_sync()
         self.param_gather_dispatched = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -480,30 +517,7 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
-            # we need to copy the param_data from the shared_param/grad_buffer to param.data
-            # after the param all-gather.
-            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                for bucket in self.buckets:
-                    is_bf16_weight_bucket = False
-                    for param in bucket.params:
-                        # Skip copying since bf16 weights in the mxfp8 model
-                        # are already mapped to param.data.
-                        if not is_float8tensor(param):
-                            is_bf16_weight_bucket = True
-                            break
-                        param_start, param_end = bucket.param_to_index[param]
-                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                        param.data.copy_(param_slice.view(param.data.shape))
-                    if is_bf16_weight_bucket:
-                        continue
-                    # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                    # We cannot zero out the entire grad buffer because one grad buffer may
-                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                    # it would clear the data of those param buffers that have not yet completed AG.
-                    bucket.param_data.zero_()
-            elif not self.ddp_config.use_distributed_optimizer:
+            if not self.ddp_config.use_distributed_optimizer:
                 for bucket in self.buckets:
                     if bucket.layerwise_gather_list is None:
                         continue
@@ -526,14 +540,7 @@ class _ParamAndGradBucketGroup:
                     # (a view into grad_data) would start from the result of the
                     # latest parameter all-gather instead of zero.
                     bucket.grad_data.zero_()
-            else:
-                fp8_params = []
-                for bucket in self.buckets:
-                    for param in bucket.params:
-                        if is_float8tensor(param):
-                            fp8_params.append(param)
-                if len(fp8_params) > 0:
-                    post_all_gather_processing(fp8_params)
+            self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
@@ -811,15 +818,22 @@ def group_params_for_buffers(
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
         is_expert_parallel = not getattr(param, 'allreduce', True)
+        is_managed_by_layer_wise_optimizer = getattr(
+            param, 'is_managed_by_layer_wise_optimizer', False
+        )
 
-        key = BufferKey(param_dtype, grad_dtype, is_expert_parallel)
+        key = BufferKey(
+            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+        )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
         key_to_params[key] = param_list
 
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
-        offset_key = BufferKey(param.dtype, grad_dtype, is_expert_parallel)
+        offset_key = BufferKey(
+            param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+        )
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1
         indices = key_to_indices.get(key, [])
@@ -1498,12 +1512,16 @@ def partition_buckets(
     if len(buffers) == 0:
         return []
 
-    dtype_to_buffer_map = {}
+    # At most one fp8 (uint8) buffer is allowed; Cases 2 and 3 below branch on
+    # whether one is present. Non-uint8 dtypes can legitimately appear in
+    # multiple buffers (e.g. LayerWise-managed bf16 weights + Adam-managed bf16
+    # biases share the bf16 ``param_dtype`` but live in separate buffers), so
+    # the uniqueness check is restricted to uint8.
+    fp8_buffer = None
     for buffer in buffers:
-        dtype = buffer.param_dtype
-        # Make sure that the param_dtype of any two buffers is different.
-        assert dtype not in dtype_to_buffer_map
-        dtype_to_buffer_map[dtype] = buffer
+        if buffer.param_dtype == torch.uint8:
+            assert fp8_buffer is None
+            fp8_buffer = buffer
 
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
     if force_single_bucket_group:
@@ -1522,7 +1540,7 @@ def partition_buckets(
         )
         return [bucket_group]
 
-    if torch.uint8 not in dtype_to_buffer_map:
+    if fp8_buffer is None:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
         #         only one bucket.
         bucket_groups = []
@@ -1546,7 +1564,6 @@ def partition_buckets(
                     non_fp8_buckets.append(bucket)
 
         bucket_groups = []
-        fp8_buffer = dtype_to_buffer_map[torch.uint8]
         for bucket in fp8_buffer.buckets:
             if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
                 # reduce_scatter_with_fp32_accumulation requires exactly one bucket

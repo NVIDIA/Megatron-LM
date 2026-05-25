@@ -177,7 +177,12 @@ class MambaMixer(MegatronModule):
         layer_number=None,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         if not HAVE_MAMBA_SSM:
             raise ImportError(
                 "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
@@ -258,6 +263,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            name=(name + f".in_proj") if name is not None else None,
             gtp_group=self.pg_collection.gtp,
         )
         # in_proj packs [z, x, B, C, dt] into one ColumnParallelLinear.  Each
@@ -393,6 +399,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            name=(name + f".out_proj") if name is not None else None,
             gtp_group=self.pg_collection.gtp,
         )
 
