@@ -88,9 +88,9 @@ class ParameterGroup:
             raise ValueError("ParameterGroup requires at least one parameter.")
 
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
-        assert axis_indices == tuple(range(mesh.ndim)), (
-            "FSDP requires dp_axes to match every mesh axis in mesh order for now."
-        )
+        assert axis_indices == tuple(
+            range(mesh.ndim)
+        ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
 
         # ---------------------------------------------------------------------
         # Record shared metadata
@@ -122,9 +122,7 @@ class ParameterGroup:
         # Python dicts preserve insertion order, so parameter_names and
         # parameters.values() define the same stable DBuffer tensor order.
         self._unsharded_model_weight = DBuffer.distribute_tensors(
-            parameters.values(),
-            mesh=self.mesh,
-            placements=[Replicate()] * self.mesh.ndim,
+            parameters.values(), mesh=self.mesh, placements=[Replicate()] * self.mesh.ndim
         )
         # Scratch initialization starts from model weights. Checkpoint loading will
         # eventually initialize main weights first and derive model weights from them.
@@ -143,18 +141,36 @@ class ParameterGroup:
             placements=placements.optimizer,
         )
 
-        main_grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
-        self.main_grad = (
-            DBuffer(
+        self.main_grad = None
+        if self.requires_grad:
+            main_grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
+            self.main_grad = DBuffer(
                 mesh=self.mesh,
                 placements=placements.gradient,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=main_grad_dtype,
                 device=self.main_weight.local_buffer.device,
             )
-            if self.requires_grad
-            else None
-        )
+            if self.main_grad.layout != self.main_weight.layout:
+                raise ValueError(
+                    "FSDP temporarily requires main_grad and main_weight to have the same "
+                    "layout until HSDP/HFSDP support is implemented."
+                )
+            if self.main_grad.placements != self.main_weight.placements:
+                raise ValueError(
+                    "FSDP temporarily requires main_grad and main_weight to have the same "
+                    "placements until HSDP/HFSDP support is implemented. "
+                    f"Got main_grad placements {self.main_grad.placements} and "
+                    f"main_weight placements {self.main_weight.placements}."
+                )
+            if self.main_grad.local_buffer.dtype != self.main_weight.local_buffer.dtype:
+                raise ValueError(
+                    "FSDP temporarily requires main_grad and main_weight to have the same "
+                    "dtype until optimizer wrapping supports optimizer-visible gradient "
+                    "conversion. "
+                    f"Got main_grad dtype {self.main_grad.local_buffer.dtype} and "
+                    f"main_weight dtype {self.main_weight.local_buffer.dtype}."
+                )
 
         # ---------------------------------------------------------------------
         # Build parameter tuples for module swapping
@@ -243,9 +259,7 @@ class ParameterGroup:
             grads.append(parameter.grad)
 
         partial_grad = DBuffer.distribute_tensors(
-            grads,
-            mesh=self.mesh,
-            placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
+            grads, mesh=self.mesh, placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim
         )
 
         # zero_grad(set_to_none=True) clears sharded parameter grads, so the next
