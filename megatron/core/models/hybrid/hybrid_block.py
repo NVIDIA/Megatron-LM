@@ -125,7 +125,12 @@ class HybridStack(MegatronModule):
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         physical_layer_offset = pp_layer_offset
-        for layer_type in self.layer_type_list:
+        # ``i`` is the logical layer index within this stack, used only for the
+        # downstream ``name=...{i}`` argument introduced from main; the existing
+        # FP8/FP4 contexts and ``layer_number`` continue to use the physical-
+        # layer counter ``physical_layer_offset`` which advances by
+        # ``get_layer_type_physical_count`` (bracket groups count > 1).
+        for i, layer_type in enumerate(self.layer_type_list):
             layer_number = physical_layer_offset + 1
             if is_layer_group(layer_type):
                 quant_init_context = nullcontext()
