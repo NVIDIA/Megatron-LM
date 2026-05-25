@@ -135,20 +135,23 @@ class ParameterGroup:
         )
 
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
-        self.main_weight = DBuffer.distribute_tensors(
-            (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
-            mesh=self.mesh,
-            placements=placements.optimizer,
-        )
+        if main_weight_dtype == self.dtype and placements.optimizer == placements.parameter:
+            self.main_weight = self.model_weight
+        else:
+            self.main_weight = DBuffer.distribute_tensors(
+                (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
+                mesh=self.mesh,
+                placements=placements.optimizer,
+            )
 
         self.main_grad = None
         if self.requires_grad:
-            main_grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
+            grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
             self.main_grad = DBuffer(
                 mesh=self.mesh,
                 placements=placements.gradient,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
-                dtype=main_grad_dtype,
+                dtype=grad_dtype,
                 device=self.main_weight.local_buffer.device,
             )
             if self.main_grad.layout != self.main_weight.layout:
