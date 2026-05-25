@@ -1132,6 +1132,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
 
+        if self.config.cuda_graph_scope and CudaGraphScope.attn in self.config.cuda_graph_scope:
+            layer_id = getattr(self, "layer_number", "unknown")
+            for i, tensor in enumerate(cuda_graph_output):
+                _maybe_register_cudagraph_grad_nan_hook(
+                    tensor, f"layer{layer_id}.attn.output[{i}]"
+                )
+
         if (
             not self.config.cuda_graph_scope
             or (not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope)
