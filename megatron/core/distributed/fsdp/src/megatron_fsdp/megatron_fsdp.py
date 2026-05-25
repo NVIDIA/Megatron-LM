@@ -744,6 +744,61 @@ class MegatronFSDP(torch.nn.Module):
             for param in param_list:
                 self._params_require_handle_grad.discard(param)
 
+        def _get_direct_module_params(module: nn.Module):
+            """Return canonical FSDP buffer params for a module's direct parameters."""
+            param_to_direct_module = getattr(
+                self.param_and_grad_buffer, "param_to_direct_module", None
+            )
+            if param_to_direct_module is None:
+                return list(module.parameters(recurse=False))
+            params_by_local_name = {}
+            for param, (_, direct_module) in param_to_direct_module.items():
+                if direct_module is not module:
+                    continue
+                param_name = self.param_and_grad_buffer.param_to_name[param]
+                params_by_local_name[param_name.rsplit(".", 1)[-1]] = param
+            return [
+                params_by_local_name[name]
+                for name, _ in module.named_parameters(recurse=False)
+                if name in params_by_local_name
+            ]
+
+        def _mirror_fsdp_param_attrs(module: nn.Module, canonical_params):
+            """Mirror FSDP buffer attrs onto transient DTensor wrappers exposed by modules."""
+            current_params = list(module.parameters(recurse=False))
+            if len(current_params) != len(canonical_params):
+                return
+            attrs = (
+                "_gbuf",
+                "_item_id",
+                "grad_added_to_main_grad",
+                "__fsdp_param__",
+                "overwrite_main_grad",
+                "skip_backward_post_hook",
+                "post_wgrad_grad_acc_hook",
+            )
+            for canonical_param, current_param in zip(canonical_params, current_params):
+                if canonical_param is current_param:
+                    continue
+                for attr in attrs:
+                    if hasattr(canonical_param, attr):
+                        setattr(current_param, attr, getattr(canonical_param, attr))
+                if hasattr(canonical_param, "_gbuf") and hasattr(canonical_param, "_item_id"):
+
+                    def main_grad_getter(param):
+                        bucket = param._gbuf.fetch_bucket(
+                            dtype=(
+                                self.mp_policy.grad_comm_dtype
+                                if param._gbuf.is_data_distributed
+                                else None
+                            )
+                        )
+                        return param._gbuf.get_item_from_bucket(bucket, param._item_id).view(
+                            to_local_if_dtensor(param).shape
+                        )
+
+                    current_param.get_main_grad = main_grad_getter.__get__(current_param)
+
         @torch.compiler.disable
         def _pre_forward_param_unshard(module: nn.Module, *unused):
             # Unshard the parameters before the forward pass.
@@ -764,7 +819,7 @@ class MegatronFSDP(torch.nn.Module):
                 param_list = list(module.parameters(recurse=False))
 
             if self.enable_fine_grained_param_gather_hook:
-                param_list = list(module.parameters(recurse=False))
+                param_list = _get_direct_module_params(module)
 
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
@@ -772,6 +827,8 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
+            if self.enable_fine_grained_param_gather_hook:
+                _mirror_fsdp_param_attrs(module, param_list)
             return None
 
         @torch.compiler.disable
@@ -883,12 +940,13 @@ class MegatronFSDP(torch.nn.Module):
             if isinstance(module, tuple(fsdp_unit_modules)):
                 param_list = list(module.parameters())
             else:
-                param_list = list(module.parameters(recurse=False))
+                param_list = _get_direct_module_params(module)
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
                 param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
             )
+            _mirror_fsdp_param_attrs(module, param_list)
 
         self._root_pre_backward_hook_issued = False
 

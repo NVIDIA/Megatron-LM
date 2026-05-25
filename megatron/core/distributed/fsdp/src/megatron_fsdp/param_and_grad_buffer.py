@@ -3455,9 +3455,9 @@ class GradReducePipeline:
         """
         # Sort parameters by their bucket IDs to ensure a deterministic processing order.
         # Performing reduce-scatter operations out of order can lead to hangs.
-        params = sorted(list(params), key=lambda x: self.buffer.param_to_param_group[x])
+        params = sorted(list(params), key=lambda x: get_param_group_id(self.buffer, x))
         for param in params:
-            bucket_id = self.buffer.param_to_param_group[param]
+            bucket_id = get_param_group_id(self.buffer, param)
             param_group = self.buffer.parameter_groups[bucket_id]
             if not param.requires_grad:
                 assert param_group.requires_grad is False, (
@@ -3956,7 +3956,7 @@ class AllGatherPipeline:
         if len(params) == 0:
             return
 
-        ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
+        ag_buckets = [get_param_group_id(self.buffer, item) for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:
@@ -4456,6 +4456,19 @@ def to_local_if_dtensor(tensor):
     if isinstance(tensor, DTensor):
         return tensor._local_tensor
     return tensor
+
+
+def get_param_group_id(buffer, param):
+    """Resolve a parameter group ID, tolerating equivalent DTensor wrapper objects."""
+    try:
+        return buffer.param_to_param_group[param]
+    except KeyError:
+        param_local = to_local_if_dtensor(param)
+        for known_param, group_id in tuple(buffer.param_to_param_group.items()):
+            if to_local_if_dtensor(known_param) is param_local:
+                buffer.param_to_param_group[param] = group_id
+                return group_id
+        raise
 
 
 def _get_fsdp_tensor_spec(
