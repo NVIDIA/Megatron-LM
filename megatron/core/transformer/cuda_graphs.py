@@ -1413,12 +1413,15 @@ _TE_HOOK_KEYS = frozenset(
         'backward_hooks',
     }
 )
+_NESTED_RESTORE_KEY = '_nested_hook_restores'
+
 _RESTORE_KEYS = frozenset(
     {
         'forward_pre_hooks_restore',
         'forward_hooks_restore',
         'backward_pre_hooks_restore',
         'backward_hooks_restore',
+        _NESTED_RESTORE_KEY,
     }
 )
 
@@ -2243,6 +2246,86 @@ class TECudaGraphHelper:
 
             return hooks_dict
 
+        def _hook_target(hook_fn):
+            return hook_fn.func if isinstance(hook_fn, partial) else hook_fn
+
+        def _is_megatron_fsdp_capture_hook(hook_fn):
+            target = _hook_target(hook_fn)
+            module_name = getattr(inspect.getmodule(target), '__name__', '')
+            qualname = getattr(target, '__qualname__', '')
+            return (
+                'megatron_fsdp' in module_name
+                and (
+                    '_pre_forward_param_unshard' in qualname
+                    or '_release_module_fp8_transpose_cache' in qualname
+                )
+            )
+
+        def _iter_cudagraph_submodules(module):
+            if not isinstance(module, GraphableMegatronModule):
+                return
+            seen = set()
+            for submodule in module._get_submodules_under_cudagraphs():
+                for nested in submodule.modules():
+                    if nested is module or id(nested) in seen:
+                        continue
+                    seen.add(id(nested))
+                    yield nested
+
+        def _bind_forward_pre_hook(module, hook_fn, with_kwargs):
+            def wrapper(_callable_module, _args):
+                if with_kwargs:
+                    return hook_fn(module, (), {})
+                return hook_fn(module, ())
+
+            return wrapper
+
+        def _bind_forward_hook(module, hook_fn, with_kwargs):
+            def wrapper(_callable_module, _args, _output):
+                if with_kwargs:
+                    return hook_fn(module, (), {}, _output)
+                return hook_fn(module, (), _output)
+
+            return wrapper
+
+        def _extract_nested_fsdp_hooks(callable_module, hooks_dict):
+            """Move FSDP hooks on graph-covered child modules out of the captured graph."""
+            nested_restores = []
+            for module in _iter_cudagraph_submodules(callable_module):
+                module_restore = {}
+
+                fph = getattr(module, '_forward_pre_hooks', None)
+                if fph:
+                    with_kw = getattr(module, '_forward_pre_hooks_with_kwargs', set())
+                    for hook_id, hook_fn in list(fph.items()):
+                        if not _is_megatron_fsdp_capture_hook(hook_fn):
+                            continue
+                        module_restore.setdefault('forward_pre_hooks_restore', {})[
+                            hook_id
+                        ] = hook_fn
+                        hooks_dict.setdefault('forward_pre_hooks', {})[
+                            ('nested_forward_pre', id(module), hook_id)
+                        ] = _bind_forward_pre_hook(module, hook_fn, hook_id in with_kw)
+                        del fph[hook_id]
+
+                fh = getattr(module, '_forward_hooks', None)
+                if fh:
+                    with_kw = getattr(module, '_forward_hooks_with_kwargs', set())
+                    for hook_id, hook_fn in list(fh.items()):
+                        if not _is_megatron_fsdp_capture_hook(hook_fn):
+                            continue
+                        module_restore.setdefault('forward_hooks_restore', {})[hook_id] = hook_fn
+                        hooks_dict.setdefault('forward_hooks', {})[
+                            ('nested_forward', id(module), hook_id)
+                        ] = _bind_forward_hook(module, hook_fn, hook_id in with_kw)
+                        del fh[hook_id]
+
+                if module_restore:
+                    nested_restores.append((module, module_restore))
+
+            if nested_restores:
+                hooks_dict.setdefault(_NESTED_RESTORE_KEY, []).extend(nested_restores)
+
         def _apply_fsdp_hook_transforms(hooks_dict):
             """Phase 2 (FSDP-specific): reroute forward hooks that wrap backward handlers.
 
@@ -2301,6 +2384,7 @@ class TECudaGraphHelper:
             if isinstance(callable_module, torch.nn.Module):
                 hooks_dict = _extract_module_hooks(callable_module)
                 _apply_fsdp_hook_transforms(hooks_dict)
+                _extract_nested_fsdp_hooks(callable_module, hooks_dict)
                 te_hooks = {k: v for k, v in hooks_dict.items() if k in _TE_HOOK_KEYS}
                 restore = {k: v for k, v in hooks_dict.items() if k in _RESTORE_KEYS}
                 extracted_hooks.append(te_hooks if te_hooks else None)
@@ -2504,6 +2588,18 @@ class TECudaGraphHelper:
                         if 'backward_hooks_restore' in restore:
                             for hook_id, hook_fn in restore['backward_hooks_restore'].items():
                                 callable_module._backward_hooks[hook_id] = hook_fn
+                        if _NESTED_RESTORE_KEY in restore:
+                            for nested_module, nested_restore in restore[_NESTED_RESTORE_KEY]:
+                                if 'forward_pre_hooks_restore' in nested_restore:
+                                    for hook_id, hook_fn in nested_restore[
+                                        'forward_pre_hooks_restore'
+                                    ].items():
+                                        nested_module._forward_pre_hooks[hook_id] = hook_fn
+                                if 'forward_hooks_restore' in nested_restore:
+                                    for hook_id, hook_fn in nested_restore[
+                                        'forward_hooks_restore'
+                                    ].items():
+                                        nested_module._forward_hooks[hook_id] = hook_fn
 
             # Push the captured graphs to the corresponding TransformerBlock.
             num_layers_accumulated = 0
