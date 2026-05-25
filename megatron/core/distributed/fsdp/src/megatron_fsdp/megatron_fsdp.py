@@ -992,7 +992,11 @@ class MegatronFSDP(torch.nn.Module):
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.PRE_BACKWARD
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
+            if self.enable_fine_grained_param_gather_hook:
+                param_list = _get_canonical_module_params(
+                    module, recurse=isinstance(module, tuple(fsdp_unit_modules))
+                )
+            elif isinstance(module, tuple(fsdp_unit_modules)):
                 param_list = list(module.parameters())
             else:
                 param_list = _get_direct_module_params(module)
