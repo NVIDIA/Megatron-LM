@@ -864,6 +864,11 @@ class MegatronFSDP(torch.nn.Module):
                 fsdp_forward_prefetch = False
             else:
                 module._training_state = TrainingState.FORWARD
+                if is_graph_capturing():
+                    # TE invokes extracted FSDP hooks around each callable while building CUDA
+                    # graphs. Do not leave async prefetch collectives outstanding when the
+                    # callable enters graph capture.
+                    fsdp_forward_prefetch = False
 
             if isinstance(module, tuple(fsdp_unit_modules)):
                 param_list = list(module.parameters())
@@ -1003,7 +1008,10 @@ class MegatronFSDP(torch.nn.Module):
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
-                param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
+                param_list,
+                prefetch=not is_graph_capturing(),
+                prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                bwd=True,
             )
             _mirror_fsdp_param_attrs(module, param_list)
 
