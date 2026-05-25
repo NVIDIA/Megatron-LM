@@ -1,3 +1,5 @@
+- [ ] I, the PR author, have personally reviewed every line of this PR.
+
 # What does this PR do ?
 <!-- Add a one line overview of what this PR aims to accomplish. -->
 
@@ -50,10 +52,3 @@ Once all required reviewers have approved, the `Approved` label is applied **aut
 ### Merge
 
 Any member of [mcore-engineers](https://github.com/orgs/NVIDIA/teams/mcore-engineers) will be able to merge your PR.
-
-<details>
-<summary>For MRs into `dev` branch</summary>
-The proposed review process for `dev` branch is under active discussion.
-
-MRs are mergable after one approval by either `eharper@nvidia.com` or `zijiey@nvidia.com`.
-</details>
