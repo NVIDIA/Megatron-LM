@@ -769,13 +769,18 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                         self.idle_buffer.remove((buf_group_id, bucket_offset))
                         break
 
-            assert buffer_name is not None, (
-                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
-                f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
-                f"bucket_offset: {bucket_offset} \n"
-                f"current using_buffer: {self.using_buffer} \n"
-                f"current idle_buffer: {self.idle_buffer}"
-            )
+            if buffer_name is None and self.fallback_to_persistent_buffer:
+                buffer_name = (
+                    f"{self.name}_fixed_pool_exhausted_{bucket_id}_{size}_{dtype}_{device}"
+                )
+            else:
+                assert buffer_name is not None, (
+                    f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
+                    f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
+                    f"bucket_offset: {bucket_offset} \n"
+                    f"current using_buffer: {self.using_buffer} \n"
+                    f"current idle_buffer: {self.idle_buffer}"
+                )
         elif self.fallback_to_persistent_buffer is True:
             buffer_name = f"{self.name}_not_fit_in_fixed_pool_{bucket_id}_{size}_{dtype}_{device}"
         else:
