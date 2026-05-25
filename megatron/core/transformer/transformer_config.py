@@ -1448,8 +1448,6 @@ class TransformerConfig(ModelParallelConfig):
             self.hetereogenous_dist_checkpoint = True
 
             if self.apply_dsa_kernel_fusion:
-                import torch
-
                 assert (
                     torch.cuda.is_available()
                 ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
