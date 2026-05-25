@@ -409,9 +409,11 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     
     # Return Transformer config.
     if getattr(args, "multi_latent_attention", False):
-        return MLATransformerConfig(**kw_args)
+        config = MLATransformerConfig(**kw_args)
     else:
-        return TransformerConfig(**kw_args)
+        config = TransformerConfig(**kw_args)
+    config.use_megatron_fsdp = getattr(args, "use_megatron_fsdp", False)
+    return config
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
@@ -422,4 +424,3 @@ def load_yaml(yaml_path):
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
         return config_namespace
-

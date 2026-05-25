@@ -1744,7 +1744,12 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
     # Return config.
-    return config_class(**kw_args)
+    config = config_class(**kw_args)
+    # Megatron-FSDP is a distributed wrapper setting rather than a TransformerConfig
+    # dataclass field. Partial MoE CUDA graph needs to know it at runtime when
+    # deciding whether shared experts must stay outside the graph.
+    config.use_megatron_fsdp = getattr(args, 'use_megatron_fsdp', False)
+    return config
 
 
 def _add_transformer_engine_args(parser):
