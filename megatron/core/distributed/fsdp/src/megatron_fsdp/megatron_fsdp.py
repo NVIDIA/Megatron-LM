@@ -15,6 +15,7 @@
 import functools
 import importlib
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
@@ -1152,6 +1153,12 @@ class MegatronFSDP(torch.nn.Module):
             assert isinstance(
                 module, tuple(fsdp_unit_modules)
             ), "_post_forward hook should only be registered on FSDP unit modules."
+
+            if (
+                bool(int(os.environ.get("MCORE_FSDP_KEEP_CUDAGRAPH_PARAMS_UNTIL_BWD", "0")))
+                and bool(getattr(module, "cuda_graphs", None))
+            ):
+                return output
 
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
