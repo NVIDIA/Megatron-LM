@@ -9,7 +9,7 @@ def grad_norm(model):
     for p in model.parameters():
         if p.grad is not None:
             total += p.grad.data.float().norm(2).item() ** 2
-    return total ** 0.5
+    return total**0.5
 
 
 def mean_loss(per_token_loss, loss_mask):
