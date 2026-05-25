@@ -520,7 +520,7 @@ def test_transpose_first_dim_uses_attention_shape_metadata():
             )
         )
     )
-    tensor = torch.arange(12).view(6, 2)
+    tensor = torch.arange(24).view(12, 2)
 
     first = _transpose_first_dim(tensor, num_splits=3, num_splits_first=True, model=model)
     last = _transpose_first_dim(tensor, num_splits=3, num_splits_first=False, model=model)
