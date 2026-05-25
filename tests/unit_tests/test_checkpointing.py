@@ -436,7 +436,9 @@ def test_checkpoint_name_variants_and_tracker_paths(tmp_path):
     assert get_distributed_optimizer_checkpoint_name(tensor_only).endswith("mp_rank_03/distrib_optim.pt")
 
 
-def test_checkpoint_exists_and_load_path_by_args(tmp_path):
+def test_checkpoint_exists_and_load_path_by_args(monkeypatch, tmp_path):
+    monkeypatch.setattr(checkpointing_module.torch.distributed, "is_initialized", lambda: False)
+
     tracker = tmp_path / "latest_checkpointed_iteration.txt"
 
     assert not checkpoint_exists(None)
@@ -545,6 +547,8 @@ def test_cleanup_old_non_persistent_checkpoint_keeps_newest(monkeypatch, tmp_pat
 
 
 def test_get_non_persistent_iteration_global_and_local(monkeypatch, tmp_path):
+    monkeypatch.setattr(checkpointing_module.torch.distributed, "is_initialized", lambda: False)
+
     args = SimpleNamespace(non_persistent_ckpt_type=None)
     assert _get_non_persistent_iteration(str(tmp_path), args) == -1
 

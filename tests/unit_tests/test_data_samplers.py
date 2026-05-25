@@ -87,7 +87,9 @@ def test_random_sampler_yields_rank_local_random_batches():
     assert len(sampler) == 8
     assert len(batches) == 2
     assert all(len(batch) == 2 for batch in batches)
-    assert sorted(idx for batch in batches for idx in batch) != [0, 1, 2, 3]
+    sampled = [idx for batch in batches for idx in batch]
+    assert len(set(sampled)) == 4
+    assert all(0 <= idx < 8 for idx in sampled)
 
 
 def test_random_sampler_shards_data_by_rank():
