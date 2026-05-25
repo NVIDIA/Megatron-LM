@@ -257,7 +257,7 @@ class TopKRouter(Router):
         else:
             logits = _sinkhorn_activation(logits)
             _, indices = torch.topk(logits, k=self.topk, dim=1)
-        map = torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
+        map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, indices, True)
         scores = logits * map
         return scores, map
 

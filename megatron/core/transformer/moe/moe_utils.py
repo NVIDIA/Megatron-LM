@@ -829,15 +829,14 @@ def topk_routing_with_score_function(
         rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
         routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
 
-        routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+        routing_map = torch.zeros_like(logits, dtype=torch.bool)
         routing_map.index_put_(
-            (rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False
+            (rows, top_indices), torch.ones_like(probs, dtype=torch.bool), accumulate=False
         )
-        routing_map = routing_map.bool()
     else:
         # TODO Try using element-wise operations instead of scatter?
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
-        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top_indices, True)
 
     return routing_probs, routing_map
 
@@ -890,7 +889,7 @@ def compute_routing_scores_for_aux_loss(
             raise ValueError(f"Invalid score_function: {score_function}")
 
         _, top_indices = torch.topk(scores, k=topk, dim=1)
-        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top_indices, True)
 
     # Apply padding mask to scores if provided
     if padding_mask is not None:
