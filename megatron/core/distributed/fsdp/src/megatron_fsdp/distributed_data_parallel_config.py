@@ -151,7 +151,7 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
-    use_fully_shard_api: bool = False
+    use_megatron_fsdp_v2: bool = False
     """If true, use the `fully_shard` API for FSDP sharding the model.
     """
 

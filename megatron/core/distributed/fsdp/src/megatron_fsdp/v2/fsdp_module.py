@@ -371,11 +371,7 @@ class FSDPModule(nn.Module):
                 child._fsdp_state._is_root = False
                 setattr(child, "_fsdp_root_context", root_context)
 
-    def unshard(
-        self,
-        async_op: bool = False,
-        bwd_pass: bool = False,
-    ):
+    def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
         Unshard parameters by all-gathering from the sharded buffer.
 
@@ -401,9 +397,7 @@ class FSDPModule(nn.Module):
             prefetch_modules = []
         for module in [self] + prefetch_modules:
             if all(
-                param_group.has_unsharded_weight_buffers(
-                    bwd_pass=bwd_pass,
-                )
+                param_group.has_unsharded_weight_buffers(bwd_pass=bwd_pass)
                 for param_group in module._fsdp_param_groups
             ):
                 continue
@@ -420,9 +414,7 @@ class FSDPModule(nn.Module):
                         ).any(), f"NaN detected in dist param for parameter {name}"
 
                 with torch.cuda.stream(stream):
-                    param_group.unshard(
-                        bwd_pass=bwd_pass,
-                    )
+                    param_group.unshard(bwd_pass=bwd_pass)
 
             # Record event to track when unshard is done for this module
             if async_op:
@@ -511,17 +503,18 @@ class FSDPModule(nn.Module):
             # layers.py) and sets grad_added_to_main_grad=True. In that case we must NOT
             # zero or overwrite main_grad; discard the dummy .grad tensor if present.
             for name, param in zip(param_names, param_group.params):
-                main_grad = param.get_main_grad()
                 if getattr(param, "grad_added_to_main_grad", False):
                     if param.grad is not None:
                         del param.grad
                 elif param.grad is None:
+                    main_grad = param.get_main_grad()
                     if hasattr(param, "main_grad") and param.main_grad is not None:
                         if param.main_grad.data_ptr() != main_grad.data_ptr():
                             main_grad.copy_(param.main_grad.detach())
                     else:
                         main_grad.zero_()
                 else:
+                    main_grad = param.get_main_grad()
                     main_grad.copy_(param.grad.detach())
                     del param.grad
 
@@ -548,9 +541,9 @@ class FSDPModule(nn.Module):
                     if dist_param.grad is not None:
                         del dist_param.grad
                 else:
-                    if dist_grad is not None:
-                        with torch.cuda.stream(stream):
-                            dist_grad = dist_grad.to(dist_param.dtype)
+                    assert (
+                        dist_grad is None or dist_param.dtype == dist_grad.dtype
+                    ), f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
                     setattr(dist_param, "grad", dist_grad)
                     if hasattr(dist_param, "decoupled_grad"):
                         dist_param.decoupled_grad = None

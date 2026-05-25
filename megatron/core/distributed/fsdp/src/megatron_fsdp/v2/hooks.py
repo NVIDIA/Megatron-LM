@@ -36,14 +36,8 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module |
     def unshard_param_groups(_hook_module, *unused):
         ctx = fsdp_module._fsdp_root_context
         if ctx.backward_phase:
-            fsdp_module.unshard(
-                async_op=ctx.enable_unshard_prefetch,
-                bwd_pass=True,
-            )
-        fsdp_module.unshard(
-            async_op=ctx.enable_unshard_prefetch,
-            bwd_pass=False,
-        )
+            fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
+        fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
     # In the normal path, the hook is installed on the FSDP module itself.
     # Fine-grained recompute can replay a child forward without entering the
@@ -133,10 +127,7 @@ def _register_backward_pre_hook(module: FSDPModule):
                     setattr(param, "overwrite_main_grad", True)
         if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
             _register_post_backward_final_callback(module._fsdp_state, module)
-        module.unshard(
-            async_op=ctx.enable_unshard_prefetch,
-            bwd_pass=True,
-        )
+        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=pre_backward_hook

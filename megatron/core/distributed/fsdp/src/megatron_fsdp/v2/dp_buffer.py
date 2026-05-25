@@ -472,8 +472,7 @@ class DataParallelBuffer:
 
     @torch.no_grad()
     def unshard(
-        self,
-        async_op: bool = True,
+        self, async_op: bool = True
     ) -> Tuple[torch.Tensor, Optional[torch.distributed.Work]]:
         """All-gather the full buffer from all shards and bind parameter storage.
 
@@ -580,15 +579,12 @@ class DataParallelBuffer:
 
         sm = self.buffer_index.shard_meta
         local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
-        reduced_grad_shard = torch.empty(sm.size, dtype=grad_comm_dtype, device=self.device)
+        reduced_grad_shard = comm_input[sm.bucket_data_index : sm.bucket_data_index + sm.size]
 
         torch.distributed.reduce_scatter_tensor(
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
-        # Accumulate into the persistent local shard buffer. The reduce-scatter output
-        # must not alias the full input buffer, otherwise the collective can clobber its
-        # own input and silently corrupt gradients.
         local_grad_shard += reduced_grad_shard
 
 

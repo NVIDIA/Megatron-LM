@@ -70,6 +70,11 @@ def _init_default_fully_shard_mesh() -> DeviceMesh:
         distributed_c10d.init_process_group()
 
     default_pg = distributed_c10d._get_default_group()  # still private
-    device = torch._C._get_accelerator()
-    mesh = init_device_mesh(device.type, mesh_shape=(default_pg.size(),))
+    device = torch._C._get_accelerator("cuda" if torch.cuda.is_available() else "cpu")
+    mesh = DeviceMesh.from_group(
+        [default_pg],
+        device_type=device.type,
+        mesh=torch.distributed.get_process_group_ranks(default_pg),
+        mesh_dim_names=("dp",),
+    )
     return mesh

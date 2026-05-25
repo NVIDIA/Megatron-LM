@@ -27,7 +27,7 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from ..uneven_dtensor import make_uneven_dtensor
+from ..uneven_dtensor import make_uneven_dtensor, update_uneven_dtensor_chunk_metadata
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import FullyShardMixedPrecisionPolicy
@@ -120,10 +120,7 @@ class ParameterGroup:
                 buffer.allocator = allocator
 
     def _create_buffer(
-        self,
-        dtype: torch.dtype,
-        is_distributed: bool,
-        role: str,
+        self, dtype: torch.dtype, is_distributed: bool, role: str
     ) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
@@ -191,9 +188,7 @@ class ParameterGroup:
             # Pass the replacement buffers so the policy can tell whether this
             # parameter's original storage has been copied into FSDP-owned storage.
             for tensor in self.mp_policy.storage_tensors_to_free(
-                p,
-                self.model_weight_buffer,
-                self.main_weight_buffer,
+                p, self.model_weight_buffer, self.main_weight_buffer
             ):
                 _free_storage(tensor)
 
@@ -207,11 +202,7 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(
-        self,
-        async_op: bool = False,
-        bwd_pass: bool = False,
-    ):
+    def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
@@ -220,35 +211,23 @@ class ParameterGroup:
         """
         work = None
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
-            self.model_weight_buffer,
-            self.transpose_weight_buffer,
-            bwd_pass=bwd_pass,
+            self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is None:
                 continue
             if weight_buffer.is_distributed and weight_buffer.is_unsharded():
                 continue
-            _, weight_work = weight_buffer.unshard(
-                async_op=async_op,
-            )
+            _, weight_work = weight_buffer.unshard(async_op=async_op)
             if work is None:
                 work = weight_work
 
-        self.mp_policy.post_unshard(
-            self.params,
-            bwd_pass=bwd_pass,
-        )
+        self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
         return work
 
-    def has_unsharded_weight_buffers(
-        self,
-        bwd_pass: bool = False,
-    ) -> bool:
+    def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
         """Return whether this phase can skip launching another distributed unshard."""
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
-            self.model_weight_buffer,
-            self.transpose_weight_buffer,
-            bwd_pass=bwd_pass,
+            self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is None:
                 continue
@@ -336,6 +315,10 @@ class ParameterGroup:
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
             self.dist_params.append(dist_param)
+
+        # Update dist_param chunk metadata for checkpointing and debugging.
+        for dist_param in self.dist_params:
+            update_uneven_dtensor_chunk_metadata(dist_param)
 
         # Create gradient DTensor views. Some groups, e.g. uint8 FP8 model
         # payloads, do not require grads and therefore have no grad buffer.

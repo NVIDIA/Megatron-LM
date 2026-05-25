@@ -159,7 +159,7 @@ class TestMegatronFSDPE2E:
                     recompute_num_layers=1,
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
-                    use_fully_shard_api=True,
+                    use_megatron_fsdp_v2=True,
                     gradient_accumulation_fusion=True,
                 ),
                 id="optim_grads_params_double_buffer",
@@ -178,7 +178,7 @@ class TestMegatronFSDPE2E:
                     moe_grouped_gemm=True,
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
-                    use_fully_shard_api=True,
+                    use_megatron_fsdp_v2=True,
                     use_precision_aware_optimizer=True,
                 ),
                 id="optim_grads_params_mxfp8_param_gather_pao",
@@ -202,7 +202,7 @@ class TestMegatronFSDPE2E:
         if ref_cache_key not in ref_cache:
             reference_spec_configs = copy.deepcopy(spec_configs)
             if reference_kind == "fsdp_v1":
-                reference_spec_configs["use_fully_shard_api"] = False
+                reference_spec_configs["use_megatron_fsdp_v2"] = False
                 reference_spec_configs.setdefault("gradient_accumulation_fusion", False)
                 ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
                     use_megatron_fsdp=True,

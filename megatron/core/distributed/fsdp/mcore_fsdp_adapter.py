@@ -64,6 +64,8 @@ except ImportError as import_megatron_fsdp_error:
 
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 
+from .checkpoint import _propagate_chunk_metadata_to_state_dict
+
 logger = logging.getLogger(__name__)
 
 
@@ -111,7 +113,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
 
-        if ddp_config.use_fully_shard_api:
+        if ddp_config.use_megatron_fsdp_v2:
             self._init_with_fully_shard(
                 config,
                 ddp_config,
@@ -209,7 +211,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config
-
         self.sync_rng_states_across_tp_group()
         self._set_dist_param_unique_name()
 
@@ -381,8 +382,17 @@ class FullyShardedDataParallel(_BaseDataParallel):
         # calls broadcast_params() with --data-parallel-random-init.
         self.broadcast_params = noop
         self.synchronize_param_gather = synchronize_param_gather
-        self.module.state_dict_for_save_checkpoint = not_implemented_op
-        self.state_dict_for_save_checkpoint = not_implemented_op
+        self.module.state_dict_for_save_checkpoint = module.state_dict
+        self.state_dict_for_save_checkpoint = lambda *args, **kwargs: self.state_dict()
+
+        # Register state dict post-hook on the root module to propagate
+        # chunk metadata (``__create_chunk_list__``) from model params to
+        # the DTensors in the state dict.  The hook receives the complete
+        # state dict so all parameter names can be matched in one pass.
+        def _post_hook(module, state_dict, prefix, local_metadata):
+            _propagate_chunk_metadata_to_state_dict(module, state_dict)
+
+        self.module.register_state_dict_post_hook(_post_hook)
 
         if torch.distributed.get_rank() == 0:
             self.module._log_parameter_groups()
@@ -396,7 +406,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         Load the state dictionary into the module.
         """
-        if self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_megatron_fsdp_v2:
             super().load_state_dict(state_dict, strict=strict)
             return
 
@@ -629,7 +639,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         For the Megatron-FSDP path: calls synchronize_gradient_reduce and
         synchronize_param_gather.
         """
-        if self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_megatron_fsdp_v2:
             ctx = self.module._fsdp_root_context
             torch.cuda.current_stream().wait_stream(ctx.ag_stream)
             torch.cuda.current_stream().wait_stream(ctx.rs_stream)
