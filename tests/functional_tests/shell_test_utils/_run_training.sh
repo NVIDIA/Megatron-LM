@@ -175,10 +175,6 @@ LAST_RANK=$((GPUS_PER_NODE - 1))
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
 
-if [[ -n "${RUN_CI_PHASE_INDEX:-}" ]]; then
-    MASTER_PORT=$((MASTER_PORT + RUN_CI_PHASE_INDEX))
-fi
-
 # Read launcher type from model config (default: torchrun)
 LAUNCHER=$(/usr/local/bin/yq '.LAUNCHER // "torchrun"' "$TRAINING_PARAMS_PATH")
 
