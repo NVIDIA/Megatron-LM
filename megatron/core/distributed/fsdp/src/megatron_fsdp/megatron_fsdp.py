@@ -38,6 +38,7 @@ from .param_and_grad_buffer import (
     ParamAndGradBuffer,
     PrefetchOrder,
     _check_nan_in_grad,
+    get_param_group_id,
     override_sharded_param_methods_with_safety_checks,
     to_local_if_dtensor,
 )
@@ -490,7 +491,7 @@ class MegatronFSDP(torch.nn.Module):
         )
         if wait_bucket_ready:
             for param in params:
-                bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                bucket_id = get_param_group_id(self.param_and_grad_buffer, param)
                 ag_pipeline.wait_bucket_ready(bucket_id, bwd)
                 if bwd and is_float8tensor(param):
                     fp8_create_transpose_cache(param)
@@ -575,7 +576,7 @@ class MegatronFSDP(torch.nn.Module):
                 the FP8 transpose cache associated with the module’s parameters.
             """
             for param in module.parameters():
-                bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                bucket_id = get_param_group_id(self.param_and_grad_buffer, param)
                 self.all_gather_pipeline.release_bucket(bucket_id, bwd, lazy=lazy)
 
             if not self.ddp_config.keep_fp8_transpose_cache:
@@ -593,7 +594,7 @@ class MegatronFSDP(torch.nn.Module):
             Utilizes the patched main_grad property of the parameter to allocate
             or fetch the main gradient bucket for the parameter.
             """
-            group_id = self.param_and_grad_buffer.param_to_param_group[param]
+            group_id = get_param_group_id(self.param_and_grad_buffer, param)
             group = self.param_and_grad_buffer.parameter_groups[group_id]
             if not group.requires_grad:
                 return
