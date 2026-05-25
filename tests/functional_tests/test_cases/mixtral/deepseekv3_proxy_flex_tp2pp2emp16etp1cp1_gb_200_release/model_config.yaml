@@ -162,6 +162,7 @@ MODEL_ARGS:
 
   # enable experimental
   --enable-experimental: true
+  --exit-interval: 47683
 METRICS:
   - "iteration-time"
   - "lm loss"
