@@ -604,7 +604,11 @@ class MegatronFSDP(torch.nn.Module):
             """
             params = (
                 _get_canonical_module_params(module, recurse=True)
-                if self.enable_fine_grained_param_gather_hook
+                if (
+                    self.enable_fine_grained_param_gather_hook
+                    or is_graph_capturing()
+                    or bool(getattr(module, "cuda_graphs", None))
+                )
                 else list(module.parameters())
             )
             for param in params:
@@ -876,7 +880,15 @@ class MegatronFSDP(torch.nn.Module):
                     # identical by not leaving async prefetch collectives outstanding.
                     fsdp_forward_prefetch = False
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
+            use_canonical_params = (
+                self.enable_fine_grained_param_gather_hook
+                or is_graph_capturing()
+                or bool(getattr(module, "cuda_graphs", None))
+            )
+            recurse = isinstance(module, tuple(fsdp_unit_modules))
+            if use_canonical_params:
+                param_list = _get_canonical_module_params(module, recurse=recurse)
+            elif recurse:
                 param_list = list(module.parameters())
             else:
                 # All-gather the shallow parameters in every forward pass for modules
@@ -884,16 +896,13 @@ class MegatronFSDP(torch.nn.Module):
                 # to allocate as little memory as possible for this forward pass.
                 param_list = list(module.parameters(recurse=False))
 
-            if self.enable_fine_grained_param_gather_hook:
-                param_list = _get_direct_module_params(module)
-
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
                 params=param_list,
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
-            if self.enable_fine_grained_param_gather_hook:
+            if use_canonical_params:
                 _mirror_fsdp_param_attrs(module, param_list)
             return None
 
