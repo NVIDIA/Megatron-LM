@@ -204,14 +204,11 @@ class MegatronOptimizer(ABC):
             # GTP-duplicate filter: only needed for non-distributed optimizer.
             is_expert = not getattr(param, 'allreduce', True)
             if hasattr(self, 'ddp_config') and self.ddp_config.use_distributed_optimizer:
-                is_not_ps_duplicate = True
+                is_not_gtp_duplicate = True
             else:
-                if is_expert:
-                    is_not_ps_duplicate = is_gtp_param or egtp_rank == 0
-                else:
-                    is_not_ps_duplicate = is_gtp_param or gtp_rank == 0
+                is_not_gtp_duplicate = is_gtp_param or (egtp_rank if is_expert else gtp_rank) == 0
 
-            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_ps_duplicate:
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 if is_gtp_param:
                     gtp_grads.append(grad)
                 else:
@@ -265,11 +262,11 @@ class MegatronOptimizer(ABC):
         # Check if this optimizer handles expert params that need EGTP reduction.
         # The model_parallel group for dense/GTP optimizers = TP×PP×GTP (includes GTP),
         # but for MoE optimizers = TP×EP×PP (does NOT include EGTP).
-        eps_world_size = parallel_state.get_expert_generalized_tensor_parallel_world_size()
+        egtp_world_size = parallel_state.get_expert_generalized_tensor_parallel_world_size()
         is_expert_optimizer = any(not getattr(p, 'allreduce', True) for p in self.get_parameters())
-        needs_eps_reduce = is_expert_optimizer and eps_world_size > 1
+        needs_egtp_reduce = is_expert_optimizer and egtp_world_size > 1
 
-        if not needs_eps_reduce:
+        if not needs_egtp_reduce:
             # Dense/GTP optimizer: grad_stats_group already covers GTP.
             return get_grad_norm_fp32(
                 non_gtp_grads + gtp_grads, grad_stats_parallel_group=grad_stats_group

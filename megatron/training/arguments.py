@@ -1462,21 +1462,13 @@ def validate_args(args, defaults={}):
                 "force setting NCCL_PROTO=Simple might introduce bad perf."
             )
 
-        # When GTP is enabled and TP is disabled, default the bwd schedule to
-        # wgrad-before-dgrad on _Linear / _LayerNormLinear. The GTP wgrad
-        # reduce-scatter then overlaps with the dgrad GEMM, and the prev_w
-        # AG prefetch overlaps with the wgrad GEMM. With TP enabled, the
-        # TP comm-overlap path assumes dgrad-first, so leave the default
-        # order untouched there.
+        # Under GTP+no-TP the optimal bwd schedule would be wgrad-before-dgrad
+        # on _Linear / _LayerNormLinear (so the GTP wgrad reduce-scatter
+        # overlaps with the dgrad GEMM and the prev_w AG prefetch overlaps
+        # with the wgrad GEMM). TE-side support for this ordering is deferred
+        # to a follow-up MR; until then, flag any attempt to activate it.
         if args.tensor_model_parallel_size == 1:
-            from megatron.experimental.gtp import HAVE_GTP, update_gtp_config
-            if HAVE_GTP:
-                update_gtp_config(wgrad_before_dgrad=True)
-                warn_rank_0(
-                    "GTP+no-TP detected: setting "
-                    "GTPConfig.wgrad_before_dgrad=True (wgrad GEMM runs before "
-                    "dgrad GEMM so RS NCCL overlaps with dgrad)."
-                )
+            raise NotImplementedError("Wgrad->Dgrad schedule to be supported later")
 
         # Propagate --fp8-param-gather into GTPConfig: enables optimizer-side
         # FP32->FP8 cast for GTP shards, so the forward skips BF16->FP8.

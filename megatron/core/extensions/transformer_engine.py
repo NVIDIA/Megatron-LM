@@ -1223,10 +1223,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}, "
-            f"GTP={self.gtp_size})"
-            if hasattr(self, "gtp_size")
-            else ")"
+            f"TP={self.tp_size}"
+            + (f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else "")
         )
 
     def backward_dw(self):
@@ -1344,10 +1342,8 @@ class TEColumnParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}, "
-            f"GTP={self.gtp_size})"
-            if hasattr(self, "gtp_size")
-            else ")"
+            f"TP={self.tp_size}"
+            + (f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else "")
         )
 
     def backward_dw(self):
@@ -1459,10 +1455,8 @@ class TERowParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}, "
-            f"GTP={self.gtp_size})"
-            if hasattr(self, "gtp_size")
-            else ")"
+            f"TP={self.tp_size}"
+            + (f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else "")
         )
 
     def backward_dw(self):

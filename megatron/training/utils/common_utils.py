@@ -105,11 +105,11 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     params_data = []                # Dense, non-sharded
     sharded_params_data = []        # Dense, sharded → reduce over dp_cp
     gtp_params_data = []            # GTP, non-sharded
-    gtp_sharded_params_data = []    # GTP, sharded → reduce over dp_cp_with_ps
+    gtp_sharded_params_data = []    # GTP, sharded → reduce over dp_cp_with_gtp
     moe_params_data = []            # MoE, non-sharded
     moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
     moe_gtp_params_data = []        # MoE-GTP, non-sharded
-    moe_gtp_sharded_params_data = []  # MoE-GTP, sharded → reduce over expert_dp_with_ps
+    moe_gtp_sharded_params_data = []  # MoE-GTP, sharded → reduce over expert_dp_with_gtp
 
     gtp_rank = mpu.get_generalized_tensor_parallel_rank()
     egtp_rank = mpu.get_expert_generalized_tensor_parallel_rank()

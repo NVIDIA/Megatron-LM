@@ -252,87 +252,12 @@ def get_rs_streams_for_chain(chain_id: str) -> list:
     return [s for k, s in _RS_STREAMS.items() if k[0] == chain_id]
 
 
-# Cached once per process: whether the TE build exposes the split-phase APIs.
-_COALESCED_AMAX_TE_APIS_AVAILABLE = hasattr(tex, "compute_amax_nvfp4") and hasattr(
-    tex, "quantize_cast_only_nvfp4"
-)
-
-# Tier-2: multi-tensor amax kernel fuses N per-expert (zero_amax + amax + D2D) chains
-# into two multi-tensor kernel launches.  Independent of Tier-1 coalesced allreduce.
-_MULTI_AMAX_TE_API_AVAILABLE = hasattr(tex, "compute_multi_amax_nvfp4")
-
-
-def _coalesced_amax_static_eligible(weights):
-    """Check whether the coalesced-amax path is applicable (NVFP4 only).
-
-    Caller already gates on GTP_CONFIG.coalesce_amax_allreduce (False for
-    non-NVFP4). Here we additionally verify TE API availability, batch size,
-    quantizer type (must have amax reduction), and the RHT flag."""
-    if not _COALESCED_AMAX_TE_APIS_AVAILABLE:
-        return False
-    if len(weights) <= 1:
-        return False
-    has_amax = [getattr(w._quantizer, "with_amax_reduction", False) for w in weights]
-    if not all(has_amax):
-        return False
-    has_rht = any(getattr(w._quantizer, "with_rht", False) for w in weights)
-    if has_rht:
-        return False
-    return True
-
-
-def _quantize_with_coalesced_amax(weights, cast_noop_flag):
-    """Replace the per-weight (compute_amax + allreduce + cast) loop with:
-    compute_amax loop  →  one coalesced allreduce  →  cast loop.
-
-    The caller has already gated on ``skip_weight_cast`` (see
-    ``_all_gather_weight``); inside this function we always do the work.
-    """
-    group = weights[0]._quantizer.amax_reduction_group
-
-    # Materialize padded shards once; on padded last-rank get_padded_shard()
-    # launches an F.pad kernel, and we'd otherwise pay it twice per expert.
-    padded_shards = [w.get_padded_shard() for w in weights]
-
-    # Phase 1: per-weight local amax into each w.quantized's amax buffers.
-    # Keep rowwise/columnwise both populated so the group allreduce sees
-    # whichever the consumer GEMM will read.
-    for w in weights:
-        w._quantizer.set_usage(rowwise=True, columnwise=True)
-    if _MULTI_AMAX_TE_API_AVAILABLE:
-        # Tier-2: single multi-tensor launch writes both rowwise and columnwise
-        # amax directly (no per-expert D2D replicate), fusing N per-expert chains.
-        # Reuse the _cached_quantizers list already populated by _all_gather_weight
-        anchor = weights[0]
-        quantizer_list = anchor._cached_quantizers
-        if quantizer_list is None:
-            quantizer_list = [w._quantizer for w in weights]
-            anchor._cached_quantizers = quantizer_list
-        tex.compute_multi_amax_nvfp4(padded_shards, quantizer_list, [w.quantized for w in weights])
-    else:
-        for w, shard in zip(weights, padded_shards):
-            tex.compute_amax_nvfp4(tensor=shard, quantizer=w._quantizer, output=w.quantized)
-
-    # Phase 2: one coalesced allreduce across every weight's amax tensors.
-    amax_tensors = []
-    for w in weights:
-        rw = w.quantized._amax_rowwise
-        cw = w.quantized._amax_columnwise
-        if rw is not None:
-            amax_tensors.append(rw)
-        if cw is not None and (rw is None or cw.data_ptr() != rw.data_ptr()):
-            amax_tensors.append(cw)
-    torch.distributed.all_reduce_coalesced(
-        amax_tensors, op=torch.distributed.ReduceOp.MAX, group=group
-    )
-
-    # Phase 3: per-weight cast using the pre-reduced amax; skips the internal
-    # allreduce inside the quantizer.
-    for w, shard in zip(weights, padded_shards):
-        tex.quantize_cast_only_nvfp4(
-            tensor=shard, quantizer=w._quantizer, output=w.quantized, noop=cast_noop_flag
-        )
-        w.did_cast_to_low_precision = True
+# NOTE: Coalesced amax reduction across the GTP group is deferred to a follow-up
+# MR. The TE-side split-phase APIs (`compute_amax_nvfp4`, `quantize_cast_only_nvfp4`,
+# `compute_multi_amax_nvfp4`) and the Mcore-side `_quantize_with_coalesced_amax`
+# helper have been removed. The `GTPConfig.coalesce_amax_allreduce` knob is kept
+# as a stub: setting it to True logs an info message and falls back to the
+# per-weight quantize path inside `_all_gather_weight`.
 
 
 @dataclass
@@ -348,25 +273,21 @@ class GTPConfig:
     # overlap. When False, every wgrad RS is synchronous and finalizes
     # inline, at the cost of that overlap.
     async_reduction: bool = True
-    # When True, _Linear.backward and _LayerNormLinear.backward run wgrad
-    # GEMM before dgrad GEMM. The GTP wgrad reduce-scatter is issued between
-    # them so its NCCL kernel overlaps with the dgrad GEMM, and the prev_w
-    # AG prefetch (issued by all_gather_and_prefetch_bwd at the top of bwd)
-    # overlaps with wgrad GEMM. When False (default), use the original
-    # dgrad-first order. Only affects _Linear and _LayerNormLinear; MLP and
-    # GroupedLinear keep the original schedule.
+    # Stub field, reserved for a follow-up MR that will land the wgrad-before-dgrad
+    # schedule on the TE side (_Linear / _LayerNormLinear backward run wgrad GEMM
+    # before dgrad GEMM, so the GTP wgrad reduce-scatter overlaps with dgrad GEMM).
+    # Setting this to True via update_config() currently raises NotImplementedError.
     wgrad_before_dgrad: bool = False
     # GTP companion to Megatron --fp8-param-gather: optimizer casts FP32 master
     # directly into GTPShardedParam.quantized; forward's _quantize_if_needed
     # short-circuits to the cached FP8. Moves BF16->FP8 off the fwd critical path.
     fp8_param_gather: bool = False
-    # When True and the weight list in _all_gather_weight contains >1 NVFP4
-    # shards that share an amax reduction group, coalesce their per-expert
-    # amax allreduces into a single NCCL call. Requires TE with
-    # tex.compute_amax_nvfp4 / tex.quantize_cast_only_nvfp4; the eligibility
-    # guard in _coalesced_amax_static_eligible falls back to the per-weight
-    # path when either binding is missing.
-    coalesce_amax_allreduce: bool = True
+    # Stub field, reserved for a follow-up MR that will re-land the coalesced
+    # NVFP4 amax allreduce across the GTP group (single NCCL call across all
+    # batched per-expert amax tensors, plus the TE split-phase compute_amax /
+    # quantize_cast primitives). Setting this to True via update_config()
+    # currently logs an info message and falls back to the per-weight path.
+    coalesce_amax_allreduce: bool = False
 
 
 GTP_CONFIG = GTPConfig()
@@ -374,6 +295,17 @@ GTP_CONFIG = GTPConfig()
 
 def update_config(**kwargs):
     """Update the global GTP configuration."""
+    if kwargs.get("wgrad_before_dgrad"):
+        raise NotImplementedError("Wgrad->Dgrad schedule to be supported later")
+    if kwargs.get("coalesce_amax_allreduce"):
+        import warnings
+        warnings.warn(
+            "GTPConfig.coalesce_amax_allreduce: coalesced amax reduction across the "
+            "GTP group is deferred in a followup MR; falling back to per-weight amax "
+            "allreduce.",
+            stacklevel=2,
+        )
+        kwargs["coalesce_amax_allreduce"] = False
     for key, value in kwargs.items():
         if not hasattr(GTP_CONFIG, key):
             raise ValueError(f"Unknown GTP config option: {key}")
@@ -453,8 +385,6 @@ def wrap_module_params_gtp(module, weight_names, gtp_group, is_grouped=None):
     2. TE modules: per-param body no-ops because the reset_parameters hook
        already produced GTPShardedParam instances.
 
-    Also stamps GTP_CONFIG.wgrad_before_dgrad onto the module so TE's
-    autograd backward can read it without importing GTP_CONFIG.
     """
     if gtp_group.size() == 1:
         return
@@ -479,11 +409,6 @@ def wrap_module_params_gtp(module, weight_names, gtp_group, is_grouped=None):
     if is_grouped:
         allweights = [getattr(module, name) for name in weight_names]
         allweights[0].weight_list = allweights
-
-    # Stamp scheduling flag onto the TE module so its autograd functions can
-    # read it without naming GTP_CONFIG. Default is False on the TE side; we
-    # only override when GTP is actually active for this module.
-    module.wgrad_before_dgrad = GTP_CONFIG.wgrad_before_dgrad
 
 
 def gtp_slice_in_reset_parameters(module, name, param, expert_idx=0):
@@ -857,28 +782,13 @@ class GTPShardedParam(torch.nn.Parameter):
                 w._set_state(new_state)
 
         # 2. Prepare: quantize, set usage direction.
-        # Static eligibility (quantizer class, flags, amax group) is fixed
-        # after model construction — compute once and cache on self so the
-        # hot path only pays the cheap per-call skip_weight_cast check.
-        if GTP_CONFIG.coalesce_amax_allreduce:
-            static_ok = getattr(self, "_coalesced_amax_static", None)
-            if static_ok is None:
-                static_ok = _coalesced_amax_static_eligible(weights)
-                self._coalesced_amax_static = static_ok
-            # Per-call: match the skip_weight_cast gate in _quantize_if_needed
-            # (fire when either skip_weight_cast is False or cast_noop_flag
-            # was provided by the FP8/NVFP4 recipe).
-            use_coalesced = static_ok and not (skip_weight_cast is True and cast_noop_flag is None)
-        else:
-            use_coalesced = False
-
-        # Quantize step: coalesced batch / fp8_param_gather cache hit (skip) /
-        # legacy per-weight. set_usage runs uniformly after, gated by did_cast.
+        # NOTE: The coalesced amax allreduce path (gated by
+        # GTPConfig.coalesce_amax_allreduce) is deferred to a follow-up MR;
+        # always use the per-weight quantize path here. update_config() logs
+        # an info message when a caller tries to enable the deferred knob.
         fp8_pg_hit = GTP_CONFIG.fp8_param_gather and self.did_cast_to_low_precision
 
-        if use_coalesced:
-            _quantize_with_coalesced_amax(weights, cast_noop_flag)
-        elif not fp8_pg_hit:
+        if not fp8_pg_hit:
             for w in weights:
                 w._quantize_if_needed(skip_weight_cast, cast_noop_flag)
 

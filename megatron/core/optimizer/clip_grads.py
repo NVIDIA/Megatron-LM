@@ -253,13 +253,13 @@ def count_zeros_fp32(
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
         if use_distributed_optimizer:
-            is_not_ps_duplicate = True
+            is_not_gtp_duplicate = True
         else:
             is_gtp_param = getattr(param, 'is_gtp', False) or (
                 HAVE_GTP and isinstance(param, GTPShardedParam)
             )
-            is_not_ps_duplicate = is_gtp_param or gtp_rank == 0
-        if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_ps_duplicate:
+            is_not_gtp_duplicate = is_gtp_param or gtp_rank == 0
+        if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()

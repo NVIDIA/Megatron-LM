@@ -138,13 +138,11 @@ At bwd step *i* the step is launching *RS of wgrad_i* while finalizing the *prev
 
 Communication never blocks compute except at the very first layer of each direction (cold start) and at enforced serialization points (CG/eager drains, finalize-grads barrier).
 
-### 7a. wgrad-before-dgrad schedule
+### 7a. wgrad-before-dgrad schedule  *(deferred to a follow-up MR)*
 
-Default: backward runs dgrad GEMM, then wgrad GEMM, then issues the GTP wgrad RS — the RS overlaps with the *next* layer's bwd GEMMs (the one-step deferral above).
+Current behavior: backward always runs dgrad GEMM, then wgrad GEMM, then issues the GTP wgrad RS — the RS overlaps with the *next* layer's bwd GEMMs (the one-step deferral above).
 
-Opt-in via `GTPConfig.wgrad_before_dgrad = True`: backward runs wgrad GEMM first, then issues the GTP wgrad RS, then runs dgrad GEMM — the RS NCCL overlaps with the dgrad GEMM of the **same** layer, and the prev_w AG prefetch issued at the top of bwd overlaps with the wgrad GEMM. Only affects `_Linear` and `_LayerNormLinear`; `LayerNormMLP` and `GroupedLinear` keep the original schedule.
-
-When to enable it: GTP + no-TP. The TP comm-overlap path assumes the original dgrad-first order, so under TP > 1 the flag stays False. Megatron auto-sets it for the GTP+no-TP case in `validate_args`.
+A future MR will add an opt-in wgrad-before-dgrad schedule on `_Linear` / `_LayerNormLinear` so the GTP wgrad RS NCCL overlaps with the dgrad GEMM of the **same** layer (best for the GTP + no-TP case). Until that MR lands, attempting to set `GTPConfig.wgrad_before_dgrad = True` raises `NotImplementedError`.
 
 ## 8. Scaling
 
@@ -199,8 +197,8 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 
 ```
 GTP enabled. GTPConfig(pad_for_alignment=16, check_param_states=False,
-  weight_prefetch=True, async_reduction=True, wgrad_before_dgrad=True,
-  fp8_param_gather=False, coalesce_amax_allreduce=True)
+  weight_prefetch=True, async_reduction=True, wgrad_before_dgrad=False,
+  fp8_param_gather=False, coalesce_amax_allreduce=False)
 ```
 
 ### What the flags do under the hood
@@ -220,9 +218,9 @@ update_gtp_config(
     pad_for_alignment=16,         # NVFP4: 16, MXFP8: 32, BF16: any; auto-set in training.py
     weight_prefetch=True,         # Disable to debug the cold-start path
     async_reduction=True,         # Wheter perform GTP gradient reduction asynchronously
-    wgrad_before_dgrad=False,     # Auto-set True for GTP+no-TP
+    # wgrad_before_dgrad: deferred — setting True currently raises NotImplementedError
     fp8_param_gather=False,       # Companion to Megatron's --fp8-param-gather; currently asserted off
-    coalesce_amax_allreduce=True, # NVFP4 only; falls back if TE lacks compute_amax_nvfp4
+    # coalesce_amax_allreduce: deferred — setting True logs an info and falls back to per-weight
 )
 ```
 

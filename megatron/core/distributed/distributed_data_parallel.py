@@ -252,7 +252,7 @@ class DistributedDataParallel(_BaseDataParallel):
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
-                # Use the with_eps group so EGTP-sharded routed experts (whose grads
+                # Use the with_egtp group so EGTP-sharded routed experts (whose grads
                 # are already RS'd over the expert-GTP axis) only DP-reduce over true
                 # weight replicas. Falls back to intra_expt_dp_group when GTP is off.
                 data_parallel_group = self.intra_expt_dp_with_egtp_group

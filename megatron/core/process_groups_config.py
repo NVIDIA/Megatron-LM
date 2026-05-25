@@ -449,14 +449,14 @@ class ProcessGroupCollection:
             expt_tp_pp_group = pg_collection.tp_ep_pp
 
             # 6. GTP with_gtp group (fallback to intra_dp_cp if not provided)
-            if hasattr(pg_collection, 'intra_dp_cp_with_ps'):
-                intra_dp_cp_with_gtp_group = pg_collection.intra_dp_cp_with_ps
+            if hasattr(pg_collection, 'intra_dp_cp_with_gtp'):
+                intra_dp_cp_with_gtp_group = pg_collection.intra_dp_cp_with_gtp
             else:
                 intra_dp_cp_with_gtp_group = intra_dp_cp_group
 
             # 7. EGTP group (fallback to intra_expt_dp if not provided)
-            if hasattr(pg_collection, 'intra_expt_dp_with_eps'):
-                intra_expt_dp_with_egtp_group = pg_collection.intra_expt_dp_with_eps
+            if hasattr(pg_collection, 'intra_expt_dp_with_egtp'):
+                intra_expt_dp_with_egtp_group = pg_collection.intra_expt_dp_with_egtp
             else:
                 intra_expt_dp_with_egtp_group = intra_expt_dp_group
 
@@ -620,8 +620,8 @@ class ProcessGroupCollection:
             result['ep_group'] = pg_collection.ep
 
             # EGTP group (fallback to intra_expt_dp if not provided)
-            if hasattr(pg_collection, 'intra_expt_dp_with_eps'):
-                result['intra_expt_dp_with_egtp_group'] = pg_collection.intra_expt_dp_with_eps
+            if hasattr(pg_collection, 'intra_expt_dp_with_egtp'):
+                result['intra_expt_dp_with_egtp_group'] = pg_collection.intra_expt_dp_with_egtp
             else:
                 result['intra_expt_dp_with_egtp_group'] = result['intra_expt_dp_group']
 
