@@ -65,6 +65,10 @@ inputs:
     description: "Trigger cadence for cadence filter (pr|nightly|mergegroup). Empty disables filter."
     required: false
     default: ""
+  sha:
+    description: "Git ref to check out. Must match the SHA used by the upstream parse step so recipes don't diverge between scheduling and execution."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -74,6 +78,8 @@ runs:
 
     - name: Checkout repository
       uses: actions/checkout@v6
+      with:
+        ref: ${{ inputs.sha }}
 
     - name: Change ownership of /home/runner/
       shell: bash
