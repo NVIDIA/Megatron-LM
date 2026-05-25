@@ -1408,14 +1408,16 @@ class TestDenseFusedIndexerSparseAttn:
         """Combined coverage for the dense-loss path's two non-numerical
         properties (assertion blocks self-label on failure):
 
-        * (a) The forward invokes ``dense_indexer_score_recompute_wrapper`` +
-              ``dense_attn_score_recompute_wrapper`` (NOT the sparse score
-              kernels) with the right BSHD/4-D shapes and ``ratio`` /
-              scale args.
-        * (b) The backward invokes ``dense_indexer_backward_wrapper``
-              (NOT the sparse one), threads ``ratio`` through, and lands
-              the kernel grads on the right SBHD leaves (BSHD → SBHD
-              permute applied for the indexer-side grads).
+        * (a) The forward invokes ``dense_attn_score_recompute_wrapper``
+              (NOT the sparse score kernels) with the right BSHD/4-D shapes
+              and ``ratio`` / scale args.  The indexer predict is derived
+              directly from ``indexer_forward_wrapper`` scores (no separate
+              ``dense_indexer_score_recompute_wrapper`` call).
+        * (b) The forward eagerly invokes ``dense_indexer_backward_wrapper``
+              (NOT the sparse one), threads ``ratio`` through, and the
+              resulting grads land on the right SBHD leaves (BSHD → SBHD
+              permute applied for the indexer-side grads, scaled by
+              ``grad_loss`` in the actual backward).
         """
         s = self.SHAPES
         ratio = 4
@@ -1438,34 +1440,12 @@ class TestDenseFusedIndexerSparseAttn:
             sparse_loss=False,
             kv_offset=s['skv'] - s['n_comp'],
         )
-        fake_dsa_a.dense_indexer_score_recompute_wrapper.assert_called_once()
+        # Indexer predict is derived from indexer_forward_wrapper scores
+        # (gather + logsumexp), NOT from dense_indexer_score_recompute_wrapper.
+        fake_dsa_a.dense_indexer_score_recompute_wrapper.assert_not_called()
         fake_dsa_a.dense_attn_score_recompute_wrapper.assert_called_once()
         fake_dsa_a.sparse_indexer_score_recompute_wrapper.assert_not_called()
         fake_dsa_a.sparse_attn_score_recompute_wrapper.assert_not_called()
-
-        idx_call = fake_dsa_a.dense_indexer_score_recompute_wrapper.call_args
-        q_arg, k_arg, w_arg = idx_call.args
-        assert q_arg.shape == (
-            s['b'],
-            s['sq'],
-            s['idx_nh'],
-            s['idx_hd'],
-        ), "(a) dense indexer score: q shape"
-        # K is unsqueezed to 4-D (B, S_k, H_kv=1, D) for the dense forward.
-        assert k_arg.shape == (
-            s['b'],
-            s['n_comp'],
-            1,
-            s['idx_hd'],
-        ), "(a) dense indexer score: k shape (must be unsqueezed h_kv=1)"
-        assert w_arg.shape == (s['b'], s['sq'], s['idx_nh']), "(a) dense indexer score: w shape"
-        assert idx_call.kwargs['qhead_per_kv_head'] == s['idx_nh']
-        assert idx_call.kwargs['ratio'] == ratio
-        # ``indexer_softmax_scale`` forwarded to the kernel; weights-scaling
-        # trick handled separately in ``_sbhd_to_bshd_indexer_inputs``.
-        assert (
-            idx_call.kwargs['sm_scale'] == idx_scale
-        ), "(a) dense indexer score: sm_scale forwarded"
 
         attn_call = fake_dsa_a.dense_attn_score_recompute_wrapper.call_args
         q_attn, k_attn, lse_arg, sm_arg = attn_call.args
@@ -1481,7 +1461,7 @@ class TestDenseFusedIndexerSparseAttn:
         assert attn_call.kwargs['qhead_per_kv_head'] == s['np_']
         assert attn_call.kwargs['ratio'] == ratio
 
-        # ---- (b) backward kernel selection + grad propagation ------------
+        # ---- (b) forward-eager indexer backward + grad propagation --------
         dk._DSA = None
         dk._flash_mla_sparse_fwd = None
         inputs_b = self._make_inputs(requires_grad=True)
@@ -1511,6 +1491,7 @@ class TestDenseFusedIndexerSparseAttn:
         )
         (output.sum() + indexer_loss).backward()
 
+        # dense_indexer_backward_wrapper is called eagerly during forward.
         fake_dsa_b.dense_indexer_backward_wrapper.assert_called_once()
         fake_dsa_b.indexer_backward_wrapper.assert_not_called()
         ig_call = fake_dsa_b.dense_indexer_backward_wrapper.call_args
