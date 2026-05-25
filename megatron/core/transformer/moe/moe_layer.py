@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -28,6 +29,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceCUDAGraphTokenDispatcher,
 )
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
@@ -460,6 +462,11 @@ class MoELayer(BaseMoELayer):
         it is computed here.
         """
         shared_expert_output = None
+        if (
+            is_graph_capturing()
+            and bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0")))
+        ):
+            return shared_expert_output
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
             if self.shared_experts_recompute:

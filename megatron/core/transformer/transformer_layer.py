@@ -1050,6 +1050,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
+                and not bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0")))
             ):
                 submodules += [self.mlp.shared_experts]
         return submodules
@@ -1138,6 +1139,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
+                and not bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0")))
             ):
                 # The shared expert output is the last second element in the CUDA graph output.
                 shared_expert_output = cuda_graph_output.pop()
