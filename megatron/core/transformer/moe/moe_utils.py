@@ -1340,8 +1340,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         ctx.weight_dtype = weight.dtype
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
+        use_te_gemm = (
+            te_general_gemm is not None
+            and router_dtype != torch.float64
+            and not bool(int(os.environ.get("MCORE_MOE_ROUTER_GATING_DISABLE_TE_GEMM", "0")))
+        )
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
+        if use_te_gemm:
             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
         elif bias is None:
@@ -1376,8 +1381,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         _debug_raise_if_nan(weight, "backward.saved_weight")
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
+        use_te_gemm = (
+            te_general_gemm is not None
+            and ctx.router_dtype != torch.float64
+            and not bool(int(os.environ.get("MCORE_MOE_ROUTER_GATING_DISABLE_TE_GEMM", "0")))
+        )
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+        if use_te_gemm:
             grad_input = te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
