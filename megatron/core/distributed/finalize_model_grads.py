@@ -491,6 +491,37 @@ def finalize_model_grads(
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
+    # Drain any in-flight GTP reduce-scatters on rs_stream before the DP gradient sync.
+    # Expert backward runs eagerly (not in CUDA graphs), so its GTP RS operations on
+    # rs_stream may still be writing to main_grad when finish_grad_sync starts the DP
+    # allreduce on main_stream.
+    if (
+        config.generalized_tensor_parallel_size > 1
+        or config.expert_generalized_tensor_parallel_size > 1
+    ):
+        from megatron.experimental.gtp import (
+            HAVE_GTP,
+            get_all_ag_streams,
+            get_all_rs_streams,
+            wait_async_comms,
+        )
+
+        if HAVE_GTP:
+            wait_async_comms()
+            for s in get_all_ag_streams():
+                torch.cuda.current_stream().wait_stream(s)
+            for s in get_all_rs_streams():
+                torch.cuda.current_stream().wait_stream(s)
+
+    # Wait for captured bwd Phase 2 (main_grad.add_) on each CG runner's
+    # stream.  bwd_completion_event only covers Phase 1; Phase 2 runs after
+    # it on runner.stream with no other sync to main_stream.
+    if config.generalized_tensor_parallel_size > 1:
+        from megatron.core.transformer.cuda_graphs import get_gtp_phase2_completion_events
+
+        for evt in get_gtp_phase2_completion_events():
+            torch.cuda.current_stream().wait_event(evt)
+
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)

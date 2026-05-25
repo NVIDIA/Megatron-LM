@@ -29,6 +29,7 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
     prepare_input_tensors_for_wgrad_compute,
 )
+from megatron.experimental.gtp import HAVE_GTP, GTPEmbeddingWeight, wrap_module_params_gtp
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
@@ -218,6 +219,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         reduce_scatter_embeddings: bool = False,
         config: ModelParallelConfig,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(VocabParallelEmbedding, self).__init__()
         # Keep the input dimensions.
@@ -280,6 +282,20 @@ class VocabParallelEmbedding(torch.nn.Module):
                     tensor=self.weight, is_parallel=True, dim=0, stride=1
                 )
 
+        self.ps_size = 1
+        if gtp_group is not None and gtp_group.size() > 1:
+            assert HAVE_GTP, (
+                "generalized_tensor_parallel_size > 1 requires megatron.experimental.gtp to import "
+                "successfully (it pulls in low-precision tensor primitives from "
+                "transformer_engine)."
+            )
+            wrap_module_params_gtp(self, ["weight"], gtp_group)
+            self.ps_size = gtp_group.size()
+            # Nothing prefetches embedding — it is head of the UNGRAPHED
+            # chain in fwd, and its bwd bypasses all_gather_and_prefetch_bwd
+            # via GTPEmbeddingWeight.backward.
+            self.weight._need_weight_prefetch = False
+
     def forward(self, input_):
         """Forward.
 
@@ -294,12 +310,17 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input[input_mask] = 0
         else:
             masked_input = input_
+
+        weight = self.weight
+        if self.ps_size > 1:
+            weight = GTPEmbeddingWeight.apply(self.weight)
+
         # Get the embeddings.
         if self.deterministic_mode:
-            output_parallel = self.weight[masked_input]
+            output_parallel = weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, self.weight)
+            output_parallel = F.embedding(masked_input, weight)
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0
@@ -469,6 +490,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_output_buffer,
         wgrad_deferral_limit,
         tp_group,
+        ps_size,
     ):
         """Forward."""
         if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
@@ -476,6 +498,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             main_grad = None
         ctx.save_for_backward(input, weight)
+
+        if ps_size > 1:
+            weight = weight.all_gather_and_prefetch(fwd=True)
+
         # We can't save main_grad in save_for_backward as this module would be
         # reused across layers like MTP logits. So, to prevent in-place modification
         # checks we save the tensor in ctx.
@@ -487,6 +513,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.grad_output_buffer = grad_output_buffer
         ctx.tp_group = tp_group
+        ctx.ps_size = ps_size
 
         if sequence_parallel:
             dim_size = list(input.size())
@@ -510,6 +537,13 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         input, weight = ctx.saved_tensors
         main_grad = ctx.main_grad
         use_bias = ctx.use_bias
+
+        # GTP: re-gather weight for dgrad
+        if ctx.ps_size > 1:
+            sharded_weight = weight
+            weight = sharded_weight.all_gather_and_prefetch_bwd()
+            ctx.gradient_accumulation_fusion = False
+
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
         handle = None
@@ -643,16 +677,31 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
+        # GTP: reduce-scatter wgrad
+        if ctx.ps_size > 1 and grad_weight is not None:
+            grad_weight = sharded_weight.wgrad_reduce_scatter(grad_weight)
+
         if ctx.sequence_parallel:
             handle.wait()
             # Need to return None's as gradient has to flow for all the input arguments
             # provided during forward
-            return (sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None)
+            return (
+                sub_grad_input,
+                grad_weight,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
         if ctx.allreduce_dgrad:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None
 
 
 def linear_with_grad_accumulation_and_async_allreduce(
@@ -665,6 +714,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ps_size: int = 1,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -741,6 +791,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         grad_output_buffer,
         wgrad_deferral_limit,
         tp_group,
+        ps_size,
     ]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:
@@ -835,6 +886,7 @@ class ColumnParallelLinear(torch.nn.Module):
         tp_comm_buffer_name: Optional[str] = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -913,6 +965,16 @@ class ColumnParallelLinear(torch.nn.Module):
             setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
         else:
             self.weight = None
+
+        self.ps_size = 1
+        if gtp_group is not None and gtp_group.size() > 1:
+            assert HAVE_GTP, (
+                "generalized_tensor_parallel_size > 1 requires megatron.experimental.gtp to import "
+                "successfully (it pulls in low-precision tensor primitives from "
+                "transformer_engine)."
+            )
+            wrap_module_params_gtp(self, ["weight"], gtp_group)
+            self.ps_size = gtp_group.size()
 
         if bias:
             if config.use_cpu_initialization:
@@ -1066,6 +1128,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 else None
             ),
             tp_group=self.tp_group,
+            ps_size=self.ps_size,
         )
 
         gather_output = self.gather_output
@@ -1181,6 +1244,7 @@ class RowParallelLinear(torch.nn.Module):
         is_expert: bool = False,
         tp_comm_buffer_name: str | None = None,  # Not used
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(RowParallelLinear, self).__init__()
 
@@ -1261,6 +1325,16 @@ class RowParallelLinear(torch.nn.Module):
                 )
         setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
 
+        self.ps_size = 1
+        if gtp_group is not None and gtp_group.size() > 1:
+            assert HAVE_GTP, (
+                "generalized_tensor_parallel_size > 1 requires megatron.experimental.gtp to import "
+                "successfully (it pulls in low-precision tensor primitives from "
+                "transformer_engine)."
+            )
+            wrap_module_params_gtp(self, ["weight"], gtp_group)
+            self.ps_size = gtp_group.size()
+
         if bias:
             if config.use_cpu_initialization:
                 self.bias = Parameter(torch.empty(self.output_size, dtype=config.params_dtype))
@@ -1333,6 +1407,7 @@ class RowParallelLinear(torch.nn.Module):
             sequence_parallel=False,
             tp_group=None,
             grad_output_buffer=None,
+            ps_size=self.ps_size,
         )
 
         # All-reduce across all the partitions.

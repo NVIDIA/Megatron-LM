@@ -117,6 +117,12 @@ class ProcessGroupCollection:
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
 
+    # _GENERALIZED_TENSOR_PARALLEL_GROUP
+    gtp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EXPERT_GENERALIZED_TENSOR_PARALLEL_GROUP
+    expt_gtp: torch.distributed.ProcessGroup = field(init=False)
+
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
     # to have sharded_state_dict can take the PG and pass it down
@@ -247,6 +253,12 @@ class ProcessGroupCollection:
                 check_initialized=False,
                 with_context_parallel=True,
             ),
+            'gtp': partial(
+                parallel_state.get_generalized_tensor_parallel_group, check_initialized=False
+            ),
+            'expt_gtp': partial(
+                parallel_state.get_expert_generalized_tensor_parallel_group, check_initialized=False
+            ),
         }
 
         assert all(
@@ -292,7 +304,10 @@ class ProcessGroupCollection:
         from megatron.core.utils import get_model_config
 
         if pg_collection is None:
-            # Use parallel_state groups
+            # Use parallel_state groups.
+            # Dense (non-GTP) params use with_gtp=False (full DP group) to maximize
+            # optimizer state sharding. GTP params use with_gtp=True (smaller group)
+            # since GTP's reduce-scatter already handled the GTP dimension.
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, partial_data_parallel=False
             )
@@ -302,9 +317,15 @@ class ProcessGroupCollection:
             intra_dp_cp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=True, partial_data_parallel=True
             )
+            intra_dp_cp_with_gtp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, with_gtp=True
+            )
             expt_dp_group = parallel_state.get_expert_data_parallel_group()
             intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
-                partial_expert_data_parallel=True
+                partial_expert_data_parallel=True, with_gtp=True
+            )
+            intra_expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(
+                with_gtp=True
             )
             intra_dist_opt_group = parallel_state.get_intra_distributed_optimizer_instance_group()
 
@@ -427,6 +448,18 @@ class ProcessGroupCollection:
                 )
             expt_tp_pp_group = pg_collection.tp_ep_pp
 
+            # 6. GTP with_gtp group (fallback to intra_dp_cp if not provided)
+            if hasattr(pg_collection, 'intra_dp_cp_with_ps'):
+                intra_dp_cp_with_gtp_group = pg_collection.intra_dp_cp_with_ps
+            else:
+                intra_dp_cp_with_gtp_group = intra_dp_cp_group
+
+            # 7. EPS group (fallback to intra_expt_dp if not provided)
+            if hasattr(pg_collection, 'intra_expt_dp_with_eps'):
+                intra_expt_dp_with_egtp_group = pg_collection.intra_expt_dp_with_eps
+            else:
+                intra_expt_dp_with_egtp_group = intra_expt_dp_group
+
             # Gloo groups - not supported when pg_collection is provided
             if use_gloo_process_groups:
                 raise ValueError(
@@ -440,8 +473,10 @@ class ProcessGroupCollection:
             'dp_group': dp_group,
             'dp_cp_group': dp_cp_group,
             'intra_dp_cp_group': intra_dp_cp_group,
+            'intra_dp_cp_with_gtp_group': intra_dp_cp_with_gtp_group,
             'expt_dp_group': expt_dp_group,
             'intra_expt_dp_group': intra_expt_dp_group,
+            'intra_expt_dp_with_egtp_group': intra_expt_dp_with_egtp_group,
             'mp_group': mp_group,
             'expt_tp_pp_group': expt_tp_pp_group,
             'inter_dist_opt_group': inter_dist_opt_group,
@@ -502,6 +537,12 @@ class ProcessGroupCollection:
                     parallel_state.get_intra_distributed_optimizer_instance_group()
                     if ddp_config.use_distributed_optimizer
                     else None
+                ),
+                'intra_dp_cp_with_gtp_group': parallel_state.get_data_parallel_group(
+                    with_context_parallel=True, with_gtp=True
+                ),
+                'intra_expt_dp_with_egtp_group': parallel_state.get_expert_data_parallel_group(
+                    with_gtp=True
                 ),
             }
         else:
@@ -577,6 +618,12 @@ class ProcessGroupCollection:
             result['tp_group'] = pg_collection.tp
             result['pp_group'] = pg_collection.pp
             result['ep_group'] = pg_collection.ep
+
+            # EPS group (fallback to intra_expt_dp if not provided)
+            if hasattr(pg_collection, 'intra_expt_dp_with_eps'):
+                result['intra_expt_dp_with_egtp_group'] = pg_collection.intra_expt_dp_with_eps
+            else:
+                result['intra_expt_dp_with_egtp_group'] = result['intra_expt_dp_group']
 
             return result
 

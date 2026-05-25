@@ -1448,6 +1448,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # For distillation ckpts without ModelOpt state
             args.modelopt_enabled = True
 
+    # Configure GTP padding alignment based on quantization recipe before model construction.
+    from megatron.experimental.gtp import HAVE_GTP, update_gtp_config
+    if HAVE_GTP and (
+        getattr(args, 'generalized_tensor_parallel_size', 1) > 1
+        or getattr(args, 'expert_generalized_tensor_parallel_size', 1) > 1
+    ):
+        if getattr(args, 'fp4', None) is not None:
+            update_gtp_config(pad_for_alignment=16)
+        elif getattr(args, 'fp8_recipe', None) == 'mxfp8':
+            update_gtp_config(pad_for_alignment=32, coalesce_amax_allreduce=False)
+        elif getattr(args, 'fp8', None) is not None:
+            update_gtp_config(pad_for_alignment=16)
+
     # Build model.
     def build_model():
         if (
@@ -1495,6 +1508,30 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if not isinstance(model, list):
         model = [model]
+
+    # Classify each GTP param into its prefetch chain (GRAPHED vs UNGRAPHED)
+    # from args.cuda_graph_modules + moe_shared_expert_overlap. Must run after
+    # model build, before the first forward (which lazily builds chain links).
+    from megatron.experimental.gtp import (
+        GTP_CONFIG,
+        HAVE_GTP,
+        classify_gtp_chains,
+        set_cuda_graph_modules,
+        tag_gtp_params_with_names,
+    )
+    if HAVE_GTP:
+        _raw_modules = getattr(args, 'cuda_graph_modules', None) or []
+        _cg_modules = {getattr(s, 'name', str(s)) for s in _raw_modules} if _raw_modules else None
+        _mse_overlap = getattr(args, 'moe_shared_expert_overlap', False)
+        set_cuda_graph_modules(_cg_modules, moe_shared_expert_overlap=_mse_overlap)
+        for model_module in model:
+            tag_gtp_params_with_names(model_module)
+            classify_gtp_chains(model_module)
+        if (
+            getattr(args, 'generalized_tensor_parallel_size', 1) > 1
+            or getattr(args, 'expert_generalized_tensor_parallel_size', 1) > 1
+        ):
+            print_rank_0(f"GTP enabled. {GTP_CONFIG}")
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these

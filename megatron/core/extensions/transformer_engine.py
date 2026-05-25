@@ -61,6 +61,7 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.experimental.gtp import HAVE_GTP
 
 try:
     import transformer_engine as te
@@ -695,6 +696,7 @@ class TELinear(te.pytorch.Linear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -817,6 +819,10 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
+        if HAVE_GTP:
+            self.gtp_size = get_pg_size(gtp_group) if gtp_group is not None else 1
+            extra_kwargs["gtp_group"] = gtp_group if torch.distributed.is_initialized() else None
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -926,6 +932,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
     ):
         if not HAVE_TE:
@@ -1017,6 +1024,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 "2.3.0.dev0+39c0e70"
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
+
+        if HAVE_GTP:
+            self.gtp_size = get_pg_size(gtp_group) if gtp_group is not None else 1
+            extra_kwargs["gtp_group"] = gtp_group if torch.distributed.is_initialized() else None
 
         self.stride = stride
 
@@ -1126,7 +1137,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}"
+            f"TP={self.tp_size}, "
+            f"GTP={self.gtp_size})"
+            if hasattr(self, "gtp_size")
+            else ")"
         )
 
     def backward_dw(self):
@@ -1153,6 +1167,7 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
     ):
         if not HAVE_TE:
@@ -1186,6 +1201,7 @@ class TEColumnParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
+            gtp_group=gtp_group,
         )
 
         # Set proper partition_stride
@@ -1236,7 +1252,10 @@ class TEColumnParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}"
+            f"TP={self.tp_size}, "
+            f"GTP={self.gtp_size})"
+            if hasattr(self, "gtp_size")
+            else ")"
         )
 
     def backward_dw(self):
@@ -1262,6 +1281,7 @@ class TERowParallelLinear(TELinear):
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1294,6 +1314,7 @@ class TERowParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
+            gtp_group=gtp_group,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -1340,7 +1361,10 @@ class TERowParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}"
+            f"TP={self.tp_size}, "
+            f"GTP={self.gtp_size})"
+            if hasattr(self, "gtp_size")
+            else ")"
         )
 
     def backward_dw(self):
@@ -1737,6 +1761,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self._tp_group = tp_group
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
+            gtp_group = pg_collection.expt_gtp
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -1756,6 +1781,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
+            if HAVE_GTP:
+                self.gtp_size = get_pg_size(gtp_group) if gtp_group is not None else 1
+                extra_kwargs["gtp_group"] = (
+                    gtp_group if torch.distributed.is_initialized() else None
+                )
             if is_te_min_version("2.14.0"):
                 extra_kwargs["single_grouped_weight"] = getattr(
                     config, "moe_single_grouped_weight", False
@@ -2146,6 +2176,17 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """
             if self.delay_wgrad_compute:
                 super().backward_dw()
+
+        def __repr__(self):
+            return (
+                f"{type(self).__name__}(per expert(["
+                f"in={self.in_features}, out={self.out_features}]) "
+                f"X num_gemms={self.num_gemms}, "
+                f"bias={self.use_bias}, TP={self.tp_size}, "
+                f"GTP={self.gtp_size})"
+                if hasattr(self, "gtp_size")
+                else ")"
+            )
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
         """

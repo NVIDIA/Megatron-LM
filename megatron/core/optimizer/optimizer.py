@@ -37,6 +37,8 @@ except ImportError:
         multi_tensor_applier = local_multi_tensor_applier
         multi_tensor_scale_impl = local_multi_tensor_scale
 
+from megatron.experimental.gtp import HAVE_GTP, GTPShardedParam
+
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -138,17 +140,33 @@ class MegatronOptimizer(ABC):
         return params
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        """Collects gradients for norm calculation, filtering duplicates.
-
+        """
+        Collects gradients for norm calculation, filtering duplicates.
         This method filters parameters based on whether the gradient is not None,
-        the parameter is not shared (to avoid double-counting gradients), and
-        the parameter is not a replica due to tensor model parallelism.
+        the parameter is not shared (to avoid double-counting gradients),
+        the parameter is not a replica due to tensor model parallelism, and
+        the parameter is not be a GTP duplicate (non-GTP params are identical across GTP peers;
+            only GTP rank 0 should contribute to avoid over-counting).
 
-        Returns:
-            List[torch.Tensor]: A list of gradient tensors filtered for norm calculation.
+        Returns all filtered grads as a single list (for backward compatibility).
+        Use get_main_grads_for_grad_norm_split() to get GTP and non-GTP grads separately.
+        """
+        non_gtp_grads, gtp_grads = self.get_main_grads_for_grad_norm_split()
+        return non_gtp_grads + gtp_grads
+
+    def get_main_grads_for_grad_norm_split(self) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Get main_grads split into (non_gtp_grads, gtp_grads).
+
+        GTP grads may need an extra GTP/EGTP reduction that differs from the
+        optimizer's grad_stats_parallel_group, so callers that compute norms
+        need them separated.
         """
         params = self.get_parameters()
-        grads_for_norm = []
+        non_gtp_grads = []
+        gtp_grads = []
+        ps_rank = parallel_state.get_generalized_tensor_parallel_rank()
+        eps_rank = parallel_state.get_expert_generalized_tensor_parallel_rank()
         for param in params:
             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
                 # Megatron-FSDP always uses decoupled_grad with FusedAdam.
@@ -170,13 +188,36 @@ class MegatronOptimizer(ABC):
                 grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
-            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-                param, getattr(self, 'tp_group', None)
-            )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
-                grads_for_norm.append(grad)
 
-        return grads_for_norm
+            is_gtp_param = getattr(param, 'is_gtp', False) or (
+                HAVE_GTP and isinstance(param, GTPShardedParam)
+            )
+
+            # GTP params are always unique across TP ranks (tensor_model_parallel
+            # attribute is lost during wrap_gtp_sharded_tensor), so skip TP filter.
+            is_not_tp_duplicate = is_gtp_param or (
+                tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                    param, getattr(self, 'tp_group', None)
+                )
+            )
+
+            # GTP-duplicate filter: only needed for non-distributed optimizer.
+            is_expert = not getattr(param, 'allreduce', True)
+            if hasattr(self, 'ddp_config') and self.ddp_config.use_distributed_optimizer:
+                is_not_ps_duplicate = True
+            else:
+                if is_expert:
+                    is_not_ps_duplicate = is_gtp_param or eps_rank == 0
+                else:
+                    is_not_ps_duplicate = is_gtp_param or ps_rank == 0
+
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_ps_duplicate:
+                if is_gtp_param:
+                    gtp_grads.append(grad)
+                else:
+                    non_gtp_grads.append(grad)
+
+        return non_gtp_grads, gtp_grads
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
@@ -208,25 +249,59 @@ class MegatronOptimizer(ABC):
         """Step the optimizer with ready gradients, return successful."""
         return True
 
+    def _compute_grad_norm_with_gtp(self, non_gtp_grads, gtp_grads):
+        """Compute grad norm handling GTP grads that may need extra GTP/EGTP reduction.
+
+        For MoE optimizers, grad_stats_parallel_group = TP×EP×PP which does NOT
+        include EPS. MoE-GTP grads need an extra EPS reduction.
+        For dense-GTP optimizers, grad_stats_parallel_group = TP×PP×GTP which
+        already includes GTP, so no extra reduction is needed.
+        """
+        grad_stats_group = self.get_grad_stats_parallel_group()
+
+        if not gtp_grads:
+            return get_grad_norm_fp32(non_gtp_grads, grad_stats_parallel_group=grad_stats_group)
+
+        # Check if this optimizer handles expert params that need EPS reduction.
+        # The model_parallel group for dense/GTP optimizers = TP×PP×GTP (includes GTP),
+        # but for MoE optimizers = TP×EP×PP (does NOT include EPS).
+        eps_world_size = parallel_state.get_expert_generalized_tensor_parallel_world_size()
+        is_expert_optimizer = any(not getattr(p, 'allreduce', True) for p in self.get_parameters())
+        needs_eps_reduce = is_expert_optimizer and eps_world_size > 1
+
+        if not needs_eps_reduce:
+            # Dense/GTP optimizer: grad_stats_group already covers GTP.
+            return get_grad_norm_fp32(
+                non_gtp_grads + gtp_grads, grad_stats_parallel_group=grad_stats_group
+            )
+
+        # MoE optimizer with EPS: compute GTP norm separately, add EPS reduction.
+        non_gtp_norm = get_grad_norm_fp32(non_gtp_grads, grad_stats_parallel_group=grad_stats_group)
+        gtp_norm = get_grad_norm_fp32(gtp_grads, grad_stats_parallel_group=grad_stats_group)
+        # get_grad_norm_fp32 returns a float. We need to do the EPS reduction on GPU.
+        gtp_norm_2 = torch.tensor([gtp_norm**2], dtype=torch.float, device='cuda')
+        torch.distributed.all_reduce(
+            gtp_norm_2,
+            op=torch.distributed.ReduceOp.SUM,
+            group=parallel_state.get_expert_generalized_tensor_parallel_group(),
+        )
+        total_norm_2 = non_gtp_norm**2 + gtp_norm_2.item()
+        return total_norm_2**0.5
+
     @torch.no_grad()
     def get_grad_norm(self):
         """Compute and return grad norm."""
-        grads_for_norm = self.get_main_grads_for_grad_norm()
-        total_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
-        return total_norm
+        non_gtp_grads, gtp_grads = self.get_main_grads_for_grad_norm_split()
+        return self._compute_grad_norm_with_gtp(non_gtp_grads, gtp_grads)
 
     def clip_grad_norm(self, clip_grad: float) -> float:
         """Compute and return grad norm, also clip grads."""
         params = self.get_parameters()
         if params:
-            grads_for_norm = self.get_main_grads_for_grad_norm()
+            non_gtp_grads, gtp_grads = self.get_main_grads_for_grad_norm_split()
         else:
-            grads_for_norm = []
-        grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
+            non_gtp_grads, gtp_grads = [], []
+        grad_norm = self._compute_grad_norm_with_gtp(non_gtp_grads, gtp_grads)
 
         if params:
             clip_grad_by_total_norm_fp32(
@@ -246,6 +321,7 @@ class MegatronOptimizer(ABC):
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
         params = self.get_parameters()
+        use_dist_opt = hasattr(self, 'ddp_config') and self.ddp_config.use_distributed_optimizer
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
@@ -256,6 +332,7 @@ class MegatronOptimizer(ABC):
                 and getattr(params[0], "__fsdp_param__", False)
             ),
             tp_group=getattr(self, 'tp_group', None),
+            use_distributed_optimizer=use_dist_opt,
         )
 
     @abstractmethod
@@ -698,8 +775,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
-                            # Create a copy
                             main_param = param.detach().clone().float()
+                            if HAVE_GTP and isinstance(param, GTPShardedParam):
+                                main_param.is_gtp = True
+                            else:
+                                main_param.is_gtp = False
+
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):

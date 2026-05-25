@@ -20,6 +20,7 @@ from typing import Any, Dict, List
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
+from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -57,6 +58,17 @@ try:
 except:
     HAVE_TE_GRAPHS = False
 
+from megatron.experimental.gtp import (
+    GTP_CONFIG,
+    HAVE_GTP,
+    GTPChain,
+    GTPShardedParam,
+    get_ag_stream,
+    get_rs_stream,
+    reallocate_gtp_cache_to_mempool,
+    wait_async_comms,
+)
+
 try:
     from tqdm import tqdm
 
@@ -67,6 +79,29 @@ except:
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
+
+
+def _set_skip_fp8_weight_update_tensor(value):
+    """Compat shim — TE main removed FP8GlobalStateManager.set_skip_fp8_weight_update_tensor
+    in favor of direct access to quantization_state.skip_fp8_weight_update_tensor.
+    """
+    qstate = FP8GlobalStateManager.quantization_state
+    if qstate.skip_fp8_weight_update_tensor is None:
+        qstate.skip_fp8_weight_update_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+    qstate.skip_fp8_weight_update_tensor.fill_(value)
+
+
+_GTP_PHASE2_COMPLETION_EVENTS: List[torch.cuda.Event] = []
+
+
+def get_gtp_phase2_completion_events() -> List[torch.cuda.Event]:
+    """Return all GTP bwd Phase 2 completion events from CG runners.
+
+    finalize_model_grads waits on these before reading main_grad,
+    ensuring captured main_grad.add_ on runner.stream has completed.
+    """
+    return _GTP_PHASE2_COMPLETION_EVENTS
+
 
 # Freeze GC during capture.
 # TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
@@ -391,6 +426,17 @@ class _CudagraphGlobalRecord:
                     "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
                 )
 
+        if any(r[0].generalized_tensor_parallel for r in cls.cudagraph_record):
+            assert HAVE_GTP, (
+                "generalized_tensor_parallel_size > 1 requires megatron.experimental.gtp to import "
+                "successfully (it pulls in low-precision tensor primitives from "
+                "transformer_engine)."
+            )
+            reallocate_gtp_cache_to_mempool(
+                torch.cuda.current_device(), CudaGraphManager.global_mempool
+            )
+            GTP_CONFIG.check_param_states = False
+
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -510,6 +556,7 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _GTP_PHASE2_COMPLETION_EVENTS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -561,6 +608,27 @@ class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
     cudagraph io and fp8/fp4 if used."""
 
+    ## Capture-time sync schemes (wait_async_comms is called INSIDE the captured
+    #  graph so the drain ops are embedded in the graph itself, not before replay).
+    #
+    #  Fwd — single-phase drain (full join before completion_event):
+    #    runner_N.stream:  GEMM ──▶ wait_async_comms ▶ _wait_side_streams ──fwd_completion_event.record
+    #    ag_stream:        AG ──────────────────────▶ ag_event.record
+    #    main_stream:                                                       fwd_completion_event.wait ▶ [next runner]
+    #    main_stream unblocks after ag/rs streams are fully drained, so eager
+    #    ops that follow see completed data.
+    #
+    #  Bwd — phased drain (cross-graph RS overlap, see _CudaGraphRunner.backward):
+    #    runner_N.stream:  GEMM ─▶ Phase 1 (drain AG) ─▶ fence ─▶ bwd_completion_event.record ─▶ Phase 2 (wait_side_streams) ─▶ phase2_event
+    #    ag_stream:        AG ──────────────────▶ ag_event.record ▶ fence_event.record
+    #    rs_stream:        RS_issue ──▶ handle.wait ▶ rs_event.record ▶ main_grad.add_ ─────────────────────────────────────────────────────┐
+    #    main_stream:                                              bwd_completion_event.wait ▶ [next runner]                                  │
+    #                                                                                                              phase2_event.wait (in finalize_model_grads) ◀─┘
+    #    main_grad.add_ runs on rs_stream right after NCCL RS — concurrent with
+    #    Phase 1 AG drain. By the time bwd_completion_event fires and the next
+    #    runner launches, the add_ is done (no SM saturation blocking overlap).
+    #    finalize_model_grads waits phase2_completion_event before DP grad sync.
+
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
         """Replay the forward graph of the passed runner."""
@@ -608,10 +676,17 @@ class _CudagraphReplayNode(torch.autograd.Function):
             # Note that FP8GlobalStateManager.is_first_fp8_module() is inacccurate as each
             # layer may be in its own fp8 context, when the fp8 recipe != delayed_scaling
             if runner.is_first_layer and (runner.fp8_param_cache_updated != is_first_microbatch):
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
+                _set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
-        runner.fwd_graph.replay()
+        if runner.use_stream:
+            runner.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(runner.stream):
+                runner.fwd_graph.replay()
+            torch.cuda.current_stream().wait_event(runner.fwd_completion_event)
+        else:
+            runner.fwd_graph.replay()
+
         return runner.fwd_graph_output_surface
 
     @staticmethod
@@ -644,7 +719,14 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
-        runner.bwd_graph.replay()
+        if runner.use_stream:
+            runner.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(runner.stream):
+                runner.bwd_graph.replay()
+            torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
+        else:
+            runner.bwd_graph.replay()
+
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
@@ -659,10 +741,38 @@ class _CudagraphReplayNode(torch.autograd.Function):
         for param, grad_added in runner.groundtruth_grad_added_to_main_grad.items():
             param.grad_added_to_main_grad = grad_added
 
+        # Fire DDP grad-ready hooks for GTP params whose main_grad.add_ was
+        # captured in this runner's bwd_graph. DDP's autograd hook returns
+        # early under is_graph_capturing and doesn't re-run from Python at
+        # replay, so trigger it explicitly here to let DDP RS overlap with
+        # the rest of backward. See _compute_finalized_during_bwd_capture
+        # for how the set is built.
+        #
+        # Fire on rs_stream (GRAPHED chain, GTP group) — the stream that
+        # ran the captured main_grad.add_(wgrad_rs). Stream FIFO orders the
+        # hook (check_grads' grad_data.norm and DDP-RS preEvent record)
+        # after that write. wait_event(bwd_phase2_completion_event) is
+        # defensive against future Phase 2 work on other sub-streams.
+        # main_stream stays unblocked so the next runner can start in
+        # parallel.
+        if runner.generalized_tensor_parallel and runner.finalized_during_bwd_capture:
+            gtp_rs_stream = get_rs_stream(
+                GTPChain.GRAPHED.value, parallel_state.get_generalized_tensor_parallel_group()
+            )
+            gtp_rs_stream.wait_event(runner.bwd_phase2_completion_event)
+            with torch.cuda.stream(gtp_rs_stream):
+                for param in runner.finalized_during_bwd_capture:
+                    hook = getattr(param, '_grad_accum_hook', None)
+                    if hook is not None:
+                        hook()
+
         # Replaying the next bwd graph destroys the data held in static_grad_inputs, so clone
         # wgrads as autograd may launch the next graph before wgrads are accumulated
         dgrads = runner.static_grad_inputs[: runner.num_dgrads]
-        wgrads = (g.clone() for g in runner.static_grad_inputs[runner.num_dgrads :])
+        wgrads = (
+            g.clone() if torch.is_tensor(g) else g
+            for g in runner.static_grad_inputs[runner.num_dgrads :]
+        )
 
         return None, None, *dgrads, *wgrads
 
@@ -711,6 +821,14 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fp4_runtime_enabled = None
         self.deallocate_pipeline_outputs = False
         self.num_warmup_steps = 0
+        self.use_stream = False
+        self.generalized_tensor_parallel = False
+        self.fwd_side_streams = []
+        self.bwd_side_streams = []
+        # Populated by create_bwd_graph: GTP params whose main_grad.add_ was captured in THIS
+        # graph.  Used in Graphed.backward's post-replay hook loop to fire DDP hooks only in the
+        # graph whose replay populates main_grad.
+        self.finalized_during_bwd_capture = []
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -735,16 +853,99 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
+            self.generalized_tensor_parallel = (
+                self.base_module.config.generalized_tensor_parallel_size > 1
+            )
+
+            # Ensure internal warmup (inside create_fwd_graph) has >= 2 steps
+            # for GTP: 1st builds chain + tickets, 2nd exercises prefetch path.
+            if self.generalized_tensor_parallel:
+                self.num_warmup_steps = max(self.num_warmup_steps, 2)
+
+            if self.generalized_tensor_parallel:
+                self.use_stream = True
+                self.stream = torch.cuda.Stream()
+                self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
+                self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
+                # GRAPHED chain only hits dense modules (mamba/attn/moe_router),
+                # all sharded across PARAMETER_SHARDING_GROUP. Materialize that
+                # (chain, group) stream pair now so it is registered as a
+                # captured side stream before the first forward.
+                from megatron.core.parallel_state import get_generalized_tensor_parallel_group
+
+                gtp_group = get_generalized_tensor_parallel_group()
+                graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
+                graphed_rs = get_rs_stream(GTPChain.GRAPHED.value, gtp_group)
+                self._register_side_stream(self.fwd_side_streams, graphed_ag)
+                self._register_side_stream(self.bwd_side_streams, graphed_ag)
+                self._register_side_stream(self.bwd_side_streams, graphed_rs)
+                # Bridges Phase 1 (AG drain on ag_stream) into runner_stream
+                # so bwd_completion_event records past NCCL_AG completion.
+                self.bwd_ag_fence_event = torch.cuda.Event()
+                # Records after Phase 2 (RS drain + main_grad.add_) completes
+                # on runner.stream. finalize_model_grads waits on this before
+                # reading main_grad for the DP gradient sync.
+                self.bwd_phase2_completion_event = torch.cuda.Event(
+                    external=True, interprocess=True
+                )
+                _GTP_PHASE2_COMPLETION_EVENTS.append(self.bwd_phase2_completion_event)
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+                _set_skip_fp8_weight_update_tensor(False)
 
             if self.fp4_enabled:
                 from megatron.core.fp4_utils import get_fp4_recipe  # to avoid circular import
 
                 self.fp4_recipe = get_fp4_recipe(self.base_module.config)
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+                _set_skip_fp8_weight_update_tensor(False)
+
+    def _register_side_stream(self, side_streams, stream):
+        """Register a side stream for graph capture/replay synchronization."""
+        side_streams.append(stream)
+
+    def _sync_against_side_streams(self, side_streams):
+        """Make registered side streams wait for the current stream.
+        Also injects a dummy kernel into each stream to ensure it is non-empty,
+        which is required for CUDA graph capture (joining an empty captured
+        stream is a CUDA error)."""
+        for s in side_streams:
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                torch.cuda._sleep(1)
+
+    def _wait_side_streams(self, side_streams):
+        """Make the current stream wait for all registered side streams."""
+        for s in side_streams:
+            torch.cuda.current_stream().wait_stream(s)
+
+    def _compute_finalized_during_bwd_capture(self):
+        """Return GTP params whose DDP grad-ready hook fires post-replay
+        of THIS bwd_graph.
+
+        A param's hook must fire in the graph that physically populates its
+        main_grad. Rules, given the cascade walk in wgrad_reduce_scatter
+        finalizes p.next_w on behalf of p:
+          - p.prev_w is None → p is sync-finalized in p's own graph; add p.
+          - p.next_w is not None → p.next_w's main_grad.add_ is captured here
+            via p's cascade; add p.next_w. (For cross-graph chain tails the
+            wait was captured in the producer's Phase 2, but the add lives
+            here regardless, bridged by external rs_event.)
+        """
+        if not HAVE_GTP or GTPShardedParam is None:
+            return []
+        finalized = {}  # id → param
+        for p in self.params_to_backprop:
+            if not isinstance(p, GTPShardedParam):
+                continue
+            if getattr(p, "prev_w", None) is None:
+                for w in getattr(p, "_weights", [p]):
+                    finalized[id(w)] = w
+            next_w = getattr(p, "next_w", None)
+            if next_w is not None:
+                for w in getattr(next_w, "_weights", [next_w]):
+                    finalized[id(w)] = w
+        return list(finalized.values())
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -919,6 +1120,7 @@ class _CudaGraphRunner(torch.nn.Module):
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
             _set_warmup_start()
+
             for _ in range(self.num_warmup_steps):
                 with self.get_quantization_context():
 
@@ -943,6 +1145,10 @@ class _CudaGraphRunner(torch.nn.Module):
                         allow_unused=True,
                     )
 
+                if self.generalized_tensor_parallel:
+                    wait_async_comms(GTPChain.GRAPHED.value)
+                    self._sync_against_side_streams(self.bwd_side_streams)
+
             _set_warmup_end()
 
             with self.get_quantization_context():
@@ -963,9 +1169,21 @@ class _CudaGraphRunner(torch.nn.Module):
                 with torch.cuda.graph(
                     self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
                 ):
+
+                    self._sync_against_side_streams(self.fwd_side_streams)
+
                     fwd_graph_outputs = self.func(
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                     )
+
+                    if self.generalized_tensor_parallel:
+                        wait_async_comms(GTPChain.GRAPHED.value)
+
+                    if self.fwd_side_streams:
+                        self._wait_side_streams(self.fwd_side_streams)
+
+                    if self.use_stream:
+                        self.fwd_completion_event.record()
 
                 # Unfreeze GC.
                 if FREEZE_GC:
@@ -1033,6 +1251,19 @@ class _CudaGraphRunner(torch.nn.Module):
         # to 0 when activation checkpointing is used. See [interaction with recompute].
         global bwd_buffer_reuse_ref_count
 
+        # Tag cross-graph chain-tail GTP params: those whose prev_w lives in
+        # another runner's params_to_backprop. Read by TE's wgrad_reduce_scatter
+        # cascade and wait_async_comms to split the captured RS wait/add across
+        # producer and consumer graphs (avoids cross-capture cudaStreamWaitEvent
+        # on c10d Work.postEvent).
+        if self.generalized_tensor_parallel and HAVE_GTP and GTPShardedParam is not None:
+            pset = {id(p) for p in self.params_to_backprop}
+            for p in self.params_to_backprop:
+                if not isinstance(p, GTPShardedParam):
+                    continue
+                prev_w = getattr(p, "prev_w", None)
+                p._is_cross_graph_tail = prev_w is not None and id(prev_w) not in pset
+
         assert self.grad_enabled
         self.bwd_graph = torch.cuda.CUDAGraph()
 
@@ -1065,11 +1296,16 @@ class _CudaGraphRunner(torch.nn.Module):
                 out_grad.requires_grad = True
             self.static_grad_outputs.append(out_grad)
 
+        torch.cuda.synchronize()
+
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
             gc.freeze()
 
         with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+
+            self._sync_against_side_streams(self.bwd_side_streams)
+
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
                 inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
@@ -1079,9 +1315,53 @@ class _CudaGraphRunner(torch.nn.Module):
                 allow_unused=True,
             )
 
+            # GTP cross-graph RS overlap, two phases:
+            #   Phase 1 — drain AG, fence runner_stream past ag_stream's tail,
+            #             then record bwd_completion_event so main_stream can
+            #             release the next runner while RS is still in flight.
+            #   Phase 2 — drain RS wait on rs_stream. For cross-graph chain
+            #             tails the wait is captured here, the add in the
+            #             consumer's cascade; for within-graph tails both
+            #             happen here (see wait_async_comms).
+            if self.generalized_tensor_parallel:
+                # Phase 1: drain AG; fence runner_stream past ag_stream so
+                # bwd_completion_event records AFTER NCCL_AG completion.
+                wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
+                from megatron.core.parallel_state import get_generalized_tensor_parallel_group
+
+                gtp_group = get_generalized_tensor_parallel_group()
+                graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
+                self.bwd_ag_fence_event.record(graphed_ag)
+                torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
+
+                # Record completion AFTER AG drain + fence but BEFORE RS drain,
+                # so main_stream can trigger the next runner while RS is still
+                # in flight on rs_stream.
+                self.bwd_completion_event.record()
+
+                # Phase 2: in-graph RS drain + finalize.
+                wait_async_comms(GTPChain.GRAPHED.value, finalize_after_drain=True)
+
+            if self.bwd_side_streams:
+                self._wait_side_streams(self.bwd_side_streams)
+
+            if self.generalized_tensor_parallel:
+                # Phase 2 + side-stream join done — record so
+                # finalize_model_grads can wait for main_grad.add_ completion.
+                self.bwd_phase2_completion_event.record()
+
+            if self.use_stream and not self.generalized_tensor_parallel:
+                # Non-GTP path: record after the side-stream join.
+                self.bwd_completion_event.record()
+
         # Unfreeze GC.
         if FREEZE_GC:
             gc.unfreeze()
+
+        # See _compute_finalized_during_bwd_capture for what's in this set and why.
+        self.finalized_during_bwd_capture = (
+            self._compute_finalized_during_bwd_capture() if self.generalized_tensor_parallel else []
+        )
 
         # Constructs a tuple suitable for returning from Graphed.backward:
         # Pads out the actually-needed grads with Nones in gradient slots for inputs
@@ -1677,8 +1957,8 @@ class CudaGraphManager(torch.nn.Module):
                     return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
 
         self.is_first_microbatch = False
-        # If forward only, next replay should be a forward pass as well
-        if is_inference_mode or not torch.is_grad_enabled():
+        # If forward only, next replay should be a forward pass as well.
+        if is_inference_mode or not torch.is_grad_enabled() or not runner.fwd_graph_recorded:
             runner.status = _GraphStatus.FWD_READY
         else:
             runner.status = _GraphStatus.BWD_READY

@@ -823,6 +823,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
             tp_group=pg_collection.tp if pg_collection is not None else None,
+            gtp_group=pg_collection.gtp,
         )
 
         # Build inner layers: two possible paths

@@ -258,6 +258,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            gtp_group=self.pg_collection.gtp,
         )
         # in_proj packs [z, x, B, C, dt] into one ColumnParallelLinear.  Each
         # component is independently TP-sharded but with different sizes.  When
@@ -392,6 +393,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            gtp_group=self.pg_collection.gtp,
         )
 
         # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the

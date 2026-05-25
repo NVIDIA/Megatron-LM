@@ -344,6 +344,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 args.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=args.use_sharp,
+                generalized_tensor_parallel_size=args.generalized_tensor_parallel_size,
+                expert_generalized_tensor_parallel_size=args.expert_generalized_tensor_parallel_size,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 hybrid_context_parallel=args.hybrid_context_parallel,

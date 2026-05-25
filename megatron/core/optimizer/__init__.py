@@ -56,6 +56,7 @@ from megatron.core.optimizer_param_scheduler import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
+from megatron.experimental.gtp import HAVE_GTP, GTPShardedParam
 
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
@@ -346,12 +347,13 @@ def _get_param_groups(
                 param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_gtp = HAVE_GTP and isinstance(param, GTPShardedParam)
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel)
+            key = (param_override_tuple, is_expert_parallel, is_gtp)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -370,7 +372,7 @@ def _get_param_groups(
     param_groups = []
     # Sort keys, None first.
     for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
-        param_override_tuple, is_expert_parallel = key
+        param_override_tuple, is_expert_parallel, is_gtp = key
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -403,6 +405,7 @@ def _get_param_groups(
         param_group = {
             'params': params,
             'is_expert_parallel': is_expert_parallel,
+            'is_gtp': is_gtp,
             'default_config': uses_default_lr_schedule,
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
@@ -920,7 +923,9 @@ def get_megatron_optimizer(
 
     dp_cp_group = process_groups_dict['dp_cp_group']
     intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
+    intra_dp_cp_with_gtp_group = process_groups_dict['intra_dp_cp_with_gtp_group']
     intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
+    intra_expt_dp_with_egtp_group = process_groups_dict['intra_expt_dp_with_egtp_group']
     mp_group = process_groups_dict['mp_group']
     expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
@@ -997,7 +1002,7 @@ def get_megatron_optimizer(
             model_chunk_offset=model_chunk_offset,
             config=config,
             config_overrides=config_overrides,
-            filter_fn=lambda g: not g['is_expert_parallel'],
+            filter_fn=lambda g: not g['is_expert_parallel'] and not g.get('is_gtp', False),
             buffer_name='buffers',
         )
         for model_chunk in dense_model_chunks:
@@ -1029,6 +1034,39 @@ def get_megatron_optimizer(
         )
         model_chunk_offset += 1
 
+    # GTP params: separate optimizer with with_gtp DP group.
+    # GTP params are sharded across GTP peers; their DDP buffers use the with_gtp group.
+    gtp_param_groups, gtp_buffers = _get_param_groups_and_buffers(
+        model_chunks,
+        model_chunk_offset=0,
+        config=config,
+        config_overrides=config_overrides,
+        filter_fn=lambda g: g.get('is_gtp', False) and not g['is_expert_parallel'],
+        buffer_name='gtp_buffers',
+    )
+    if dump_param_to_param_group_map is not None:
+        for param_group in gtp_param_groups:
+            for param in param_group["params"]:
+                param_name = get_global_unique_param_name(model_chunks, param)
+                param_to_param_group[param_name] = param_group_id
+            param_group_id += 1
+    if len(gtp_param_groups) > 0:
+        optimizers.append(
+            _get_megatron_optimizer_based_on_param_groups(
+                config=config,
+                model_chunks=model_chunks,
+                param_groups=gtp_param_groups,
+                per_model_buffers=gtp_buffers,
+                model_parallel_group=mp_group,
+                data_parallel_group=intra_dp_cp_with_gtp_group,
+                data_parallel_group_gloo=None,
+                data_parallel_group_idx=model_parallel_rank,
+                intra_dist_opt_group=intra_dist_opt_group,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
+            )
+        )
+
     moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
         model_chunks,
         model_chunk_offset=0,
@@ -1057,7 +1095,7 @@ def get_megatron_optimizer(
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
                 model_parallel_group=expt_tp_pp_group,
-                data_parallel_group=intra_expt_dp_group,
+                data_parallel_group=intra_expt_dp_with_egtp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,

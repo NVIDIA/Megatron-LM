@@ -169,6 +169,7 @@ class MLP(MegatronModule):
         input_size: Optional[int] = None,
         ffn_hidden_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
 
@@ -217,6 +218,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            gtp_group=gtp_group,
             stride=fc1_stride,
         )
 
@@ -238,6 +240,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
+            gtp_group=gtp_group,
         )
 
     def forward(

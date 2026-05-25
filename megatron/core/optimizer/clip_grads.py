@@ -47,6 +47,9 @@ except ImportError:
         multi_tensor_scale_tensor_impl = None
 
 
+from megatron.experimental.gtp import HAVE_GTP, GTPShardedParam
+
+from .. import parallel_state
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
@@ -59,18 +62,18 @@ def get_grad_norm_fp32(
 ) -> float:
     """Calculate the p-norm of gradients in FP32 precision.
 
-    This function is adapted from `torch.nn.utils.clip_grad.clip_grad_norm_` 
-    and extends it with functionality to handle model-parallel parameters. 
-    It ensures that the norm is correctly computed and reduced across 
-    the specified process group (typically the model-parallel group for 
+    This function is adapted from `torch.nn.utils.clip_grad.clip_grad_norm_`
+    and extends it with functionality to handle model-parallel parameters.
+    It ensures that the norm is correctly computed and reduced across
+    the specified process group (typically the model-parallel group for
     non-distributed optimizers or the entire world for distributed optimizers).
 
     Args:
-        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): An iterable 
+        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): An iterable
             of Tensors or a single Tensor used to calculate the gradient norm.
-        norm_type (Union[int, float]): The type of the p-norm to use. Can be 
+        norm_type (Union[int, float]): The type of the p-norm to use. Can be
             'inf' for infinity norm. Defaults to 2.
-        grad_stats_parallel_group (ProcessGroup, optional): The process group 
+        grad_stats_parallel_group (ProcessGroup, optional): The process group
             used for reducing gradient statistics (e.g., norms and zero counts).
 
     Returns:
@@ -155,13 +158,13 @@ def clip_grad_by_total_norm_fp32(
     Note that the gradients are modified in-place.
 
     Args:
-        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of 
+        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
             Tensors or a single Tensor that will have gradients normalized.
-        max_norm (Union[int, float]): The maximum permissible total norm 
+        max_norm (Union[int, float]): The maximum permissible total norm
             of the gradients.
         total_norm (float): The current total norm of the gradients.
-        use_decoupled_grad (bool, optional): Whether to read from the 
-            '.decoupled_grad' attribute instead of the standard '.grad'. 
+        use_decoupled_grad (bool, optional): Whether to read from the
+            '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.
     """
     # Grads.
@@ -201,22 +204,23 @@ def count_zeros_fp32(
     grad_stats_parallel_group: torch.distributed.ProcessGroup,
     use_decoupled_grad: bool = False,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    use_distributed_optimizer: bool = False,
 ) -> float:
     """Counts the number of zero values in the gradients of the given parameters.
 
-    The count is performed in FP32. This method filters parameters to ensure 
-    gradients are not double-counted by checking if the gradient is not None, 
-    the parameter is not shared, and the parameter is not a replica due 
-    to tensor model parallelism. It also handles parameters managed by 
+    The count is performed in FP32. This method filters parameters to ensure
+    gradients are not double-counted by checking if the gradient is not None,
+    the parameter is not shared, and the parameter is not a replica due
+    to tensor model parallelism. It also handles parameters managed by
     Megatron FSDP specifically.
 
     Args:
-        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of 
+        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
             Tensors or a single Tensor whose gradients will be checked for zeros.
-        grad_stats_parallel_group (ProcessGroup): The process group used for 
+        grad_stats_parallel_group (ProcessGroup): The process group used for
             reducing the zero count across distributed ranks.
-        use_decoupled_grad (bool, optional): If True, reads from the 
-            '.decoupled_grad' attribute instead of the standard '.grad'. 
+        use_decoupled_grad (bool, optional): If True, reads from the
+            '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.
 
     Returns:
@@ -230,9 +234,11 @@ def count_zeros_fp32(
     #   - grad should not be none
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
+    #   - should not be a GTP duplicate (non-GTP params identical across GTP peers)
     total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
     data_parallel_group = None
     use_megatron_fsdp = False
+    ps_rank = parallel_state.get_generalized_tensor_parallel_rank()
     for param in parameters:
         if getattr(param, "__fsdp_param__", False) and param.grad is not None:
             # If the parameter is managed by Megatron FSDP, we need to handle it differently.
@@ -246,7 +252,14 @@ def count_zeros_fp32(
         grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
-        if grad_not_none and is_not_shared and is_not_tp_duplicate:
+        if use_distributed_optimizer:
+            is_not_ps_duplicate = True
+        else:
+            is_gtp_param = getattr(param, 'is_gtp', False) or (
+                HAVE_GTP and isinstance(param, GTPShardedParam)
+            )
+            is_not_ps_duplicate = is_gtp_param or ps_rank == 0
+        if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_ps_duplicate:
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()
