@@ -1,4 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# This is a stdout-reporting standalone script; `print` is intentional.
+# pylint: disable=bad-builtin
 
 """BSHD vs THD correctness test for multimodal_dev packed sequence support.
 
@@ -28,15 +30,12 @@ import sys
 
 import torch
 
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "../../.."),
-)
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from examples.multimodal_dev.forward_step import _build_packed_seq_params, pack_or_pad_batch
+from examples.multimodal_dev.forward_step import pack_or_pad_batch
 from examples.multimodal_dev.tests._helpers import grad_norm, mean_loss
-from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -61,11 +60,9 @@ def _samples_from_bshd(input_ids, labels, loss_mask, seq_lengths=None):
                 "loss_mask": loss_mask[i, :L].clone(),
                 # pack_or_pad_batch requires these keys but the model call
                 # below ignores them; provide minimal dummies.
-                "pixel_values": torch.zeros(
-                    1, 1, device=input_ids.device,
-                ),
+                "pixel_values": torch.zeros(1, 1, device=input_ids.device),
                 "image_grid_thw": torch.tensor(
-                    [[2, 1, 1]], dtype=torch.long, device=input_ids.device,
+                    [[2, 1, 1]], dtype=torch.long, device=input_ids.device
                 ),
             }
         )
@@ -74,9 +71,9 @@ def _samples_from_bshd(input_ids, labels, loss_mask, seq_lengths=None):
 
 def _thd_position_ids(seq_lengths, device):
     """Build ``[1, T]`` THD position_ids: each segment restarts at 0."""
-    return torch.cat(
-        [torch.arange(L, device=device) for L in seq_lengths],
-    ).unsqueeze(0).contiguous()
+    return (
+        torch.cat([torch.arange(L, device=device) for L in seq_lengths]).unsqueeze(0).contiguous()
+    )
 
 
 # ===================================================================
@@ -106,15 +103,7 @@ def _build_model(cfg, vocab_size, max_seq_len):
 # ===================================================================
 
 
-def run_equal_length_test(
-    model,
-    batch_size,
-    seq_len,
-    vocab_size,
-    seed,
-    atol_loss,
-    rtol_grad,
-):
+def run_equal_length_test(model, batch_size, seq_len, vocab_size, seed, atol_loss, rtol_grad):
     """Compare BSHD and THD with equal-length sequences (no padding).
 
     Returns a dict with test metrics for logging.
@@ -126,9 +115,7 @@ def run_equal_length_test(
     input_ids = torch.randint(0, vocab_size, (B, S), device="cuda")
     labels = torch.randint(0, vocab_size, (B, S), device="cuda")
     loss_mask = torch.ones(B, S, device="cuda")
-    position_ids = (
-        torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1).contiguous()
-    )
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1).contiguous()
 
     # ---- BSHD forward / backward ----
     output_bshd = model(
@@ -148,9 +135,7 @@ def run_equal_length_test(
 
     # ---- THD forward / backward ----
     samples = _samples_from_bshd(input_ids, labels, loss_mask)
-    packed = pack_or_pad_batch(
-        samples, use_packed_sequence=True, device="cuda",
-    )
+    packed = pack_or_pad_batch(samples, use_packed_sequence=True, device="cuda")
     psp = packed.pop("packed_seq_params")
     thd_position_ids = _thd_position_ids([S] * B, device="cuda")
 
@@ -222,19 +207,16 @@ def run_variable_length_smoke_test(model, vocab_size, seed):
     for i, sl in enumerate(seq_lengths):
         loss_mask[i, sl:] = 0.0
 
-    samples = _samples_from_bshd(
-        input_ids, labels, loss_mask, seq_lengths=seq_lengths,
-    )
-    packed = pack_or_pad_batch(
-        samples, use_packed_sequence=True, device="cuda",
-    )
+    samples = _samples_from_bshd(input_ids, labels, loss_mask, seq_lengths=seq_lengths)
+    packed = pack_or_pad_batch(samples, use_packed_sequence=True, device="cuda")
     psp = packed.pop("packed_seq_params")
     thd_position_ids = _thd_position_ids(seq_lengths, device="cuda")
 
     T = sum(seq_lengths)
-    assert packed["input_ids"].shape == (1, T), (
-        f"Expected [1, {T}], got {packed['input_ids'].shape}"
-    )
+    assert packed["input_ids"].shape == (
+        1,
+        T,
+    ), f"Expected [1, {T}], got {packed['input_ids'].shape}"
     assert packed["labels"].shape == (1, T)
     assert packed["loss_mask"].shape == (1, T)
     assert psp.cu_seqlens_q.tolist() == [
@@ -287,9 +269,8 @@ def _print_banner(title):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="BSHD vs THD correctness test",
-    )
+    """CLI entry: run the equal-length parity test + variable-length smoke test."""
+    parser = argparse.ArgumentParser(description="BSHD vs THD correctness test")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--vocab-size", type=int, default=1024)
@@ -299,10 +280,12 @@ def main():
     parser.add_argument("--num-kv-heads", type=int, default=2)
     parser.add_argument("--ffn-hidden-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--atol-loss", type=float, default=1e-5,
-                        help="Absolute tolerance for loss comparison")
-    parser.add_argument("--rtol-grad", type=float, default=1e-3,
-                        help="Relative tolerance for grad norm comparison")
+    parser.add_argument(
+        "--atol-loss", type=float, default=1e-5, help="Absolute tolerance for loss comparison"
+    )
+    parser.add_argument(
+        "--rtol-grad", type=float, default=1e-3, help="Relative tolerance for grad norm comparison"
+    )
     args = parser.parse_args()
 
     Utils.initialize_model_parallel(tensor_model_parallel_size=1)
@@ -340,9 +323,11 @@ def main():
         atol_loss=args.atol_loss,
         rtol_grad=args.rtol_grad,
     )
-    print(f"  Config: B={args.batch_size}, S={args.seq_len}, "
-          f"H={args.hidden_size}, L={args.num_layers}, "
-          f"heads={args.num_heads}/{args.num_kv_heads}")
+    print(
+        f"  Config: B={args.batch_size}, S={args.seq_len}, "
+        f"H={args.hidden_size}, L={args.num_layers}, "
+        f"heads={args.num_heads}/{args.num_kv_heads}"
+    )
     print(f"  BSHD loss:             {m['bshd_loss']:.8f}")
     print(f"  THD  loss:             {m['thd_loss']:.8f}")
     print(f"  Loss abs diff:         {m['loss_diff']:.2e}")
@@ -351,10 +336,12 @@ def main():
     print(f"  Grad norm rel diff:    {m['grad_rel']:.2e}")
     print(f"  Per-token max diff:    {m['token_max_diff']:.2e}")
     print(f"  Per-token mean diff:   {m['token_mean_diff']:.2e}")
-    print(f"  Loss match:            {'PASS' if m['loss_ok'] else 'FAIL'} "
-          f"(atol={args.atol_loss})")
-    print(f"  Grad norm match:       {'PASS' if m['grad_ok'] else 'FAIL'} "
-          f"(rtol={args.rtol_grad})")
+    print(
+        f"  Loss match:            {'PASS' if m['loss_ok'] else 'FAIL'} " f"(atol={args.atol_loss})"
+    )
+    print(
+        f"  Grad norm match:       {'PASS' if m['grad_ok'] else 'FAIL'} " f"(rtol={args.rtol_grad})"
+    )
     if not (m["loss_ok"] and m["grad_ok"]):
         all_passed = False
 

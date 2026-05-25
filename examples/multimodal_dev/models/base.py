@@ -32,24 +32,15 @@ def _cp_split_tensor(tensor, seq_dim, cp_size, cp_rank):
     This mirrors ``megatron.core.utils.get_batch_on_this_cp_rank``.
     """
     S = tensor.shape[seq_dim]
-    assert S % (2 * cp_size) == 0, (
-        f"seq_len {S} not divisible by 2*cp_size={2 * cp_size}"
-    )
+    assert S % (2 * cp_size) == 0, f"seq_len {S} not divisible by 2*cp_size={2 * cp_size}"
     tensor = tensor.view(
-        *tensor.shape[:seq_dim],
-        2 * cp_size,
-        S // (2 * cp_size),
-        *tensor.shape[seq_dim + 1 :],
+        *tensor.shape[:seq_dim], 2 * cp_size, S // (2 * cp_size), *tensor.shape[seq_dim + 1 :]
     )
     index = torch.zeros(2, dtype=torch.int64, device=tensor.device)
     index[0] = cp_rank
     index[1] = 2 * cp_size - cp_rank - 1
     tensor = tensor.index_select(seq_dim, index)
-    tensor = tensor.view(
-        *tensor.shape[:seq_dim],
-        -1,
-        *tensor.shape[seq_dim + 2 :],
-    )
+    tensor = tensor.view(*tensor.shape[:seq_dim], -1, *tensor.shape[seq_dim + 2 :])
     return tensor
 
 
@@ -61,9 +52,11 @@ class _NoCPGroup:
     """
 
     def size(self):
+        """Pretend this group has exactly one rank."""
         return 1
 
     def rank(self):
+        """This rank's id within the fake group is always 0."""
         return 0
 
 
@@ -82,9 +75,7 @@ def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
     """
     from transformer_engine.pytorch import cpp_extensions as tex
 
-    idx = tex.thd_get_partitioned_indices(
-        cu_seqlens_padded, total_tokens, cp_size, cp_rank,
-    )
+    idx = tex.thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
     return idx.long()
 
 
@@ -122,8 +113,8 @@ class MultimodalModel(MegatronModule):
         position_embedding_type: str = "rope",
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
-        mrope_section: list = None,
-        mtp_block_spec: ModuleSpec = None,
+        mrope_section: Optional[list] = None,
+        mtp_block_spec: Optional[ModuleSpec] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
     ):
@@ -140,9 +131,7 @@ class MultimodalModel(MegatronModule):
             pre_process=True,
             post_process=True,
             parallel_output=parallel_output,
-            share_embeddings_and_output_weights=(
-                share_embeddings_and_output_weights
-            ),
+            share_embeddings_and_output_weights=(share_embeddings_and_output_weights),
             position_embedding_type=position_embedding_type,
             rotary_percent=rotary_percent,
             rotary_base=rotary_base,
@@ -157,10 +146,7 @@ class MultimodalModel(MegatronModule):
         self.language_model.set_input_tensor(input_tensor[0])
 
     def _scatter_vision_embeddings(
-        self,
-        input_ids: Tensor,
-        text_embeddings: Tensor,
-        vision_embeddings: Tensor,
+        self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings: Tensor
     ) -> Tensor:
         """Replace image-token positions with vision embeddings.
 
@@ -176,39 +162,27 @@ class MultimodalModel(MegatronModule):
         """
         sp = (
             self.config.sequence_parallel
-            and parallel_state.get_tensor_model_parallel_world_size()
-            > 1
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
         )
 
         if sp:
-            text_embeddings = (
-                tensor_parallel.gather_from_sequence_parallel_region(
-                    text_embeddings, tensor_parallel_output_grad=False,
-                )
+            text_embeddings = tensor_parallel.gather_from_sequence_parallel_region(
+                text_embeddings, tensor_parallel_output_grad=False
             )
 
         combined = text_embeddings.transpose(0, 1).contiguous()
         image_mask = input_ids == self.image_token_id
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(
-            mask_expanded, vision_embeddings,
-        )
+        combined = combined.masked_scatter(mask_expanded, vision_embeddings)
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:
-            combined = (
-                tensor_parallel.scatter_to_sequence_parallel_region(
-                    combined,
-                )
-            )
+            combined = tensor_parallel.scatter_to_sequence_parallel_region(combined)
 
         return combined
 
     def compute_position_ids(
-        self,
-        input_ids: Tensor,
-        image_grid_thw: Optional[Tensor] = None,
-        packed_seq_params=None,
+        self, input_ids: Tensor, image_grid_thw: Optional[Tensor] = None, packed_seq_params=None
     ) -> Tensor:
         """Compute position IDs.  Override for MRoPE etc.
 
@@ -216,11 +190,7 @@ class MultimodalModel(MegatronModule):
         accepted for subclass compatibility (e.g. MRoPE in THD mode).
         """
         B, S = input_ids.shape
-        return (
-            torch.arange(S, device=input_ids.device)
-            .unsqueeze(0)
-            .expand(B, -1)
-        )
+        return torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, -1)
 
     def _cp_split_for_forward(
         self,
@@ -245,21 +215,15 @@ class MultimodalModel(MegatronModule):
         """
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
-            return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids,
-            )
+            return (decoder_input, input_ids, labels, loss_mask, attention_mask, position_ids)
         cp_rank = parallel_state.get_context_parallel_rank()
 
         if packed_seq_params is not None:
             total_tokens = (
-                decoder_input.shape[0]
-                if decoder_input is not None
-                else input_ids.shape[1]
+                decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
             )
             idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded,
-                total_tokens, cp_size, cp_rank,
+                packed_seq_params.cu_seqlens_q_padded, total_tokens, cp_size, cp_rank
             )
             if decoder_input is not None:
                 decoder_input = decoder_input.index_select(0, idx)
@@ -270,20 +234,21 @@ class MultimodalModel(MegatronModule):
             if loss_mask is not None:
                 loss_mask = loss_mask.index_select(1, idx)
         else:
+
             def _split(t, seq_dim):
-                return None if t is None else _cp_split_tensor(
-                    t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank,
+                return (
+                    None
+                    if t is None
+                    else _cp_split_tensor(t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
                 )
+
             decoder_input = _split(decoder_input, 0)
             input_ids = _split(input_ids, 1)
             labels = _split(labels, 1)
             loss_mask = _split(loss_mask, 1)
             attention_mask = _split(attention_mask, 1)
 
-        return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids,
-        )
+        return (decoder_input, input_ids, labels, loss_mask, attention_mask, position_ids)
 
     @staticmethod
     def cp_split_loss_mask(loss_mask, packed_seq_params):
@@ -300,13 +265,10 @@ class MultimodalModel(MegatronModule):
         cp_rank = parallel_state.get_context_parallel_rank()
         if packed_seq_params is not None:
             idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded,
-                loss_mask.shape[1], cp_size, cp_rank,
+                packed_seq_params.cu_seqlens_q_padded, loss_mask.shape[1], cp_size, cp_rank
             )
             return loss_mask.index_select(1, idx)
-        return _cp_split_tensor(
-            loss_mask, seq_dim=1, cp_size=cp_size, cp_rank=cp_rank,
-        )
+        return _cp_split_tensor(loss_mask, seq_dim=1, cp_size=cp_size, cp_rank=cp_rank)
 
     @contextlib.contextmanager
     def _thd_mrope_no_cp_override(self, packed_seq_params):
@@ -370,37 +332,29 @@ class MultimodalModel(MegatronModule):
             )
 
         vision_embeddings = None
-        if (
-            self.vision_model is not None
-            and pixel_values is not None
-        ):
-            vision_embeddings = self.vision_model(
-                pixel_values, image_grid_thw,
-            )
+        if self.vision_model is not None and pixel_values is not None:
+            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
 
         if decoder_input is None and self.language_model is not None:
-            text_embeddings = self.language_model.embedding(
-                input_ids=input_ids, position_ids=None,
-            )
+            text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
 
             if vision_embeddings is not None:
                 decoder_input = self._scatter_vision_embeddings(
-                    input_ids, text_embeddings, vision_embeddings,
+                    input_ids, text_embeddings, vision_embeddings
                 )
             else:
                 decoder_input = text_embeddings
 
-        (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids,
-        ) = self._cp_split_for_forward(
-            decoder_input=decoder_input,
-            input_ids=input_ids,
-            labels=labels,
-            loss_mask=loss_mask,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
+        (decoder_input, input_ids, labels, loss_mask, attention_mask, position_ids) = (
+            self._cp_split_for_forward(
+                decoder_input=decoder_input,
+                input_ids=input_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+            )
         )
 
         with self._thd_mrope_no_cp_override(packed_seq_params):

@@ -5,7 +5,7 @@
 import math
 from functools import partial
 from itertools import accumulate
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Optional
 
 import torch
 import torch.nn.functional as F
@@ -46,12 +46,11 @@ def _id_to_dtype(id_val):
 # Tensor broadcast helper
 # -------------------------------------------------------------------
 
+
 def _broadcast_tensor(tensor, src, group, device):
     """Broadcast a single tensor from *src* to all ranks in *group*."""
     ndim = torch.tensor(
-        [len(tensor.shape) if tensor is not None else 0],
-        dtype=torch.long,
-        device=device,
+        [len(tensor.shape) if tensor is not None else 0], dtype=torch.long, device=device
     )
     torch.distributed.broadcast(ndim, src, group=group)
 
@@ -59,18 +58,10 @@ def _broadcast_tensor(tensor, src, group, device):
         return None
 
     if tensor is not None:
-        shape_tensor = torch.tensor(
-            list(tensor.shape), dtype=torch.long, device=device,
-        )
-        dtype_id = torch.tensor(
-            [_dtype_to_id(tensor.dtype)],
-            dtype=torch.long,
-            device=device,
-        )
+        shape_tensor = torch.tensor(list(tensor.shape), dtype=torch.long, device=device)
+        dtype_id = torch.tensor([_dtype_to_id(tensor.dtype)], dtype=torch.long, device=device)
     else:
-        shape_tensor = torch.zeros(
-            ndim.item(), dtype=torch.long, device=device,
-        )
+        shape_tensor = torch.zeros(ndim.item(), dtype=torch.long, device=device)
         dtype_id = torch.zeros(1, dtype=torch.long, device=device)
 
     torch.distributed.broadcast(shape_tensor, src, group=group)
@@ -89,6 +80,7 @@ def _broadcast_tensor(tensor, src, group, device):
 # Batch broadcast across TP ranks
 # -------------------------------------------------------------------
 
+
 def broadcast_data_batch(data, device="cuda"):
     """Broadcast a data-batch dict from TP rank 0 to all TP ranks."""
     src = get_tensor_model_parallel_src_rank()
@@ -101,9 +93,7 @@ def broadcast_data_batch(data, device="cuda"):
         keys = list(data.keys())
         key_str = ",".join(keys)
         key_bytes = key_str.encode("utf-8")
-        key_len = torch.tensor(
-            [len(key_bytes)], dtype=torch.long, device=device,
-        )
+        key_len = torch.tensor([len(key_bytes)], dtype=torch.long, device=device)
     else:
         key_len = torch.zeros(1, dtype=torch.long, device=device)
         keys = []
@@ -111,13 +101,9 @@ def broadcast_data_batch(data, device="cuda"):
     torch.distributed.broadcast(key_len, src, group=group)
 
     if get_tensor_model_parallel_rank() == 0:
-        key_tensor = torch.tensor(
-            list(key_bytes), dtype=torch.uint8, device=device,
-        )
+        key_tensor = torch.tensor(list(key_bytes), dtype=torch.uint8, device=device)
     else:
-        key_tensor = torch.zeros(
-            key_len.item(), dtype=torch.uint8, device=device,
-        )
+        key_tensor = torch.zeros(key_len.item(), dtype=torch.uint8, device=device)
 
     torch.distributed.broadcast(key_tensor, src, group=group)
 
@@ -131,8 +117,7 @@ def broadcast_data_batch(data, device="cuda"):
         if tensor is not None and isinstance(tensor, torch.Tensor):
             tensor = tensor.to(device)
         result[key] = _broadcast_tensor(
-            tensor if isinstance(tensor, torch.Tensor) else None,
-            src, group, device,
+            tensor if isinstance(tensor, torch.Tensor) else None, src, group, device
         )
 
     return result
@@ -142,9 +127,8 @@ def broadcast_data_batch(data, device="cuda"):
 # THD (packed sequence) helpers
 # -------------------------------------------------------------------
 
-def _build_packed_seq_params(
-    seq_lengths: torch.Tensor, device: torch.device,
-) -> PackedSeqParams:
+
+def _build_packed_seq_params(seq_lengths: torch.Tensor, device: torch.device) -> PackedSeqParams:
     """Build ``PackedSeqParams`` from per-sample valid sequence lengths.
 
     Args:
@@ -157,18 +141,14 @@ def _build_packed_seq_params(
     if not isinstance(seq_lengths, torch.Tensor):
         seq_lengths = torch.tensor(seq_lengths)
     lengths_t = seq_lengths.to(device=device, dtype=torch.int32)
-    cu_seqlens = torch.zeros(
-        lengths_t.numel() + 1, dtype=torch.int32, device=device,
-    )
+    cu_seqlens = torch.zeros(lengths_t.numel() + 1, dtype=torch.int32, device=device)
     torch.cumsum(lengths_t, dim=0, out=cu_seqlens[1:])
     max_seqlen = int(lengths_t.max().item())
-    return _build_packed_seq_params_from_cu_seqlens(
-        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-    )
+    return _build_packed_seq_params_from_cu_seqlens(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
 
 def _build_packed_seq_params_from_cu_seqlens(
-    cu_seqlens: torch.Tensor, max_seqlen: int,
+    cu_seqlens: torch.Tensor, max_seqlen: int
 ) -> PackedSeqParams:
     """Build ``PackedSeqParams`` from packed cumulative sequence lengths.
 
@@ -188,12 +168,10 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
-
-
 def pack_or_pad_batch(
-    batch: list[Dict[str, Any]],
+    batch: Optional[list[Dict[str, Any]]],
     use_packed_sequence: bool = False,
-    seq_length: int = None,
+    seq_length: Optional[int] = None,
     device="cuda",
 ) -> Dict[str, Any]:
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD or ``[B, S]`` BSHD.
@@ -235,20 +213,12 @@ def pack_or_pad_batch(
             for sample in batch:
                 seqlen = sample["input_ids"].shape[0]
                 assert (
-                    sample["labels"].shape
-                    == sample["input_ids"].shape
-                    == sample["loss_mask"].shape
+                    sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
                 ), "labels, input_ids, and loss_mask must have the same shape"
                 target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                input_ids_list.append(
-                    F.pad(sample["input_ids"], (0, target_len - seqlen), value=0)
-                )
-                labels_list.append(
-                    F.pad(sample["labels"], (0, target_len - seqlen), value=-100)
-                )
-                loss_mask_list.append(
-                    F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0)
-                )
+                input_ids_list.append(F.pad(sample["input_ids"], (0, target_len - seqlen), value=0))
+                labels_list.append(F.pad(sample["labels"], (0, target_len - seqlen), value=-100))
+                loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
                 pixel_values_list.append(sample["pixel_values"])
@@ -264,11 +234,9 @@ def pack_or_pad_batch(
             packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
-            packed_batch["cu_seqlens"] = torch.tensor(
-                cu_seqlens, dtype=torch.int32, device=device,
-            )
+            packed_batch["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
             packed_batch["cu_seqlens_padded"] = torch.tensor(
-                cu_seqlens_padded, dtype=torch.int32, device=device,
+                cu_seqlens_padded, dtype=torch.int32, device=device
             )
 
         packed_batch = broadcast_data_batch(packed_batch, device=device)
@@ -293,9 +261,7 @@ def pack_or_pad_batch(
         return packed_batch
 
     # ---------- padded (BSHD) branch ----------
-    assert seq_length is not None, (
-        "seq_length must be provided when use_packed_sequence is False"
-    )
+    assert seq_length is not None, "seq_length must be provided when use_packed_sequence is False"
     padded_batch: Dict[str, Any] = {}
 
     if is_src:
@@ -309,21 +275,22 @@ def pack_or_pad_batch(
 
         for sample in batch:
             sample["input_ids"] = F.pad(
-                sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]),
-                value=0,
+                sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]), value=0
             )
             sample["labels"] = F.pad(
-                sample["labels"], (0, target_seqlens - sample["labels"].shape[0]),
-                value=-100,
+                sample["labels"], (0, target_seqlens - sample["labels"].shape[0]), value=-100
             )
             sample["loss_mask"] = F.pad(
-                sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]),
-                value=0,
+                sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]), value=0
             )
 
-        padded_batch["input_ids"] = torch.concat([x["input_ids"].unsqueeze(0) for x in batch], dim=0)
+        padded_batch["input_ids"] = torch.concat(
+            [x["input_ids"].unsqueeze(0) for x in batch], dim=0
+        )
         padded_batch["labels"] = torch.concat([x["labels"].unsqueeze(0) for x in batch], dim=0)
-        padded_batch["loss_mask"] = torch.concat([x["loss_mask"].unsqueeze(0) for x in batch], dim=0)
+        padded_batch["loss_mask"] = torch.concat(
+            [x["loss_mask"].unsqueeze(0) for x in batch], dim=0
+        )
         padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
@@ -334,7 +301,8 @@ def pack_or_pad_batch(
 # get_batch
 # -------------------------------------------------------------------
 
-def get_batch(data_iterator: Iterator[Dict[str, Any]]):
+
+def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
@@ -342,13 +310,9 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     if get_tensor_model_parallel_rank() == 0:
         try:
             data = next(data_iterator)
-            has_data = torch.tensor(
-                [1], dtype=torch.uint8, device=device,
-            )
+            has_data = torch.tensor([1], dtype=torch.uint8, device=device)
         except StopIteration:
-            has_data = torch.tensor(
-                [0], dtype=torch.uint8, device=device,
-            )
+            has_data = torch.tensor([0], dtype=torch.uint8, device=device)
             data = None
     else:
         has_data = torch.empty(1, dtype=torch.uint8, device=device)
@@ -376,10 +340,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
             B, P, D = pv.shape
             batch["pixel_values"] = pv.reshape(B * P, D)
 
-    if (
-        "image_grid_thw" in batch
-        and batch["image_grid_thw"] is not None
-    ):
+    if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
         g = batch["image_grid_thw"]
         if g.dim() == 3:
             batch["image_grid_thw"] = g.squeeze(1)
@@ -391,6 +352,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
 # Loss
 # -------------------------------------------------------------------
 
+
 def loss_func(loss_mask, output_tensor):
     """Compute masked language model loss."""
     losses = output_tensor.float()
@@ -398,9 +360,7 @@ def loss_func(loss_mask, output_tensor):
 
     total_tokens = loss_mask.sum().clone().detach().to(torch.int)
     total_loss = torch.sum(losses.view(-1) * loss_mask)
-    reporting_loss = torch.cat(
-        [total_loss.clone().detach().view(1), total_tokens.view(1)],
-    )
+    reporting_loss = torch.cat([total_loss.clone().detach().view(1), total_tokens.view(1)])
 
     return (total_loss, total_tokens, {"lm loss": reporting_loss})
 
@@ -408,6 +368,7 @@ def loss_func(loss_mask, output_tensor):
 # -------------------------------------------------------------------
 # Forward step
 # -------------------------------------------------------------------
+
 
 def forward_step(data_iterator, model):
     """Forward step for multimodal_dev training."""
@@ -438,17 +399,13 @@ def forward_step(data_iterator, model):
 
     loss_mask = batch.get("loss_mask", None)
     if loss_mask is None:
-        loss_mask = torch.ones_like(
-            batch["input_ids"], dtype=torch.float,
-        )
+        loss_mask = torch.ones_like(batch["input_ids"], dtype=torch.float)
 
     # Slice loss_mask the same way the model sliced its inputs, so the
     # mask aligns with the CP-shard output.  Delegated to MultimodalModel
     # so the slicing rule lives in one place.
     from examples.multimodal_dev.models.base import MultimodalModel
 
-    loss_mask = MultimodalModel.cp_split_loss_mask(
-        loss_mask, batch.get("packed_seq_params", None),
-    )
+    loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, batch.get("packed_seq_params", None))
 
     return output_tensor, partial(loss_func, loss_mask)
