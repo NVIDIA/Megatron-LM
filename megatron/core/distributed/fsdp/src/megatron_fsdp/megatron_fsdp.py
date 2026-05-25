@@ -630,6 +630,22 @@ class MegatronFSDP(torch.nn.Module):
             Utilizes the patched main_grad property of the parameter to allocate
             or fetch the main gradient bucket for the parameter.
             """
+            def _raise_if_nan(tensor, source):
+                if not self.report_nan_in_param_grad or tensor is None:
+                    return
+                local_tensor = to_local_if_dtensor(tensor)
+                if not torch.is_floating_point(local_tensor):
+                    return
+                has_nan = torch.isnan(local_tensor).any()
+                if bool(has_nan.detach().cpu().item()):
+                    name = self.param_to_name.get(param, "<unknown>")
+                    nan_count = int(torch.isnan(local_tensor).sum().detach().cpu().item())
+                    raise RuntimeError(
+                        "[Megatron-FSDP] Detected NaN in "
+                        f"{source}: param={name}, shape={tuple(local_tensor.shape)}, "
+                        f"dtype={local_tensor.dtype}, nan_count={nan_count}"
+                    )
+
             group_id = get_param_group_id(self.param_and_grad_buffer, param)
             group = self.param_and_grad_buffer.parameter_groups[group_id]
             if not group.requires_grad:
@@ -648,7 +664,7 @@ class MegatronFSDP(torch.nn.Module):
                     param.main_grad = param.get_main_grad()
                     if param.grad is not None:
                         if self.report_nan_in_param_grad:
-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
+                            _raise_if_nan(param.grad, "param.grad before main_grad copy")
                         # Copy the gradient into the allocated main gradient bucket.
                         # It will be reduce-scattered and accumulated into gbuf.
                         param.main_grad.copy_(to_local_if_dtensor(param.grad))
@@ -661,7 +677,7 @@ class MegatronFSDP(torch.nn.Module):
                 if not param.grad_added_to_main_grad:
                     if param.grad is not None:
                         if self.report_nan_in_param_grad:
-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
+                            _raise_if_nan(param.grad, "param.grad before main_grad add")
                         # Accumulate the gradient into the main gradient buffer,
                         # because we only reduce once per optimization cycle.
                         param.main_grad = param.get_main_grad()
@@ -670,6 +686,9 @@ class MegatronFSDP(torch.nn.Module):
 
             if param.grad_added_to_main_grad and param.grad is not None:
                 del param.grad
+
+            if self.report_nan_in_param_grad:
+                _raise_if_nan(getattr(param, "main_grad", None), "param.main_grad after grad_acc")
 
             # Reset the grad accumulate flag.
             param.grad_added_to_main_grad = False

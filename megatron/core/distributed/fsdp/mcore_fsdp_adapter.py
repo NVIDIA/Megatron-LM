@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 import random
 from typing import Dict, List, Optional
 
@@ -167,6 +168,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
+                report_nan_in_param_grad=bool(
+                    int(os.environ.get("MCORE_FSDP_REPORT_NAN_IN_PARAM_GRAD", "0"))
+                ),
                 enable_fine_grained_param_gather_hook=(
                     config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
                 ),
