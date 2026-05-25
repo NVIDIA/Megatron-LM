@@ -554,6 +554,33 @@ class MegatronFSDP(torch.nn.Module):
         """
         fsdp_unit_modules = self.fsdp_unit_modules
 
+        def _get_canonical_module_params(module: nn.Module, recurse: bool = True):
+            """Return canonical FSDP buffer params owned by a module."""
+            param_to_direct_module = getattr(
+                self.param_and_grad_buffer, "param_to_direct_module", None
+            )
+            if param_to_direct_module is None:
+                return list(module.parameters(recurse=recurse))
+
+            if recurse:
+                return [
+                    param
+                    for param, (_, direct_module) in param_to_direct_module.items()
+                    if direct_module is module or is_submodule(direct_module, module)
+                ]
+
+            params_by_local_name = {}
+            for param, (_, direct_module) in param_to_direct_module.items():
+                if direct_module is not module:
+                    continue
+                param_name = self.param_and_grad_buffer.param_to_name[param]
+                params_by_local_name[param_name.rsplit(".", 1)[-1]] = param
+            return [
+                params_by_local_name[name]
+                for name, _ in module.named_parameters(recurse=False)
+                if name in params_by_local_name
+            ]
+
         def release_module_parameters(module, bwd, lazy=False, *unused):
             """
             Release the parameters of a given module after completing the forward
@@ -575,12 +602,17 @@ class MegatronFSDP(torch.nn.Module):
                 - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
                 the FP8 transpose cache associated with the module’s parameters.
             """
-            for param in module.parameters():
+            params = (
+                _get_canonical_module_params(module, recurse=True)
+                if self.enable_fine_grained_param_gather_hook
+                else list(module.parameters())
+            )
+            for param in params:
                 bucket_id = get_param_group_id(self.param_and_grad_buffer, param)
                 self.all_gather_pipeline.release_bucket(bucket_id, bwd, lazy=lazy)
 
             if not self.ddp_config.keep_fp8_transpose_cache:
-                release_params_fp8_transpose_cache(module.parameters())
+                release_params_fp8_transpose_cache(params)
 
         def release_params_fp8_transpose_cache(params):
             for param in params:
@@ -749,22 +781,7 @@ class MegatronFSDP(torch.nn.Module):
 
         def _get_direct_module_params(module: nn.Module):
             """Return canonical FSDP buffer params for a module's direct parameters."""
-            param_to_direct_module = getattr(
-                self.param_and_grad_buffer, "param_to_direct_module", None
-            )
-            if param_to_direct_module is None:
-                return list(module.parameters(recurse=False))
-            params_by_local_name = {}
-            for param, (_, direct_module) in param_to_direct_module.items():
-                if direct_module is not module:
-                    continue
-                param_name = self.param_and_grad_buffer.param_to_name[param]
-                params_by_local_name[param_name.rsplit(".", 1)[-1]] = param
-            return [
-                params_by_local_name[name]
-                for name, _ in module.named_parameters(recurse=False)
-                if name in params_by_local_name
-            ]
+            return _get_canonical_module_params(module, recurse=False)
 
         def _mirror_fsdp_param_attrs(module: nn.Module, canonical_params):
             """Mirror FSDP buffer state onto transient wrappers exposed by modules."""
