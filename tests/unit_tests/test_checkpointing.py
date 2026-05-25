@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -27,6 +28,9 @@ from megatron.training.checkpointing import (
     _transpose_first_dim,
     checkpoint_exists,
     cleanup_old_non_persistent_checkpoint,
+    finalize_deletion_processes,
+    find_checkpoint_rank_0,
+    fix_query_key_value_ordering,
     generate_state_dict,
     get_checkpoint_tracker_filename,
     get_checkpoint_name,
@@ -454,6 +458,24 @@ def test_checkpoint_exists_and_load_path_by_args(monkeypatch, tmp_path):
     assert get_load_checkpoint_path_by_args(args).endswith("iter_0000009")
 
 
+def test_find_checkpoint_rank_0_checks_known_layouts(monkeypatch, tmp_path):
+    checkpoint_name = get_checkpoint_name(
+        str(tmp_path),
+        4,
+        pipeline_parallel=True,
+        tensor_rank=0,
+        pipeline_rank=0,
+        expert_parallel=True,
+        expert_rank=0,
+    )
+    Path(checkpoint_name).parent.mkdir(parents=True)
+    Path(checkpoint_name).write_text("checkpoint", encoding="utf-8")
+    monkeypatch.setattr(checkpointing_module.dist_checkpointing, "check_is_distributed_checkpoint", lambda path: False)
+
+    assert find_checkpoint_rank_0(str(tmp_path), 4) == checkpoint_name
+    assert find_checkpoint_rank_0(str(tmp_path), 5) is None
+
+
 def test_checkpoint_version_and_loaded_iteration_helpers(monkeypatch):
     monkeypatch.setattr(checkpointing_module, "_CHECKPOINT_VERSION", None)
     monkeypatch.setattr(checkpointing_module, "_LOADED_ITERATION", None)
@@ -464,6 +486,33 @@ def test_checkpoint_version_and_loaded_iteration_helpers(monkeypatch):
 
     set_checkpoint_version(3.0)
     set_checkpoint_version(3.0)
+
+
+def test_finalize_deletion_processes_joins_finished_and_blocking(monkeypatch):
+    class FakeProcess:
+        def __init__(self, alive):
+            self.alive = alive
+            self.pid = id(self)
+            self.joined = False
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self):
+            self.joined = True
+
+    finished = FakeProcess(alive=False)
+    running = FakeProcess(alive=True)
+    monkeypatch.setattr(checkpointing_module, "_deletion_processes", [finished, running])
+
+    finalize_deletion_processes(blocking=False)
+    assert finished.joined
+    assert not running.joined
+    assert checkpointing_module._deletion_processes == [running]
+
+    finalize_deletion_processes(blocking=True)
+    assert running.joined
+    assert checkpointing_module._deletion_processes == []
 
 
 def test_generate_state_dict_collects_model_optimizer_scheduler_and_rng(create_args):
@@ -533,6 +582,45 @@ def test_transpose_first_dim_uses_attention_shape_metadata():
     assert sorted(last.flatten().tolist()) == sorted(tensor.flatten().tolist())
 
 
+def test_fix_query_key_value_ordering_transposes_legacy_qkv_params(monkeypatch):
+    calls = []
+
+    class FakeParam:
+        def __init__(self):
+            self.data = torch.arange(24).view(12, 2)
+
+    class FakeModel:
+        def __init__(self):
+            self.weight = FakeParam()
+            self.bias = FakeParam()
+            self.other = FakeParam()
+
+        def named_parameters(self):
+            return [
+                ("layer.query_key_value.weight", self.weight),
+                ("layer.query_key_value.bias", self.bias),
+                ("layer.dense.weight", self.other),
+            ]
+
+    def fake_transpose(tensor, num_splits, num_splits_first, model):
+        calls.append((tuple(tensor.shape), num_splits, num_splits_first))
+        return tensor + 1
+
+    model = FakeModel()
+    monkeypatch.setattr(checkpointing_module, "_transpose_first_dim", fake_transpose)
+
+    fix_query_key_value_ordering([model], checkpoint_version=0)
+    fix_query_key_value_ordering(model, checkpoint_version=1.0)
+
+    assert calls == [
+        ((12, 2), 3, True),
+        ((12, 2), 3, True),
+        ((12, 2), 3, False),
+        ((12, 2), 3, False),
+    ]
+    assert torch.equal(model.other.data, torch.arange(24).view(12, 2))
+
+
 def test_cleanup_old_non_persistent_checkpoint_keeps_newest(monkeypatch, tmp_path):
     monkeypatch.setattr(checkpointing_module.torch.distributed, "is_initialized", lambda: False)
 
@@ -568,6 +656,32 @@ def test_maybe_save_dataloader_state_validates_iterator(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="Could not find a save_state"):
         maybe_save_dataloader_state(SimpleNamespace(iterable=object()), 1, str(tmp_path))
+
+
+def test_maybe_save_dataloader_state_calls_supported_iterator(monkeypatch, tmp_path):
+    calls = []
+    iterator = SimpleNamespace(iterable=SimpleNamespace(save_state=lambda: {"state": 1}))
+    monkeypatch.setattr(checkpointing_module.mpu, "is_pipeline_first_stage", lambda ignore_virtual=True: True)
+    monkeypatch.setattr(checkpointing_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_group", lambda: "dp")
+    monkeypatch.setattr(checkpointing_module.torch.distributed, "barrier", lambda group=None: calls.append(("barrier", group)))
+    monkeypatch.setattr(checkpointing_module, "ensure_directory_exists", lambda path: calls.append(("mkdir", path)))
+    monkeypatch.setattr(
+        checkpointing_module,
+        "get_checkpoint_name",
+        lambda path, iteration, basename: str(tmp_path / basename),
+    )
+    monkeypatch.setattr(checkpointing_module.torch, "save", lambda state, path: calls.append(("save", state, path)))
+
+    maybe_save_dataloader_state(iterator, iteration=7, dataloader_save_path=str(tmp_path))
+
+    assert calls == [
+        ("barrier", "dp"),
+        ("mkdir", str(tmp_path / "train_dataloader_dprank000.pt")),
+        ("barrier", "dp"),
+        ("save", {"dataloader_state_dict": {"state": 1}}, str(tmp_path / "train_dataloader_dprank000.pt")),
+    ]
 
 
 def test_load_args_from_checkpoint_updates_missing_values(monkeypatch, tmp_path):

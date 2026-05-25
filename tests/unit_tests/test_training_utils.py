@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import json
+import types
 import warnings
 from types import SimpleNamespace
 
@@ -166,3 +167,83 @@ def test_warn_rank_0_uses_explicit_rank():
         utils.warn_rank_0("hidden warning", rank=1)
 
     assert captured == []
+
+
+def test_print_rank_last_handles_uninitialized_and_last_rank(monkeypatch, capsys):
+    monkeypatch.setattr(utils.torch.distributed, "is_initialized", lambda: False)
+    utils.print_rank_last("visible without distributed")
+    assert "visible without distributed" in capsys.readouterr().out
+
+    monkeypatch.setattr(utils.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(utils.torch.distributed, "get_backend", lambda: "nccl")
+    monkeypatch.setattr(utils.torch.distributed, "get_world_size", lambda: 4)
+    monkeypatch.setattr(utils, "_safe_get_rank", lambda: 3)
+    utils.print_rank_last("visible on last rank")
+    assert "visible on last rank" in capsys.readouterr().out
+
+    monkeypatch.setattr(utils, "_safe_get_rank", lambda: 1)
+    utils.print_rank_last("hidden on middle rank")
+    assert "hidden on middle rank" not in capsys.readouterr().out
+
+
+def test_append_to_progress_log_writes_only_rank_zero(monkeypatch, tmp_path):
+    args = SimpleNamespace(save=str(tmp_path), world_size=8)
+    barriers = []
+    monkeypatch.setenv("SLURM_JOB_ID", "job-123")
+    monkeypatch.setattr(utils, "get_args", lambda: args)
+    monkeypatch.setattr(utils.torch.distributed, "barrier", lambda: barriers.append("barrier"))
+    monkeypatch.setattr(utils.torch.distributed, "get_rank", lambda: 0)
+
+    utils.append_to_progress_log("Starting job")
+
+    content = (tmp_path / "progress.txt").read_text(encoding="utf-8")
+    assert barriers == ["barrier"]
+    assert "Job ID: job-123" in content
+    assert "# GPUs: 8" in content
+    assert "Starting job" in content
+
+    monkeypatch.setattr(utils.torch.distributed, "get_rank", lambda: 1)
+    utils.append_to_progress_log("hidden", barrier=False)
+    assert "hidden" not in (tmp_path / "progress.txt").read_text(encoding="utf-8")
+
+
+def test_report_memory_uses_cuda_stats_and_data_parallel_rank(monkeypatch, capsys):
+    args = SimpleNamespace(log_device_memory_used=True)
+    monkeypatch.setattr(utils, "get_args", lambda: args)
+    monkeypatch.setattr(utils.mpu, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(utils.torch.distributed, "get_rank", lambda: 7)
+    monkeypatch.setattr(utils.torch.cuda, "memory_allocated", lambda: 1024 * 1024)
+    monkeypatch.setattr(utils.torch.cuda, "max_memory_allocated", lambda: 2 * 1024 * 1024)
+    monkeypatch.setattr(utils.torch.cuda, "memory_reserved", lambda: 3 * 1024 * 1024)
+    monkeypatch.setattr(utils.torch.cuda, "max_memory_reserved", lambda: 4 * 1024 * 1024)
+    monkeypatch.setattr(utils.torch.cuda, "device_memory_used", lambda: 5 * 1024 * 1024)
+
+    utils.report_memory("after step")
+
+    output = capsys.readouterr().out
+    assert "[Rank 7]" in output
+    assert "allocated: 1.00" in output
+    assert "total device memory used: 5.00" in output
+
+
+def test_get_nvtx_range_uses_nvtx_and_optional_timers(monkeypatch):
+    calls = []
+
+    class FakeTimer:
+        def start(self):
+            calls.append("timer-start")
+
+        def stop(self):
+            calls.append("timer-stop")
+
+    fake_nvtx = types.SimpleNamespace(
+        range_push=lambda msg: calls.append(("push", msg)),
+        range_pop=lambda: calls.append("pop"),
+    )
+    monkeypatch.setattr(utils.torch.cuda, "nvtx", fake_nvtx, raising=False)
+    monkeypatch.setattr(utils, "get_timers", lambda: lambda *args, **kwargs: FakeTimer())
+
+    with utils.get_nvtx_range()("section", time=True):
+        calls.append("body")
+
+    assert calls == ["timer-start", ("push", "section"), "body", "pop", "timer-stop"]
