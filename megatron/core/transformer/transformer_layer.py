@@ -1469,9 +1469,7 @@ class MoETransformerLayer(TransformerLayer):
                 else:
                     self.token_dispatcher_attrs[attr_name] = attr.detach()
 
-        # _te_cuda_graph_replay expects router outputs first and residual last:
-        # [hidden_states, probs, attrs..., shared_expert_output?, residual].
-        return *router_outputs, residual
+        return residual, *router_outputs
 
     def _forward_mlp_expert_compute(self, hidden_states, probs):
         """
