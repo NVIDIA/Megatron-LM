@@ -531,7 +531,9 @@ def test_transpose_first_dim_uses_attention_shape_metadata():
     assert sorted(last.flatten().tolist()) == sorted(tensor.flatten().tolist())
 
 
-def test_cleanup_old_non_persistent_checkpoint_keeps_newest(tmp_path):
+def test_cleanup_old_non_persistent_checkpoint_keeps_newest(monkeypatch, tmp_path):
+    monkeypatch.setattr(checkpointing_module.torch.distributed, "is_initialized", lambda: False)
+
     for iteration in [1, 2, 3]:
         (tmp_path / f"iter_{iteration:07d}").mkdir()
 
