@@ -23,7 +23,6 @@ from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
-from megatron.core.transformer.moe.moe_utils import should_skip_shared_expert_cudagraph_capture
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -42,6 +41,18 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
+
+
+def _should_skip_shared_expert_cudagraph_capture(config: TransformerConfig) -> bool:
+    if bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0"))):
+        return True
+    return (
+        getattr(config, "use_megatron_fsdp", False)
+        and config.cuda_graph_impl == "transformer_engine"
+        and CudaGraphScope.moe_router in (config.cuda_graph_scope or [])
+        and config.moe_shared_expert_intermediate_size is not None
+        and not config.moe_shared_expert_overlap
+    )
 
 
 def _maybe_register_cudagraph_grad_nan_hook(tensor: Tensor | None, source: str):
@@ -1051,7 +1062,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
-                and not should_skip_shared_expert_cudagraph_capture(self.config)
+                and not _should_skip_shared_expert_cudagraph_capture(self.config)
             ):
                 submodules += [self.mlp.shared_experts]
         return submodules
@@ -1140,14 +1151,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
-                and not should_skip_shared_expert_cudagraph_capture(self.config)
+                and not _should_skip_shared_expert_cudagraph_capture(self.config)
             ):
                 # The shared expert output is the last second element in the CUDA graph output.
                 shared_expert_output = cuda_graph_output.pop()
             elif (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
-                and should_skip_shared_expert_cudagraph_capture(self.config)
+                and _should_skip_shared_expert_cudagraph_capture(self.config)
             ):
                 # Shared experts consume the pre-MLP-layernorm tensor, while the graph output below
                 # is already post-router/preprocess. Recompute the shared-expert input eagerly.
