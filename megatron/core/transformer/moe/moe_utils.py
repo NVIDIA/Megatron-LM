@@ -1518,6 +1518,7 @@ class MoECudaGraphPartialCaptureSignal(Exception):
             # "token_dispatcher.cudagraph_attrs".
             outputs = [self.kwargs['hidden_states'], self.kwargs['probs']]
             valid_cudagraph_attrs = []
+            probs_output = self.kwargs['probs']
             for attr_name in self.moe_layer.token_dispatcher.cudagraph_attrs:
                 hier_attr_name = attr_name.split('.')
                 attr = self.moe_layer.token_dispatcher
@@ -1526,6 +1527,14 @@ class MoECudaGraphPartialCaptureSignal(Exception):
                     if attr is None:
                         break
                 if isinstance(attr, torch.Tensor):
+                    if (
+                        attr_name.endswith('token_probs')
+                        and isinstance(probs_output, torch.Tensor)
+                        and attr.shape == probs_output.shape
+                        and attr.dtype == probs_output.dtype
+                        and attr.data_ptr() == probs_output.data_ptr()
+                    ):
+                        continue
                     outputs.append(attr)
                     valid_cudagraph_attrs.append(attr_name)
             if self.moe_layer.token_dispatcher.valid_cudagraph_attrs is None:

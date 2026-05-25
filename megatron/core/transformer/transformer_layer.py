@@ -1188,6 +1188,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     for name in hier_attr_name[:-1]:
                         attr = getattr(attr, name)
                     setattr(attr, hier_attr_name[-1], attr_outputs[i])
+                comm_manager = getattr(self.mlp.token_dispatcher, '_comm_manager', None)
+                if comm_manager is not None and hasattr(comm_manager, 'token_probs'):
+                    comm_manager.token_probs = probs
             else:
                 # CUDA graph output is [hidden_states, probs, routing_map].
                 assert len(cuda_graph_output) == 3, (
