@@ -60,6 +60,8 @@ _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 def _debug_raise_if_nan(tensor: torch.Tensor, source: str):
     if not bool(int(os.environ.get("MCORE_MOE_ROUTER_GATING_DEBUG_NAN", "0"))):
         return
+    if is_graph_capturing():
+        return
     if tensor is None or not torch.is_floating_point(tensor):
         return
     nan_count = torch.isnan(tensor).sum()
