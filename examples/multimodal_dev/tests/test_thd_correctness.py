@@ -34,21 +34,48 @@ _REPO_ROOT = os.path.abspath(
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from examples.multimodal_dev.forward_step import _build_packed_seq_params, pack_or_pad_batch
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
-)
-from megatron.core.tensor_parallel.random import (
-    model_parallel_cuda_manual_seed,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-from examples.multimodal_dev.forward_step import (
-    _build_packed_seq_params,
-    _pack_batch,
-)
+
+def _samples_from_bshd(input_ids, labels, loss_mask, seq_lengths=None):
+    """Slice ``[B, S]`` tensors into the per-sample dict list that
+    ``pack_or_pad_batch`` expects.  ``seq_lengths`` lets variable-length
+    samples carry only their valid tokens (no attention_mask needed).
+    """
+    B, S = input_ids.shape
+    if seq_lengths is None:
+        seq_lengths = [S] * B
+    samples = []
+    for i, L in enumerate(seq_lengths):
+        samples.append(
+            {
+                "input_ids": input_ids[i, :L].clone(),
+                "labels": labels[i, :L].clone(),
+                "loss_mask": loss_mask[i, :L].clone(),
+                # pack_or_pad_batch requires these keys but the model call
+                # below ignores them; provide minimal dummies.
+                "pixel_values": torch.zeros(
+                    1, 1, device=input_ids.device,
+                ),
+                "image_grid_thw": torch.tensor(
+                    [[2, 1, 1]], dtype=torch.long, device=input_ids.device,
+                ),
+            }
+        )
+    return samples
+
+
+def _thd_position_ids(seq_lengths, device):
+    """Build ``[1, T]`` THD position_ids: each segment restarts at 0."""
+    return torch.cat(
+        [torch.arange(L, device=device) for L in seq_lengths],
+    ).unsqueeze(0).contiguous()
 
 
 # ===================================================================
@@ -135,18 +162,16 @@ def run_equal_length_test(
     model.zero_grad()
 
     # ---- THD forward / backward ----
-    batch = {
-        "input_ids": input_ids.clone(),
-        "labels": labels.clone(),
-        "loss_mask": loss_mask.clone(),
-        "position_ids": position_ids.clone(),
-    }
-    packed = _pack_batch(batch)
+    samples = _samples_from_bshd(input_ids, labels, loss_mask)
+    packed = pack_or_pad_batch(
+        samples, use_packed_sequence=True, device="cuda",
+    )
     psp = packed.pop("packed_seq_params")
+    thd_position_ids = _thd_position_ids([S] * B, device="cuda")
 
     output_thd = model(
         input_ids=packed["input_ids"],
-        position_ids=packed["position_ids"],
+        position_ids=thd_position_ids,
         attention_mask=None,
         labels=packed["labels"],
         loss_mask=packed["loss_mask"],
@@ -206,25 +231,20 @@ def run_variable_length_smoke_test(model, vocab_size, seed):
     input_ids = torch.randint(0, vocab_size, (B, S), device="cuda")
     labels = torch.randint(0, vocab_size, (B, S), device="cuda")
     loss_mask = torch.ones(B, S, device="cuda")
-    position_ids = (
-        torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1).contiguous()
-    )
 
-    # Build attention_mask to indicate valid tokens per sample.
-    attention_mask = torch.zeros(B, S, device="cuda")
+    # Mask out padded positions in loss_mask for the input we hand to
+    # pack_or_pad_batch (variable-length samples carry only valid tokens).
     for i, sl in enumerate(seq_lengths):
-        attention_mask[i, :sl] = 1.0
         loss_mask[i, sl:] = 0.0
 
-    batch = {
-        "input_ids": input_ids,
-        "labels": labels,
-        "loss_mask": loss_mask,
-        "position_ids": position_ids,
-        "attention_mask": attention_mask,
-    }
-    packed = _pack_batch(batch)
+    samples = _samples_from_bshd(
+        input_ids, labels, loss_mask, seq_lengths=seq_lengths,
+    )
+    packed = pack_or_pad_batch(
+        samples, use_packed_sequence=True, device="cuda",
+    )
     psp = packed.pop("packed_seq_params")
+    thd_position_ids = _thd_position_ids(seq_lengths, device="cuda")
 
     T = sum(seq_lengths)
     assert packed["input_ids"].shape == (1, T), (
@@ -242,7 +262,7 @@ def run_variable_length_smoke_test(model, vocab_size, seed):
 
     output = model(
         input_ids=packed["input_ids"],
-        position_ids=packed["position_ids"],
+        position_ids=thd_position_ids,
         attention_mask=None,
         labels=packed["labels"],
         loss_mask=packed["loss_mask"],
