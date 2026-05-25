@@ -244,7 +244,7 @@ class ParameterGroup:
         self,
         bwd_pass: bool = False,
     ) -> bool:
-        """Return whether all weight buffers needed for this forward/backward phase are unsharded."""
+        """Return whether this phase can skip launching another distributed unshard."""
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer,
             self.transpose_weight_buffer,
@@ -252,6 +252,10 @@ class ParameterGroup:
         ):
             if weight_buffer is None:
                 continue
+            if not weight_buffer.is_distributed:
+                # Replicated buffers still need DataParallelBuffer.unshard() to
+                # rebind original parameter storage before the module uses it.
+                return False
             if not weight_buffer.is_unsharded():
                 return False
         return True

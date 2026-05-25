@@ -408,9 +408,54 @@ class FullyShardMixedPrecisionPolicy:
             return
 
         assert model_weight_buffer is not None, "main weights require a model-weight buffer"
+
+        def sync_replicated_model_buffer(buffer) -> None:
+            if buffer is None or buffer.is_distributed or not main_weight_buffer.is_distributed:
+                return
+            # Use this rank's virtual shard of the replicated model buffer as the
+            # all-gather input; each rank then receives the complete updated buffer.
+            shard_meta = buffer.buffer_index.shard_meta
+            local_shard = buffer.data[
+                shard_meta.local_data_index : shard_meta.local_data_index + shard_meta.size
+            ]
+            torch.distributed.all_gather_into_tensor(
+                output_tensor=buffer.data,
+                input_tensor=local_shard,
+                group=data_parallel_group,
+            )
+
         if not self.is_fp8_param(params[0]):
-            model_weight_buffer.data.copy_(main_weight_buffer.data)
-            return
+            same_buffer_layout = (
+                model_weight_buffer.is_distributed == main_weight_buffer.is_distributed
+            )
+            if same_buffer_layout:
+                model_weight_buffer.data.copy_(main_weight_buffer.data)
+                return
+
+            copy_shard_to_replicated_model = (
+                not model_weight_buffer.is_distributed and main_weight_buffer.is_distributed
+            )
+            if copy_shard_to_replicated_model:
+                # First install this rank's updated main-weight shard into the
+                # matching virtual shard of the replicated model buffer.
+                model_shard_meta = model_weight_buffer.buffer_index.shard_meta
+                main_shard_meta = main_weight_buffer.buffer_index.shard_meta
+                model_weight_buffer.data[
+                    model_shard_meta.local_data_index : model_shard_meta.local_data_index
+                    + model_shard_meta.size
+                ].copy_(
+                    main_weight_buffer.data[
+                        main_shard_meta.local_data_index : main_shard_meta.local_data_index
+                        + main_shard_meta.size
+                    ]
+                )
+                sync_replicated_model_buffer(model_weight_buffer)
+                return
+
+            raise RuntimeError(
+                "Unsupported FSDP main/model weight buffer layout: "
+                "model weights are sharded but main weights are replicated."
+            )
 
         fp8_params = []
         main_params = []
@@ -443,6 +488,8 @@ class FullyShardMixedPrecisionPolicy:
             data_parallel_group,
             model_param_shards,
         )
+        sync_replicated_model_buffer(model_weight_buffer)
+        sync_replicated_model_buffer(transpose_weight_buffer)
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:
