@@ -23,6 +23,7 @@ from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.moe.moe_utils import should_skip_shared_expert_cudagraph_capture
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1050,7 +1051,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
-                and not bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0")))
+                and not should_skip_shared_expert_cudagraph_capture(self.config)
             ):
                 submodules += [self.mlp.shared_experts]
         return submodules
@@ -1139,10 +1140,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
-                and not bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0")))
+                and not should_skip_shared_expert_cudagraph_capture(self.config)
             ):
                 # The shared expert output is the last second element in the CUDA graph output.
                 shared_expert_output = cuda_graph_output.pop()
+            elif (
+                self.config.moe_shared_expert_intermediate_size is not None
+                and not self.config.moe_shared_expert_overlap
+                and should_skip_shared_expert_cudagraph_capture(self.config)
+            ):
+                # Shared experts consume the pre-MLP-layernorm tensor, while the graph output below
+                # is already post-router/preprocess. Recompute the shared-expert input eagerly.
+                shared_expert_input = apply_module(self.pre_mlp_layernorm)(residual)
+                if isinstance(shared_expert_input, tuple):
+                    if len(shared_expert_input) != 2:
+                        raise ValueError(
+                            f"When the output of pre_mlp_layernorm is a tuple, it is "
+                            f"expected to have 2 elements (output, residual), but "
+                            f"got {len(shared_expert_input)}"
+                        )
+                    shared_expert_input, _ = shared_expert_input
+                shared_expert_output = self.mlp.shared_experts_compute(shared_expert_input)
 
             if CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope:
                 # CUDA graph output is [hidden_states, probs] + attributes outputs.

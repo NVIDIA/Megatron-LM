@@ -57,6 +57,19 @@ else:
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
 
+def should_skip_shared_expert_cudagraph_capture(config: TransformerConfig) -> bool:
+    """Return True when shared experts should stay outside TE partial MoE graphs."""
+    if bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0"))):
+        return True
+    return (
+        getattr(config, "use_megatron_fsdp", False)
+        and config.cuda_graph_impl == "transformer_engine"
+        and CudaGraphScope.moe_router in (config.cuda_graph_scope or [])
+        and config.moe_shared_expert_intermediate_size is not None
+        and not config.moe_shared_expert_overlap
+    )
+
+
 def _debug_raise_if_nan(tensor: torch.Tensor, source: str):
     if not bool(int(os.environ.get("MCORE_MOE_ROUTER_GATING_DEBUG_NAN", "0"))):
         return

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -18,6 +17,7 @@ from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphTensorStore,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
+    should_skip_shared_expert_cudagraph_capture,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -462,10 +462,7 @@ class MoELayer(BaseMoELayer):
         it is computed here.
         """
         shared_expert_output = None
-        if (
-            is_graph_capturing()
-            and bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0")))
-        ):
+        if is_graph_capturing() and should_skip_shared_expert_cudagraph_capture(self.config):
             return shared_expert_output
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
