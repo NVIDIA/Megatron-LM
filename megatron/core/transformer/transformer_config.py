@@ -216,6 +216,11 @@ class TransformerConfig(ModelParallelConfig):
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu or weighted SwiGLU (MoE only)."""
 
+    activation_func_clamp_value_shared_expert: Optional[float] = None
+    """Clamp the output of the linear_fc1 in the activation function for shared expert. Only used
+    when activation_func is SwiGLU (MoE only). When not None, it will override the
+    activation_func_clamp_value for shared expert, otherwise use the activation_func_clamp_value."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -2212,6 +2217,24 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "use_transformer_engine_op_fuser must be False "
                         "when activation_func_clamp_value is not None for SwiGLU"
+                    )
+
+        if self.activation_func_clamp_value_shared_expert is not None:
+            # swiglu
+            if self.activation_func == F.silu and self.gated_linear_unit:
+                if self.num_moe_experts is None:
+                    raise ValueError(
+                        "activation_func_clamp_value_shared_expert for SwiGLU is only supported with MoE."
+                    )
+                if self.use_te_activation_func:
+                    raise ValueError(
+                        "use_te_activation_func must be False "
+                        "when activation_func_clamp_value_shared_expert is not None for SwiGLU"
+                    )
+                if self.use_transformer_engine_op_fuser:
+                    raise ValueError(
+                        "use_transformer_engine_op_fuser must be False "
+                        "when activation_func_clamp_value_shared_expert is not None for SwiGLU"
                     )
 
         if self.apply_rope_fusion:

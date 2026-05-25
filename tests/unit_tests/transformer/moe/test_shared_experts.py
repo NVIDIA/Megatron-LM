@@ -192,3 +192,120 @@ class TestSharedExperts:
             "Clamping had no observable effect on shared-expert output; "
             "activation_func_clamp_value may not be plumbed through."
         )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("bias_activation_fusion", [True, False])
+    def test_shared_expert_clamp_value_shared_expert_swiglu(self, bias_activation_fusion):
+        """
+        Verifies that ``activation_func_clamp_value_shared_expert`` independently
+        controls clamping of the shared expert's SwiGLU activation, in both the
+        overlapped and non-overlapped paths, and in both the
+        ``bias_activation_fusion`` and manual-glu code paths.
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+
+        clamp_value = 1.0
+
+        # Create MoE layer with shared expert overlap enabled.
+        model_parallel_cuda_manual_seed(123)
+        moe_layer_overlap = self.get_moe_layer(
+            moe_shared_expert_overlap=True,
+            moe_token_dispatcher_type="alltoall",
+            activation_func_clamp_value_shared_expert=clamp_value,
+            bias_activation_fusion=bias_activation_fusion,
+        ).to(dtype=torch.bfloat16)
+
+        # Create MoE layer with shared expert overlap disabled, sharing weights.
+        model_parallel_cuda_manual_seed(123)
+        moe_layer_no_overlap = self.get_moe_layer(
+            moe_shared_expert_overlap=False,
+            moe_token_dispatcher_type="alltoall",
+            activation_func_clamp_value_shared_expert=clamp_value,
+            bias_activation_fusion=bias_activation_fusion,
+        ).to(dtype=torch.bfloat16)
+        moe_layer_no_overlap.load_state_dict(moe_layer_overlap.state_dict())
+
+        # Use a large input range to ensure the clamp actually triggers.
+        hidden_states = (
+            torch.randn((32, 2, self.config.hidden_size), device="cuda", dtype=torch.bfloat16) * 5.0
+        )
+        hidden_states = hidden_states.detach().requires_grad_(True)
+        hidden_states_no_overlap = hidden_states.detach().clone().requires_grad_(True)
+
+        output_overlap, _ = moe_layer_overlap(hidden_states)
+        output_no_overlap, _ = moe_layer_no_overlap(hidden_states_no_overlap)
+
+        cos_out = torch.nn.functional.cosine_similarity(
+            output_overlap.flatten().unsqueeze(0).float(),
+            output_no_overlap.flatten().unsqueeze(0).float(),
+        ).item()
+        assert cos_out > 0.999, (
+            f"shared-expert clamp_value_shared_expert output mismatch "
+            f"(fusion={bias_activation_fusion}): cos sim = {cos_out:.6f}"
+        )
+
+        output_overlap.mean().backward()
+        output_no_overlap.mean().backward()
+
+        for p_overlap, p_no_overlap in zip(
+            moe_layer_overlap.parameters(), moe_layer_no_overlap.parameters()
+        ):
+            assert torch.allclose(p_overlap.grad, p_no_overlap.grad), (
+                f"shared-expert clamp_value_shared_expert grad mismatch "
+                f"(fusion={bias_activation_fusion}); "
+                f"max diff: {torch.max(torch.abs(p_overlap.grad - p_no_overlap.grad))}"
+            )
+
+        # Verify clamping has an observable effect on the shared-expert output.
+        model_parallel_cuda_manual_seed(123)
+        moe_layer_unclamped = self.get_moe_layer(
+            moe_shared_expert_overlap=False,
+            moe_token_dispatcher_type="alltoall",
+            activation_func_clamp_value_shared_expert=None,
+            bias_activation_fusion=bias_activation_fusion,
+        ).to(dtype=torch.bfloat16)
+        moe_layer_unclamped.load_state_dict(moe_layer_overlap.state_dict())
+
+        hidden_states_unclamped = hidden_states.clone().detach().requires_grad_(True)
+        output_unclamped, _ = moe_layer_unclamped(hidden_states_unclamped)
+        assert not torch.allclose(output_no_overlap, output_unclamped), (
+            "Clamping had no observable effect on shared-expert output; "
+            "activation_func_clamp_value_shared_expert may not be plumbed through."
+        )
+
+        # Verify activation_func_clamp_value (routed-expert setting) does NOT clamp
+        # the shared expert when activation_func_clamp_value_shared_expert is None.
+        # The shared-expert outputs should match between the unclamped run above
+        # and a run that sets only the routed-expert clamp.
+        model_parallel_cuda_manual_seed(123)
+        moe_layer_routed_only = self.get_moe_layer(
+            moe_shared_expert_overlap=False,
+            moe_token_dispatcher_type="alltoall",
+            activation_func_clamp_value=clamp_value,
+            activation_func_clamp_value_shared_expert=None,
+            bias_activation_fusion=bias_activation_fusion,
+        ).to(dtype=torch.bfloat16)
+        moe_layer_routed_only.load_state_dict(moe_layer_overlap.state_dict())
+
+        se_input = (
+            torch.randn((4, 2, self.config.hidden_size), device="cuda", dtype=torch.bfloat16) * 5.0
+        )
+        se_out_unclamped = moe_layer_unclamped.shared_experts(se_input)
+        se_out_routed_only = moe_layer_routed_only.shared_experts(se_input)
+        torch.testing.assert_close(
+            se_out_unclamped,
+            se_out_routed_only,
+            msg=(
+                "activation_func_clamp_value should not affect shared experts when "
+                "activation_func_clamp_value_shared_expert is None."
+            ),
+        )
+
+        # And conversely, setting only activation_func_clamp_value_shared_expert
+        # should change the shared-expert output relative to the fully-unclamped run.
+        se_out_se_clamp = moe_layer_no_overlap.shared_experts(se_input)
+        assert not torch.allclose(se_out_unclamped, se_out_se_clamp), (
+            "activation_func_clamp_value_shared_expert had no observable effect on "
+            "shared-expert output when set in isolation."
+        )
