@@ -2421,7 +2421,9 @@ class TECudaGraphHelper:
             if is_te_min_version("2.7.0"):
                 # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory usage
                 # by reusing input/output data buffers between graphs.
-                kwargs['_reuse_graph_input_output_buffers'] = True
+                kwargs['_reuse_graph_input_output_buffers'] = not bool(
+                    int(os.environ.get("MCORE_TE_DISABLE_GRAPH_IO_REUSE", "0"))
+                )
 
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs
