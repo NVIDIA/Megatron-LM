@@ -767,7 +767,8 @@ class MegatronFSDP(torch.nn.Module):
 
         def _mirror_fsdp_param_attrs(module: nn.Module, canonical_params):
             """Mirror FSDP buffer state onto transient wrappers exposed by modules."""
-            current_params = list(module.parameters(recurse=False))
+            current_named_params = list(module.named_parameters(recurse=False))
+            current_params = [param for _, param in current_named_params]
             if len(current_params) != len(canonical_params):
                 return
 
@@ -807,8 +808,13 @@ class MegatronFSDP(torch.nn.Module):
                 "skip_backward_post_hook",
                 "post_wgrad_grad_acc_hook",
             )
-            for canonical_param, current_param in zip(canonical_params, current_params):
+            for (name, current_param), canonical_param in zip(
+                current_named_params, canonical_params
+            ):
                 if canonical_param is current_param:
+                    continue
+                if is_graph_capturing():
+                    _replace_module_parameter(module, name, canonical_param)
                     continue
                 _mirror_param_data(canonical_param, current_param)
                 for attr in attrs:
