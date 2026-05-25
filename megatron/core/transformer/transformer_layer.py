@@ -46,6 +46,8 @@ logger = logging.getLogger(__name__)
 def _should_skip_shared_expert_cudagraph_capture(config: TransformerConfig) -> bool:
     if bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0"))):
         return True
+    if bool(int(os.environ.get("MCORE_CG_FORCE_SHARED_EXPERT_CAPTURE", "0"))):
+        return False
     return (
         getattr(config, "use_megatron_fsdp", False)
         and config.cuda_graph_impl == "transformer_engine"

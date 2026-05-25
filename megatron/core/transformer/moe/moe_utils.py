@@ -61,6 +61,8 @@ def should_skip_shared_expert_cudagraph_capture(config: TransformerConfig) -> bo
     """Return True when shared experts should stay outside TE partial MoE graphs."""
     if bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0"))):
         return True
+    if bool(int(os.environ.get("MCORE_CG_FORCE_SHARED_EXPERT_CAPTURE", "0"))):
+        return False
     return (
         getattr(config, "use_megatron_fsdp", False)
         and config.cuda_graph_impl == "transformer_engine"
