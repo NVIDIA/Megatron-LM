@@ -2940,6 +2940,9 @@ def train(
             cuda_graph_helper.create_cudagraphs()
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
+            if args.cuda_graph_warmup_steps > 0 and (
+                should_disable_forward_pre_hook(args) or args.use_megatron_fsdp
+            ):
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Completely skip iteration if needed.
@@ -3034,15 +3037,16 @@ def train(
                     enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
-                    # Set the manual hooks here since it's not set right after the capturing.
-                    if (
-                        args.cuda_graph_impl == "transformer_engine"
-                        and args.cuda_graph_warmup_steps == 0
-                    ):
-                        assert (
-                            cuda_graph_helper.capture_finished()
-                        ), "CUDA Graph capture should have been finished."
-                        cuda_graph_helper.cuda_graph_set_manual_hooks()
+                # Set the manual hooks here since it's not set right after the capturing.
+                if (
+                    args.cuda_graph_impl == "transformer_engine"
+                    and args.cuda_graph_warmup_steps == 0
+                    and (should_disable_forward_pre_hook(args) or args.use_megatron_fsdp)
+                ):
+                    assert (
+                        cuda_graph_helper.capture_finished()
+                    ), "CUDA Graph capture should have been finished."
+                    cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
 

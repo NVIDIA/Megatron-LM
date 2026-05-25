@@ -182,6 +182,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.broadcast_params = self.module.broadcast_params
         self.synchronize_param_gather = self.module.synchronize_param_gather
         self._replace_param_with_raw_if_needed = self.module._replace_param_with_raw_if_needed
+        self._make_forward_pre_hook = self.module._make_forward_pre_hook
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config

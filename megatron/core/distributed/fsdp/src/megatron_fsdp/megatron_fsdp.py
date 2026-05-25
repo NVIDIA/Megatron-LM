@@ -855,7 +855,9 @@ class MegatronFSDP(torch.nn.Module):
                     current_param.get_main_grad = main_grad_getter.__get__(current_param)
 
         @torch.compiler.disable
-        def _pre_forward_param_unshard(module: nn.Module, *unused):
+        def _pre_forward_param_unshard(
+            module: nn.Module, *unused, force_disable_prefetch: bool = False
+        ):
             # Unshard the parameters before the forward pass.
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
@@ -864,10 +866,10 @@ class MegatronFSDP(torch.nn.Module):
                 fsdp_forward_prefetch = False
             else:
                 module._training_state = TrainingState.FORWARD
-                if is_graph_capturing():
+                if force_disable_prefetch or is_graph_capturing():
                     # TE invokes extracted FSDP hooks around each callable while building CUDA
-                    # graphs. Do not leave async prefetch collectives outstanding when the
-                    # callable enters graph capture.
+                    # graphs, and manual hooks before graph replay. Keep allocation order
+                    # identical by not leaving async prefetch collectives outstanding.
                     fsdp_forward_prefetch = False
 
             if isinstance(module, tuple(fsdp_unit_modules)):
@@ -890,6 +892,18 @@ class MegatronFSDP(torch.nn.Module):
             if self.enable_fine_grained_param_gather_hook:
                 _mirror_fsdp_param_attrs(module, param_list)
             return None
+
+        def _make_forward_pre_hook():
+            """Create a manual pre-forward hook for CUDA graph replay."""
+
+            def hook(module, *unused):
+                return _pre_forward_param_unshard(
+                    module, *unused, force_disable_prefetch=True
+                )
+
+            return hook
+
+        self._make_forward_pre_hook = _make_forward_pre_hook
 
         @torch.compiler.disable
         def _register_post_backward_hook(
