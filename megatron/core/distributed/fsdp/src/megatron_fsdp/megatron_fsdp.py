@@ -1299,38 +1299,6 @@ class MegatronFSDP(torch.nn.Module):
                 # Only register grad acc hook for parameters that require gradients.
                 if not param.requires_grad:
                     continue
-                if bool(
-                    int(os.environ.get("MCORE_FSDP_REPORT_NAN_IN_INCOMING_AUTOGRAD_GRAD", "0"))
-                ):
-
-                    def _make_incoming_grad_nan_hook(param):
-                        def _hook(grad):
-                            if grad is None:
-                                return grad
-                            local_grad = to_local_if_dtensor(grad)
-                            if not (
-                                torch.is_tensor(local_grad)
-                                and torch.is_floating_point(local_grad)
-                            ):
-                                return grad
-                            has_nan = torch.isnan(local_grad).any()
-                            if bool(has_nan.detach().cpu().item()):
-                                name = self.param_to_name.get(param, "<unknown>")
-                                nan_count = int(
-                                    torch.isnan(local_grad).sum().detach().cpu().item()
-                                )
-                                raise RuntimeError(
-                                    "[Megatron-FSDP] Detected NaN in incoming autograd grad: "
-                                    f"param={name}, shape={tuple(local_grad.shape)}, "
-                                    f"dtype={local_grad.dtype}, nan_count={nan_count}"
-                                )
-                            return grad
-
-                        return _hook
-
-                    self.grad_acc_hooks[
-                        f"nan check for incoming grad {self.param_to_name[param]}"
-                    ] = param.register_hook(_make_incoming_grad_nan_hook(param))
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
                     param.register_post_accumulate_grad_hook(
                         lambda p: _process_post_backward_gradients([p])
