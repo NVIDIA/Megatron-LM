@@ -1448,6 +1448,17 @@ class TransformerConfig(ModelParallelConfig):
             self.hetereogenous_dist_checkpoint = True
 
             if self.apply_dsa_kernel_fusion:
+                import torch
+
+                assert (
+                    torch.cuda.is_available()
+                ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
+                sm = torch.cuda.get_device_capability()
+                assert sm[0] >= 10, (
+                    f"apply_dsa_kernel_fusion requires SM100+ (Blackwell or later), "
+                    f"but current device has compute capability {sm[0]}.{sm[1]}."
+                )
+
                 _flash_mla_available = True
                 try:
                     from flash_mla import flash_mla_sparse_fwd  # noqa: F401
