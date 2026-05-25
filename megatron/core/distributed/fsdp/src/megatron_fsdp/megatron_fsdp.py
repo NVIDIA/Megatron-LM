@@ -647,10 +647,35 @@ class MegatronFSDP(torch.nn.Module):
                 if bool(has_nan.detach().cpu().item()):
                     name = self.param_to_name.get(param, "<unknown>")
                     nan_count = int(torch.isnan(local_tensor).sum().detach().cpu().item())
+                    param_grad = getattr(param, "grad", None)
+                    main_grad = getattr(param, "main_grad", None)
+
+                    def _tensor_debug_state(debug_tensor):
+                        if debug_tensor is None:
+                            return "None"
+                        local_debug_tensor = to_local_if_dtensor(debug_tensor)
+                        if not torch.is_tensor(local_debug_tensor):
+                            return type(local_debug_tensor).__name__
+                        debug_state = (
+                            f"shape={tuple(local_debug_tensor.shape)}, "
+                            f"dtype={local_debug_tensor.dtype}, "
+                            f"ptr={local_debug_tensor.data_ptr()}"
+                        )
+                        if torch.is_floating_point(local_debug_tensor):
+                            debug_nan_count = int(
+                                torch.isnan(local_debug_tensor).sum().detach().cpu().item()
+                            )
+                            debug_state += f", nan_count={debug_nan_count}"
+                        return debug_state
+
                     raise RuntimeError(
                         "[Megatron-FSDP] Detected NaN in "
                         f"{source}: param={name}, shape={tuple(local_tensor.shape)}, "
-                        f"dtype={local_tensor.dtype}, nan_count={nan_count}"
+                        f"dtype={local_tensor.dtype}, nan_count={nan_count}, "
+                        f"grad_added_to_main_grad={getattr(param, 'grad_added_to_main_grad', None)}, "
+                        f"param_id={id(param)}, param_data_ptr={to_local_if_dtensor(param).data_ptr()}, "
+                        f"param.grad=({_tensor_debug_state(param_grad)}), "
+                        f"param.main_grad=({_tensor_debug_state(main_grad)})"
                     )
 
             group_id = get_param_group_id(self.param_and_grad_buffer, param)
