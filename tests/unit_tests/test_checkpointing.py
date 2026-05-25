@@ -403,7 +403,9 @@ def test_checkpoint_name_variants_and_tracker_paths(tmp_path):
         42,
         pipeline_parallel=False,
         tensor_rank=3,
+        pipeline_rank=0,
         expert_parallel=False,
+        expert_rank=0,
     )
     pipeline_and_expert = get_checkpoint_name(
         str(root),
@@ -421,7 +423,9 @@ def test_checkpoint_name_variants_and_tracker_paths(tmp_path):
         release=True,
         pipeline_parallel=False,
         tensor_rank=0,
+        pipeline_rank=0,
         expert_parallel=False,
+        expert_rank=0,
     )
 
     assert base_dir.endswith("iter_0000042")
