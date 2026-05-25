@@ -130,7 +130,7 @@ class TestLayerWiseOptimizer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_generalized_tensor_parallel(self):
+    def test_parameter_sharding(self):
         """Test that parameters are correctly sharded across DP ranks."""
         Utils.initialize_model_parallel(1, 1)
 

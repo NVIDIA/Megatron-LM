@@ -428,7 +428,7 @@ def _gtp_slice_one_param(param, gtp_group, *, name="<unnamed>"):
 
 
 def _gtp_attach_attrs(gtp_shard, gtp_group, *, is_grouped=False, expert_idx=0):
-    """Attach group / ps_size / routed-expert tags and register in _GTP_PARAMS.
+    """Attach group / gtp_size / routed-expert tags and register in _GTP_PARAMS.
 
     Kept separate from _gtp_slice_one_param so attrs land on the post-quantize
     param (when quantize fires between slice and attach).
@@ -440,7 +440,7 @@ def _gtp_attach_attrs(gtp_shard, gtp_group, *, is_grouped=False, expert_idx=0):
         # cuda_graph_modules at init time.
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_group
-    gtp_shard.ps_size = gtp_group.size()
+    gtp_shard.gtp_size = gtp_group.size()
     global _GTP_PARAMS
     _GTP_PARAMS.append(gtp_shard)
 

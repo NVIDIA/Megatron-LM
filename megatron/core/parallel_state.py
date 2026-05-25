@@ -869,16 +869,16 @@ def initialize_model_parallel(
     ), "generalized tensor parallel group is already initialized"
     for cp_dp_ranks in decoder_rank_generator.get_ranks('cp-dp'):
         for i in range(0, len(cp_dp_ranks), generalized_tensor_parallel_size):
-            ps_ranks = cp_dp_ranks[i : i + generalized_tensor_parallel_size]
+            gtp_ranks = cp_dp_ranks[i : i + generalized_tensor_parallel_size]
             group = create_group(
-                ps_ranks,
+                gtp_ranks,
                 timeout=timeout,
                 pg_options=get_nccl_options("ps", nccl_comm_cfgs),
                 group_desc="GENERALIZED_TENSOR_PARALLEL_GROUP",
             )
-            if rank in ps_ranks:
+            if rank in gtp_ranks:
                 _GENERALIZED_TENSOR_PARALLEL_GROUP = group
-                _GENERALIZED_TENSOR_PARALLEL_GLOBAL_RANKS = ps_ranks
+                _GENERALIZED_TENSOR_PARALLEL_GLOBAL_RANKS = gtp_ranks
 
     # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp group.
     if sharp_enabled_group == "dp":
@@ -1002,39 +1002,39 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_WITH_GTP
     global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
     if generalized_tensor_parallel_size > 1:
-        # Build rank→ps_rank mapping.
-        rank_to_ps_rank = {}
+        # Build rank→gtp_rank mapping.
+        rank_to_gtp_rank = {}
         for cp_dp_ranks in decoder_rank_generator.get_ranks('cp-dp'):
             for i in range(0, len(cp_dp_ranks), generalized_tensor_parallel_size):
                 ps_chunk = cp_dp_ranks[i : i + generalized_tensor_parallel_size]
-                for ps_rank_idx, r in enumerate(ps_chunk):
-                    rank_to_ps_rank[r] = ps_rank_idx
+                for gtp_rank_idx, r in enumerate(ps_chunk):
+                    rank_to_gtp_rank[r] = gtp_rank_idx
 
-        # DP-only with GTP: create one group per (dp_group, ps_rank) pair.
+        # DP-only with GTP: create one group per (dp_group, gtp_rank) pair.
         # All ranks must participate in every create_group call (collective).
         for dp_ranks in decoder_rank_generator.get_ranks('dp'):
-            for ps_rank_val in range(generalized_tensor_parallel_size):
-                dp_ps_ranks = [r for r in dp_ranks if rank_to_ps_rank[r] == ps_rank_val]
+            for gtp_rank_val in range(generalized_tensor_parallel_size):
+                dp_gtp_ranks = [r for r in dp_ranks if rank_to_gtp_rank[r] == gtp_rank_val]
                 group = create_group(
-                    dp_ps_ranks,
+                    dp_gtp_ranks,
                     timeout=timeout,
                     pg_options=get_nccl_options("dp_ps", nccl_comm_cfgs),
                     group_desc="DATA_PARALLEL_GROUP_WITH_GTP",
                 )
-                if rank in dp_ps_ranks:
+                if rank in dp_gtp_ranks:
                     _DATA_PARALLEL_GROUP_WITH_GTP = group
 
         # DP-CP with GTP
         for dp_cp_ranks in decoder_rank_generator.get_ranks('dp-cp'):
-            for ps_rank_val in range(generalized_tensor_parallel_size):
-                dp_cp_ps_ranks = [r for r in dp_cp_ranks if rank_to_ps_rank[r] == ps_rank_val]
+            for gtp_rank_val in range(generalized_tensor_parallel_size):
+                dp_cp_gtp_ranks = [r for r in dp_cp_ranks if rank_to_gtp_rank[r] == gtp_rank_val]
                 group = create_group(
-                    dp_cp_ps_ranks,
+                    dp_cp_gtp_ranks,
                     timeout=timeout,
                     pg_options=get_nccl_options("dp_cp_ps", nccl_comm_cfgs),
                     group_desc="DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP",
                 )
-                if rank in dp_cp_ps_ranks:
+                if rank in dp_cp_gtp_ranks:
                     _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = group
     else:
         _DATA_PARALLEL_GROUP_WITH_GTP = _DATA_PARALLEL_GROUP
@@ -1100,10 +1100,10 @@ def initialize_model_parallel(
         model_parallel_groups_set = set()
         for cp_dp_ranks in decoder_rank_generator.get_ranks('cp-dp'):
             for i in range(0, len(cp_dp_ranks), generalized_tensor_parallel_size):
-                ps_ranks = cp_dp_ranks[i : i + generalized_tensor_parallel_size]
+                gtp_ranks = cp_dp_ranks[i : i + generalized_tensor_parallel_size]
                 # Merge tp-pp groups of all GTP peers
                 mp_ranks = []
-                for ps_r in ps_ranks:
+                for ps_r in gtp_ranks:
                     mp_ranks.extend(rank_to_tp_pp[ps_r])
                 mp_ranks = sorted(set(mp_ranks))
                 mp_key = tuple(mp_ranks)
@@ -1300,16 +1300,16 @@ def initialize_model_parallel(
     ), 'Expert generalized tensor parallel group is already initialized'
     for dp_ranks in expert_decoder_rank_generator.get_ranks('dp'):
         for i in range(0, len(dp_ranks), expert_generalized_tensor_parallel_size):
-            eps_ranks = dp_ranks[i : i + expert_generalized_tensor_parallel_size]
+            egtp_ranks = dp_ranks[i : i + expert_generalized_tensor_parallel_size]
             group = create_group(
-                eps_ranks,
+                egtp_ranks,
                 timeout=timeout,
                 pg_options=get_nccl_options("expt_gtp", nccl_comm_cfgs),
                 group_desc="EXPERT_GENERALIZED_TENSOR_PARALLEL_GROUP",
             )
-            if rank in eps_ranks:
+            if rank in egtp_ranks:
                 _EXPERT_GENERALIZED_TENSOR_PARALLEL_GROUP = group
-                _EXPERT_GENERALIZED_TENSOR_PARALLEL_GLOBAL_RANKS = eps_ranks
+                _EXPERT_GENERALIZED_TENSOR_PARALLEL_GLOBAL_RANKS = egtp_ranks
 
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
@@ -1454,25 +1454,25 @@ def initialize_model_parallel(
     # Build expert DP group with expert generalized tensor parallel accounted for.
     global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
     if expert_generalized_tensor_parallel_size > 1:
-        # Build rank→expert_ps_rank mapping.
-        rank_to_expert_ps_rank = {}
+        # Build rank→expert_gtp_rank mapping.
+        rank_to_expert_gtp_rank = {}
         for dp_ranks in expert_decoder_rank_generator.get_ranks('dp'):
             for i in range(0, len(dp_ranks), expert_generalized_tensor_parallel_size):
                 eps_chunk = dp_ranks[i : i + expert_generalized_tensor_parallel_size]
-                for eps_rank_idx, r in enumerate(eps_chunk):
-                    rank_to_expert_ps_rank[r] = eps_rank_idx
+                for egtp_rank_idx, r in enumerate(eps_chunk):
+                    rank_to_expert_gtp_rank[r] = egtp_rank_idx
 
-        # Create one group per (expert_dp_group, expert_ps_rank) pair (collective).
+        # Create one group per (expert_dp_group, expert_gtp_rank) pair (collective).
         for dp_ranks in expert_decoder_rank_generator.get_ranks('dp'):
-            for eps_rank_val in range(expert_generalized_tensor_parallel_size):
-                edp_ps_ranks = [r for r in dp_ranks if rank_to_expert_ps_rank[r] == eps_rank_val]
+            for egtp_rank_val in range(expert_generalized_tensor_parallel_size):
+                edp_gtp_ranks = [r for r in dp_ranks if rank_to_expert_gtp_rank[r] == egtp_rank_val]
                 group = create_group(
-                    edp_ps_ranks,
+                    edp_gtp_ranks,
                     timeout=timeout,
                     pg_options=get_nccl_options("ep_dp_ps", nccl_comm_cfgs),
                     group_desc="EXPERT_DATA_PARALLEL_GROUP_WITH_GTP",
                 )
-                if rank in edp_ps_ranks:
+                if rank in edp_gtp_ranks:
                     _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = group
     else:
         _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = _EXPERT_DATA_PARALLEL_GROUP

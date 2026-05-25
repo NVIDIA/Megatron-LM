@@ -232,8 +232,8 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
-                # GTP: collective averages over with_gtp group (size = dp_cp_size / ps_size).
-                # GTP RS already summed over ps_size ranks. To total 1/dp_cp_size scaling:
+                # GTP: collective averages over with_gtp group (size = dp_cp_size / gtp_size).
+                # GTP RS already summed over gtp_size ranks. To total 1/dp_cp_size scaling:
                 # pre_scale * (1/with_gtp_size) = 1/dp_cp_size  =>  pre_scale = with_gtp_size / dp_cp_size.
                 gtp_gradient_scaling_factor = (
                     self.intra_dp_cp_with_gtp_group.size() / self.dp_cp_group.size()
@@ -405,15 +405,10 @@ class DistributedDataParallel(_BaseDataParallel):
                     )
 
         # Create map from param to bucket group, used in pre_hook.
-        for bucket_groups in [
-            self.bucket_groups,
-            self.expert_parallel_bucket_groups,
-            self.gtp_bucket_groups,
-        ]:
-            for bucket_group in bucket_groups:
-                for bucket in bucket_group.buckets:
-                    for param in bucket.params_list:
-                        self.param_to_bucket_group[param] = bucket_group
+        for bucket_group in self.all_bucket_groups:
+            for bucket in bucket_group.buckets:
+                for param in bucket.params_list:
+                    self.param_to_bucket_group[param] = bucket_group
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).

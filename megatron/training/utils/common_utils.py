@@ -86,6 +86,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
     if getattr(args, 'use_megatron_fsdp', False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
+        # params_data is a dict of device_mesh -> list of local tensors.
         params = []
         for model_chunk in model:
             model_chunk.stop_communication()
@@ -110,8 +111,8 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     moe_gtp_params_data = []        # MoE-GTP, non-sharded
     moe_gtp_sharded_params_data = []  # MoE-GTP, sharded → reduce over expert_dp_with_ps
 
-    ps_rank = mpu.get_generalized_tensor_parallel_rank()
-    eps_rank = mpu.get_expert_generalized_tensor_parallel_rank()
+    gtp_rank = mpu.get_generalized_tensor_parallel_rank()
+    egtp_rank = mpu.get_expert_generalized_tensor_parallel_rank()
 
     for model_chunk in model:
         for param in model_chunk.parameters():
@@ -125,10 +126,10 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
             # Filter GTP duplicates: non-GTP params are replicated across GTP ranks.
             if is_expert:
-                if not is_gtp and eps_rank != 0:
+                if not is_gtp and egtp_rank != 0:
                     continue
             else:
-                if not is_gtp and ps_rank != 0:
+                if not is_gtp and gtp_rank != 0:
                     continue
 
             # Route to the correct bucket.
@@ -177,8 +178,8 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     norm_2 = params_norm_2 + sharded_norm_2 + gtp_norm_2 + gtp_sharded_norm_2
 
     # --- Combine MoE + MoE-GTP norms ---
-    # expert_model_parallel = TP×EP×PP (does NOT include EPS), so we need
-    # an explicit EPS reduction for MoE-GTP before the model-parallel reduce.
+    # expert_model_parallel = TP×EP×PP (does NOT include EGTP), so we need
+    # an explicit EGTP reduction for MoE-GTP before the model-parallel reduce.
     moe_gtp_combined_norm_2 = moe_gtp_norm_2 + moe_gtp_sharded_norm_2
     _sum_reduce(moe_gtp_combined_norm_2, mpu.get_expert_generalized_tensor_parallel_group())
     moe_total_norm_2 = moe_norm_2 + moe_sharded_norm_2 + moe_gtp_combined_norm_2

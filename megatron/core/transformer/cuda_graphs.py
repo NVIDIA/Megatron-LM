@@ -1971,7 +1971,7 @@ class CudaGraphManager(torch.nn.Module):
                     return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
 
         self.is_first_microbatch = False
-        # If forward only, next replay should be a forward pass as well.
+        # If forward only, next replay should be a forward pass as well
         if is_inference_mode or not torch.is_grad_enabled() or not runner.fwd_graph_recorded:
             runner.status = _GraphStatus.FWD_READY
         else:

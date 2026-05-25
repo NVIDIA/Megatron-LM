@@ -165,8 +165,8 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         non_gtp_grads = []
         gtp_grads = []
-        ps_rank = parallel_state.get_generalized_tensor_parallel_rank()
-        eps_rank = parallel_state.get_expert_generalized_tensor_parallel_rank()
+        gtp_rank = parallel_state.get_generalized_tensor_parallel_rank()
+        egtp_rank = parallel_state.get_expert_generalized_tensor_parallel_rank()
         for param in params:
             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
                 # Megatron-FSDP always uses decoupled_grad with FusedAdam.
@@ -207,9 +207,9 @@ class MegatronOptimizer(ABC):
                 is_not_ps_duplicate = True
             else:
                 if is_expert:
-                    is_not_ps_duplicate = is_gtp_param or eps_rank == 0
+                    is_not_ps_duplicate = is_gtp_param or egtp_rank == 0
                 else:
-                    is_not_ps_duplicate = is_gtp_param or ps_rank == 0
+                    is_not_ps_duplicate = is_gtp_param or gtp_rank == 0
 
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_ps_duplicate:
                 if is_gtp_param:
@@ -253,7 +253,7 @@ class MegatronOptimizer(ABC):
         """Compute grad norm handling GTP grads that may need extra GTP/EGTP reduction.
 
         For MoE optimizers, grad_stats_parallel_group = TP×EP×PP which does NOT
-        include EPS. MoE-GTP grads need an extra EPS reduction.
+        include EGTP. MoE-GTP grads need an extra EGTP reduction.
         For dense-GTP optimizers, grad_stats_parallel_group = TP×PP×GTP which
         already includes GTP, so no extra reduction is needed.
         """
@@ -262,9 +262,9 @@ class MegatronOptimizer(ABC):
         if not gtp_grads:
             return get_grad_norm_fp32(non_gtp_grads, grad_stats_parallel_group=grad_stats_group)
 
-        # Check if this optimizer handles expert params that need EPS reduction.
+        # Check if this optimizer handles expert params that need EGTP reduction.
         # The model_parallel group for dense/GTP optimizers = TP×PP×GTP (includes GTP),
-        # but for MoE optimizers = TP×EP×PP (does NOT include EPS).
+        # but for MoE optimizers = TP×EP×PP (does NOT include EGTP).
         eps_world_size = parallel_state.get_expert_generalized_tensor_parallel_world_size()
         is_expert_optimizer = any(not getattr(p, 'allreduce', True) for p in self.get_parameters())
         needs_eps_reduce = is_expert_optimizer and eps_world_size > 1
@@ -275,10 +275,10 @@ class MegatronOptimizer(ABC):
                 non_gtp_grads + gtp_grads, grad_stats_parallel_group=grad_stats_group
             )
 
-        # MoE optimizer with EPS: compute GTP norm separately, add EPS reduction.
+        # MoE optimizer with EGTP: compute GTP norm separately, add EGTP reduction.
         non_gtp_norm = get_grad_norm_fp32(non_gtp_grads, grad_stats_parallel_group=grad_stats_group)
         gtp_norm = get_grad_norm_fp32(gtp_grads, grad_stats_parallel_group=grad_stats_group)
-        # get_grad_norm_fp32 returns a float. We need to do the EPS reduction on GPU.
+        # get_grad_norm_fp32 returns a float. We need to do the EGTP reduction on GPU.
         gtp_norm_2 = torch.tensor([gtp_norm**2], dtype=torch.float, device='cuda')
         torch.distributed.all_reduce(
             gtp_norm_2,
@@ -775,11 +775,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
+                            # Create a copy
                             main_param = param.detach().clone().float()
-                            if HAVE_GTP and isinstance(param, GTPShardedParam):
-                                main_param.is_gtp = True
-                            else:
-                                main_param.is_gtp = False
+                            main_param.is_gtp = HAVE_GTP and isinstance(param, GTPShardedParam)
 
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)

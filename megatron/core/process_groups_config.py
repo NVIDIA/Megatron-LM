@@ -304,7 +304,7 @@ class ProcessGroupCollection:
         from megatron.core.utils import get_model_config
 
         if pg_collection is None:
-            # Use parallel_state groups.
+            # Use parallel_state groups
             # Dense (non-GTP) params use with_gtp=False (full DP group) to maximize
             # optimizer state sharding. GTP params use with_gtp=True (smaller group)
             # since GTP's reduce-scatter already handled the GTP dimension.
@@ -454,7 +454,7 @@ class ProcessGroupCollection:
             else:
                 intra_dp_cp_with_gtp_group = intra_dp_cp_group
 
-            # 7. EPS group (fallback to intra_expt_dp if not provided)
+            # 7. EGTP group (fallback to intra_expt_dp if not provided)
             if hasattr(pg_collection, 'intra_expt_dp_with_eps'):
                 intra_expt_dp_with_egtp_group = pg_collection.intra_expt_dp_with_eps
             else:
@@ -619,7 +619,7 @@ class ProcessGroupCollection:
             result['pp_group'] = pg_collection.pp
             result['ep_group'] = pg_collection.ep
 
-            # EPS group (fallback to intra_expt_dp if not provided)
+            # EGTP group (fallback to intra_expt_dp if not provided)
             if hasattr(pg_collection, 'intra_expt_dp_with_eps'):
                 result['intra_expt_dp_with_egtp_group'] = pg_collection.intra_expt_dp_with_eps
             else:

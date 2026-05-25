@@ -1434,8 +1434,8 @@ def validate_args(args, defaults={}):
 
 
     if args.generalized_tensor_parallel_size > 1 or args.expert_generalized_tensor_parallel_size > 1:
-        ps_size = args.generalized_tensor_parallel_size
-        eps_size = args.expert_generalized_tensor_parallel_size
+        gtp_size = args.generalized_tensor_parallel_size
+        egtp_size = args.expert_generalized_tensor_parallel_size
         if get_device_arch_version() >= 10:
             # Setting GTP communication groups for high priority streams for Blackwell and later
             # architectures. Assigning high priority to communication streams ensures that
@@ -1444,7 +1444,7 @@ def validate_args(args, defaults={}):
             if 'ps' not in args.high_priority_stream_groups:
                 args.high_priority_stream_groups.append('ps')
                 warn_rank_0("Setting 'ps' group for high priority streams.")
-            if eps_size > 1 and 'expt_gtp' not in args.high_priority_stream_groups:
+            if egtp_size > 1 and 'expt_gtp' not in args.high_priority_stream_groups:
                 args.high_priority_stream_groups.append('expt_gtp')
                 warn_rank_0("Setting 'expt_gtp' group for high priority streams.")
 
