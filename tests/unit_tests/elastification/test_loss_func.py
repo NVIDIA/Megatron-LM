@@ -16,11 +16,8 @@ import torch
 
 pytestmark = pytest.mark.flaky_in_dev
 
-try:
-    from megatron.elastification import loss_func as loss_func_module
-    from megatron.elastification.loss_func import _mask_loss, loss_func
-except ImportError as exc:
-    pytest.skip(f"megatron.elastification.loss_func unavailable: {exc}", allow_module_level=True)
+from megatron.elastification import loss_func as loss_func_module
+from megatron.elastification.loss_func import _mask_loss, loss_func
 
 
 def _stub_args(**overrides):
