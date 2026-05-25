@@ -120,6 +120,11 @@ class _ParamAndGradBucket:
             self.param_to_index[param] = (global_start - offset, global_end - offset)
         self.params_with_extra_main_grads = params_with_extra_main_grads
 
+        # Back-reference to the owning _ParamAndGradBuffer. Set by the buffer immediately after
+        # bucket construction. Used to reach the buffer-scoped shared scratch tensor that backs
+        # reduce_scatter_with_fp32_accumulation's all-to-all output.
+        self.parent_buffer = None
+
         # Layer-wise optimizer attributes for async param gather.
         self.layerwise_params_list = None
         self.layerwise_param_flat_sizes = None
@@ -657,12 +662,23 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
+                    # Under reduce_scatter_with_fp32_accumulation, share the all-to-all output
+                    # tensor across consecutive bucket reductions: the drain in start_grad_sync
+                    # guarantees the predecessor has been waited on, so reusing the same scratch
+                    # buffer is safe and eliminates per-bucket alloc/free of a bucket-sized
+                    # tensor. For other reduce-scatter implementations the kwarg is omitted.
+                    extra_kwargs = {}
+                    if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+                        extra_kwargs['output_buffer'] = (
+                            bucket.parent_buffer.get_or_alloc_all_to_all_output_buffer()
+                        )
                     grad_reduce_handle = dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
                         group=communication_group,
                         async_op=async_op,
+                        **extra_kwargs,
                     )
                 else:
                     if torch.distributed.get_rank() == 0 and force_all_reduce:
@@ -1264,6 +1280,17 @@ class _ParamAndGradBuffer:
             self.buckets.append(
                 _create_bucket(cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads)
             )
+
+        # Stamp the back-reference on each bucket and record the maximum bucket size for the
+        # lazily-allocated shared all-to-all output buffer (see
+        # get_or_alloc_all_to_all_output_buffer).
+        for bucket in self.buckets:
+            bucket.parent_buffer = self
+        self.max_bucket_grad_numel = (
+            max(bucket.grad_data.numel() for bucket in self.buckets) if self.buckets else 0
+        )
+        self.all_to_all_output_buffer: Optional[torch.Tensor] = None
+
         # Log buckets for all PP stages.
         log_strs = []
         log_strs.append(
@@ -1475,6 +1502,25 @@ class _ParamAndGradBuffer:
         self.grad_data.zero_()
         for grad in self.extra_main_grads:
             grad.zero_()
+
+    def get_or_alloc_all_to_all_output_buffer(self) -> torch.Tensor:
+        """Lazily allocate and return a buffer-scoped scratch tensor for
+        reduce_scatter_with_fp32_accumulation's all-to-all output.
+
+        Sized to the largest bucket in this buffer so a single allocation can back the
+        all-to-all output for every bucket reduction, eliminating per-step alloc/free churn.
+        Sharing this buffer across buckets is only safe when consecutive bucket reductions
+        cannot overlap in time on the NCCL stream — that constraint is enforced separately by
+        the predecessor-drain in `_ParamAndGradBucketGroup.start_grad_sync`.
+        """
+        if self.all_to_all_output_buffer is None:
+            assert self.buckets, "Cannot allocate all-to-all output buffer with no buckets"
+            self.all_to_all_output_buffer = torch.empty(
+                self.max_bucket_grad_numel,
+                dtype=self.grad_dtype,
+                device=self.buckets[0].grad_data.device,
+            )
+        return self.all_to_all_output_buffer
 
     def offload_to_cpu(self, move_params: bool = True, move_grads: bool = True) -> None:
         """
