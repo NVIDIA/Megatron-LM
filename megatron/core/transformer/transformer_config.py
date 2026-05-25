@@ -2224,7 +2224,8 @@ class TransformerConfig(ModelParallelConfig):
             if self.activation_func == F.silu and self.gated_linear_unit:
                 if self.num_moe_experts is None:
                     raise ValueError(
-                        "activation_func_clamp_value_shared_expert for SwiGLU is only supported with MoE."
+                        "activation_func_clamp_value_shared_expert for SwiGLU is only "
+                        "supported with MoE."
                     )
                 if self.use_te_activation_func:
                     raise ValueError(
