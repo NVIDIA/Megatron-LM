@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
@@ -191,97 +190,144 @@ def _build_packed_seq_params_from_cu_seqlens(
 
 
 
-def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=False, seq_length: int=None, device = "cuda") -> list[Dict[str, Any]]:
-    """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD format."""
+def pack_or_pad_batch(
+    batch: list[Dict[str, Any]],
+    use_packed_sequence: bool = False,
+    seq_length: int = None,
+    device="cuda",
+) -> Dict[str, Any]:
+    """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD or ``[B, S]`` BSHD.
+
+    Must be invoked on every TP rank. On the TP source rank ``batch`` is
+    the per-sample dict list from the dataset; on other TP ranks ``batch``
+    may be ``None`` (the function relies on the trailing TP broadcast to
+    distribute results). All metadata needed to reconstruct
+    ``PackedSeqParams`` (``cu_seqlens``, ``cu_seqlens_padded``,
+    ``max_seqlen``, ``total_tokens``) is broadcast alongside the data, so
+    every rank can build an identical ``PackedSeqParams`` on its own.
+    """
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
+    is_src = mpu.get_tensor_model_parallel_rank() == 0
 
     # SP is an explicit runtime option; TP>1 does not imply SP is enabled.
+    # get_args() itself raises in test contexts where megatron globals are
+    # not initialised.
     try:
-        has_sp = bool(get_args().sequence_parallel)
-    except Exception:
+        has_sp = bool(getattr(get_args(), "sequence_parallel", False))
+    except AssertionError:
         has_sp = False
 
     if cp_size > 1:
         divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
     else:
         divisible_by = tp_size if has_sp else 1
-    # NOTE: don't consider fp8 padding now
-    
+
     if use_packed_sequence:
-        input_ids_list, labels_list, loss_mask_list, pixel_values_list, image_grid_thw_list = [], [], [], [], []
-        seqlens_list, seqlens_padded_list = [], []
+        packed_batch: Dict[str, Any] = {}
 
-        # NOTE: for attention_mask, we don't use attention mask
-        #       for position_ids, let model handle it itself
-        #       we don't cut input id, althrough it exceeds seq_length
+        if is_src:
+            assert batch is not None, "source TP rank must provide a batch"
+            input_ids_list, labels_list, loss_mask_list = [], [], []
+            pixel_values_list, image_grid_thw_list = [], []
+            seqlens_list, seqlens_padded_list = [], []
 
-        packed_batch = dict()
+            for sample in batch:
+                seqlen = sample["input_ids"].shape[0]
+                assert (
+                    sample["labels"].shape
+                    == sample["input_ids"].shape
+                    == sample["loss_mask"].shape
+                ), "labels, input_ids, and loss_mask must have the same shape"
+                target_len = math.ceil(seqlen / divisible_by) * divisible_by
+                input_ids_list.append(
+                    F.pad(sample["input_ids"], (0, target_len - seqlen), value=0)
+                )
+                labels_list.append(
+                    F.pad(sample["labels"], (0, target_len - seqlen), value=-100)
+                )
+                loss_mask_list.append(
+                    F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0)
+                )
+                seqlens_list.append(seqlen)
+                seqlens_padded_list.append(target_len)
+                pixel_values_list.append(sample["pixel_values"])
+                image_grid_thw_list.append(sample["image_grid_thw"])
 
-        for sample in batch:
-            seqlen = sample["input_ids"].shape[0]
-            assert sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape, "labels, input_ids, and loss_mask must have the same shape"
-            target_len = math.ceil(seqlen / divisible_by) * divisible_by
-            input_ids = F.pad(sample["input_ids"], (0, target_len - seqlen), value=0)
-            labels = F.pad(sample["labels"], (0, target_len - seqlen), value=-100)
-            loss_mask = F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0)
+            cu_seqlens = list(accumulate(seqlens_list, initial=0))
+            cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
 
-            input_ids_list.append(input_ids)
-            labels_list.append(labels)
-            loss_mask_list.append(loss_mask)
-            seqlens_list.append(seqlen)
-            seqlens_padded_list.append(target_len)
-            pixel_values_list.append(sample["pixel_values"])
-            image_grid_thw_list.append(sample["image_grid_thw"])
+            packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
+            packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
+            packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
+            packed_batch["pixel_values"] = torch.concat(pixel_values_list)
+            packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
+            # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
+            # so each rank can build an identical PackedSeqParams.
+            packed_batch["cu_seqlens"] = torch.tensor(
+                cu_seqlens, dtype=torch.int32, device=device,
+            )
+            packed_batch["cu_seqlens_padded"] = torch.tensor(
+                cu_seqlens_padded, dtype=torch.int32, device=device,
+            )
 
-        cu_seqlens = list(accumulate(seqlens_list, initial=0))
-        cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
-
-        packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
-        packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
-        packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
-
-        # TODO, maybe pixel_values's seqlens needs to be recorded. 
-        packed_batch["pixel_values"] = torch.concat(pixel_values_list)
-        packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
-        
-        # broadcast to all tp ranks
         packed_batch = broadcast_data_batch(packed_batch, device=device)
 
+        cu_seqlens_t = packed_batch.pop("cu_seqlens")
+        cu_seqlens_padded_t = packed_batch.pop("cu_seqlens_padded")
+        # Derive max_seqlen / total_tokens from the (broadcast) cu_seqlens —
+        # no extra collective needed.
+        max_seqlen_q = int((cu_seqlens_padded_t[1:] - cu_seqlens_padded_t[:-1]).max().item())
+        total_tokens = int(cu_seqlens_padded_t[-1].item())
+
         packed_batch["packed_seq_params"] = PackedSeqParams(
-            qkv_format='thd',
-            cu_seqlens_q=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
-            cu_seqlens_kv=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
-            cu_seqlens_q_padded=torch.tensor(cu_seqlens_padded, dtype=torch.int32, device=device),
-            cu_seqlens_kv_padded=torch.tensor(cu_seqlens_padded, dtype=torch.int32, device=device),
-            max_seqlen_q=max(seqlens_padded_list),
-            max_seqlen_kv=max(seqlens_padded_list),
-            total_tokens=cu_seqlens_padded[-1],
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_t,
+            cu_seqlens_kv=cu_seqlens_t,
+            cu_seqlens_q_padded=cu_seqlens_padded_t,
+            cu_seqlens_kv_padded=cu_seqlens_padded_t,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_q,
+            total_tokens=total_tokens,
         )
         return packed_batch
-    else:
-        assert seq_length is not None, "seq_length must be provided when use_packed_sequence is False"
-        max_seqlens = max([x["input_ids"].shape[0] for x in batch])
+
+    # ---------- padded (BSHD) branch ----------
+    assert seq_length is not None, (
+        "seq_length must be provided when use_packed_sequence is False"
+    )
+    padded_batch: Dict[str, Any] = {}
+
+    if is_src:
+        assert batch is not None, "source TP rank must provide a batch"
+        max_seqlens = max(x["input_ids"].shape[0] for x in batch)
         target_seqlens = min(max_seqlens, seq_length)
         # Round target seqlen up to the parallelism alignment factor so the
         # batched tensor is divisible for CP (+SP) splitting downstream.
         if divisible_by > 1:
             target_seqlens = math.ceil(target_seqlens / divisible_by) * divisible_by
-        padded_batch = dict()
-        
+
         for sample in batch:
-            sample["input_ids"] = F.pad(sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]), value=0)
-            sample["labels"] = F.pad(sample["labels"], (0, target_seqlens - sample["labels"].shape[0]), value=-100)
-            sample["loss_mask"] = F.pad(sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]), value=0)
+            sample["input_ids"] = F.pad(
+                sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]),
+                value=0,
+            )
+            sample["labels"] = F.pad(
+                sample["labels"], (0, target_seqlens - sample["labels"].shape[0]),
+                value=-100,
+            )
+            sample["loss_mask"] = F.pad(
+                sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]),
+                value=0,
+            )
 
         padded_batch["input_ids"] = torch.concat([x["input_ids"].unsqueeze(0) for x in batch], dim=0)
         padded_batch["labels"] = torch.concat([x["labels"].unsqueeze(0) for x in batch], dim=0)
         padded_batch["loss_mask"] = torch.concat([x["loss_mask"].unsqueeze(0) for x in batch], dim=0)
         padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
-        # broadcast to all tp ranks
-        padded_batch = broadcast_data_batch(padded_batch, device=device)
-        return padded_batch
+
+    return broadcast_data_batch(padded_batch, device=device)
 
 
 # -------------------------------------------------------------------
@@ -396,31 +442,13 @@ def forward_step(data_iterator, model):
             batch["input_ids"], dtype=torch.float,
         )
 
-    # CP-split loss_mask to match the model output (which is CP-split
-    # inside MultimodalModel.forward / Qwen35VLModel.forward).
-    # THD: use the same TE-based per-sample partition index as the model.
-    # BSHD: use the matching zigzag split.
-    cp_size = get_context_parallel_world_size()
-    if cp_size > 1:
-        from megatron.core.parallel_state import get_context_parallel_rank
+    # Slice loss_mask the same way the model sliced its inputs, so the
+    # mask aligns with the CP-shard output.  Delegated to MultimodalModel
+    # so the slicing rule lives in one place.
+    from examples.multimodal_dev.models.base import MultimodalModel
 
-        from examples.multimodal_dev.models.base import (
-            _cp_split_tensor,
-            _thd_cp_partition_index,
-        )
-
-        cp_rank = get_context_parallel_rank()
-        psp = batch.get("packed_seq_params", None)
-        if psp is not None:
-            idx = _thd_cp_partition_index(
-                psp.cu_seqlens_q_padded,
-                loss_mask.shape[1], cp_size, cp_rank,
-            )
-            loss_mask = loss_mask.index_select(1, idx)
-        else:
-            loss_mask = _cp_split_tensor(
-                loss_mask, seq_dim=1,
-                cp_size=cp_size, cp_rank=cp_rank,
-            )
+    loss_mask = MultimodalModel.cp_split_loss_mask(
+        loss_mask, batch.get("packed_seq_params", None),
+    )
 
     return output_tensor, partial(loss_func, loss_mask)

@@ -285,6 +285,29 @@ class MultimodalModel(MegatronModule):
             attention_mask, position_ids,
         )
 
+    @staticmethod
+    def cp_split_loss_mask(loss_mask, packed_seq_params):
+        """Slice ``loss_mask`` the same way the model slices its inputs.
+
+        Mirrors the slicing done inside :meth:`_cp_split_for_forward` so
+        the loss computation outside the model can index a mask aligned
+        with the model's CP-shard output. Returns ``loss_mask`` unchanged
+        when ``CP <= 1``.
+        """
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if cp_size <= 1 or loss_mask is None:
+            return loss_mask
+        cp_rank = parallel_state.get_context_parallel_rank()
+        if packed_seq_params is not None:
+            idx = _thd_cp_partition_index(
+                packed_seq_params.cu_seqlens_q_padded,
+                loss_mask.shape[1], cp_size, cp_rank,
+            )
+            return loss_mask.index_select(1, idx)
+        return _cp_split_tensor(
+            loss_mask, seq_dim=1, cp_size=cp_size, cp_rank=cp_rank,
+        )
+
     @contextlib.contextmanager
     def _thd_mrope_no_cp_override(self, packed_seq_params):
         """Force ``rotary_pos_emb.cp_group`` to size 1 for the wrapped

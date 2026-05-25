@@ -35,6 +35,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from examples.multimodal_dev.forward_step import _build_packed_seq_params, pack_or_pad_batch
+from examples.multimodal_dev.tests._helpers import grad_norm, mean_loss
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -81,22 +82,6 @@ def _thd_position_ids(seq_lengths, device):
 # ===================================================================
 # Helpers
 # ===================================================================
-
-
-def _grad_norm(model):
-    """L2 norm of all parameter gradients."""
-    total = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            total += p.grad.data.float().norm(2).item() ** 2
-    return total ** 0.5
-
-
-def _mean_loss(per_token_loss, loss_mask):
-    """Mean loss over valid tokens."""
-    flat = per_token_loss.float().view(-1)
-    mask = loss_mask.float().view(-1)
-    return (flat * mask).sum() / mask.sum().clamp(min=1)
 
 
 def _build_model(cfg, vocab_size, max_seq_len):
@@ -153,9 +138,9 @@ def run_equal_length_test(
         labels=labels,
         loss_mask=loss_mask,
     )
-    bshd_loss = _mean_loss(output_bshd, loss_mask)
+    bshd_loss = mean_loss(output_bshd, loss_mask)
     bshd_loss.backward()
-    bshd_gn = _grad_norm(model)
+    bshd_gn = grad_norm(model)
     bshd_lv = bshd_loss.item()
     bshd_per_token = output_bshd.detach().float().view(-1).clone()
 
@@ -177,9 +162,9 @@ def run_equal_length_test(
         loss_mask=packed["loss_mask"],
         packed_seq_params=psp,
     )
-    thd_loss = _mean_loss(output_thd, packed["loss_mask"])
+    thd_loss = mean_loss(output_thd, packed["loss_mask"])
     thd_loss.backward()
-    thd_gn = _grad_norm(model)
+    thd_gn = grad_norm(model)
     thd_lv = thd_loss.item()
     thd_per_token = output_thd.detach().float().view(-1).clone()
 
@@ -268,9 +253,9 @@ def run_variable_length_smoke_test(model, vocab_size, seed):
         loss_mask=packed["loss_mask"],
         packed_seq_params=psp,
     )
-    loss = _mean_loss(output, packed["loss_mask"])
+    loss = mean_loss(output, packed["loss_mask"])
     loss.backward()
-    gn = _grad_norm(model)
+    gn = grad_norm(model)
     loss_val = loss.item()
 
     model.zero_grad()

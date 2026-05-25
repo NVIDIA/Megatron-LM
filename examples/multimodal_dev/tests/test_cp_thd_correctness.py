@@ -29,7 +29,6 @@ import os
 import sys
 
 import torch
-import torch.nn as nn
 
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "../../.."),
@@ -65,9 +64,6 @@ class _StubVisionEncoder(MegatronModule):
 
     def __init__(self, config):
         super().__init__(config=config)
-        # MegatronModule expects at least one parameter for state_dict
-        # round-tripping; this Linear is otherwise unused.
-        self._unused = nn.Linear(1, 1)
 
     def forward(self, pixel_values, image_grid_thw):
         raise RuntimeError(
