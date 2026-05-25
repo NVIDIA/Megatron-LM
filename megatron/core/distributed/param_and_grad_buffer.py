@@ -569,10 +569,17 @@ class _ParamAndGradBucketGroup:
 
         # Drain the predecessor bucket group's reduce-scatter before allocating ours. Only
         # linked under reduce_scatter_with_fp32_accumulation, which holds an intermediate
-        # all-to-all output tensor pinned until .wait() runs. Idempotent — finish_grad_sync
-        # is a no-op once the predecessor has already been drained (e.g., by DDP-level
-        # finish_grad_sync on the first batch, or by a prior successor's dispatch).
-        if self.previous_grad_reduce_bucket_group is not None:
+        # all-to-all output tensor pinned until .wait() runs. We only drain when the
+        # predecessor has actually been dispatched this iteration (grad_reduce_handle set):
+        # backward param ordering does not always match bucket linkage order (e.g. NVFP4
+        # bucket layouts), so the predecessor may not have fired yet when we arrive here.
+        # In that case the predecessor will dispatch and drain on its own once its params
+        # become ready. The end-of-step finalize loop still catches any bucket that
+        # neither a successor nor itself drained.
+        if (
+            self.previous_grad_reduce_bucket_group is not None
+            and self.previous_grad_reduce_bucket_group.grad_reduce_handle is not None
+        ):
             self.previous_grad_reduce_bucket_group.finish_grad_sync(
                 force_all_reduce=force_all_reduce
             )
