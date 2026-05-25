@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module."""
+import os
 from functools import partial
 from typing import Optional, Tuple
 
@@ -275,6 +276,55 @@ class GraphableMegatronModule(MegatronModule):
                     param_modules[id(module)] = module
         for module in param_modules.values():
             self.cuda_graph_manual_hooks.append((make_hook_func(), (module,)))
+
+        self._maybe_register_cudagraph_param_grad_nan_hooks(param_modules.values())
+
+    def _maybe_register_cudagraph_param_grad_nan_hooks(self, param_modules):
+        """Register debug hooks for parameter gradients returned by TE CUDA graph backward."""
+        if not bool(int(os.environ.get("MCORE_CG_PARAM_GRAD_DEBUG_NAN", "0"))):
+            return
+        if getattr(self, "_cuda_graph_param_grad_nan_hooks_registered", False):
+            return
+
+        name_by_param_id = {id(param): name for name, param in self.named_parameters()}
+        params_by_id = {}
+        for module in param_modules:
+            for param in module.parameters(recurse=False):
+                if param.requires_grad:
+                    params_by_id[id(param)] = param
+
+        hook_handles = []
+
+        def _to_local(tensor):
+            to_local = getattr(tensor, "to_local", None)
+            if callable(to_local):
+                return to_local()
+            return tensor
+
+        for param in params_by_id.values():
+            param_name = name_by_param_id.get(id(param), "<unknown>")
+
+            def _hook(grad, param_name=param_name):
+                if grad is None:
+                    return grad
+                local_grad = _to_local(grad)
+                if not torch.is_tensor(local_grad) or not torch.is_floating_point(local_grad):
+                    return grad
+                has_nan = torch.isnan(local_grad).any()
+                if bool(has_nan.detach().cpu().item()):
+                    nan_count = int(torch.isnan(local_grad).sum().detach().cpu().item())
+                    raise RuntimeError(
+                        "[CUDA graph param grad] Detected NaN in incoming param grad: "
+                        f"layer={getattr(self, 'layer_number', '<unknown>')}, "
+                        f"param={param_name}, shape={tuple(local_grad.shape)}, "
+                        f"dtype={local_grad.dtype}, nan_count={nan_count}"
+                    )
+                return grad
+
+            hook_handles.append(param.register_hook(_hook))
+
+        self._cuda_graph_param_grad_nan_hook_handles = hook_handles
+        self._cuda_graph_param_grad_nan_hooks_registered = True
 
     def _get_submodules_under_cudagraphs(self):
         """
