@@ -27,6 +27,8 @@ from .mixed_precision import (
     MixedPrecisionPolicy,
     fp8_create_transpose_cache,
     fp8_discard_transpose_cache,
+    fp8_get_raw_data,
+    fp8_set_raw_data,
     is_float8tensor,
 )
 from .param_and_grad_buffer import (
@@ -764,10 +766,38 @@ class MegatronFSDP(torch.nn.Module):
             ]
 
         def _mirror_fsdp_param_attrs(module: nn.Module, canonical_params):
-            """Mirror FSDP buffer attrs onto transient DTensor wrappers exposed by modules."""
+            """Mirror FSDP buffer state onto transient wrappers exposed by modules."""
             current_params = list(module.parameters(recurse=False))
             if len(current_params) != len(canonical_params):
                 return
+
+            def _get_param_data(param):
+                local_param = to_local_if_dtensor(param)
+                if is_float8tensor(local_param):
+                    return fp8_get_raw_data(local_param)
+                return local_param.data
+
+            def _set_param_data(param, data):
+                local_param = to_local_if_dtensor(param)
+                if is_float8tensor(local_param):
+                    fp8_set_raw_data(local_param, data)
+                else:
+                    local_param.data = data
+
+            def _mirror_param_data(canonical_param, current_param):
+                canonical_data = _get_param_data(canonical_param)
+                current_data = _get_param_data(current_param)
+                if current_data is canonical_data:
+                    return
+                if (
+                    current_data is not None
+                    and canonical_data is not None
+                    and current_data.shape == canonical_data.shape
+                    and current_data.data_ptr() == canonical_data.data_ptr()
+                ):
+                    return
+                _set_param_data(current_param, canonical_data)
+
             attrs = (
                 "_gbuf",
                 "_item_id",
@@ -780,6 +810,7 @@ class MegatronFSDP(torch.nn.Module):
             for canonical_param, current_param in zip(canonical_params, current_params):
                 if canonical_param is current_param:
                     continue
+                _mirror_param_data(canonical_param, current_param)
                 for attr in attrs:
                     if hasattr(canonical_param, attr):
                         setattr(current_param, attr, getattr(canonical_param, attr))
