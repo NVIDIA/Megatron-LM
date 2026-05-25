@@ -21,13 +21,27 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import (
     CheckpointType,
+    _get_non_persistent_iteration,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _transpose_first_dim,
+    checkpoint_exists,
+    cleanup_old_non_persistent_checkpoint,
+    generate_state_dict,
     get_checkpoint_tracker_filename,
+    get_checkpoint_name,
+    get_distributed_optimizer_checkpoint_name,
+    get_load_checkpoint_path_by_args,
+    get_loaded_iteration,
     load_checkpoint,
+    load_args_from_checkpoint,
+    maybe_save_dataloader_state,
     read_metadata,
     save_checkpoint,
+    set_checkpoint_version,
+    set_loaded_iteration,
 )
+from megatron.training import checkpointing as checkpointing_module
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -378,3 +392,260 @@ def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter
 
     assert max_iter == expected_iter, f"Expected iteration {expected_iter}, got {max_iter}"
     assert release == expected_release, f"Expected release={expected_release}, got {release}"
+
+
+def test_checkpoint_name_variants_and_tracker_paths(tmp_path):
+    root = tmp_path / "ckpts"
+
+    base_dir = get_checkpoint_name(str(root), 42, return_base_dir=True)
+    tensor_only = get_checkpoint_name(
+        str(root),
+        42,
+        pipeline_parallel=False,
+        tensor_rank=3,
+        expert_parallel=False,
+    )
+    pipeline_and_expert = get_checkpoint_name(
+        str(root),
+        42,
+        pipeline_parallel=True,
+        tensor_rank=1,
+        pipeline_rank=2,
+        expert_parallel=True,
+        expert_rank=4,
+        basename="state.pt",
+    )
+    release = get_checkpoint_name(
+        str(root),
+        0,
+        release=True,
+        pipeline_parallel=False,
+        tensor_rank=0,
+        expert_parallel=False,
+    )
+
+    assert base_dir.endswith("iter_0000042")
+    assert tensor_only.endswith("iter_0000042/mp_rank_03/model_optim_rng.pt")
+    assert pipeline_and_expert.endswith("iter_0000042/mp_rank_01_002_004/state.pt")
+    assert release.endswith("release/mp_rank_00/model_optim_rng.pt")
+    assert get_checkpoint_tracker_filename(str(root)).endswith("latest_checkpointed_iteration.txt")
+    assert get_distributed_optimizer_checkpoint_name(tensor_only).endswith("mp_rank_03/distrib_optim.pt")
+
+
+def test_checkpoint_exists_and_load_path_by_args(tmp_path):
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+
+    assert not checkpoint_exists(None)
+    assert not checkpoint_exists(str(tmp_path))
+
+    tracker.write_text("7", encoding="utf-8")
+    args = SimpleNamespace(load=str(tmp_path), ckpt_step=None)
+
+    assert checkpoint_exists(str(tmp_path))
+    assert get_load_checkpoint_path_by_args(args).endswith("iter_0000007")
+
+    args.ckpt_step = 9
+    assert get_load_checkpoint_path_by_args(args).endswith("iter_0000009")
+
+
+def test_checkpoint_version_and_loaded_iteration_helpers(monkeypatch):
+    monkeypatch.setattr(checkpointing_module, "_CHECKPOINT_VERSION", None)
+    monkeypatch.setattr(checkpointing_module, "_LOADED_ITERATION", None)
+
+    set_loaded_iteration(123)
+
+    assert get_loaded_iteration() == 123
+
+    set_checkpoint_version(3.0)
+    set_checkpoint_version(3.0)
+
+
+def test_generate_state_dict_collects_model_optimizer_scheduler_and_rng(create_args):
+    args = create_args
+    args.ckpt_format = "torch"
+    args.no_save_optim = False
+    args.no_save_rng = False
+    model = [mock.Mock()]
+    model[0].state_dict_for_save_checkpoint.return_value = {"weight": torch.ones(1)}
+    optimizer = MockState({"optimizer": "state"})
+    scheduler = MockState({"scheduler": "state"})
+    rng_state = [{"rng": "state"}]
+    rerun_state = {"rerun": "state"}
+
+    state_dict = generate_state_dict(
+        args,
+        model,
+        optimizer,
+        scheduler,
+        rng_state,
+        iteration=11,
+        rerun_state=rerun_state,
+    )
+
+    assert state_dict["args"] is args
+    assert state_dict["checkpoint_version"] == 3.0
+    assert state_dict["iteration"] == 11
+    assert torch.equal(state_dict["model"]["weight"], torch.ones(1))
+    assert state_dict["optimizer"] == {"optimizer": "state"}
+    assert state_dict["opt_param_scheduler"] == {"scheduler": "state"}
+    assert state_dict["rng_state"] == rng_state
+    assert state_dict["rerun_state_machine"] == rerun_state
+
+
+def test_generate_state_dict_skips_optimizer_and_rng_when_disabled(create_args):
+    args = create_args
+    args.ckpt_format = "torch"
+    args.no_save_optim = True
+    args.no_save_rng = True
+    model = [mock.Mock()]
+    model[0].state_dict_for_save_checkpoint.return_value = {"weight": "model"}
+
+    state_dict = generate_state_dict(args, model, optimizer=None, opt_param_scheduler=None, rng_state=None)
+
+    assert "optimizer" not in state_dict
+    assert "opt_param_scheduler" not in state_dict
+    assert "rng_state" not in state_dict
+
+
+def test_transpose_first_dim_uses_attention_shape_metadata():
+    attention = SimpleNamespace(hidden_size_per_attention_head=2, num_attention_heads_per_partition=2)
+    model = SimpleNamespace(
+        language_model=SimpleNamespace(
+            encoder=SimpleNamespace(
+                layers=[SimpleNamespace(self_attention=attention)]
+            )
+        )
+    )
+    tensor = torch.arange(12).view(6, 2)
+
+    first = _transpose_first_dim(tensor, num_splits=3, num_splits_first=True, model=model)
+    last = _transpose_first_dim(tensor, num_splits=3, num_splits_first=False, model=model)
+
+    assert first.shape == tensor.shape
+    assert last.shape == tensor.shape
+    assert sorted(first.flatten().tolist()) == sorted(tensor.flatten().tolist())
+    assert sorted(last.flatten().tolist()) == sorted(tensor.flatten().tolist())
+
+
+def test_cleanup_old_non_persistent_checkpoint_keeps_newest(tmp_path):
+    for iteration in [1, 2, 3]:
+        (tmp_path / f"iter_{iteration:07d}").mkdir()
+
+    cleanup_old_non_persistent_checkpoint(tmp_path, leave_ckpt_num=1, do_async=False)
+
+    assert not (tmp_path / "iter_0000001").exists()
+    assert not (tmp_path / "iter_0000002").exists()
+    assert (tmp_path / "iter_0000003").exists()
+
+
+def test_get_non_persistent_iteration_global_and_local(monkeypatch, tmp_path):
+    args = SimpleNamespace(non_persistent_ckpt_type=None)
+    assert _get_non_persistent_iteration(str(tmp_path), args) == -1
+
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("13", encoding="utf-8")
+    args.non_persistent_ckpt_type = "global"
+    assert _get_non_persistent_iteration(str(tmp_path), args) == 13
+
+    args.non_persistent_ckpt_type = "local"
+    context = {"local_checkpoint_manager": SimpleNamespace(find_latest=lambda: 17)}
+    assert _get_non_persistent_iteration(str(tmp_path), args, context) == 17
+
+
+def test_maybe_save_dataloader_state_validates_iterator(monkeypatch, tmp_path):
+    maybe_save_dataloader_state(None, iteration=1, dataloader_save_path=str(tmp_path))
+    maybe_save_dataloader_state(object(), iteration=1, dataloader_save_path="")
+
+    with pytest.raises(RuntimeError, match="Could not find a save_state"):
+        maybe_save_dataloader_state(SimpleNamespace(iterable=object()), 1, str(tmp_path))
+
+
+def test_load_args_from_checkpoint_updates_missing_values(monkeypatch, tmp_path):
+    checkpoint_args = SimpleNamespace(
+        disable_bias_linear=True,
+        hybrid_override_pattern="M*",
+        hybrid_layer_pattern=None,
+        num_layers=2,
+        hidden_size=16,
+        ffn_hidden_size=64,
+        seq_length=8,
+        num_attention_heads=4,
+        num_query_groups=2,
+        group_query_attention=True,
+        kv_channels=4,
+        max_position_embeddings=8,
+        position_embedding_type="rope",
+        add_position_embedding=True,
+        use_rotary_position_embeddings=True,
+        rotary_base=10000,
+        rotary_percent=1.0,
+        rotary_interleaved=False,
+        add_qkv_bias=True,
+        squared_relu=False,
+        swiglu=True,
+        untie_embeddings_and_output_weights=True,
+        apply_layernorm_1p=False,
+        normalization="RMSNorm",
+        apply_query_key_layer_scaling=False,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        mtp_hybrid_override_pattern=None,
+        mtp_num_layers=None,
+        mtp_use_repeated_layer=False,
+        spec=None,
+        num_experts=None,
+        moe_layer_freq=None,
+        moe_router_topk=1,
+        moe_token_dispatcher_type="allgather",
+        moe_router_pre_softmax=False,
+        moe_grouped_gemm=False,
+        moe_shared_expert_intermediate_size=None,
+        moe_router_score_function="softmax",
+        moe_router_enable_expert_bias=False,
+        moe_router_topk_scaling_factor=None,
+        mamba_state_dim=None,
+        mamba_head_dim=None,
+        mamba_num_groups=None,
+        mamba_num_heads=None,
+        heterogeneous_layers_config_path=None,
+        heterogeneous_layers_config_encoded_json=None,
+        moe_latent_size=None,
+        tokenizer_model="tok.model",
+        tokenizer_type="GPT2BPETokenizer",
+        tiktoken_pattern=None,
+        padded_vocab_size=128,
+        ckpt_format="torch",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        num_layers_per_virtual_pipeline_stage=None,
+        expert_model_parallel_size=1,
+    )
+    state_dict = {
+        "args": checkpoint_args,
+        "checkpoint_version": 3.0,
+        "iteration": 23,
+    }
+    args = SimpleNamespace(
+        load=str(tmp_path),
+        use_tokenizer_model_from_checkpoint_args=True,
+        use_mp_args_from_checkpoint_args=True,
+    )
+    monkeypatch.setattr(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        lambda *items, **kwargs: (state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    )
+
+    updated, returned_checkpoint_args = load_args_from_checkpoint(args)
+
+    assert updated is args
+    assert returned_checkpoint_args is checkpoint_args
+    assert args.iteration == 23
+    assert args.add_bias_linear is False
+    assert args.hybrid_layer_pattern == "M*"
+    assert checkpoint_args.num_layers is None
+    assert not hasattr(args, "num_layers")
+    assert args.hidden_size == 16
+    assert args.num_query_groups == 2
+    assert args.tokenizer_model == "tok.model"
+    assert args.tensor_model_parallel_size == 1
