@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.dbuffer import (
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import (
     DBuffer,
     Flat,
     Partial,
@@ -231,6 +231,29 @@ def test_partial_allreduce(setup: DistributedSetup):
 
 
 @pytest.mark.distributed
+def test_partial_allreduce_average(setup: DistributedSetup):
+    """Partial buffers can all-reduce with AVG."""
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    rank_scale = float(setup.rank + 1)
+    tensors = [
+        torch.full((5, 3), rank_scale, dtype=torch.float32, device=setup.device),
+        torch.full((4,), rank_scale * 10, dtype=torch.float32, device=setup.device),
+    ]
+    partial_buffer = DBuffer.distribute_tensors(
+        tensors, mesh, [Partial(reduce_op=dist.ReduceOp.AVG)]
+    )
+
+    replicated_buffer = partial_buffer.allreduce(0)
+
+    scale_average = float(setup.world_size + 1) / 2.0
+    expected = [
+        torch.full((5, 3), scale_average, dtype=torch.float32, device=setup.device),
+        torch.full((4,), scale_average * 10, dtype=torch.float32, device=setup.device),
+    ]
+    _assert_dbuffer_contains_tensors(replicated_buffer, expected, exact=False)
+
+
+@pytest.mark.distributed
 def test_partial_reduce_scatter_to_flat(setup: DistributedSetup):
     """Partial buffers reduce-scatter into Flat buffers."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
@@ -252,6 +275,34 @@ def test_partial_reduce_scatter_to_flat(setup: DistributedSetup):
     expected_tensors = [
         torch.full((5, 3), scale_sum, dtype=torch.float32, device=setup.device),
         torch.full((4,), scale_sum * 10, dtype=torch.float32, device=setup.device),
+    ]
+    _assert_dbuffer_contains_tensors(replicated_buffer, expected_tensors, exact=False)
+
+
+@pytest.mark.distributed
+def test_partial_reduce_scatter_to_flat_average(setup: DistributedSetup):
+    """Partial buffers can reduce-scatter with AVG."""
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    rank_scale = float(setup.rank + 1)
+    tensors = [
+        torch.full((5, 3), rank_scale, dtype=torch.float32, device=setup.device),
+        torch.full((4,), rank_scale * 10, dtype=torch.float32, device=setup.device),
+    ]
+    partial_buffer = DBuffer.distribute_tensors(
+        tensors, mesh, [Partial(reduce_op=dist.ReduceOp.AVG)]
+    )
+    layout = partial_buffer.layout
+
+    flat_buffer = partial_buffer.reduce_scatter(0, Flat())
+    replicated_buffer = flat_buffer.allgather(0)
+
+    assert flat_buffer.placements == (Flat(),)
+    assert flat_buffer.layout == layout
+    assert replicated_buffer.layout == layout
+    scale_average = float(setup.world_size + 1) / 2.0
+    expected_tensors = [
+        torch.full((5, 3), scale_average, dtype=torch.float32, device=setup.device),
+        torch.full((4,), scale_average * 10, dtype=torch.float32, device=setup.device),
     ]
     _assert_dbuffer_contains_tensors(replicated_buffer, expected_tensors, exact=False)
 
