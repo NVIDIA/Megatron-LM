@@ -14,6 +14,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -536,6 +540,7 @@ class TestVisionTECudaGraphHelperPP2:
         self.micro_batch_size = 2
 
     def teardown_method(self, method):
+        destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
         gc.collect()
 
@@ -596,6 +601,14 @@ class TestVisionTECudaGraphHelperPP2:
         self.llava_model.cuda()
         num_mb = 4
         helper = self._make_helper(num_microbatches=num_mb)
+
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=self.micro_batch_size * num_mb,
+            micro_batch_size=self.micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
 
         assert not helper.graphs_created()
 
