@@ -588,11 +588,12 @@ def test_dummy_train_step_consumes_microbatches_until_rerun_stops(monkeypatch):
 
     class FakeRerunStateMachine:
         def __init__(self):
-            self.remaining = 2
+            self.should_run = True
 
         def should_run_forward_backward(self, data_iterator):
-            self.remaining -= 1
-            return self.remaining >= 0
+            should_run = self.should_run
+            self.should_run = False
+            return should_run
 
     monkeypatch.setattr(training, "get_num_microbatches", lambda: 2)
     monkeypatch.setattr(training, "get_rerun_state_machine", lambda: FakeRerunStateMachine())
