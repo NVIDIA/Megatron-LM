@@ -169,7 +169,7 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform", "flash_mla"]
+no_pypi_wheels = ["emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
@@ -179,7 +179,6 @@ no-build-isolation-package = [
     "transformer-engine",
     "transformer-engine-torch",
     "fast-hadamard-transform",
-    "flash_mla",
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
@@ -191,12 +190,11 @@ override-dependencies = [
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
 ]
-extra-build-variables = { flash_mla = { CFLAGS = "-I/usr/local/cuda/include/cccl", CXXFLAGS = "-I/usr/local/cuda/include/cccl" } }
 
 [tool.uv.sources]
 
 flash_mla = [
-    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" },
+    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
