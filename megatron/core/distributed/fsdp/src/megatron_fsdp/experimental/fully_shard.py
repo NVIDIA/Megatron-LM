@@ -15,7 +15,7 @@
 """Minimal per-module Megatron-FSDP implementation."""
 
 import dataclasses
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.distributed as dist
@@ -104,11 +104,13 @@ class ParameterGroup:
         for name, parameter in parameters.items():
             if parameter.is_meta:
                 raise ValueError(
-                    f"Expected parameter {name!r} to be materialized before ParameterGroup construction."
+                    f"Expected parameter {name!r} to be materialized before "
+                    "ParameterGroup construction."
                 )
             if parameter.dtype != self.dtype:
                 raise ValueError(
-                    f"Expected parameter {name!r} to have dtype {self.dtype}, got {parameter.dtype}."
+                    f"Expected parameter {name!r} to have dtype {self.dtype}, "
+                    f"got {parameter.dtype}."
                 )
             if parameter.requires_grad != self.requires_grad:
                 raise ValueError(
@@ -117,31 +119,34 @@ class ParameterGroup:
                 )
 
         # ---------------------------------------------------------------------
-        # Initialize DBuffers from original parameter values
+        # Initialize persistent DBuffers
         # ---------------------------------------------------------------------
         # Python dicts preserve insertion order, so parameter_names and
         # parameters.values() define the same stable DBuffer tensor order.
-        self._unsharded_model_weight = DBuffer.distribute_tensors(
-            parameters.values(), mesh=self.mesh, placements=[Replicate()] * self.mesh.ndim
-        )
-        # Scratch initialization starts from model weights. Checkpoint loading will
-        # eventually initialize main weights first and derive model weights from them.
-        self.model_weight = self._unsharded_model_weight.redistribute(placements.parameter)
-        model_weight_storage = self.model_weight.local_buffer.untyped_storage()
-        unsharded_model_weight_storage = self._unsharded_model_weight.local_buffer.untyped_storage()
-        assert model_weight_storage.data_ptr() != unsharded_model_weight_storage.data_ptr(), (
-            "model_weight must not share storage with _unsharded_model_weight because "
-            "_unsharded_model_weight storage is resized and released after resharding."
+        tensor_shapes = tuple(parameter.shape for parameter in parameters.values())
+        main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
+        self.main_weight = DBuffer.distribute_tensors(
+            (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
+            mesh=self.mesh,
+            placements=placements.optimizer,
         )
 
-        main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
+        self._unsharded_model_weight = DBuffer(
+            mesh=self.mesh,
+            placements=[Replicate()] * self.mesh.ndim,
+            tensor_shapes=tensor_shapes,
+            dtype=self.dtype,
+            device=self.main_weight.local_buffer.device,
+        )
         if main_weight_dtype == self.dtype and placements.optimizer == placements.parameter:
-            self.main_weight = self.model_weight
+            self.model_weight = self.main_weight
         else:
-            self.main_weight = DBuffer.distribute_tensors(
-                (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
+            self.model_weight = DBuffer(
                 mesh=self.mesh,
-                placements=placements.optimizer,
+                placements=placements.parameter,
+                tensor_shapes=tensor_shapes,
+                dtype=self.dtype,
+                device=self.main_weight.local_buffer.device,
             )
 
         self.main_grad = None
@@ -154,25 +159,16 @@ class ParameterGroup:
                 dtype=grad_dtype,
                 device=self.main_weight.local_buffer.device,
             )
-            if self.main_grad.layout != self.main_weight.layout:
-                raise ValueError(
-                    "FSDP temporarily requires main_grad and main_weight to have the same "
-                    "layout until HSDP/HFSDP support is implemented."
-                )
+            assert self.main_grad.layout == self.main_weight.layout, (
+                "main_grad is built from main_weight tensor shapes on the same mesh, "
+                "and DBuffer layouts are deterministic from those shapes and mesh size."
+            )
             if self.main_grad.placements != self.main_weight.placements:
                 raise ValueError(
                     "FSDP temporarily requires main_grad and main_weight to have the same "
                     "placements until HSDP/HFSDP support is implemented. "
                     f"Got main_grad placements {self.main_grad.placements} and "
                     f"main_weight placements {self.main_weight.placements}."
-                )
-            if self.main_grad.local_buffer.dtype != self.main_weight.local_buffer.dtype:
-                raise ValueError(
-                    "FSDP temporarily requires main_grad and main_weight to have the same "
-                    "dtype until optimizer wrapping supports optimizer-visible gradient "
-                    "conversion. "
-                    f"Got main_grad dtype {self.main_grad.local_buffer.dtype} and "
-                    f"main_weight dtype {self.main_weight.local_buffer.dtype}."
                 )
 
         # ---------------------------------------------------------------------
@@ -216,8 +212,18 @@ class ParameterGroup:
     def _switch_to_unsharded_parameters(self) -> None:
         self._set_module_parameters(self.unsharded_parameters)
 
+    def sync_model_weight_from_main_weight(self) -> None:
+        """Refresh compute weights from optimizer weights."""
+        if self.main_weight is self.model_weight:
+            return
+
+        self.main_weight.cast(self.model_weight.local_buffer.dtype).redistribute(
+            self.model_weight.placements, out=self.model_weight
+        )
+
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
+        self.sync_model_weight_from_main_weight()
         self._unsharded_model_weight.reallocate_storage()
         # This buffer backs unsharded Parameters whose views may be saved by autograd.
         # Materializing FSDP-managed storage should not look like a user mutation.
@@ -436,7 +442,7 @@ def _materialize_and_collect_owned_parameters(
                         f"Module {submodule_fqn!r} does not have "
                         "reset_parameters or _reset_parameters."
                     )
-            # Module.to_empty doesn't necessarily reuse Parameters so collects direct parameters again.
+            # Module.to_empty may replace Parameters, so collect direct parameters again.
             direct_parameters = list(submodule.named_parameters(recurse=False))
 
         for local_parameter_name, parameter in direct_parameters:

@@ -244,6 +244,42 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(setup: Distrib
 
 
 @pytest.mark.distributed
+def test_next_forward_uses_optimizer_updated_weights(setup: DistributedSetup):
+    """The next forward should observe weights updated by the previous optimizer step."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = nn.Linear(1, setup.world_size, bias=False, dtype=torch.bfloat16).to(setup.device)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+
+    fully_shard(
+        model,
+        mesh=mesh,
+        placements=_flat_placements(),
+        mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+    )
+    # SGD's foreach/fused CUDA paths require matching parameter and gradient dtypes.
+    # Use the scalar path to exercise FP32 main weights with default BF16 main grads.
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
+    x = torch.ones(1, 1, device=setup.device, dtype=torch.bfloat16)
+
+    def train_iteration() -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=True)
+        loss = model(x).sum()
+        loss.backward()
+        optimizer.step()
+        return loss.detach().float()
+
+    first_loss = train_iteration()
+    second_loss = train_iteration()
+
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(second_loss, first_loss)
+
+
+@pytest.mark.distributed
 def test_meta_parameters_initialize_with_reset_parameters(setup: DistributedSetup):
     """Meta parameters should be replaced by sharded DTensors and initialized in place."""
     if setup.world_size < 2:
