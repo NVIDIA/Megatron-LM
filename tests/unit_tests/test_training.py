@@ -1259,7 +1259,7 @@ def test_train_step_success_path_averages_losses_and_steps_scheduler(monkeypatch
     assert "zero-grad-buffer" in calls
     assert "optimizer-zero-grad" in calls
     assert "optimizer-step" in calls
-    assert ("scheduler-step", 4) in calls
+    assert ("scheduler-step", 8) in calls
     assert ("forward-backward", 2, False) in calls
 
 
