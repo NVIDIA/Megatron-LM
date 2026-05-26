@@ -70,7 +70,7 @@ MODEL_ARGS:
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
-  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --tensorboard-dir: /opt/megatron-lm/runs/9a0ae508-217d-4462-9ff6-e4dcc9bd1161/1/tensorboard
   --log-interval: 1
   --timing-log-level: 0
   --save-interval: 50
@@ -78,8 +78,8 @@ MODEL_ARGS:
   --eval-iters: 10
   --mock-data: true
   --tokenizer-type: NullTokenizer
-  --save: ${CHECKPOINT_SAVE_PATH}
-  --load: ${CHECKPOINT_LOAD_PATH}
+  --save: /opt/megatron-lm/runs/9a0ae508-217d-4462-9ff6-e4dcc9bd1161/checkpoints
+  --load: /tmp/checkpoints/
   --ckpt-fully-parallel-load: true
   --ckpt-format: torch_dist
   --ckpt-assume-constant-structure: true

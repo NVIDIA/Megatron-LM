@@ -176,6 +176,7 @@ class MLP(MegatronModule):
         self.config: TransformerConfig = config
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
+        self.is_expert = is_expert
 
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         if ffn_hidden_size is None:
@@ -359,6 +360,7 @@ class MLP(MegatronModule):
                             sharded_offsets,
                             singleton_local_shards,
                             metadata.get("use_dtensor_format", False),
+                            is_expert=self.is_expert,
                         )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
@@ -399,6 +401,7 @@ def apply_swiglu_sharded_factory(
     sharded_offsets,
     singleton_local_shards: bool = False,
     use_dtensor_format: bool = False,
+    is_expert: bool = False,
 ):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
@@ -440,7 +443,9 @@ def apply_swiglu_sharded_factory(
 
         kwargs = {}
         if use_dtensor_format:
-            placements, device_mesh = get_dtensor_metadata(tp=True, tp_axis=swiglu_shard_axis)
+            placements, device_mesh = get_dtensor_metadata(
+                tp=True, tp_axis=swiglu_shard_axis, is_expert=is_expert
+            )
             kwargs.update(
                 dict(dtensor_ckpt_device_mesh=device_mesh, dtensor_ckpt_placements=placements)
             )
