@@ -1394,7 +1394,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.offload_moe_act = False
         # Check the compatibility of fine-grained activation offloading and cuda graph.
         if self.config.fine_grained_activation_offloading:
-            if CudaGraphScope.attn in self.config.cuda_graph_scope:
+            cuda_graph_modules = self.config.cuda_graph_modules or []
+            if CudaGraphModule.attn in cuda_graph_modules:
                 self.offload_attn_norm = False
                 log_single_rank(
                     logger,
@@ -1406,18 +1407,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # For moe layer, mlp_norm offloading isn't supported with attn or moe_router cudagraph.
             if self.is_moe_layer:
                 if (
-                    CudaGraphScope.attn in self.config.cuda_graph_scope
-                    or CudaGraphScope.moe_router in self.config.cuda_graph_scope
+                    CudaGraphModule.attn in cuda_graph_modules
+                    or CudaGraphModule.moe_router in cuda_graph_modules
                 ):
                     mark_mlp_norm_offloading_not_supported = True
             # For non-moe layer, mlp_norm is the boundary of attn or mlp cudagraph.
             # The only case where mlp_norm offloading is supported is when whole layer is captured.
             elif (
-                CudaGraphScope.attn in self.config.cuda_graph_scope
-                and CudaGraphScope.mlp not in self.config.cuda_graph_scope
+                CudaGraphModule.attn in cuda_graph_modules
+                and CudaGraphModule.mlp not in cuda_graph_modules
             ) or (
-                CudaGraphScope.attn not in self.config.cuda_graph_scope
-                and CudaGraphScope.mlp in self.config.cuda_graph_scope
+                CudaGraphModule.attn not in cuda_graph_modules
+                and CudaGraphModule.mlp in cuda_graph_modules
             ):
                 mark_mlp_norm_offloading_not_supported = True
             if mark_mlp_norm_offloading_not_supported:
@@ -1430,10 +1431,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
-        if CudaGraphScope.attn in self.config.cuda_graph_scope:
+        cuda_graph_modules = self.config.cuda_graph_modules or []
+        if CudaGraphModule.attn in cuda_graph_modules:
             if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
                 self.offload_module_in_cuda_graph = True
-        if not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope:
+        if not self.is_moe_layer and CudaGraphModule.mlp in cuda_graph_modules:
             if self.offload_mlp_norm:
                 self.offload_module_in_cuda_graph = True
         if self.offload_module_in_cuda_graph:
