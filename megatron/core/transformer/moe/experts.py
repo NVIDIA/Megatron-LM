@@ -550,17 +550,6 @@ class TEGroupedMLP(MegatronModule):
         if use_paged_stash:
             output = paged_stash_group_commit(output, name="grouped_mlp")
 
-        return output
-
-    @staticmethod
-    def _remove_glu_interleaving(x: torch.Tensor, interleave_size: int) -> torch.Tensor:
-        """Reorder interleaved GLU blocks so gate and linear halves are contiguous."""
-        shape = x.size()
-        x = x.reshape(-1, shape[-1] // (2 * interleave_size), 2, interleave_size)
-        x = x.transpose(1, 2).contiguous()
-        x = x.view(shape)
-        return x
-
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
