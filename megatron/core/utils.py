@@ -2938,11 +2938,7 @@ def get_dtensor_metadata(tp: bool = False, tp_axis: int = None, is_expert: bool 
             world_size = torch.distributed.get_world_size()
             with torch.device("cpu"):
                 mesh = (
-                    torch.arange(
-                        world_size,
-                        world_size + tp_size * dp_size,
-                        dtype=torch.int,
-                    )
+                    torch.arange(world_size, world_size + tp_size * dp_size, dtype=torch.int)
                     .reshape(tp_size, dp_size)
                     .contiguous()
                 )
@@ -2961,9 +2957,7 @@ def get_dtensor_metadata(tp: bool = False, tp_axis: int = None, is_expert: bool 
                 # Reshape as (dp_size, tp_size) then transpose to get (tp_size, dp_size) mesh
                 # where row=tp_rank and col=dp_rank, matching mesh_dim_names=('tp', 'dp').
                 mesh = (
-                    torch.tensor(group_ranks, dtype=torch.int)
-                    .view(dp_size, tp_size)
-                    .T.contiguous()
+                    torch.tensor(group_ranks, dtype=torch.int).view(dp_size, tp_size).T.contiguous()
                 )
             tp_ranks = get_process_group_ranks(tp_group_for_mesh)
             dp_ranks = get_process_group_ranks(dp_group_for_mesh)

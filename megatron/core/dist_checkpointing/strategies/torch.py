@@ -825,9 +825,7 @@ class TorchDistSaveShardedStrategy:
             values_to_save = inject_placeholders(sharded_state_dict, keep_only_main_replica=True)
             values_to_save = convert_state_dict_to_dcp_compatible(values_to_save)
             return torch.distributed.checkpoint.save(
-                values_to_save,
-                checkpoint_id=checkpoint_dir,
-                planner=DTensorFormatSavePlanner(),
+                values_to_save, checkpoint_id=checkpoint_dir, planner=DTensorFormatSavePlanner()
             )
         else:
             async_request = self.async_save(
