@@ -314,6 +314,11 @@ class DSv4HybridAttention(Attention):
         else:
             cu_seqlens_kv = None
             rope_seqlen = seq_len
+            if self.config.context_parallel_size > 1:
+                # ``core_attn_out`` is local to this CP rank. Request the full
+                # sequence RoPE table so RotaryEmbedding can take its normal
+                # zigzag CP slice, yielding local global-position frequencies.
+                rope_seqlen *= self.config.context_parallel_size
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None

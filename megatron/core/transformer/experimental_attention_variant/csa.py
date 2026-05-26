@@ -103,6 +103,11 @@ def _apply_rope(
         total_seq_len = rotary_seq_len
     else:
         total_seq_len = rotary_seq_len * ratio
+    if cp_group is not None and cp_group.size() > 1:
+        # Inputs are already local zigzag CP chunks. Request the full sequence
+        # length, then let RotaryEmbedding select this rank's CP slice before
+        # optional compression-ratio sampling.
+        total_seq_len *= cp_group.size()
     mscale = 1.0
     rotary_pos_cos = None
     rotary_pos_sin = None
