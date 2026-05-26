@@ -280,7 +280,7 @@ def test_get_train_valid_test_num_samples_iteration_sample_and_phase_paths(monke
     )
     monkeypatch.setattr(training, "get_args", lambda: args)
 
-    assert get_train_valid_test_num_samples() == (36, 16, 8)
+    assert get_train_valid_test_num_samples() == (36, 32, 8)
 
     args.train_samples = 100
     args.full_validation = True
