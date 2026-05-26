@@ -411,9 +411,9 @@ class DBuffer:
         if changed_axis is None:
             if out is None:
                 return self
-            destination = self._create_or_validate_out(new_placements, out)
-            destination.local_buffer.copy_(self.local_buffer)
-            return destination
+            out = self._create_or_validate_out(new_placements, out)
+            out.local_buffer.copy_(self.local_buffer)
+            return out
 
         axis = changed_axis
         old_placement = self.placements[axis]
@@ -440,13 +440,13 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = Replicate()
         validate_placements(placements)
-        destination = self._create_or_validate_out(placements, out)
+        out = self._create_or_validate_out(placements, out)
         dist.all_gather_into_tensor(
-            output_tensor=destination.local_buffer,
+            output_tensor=out.local_buffer,
             input_tensor=self.local_buffer,
             group=self.mesh.get_group(axis),
         )
-        return destination
+        return out
 
     def allreduce(self, mesh_axis: MeshAxis, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-reduce a Partial axis into Replicate placement."""
@@ -457,14 +457,14 @@ class DBuffer:
 
         placements = list(self.placements)
         placements[axis] = Replicate()
-        destination = self._create_or_validate_out(placements, out)
-        destination.local_buffer.copy_(self.local_buffer)
+        out = self._create_or_validate_out(placements, out)
+        out.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
-            destination.local_buffer,
+            out.local_buffer,
             op=partial_placement.reduce_op,
             group=self.mesh.get_group(axis),
         )
-        return destination
+        return out
 
     def reduce_scatter(
         self, mesh_axis: MeshAxis, new_placement: Placement, *, out: "DBuffer | None" = None
@@ -480,14 +480,14 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = new_placement
         validate_placements(placements)
-        destination = self._create_or_validate_out(placements, out)
+        out = self._create_or_validate_out(placements, out)
         dist.reduce_scatter_tensor(
-            output=destination.local_buffer,
+            output=out.local_buffer,
             input=self.local_buffer,
             op=partial_placement.reduce_op,
             group=self.mesh.get_group(axis),
         )
-        return destination
+        return out
 
     def scatter(
         self, mesh_axis: MeshAxis, new_placement: Placement, *, out: "DBuffer | None" = None
@@ -508,9 +508,9 @@ class DBuffer:
                 self.mesh, placements
             )
         else:
-            destination = self._create_or_validate_out(placements, out)
-            destination_offset = destination.offset
-            destination_numel = destination.local_buffer.numel()
+            out = self._create_or_validate_out(placements, out)
+            destination_offset = out.offset
+            destination_numel = out.local_buffer.numel()
 
         local_buffer_offset = destination_offset - self.offset
         if (
@@ -522,8 +522,8 @@ class DBuffer:
         if out is None:
             return DBuffer.from_local(local_slice, self.mesh, placements, self.layout.tensor_shapes)
 
-        destination.local_buffer.copy_(local_slice)
-        return destination
+        out.local_buffer.copy_(local_slice)
+        return out
 
     def get_tensor(self, index: int) -> torch.Tensor:
         """Return this rank's local view for logical tensor ``index``.
