@@ -1006,8 +1006,8 @@ def initialize_model_parallel(
         rank_to_gtp_rank = {}
         for cp_dp_ranks in decoder_rank_generator.get_ranks('cp-dp'):
             for i in range(0, len(cp_dp_ranks), generalized_tensor_parallel_size):
-                ps_chunk = cp_dp_ranks[i : i + generalized_tensor_parallel_size]
-                for gtp_rank_idx, r in enumerate(ps_chunk):
+                gtp_chunk = cp_dp_ranks[i : i + generalized_tensor_parallel_size]
+                for gtp_rank_idx, r in enumerate(gtp_chunk):
                     rank_to_gtp_rank[r] = gtp_rank_idx
 
         # DP-only with GTP: create one group per (dp_group, gtp_rank) pair.
@@ -1103,8 +1103,8 @@ def initialize_model_parallel(
                 gtp_ranks = cp_dp_ranks[i : i + generalized_tensor_parallel_size]
                 # Merge tp-pp groups of all GTP peers
                 mp_ranks = []
-                for ps_r in gtp_ranks:
-                    mp_ranks.extend(rank_to_tp_pp[ps_r])
+                for gtp_r in gtp_ranks:
+                    mp_ranks.extend(rank_to_tp_pp[gtp_r])
                 mp_ranks = sorted(set(mp_ranks))
                 mp_key = tuple(mp_ranks)
                 if mp_key not in model_parallel_groups_set:
@@ -1458,8 +1458,8 @@ def initialize_model_parallel(
         rank_to_expert_gtp_rank = {}
         for dp_ranks in expert_decoder_rank_generator.get_ranks('dp'):
             for i in range(0, len(dp_ranks), expert_generalized_tensor_parallel_size):
-                eps_chunk = dp_ranks[i : i + expert_generalized_tensor_parallel_size]
-                for egtp_rank_idx, r in enumerate(eps_chunk):
+                egtp_chunk = dp_ranks[i : i + expert_generalized_tensor_parallel_size]
+                for egtp_rank_idx, r in enumerate(egtp_chunk):
                     rank_to_expert_gtp_rank[r] = egtp_rank_idx
 
         # Create one group per (expert_dp_group, expert_gtp_rank) pair (collective).
@@ -2384,8 +2384,14 @@ def destroy_model_parallel():
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
 
+    global _DATA_PARALLEL_GROUP_WITH_GTP
+    _DATA_PARALLEL_GROUP_WITH_GTP = None
+
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
+    _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
@@ -2485,6 +2491,9 @@ def destroy_model_parallel():
 
     global _EXPERT_DATA_PARALLEL_GROUP
     _EXPERT_DATA_PARALLEL_GROUP = None
+
+    global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
+    _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = None
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     if (
