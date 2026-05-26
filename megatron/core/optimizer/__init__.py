@@ -721,6 +721,17 @@ def check_config_overrides_consistency(
     return True
 
 
+def _sync_overlap_param_gather_from_ddp_config(
+    config: OptimizerConfig, model_chunks: List[MegatronModule]
+) -> None:
+    """Sync optimizer overlap_param_gather from the model chunk's DDP config."""
+    for model_chunk in model_chunks:
+        ddp_config = getattr(model_chunk, 'ddp_config', None)
+        if ddp_config is not None:
+            config.overlap_param_gather = ddp_config.overlap_param_gather
+            return
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -994,6 +1005,7 @@ def get_megatron_optimizer(
     if config_overrides is None:
         config_overrides = get_standard_config_overrides(config)
 
+    _sync_overlap_param_gather_from_ddp_config(config, model_chunks)
     check_config_overrides_consistency(config, config_overrides)
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
