@@ -153,6 +153,9 @@ SERVER_COMMON_ARGS=(
         --nproc-per-node "$WORLD_SIZE" \
         --master_addr "$MASTER_ADDR" \
         --master_port "$MASTER_PORT" \
+        --log-dir "$TORCHRUN_LOG_DIR" \
+        --tee "0:3" \
+        --redirects "3" \
         -m tools.run_dynamic_text_generation_server \
         "${SERVER_COMMON_ARGS[@]}" \
         "${MODEL_ARGS[@]}" \
