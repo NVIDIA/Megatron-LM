@@ -98,7 +98,7 @@ class TestCudaGraphConfigAndArguments:
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
 
-    def test_local_impl_allows_non_overlapping_activation_offload_scope(self):
+    def test_local_impl_allows_expert_activation_offload_scope(self):
         cfg = _base_cuda_graph_config(
             cuda_graph_impl='local',
             cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
@@ -112,11 +112,12 @@ class TestCudaGraphConfigAndArguments:
         assert CudaGraphModule.moe_router in cfg.cuda_graph_modules
         assert CudaGraphModule.moe_preprocess in cfg.cuda_graph_modules
 
-    def test_local_impl_rejects_overlapping_activation_offload_scope(self):
+    def test_local_impl_rejects_unsupported_activation_offload_scope(self):
         with pytest.raises(
             AssertionError,
             match=(
-                "fine-grained activation offloading with cuda_graph_impl='local'.*qkv_linear"
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['qkv_linear'\\]"
             ),
         ):
             _base_cuda_graph_config(
@@ -129,9 +130,7 @@ class TestCudaGraphConfigAndArguments:
     def test_local_impl_rejects_full_layer_graph_with_activation_offload(self):
         with pytest.raises(
             AssertionError,
-            match=(
-                "fine-grained activation offloading with cuda_graph_impl='local'.*expert_fc1"
-            ),
+            match="not supported with whole-layer CUDA graph capture",
         ):
             _base_cuda_graph_config(
                 cuda_graph_impl='local',
@@ -143,7 +142,10 @@ class TestCudaGraphConfigAndArguments:
     def test_local_impl_rejects_moe_router_graph_with_mlp_norm_offload(self):
         with pytest.raises(
             AssertionError,
-            match="fine-grained activation offloading with cuda_graph_impl='local'.*mlp_norm",
+            match=(
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['mlp_norm'\\]"
+            ),
         ):
             _base_cuda_graph_config(
                 cuda_graph_impl='local',
