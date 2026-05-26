@@ -367,15 +367,17 @@ class DBuffer:
             )
 
         if out.mesh != self.mesh:
-            raise ValueError("out must use the same mesh.")
+            raise ValueError(f"Expected out mesh {self.mesh!r}, got {out.mesh!r}.")
         if out.placements != placements:
-            raise ValueError(f"Expected out placements {placements}, got {out.placements}.")
+            raise ValueError(f"Expected out placements {placements!r}, got {out.placements!r}.")
         if out.layout != self.layout:
-            raise ValueError("out layout must match the source layout.")
+            raise ValueError(f"Expected out layout {self.layout!r}, got {out.layout!r}.")
         if out.dtype != self.dtype:
-            raise ValueError("out dtype must match the source dtype.")
+            raise ValueError(f"Expected out dtype {self.dtype}, got {out.dtype}.")
         if out.local_buffer.device != self.local_buffer.device:
-            raise ValueError("out device must match the source device.")
+            raise ValueError(
+                f"Expected out device {self.local_buffer.device}, got {out.local_buffer.device}."
+            )
         return out
 
     def redistribute(
