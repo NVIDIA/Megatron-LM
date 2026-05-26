@@ -16,7 +16,7 @@
 
 import dataclasses
 import math
-from typing import Sequence
+from collections.abc import Iterable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -39,6 +39,8 @@ class Replicate(Placement):
 @dataclasses.dataclass(frozen=True)
 class Partial(Placement):
     """Unreduced replicated local buffer placement."""
+
+    reduce_op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM
 
 
 @dataclasses.dataclass(frozen=True)
@@ -257,7 +259,7 @@ class DBuffer:
 
     @classmethod
     def distribute_tensors(
-        cls, tensors: Sequence[torch.Tensor], mesh: DeviceMesh, placements: Sequence[Placement]
+        cls, tensors: Iterable[torch.Tensor], mesh: DeviceMesh, placements: Sequence[Placement]
     ) -> "DBuffer":
         """Distribute full local tensor values into a DBuffer.
 
@@ -269,24 +271,24 @@ class DBuffer:
         Returns:
             A DBuffer whose local storage matches ``placements``.
         """
-        if not tensors:
-            raise ValueError("DBuffer.distribute_tensors() requires at least one tensor.")
-
         tensors = tuple(
             (
                 tensor.to(mesh.device_type)
                 if tensor.device.type != mesh.device_type and not tensor.is_meta
                 else tensor
             )
+            .detach()
+            .contiguous()
             for tensor in tensors
         )
+        if not tensors:
+            raise ValueError("DBuffer.distribute_tensors() requires at least one tensor.")
+
         dtype = tensors[0].dtype
         device = tensors[0].device
         for tensor in tensors:
             if tensor.dtype != dtype or tensor.device != device:
                 raise ValueError("All tensors in a DBuffer must have the same dtype and device.")
-            if not tensor.is_contiguous():
-                raise ValueError("DBuffer.distribute_tensors() expects contiguous tensors.")
 
         tensor_shapes = tuple(tensor.shape for tensor in tensors)
         buffer = cls(
@@ -296,12 +298,23 @@ class DBuffer:
             dtype=dtype,
             device=device,
         )
-        full_buffer = torch.zeros(buffer.layout.size, dtype=dtype, device=device)
-        for tensor, offset in zip(tensors, buffer.layout.tensor_to_offset, strict=True):
-            full_buffer.narrow(0, offset, tensor.numel()).copy_(tensor.view(-1))
+        local_start = buffer.offset
+        local_end = local_start + buffer.local_buffer.numel()
+        # Only logical tensor ranges are initialized. Padding and layout gaps are not
+        # observable through get_tensor() and can remain unspecified.
+        for tensor, tensor_start in zip(tensors, buffer.layout.tensor_to_offset, strict=True):
+            tensor_end = tensor_start + tensor.numel()
+            overlap_start = max(local_start, tensor_start)
+            overlap_end = min(local_end, tensor_end)
+            if overlap_start >= overlap_end:
+                continue
 
-        local_buffer = full_buffer.narrow(0, buffer.offset, buffer.local_buffer.numel())
-        buffer.local_buffer.copy_(local_buffer)
+            overlap_numel = overlap_end - overlap_start
+            source_offset = overlap_start - tensor_start
+            destination_offset = overlap_start - local_start
+            buffer.local_buffer.narrow(0, destination_offset, overlap_numel).copy_(
+                tensor.view(-1).narrow(0, source_offset, overlap_numel)
+            )
         return buffer
 
     def redistribute(self, new_placements: Sequence[Placement]) -> "DBuffer":
@@ -370,7 +383,8 @@ class DBuffer:
     def allreduce(self, mesh_axis: MeshAxis) -> "DBuffer":
         """All-reduce a Partial axis into Replicate placement."""
         axis = _axis_index(self.mesh, mesh_axis)
-        if not isinstance(self.placements[axis], Partial):
+        partial_placement = self.placements[axis]
+        if not isinstance(partial_placement, Partial):
             raise ValueError(f"allreduce() requires Partial placement on axis {mesh_axis!r}.")
 
         placements = list(self.placements)
@@ -383,7 +397,11 @@ class DBuffer:
             device=self.local_buffer.device,
         )
         buffer.local_buffer.copy_(self.local_buffer)
-        dist.all_reduce(buffer.local_buffer, op=dist.ReduceOp.SUM, group=self.mesh.get_group(axis))
+        dist.all_reduce(
+            buffer.local_buffer,
+            op=partial_placement.reduce_op,
+            group=self.mesh.get_group(axis),
+        )
         return buffer
 
     def reduce_scatter(self, mesh_axis: MeshAxis, new_placement: Placement) -> "DBuffer":
@@ -391,7 +409,8 @@ class DBuffer:
         axis = _axis_index(self.mesh, mesh_axis)
         if not isinstance(new_placement, Flat):
             raise NotImplementedError("DBuffer currently supports reduce_scatter() to Flat only.")
-        if not isinstance(self.placements[axis], Partial):
+        partial_placement = self.placements[axis]
+        if not isinstance(partial_placement, Partial):
             raise ValueError(f"reduce_scatter() requires Partial placement on axis {mesh_axis!r}.")
 
         placements = list(self.placements)
@@ -407,7 +426,7 @@ class DBuffer:
         dist.reduce_scatter_tensor(
             output=buffer.local_buffer,
             input=self.local_buffer,
-            op=dist.ReduceOp.SUM,
+            op=partial_placement.reduce_op,
             group=self.mesh.get_group(axis),
         )
         return buffer
