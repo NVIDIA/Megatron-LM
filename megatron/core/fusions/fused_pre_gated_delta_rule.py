@@ -23,13 +23,20 @@ Forward (``_triton_pre_gated_delta_rule_forward``)
     Four Triton kernels on four CUDA side streams overlap the four
     sub-computations:
 
-    * ``_conv_silu_l2norm_repeat_kernel`` (3 launches on s_q / s_k / s_v).
-      Depthwise conv1d → silu → optional l2norm-over-head → optional
-      REPEAT-way head broadcast, all in registers. The V launch also
-      copies the z slice through ``WRITE_Z=True`` so we don't need a
-      separate gate kernel. The Q and K launches persist the bf16-rounded
-      ``silu(conv(x))`` into a scratch buffer so the backward doesn't need
-      to re-run conv+silu (Phase 9).
+    * ``_conv_silu_project_kernel`` QK specialization (1 launch on s_qk).
+      Q and K are one logical branch. The grid selects one Q/K group per
+      program tile, then performs depthwise conv1d → silu → l2norm →
+      REPEAT-way head broadcast directly into the final query/key layouts.
+      The launch persists the bf16-rounded ``silu(conv(x))`` scratch for
+      both Q and K so the current backward can keep using its saved-QK path.
+
+    * ``_conv_silu_project_kernel`` V specialization (1 launch on s_v).
+      Depthwise conv1d → silu directly into the final value layout. This
+      shares the source-level conv+silu template with QK but compiles out
+      QK-only l2norm/repeat logic.
+
+    * ``_copy_z_kernel`` (1 launch on s_z). Directly copies the z slice into
+      the final gate layout.
 
     * ``_compute_g_and_beta_kernel`` (1 launch on s_gbeta).
       ``g = -exp(A_log) * softplus(alpha + dt_bias)`` and
@@ -120,10 +127,11 @@ Future directions (NOT implemented)
    kernel tolerates fp32 precision, the round-trip can go. Needs a
    tolerance study — current UT bound is too tight to absorb.
 
-4. **Single-launch Q+K conv.** Q and K share kernel structure (l2norm +
-   repeat, same HEAD_DIM, same K_W). Folding them into one launch with a
-   3D grid ``(batch, 2 * num_key_heads, seq_blocks)`` saves one
-   kernel-launch overhead (~5 μs at our shape).
+4. **Fused-streamed backward.** Forward now treats QK as one logical branch
+   and keeps V/Z/G-Beta separate. Backward still uses the previous staged
+   l2norm/V/Z transforms plus the external causal-conv backward. A future
+   pass should replace that with QK/V branch kernels that compute conv input
+   gradients and channel weight gradients in the same scope.
 
 5. **Reduce HBM traffic in backward.** The backward is bandwidth-bound;
    stream-overlap tuning (Phase 11) was a no-op for that reason. The
@@ -200,32 +208,33 @@ def _g_beta_autotune_configs():
     ]
 
 
-@triton.autotune(configs=_conv_autotune_configs(), key=["seq_len", "HEAD_DIM", "K_W"])
+@triton.autotune(
+    configs=_conv_autotune_configs(),
+    key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS"],
+)
 @triton.jit
-def _conv_silu_l2norm_repeat_kernel(
+def _conv_silu_project_kernel(
     qkvzba_ptr,
     weight_ptr,
     bias_ptr,
     out_ptr,
-    z_out_ptr,
     silu_save_ptr,
     seq_len,
     num_in_heads,
     in_channel_offset,
-    z_channel_offset,
+    in_group_stride,
     silu_save_chan_offset,
+    silu_save_group_stride,
     qkvzba_s_stride,
     qkvzba_b_stride,
     qkvzba_c_stride,
     weight_c_stride,
     weight_w_stride,
     bias_stride,
+    out_group_dim_stride,
     out_b_stride,
     out_s_stride,
     out_h_stride,
-    z_b_stride,
-    z_s_stride,
-    z_h_stride,
     silu_save_b_stride,
     silu_save_c_stride,
     silu_save_s_stride,
@@ -233,35 +242,40 @@ def _conv_silu_l2norm_repeat_kernel(
     HEAD_DIM: tl.constexpr,
     K_W: tl.constexpr,
     REPEAT: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    USE_L2NORM: tl.constexpr,
-    WRITE_Z: tl.constexpr,
+    APPLY_L2: tl.constexpr,
     SAVE_SILU: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
     """Depthwise conv1d + silu + (optional l2norm) + (optional head repeat).
 
     Grid layout (program_id):
-        0: batch * num_in_heads (flat)
+        0: batch * NUM_GROUPS * num_in_heads (flat)
         1: num_seq_blocks
 
     Args:
-        in_channel_offset: starting channel index of this section inside
-            ``qkvzba``. 0 for Q, ``qk_channels`` for K.
-        z_channel_offset: when ``WRITE_Z`` is true (V branch), the kernel also
-            copies the gate (z) slice for the same head into ``z_out_ptr``.
-            This saves an extra launch and lets the V load amortise some L2
-            cache lines for the adjacent z channels.
+        in_channel_offset: starting channel index of the first group inside
+            ``qkvzba``. 0 for QK, ``v_channel_offset`` for V.
+        in_group_stride: channel distance between logical groups. For QK this
+            is ``qk_channels`` so group 0 is Q and group 1 is K. For V this is
+            0 because ``NUM_GROUPS == 1``.
+        out_group_dim_stride: output-storage distance between logical groups. QK
+            passes a grouped output buffer and V passes 0.
     """
 
-    pid_bh = tl.program_id(0)
+    pid_bgh = tl.program_id(0)
     pid_s = tl.program_id(1)
 
-    batch_id = pid_bh // num_in_heads
-    head_id = pid_bh - batch_id * num_in_heads
+    heads_per_batch = num_in_heads * NUM_GROUPS
+    batch_id = pid_bgh // heads_per_batch
+    local_bgh = pid_bgh - batch_id * heads_per_batch
+    group_id = local_bgh // num_in_heads
+    head_id = local_bgh - group_id * num_in_heads
 
     chan_off = tl.arange(0, HEAD_DIM)
-    chan = in_channel_offset + head_id * HEAD_DIM + chan_off
+    group_channel_offset = in_channel_offset + group_id * in_group_stride
+    chan = group_channel_offset + head_id * HEAD_DIM + chan_off
 
     if HAS_BIAS:
         bias = tl.load(bias_ptr + chan * bias_stride).to(tl.float32)
@@ -294,7 +308,7 @@ def _conv_silu_l2norm_repeat_kernel(
     acc = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
     silu_out = acc * tl.sigmoid(acc)
 
-    if USE_L2NORM:
+    if APPLY_L2:
         # F.silu rounds to the input dtype before l2norm reads it. Round-trip
         # via bf16 to match that precision.
         silu_out = silu_out.to(out_ptr.dtype.element_ty).to(tl.float32)
@@ -304,7 +318,12 @@ def _conv_silu_l2norm_repeat_kernel(
             # mirrors what causal_conv1d would have returned: (b, c, s)
             # bf16. We only save the QK slice (V doesn't need l2norm
             # backward).
-            silu_save_chan = silu_save_chan_offset + head_id * HEAD_DIM + chan_off
+            silu_save_chan = (
+                silu_save_chan_offset
+                + group_id * silu_save_group_stride
+                + head_id * HEAD_DIM
+                + chan_off
+            )
             silu_save_ptrs = (
                 silu_save_ptr
                 + batch_id * silu_save_b_stride
@@ -333,6 +352,7 @@ def _conv_silu_l2norm_repeat_kernel(
         v_head = head_id * REPEAT + r
         write_ptr = (
             out_ptr
+            + group_id * out_group_dim_stride
             + batch_id * out_b_stride
             + s_offs[:, None] * out_s_stride
             + v_head * out_h_stride
@@ -340,27 +360,51 @@ def _conv_silu_l2norm_repeat_kernel(
         )
         tl.store(write_ptr, out_typed, mask=s_mask[:, None])
 
-    if WRITE_Z:
-        # Adjacent gate (z) slice for the same head. The V conv path already
-        # touches channel range [in_channel_offset + h*HEAD_DIM,
-        # in_channel_offset + h*HEAD_DIM + HEAD_DIM); z lives ``z_channel_offset``
-        # channels later in the same row, so cache locality is decent.
-        z_chan = z_channel_offset + head_id * HEAD_DIM + chan_off
-        z_src_ptr = (
-            qkvzba_ptr
-            + s_offs[:, None] * qkvzba_s_stride
-            + batch_id * qkvzba_b_stride
-            + z_chan[None, :] * qkvzba_c_stride
-        )
-        z_val = tl.load(z_src_ptr, mask=s_mask[:, None])
-        z_write_ptr = (
-            z_out_ptr
-            + batch_id * z_b_stride
-            + s_offs[:, None] * z_s_stride
-            + head_id * z_h_stride
-            + chan_off[None, :]
-        )
-        tl.store(z_write_ptr, z_val, mask=s_mask[:, None])
+
+@triton.jit
+def _copy_z_kernel(
+    qkvzba_ptr,
+    gate_ptr,
+    seq_len,
+    num_v_heads,
+    z_channel_offset,
+    qkvzba_s_stride,
+    qkvzba_b_stride,
+    qkvzba_c_stride,
+    gate_b_stride,
+    gate_s_stride,
+    gate_h_stride,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """Copy the z slice from qkvzba into the final gate layout."""
+
+    pid_bh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    batch_id = pid_bh // num_v_heads
+    head_id = pid_bh - batch_id * num_v_heads
+
+    chan_off = tl.arange(0, HEAD_DIM)
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    s_mask = s_offs < seq_len
+
+    z_chan = z_channel_offset + head_id * HEAD_DIM + chan_off
+    z_src_ptr = (
+        qkvzba_ptr
+        + s_offs[:, None] * qkvzba_s_stride
+        + batch_id * qkvzba_b_stride
+        + z_chan[None, :] * qkvzba_c_stride
+    )
+    z_val = tl.load(z_src_ptr, mask=s_mask[:, None])
+    z_write_ptr = (
+        gate_ptr
+        + batch_id * gate_b_stride
+        + s_offs[:, None] * gate_s_stride
+        + head_id * gate_h_stride
+        + chan_off[None, :]
+    )
+    tl.store(z_write_ptr, z_val, mask=s_mask[:, None])
 
 
 @triton.autotune(configs=_g_beta_autotune_configs(), key=["seq_len", "num_v_heads"])
@@ -479,7 +523,7 @@ def _conv_silu_l2norm_backward_kernel(
     USE_L2NORM: tl.constexpr,
     V_HEAD_SHARED: tl.constexpr,
 ):
-    """Backward for the Q / K / V branches of ``_conv_silu_l2norm_repeat_kernel``.
+    """Backward for the Q / K / V branches of ``_conv_silu_project_kernel``.
 
     ``USE_L2NORM`` is a constexpr branch: ``True`` for the QK branches (with
     l2norm) and ``False`` for the V branch. The V case skips the l2norm
@@ -1301,12 +1345,14 @@ def _triton_pre_gated_delta_rule_forward(
     device = qkvzba.device
 
     # Output buffers: contiguous (b, s, h, d) for q/k/v and (b, s, h) for g/beta.
-    query = torch.empty(
-        batch, seq_len, num_value_heads, key_head_dim, dtype=out_dtype, device=device
+    # Q and K share one allocation so the fused-streamed QK kernel can select
+    # the logical group by pointer stride instead of branching between two
+    # unrelated base pointers inside Triton.
+    qk_out = torch.empty(
+        2, batch, seq_len, num_value_heads, key_head_dim, dtype=out_dtype, device=device
     )
-    key = torch.empty(
-        batch, seq_len, num_value_heads, key_head_dim, dtype=out_dtype, device=device
-    )
+    query = qk_out[0]
+    key = qk_out[1]
     value = torch.empty(
         batch, seq_len, num_value_heads, value_head_dim, dtype=out_dtype, device=device
     )
@@ -1322,9 +1368,9 @@ def _triton_pre_gated_delta_rule_forward(
     bias_tensor = qkvzba
     bias_stride = 0
 
-    # Allocate the gate (z) output buffer that the V kernel will populate as
-    # a side effect (``WRITE_Z=True``). This avoids a separate gate-copy
-    # launch on the value stream.
+    # Allocate the gate (z) output buffer that the independent Z kernel will
+    # populate. Keeping Z separate makes the forward scopes QK / V / Z /
+    # G-Beta explicit.
     gate = torch.empty(
         batch, seq_len, num_value_heads, value_head_dim, dtype=out_dtype, device=device
     )
@@ -1342,42 +1388,43 @@ def _triton_pre_gated_delta_rule_forward(
     silu_save_s_stride = silu_qk_save.stride(2)
 
     # Stream setup. Each side stream handles one of the four sub-computations
-    # (Q conv+l2norm, K conv+l2norm, V conv+z, g/beta).
+    # (QK conv+l2norm, V conv, Z copy, g/beta).
     main_stream = torch.cuda.current_stream(device=device)
-    q_stream = _get_side_stream(device, slot=0)
-    k_stream = _get_side_stream(device, slot=1)
+    qk_stream = _get_side_stream(device, slot=0)
     v_stream = _get_side_stream(device, slot=2)
     gb_stream = _get_side_stream(device, slot=3)
-    for s in (q_stream, k_stream, v_stream, gb_stream):
+    z_stream = _get_side_stream(device, slot=4)
+    for s in (qk_stream, v_stream, gb_stream, z_stream):
         s.wait_stream(main_stream)
 
-    # --- Q conv + silu + l2norm + repeat ---
-    qk_grid = lambda meta: (batch * num_key_heads, triton.cdiv(seq_len, meta["BLOCK_S"]))
-    with torch.cuda.stream(q_stream):
-        _conv_silu_l2norm_repeat_kernel[qk_grid](
+    # --- QK conv + silu + l2norm + repeat ---
+    qk_grid = lambda meta: (
+        batch * 2 * num_key_heads,
+        triton.cdiv(seq_len, meta["BLOCK_S"]),
+    )
+    with torch.cuda.stream(qk_stream):
+        _conv_silu_project_kernel[qk_grid](
             qkvzba,
             weight_2d,
             bias_tensor,
-            query,
-            qkvzba,  # z_out_ptr unused (WRITE_Z=False)
+            qk_out,
             silu_qk_save,
             seq_len,
             num_key_heads,
-            0,  # Q starts at channel 0
-            0,  # z_channel_offset unused
-            0,  # silu_save_chan_offset: Q writes to silu_save[0:qk_channels]
+            0,  # QK starts at channel 0; group 1 starts at +qk_channels.
+            qk_channels,
+            0,  # silu_save_chan_offset
+            qk_channels,
             qkvzba.stride(0),
             qkvzba.stride(1),
             qkvzba.stride(2),
             weight_2d.stride(0),
             weight_2d.stride(1),
             bias_stride,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            0,  # z strides unused
-            0,
-            0,
+            qk_out.stride(0),
+            qk_out.stride(1),
+            qk_out.stride(2),
+            qk_out.stride(3),
             silu_save_b_stride,
             silu_save_c_stride,
             silu_save_s_stride,
@@ -1385,80 +1432,39 @@ def _triton_pre_gated_delta_rule_forward(
             HEAD_DIM=key_head_dim,
             K_W=k_w,
             REPEAT=repeat_factor,
+            NUM_GROUPS=2,
             HAS_BIAS=False,
-            USE_L2NORM=True,
-            WRITE_Z=False,
             SAVE_SILU=True,
+            APPLY_L2=True,
         )
 
-    # --- K conv + silu + l2norm + repeat ---
-    with torch.cuda.stream(k_stream):
-        _conv_silu_l2norm_repeat_kernel[qk_grid](
-            qkvzba,
-            weight_2d,
-            bias_tensor,
-            key,
-            qkvzba,  # z_out_ptr unused
-            silu_qk_save,
-            seq_len,
-            num_key_heads,
-            qk_channels,  # K starts after Q
-            0,  # z_channel_offset unused
-            qk_channels,  # silu_save_chan_offset: K writes to silu_save[qk_channels:2*qk_channels]
-            qkvzba.stride(0),
-            qkvzba.stride(1),
-            qkvzba.stride(2),
-            weight_2d.stride(0),
-            weight_2d.stride(1),
-            bias_stride,
-            key.stride(0),
-            key.stride(1),
-            key.stride(2),
-            0,  # z strides unused
-            0,
-            0,
-            silu_save_b_stride,
-            silu_save_c_stride,
-            silu_save_s_stride,
-            _L2NORM_EPS,
-            HEAD_DIM=key_head_dim,
-            K_W=k_w,
-            REPEAT=repeat_factor,
-            HAS_BIAS=False,
-            USE_L2NORM=True,
-            WRITE_Z=False,
-            SAVE_SILU=True,
-        )
-
-    # --- V conv + silu + z copy (no l2norm, no repeat) ---
+    # --- V conv + silu (no l2norm, no repeat) ---
     v_channel_offset = 2 * qk_channels
     z_channel_offset = 2 * qk_channels + v_channels
     v_grid = lambda meta: (batch * num_value_heads, triton.cdiv(seq_len, meta["BLOCK_S"]))
     with torch.cuda.stream(v_stream):
-        _conv_silu_l2norm_repeat_kernel[v_grid](
+        _conv_silu_project_kernel[v_grid](
             qkvzba,
             weight_2d,
             bias_tensor,
             value,
-            gate,
-            qkvzba,  # silu_save unused (SAVE_SILU=False, V doesn't have l2norm bwd)
+            qkvzba,  # silu_save unused (SAVE_SILU=False)
             seq_len,
             num_value_heads,
             v_channel_offset,
-            z_channel_offset,
+            0,  # in_group_stride unused for NUM_GROUPS=1
             0,  # silu_save_chan_offset unused
+            0,  # silu_save_group_stride unused
             qkvzba.stride(0),
             qkvzba.stride(1),
             qkvzba.stride(2),
             weight_2d.stride(0),
             weight_2d.stride(1),
             bias_stride,
+            0,  # out_group_dim_stride unused for NUM_GROUPS=1
             value.stride(0),
             value.stride(1),
             value.stride(2),
-            gate.stride(0),
-            gate.stride(1),
-            gate.stride(2),
             0,  # silu_save strides unused
             0,
             0,
@@ -1466,10 +1472,32 @@ def _triton_pre_gated_delta_rule_forward(
             HEAD_DIM=value_head_dim,
             K_W=k_w,
             REPEAT=1,
+            NUM_GROUPS=1,
             HAS_BIAS=False,
-            USE_L2NORM=False,
-            WRITE_Z=True,
             SAVE_SILU=False,
+            APPLY_L2=False,
+        )
+
+    # --- Z copy ---
+    BLOCK_Z_S = 64
+    z_grid = (batch * num_value_heads, triton.cdiv(seq_len, BLOCK_Z_S))
+    with torch.cuda.stream(z_stream):
+        _copy_z_kernel[z_grid](
+            qkvzba,
+            gate,
+            seq_len,
+            num_value_heads,
+            z_channel_offset,
+            qkvzba.stride(0),
+            qkvzba.stride(1),
+            qkvzba.stride(2),
+            gate.stride(0),
+            gate.stride(1),
+            gate.stride(2),
+            HEAD_DIM=value_head_dim,
+            BLOCK_S=BLOCK_Z_S,
+            num_warps=4,
+            num_stages=2,
         )
 
     # --- g and beta ---
@@ -1503,9 +1531,9 @@ def _triton_pre_gated_delta_rule_forward(
         )
 
     # Re-join the side streams so the caller's stream observes the writes.
-    main_stream.wait_stream(q_stream)
-    main_stream.wait_stream(k_stream)
+    main_stream.wait_stream(qk_stream)
     main_stream.wait_stream(v_stream)
+    main_stream.wait_stream(z_stream)
     main_stream.wait_stream(gb_stream)
 
     return query, key, value, gate, beta_out, g, silu_qk_save
