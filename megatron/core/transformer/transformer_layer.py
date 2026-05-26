@@ -1049,9 +1049,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 #   cu_seqlens = [0, max_T, max_T, ..., max_T]
                 # which represents a single packed sequence followed by zero-length
                 # entries. cu_seqlens_q / kv / *_padded all share this layout.
-                max_T = (
-                    self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
-                )
+                max_T = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
                 max_num_seqs = self.config.thd_max_num_seqs
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
                 cu_seqlens[1:] = max_T
@@ -1369,7 +1367,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # using `*cuda_graph_output, padding_mask=...`: the latter would
             # collide if cuda_graph_output ever included a `padding_mask`
             # positional element.
-            assert len(cuda_graph_output) >= 1, "expected at least hidden_states in cuda_graph_output"
+            assert (
+                len(cuda_graph_output) >= 1
+            ), "expected at least hidden_states in cuda_graph_output"
             hidden_states = cuda_graph_output[0]
             output = self._forward_mlp(
                 hidden_states,

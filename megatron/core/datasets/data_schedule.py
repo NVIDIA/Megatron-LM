@@ -123,9 +123,8 @@ class DpBalancedScheduler(BasePackingScheduler):
         single_microbatch = []
 
         for i in range(len(sample_id_seqlens)):
-            if (
-                sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks
-                and (self.max_num_seqs is None or len(single_microbatch) < self.max_num_seqs)
+            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks and (
+                self.max_num_seqs is None or len(single_microbatch) < self.max_num_seqs
             ):
                 single_microbatch.append(i)
                 sum_seqlen += sample_id_seqlens[i][1]
@@ -569,9 +568,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             # stage. cu_seqlens_padded keeps the pre-CP packed length; divide
             # by cp_size to match the already CP-sliced tokens/labels length.
             cp_world = cp_group.size()
-            total_tokens = (
-                batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world
-            ).reshape(1)
+            total_tokens = (batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world).reshape(1)
         else:
             total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
         broadcast_tensor(total_tokens, tp_src_rank, tp_group)
