@@ -268,6 +268,21 @@ class DBuffer:
             raise ValueError(f"Expected out device {self.device}, got {out.device}.")
         return out
 
+    def cast(self, dtype: torch.dtype) -> "DBuffer":
+        """Return this buffer with the same layout and placements in ``dtype``."""
+        if self.dtype == dtype:
+            return self
+
+        destination = DBuffer(
+            mesh=self.mesh,
+            placements=self.placements,
+            tensor_shapes=self.layout.tensor_shapes,
+            dtype=dtype,
+            device=self.device,
+        )
+        destination.local_buffer.copy_(self.local_buffer)
+        return destination
+
     def redistribute(
         self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
     ) -> "DBuffer":

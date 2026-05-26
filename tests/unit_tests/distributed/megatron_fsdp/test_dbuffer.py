@@ -156,6 +156,36 @@ def test_constructor_allocates_local_buffer(distributed_setup):
 
 
 @pytest.mark.distributed
+def test_cast_to_same_dtype_returns_self(distributed_setup):
+    """DBuffer.cast returns self when the dtype already matches."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
+
+    assert buffer.cast(torch.float32) is buffer
+
+
+@pytest.mark.distributed
+def test_cast_preserves_layout_and_casts_values(distributed_setup):
+    """DBuffer.cast preserves layout metadata and casts local values."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
+
+    cast_buffer = buffer.cast(torch.bfloat16)
+
+    assert cast_buffer is not buffer
+    assert cast_buffer.mesh == buffer.mesh
+    assert cast_buffer.placements == buffer.placements
+    assert cast_buffer.layout == buffer.layout
+    assert cast_buffer.device == buffer.device
+    assert cast_buffer.dtype is torch.bfloat16
+    _assert_dbuffer_local_tensors_close(
+        cast_buffer, [tensor.to(dtype=torch.bfloat16) for tensor in tensors]
+    )
+
+
+@pytest.mark.distributed
 def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup):
     """DBuffer storage can be released and reallocated without replacing existing views."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
