@@ -112,7 +112,7 @@ dev = [
     "orjson",
 ]
 
-### 'lts' extra is deprecated (AUT-479).                                       ###
+### 'lts' extra is deprecated                                                   ###
 ### LTS Python dependencies are now pinned directly in docker/Dockerfile.ci.lts ###
 ### so this pyproject.toml can host meaningful module-level extras without      ###
 ### colliding with the LTS pin set. Kept as an empty alias for one release      ###

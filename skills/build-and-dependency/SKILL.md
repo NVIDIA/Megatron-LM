@@ -38,7 +38,7 @@ Two image variants exist, each with its own Dockerfile, selected by the
 | **`lts`** | `docker/.ngc_version.lts` | `docker/Dockerfile.ci.lts` | Inline `uv pip install` list at the top of `Dockerfile.ci.lts` | Stability testing; excludes ModelOpt and other bleeding-edge extras |
 
 > LTS deps used to live in `[project.optional-dependencies].lts` in
-> `pyproject.toml`. They were moved into `Dockerfile.ci.lts` (AUT-479) so
+> `pyproject.toml`. They were moved into `Dockerfile.ci.lts` so
 > `pyproject.toml` can host meaningful module-level extras without colliding
 > with the LTS pin set. To bump an LTS dependency, edit the `uv pip install`
 > block in `docker/Dockerfile.ci.lts`.
@@ -155,7 +155,7 @@ inside the container (already on `PATH`).
 | `linting` | ruff, black, isort, pylint |
 | `build` | Cython, pybind11, nvidia-mathdx |
 
-> The previous `lts` extra has been emptied (AUT-479). LTS deps are pinned in
+> The previous `lts` extra has been emptied. LTS deps are pinned in
 > `docker/Dockerfile.ci.lts` rather than `pyproject.toml`. Do not add new
 > packages under `[project.optional-dependencies].lts`.
 
@@ -163,7 +163,7 @@ Install commands (inside the container):
 
 ```bash
 # Full dev + test environment
-uv sync --locked --extra dev --group test
+uv sync --locked --group dev --group test
 
 # Linting only
 uv sync --locked --only-group linting
