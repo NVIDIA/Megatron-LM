@@ -1292,10 +1292,25 @@ class ChainedOptimizer(MegatronOptimizer):
         return success
 
     def _should_defer_mxfp8_param_sync(self) -> bool:
-        """Return whether MXFP8 param sync should be deferred until chained steps finish."""
-        return (
-            self.config.reuse_grad_buf_for_mxfp8_param_ag and not self.config.overlap_param_gather
-        )
+        """Return whether MXFP8 param sync should be deferred until chained steps finish.
+
+        The deferred-sync path is only needed when MXFP8 grad/param buffer reuse is active
+        AND the DDP-level param gather is not overlapped (i.e. the race fixed by PR #4800
+        can occur). The OptimizerConfig.overlap_param_gather field is unreliable as a proxy
+        for the DDP-level setting -- the two configs can diverge -- so probe the underlying
+        DistOpts directly.
+        """
+        if not self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            return False
+
+        from .distrib_optimizer import DistributedOptimizer
+
+        for optimizer in self.chained_optimizers:
+            if not isinstance(optimizer, DistributedOptimizer):
+                continue
+            if not optimizer.ddp_config.overlap_param_gather:
+                return True
+        return False
 
     def _enable_deferred_mxfp8_param_sync(self) -> List[Tuple[Any, Any]]:
         """Enable deferred DistOpt param sync and collect bucket groups to sync later."""
