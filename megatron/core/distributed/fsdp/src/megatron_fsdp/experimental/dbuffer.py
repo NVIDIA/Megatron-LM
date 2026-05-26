@@ -81,6 +81,11 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
     """Compute global tensor element offsets and padded size.
 
+    This is a DBuffer-specific reimplementation of
+    ``param_and_grad_buffer.build_data_parallel_buffer_index``. It keeps only
+    the global offset construction and final DP-LCM padding; DBuffer derives
+    rank-local slices later through DTensor placements.
+
     The computed layout is compatible with Flat, TensorAtomic, and BlockAtomic,
     even though the latter two are not implemented.
 
@@ -103,6 +108,8 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
             raise ValueError(f"Cannot compute a layout for zero-sized non-leading dims: {shape}.")
         chunk_size = math.lcm(chunk_size, non_leading_numel)
 
+    # The LCM part is the packing grid. Since every row size divides this grid,
+    # DP shard boundaries that are multiples of the grid avoid splitting dim-0 rows.
     tensor_to_offset: list[int | None] = [None] * len(shapes)
     fragment_items = []
     regular_items = []
@@ -112,6 +119,8 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
         else:
             regular_items.append((tensor_id, shape))
 
+    # Regular tensors anchor the layout. Fragments are held back to fill padding
+    # gaps left by regular tensors whose sizes are not exact multiples of the grid.
     fragment_items.sort(key=lambda id_shape: id_shape[1].numel(), reverse=True)
 
     next_offset = 0
@@ -127,29 +136,34 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
         gap_offset = next_offset + tensor_numel
         next_offset += _pad_to_multiple(tensor_numel, chunk_size)
         fragment_gap_end = next_offset
-        remain = tensor_numel % chunk_size
+        remainder = tensor_numel % chunk_size
 
-        found_rhs = None
-        for rhs in regular_items[:]:
-            _, rhs_shape = rhs
-            rhs_numel = rhs_shape.numel()
-            rhs_remain = rhs_numel % chunk_size
-            if rhs_remain == 0:
+        # Try to pair this non-divisible regular tensor with a conjugate regular
+        # tensor whose remainder fits in the same LCM part. The conjugate starts
+        # in the gap and then continues with full LCM parts after this one.
+        conjugate_item = None
+        for candidate_item in regular_items[:]:
+            _, candidate_shape = candidate_item
+            candidate_numel = candidate_shape.numel()
+            candidate_remainder = candidate_numel % chunk_size
+            if candidate_remainder == 0:
                 continue
-            if remain + rhs_remain <= chunk_size:
-                found_rhs = rhs
-                regular_items.remove(rhs)
+            if remainder + candidate_remainder <= chunk_size:
+                conjugate_item = candidate_item
+                regular_items.remove(candidate_item)
                 break
 
-        if found_rhs is not None:
-            rhs_id, rhs_shape = found_rhs
-            rhs_numel = rhs_shape.numel()
-            rhs_remain = rhs_numel % chunk_size
-            rhs_offset = next_offset - rhs_remain
-            tensor_to_offset[rhs_id] = rhs_offset
-            fragment_gap_end = rhs_offset
-            next_offset += (rhs_numel // chunk_size) * chunk_size
+        if conjugate_item is not None:
+            conjugate_id, conjugate_shape = conjugate_item
+            conjugate_numel = conjugate_shape.numel()
+            conjugate_remainder = conjugate_numel % chunk_size
+            conjugate_offset = next_offset - conjugate_remainder
+            tensor_to_offset[conjugate_id] = conjugate_offset
+            fragment_gap_end = conjugate_offset
+            next_offset += (conjugate_numel // chunk_size) * chunk_size
 
+        # Fill any remaining gap with fragments, keeping each fragment aligned to
+        # its own row size so dim-0 rows remain contiguous within DP shards.
         for fragment in fragment_items[:]:
             frag_id, frag_shape = fragment
             frag_numel = frag_shape.numel()
@@ -160,6 +174,7 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
             gap_offset = aligned_gap_offset + frag_numel
             fragment_items.remove(fragment)
 
+    # Fragments that did not fit into regular-tensor gaps are appended at the tail.
     for frag_id, frag_shape in fragment_items:
         next_offset = _pad_to_multiple(next_offset, _non_leading_numel(frag_shape))
         tensor_to_offset[frag_id] = next_offset
