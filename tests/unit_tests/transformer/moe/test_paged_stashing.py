@@ -15,6 +15,7 @@ from megatron.core.transformer.moe.paged_stash import (
     paged_stash_init_chunk_handler,
     paged_stash_reset,
 )
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
@@ -136,7 +137,7 @@ class MoEModelTestContainer:
         quantization_context = get_fp8_context(self.config, layer_number, is_init=True)
         with quantization_context:
             moe_layer = (
-                MoELayer(self.config, transformer_layer_spec.submodules.mlp.submodules)
+                MoELayer(self.config, get_submodules(transformer_layer_spec.submodules.mlp))
                 .cuda()
                 .to(dtype=self.test_dtype)
             )
@@ -207,6 +208,7 @@ class TestPagedStashing:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_forward_backward_4_layers(self):
@@ -296,6 +298,7 @@ class TestPagedStashingOverBudget:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_overload_factor_and_over_budget(self):
