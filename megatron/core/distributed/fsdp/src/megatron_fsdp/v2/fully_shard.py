@@ -84,6 +84,7 @@ def fully_shard(
     module.__class__ = new_cls
 
     use_trace_pool = enable_trace_pool and sharding_strategy in (
+        "optim",
         "optim_grads",
         "optim_grads_params",
     )
