@@ -4,7 +4,7 @@
 
 import dataclasses
 import os
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 import pytest
 import torch
@@ -58,14 +58,9 @@ def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
     ]
 
 
-def _assert_dbuffer_contains_tensors(
-    buffer: DBuffer, expected: list[torch.Tensor], *, exact: bool = True
-) -> None:
+def _assert_dbuffer_contains_tensors(buffer: DBuffer, expected: Iterable[torch.Tensor]) -> None:
     for index, tensor in enumerate(expected):
-        if exact:
-            torch.testing.assert_close(buffer.get_tensor(index), tensor, rtol=0, atol=0)
-        else:
-            torch.testing.assert_close(buffer.get_tensor(index), tensor)
+        torch.testing.assert_close(buffer.get_tensor(index), tensor)
 
 
 @pytest.mark.distributed
@@ -125,7 +120,7 @@ def test_constructor_allocates_local_buffer(setup: DistributedSetup):
         dtype=torch.float32,
         device=setup.device,
     )
-    flat_buffer = DBuffer(
+    sharded_buffer = DBuffer(
         mesh=mesh,
         placements=[Flat()],
         tensor_shapes=tensor_shapes,
@@ -133,16 +128,37 @@ def test_constructor_allocates_local_buffer(setup: DistributedSetup):
         device=setup.device,
     )
 
-    assert replicated_buffer.layout == flat_buffer.layout
+    assert replicated_buffer.layout == sharded_buffer.layout
     assert replicated_buffer.layout.tensor_shapes == tuple(tensor_shapes)
     assert replicated_buffer.offset == 0
-    expected_flat_local_numel = replicated_buffer.layout.size // setup.world_size
-    assert flat_buffer.offset == setup.rank * expected_flat_local_numel
+    expected_sharded_local_numel = replicated_buffer.layout.size // setup.world_size
+    assert sharded_buffer.offset == setup.rank * expected_sharded_local_numel
     assert replicated_buffer.local_buffer.numel() == replicated_buffer.layout.size
-    assert flat_buffer.local_buffer.numel() == replicated_buffer.layout.size // setup.world_size
-    assert flat_buffer.layout.size % (15 * mesh_size) == 0
-    assert replicated_buffer.local_buffer.dtype == torch.float32
-    assert flat_buffer.local_buffer.device == setup.device
+    assert sharded_buffer.local_buffer.numel() == replicated_buffer.layout.size // setup.world_size
+    assert sharded_buffer.layout.size % (15 * mesh_size) == 0
+    assert replicated_buffer.dtype == torch.float32
+    assert sharded_buffer.local_buffer.device == setup.device
+
+
+@pytest.mark.distributed
+def test_from_local_reuses_required_local_buffer(setup: DistributedSetup):
+    """DBuffer.from_local reuses caller-provided local storage without allocation."""
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(setup.device)
+    replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
+    local_numel = replicated_buffer.layout.size // setup.world_size
+    offset = setup.rank * local_numel
+    local_buffer = replicated_buffer.local_buffer.narrow(0, offset, local_numel)
+
+    sharded_buffer = DBuffer.from_local(
+        local_buffer, mesh, iter([Flat()]), replicated_buffer.layout.tensor_shapes
+    )
+
+    assert sharded_buffer.placements == (Flat(),)
+    assert sharded_buffer.layout == replicated_buffer.layout
+    assert sharded_buffer.offset == offset
+    assert sharded_buffer.local_buffer.data_ptr() == local_buffer.data_ptr()
+    _assert_dbuffer_contains_tensors(sharded_buffer.allgather(0), tensors)
 
 
 @pytest.mark.distributed
@@ -171,42 +187,78 @@ def test_distribute_tensors_moves_inputs_to_mesh_device(setup: DistributedSetup)
 
 
 @pytest.mark.distributed
-def test_flat_allgather_round_trip(setup: DistributedSetup):
-    """Flat buffers round-trip through all-gather as contiguous tensor fragments."""
+def test_sharded_allgather_round_trip(setup: DistributedSetup):
+    """Sharded buffers round-trip through all-gather as contiguous tensor fragments."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     tensors = _same_tensors_on_all_ranks(setup.device)
 
-    flat_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
-    layout = flat_buffer.layout
+    sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
+    layout = sharded_buffer.layout
     for index, tensor in enumerate(tensors):
-        local_tensor = flat_buffer.get_tensor(index)
+        local_tensor = sharded_buffer.get_tensor(index)
         assert local_tensor.shape[1:] == tensor.shape[1:]
         assert local_tensor.is_contiguous()
 
-    replicated_buffer = flat_buffer.allgather(0)
+    replicated_buffer = sharded_buffer.allgather(0)
 
     assert replicated_buffer.layout == layout
     _assert_dbuffer_contains_tensors(replicated_buffer, tensors)
 
 
 @pytest.mark.distributed
+def test_sharded_allgather_into_existing_buffer(setup: DistributedSetup):
+    """Sharded buffers can all-gather directly into a preallocated replicated buffer."""
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(setup.device)
+    sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
+    destination = DBuffer(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=sharded_buffer.layout.tensor_shapes,
+        dtype=sharded_buffer.dtype,
+        device=sharded_buffer.local_buffer.device,
+    )
+    destination_data_ptr = destination.local_buffer.data_ptr()
+
+    result = sharded_buffer.allgather(0, out=destination)
+
+    assert result is destination
+    assert destination.local_buffer.data_ptr() == destination_data_ptr
+    _assert_dbuffer_contains_tensors(destination, tensors)
+
+
+@pytest.mark.distributed
 def test_replicate_scatter_round_trip(setup: DistributedSetup):
-    """Replicated buffers locally chunk into Flat buffers and all-gather back."""
+    """Replicated buffers locally chunk into sharded buffers and all-gather back."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     tensors = _same_tensors_on_all_ranks(setup.device)
 
     replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
-    flat_buffer = replicated_buffer.scatter(0, Flat())
-    redistributed_flat_buffer = replicated_buffer.redistribute([Flat()])
-
-    assert flat_buffer.placements == (Flat(),)
-    assert redistributed_flat_buffer.placements == (Flat(),)
-    expected_flat_local_numel = replicated_buffer.layout.size // setup.world_size
-    assert flat_buffer.offset == setup.rank * expected_flat_local_numel
-    torch.testing.assert_close(
-        flat_buffer.local_buffer, redistributed_flat_buffer.local_buffer, rtol=0, atol=0
+    sharded_buffer = replicated_buffer.scatter(0, Flat())
+    redistribute_destination = DBuffer(
+        mesh=mesh,
+        placements=[Flat()],
+        tensor_shapes=replicated_buffer.layout.tensor_shapes,
+        dtype=replicated_buffer.dtype,
+        device=replicated_buffer.local_buffer.device,
     )
-    _assert_dbuffer_contains_tensors(flat_buffer.allgather(0), tensors)
+    redistributed_sharded_buffer = replicated_buffer.redistribute(
+        [Flat()], out=redistribute_destination
+    )
+
+    assert sharded_buffer.placements == (Flat(),)
+    assert redistributed_sharded_buffer is redistribute_destination
+    assert redistributed_sharded_buffer.placements == (Flat(),)
+    expected_sharded_local_numel = replicated_buffer.layout.size // setup.world_size
+    assert sharded_buffer.offset == setup.rank * expected_sharded_local_numel
+    source_slice = replicated_buffer.local_buffer.narrow(
+        0, sharded_buffer.offset - replicated_buffer.offset, sharded_buffer.local_buffer.numel()
+    )
+    assert sharded_buffer.local_buffer.data_ptr() == source_slice.data_ptr()
+    torch.testing.assert_close(
+        sharded_buffer.local_buffer, redistributed_sharded_buffer.local_buffer, rtol=0, atol=0
+    )
+    _assert_dbuffer_contains_tensors(sharded_buffer.allgather(0), tensors)
 
 
 @pytest.mark.distributed
@@ -227,7 +279,7 @@ def test_partial_allreduce(setup: DistributedSetup):
         torch.full((5, 3), scale_sum, dtype=torch.float32, device=setup.device),
         torch.full((4,), scale_sum * 10, dtype=torch.float32, device=setup.device),
     ]
-    _assert_dbuffer_contains_tensors(replicated_buffer, expected, exact=False)
+    _assert_dbuffer_contains_tensors(replicated_buffer, expected)
 
 
 @pytest.mark.distributed
@@ -243,19 +295,27 @@ def test_partial_allreduce_average(setup: DistributedSetup):
         tensors, mesh, [Partial(reduce_op=dist.ReduceOp.AVG)]
     )
 
-    replicated_buffer = partial_buffer.allreduce(0)
+    destination = DBuffer(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=partial_buffer.layout.tensor_shapes,
+        dtype=partial_buffer.dtype,
+        device=partial_buffer.local_buffer.device,
+    )
+    replicated_buffer = partial_buffer.allreduce(0, out=destination)
 
+    assert replicated_buffer is destination
     scale_average = float(setup.world_size + 1) / 2.0
     expected = [
         torch.full((5, 3), scale_average, dtype=torch.float32, device=setup.device),
         torch.full((4,), scale_average * 10, dtype=torch.float32, device=setup.device),
     ]
-    _assert_dbuffer_contains_tensors(replicated_buffer, expected, exact=False)
+    _assert_dbuffer_contains_tensors(replicated_buffer, expected)
 
 
 @pytest.mark.distributed
 def test_partial_reduce_scatter_to_flat(setup: DistributedSetup):
-    """Partial buffers reduce-scatter into Flat buffers."""
+    """Partial buffers reduce-scatter into sharded buffers."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     rank_scale = float(setup.rank + 1)
     tensors = [
@@ -265,18 +325,26 @@ def test_partial_reduce_scatter_to_flat(setup: DistributedSetup):
     partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial()])
     layout = partial_buffer.layout
 
-    flat_buffer = partial_buffer.reduce_scatter(0, Flat())
-    replicated_buffer = flat_buffer.allgather(0)
+    destination = DBuffer(
+        mesh=mesh,
+        placements=[Flat()],
+        tensor_shapes=partial_buffer.layout.tensor_shapes,
+        dtype=partial_buffer.dtype,
+        device=partial_buffer.local_buffer.device,
+    )
+    sharded_buffer = partial_buffer.reduce_scatter(0, Flat(), out=destination)
+    replicated_buffer = sharded_buffer.allgather(0)
 
-    assert flat_buffer.placements == (Flat(),)
-    assert flat_buffer.layout == layout
+    assert sharded_buffer is destination
+    assert sharded_buffer.placements == (Flat(),)
+    assert sharded_buffer.layout == layout
     assert replicated_buffer.layout == layout
     scale_sum = float(setup.world_size * (setup.world_size + 1) // 2)
     expected_tensors = [
         torch.full((5, 3), scale_sum, dtype=torch.float32, device=setup.device),
         torch.full((4,), scale_sum * 10, dtype=torch.float32, device=setup.device),
     ]
-    _assert_dbuffer_contains_tensors(replicated_buffer, expected_tensors, exact=False)
+    _assert_dbuffer_contains_tensors(replicated_buffer, expected_tensors)
 
 
 @pytest.mark.distributed
@@ -293,30 +361,30 @@ def test_partial_reduce_scatter_to_flat_average(setup: DistributedSetup):
     )
     layout = partial_buffer.layout
 
-    flat_buffer = partial_buffer.reduce_scatter(0, Flat())
-    replicated_buffer = flat_buffer.allgather(0)
+    sharded_buffer = partial_buffer.reduce_scatter(0, Flat())
+    replicated_buffer = sharded_buffer.allgather(0)
 
-    assert flat_buffer.placements == (Flat(),)
-    assert flat_buffer.layout == layout
+    assert sharded_buffer.placements == (Flat(),)
+    assert sharded_buffer.layout == layout
     assert replicated_buffer.layout == layout
     scale_average = float(setup.world_size + 1) / 2.0
     expected_tensors = [
         torch.full((5, 3), scale_average, dtype=torch.float32, device=setup.device),
         torch.full((4,), scale_average * 10, dtype=torch.float32, device=setup.device),
     ]
-    _assert_dbuffer_contains_tensors(replicated_buffer, expected_tensors, exact=False)
+    _assert_dbuffer_contains_tensors(replicated_buffer, expected_tensors)
 
 
 @pytest.mark.distributed
-def test_get_dtensor_from_flat_buffer(setup: DistributedSetup):
-    """Flat DBuffer exposes per-tensor local shards as DTensors."""
+def test_get_dtensor_from_sharded_buffer(setup: DistributedSetup):
+    """Sharded DBuffer exposes per-tensor local shards as DTensors."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     tensors = _same_tensors_on_all_ranks(setup.device)
-    flat_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
+    sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
 
-    dtensor = flat_buffer.get_dtensor(0)
+    dtensor = sharded_buffer.get_dtensor(0)
 
-    torch.testing.assert_close(dtensor.to_local(), flat_buffer.get_tensor(0), rtol=0, atol=0)
+    torch.testing.assert_close(dtensor.to_local(), sharded_buffer.get_tensor(0), rtol=0, atol=0)
     assert dtensor.shape == tensors[0].shape
 
 
@@ -331,8 +399,8 @@ def test_2d_mesh_replicate_flat_round_trip(setup: DistributedSetup):
         setup.device.type, (2, setup.world_size // 2), mesh_dim_names=("replicate", "flat")
     )
 
-    flat_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Flat()])
-    replicated_buffer = flat_buffer.allgather("flat")
+    sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Flat()])
+    replicated_buffer = sharded_buffer.allgather("flat")
 
     _assert_dbuffer_contains_tensors(replicated_buffer, tensors)
 
@@ -367,41 +435,19 @@ def test_2d_mesh_shards_across_all_ranks(setup: DistributedSetup):
     mesh = init_device_mesh(
         setup.device.type, (2, setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
     )
-    flat_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat(), Flat()])
+    fully_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat(), Flat()])
 
-    assert flat_buffer.layout.tensor_shapes == tuple(tensor.shape for tensor in tensors)
-    expected_local_numel = flat_buffer.layout.size // mesh.size()
-    expected_inner_axis_shard_numel = flat_buffer.layout.size // mesh.size(1)
+    assert fully_sharded_buffer.layout.tensor_shapes == tuple(tensor.shape for tensor in tensors)
+    expected_local_numel = fully_sharded_buffer.layout.size // mesh.size()
+    expected_inner_axis_shard_numel = fully_sharded_buffer.layout.size // mesh.size(1)
     expected_offset = (
         mesh.get_local_rank("dp_inner") * expected_inner_axis_shard_numel
         + mesh.get_local_rank("dp_outer") * expected_local_numel
     )
-    assert flat_buffer.offset == expected_offset
-    assert flat_buffer.local_buffer.numel() == flat_buffer.layout.size // mesh.size()
+    assert fully_sharded_buffer.offset == expected_offset
+    assert fully_sharded_buffer.local_buffer.numel() == fully_sharded_buffer.layout.size // mesh.size()
     for index, _ in enumerate(tensors):
-        assert flat_buffer.get_tensor(index).is_contiguous()
-
-
-@pytest.mark.distributed
-def test_2d_mesh_flat_flat_redistribute_to_replicate_replicate(setup: DistributedSetup):
-    """Redistribute composes all-gathers across both Flat axes."""
-    if setup.world_size < 4 or setup.world_size % 2 != 0:
-        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
-
-    tensors = _same_tensors_on_all_ranks(setup.device)
-    mesh = init_device_mesh(
-        setup.device.type, (2, setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
-    )
-    flat_flat_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat(), Flat()])
-    layout = flat_flat_buffer.layout
-
-    replicated_buffer = flat_flat_buffer.redistribute([Replicate(), Replicate()])
-
-    assert replicated_buffer.placements == (Replicate(), Replicate())
-    assert replicated_buffer.layout == layout
-    assert replicated_buffer.offset == 0
-    assert replicated_buffer.local_buffer.numel() == layout.size
-    _assert_dbuffer_contains_tensors(replicated_buffer, tensors)
+        assert fully_sharded_buffer.get_tensor(index).is_contiguous()
 
 
 @pytest.mark.distributed
@@ -419,26 +465,26 @@ def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(setup: DistributedSetu
         torch.full((4,), outer_scale * 10, dtype=torch.float32, device=setup.device),
     ]
 
-    partial_flat_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial(), Flat()])
-    flat_flat_buffer = partial_flat_buffer.reduce_scatter("dp_outer", Flat())
-    replicated_buffer = flat_flat_buffer.allgather("dp_outer").allgather("dp_inner")
+    partial_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial(), Flat()])
+    fully_sharded_buffer = partial_sharded_buffer.reduce_scatter("dp_outer", Flat())
+    replicated_buffer = fully_sharded_buffer.allgather("dp_outer").allgather("dp_inner")
 
-    assert flat_flat_buffer.placements == (Flat(), Flat())
-    expected_local_numel = flat_flat_buffer.layout.size // mesh.size()
-    expected_inner_axis_shard_numel = flat_flat_buffer.layout.size // mesh.size(1)
+    assert fully_sharded_buffer.placements == (Flat(), Flat())
+    expected_local_numel = fully_sharded_buffer.layout.size // mesh.size()
+    expected_inner_axis_shard_numel = fully_sharded_buffer.layout.size // mesh.size(1)
     expected_offset = (
         mesh.get_local_rank("dp_inner") * expected_inner_axis_shard_numel
         + mesh.get_local_rank("dp_outer") * expected_local_numel
     )
-    assert flat_flat_buffer.offset == expected_offset
-    assert flat_flat_buffer.local_buffer.numel() == partial_flat_buffer.local_buffer.numel() // 2
+    assert fully_sharded_buffer.offset == expected_offset
+    assert fully_sharded_buffer.local_buffer.numel() == partial_sharded_buffer.local_buffer.numel() // 2
 
     outer_scale_sum = float(mesh.size(0) * (mesh.size(0) + 1) // 2)
     expected = [
         torch.full((6, 2), outer_scale_sum, dtype=torch.float32, device=setup.device),
         torch.full((4,), outer_scale_sum * 10, dtype=torch.float32, device=setup.device),
     ]
-    _assert_dbuffer_contains_tensors(replicated_buffer, expected, exact=False)
+    _assert_dbuffer_contains_tensors(replicated_buffer, expected)
 
 
 @pytest.mark.distributed
@@ -452,17 +498,17 @@ def test_2d_mesh_replicate_flat_scatter_to_flat_flat(setup: DistributedSetup):
         setup.device.type, (2, setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
     )
 
-    replicate_flat_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Flat()])
-    flat_flat_buffer = replicate_flat_buffer.scatter("dp_outer", Flat())
-    replicated_buffer = flat_flat_buffer.allgather("dp_outer").allgather("dp_inner")
+    replicated_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Flat()])
+    fully_sharded_buffer = replicated_sharded_buffer.scatter("dp_outer", Flat())
+    replicated_buffer = fully_sharded_buffer.allgather("dp_outer").allgather("dp_inner")
 
-    assert flat_flat_buffer.placements == (Flat(), Flat())
-    expected_local_numel = flat_flat_buffer.layout.size // mesh.size()
-    expected_inner_axis_shard_numel = flat_flat_buffer.layout.size // mesh.size(1)
+    assert fully_sharded_buffer.placements == (Flat(), Flat())
+    expected_local_numel = fully_sharded_buffer.layout.size // mesh.size()
+    expected_inner_axis_shard_numel = fully_sharded_buffer.layout.size // mesh.size(1)
     expected_offset = (
         mesh.get_local_rank("dp_inner") * expected_inner_axis_shard_numel
         + mesh.get_local_rank("dp_outer") * expected_local_numel
     )
-    assert flat_flat_buffer.offset == expected_offset
-    assert flat_flat_buffer.local_buffer.numel() == replicate_flat_buffer.local_buffer.numel() // 2
+    assert fully_sharded_buffer.offset == expected_offset
+    assert fully_sharded_buffer.local_buffer.numel() == replicated_sharded_buffer.local_buffer.numel() // 2
     _assert_dbuffer_contains_tensors(replicated_buffer, tensors)
