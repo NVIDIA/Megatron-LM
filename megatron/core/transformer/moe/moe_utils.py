@@ -2,7 +2,6 @@
 
 import functools
 import math
-import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -59,34 +58,12 @@ _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
 def should_skip_shared_expert_cudagraph_capture(config: TransformerConfig) -> bool:
     """Return True when shared experts should stay outside TE partial MoE graphs."""
-    if bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0"))):
-        return True
-    if bool(int(os.environ.get("MCORE_CG_FORCE_SHARED_EXPERT_CAPTURE", "0"))):
-        return False
     return (
         getattr(config, "use_megatron_fsdp", False)
         and config.cuda_graph_impl == "transformer_engine"
         and CudaGraphScope.moe_router in (config.cuda_graph_scope or [])
         and config.moe_shared_expert_intermediate_size is not None
         and not config.moe_shared_expert_overlap
-    )
-
-
-def _debug_raise_if_nan(tensor: torch.Tensor, source: str):
-    if not bool(int(os.environ.get("MCORE_MOE_ROUTER_GATING_DEBUG_NAN", "0"))):
-        return
-    if is_graph_capturing():
-        return
-    if tensor is None or not torch.is_floating_point(tensor):
-        return
-    nan_count = torch.isnan(tensor).sum()
-    if nan_count.item() == 0:
-        return
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    raise RuntimeError(
-        "[MoE router gating] Detected NaN "
-        f"rank={rank} source={source}, shape={tuple(tensor.shape)}, "
-        f"dtype={tensor.dtype}, nan_count={nan_count.item()}"
     )
 
 
@@ -1358,7 +1335,6 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         use_te_gemm = (
             te_general_gemm is not None
             and router_dtype != torch.float64
-            and not bool(int(os.environ.get("MCORE_MOE_ROUTER_GATING_DISABLE_TE_GEMM", "0")))
         )
 
         if use_te_gemm:
@@ -1391,15 +1367,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp, weight, bias = ctx.saved_tensors
         inp_shape = inp.shape
         grad_shape = grad_output.shape
-        _debug_raise_if_nan(grad_output, "backward.grad_output")
-        _debug_raise_if_nan(inp, "backward.saved_input")
-        _debug_raise_if_nan(weight, "backward.saved_weight")
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
         use_te_gemm = (
             te_general_gemm is not None
             and ctx.router_dtype != torch.float64
-            and not bool(int(os.environ.get("MCORE_MOE_ROUTER_GATING_DISABLE_TE_GEMM", "0")))
         )
 
         if use_te_gemm:
@@ -1415,8 +1387,6 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
             grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
 
-        _debug_raise_if_nan(grad_input, "backward.grad_input")
-        _debug_raise_if_nan(grad_weight, "backward.grad_weight")
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
         return grad_input, grad_weight, grad_bias, None

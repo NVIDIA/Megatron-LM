@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -44,10 +43,6 @@ logger = logging.getLogger(__name__)
 
 
 def _should_skip_shared_expert_cudagraph_capture(config: TransformerConfig) -> bool:
-    if bool(int(os.environ.get("MCORE_CG_SKIP_SHARED_EXPERT_CAPTURE", "0"))):
-        return True
-    if bool(int(os.environ.get("MCORE_CG_FORCE_SHARED_EXPERT_CAPTURE", "0"))):
-        return False
     return (
         getattr(config, "use_megatron_fsdp", False)
         and config.cuda_graph_impl == "transformer_engine"
@@ -55,28 +50,6 @@ def _should_skip_shared_expert_cudagraph_capture(config: TransformerConfig) -> b
         and config.moe_shared_expert_intermediate_size is not None
         and not config.moe_shared_expert_overlap
     )
-
-
-def _maybe_register_cudagraph_grad_nan_hook(tensor: Tensor | None, source: str):
-    if not bool(int(os.environ.get("MCORE_CG_OUTPUT_GRAD_DEBUG_NAN", "0"))):
-        return
-    if tensor is None or not tensor.requires_grad or not torch.is_floating_point(tensor):
-        return
-
-    def _hook(grad: Tensor):
-        if grad is None or not torch.is_floating_point(grad):
-            return grad
-        nan_count = torch.isnan(grad).sum()
-        if nan_count.item() == 0:
-            return grad
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        raise RuntimeError(
-            "[CUDA graph output] Detected NaN in output grad "
-            f"rank={rank} source={source}, shape={tuple(grad.shape)}, "
-            f"dtype={grad.dtype}, nan_count={nan_count.item()}"
-        )
-
-    tensor.register_hook(_hook)
 
 
 def get_transformer_layer_offset(
@@ -1132,13 +1105,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
 
-        if self.config.cuda_graph_scope and CudaGraphScope.attn in self.config.cuda_graph_scope:
-            layer_id = getattr(self, "layer_number", "unknown")
-            for i, tensor in enumerate(cuda_graph_output):
-                _maybe_register_cudagraph_grad_nan_hook(
-                    tensor, f"layer{layer_id}.attn.output[{i}]"
-                )
-
         if (
             not self.config.cuda_graph_scope
             or (not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope)
@@ -1205,28 +1171,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     f"but got {len(cuda_graph_output)} elements"
                 )
                 hidden_states, probs, routing_map = cuda_graph_output
-
-            if bool(int(os.environ.get("MCORE_CG_CLONE_MOE_ROUTER_OUTPUTS", "0"))):
-                hidden_states = hidden_states.clone()
-                probs = probs.clone()
-                if routing_map is not None:
-                    routing_map = routing_map.clone()
-                if shared_expert_output is not None:
-                    shared_expert_output = shared_expert_output.clone()
-
-            layer_id = getattr(self, "layer_number", "unknown")
-            _maybe_register_cudagraph_grad_nan_hook(
-                residual, f"layer{layer_id}.moe_router.residual"
-            )
-            _maybe_register_cudagraph_grad_nan_hook(
-                hidden_states, f"layer{layer_id}.moe_router.hidden_states"
-            )
-            _maybe_register_cudagraph_grad_nan_hook(
-                probs, f"layer{layer_id}.moe_router.probs"
-            )
-            _maybe_register_cudagraph_grad_nan_hook(
-                shared_expert_output, f"layer{layer_id}.moe_router.shared_expert_output"
-            )
 
             # Resume the MoELayer forward pass from the end of the CUDA graph scope.
             # The MoE layer will skip redundant computations when we pass in the calculated values

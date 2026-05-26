@@ -15,7 +15,6 @@
 import functools
 import importlib
 import logging
-import os
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,7 +37,6 @@ from .param_and_grad_buffer import (
     GradReducePipeline,
     ParamAndGradBuffer,
     PrefetchOrder,
-    _check_nan_in_grad,
     get_param_group_id,
     override_sharded_param_methods_with_safety_checks,
     to_local_if_dtensor,
@@ -603,12 +601,6 @@ class MegatronFSDP(torch.nn.Module):
                 - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
                 the FP8 transpose cache associated with the module’s parameters.
             """
-            if (
-                bool(int(os.environ.get("MCORE_FSDP_KEEP_CUDAGRAPH_PARAMS_UNTIL_BWD", "0")))
-                and (is_graph_capturing() or bool(getattr(module, "cuda_graphs", None)))
-            ):
-                return
-
             params = (
                 _get_canonical_module_params(module, recurse=True)
                 if (
@@ -637,45 +629,20 @@ class MegatronFSDP(torch.nn.Module):
             Utilizes the patched main_grad property of the parameter to allocate
             or fetch the main gradient bucket for the parameter.
             """
-            def _raise_if_nan(tensor, source):
+            def _check_finite(tensor, source):
                 if not self.report_nan_in_param_grad or tensor is None:
                     return
                 local_tensor = to_local_if_dtensor(tensor)
-                if not torch.is_floating_point(local_tensor):
+                if not torch.is_tensor(local_tensor) or not torch.is_floating_point(local_tensor):
                     return
-                has_nan = torch.isnan(local_tensor).any()
-                if bool(has_nan.detach().cpu().item()):
+                is_finite = torch.isfinite(local_tensor)
+                if not bool(is_finite.all().detach().cpu().item()):
                     name = self.param_to_name.get(param, "<unknown>")
-                    nan_count = int(torch.isnan(local_tensor).sum().detach().cpu().item())
-                    param_grad = getattr(param, "grad", None)
-                    main_grad = getattr(param, "main_grad", None)
-
-                    def _tensor_debug_state(debug_tensor):
-                        if debug_tensor is None:
-                            return "None"
-                        local_debug_tensor = to_local_if_dtensor(debug_tensor)
-                        if not torch.is_tensor(local_debug_tensor):
-                            return type(local_debug_tensor).__name__
-                        debug_state = (
-                            f"shape={tuple(local_debug_tensor.shape)}, "
-                            f"dtype={local_debug_tensor.dtype}, "
-                            f"ptr={local_debug_tensor.data_ptr()}"
-                        )
-                        if torch.is_floating_point(local_debug_tensor):
-                            debug_nan_count = int(
-                                torch.isnan(local_debug_tensor).sum().detach().cpu().item()
-                            )
-                            debug_state += f", nan_count={debug_nan_count}"
-                        return debug_state
-
+                    nonfinite_count = int((~is_finite).sum().detach().cpu().item())
                     raise RuntimeError(
-                        "[Megatron-FSDP] Detected NaN in "
+                        "[Megatron-FSDP] Detected non-finite value in "
                         f"{source}: param={name}, shape={tuple(local_tensor.shape)}, "
-                        f"dtype={local_tensor.dtype}, nan_count={nan_count}, "
-                        f"grad_added_to_main_grad={getattr(param, 'grad_added_to_main_grad', None)}, "
-                        f"param_id={id(param)}, param_data_ptr={to_local_if_dtensor(param).data_ptr()}, "
-                        f"param.grad=({_tensor_debug_state(param_grad)}), "
-                        f"param.main_grad=({_tensor_debug_state(main_grad)})"
+                        f"dtype={local_tensor.dtype}, nonfinite_count={nonfinite_count}"
                     )
 
             group_id = get_param_group_id(self.param_and_grad_buffer, param)
@@ -696,7 +663,7 @@ class MegatronFSDP(torch.nn.Module):
                     param.main_grad = param.get_main_grad()
                     if param.grad is not None:
                         if self.report_nan_in_param_grad:
-                            _raise_if_nan(param.grad, "param.grad before main_grad copy")
+                            _check_finite(param.grad, "param.grad before main_grad copy")
                         # Copy the gradient into the allocated main gradient bucket.
                         # It will be reduce-scattered and accumulated into gbuf.
                         param.main_grad.copy_(to_local_if_dtensor(param.grad))
@@ -709,7 +676,7 @@ class MegatronFSDP(torch.nn.Module):
                 if not param.grad_added_to_main_grad:
                     if param.grad is not None:
                         if self.report_nan_in_param_grad:
-                            _raise_if_nan(param.grad, "param.grad before main_grad add")
+                            _check_finite(param.grad, "param.grad before main_grad add")
                         # Accumulate the gradient into the main gradient buffer,
                         # because we only reduce once per optimization cycle.
                         param.main_grad = param.get_main_grad()
@@ -720,7 +687,7 @@ class MegatronFSDP(torch.nn.Module):
                 del param.grad
 
             if self.report_nan_in_param_grad:
-                _raise_if_nan(getattr(param, "main_grad", None), "param.main_grad after grad_acc")
+                _check_finite(getattr(param, "main_grad", None), "param.main_grad after grad_acc")
 
             # Reset the grad accumulate flag.
             param.grad_added_to_main_grad = False
@@ -1196,12 +1163,6 @@ class MegatronFSDP(torch.nn.Module):
             assert isinstance(
                 module, tuple(fsdp_unit_modules)
             ), "_post_forward hook should only be registered on FSDP unit modules."
-
-            if (
-                bool(int(os.environ.get("MCORE_FSDP_KEEP_CUDAGRAPH_PARAMS_UNTIL_BWD", "0")))
-                and bool(getattr(module, "cuda_graphs", None))
-            ):
-                return output
 
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
