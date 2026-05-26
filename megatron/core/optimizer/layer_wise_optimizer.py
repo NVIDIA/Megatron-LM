@@ -1,5 +1,6 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import logging
 import math
 from typing import Callable, Dict, List, Optional, Tuple
@@ -13,6 +14,7 @@ from megatron.core.distributed.param_and_grad_buffer import group_params_for_buf
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
+from ..fp8_utils import is_mxfp8tensor
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
     ChainedOptimizer,
@@ -30,6 +32,89 @@ from .param_layout import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _skip_mxfp8_in_copy_main_to_model(inner_opt: 'Float16OptimizerWithFloat16Params') -> None:
+    """Patch ``inner_opt._copy_main_params_to_model_params`` to skip MXFP8 model params.
+
+    With ``reuse_grad_buf_for_mxfp8_param_ag=True`` at the outer LayerWise level,
+    the bf16 ``param_buffer`` is written by
+    :py:meth:`LayerWiseDistributedOptimizer._write_owned_mxfp8_masters_to_param_buffer`
+    and the MXFP8 storage is then refreshed by the post-AG
+    ``param.data.copy_(bf16_slice)`` step inside
+    ``_ParamAndGradBucketGroup._post_param_sync``. The inner's default
+    ``_copy_main_params_to_model_params`` (which runs because we flipped
+    ``inner_config.reuse_grad_buf_for_mxfp8_param_ag=False``) would do
+    ``model.data.copy_(main.data fp32)`` for each MXFP8 model param, triggering
+    ``QuantizedTensor.__torch_dispatch__`` ⇒ ``dst.quantize_(fp32)`` — a wasted
+    second quantization that the post-AG ``quantize_(bf16)`` later overwrites,
+    but which empirically perturbed muon convergence (~0.27 nats lag by iter 10
+    on the 100-iter OCI-HSG test). Standard ``DistributedOptimizer`` avoids
+    this by branching to ``_copy_main_params_to_param_buffer`` in its
+    ``reuse_grad_buf`` step path and never invoking the model-copy at all on
+    MXFP8 params. This patch matches that behavior for the LayerWise inner.
+
+    Non-MXFP8 params (plain bf16 / Float8Tensor with per-tensor scaling) keep
+    going through the standard model-copy path, since their storage is mapped
+    to ``param_buffer`` via :func:`modify_underlying_storage` and the inner
+    copy lands the update in the right place.
+    """
+    original_get_pairs = inner_opt._get_model_and_main_params_data_float16
+    # Local import to avoid hoisting the helper to a wider scope.
+    from ..fp8_utils import is_mxfp8tensor
+    from .optimizer import _multi_tensor_copy_this_to_that
+
+    def patched_copy_main_params_to_model_params(_self=inner_opt):
+        non_mxfp8_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for model_group, main_group in zip(_self.float16_groups, _self.fp32_from_float16_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                if is_mxfp8tensor(model_param):
+                    continue
+                non_mxfp8_pairs.append((model_param.data, main_param.data))
+        if not non_mxfp8_pairs:
+            return
+        model_data = [m for m, _ in non_mxfp8_pairs]
+        main_data = [n for _, n in non_mxfp8_pairs]
+        _multi_tensor_copy_this_to_that(
+            this=main_data, that=model_data, overflow_buf=_self._dummy_overflow_buf
+        )
+
+    inner_opt._copy_main_params_to_model_params = patched_copy_main_params_to_model_params
+
+
+def _restore_high_precision_init_val(inner_opt: 'Float16OptimizerWithFloat16Params') -> None:
+    """Overwrite the fp32 master of any MXFP8 model param with the BF16 init
+    values that TE preserved on CPU at module construction.
+
+    Float16OptimizerWithFloat16Params.__init__ creates the master via
+    ``param.detach().clone().float()``. For an MXFP8Tensor model param,
+    ``.float()`` calls ``QuantizedTensor.dequantize(dtype=fp32)`` — the master
+    is therefore initialized from FP8-quantized values, not the original BF16
+    init, and carries ~FP8 precision noise relative to the bf16 init from
+    iter 0. DistributedOptimizer fixes this by reading
+    ``model_param.get_high_precision_init_val()`` (a CPU bf16 tensor TE saves
+    at base.py:1461 before the quantize-wrap) — see
+    ``distrib_optimizer.py`` lines 405-416. Mirror that fix for the LayerWise
+    inner so muon's fp32 masters start bit-identical to the bf16 baseline.
+    No-op for params without the attribute (non-MXFP8 / TE versions without
+    preserved init vals).
+    """
+    if inner_opt is None or not hasattr(inner_opt, 'float16_groups'):
+        return
+    for model_group, main_group in zip(
+        inner_opt.float16_groups, inner_opt.fp32_from_float16_groups
+    ):
+        for model_param, main_param in zip(model_group, main_group):
+            if not hasattr(model_param, 'get_high_precision_init_val'):
+                continue
+            init_val = model_param.get_high_precision_init_val()
+            if init_val is None:
+                continue
+            main_param.data.copy_(
+                init_val.view(model_param.shape).to(device=main_param.device, dtype=torch.float32)
+            )
+            if hasattr(model_param, 'clear_high_precision_init_val'):
+                model_param.clear_high_precision_init_val()
 
 
 def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
@@ -401,6 +486,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Callers pass base optimizers; wrapping happens here *after*
         # shard_params so master weights are only created for the local shard.
         if config.bf16:
+            # Hide ``reuse_grad_buf_for_mxfp8_param_ag`` from the inner
+            # ``Float16OptimizerWithFloat16Params``: its step path would call
+            # ``_copy_main_params_to_param_buffer`` (a DistributedOptimizer-only
+            # method) and raise ``AttributeError`` here. We take responsibility
+            # for the bf16 ⇒ param_buffer write for owned MXFP8 model params in
+            # :py:meth:`_write_owned_mxfp8_masters_to_param_buffer` below.
+            inner_config = copy.copy(config)
+            inner_config.reuse_grad_buf_for_mxfp8_param_ag = False
             for i in range(len(optimizers)):
                 opt = optimizers[i]
                 if isinstance(opt, (Float16OptimizerWithFloat16Params, FP32Optimizer)):
@@ -408,11 +501,54 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         'LayerWiseDistributedOptimizer expects base torch optimizers, '
                         f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
-                optimizers[i] = Float16OptimizerWithFloat16Params(
-                    opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
+                inner_opt = Float16OptimizerWithFloat16Params(
+                    opt, inner_config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
+                # Mirror DistributedOptimizer's ``reuse_grad_buf_for_mxfp8_param_ag``
+                # path: skip the inner's ``model.data.copy_(main fp32)`` for MXFP8
+                # model params (which would otherwise trigger an extra
+                # ``QuantizedTensor.__torch_dispatch__`` ⇒ ``dst.quantize_(fp32)``
+                # that then gets overwritten by the post-AG ``quantize_(bf16)``).
+                # The wasted double-quantization left a small mismatch between
+                # ON and OFF on muon experiments (~0.27 nats by iter 10 that
+                # shrank but didn't vanish by iter 100); distopt's flow avoids
+                # this by routing through ``_copy_main_params_to_param_buffer``
+                # in the ``reuse_grad_buf`` branch and never touching MXFP8
+                # storage at the inner step. Replicate that exactly here.
+                if config.reuse_grad_buf_for_mxfp8_param_ag:
+                    _skip_mxfp8_in_copy_main_to_model(inner_opt)
+                # Mirror DistributedOptimizer's master-init fix-up: when the
+                # model param is MXFP8 (``primary_weights_in_fp8=True``), the
+                # default inner construction sets ``main_param = param.detach()
+                # .clone().float()`` which DEQUANTIZES the MXFP8 storage and
+                # bakes the FP8 quantization noise into the fp32 master from
+                # iter 0. TE preserves the original bf16/fp16 init values on
+                # CPU via ``_high_precision_init_val``; DistOpt reads them back
+                # at master construction (see ``distrib_optimizer.py`` lines
+                # 405-416). Without this, ON masters disagree with OFF masters
+                # by ~FP8 precision, the subsequent bf16⇒MXFP8 round-trip
+                # amplifies the residual, and muon's NS step produces slightly
+                # different updates each iter — observed as a small loss lag
+                # vs the fp8_param_gather=False baseline that doesn't fully
+                # close even by iter 100.
+                _restore_high_precision_init_val(inner_opt)
+                optimizers[i] = inner_opt
 
         super().__init__(optimizers)
+
+        # Restore the outer config on this LayerWise wrapper. ChainedOptimizer
+        # __init__ sets ``self.config`` to the *first inner child's* config,
+        # which here is the shallow-copied ``inner_config`` (with
+        # reuse_grad_buf_for_mxfp8_param_ag forced False) — but the outer
+        # ChainedOptimizer that wraps ``[LayerWise, sibling DistOpt]`` asserts
+        # that every child shares the same config, and the sibling DistOpt
+        # holds the unmodified outer ``config``. Setting ``self.config = config``
+        # restores that equality without changing inner-step behavior (only
+        # the inner Float16Optimizer needs the flag flipped; LayerWise itself
+        # behaves correctly under the outer config and our own writes to the
+        # param buffer in :py:meth:`_write_owned_mxfp8_masters_to_param_buffer`
+        # are gated on the outer config's ``reuse_grad_buf_for_mxfp8_param_ag``).
+        self.config = config
 
         # Assign self.model_chunks AFTER super().__init__: ChainedOptimizer.__init__
         # resets self.model_chunks to [] and then repopulates only from chained
@@ -717,6 +853,38 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
         )
 
+    def _ensure_mxfp8_quantizer_dual_usage(self, bucket) -> None:
+        """Force every MXFP8 param's bound quantizer to ``rowwise=True, columnwise=True``.
+
+        The post-AG ``param.data.copy_(param_buffer_slice)`` triggered by
+        :meth:`_ParamAndGradBucketGroup._post_param_sync` routes through
+        ``QuantizedTensor.__torch_dispatch__`` ⇒ ``dst.quantize_(src)`` ⇒
+        ``MXFP8Quantizer.update_quantized`` ⇒ ``tex.quantize(src, quantizer, dst)``.
+        ``tex.quantize`` picks the kernel based on ``quantizer.rowwise_usage`` /
+        ``quantizer.columnwise_usage``: both ``True`` selects the x2 kernel that
+        produces rowwise + columnwise data + scales in a single pass, anything
+        else updates only the requested orientation.
+
+        TE Linear sets the weight quantizer to ``rowwise=True, columnwise=True``
+        at module construction time when ``torch.is_grad_enabled()`` (see
+        ``base.py:1467``), and bwd briefly toggles it for grad GEMMs, so for
+        most paths the quantizer happens to be configured correctly when the
+        optimizer step runs. Re-asserting it here makes the post-AG MXFP8
+        refresh deterministic for muon's LayerWise path regardless of what TE
+        toggled during the previous fwd/bwd. Without this, a stale
+        ``columnwise_data`` survives across iterations and the next bwd's
+        dgrad GEMM uses out-of-date weights, producing a slow loss-curve
+        divergence vs the ``fp8_param_gather=False`` baseline (observed
+        ~0.27 nats lag by iter 10 that doesn't fully close by iter 100).
+        """
+        for param in bucket.params:
+            if not is_mxfp8tensor(param):
+                continue
+            quantizer = getattr(param, '_quantizer', None)
+            if quantizer is None:
+                continue
+            quantizer.set_usage(rowwise=True, columnwise=True)
+
     def start_param_sync_for_bucket_group_subset(self) -> None:
         """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
 
@@ -726,6 +894,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         double-sync the same buckets. Uses
         :meth:`DistributedDataParallel._start_bucket_group_param_sync` so FP8
         post-all-gather processing (and MXFP8 copy) still runs.
+
+        Before dispatching each LayerWise-managed bucket group's AG, force the
+        bucket's MXFP8 param quantizers to ``rowwise=True, columnwise=True``
+        so the post-AG ``param.data.copy_(bf16)`` refreshes both orientations
+        (see :py:meth:`_ensure_mxfp8_quantizer_dual_usage`).
         """
         for model_chunk in self.model_chunks:
             for bucket_group in (
@@ -734,7 +907,74 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 if bucket_group.buckets and _bucket_is_managed_by_layer_wise_optimizer(
                     bucket_group.buckets[0]
                 ):
+                    for bucket in bucket_group.buckets:
+                        self._ensure_mxfp8_quantizer_dual_usage(bucket)
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+
+    @torch.no_grad()
+    def _write_owned_mxfp8_masters_to_param_buffer(self) -> None:
+        """For each owned MXFP8 model param, write its fp32 master cast to bf16
+        directly into the corresponding slice of DDP's bf16 param buffer.
+
+        Mirrors :meth:`DistributedOptimizer._copy_main_params_to_param_buffer`
+        for the LayerWise + ``use_buffer_param_sync`` case. With
+        ``reuse_grad_buf_for_mxfp8_param_ag=True`` the bf16 ``param_buffer`` is
+        kept separate from each MXFP8 model param's ``_rowwise_data`` /
+        ``_columnwise_data`` storage; the inner
+        ``Float16OptimizerWithFloat16Params._copy_main_params_to_model_params``
+        refreshes the MXFP8 storage via TE's ``QuantizedTensor`` dispatch but
+        leaves ``param_buffer`` stale. ``DistributedDataParallel.start_param_sync``
+        all-gathers ``param_buffer`` and then quantizes back to MXFP8 in-place on
+        every rank, so the buffer must hold the freshly updated bf16 master cast
+        before AG dispatches.
+
+        Walks each model chunk's dense + expert-parallel buffers and writes only
+        for params that are (a) owned by this rank on the LayerWise side, (b)
+        MXFP8 (other quantized formats already have their byte storage remapped
+        to ``param_buffer`` via :func:`modify_underlying_storage` during DDP
+        init), and (c) sitting in a LayerWise-managed bucket.
+
+        No-op unless ``use_buffer_param_sync=True`` and
+        ``config.reuse_grad_buf_for_mxfp8_param_ag=True``.
+        """
+        if not self.use_buffer_param_sync:
+            return
+        if not self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            return
+
+        # Collect the (model_param, main_param) pairs we own — float16_groups
+        # are already narrowed to the per-rank shard by ``shard_params``.
+        owned_pairs: List[Tuple[torch.nn.Parameter, torch.nn.Parameter]] = []
+        for inner_opt in self.chained_optimizers:
+            if not hasattr(inner_opt, 'float16_groups'):
+                continue
+            for model_group, main_group in zip(
+                inner_opt.float16_groups, inner_opt.fp32_from_float16_groups
+            ):
+                for model_param, main_param in zip(model_group, main_group):
+                    if is_mxfp8tensor(model_param):
+                        owned_pairs.append((model_param, main_param))
+        if not owned_pairs:
+            return
+
+        # Resolve each owned MXFP8 param's bucket + per-bucket offset. Walk
+        # the DDP buffers once and skip non-LayerWise buckets so a sibling
+        # DistOpt's MXFP8 params (if any) are not double-handled.
+        for model_chunk in self.model_chunks:
+            buffers = list(model_chunk.buffers) + list(model_chunk.expert_parallel_buffers)
+            for buffer in buffers:
+                for model_param, main_param in owned_pairs:
+                    if model_param not in buffer.param_to_bucket:
+                        continue
+                    bucket = buffer.param_to_bucket[model_param]
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
+                        continue
+                    param_start, param_end = bucket.param_to_index[model_param]
+                    # bf16 cast happens implicitly via tensor.copy_'s dtype
+                    # conversion (param_buffer is bf16, main_param is fp32).
+                    bucket.param_data.view(-1)[param_start:param_end].copy_(
+                        main_param.data.view(-1)
+                    )
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
@@ -746,6 +986,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         ``step``.
         """
         success = super().step_with_ready_grads()
+
+        # MXFP8 + ``reuse_grad_buf_for_mxfp8_param_ag``: write the just-updated
+        # fp32 master shards into ``param_buffer`` before the AG dispatches
+        # (no-op for other recipes). Safe to call in both overlap and
+        # non-overlap modes — in overlap mode the param sync fires from the
+        # forward pre-hooks after step returns, so the buffer is correct by
+        # then; in non-overlap mode the ``start_param_sync_for_bucket_group_subset``
+        # call below dispatches synchronously and sees the correct buffer.
+        self._write_owned_mxfp8_masters_to_param_buffer()
 
         # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.

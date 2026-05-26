@@ -1075,6 +1075,33 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
             '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
+        # When the layer-wise distributed optimizer takes over (muon and other
+        # non-Adam/SGD optimizers when ``--use-distributed-optimizer`` is set;
+        # the auto-flip to ``use_layer_wise_distributed_optimizer`` happens
+        # further down in this file), --fp8-param-gather is supported via the
+        # standard distopt buffer-AG path that PR #4771 wired up — but only if
+        # the bf16 staging buffer for the MXFP8 param all-gather is the idle
+        # grad buffer (the same ``reuse_grad_buf_for_mxfp8_param_ag`` trick
+        # used by the standard DistributedOptimizer). For MXFP8 + LayerWise the
+        # model params keep their own ``_rowwise_data`` / ``_columnwise_data``
+        # storage and the bf16 ``param_buffer`` is separate; if we don't also
+        # write the optimizer-step output into ``param_buffer`` before the AG,
+        # the AG ships stale bytes. The LayerWise code path that does that
+        # write is gated on ``reuse_grad_buf_for_mxfp8_param_ag``, so require
+        # the flag explicitly to fail fast on misconfiguration.
+        will_use_layer_wise_distributed_optimizer = (
+            args.optimizer not in ('sgd', 'adam') and args.use_distributed_optimizer
+        )
+        if will_use_layer_wise_distributed_optimizer and args.fp8_recipe == 'mxfp8':
+            assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                '--fp8-param-gather with --fp8-recipe=mxfp8 and the layer-wise '
+                'distributed optimizer (auto-selected for non-adam/sgd optimizers '
+                'when --use-distributed-optimizer is set) requires '
+                '--reuse-grad-buf-for-mxfp8-param-ag: the bf16 staging buffer '
+                'for the MXFP8 param all-gather is the idle grad buffer; the '
+                'two features must be co-enabled.'
+            )
+
     # FP4 and FP8 are mutually exclusive
     if args.fp4 and args.fp8:
         raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
