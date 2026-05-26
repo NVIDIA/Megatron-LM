@@ -191,6 +191,9 @@ override-dependencies = [
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
 ]
+extra-build-variables = {
+    flash_mla = { CFLAGS = "-I/usr/local/cuda/include/cccl", CXXFLAGS = "-I/usr/local/cuda/include/cccl" }
+}
 
 [tool.uv.sources]
 
