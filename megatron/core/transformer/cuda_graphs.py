@@ -2269,8 +2269,11 @@ class TECudaGraphHelper:
             probe_num_microbatches = self._get_probe_num_microbatches_for_dynamic_slots()
             from megatron.core.pipeline_parallel.schedules import (
                 get_pp_rank_microbatches as _probe_get_pp,
+            )
+            from megatron.core.pipeline_parallel.schedules import (
                 get_schedule_table as _probe_get_st,
             )
+
             _, _, _probe_warmup, _ = _probe_get_pp(
                 probe_num_microbatches,
                 self.num_model_chunks,
@@ -2315,7 +2318,8 @@ class TECudaGraphHelper:
                 level=logging.INFO,
                 msg=f'Rank {torch.distributed.get_rank()}: dynamic CUDA graph slots enabled. '
                 f'runtime_num_microbatches={get_num_microbatches()}, '
-                f'auto_num_slots={auto_num_slots}, capture_num_microbatches={self.num_microbatches}',
+                f'auto_num_slots={auto_num_slots}, '
+                f'capture_num_microbatches={self.num_microbatches}',
             )
         else:
             self.num_microbatches = get_num_microbatches()

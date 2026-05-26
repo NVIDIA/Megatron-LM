@@ -249,18 +249,16 @@ class GraphableMegatronModule(MegatronModule):
 
         if self._is_thd_cuda_graph():
             # THD + CUDA Graph: pre-padded packed-sequence buffer, batch dim = 1.
-            assert self.config.max_seqlen_per_dp_cp_rank is not None, (
-                "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
-            )
+            assert (
+                self.config.max_seqlen_per_dp_cp_rank is not None
+            ), "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
             slen_full = self.config.max_seqlen_per_dp_cp_rank
             batch = 1
         else:
             # SBHD path: per-rank seq is split by CP and (optionally) by TP under SP.
             slen_full = seq_length // context_parallel_size
             batch = micro_batch_size
-        slen_per_cptp = (
-            slen_full // tensor_model_parallel_size if sequence_parallel else slen_full
-        )
+        slen_per_cptp = slen_full // tensor_model_parallel_size if sequence_parallel else slen_full
 
         # Static input dtype must match the runtime activation dtype that flows
         # through the captured graph. Hardcoding bfloat16 silently breaks --fp16.

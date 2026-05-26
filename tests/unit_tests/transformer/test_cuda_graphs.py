@@ -1077,9 +1077,7 @@ class TestRequiredNumMicrobatchSlots:
 
     @staticmethod
     def _slots(order, num_chunks):
-        return TECudaGraphHelper._get_required_num_microbatch_slots_from_order(
-            order, num_chunks
-        )
+        return TECudaGraphHelper._get_required_num_microbatch_slots_from_order(order, num_chunks)
 
     def test_single_chunk_single_microbatch(self):
         # F0 then B0: one slot is enough.

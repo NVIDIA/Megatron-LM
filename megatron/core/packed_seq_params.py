@@ -190,7 +190,8 @@ def pad_thd_for_cuda_graph(
             f"Individual request length ({_max_individual}) exceeds the global max sequence length "
             f"({max_seqlen_global} = max_seqlen_per_dp_cp_rank {max_seqlen} * cp_size {cp_size}). "
             f"Each request must fit within the CUDA Graph static buffer after CP partitioning. "
-            f"Increase --max-seqlen-per-dp-cp-rank or --seq-length, or filter out overlong requests."
+            f"Increase --max-seqlen-per-dp-cp-rank or --seq-length, or filter out overlong "
+            f"requests."
         )
 
     tokens = _pad_seq_tensor(tokens, max_seqlen)
@@ -224,9 +225,11 @@ def pad_thd_for_cuda_graph(
         else:
             local_actual_T = int(
                 get_thd_partitioned_indices(
-                    packed_seq_params.cu_seqlens_q_padded
-                    if packed_seq_params.cu_seqlens_q_padded is not None
-                    else packed_seq_params.cu_seqlens_q,
+                    (
+                        packed_seq_params.cu_seqlens_q_padded
+                        if packed_seq_params.cu_seqlens_q_padded is not None
+                        else packed_seq_params.cu_seqlens_q
+                    ),
                     int(actual_T),
                     cp_size,
                     cp_rank,
@@ -234,9 +237,11 @@ def pad_thd_for_cuda_graph(
             )
             local_max_seqlen = int(
                 get_thd_partitioned_indices(
-                    padded_params.cu_seqlens_q_padded
-                    if padded_params.cu_seqlens_q_padded is not None
-                    else padded_params.cu_seqlens_q,
+                    (
+                        padded_params.cu_seqlens_q_padded
+                        if padded_params.cu_seqlens_q_padded is not None
+                        else padded_params.cu_seqlens_q
+                    ),
                     max_seqlen_global,
                     cp_size,
                     cp_rank,
