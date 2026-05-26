@@ -577,7 +577,7 @@ class CheckpointConfig:
     by using Gloo (instead of NCCL) and only one rank for saving. Turn on only if experiencing host or device memory
     issues. Has affect only with `dist_ckpt_optim_fully_reshardable` flag."""
 
-    dist_ckpt_use_dtensor_format: bool = False
+    dist_ckpt_use_dtensor_format: bool = True
     """Sets distributed checkpoint tensors fromat to torch's DTensor."""
 
     save_tokenizer_assets: bool = True
