@@ -14,7 +14,7 @@ import torch
 import megatron.core.utils as util
 import megatron.training.utils as training_util
 from megatron.core import config
-from megatron.core._rank_utils import safe_get_world_size
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
@@ -520,6 +520,30 @@ class TestGetWorldSizeSafe:
 
         with pytest.raises(ValueError):
             safe_get_world_size()
+
+
+class TestGetRankSafe:
+    """Test safe_get_rank function."""
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"RANK": "9"})
+    def test_uninitialized_torch_distributed_with_rank_env_var(self, mock_is_initialized):
+        """Test safe_get_rank when torch.distributed is not initialized but RANK env var exists."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_rank()
+
+        assert result == 9
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"RANK": "invalid"})
+    def test_invalid_rank_env_var_should_warn_and_return_zero(self, mock_is_initialized):
+        """Test safe_get_rank with invalid RANK environment variable."""
+        mock_is_initialized.return_value = False
+
+        with pytest.warns(UserWarning, match="Invalid RANK environment variable value"):
+            assert safe_get_rank() == 0
 
 
 class TestGetLocalRankPreinit:
