@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import os
 import random
 
 import numpy as np
@@ -17,6 +18,15 @@ except:
     from torch.optim import Adam as GPUAdam
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
+
+@pytest.fixture(autouse=True)
+def _set_cuda_device_for_local_rank():
+    """Keep torchrun ranks from piling all allocations onto GPU 0."""
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank % torch.cuda.device_count())
+        torch.cuda.empty_cache()
 
 
 class Net(nn.Module):
@@ -45,10 +55,10 @@ class BigNet(nn.Module):
         self.conv1 = nn.Conv2d(3, 6, 5)
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 2048)
-        self.fc2 = nn.Linear(2048, 8192)
-        self.fc3 = nn.Linear(8192, 2048)
-        self.fc4 = nn.Linear(2048, 100)
+        self.fc1 = nn.Linear(16 * 5 * 5, 1024)
+        self.fc2 = nn.Linear(1024, 2048)
+        self.fc3 = nn.Linear(2048, 1024)
+        self.fc4 = nn.Linear(1024, 100)
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
