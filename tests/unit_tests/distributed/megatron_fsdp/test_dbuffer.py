@@ -107,6 +107,50 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(setup: DistributedSetup)
 
 
 @pytest.mark.distributed
+def test_compute_layout_fills_lcm_padding_gaps(setup: DistributedSetup):
+    """LCM packing fills row-aligned padding gaps on a 5-rank flat-sharded mesh."""
+    if setup.world_size < 5:
+        pytest.skip("LCM padding-gap layout test requires at least 5 ranks.")
+
+    # P0-P4 are zero-based logical tensor names matching tensor indices.
+    shapes = [
+        torch.Size((2, 6)),  # P0
+        torch.Size((4, 4)),  # P1
+        torch.Size((4, 4)),  # P2
+        torch.Size((1, 2)),  # P3
+        torch.Size((1, 6)),  # P4
+    ]
+
+    mesh = init_device_mesh(setup.device.type, (5,))
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the 5-rank DBuffer mesh.")
+
+    buffer = DBuffer(
+        mesh=mesh,
+        placements=[Flat()],
+        tensor_shapes=shapes,
+        dtype=torch.float32,
+        device=setup.device,
+    )
+    layout = buffer.layout
+    expected_local_shapes_by_rank = [
+        [(2, 6), (0, 4), (0, 4), (0, 2), (0, 6)],
+        [(0, 6), (3, 4), (0, 4), (0, 2), (0, 6)],
+        [(0, 6), (1, 4), (1, 4), (1, 2), (0, 6)],
+        [(0, 6), (0, 4), (3, 4), (0, 2), (0, 6)],
+        [(0, 6), (0, 4), (0, 4), (0, 2), (1, 6)],
+    ]
+
+    assert layout.tensor_shapes == tuple(shapes)
+    assert layout.tensor_to_offset == (0, 12, 32, 28, 48)
+    assert layout.size == 60
+    expected_local_shapes = expected_local_shapes_by_rank[mesh.get_local_rank(0)]
+    for index, expected_shape in enumerate(expected_local_shapes):
+        assert buffer.get_tensor(index).shape == torch.Size(expected_shape)
+        assert buffer.get_dtensor(index).shape == shapes[index]
+
+
+@pytest.mark.distributed
 def test_constructor_allocates_local_buffer(setup: DistributedSetup):
     """DBuffer allocates local storage from shape, mesh, placement, dtype, and device."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))

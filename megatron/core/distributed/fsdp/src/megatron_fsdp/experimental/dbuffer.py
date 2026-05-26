@@ -112,21 +112,21 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
         else:
             regular_items.append((tensor_id, shape))
 
-    fragment_items.sort(key=lambda id_shape: -id_shape[1].numel())
+    fragment_items.sort(key=lambda id_shape: id_shape[1].numel(), reverse=True)
 
-    data_index = 0
+    next_offset = 0
     while regular_items:
         tensor_id, shape = regular_items.pop(0)
         tensor_numel = shape.numel()
-        tensor_to_offset[tensor_id] = data_index
+        tensor_to_offset[tensor_id] = next_offset
 
         if tensor_numel % chunk_size == 0:
-            data_index += tensor_numel
+            next_offset += tensor_numel
             continue
 
-        gap_offset = data_index + tensor_numel
-        data_index += _pad_to_multiple(tensor_numel, chunk_size)
-        fragment_gap_end = data_index
+        gap_offset = next_offset + tensor_numel
+        next_offset += _pad_to_multiple(tensor_numel, chunk_size)
+        fragment_gap_end = next_offset
         remain = tensor_numel % chunk_size
 
         found_rhs = None
@@ -145,10 +145,10 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
             rhs_id, rhs_shape = found_rhs
             rhs_numel = rhs_shape.numel()
             rhs_remain = rhs_numel % chunk_size
-            rhs_offset = data_index - rhs_remain
+            rhs_offset = next_offset - rhs_remain
             tensor_to_offset[rhs_id] = rhs_offset
             fragment_gap_end = rhs_offset
-            data_index += (rhs_numel // chunk_size) * chunk_size
+            next_offset += (rhs_numel // chunk_size) * chunk_size
 
         for fragment in fragment_items[:]:
             frag_id, frag_shape = fragment
@@ -161,9 +161,9 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
             fragment_items.remove(fragment)
 
     for frag_id, frag_shape in fragment_items:
-        data_index = _pad_to_multiple(data_index, _non_leading_numel(frag_shape))
-        tensor_to_offset[frag_id] = data_index
-        data_index += frag_shape.numel()
+        next_offset = _pad_to_multiple(next_offset, _non_leading_numel(frag_shape))
+        tensor_to_offset[frag_id] = next_offset
+        next_offset += frag_shape.numel()
 
     if any(offset is None for offset in tensor_to_offset):
         raise AssertionError(f"Incomplete DBuffer layout for shapes {shapes}.")
@@ -173,7 +173,7 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
         row_size = _non_leading_numel(shape)
         if offset % row_size != 0:
             raise AssertionError(f"Tensor offset {offset} is not aligned to row size {row_size}.")
-    size = _pad_to_multiple(data_index, chunk_size * dp_size)
+    size = _pad_to_multiple(next_offset, chunk_size * dp_size)
     return GlobalLayout(tensor_shapes=shapes, tensor_to_offset=resolved_tensor_to_offset, size=size)
 
 
