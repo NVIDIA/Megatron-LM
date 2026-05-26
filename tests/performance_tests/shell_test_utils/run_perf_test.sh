@@ -40,7 +40,10 @@ YQ=/usr/local/bin/yq
 mkdir -p "$RESULTS_ROOT"
 RESULTS_JSON="$RESULTS_ROOT/results.json"
 SERVER_LOG_DIR="$RESULTS_ROOT/server_logs"
-mkdir -p "$SERVER_LOG_DIR"
+# launch_jet_workload.py retries unless torchrun's per-rank std*.log assets exist.
+ASSETS_ROOT="$(dirname "$RESULTS_ROOT")"
+TORCHRUN_LOG_DIR="$ASSETS_ROOT/logs/1"
+mkdir -p "$SERVER_LOG_DIR" "$TORCHRUN_LOG_DIR"
 # Clean any pre-existing results.json so this run starts fresh.
 rm -f "$RESULTS_JSON"
 

@@ -7,7 +7,6 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
@@ -476,53 +475,20 @@ class DistributedDataParallel(_BaseDataParallel):
     def _start_bucket_group_param_sync(
         self, bucket_group: '_ParamAndGradBucketGroup', force_sync: bool
     ) -> None:
-        """Dispatch one bucket group's param all-gather + run the FP8 / MXFP8
+        """Dispatch one bucket group's param all-gather + run the FP8 / MXFP8 / FP4
         post-all-gather work the synchronous path needs.
 
         Factored out of :meth:`start_param_sync` so callers that own a subset
         of bucket groups (e.g. a chained ``LayerWiseDistributedOptimizer`` +
         ``DistributedOptimizer`` pair) can sync only their own buckets without
-        losing the FP8 post-processing that follows the collective.
+        losing the post-processing that follows the collective.
         """
         bucket_group.start_param_sync(force_sync=force_sync)
 
         if self.ddp_config.overlap_param_gather:
             return
 
-        # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
-        # the param.data, since param buffer is not mapped to model params for MXFP8 case.
-        # The paramaters are cast from bf16 to MXFP8 during copy.
-        # In the case of "overlap_param_gather=True", the param copy is done
-        # in "finish_param_sync" stage after zeroing the shared gardient buffers.
-        if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-            for bucket in bucket_group.buckets:
-                is_bf16_weight_bucket = False
-                for param in bucket.params:
-                    # Skip copying since bf16 weights in the mxfp8 model
-                    # are already mapped to param.data.
-                    if not is_float8tensor(param):
-                        is_bf16_weight_bucket = True
-                        break
-                    param_start, param_end = bucket.param_to_index[param]
-                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    param.data.copy_(param_slice.view(param.data.shape))
-                if is_bf16_weight_bucket:
-                    continue
-                # All-gathered params are not needed after being copied to param.data.
-                # Zero out the param buffer (shared with grad buffer) for gradient
-                # accumulation. We cannot zero out the entire grad buffer because one grad
-                # buffer may correspond to multiple param buffers. If we zero out the entire
-                # grad buffer, it would clear the data of those param buffers that have not
-                # yet completed AG.
-                bucket.param_data.zero_()
-        else:
-            fp8_params = []
-            for bucket in bucket_group.buckets:
-                for param in bucket.params:
-                    if is_float8tensor(param):
-                        fp8_params.append(param)
-            if len(fp8_params) > 0:
-                post_all_gather_processing(fp8_params)
+        bucket_group._post_param_sync()
 
     def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
         """

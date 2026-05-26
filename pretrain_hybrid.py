@@ -104,7 +104,13 @@ def get_batch(data_iterator, vp_stage=None):
 
     batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_hybrid_cp, cp_group=get_context_parallel_group(), hybrid_cp_group_func=get_hybrid_data_context_parallel_groups)
 
-    return [batch[key] for key in sorted(batch.keys())]
+    # Return values in BATCH_KEYS order so callers can unpack into the fixed
+    # names regardless of any provenance fields wrappers like BlendedDataset
+    # add (e.g. "dataset_id"). The for-loop above already populates every
+    # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
+    # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
+    # the historical sorted(batch.keys()) order.
+    return [batch[key] for key in BATCH_KEYS]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
