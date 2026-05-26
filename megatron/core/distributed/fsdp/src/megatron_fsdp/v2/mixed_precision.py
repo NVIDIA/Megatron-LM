@@ -135,6 +135,51 @@ if not HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
                 that_.copy_(this_)
 
 
+def sync_replicated_buffer_from_shard(
+    model_weight_buffer,
+    main_weight_buffer,
+    data_parallel_group: torch.distributed.ProcessGroup,
+    transpose_weight_buffer=None,
+) -> None:
+    """Refresh replicated compute-weight buffers from this rank's updated shards."""
+    if model_weight_buffer is None or model_weight_buffer.is_distributed:
+        return
+
+    def shard_to_replicated(replicated_buffer, shard_buffer) -> None:
+        if replicated_buffer is None:
+            return
+        assert shard_buffer is not None
+
+        if replicated_buffer.dtype != shard_buffer.dtype:
+            replicated_shard_meta = replicated_buffer.buffer_index.shard_meta
+            shard_meta = shard_buffer.buffer_index.shard_meta
+            replicated_buffer.data[
+                replicated_shard_meta.local_data_index : replicated_shard_meta.local_data_index
+                + replicated_shard_meta.size
+            ].copy_(
+                shard_buffer.data[
+                    shard_meta.local_data_index : shard_meta.local_data_index + shard_meta.size
+                ]
+            )
+            shard_buffer = replicated_buffer
+
+        shard_meta = shard_buffer.buffer_index.shard_meta
+        shard = shard_buffer.data[
+            shard_meta.local_data_index : shard_meta.local_data_index + shard_meta.size
+        ]
+        torch.distributed.all_gather_into_tensor(
+            output_tensor=replicated_buffer.data,
+            input_tensor=shard,
+            group=data_parallel_group,
+        )
+
+    if is_fp8_param(model_weight_buffer.params[0]):
+        shard_to_replicated(model_weight_buffer, model_weight_buffer)
+        shard_to_replicated(transpose_weight_buffer, transpose_weight_buffer)
+    else:
+        shard_to_replicated(model_weight_buffer, main_weight_buffer)
+
+
 @dataclass(frozen=True)
 class FullyShardFP8Policy:
     """FP8 recipe settings owned by the v2 ``fully_shard`` path."""
@@ -397,42 +442,15 @@ class FullyShardMixedPrecisionPolicy:
 
         assert model_weight_buffer is not None, "main weights require a model-weight buffer"
 
-        def sync_replicated_buffer_from_shard(replicated_buffer, shard_buffer) -> None:
-            if replicated_buffer is None or replicated_buffer.is_distributed:
-                return
-            assert shard_buffer is not None
-            shard_meta = shard_buffer.buffer_index.shard_meta
-            shard = shard_buffer.data[
-                shard_meta.local_data_index : shard_meta.local_data_index + shard_meta.size
-            ]
-            torch.distributed.all_gather_into_tensor(
-                output_tensor=replicated_buffer.data,
-                input_tensor=shard,
-                group=data_parallel_group,
-            )
-
         if not self.is_fp8_param(params[0]):
-            same_buffer_layout = (
-                model_weight_buffer.is_distributed == main_weight_buffer.is_distributed
-            )
-            if same_buffer_layout:
-                model_weight_buffer.data.copy_(main_weight_buffer.data)
-                return
-
-            copy_shard_to_replicated = (
-                not model_weight_buffer.is_distributed and main_weight_buffer.is_distributed
-            )
-            if copy_shard_to_replicated:
-                sync_replicated_buffer_from_shard(
-                    replicated_buffer=model_weight_buffer,
-                    shard_buffer=main_weight_buffer,
+            if model_weight_buffer.is_distributed and not main_weight_buffer.is_distributed:
+                raise RuntimeError(
+                    "Unsupported FSDP main/model weight buffer layout: "
+                    "model weights are sharded but main weights are replicated."
                 )
-                return
-
-            raise RuntimeError(
-                "Unsupported FSDP main/model weight buffer layout: "
-                "model weights are sharded but main weights are replicated."
-            )
+            if model_weight_buffer.is_distributed == main_weight_buffer.is_distributed:
+                model_weight_buffer.data.copy_(main_weight_buffer.data)
+            return
 
         fp8_params = []
         main_params = []
@@ -461,15 +479,6 @@ class FullyShardMixedPrecisionPolicy:
         quantize_main_weights_to_fp8(
             fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
         )
-        if main_weight_buffer.is_distributed:
-            sync_replicated_buffer_from_shard(
-                replicated_buffer=model_weight_buffer,
-                shard_buffer=model_weight_buffer,
-            )
-            sync_replicated_buffer_from_shard(
-                replicated_buffer=transpose_weight_buffer,
-                shard_buffer=transpose_weight_buffer,
-            )
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:

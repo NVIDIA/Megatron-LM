@@ -30,7 +30,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from ..uneven_dtensor import make_uneven_dtensor, update_uneven_dtensor_chunk_metadata
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
-from .mixed_precision import FullyShardMixedPrecisionPolicy
+from .mixed_precision import FullyShardMixedPrecisionPolicy, sync_replicated_buffer_from_shard
 from .utils import ParamGroupIdx
 
 
@@ -104,6 +104,10 @@ class ParameterGroup:
         self.hsdp_wbuf: Optional[DataParallelBuffer] = None
         self.hsdp_gbuf: Optional[DataParallelBuffer] = None
         self.hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
+        # For optim/optim_grads, optimizer updates sharded main weights while
+        # forward uses replicated model weights. Mark the replica for one
+        # refresh on the next forward unshard.
+        self._needs_replicated_weight_buffer_refresh = False
 
         # Initialize buffers and distributed parameters
         self._init_buffers()
@@ -210,6 +214,15 @@ class ParameterGroup:
         parameters rebind their TE raw payload instead of ``param.data``.
         """
         work = None
+        if not bwd_pass and self._needs_replicated_weight_buffer_refresh:
+            sync_replicated_buffer_from_shard(
+                self.model_weight_buffer,
+                self.main_weight_buffer,
+                self.dp_group,
+                self.transpose_weight_buffer,
+            )
+            self._needs_replicated_weight_buffer_refresh = False
+
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
@@ -257,6 +270,12 @@ class ParameterGroup:
             self.main_weight_buffer,
             self.transpose_weight_buffer,
         )
+        self._needs_replicated_weight_buffer_refresh = False
+        if self.main_weight_buffer is not None:
+            self._needs_replicated_weight_buffer_refresh = (
+                self.main_weight_buffer.is_distributed
+                and not self.model_weight_buffer.is_distributed
+            )
 
     def reduce_grad(self):
         """
