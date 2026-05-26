@@ -23,12 +23,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     FusedDSAIndexerLoss,
     _build_causal_mask_from_positions,
     _build_fused_indexer_varlen_bounds,
+    _build_packed_allgather_cp_query_positions_and_key_reorder,
     _compute_index_scores,
     _fused_qk_topk_lighting,
     _fused_qk_topk_lighting_with_streaming_sparse_kl,
-    _scatter_topk_into_index_mask,
-    _build_causal_mask_from_positions,
-    _build_packed_allgather_cp_query_positions_and_key_reorder,
     _generate_varlen_mask_params,
     _get_cp_positions_from_layout,
     _scatter_topk_into_index_mask,
@@ -860,13 +858,7 @@ class TestDSAIndexerLossRowMaskCPU:
         weights = torch.tensor([[[1.0]]], dtype=torch.float32)
         mask = torch.tensor([[0.0, float("-inf"), float("-inf")]], dtype=torch.float32)
 
-        _, topk_indices = fused_qk_topk_naive(
-            q=q,
-            k=k,
-            weights=weights,
-            index_topk=3,
-            mask=mask,
-        )
+        _, topk_indices = fused_qk_topk_naive(q=q, k=k, weights=weights, index_topk=3, mask=mask)
 
         expected = torch.tensor([[[0, -1, -1]]], dtype=torch.int64)
         torch.testing.assert_close(topk_indices, expected)
@@ -1471,7 +1463,9 @@ class TestDSAIndexer:
 
         self.indexer.config.dsa_indexer_rope_interleaved = interleaved
 
-        x = torch.randn(2, 1, self.indexer.index_n_heads, self.indexer.index_head_dim, dtype=torch.bfloat16)
+        x = torch.randn(
+            2, 1, self.indexer.index_n_heads, self.indexer.index_head_dim, dtype=torch.bfloat16
+        )
         rotary_pos_emb = torch.randn(2, 1, 1, self.config.qk_pos_emb_head_dim, dtype=torch.bfloat16)
 
         with patch(
