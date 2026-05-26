@@ -16,7 +16,7 @@
 
 import dataclasses
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 
 import torch
 import torch.distributed as dist
@@ -56,7 +56,7 @@ class GlobalLayout:
     tensor_to_offset: tuple[int, ...]
     size: int
 
-    def get_local_range(self, mesh: DeviceMesh, placements: Sequence[Placement]) -> tuple[int, int]:
+    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
         """Return this rank's local element offset and length for ``placements``."""
         offset = 0
         numel = self.size
@@ -101,7 +101,7 @@ def _validate_placement(placement: Placement) -> None:
         raise TypeError(f"Unsupported DBuffer placement: {placement!r}.")
 
 
-def _validate_placements(placements: Sequence[Placement]) -> None:
+def _validate_placements(placements: Iterable[Placement]) -> None:
     seen_flat = False
     for placement in placements:
         _validate_placement(placement)
@@ -114,7 +114,7 @@ def _validate_placements(placements: Sequence[Placement]) -> None:
             )
 
 
-def _compute_layout(shapes: Sequence[torch.Size], dp_size: int) -> GlobalLayout:
+def _compute_layout(shapes: Iterable[torch.Size], dp_size: int) -> GlobalLayout:
     """Compute flat-buffer element offsets and globally padded size.
 
     Args:
@@ -227,8 +227,8 @@ class DBuffer:
     def __init__(
         self,
         mesh: DeviceMesh,
-        placements: Sequence[Placement],
-        tensor_shapes: Sequence[torch.Size],
+        placements: Iterable[Placement],
+        tensor_shapes: Iterable[torch.Size],
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
@@ -257,9 +257,59 @@ class DBuffer:
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
 
+    @property
+    def dtype(self) -> torch.dtype:
+        """Dtype of the local flat buffer."""
+        return self.local_buffer.dtype
+
+    @classmethod
+    def from_local(
+        cls,
+        local_buffer: torch.Tensor,
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        tensor_shapes: Iterable[torch.Size],
+    ) -> "DBuffer":
+        """Create a DBuffer from an existing local flat buffer.
+
+        Args:
+            local_buffer: Local flat tensor storage for this rank.
+            mesh: Device mesh whose dimensions correspond to ``placements``.
+            placements: Per-mesh-axis DBuffer placements.
+            tensor_shapes: Global shapes for each logical tensor in this buffer.
+
+        Returns:
+            A DBuffer that reuses ``local_buffer`` without allocating storage.
+        """
+        placements = tuple(placements)
+        if len(placements) != mesh.ndim:
+            raise ValueError(
+                f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
+            )
+        _validate_placements(placements)
+        if local_buffer.dim() != 1:
+            raise ValueError("local_buffer must be a flat 1D tensor.")
+
+        tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
+        layout = _compute_layout(tensor_shapes, dp_size=mesh.size())
+        offset, local_numel = layout.get_local_range(mesh, placements)
+        if local_buffer.numel() != local_numel:
+            raise ValueError(
+                f"Expected local_buffer with {local_numel} elements, got "
+                f"{local_buffer.numel()}."
+            )
+
+        buffer = cls.__new__(cls)
+        buffer.mesh = mesh
+        buffer.placements = placements
+        buffer.layout = layout
+        buffer.offset = offset
+        buffer.local_buffer = local_buffer
+        return buffer
+
     @classmethod
     def distribute_tensors(
-        cls, tensors: Iterable[torch.Tensor], mesh: DeviceMesh, placements: Sequence[Placement]
+        cls, tensors: Iterable[torch.Tensor], mesh: DeviceMesh, placements: Iterable[Placement]
     ) -> "DBuffer":
         """Distribute full local tensor values into a DBuffer.
 
@@ -317,10 +367,37 @@ class DBuffer:
             )
         return buffer
 
-    def redistribute(self, new_placements: Sequence[Placement]) -> "DBuffer":
+    def _create_or_validate_out(
+        self, placements: Iterable[Placement], out: "DBuffer | None"
+    ) -> "DBuffer":
+        placements = tuple(placements)
+        if out is None:
+            return DBuffer(
+                mesh=self.mesh,
+                placements=placements,
+                tensor_shapes=self.layout.tensor_shapes,
+                dtype=self.dtype,
+                device=self.local_buffer.device,
+            )
+
+        if out.mesh != self.mesh:
+            raise ValueError("out must use the same mesh.")
+        if out.placements != placements:
+            raise ValueError(f"Expected out placements {placements}, got {out.placements}.")
+        if out.layout != self.layout:
+            raise ValueError("out layout must match the source layout.")
+        if out.dtype != self.dtype:
+            raise ValueError("out dtype must match the source dtype.")
+        if out.local_buffer.device != self.local_buffer.device:
+            raise ValueError("out device must match the source device.")
+        return out
+
+    def redistribute(
+        self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
+    ) -> "DBuffer":
         """Redistribute this buffer to ``new_placements``.
 
-        This dispatcher composes the supported one-axis transitions:
+        This dispatcher supports the one-axis transitions:
         Flat -> Replicate, Partial -> Replicate, Partial -> Flat, and
         Replicate -> Flat. Other placement changes are intentionally unsupported.
         """
@@ -332,32 +409,43 @@ class DBuffer:
             )
         _validate_placements(new_placements)
 
-        buffer = self
-        for axis, new_placement in enumerate(new_placements):
-            old_placement = buffer.placements[axis]
+        changed_axis: int | None = None
+        for axis, (old_placement, new_placement) in enumerate(
+            zip(self.placements, new_placements, strict=True)
+        ):
             if old_placement == new_placement:
                 continue
-            if isinstance(old_placement, Flat) and isinstance(new_placement, Replicate):
-                buffer = buffer.allgather(axis)
-            elif isinstance(old_placement, Partial) and isinstance(new_placement, Replicate):
-                buffer = buffer.allreduce(axis)
-            elif isinstance(old_placement, Partial) and isinstance(new_placement, Flat):
-                buffer = buffer.reduce_scatter(axis, new_placement)
-            elif isinstance(old_placement, Replicate) and isinstance(new_placement, Flat):
-                buffer = buffer.scatter(axis, new_placement)
-            else:
+            if changed_axis is not None:
                 raise NotImplementedError(
-                    "Unsupported DBuffer placement transition on axis "
-                    f"{axis}: {old_placement!r} -> {new_placement!r}."
+                    "redistribute() currently supports one placement change, "
+                    f"got changed axes {changed_axis} and {axis}."
                 )
+            changed_axis = axis
 
-        if buffer.placements != new_placements:
-            raise AssertionError(
-                f"Redistribute produced placements {buffer.placements}, expected {new_placements}."
-            )
-        return buffer
+        if changed_axis is None:
+            if out is None:
+                return self
+            destination = self._create_or_validate_out(new_placements, out)
+            destination.local_buffer.copy_(self.local_buffer)
+            return destination
 
-    def allgather(self, mesh_axis: MeshAxis) -> "DBuffer":
+        axis = changed_axis
+        old_placement = self.placements[axis]
+        new_placement = new_placements[axis]
+        if isinstance(old_placement, Flat) and isinstance(new_placement, Replicate):
+            return self.allgather(axis, out=out)
+        if isinstance(old_placement, Partial) and isinstance(new_placement, Replicate):
+            return self.allreduce(axis, out=out)
+        if isinstance(old_placement, Partial) and isinstance(new_placement, Flat):
+            return self.reduce_scatter(axis, new_placement, out=out)
+        if isinstance(old_placement, Replicate) and isinstance(new_placement, Flat):
+            return self.scatter(axis, new_placement, out=out)
+        raise NotImplementedError(
+            "Unsupported DBuffer placement transition on axis "
+            f"{axis}: {old_placement!r} -> {new_placement!r}."
+        )
+
+    def allgather(self, mesh_axis: MeshAxis, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-gather a Flat axis into Replicate placement."""
         axis = _axis_index(self.mesh, mesh_axis)
         if not isinstance(self.placements[axis], Flat):
@@ -366,21 +454,15 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = Replicate()
         _validate_placements(placements)
-        buffer = DBuffer(
-            mesh=self.mesh,
-            placements=placements,
-            tensor_shapes=self.layout.tensor_shapes,
-            dtype=self.local_buffer.dtype,
-            device=self.local_buffer.device,
-        )
+        destination = self._create_or_validate_out(placements, out)
         dist.all_gather_into_tensor(
-            output_tensor=buffer.local_buffer,
+            output_tensor=destination.local_buffer,
             input_tensor=self.local_buffer,
             group=self.mesh.get_group(axis),
         )
-        return buffer
+        return destination
 
-    def allreduce(self, mesh_axis: MeshAxis) -> "DBuffer":
+    def allreduce(self, mesh_axis: MeshAxis, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-reduce a Partial axis into Replicate placement."""
         axis = _axis_index(self.mesh, mesh_axis)
         partial_placement = self.placements[axis]
@@ -389,22 +471,18 @@ class DBuffer:
 
         placements = list(self.placements)
         placements[axis] = Replicate()
-        buffer = DBuffer(
-            mesh=self.mesh,
-            placements=placements,
-            tensor_shapes=self.layout.tensor_shapes,
-            dtype=self.local_buffer.dtype,
-            device=self.local_buffer.device,
-        )
-        buffer.local_buffer.copy_(self.local_buffer)
+        destination = self._create_or_validate_out(placements, out)
+        destination.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
-            buffer.local_buffer,
+            destination.local_buffer,
             op=partial_placement.reduce_op,
             group=self.mesh.get_group(axis),
         )
-        return buffer
+        return destination
 
-    def reduce_scatter(self, mesh_axis: MeshAxis, new_placement: Placement) -> "DBuffer":
+    def reduce_scatter(
+        self, mesh_axis: MeshAxis, new_placement: Placement, *, out: "DBuffer | None" = None
+    ) -> "DBuffer":
         """Reduce-scatter a Partial axis into ``new_placement``."""
         axis = _axis_index(self.mesh, mesh_axis)
         if not isinstance(new_placement, Flat):
@@ -416,22 +494,18 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = new_placement
         _validate_placements(placements)
-        buffer = DBuffer(
-            mesh=self.mesh,
-            placements=placements,
-            tensor_shapes=self.layout.tensor_shapes,
-            dtype=self.local_buffer.dtype,
-            device=self.local_buffer.device,
-        )
+        destination = self._create_or_validate_out(placements, out)
         dist.reduce_scatter_tensor(
-            output=buffer.local_buffer,
+            output=destination.local_buffer,
             input=self.local_buffer,
             op=partial_placement.reduce_op,
             group=self.mesh.get_group(axis),
         )
-        return buffer
+        return destination
 
-    def scatter(self, mesh_axis: MeshAxis, new_placement: Placement) -> "DBuffer":
+    def scatter(
+        self, mesh_axis: MeshAxis, new_placement: Placement, *, out: "DBuffer | None" = None
+    ) -> "DBuffer":
         """Locally chunk a Replicate axis into ``new_placement``."""
         axis = _axis_index(self.mesh, mesh_axis)
         if not isinstance(new_placement, Flat):
@@ -442,23 +516,30 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = new_placement
         _validate_placements(placements)
-        buffer = DBuffer(
-            mesh=self.mesh,
-            placements=placements,
-            tensor_shapes=self.layout.tensor_shapes,
-            dtype=self.local_buffer.dtype,
-            device=self.local_buffer.device,
-        )
-        local_buffer_offset = buffer.offset - self.offset
+
+        if out is None:
+            destination_offset, destination_numel = self.layout.get_local_range(
+                self.mesh, placements
+            )
+        else:
+            destination = self._create_or_validate_out(placements, out)
+            destination_offset = destination.offset
+            destination_numel = destination.local_buffer.numel()
+
+        local_buffer_offset = destination_offset - self.offset
         if (
             local_buffer_offset < 0
-            or local_buffer_offset + buffer.local_buffer.numel() > self.local_buffer.numel()
+            or local_buffer_offset + destination_numel > self.local_buffer.numel()
         ):
             raise RuntimeError("scatter() destination is not contained in the source local buffer.")
-        buffer.local_buffer.copy_(
-            self.local_buffer.narrow(0, local_buffer_offset, buffer.local_buffer.numel())
-        )
-        return buffer
+        local_slice = self.local_buffer.narrow(0, local_buffer_offset, destination_numel)
+        if out is None:
+            return DBuffer.from_local(
+                local_slice, self.mesh, placements, self.layout.tensor_shapes
+            )
+
+        destination.local_buffer.copy_(local_slice)
+        return destination
 
     def get_tensor(self, index: int) -> torch.Tensor:
         """Return this rank's local view for logical tensor ``index``.
@@ -479,7 +560,7 @@ class DBuffer:
         if overlap_end <= overlap_start:
             empty_shape = torch.Size((0, *shape[1:]))
             return torch.empty(
-                empty_shape, dtype=self.local_buffer.dtype, device=self.local_buffer.device
+                empty_shape, dtype=self.dtype, device=self.local_buffer.device
             )
 
         local_numel = overlap_end - overlap_start
