@@ -16,11 +16,4 @@
 
 from .dbuffer import DBuffer, Flat, MeshAxis, Partial, Placement, Replicate
 
-__all__ = [
-    "DBuffer",
-    "Flat",
-    "MeshAxis",
-    "Partial",
-    "Placement",
-    "Replicate",
-]
+__all__ = ["DBuffer", "Flat", "MeshAxis", "Partial", "Placement", "Replicate"]
