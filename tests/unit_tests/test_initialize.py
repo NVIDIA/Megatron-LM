@@ -333,7 +333,7 @@ def test_initialize_distributed_sets_flight_recorder_env_and_init_group(monkeypa
         distributed_timeout_minutes=7,
         fake_process_group=False,
     )
-    for env_name in [
+    flight_recorder_env_names = [
         "TORCH_FR_DUMP_TEMP_FILE",
         "TORCH_NCCL_DEBUG_INFO_TEMP_FILE",
         "TORCH_NCCL_TRACE_BUFFER_SIZE",
@@ -341,7 +341,8 @@ def test_initialize_distributed_sets_flight_recorder_env_and_init_group(monkeypa
         "TORCH_INCLUDE_STACK_TRACE",
         "TORCH_INCLUDE_ONLY_ACTIVE",
         "TORCH_NCCL_EXTRA_DUMP_ON_EXEC",
-    ]:
+    ]
+    for env_name in flight_recorder_env_names:
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 0)
@@ -355,16 +356,20 @@ def test_initialize_distributed_sets_flight_recorder_env_and_init_group(monkeypa
     monkeypatch.setattr(initialize, "print_rank_0", lambda message: calls.append(("print", message)))
     monkeypatch.setattr(initialize, "warn_rank_0", lambda message: calls.append(("warn", message)))
 
-    initialize._initialize_distributed(None, None, store="store")
+    try:
+        initialize._initialize_distributed(None, None, store="store")
 
-    init_kwargs = next(item[1] for item in calls if item[0] == "init")
-    assert init_kwargs["backend"] == "nccl"
-    assert init_kwargs["world_size"] == 4
-    assert init_kwargs["rank"] == 2
-    assert init_kwargs["store"] == "store"
-    assert ("nccl", None) in calls
-    assert initialize.os.environ["TORCH_FR_DUMP_TEMP_FILE"].endswith("_dump_")
-    assert initialize.os.environ["TORCH_NCCL_TRACE_BUFFER_SIZE"] == "4096"
+        init_kwargs = next(item[1] for item in calls if item[0] == "init")
+        assert init_kwargs["backend"] == "nccl"
+        assert init_kwargs["world_size"] == 4
+        assert init_kwargs["rank"] == 2
+        assert init_kwargs["store"] == "store"
+        assert ("nccl", None) in calls
+        assert initialize.os.environ["TORCH_FR_DUMP_TEMP_FILE"].endswith("_dump_")
+        assert initialize.os.environ["TORCH_NCCL_TRACE_BUFFER_SIZE"] == "4096"
+    finally:
+        for env_name in flight_recorder_env_names:
+            initialize.os.environ.pop(env_name, None)
 
 
 def test_setup_logging_uses_env_and_argument_precedence(monkeypatch):

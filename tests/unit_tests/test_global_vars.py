@@ -261,6 +261,7 @@ def test_set_adlr_autoresume_success(monkeypatch):
         pass
 
     fake_userlib = types.ModuleType("userlib")
+    fake_userlib.__path__ = []
     fake_auto_resume = types.ModuleType("userlib.auto_resume")
     fake_auto_resume.AutoResume = FakeAutoResume
     monkeypatch.setitem(sys.modules, "userlib", fake_userlib)

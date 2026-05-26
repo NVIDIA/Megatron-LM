@@ -57,6 +57,7 @@ def test_ft_setup_initializes_client_and_setup_section(monkeypatch, tmp_path):
             created.append(self)
 
     fake_package = types.ModuleType("nvidia_resiliency_ext")
+    fake_package.__path__ = []
     fake_fault_tolerance = types.ModuleType("nvidia_resiliency_ext.fault_tolerance")
     fake_fault_tolerance.RankMonitorClient = SetupRankMonitorClient
     monkeypatch.setitem(sys.modules, "nvidia_resiliency_ext", fake_package)
