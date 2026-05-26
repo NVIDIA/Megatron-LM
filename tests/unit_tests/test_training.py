@@ -482,16 +482,54 @@ def test_build_train_valid_test_data_iterators_wraps_multiple_validation_loaders
     monkeypatch.setattr(
         training,
         "build_train_valid_test_data_loaders",
-        lambda provider: ("train-loader", ["valid-a", "valid-b"], "test-loader"),
+        lambda provider: ("train-loader", [["valid-a"], ["valid-b"]], "test-loader"),
     )
     monkeypatch.setattr(training, "RerunDataIterator", lambda iterator: wrapped.append(iterator) or ("wrapped", iterator))
 
     train_iter, valid_iters, test_iter = build_train_valid_test_data_iterators(lambda _: None)
 
     assert train_iter == ("wrapped", "train-loader")
-    assert valid_iters == [("wrapped", "valid-a"), ("wrapped", "valid-b")]
+    assert [valid_iter[0] for valid_iter in valid_iters] == ["wrapped", "wrapped"]
+    assert [next(valid_iter[1]) for valid_iter in valid_iters] == ["valid-a", "valid-b"]
     assert test_iter == ("wrapped", "test-loader")
-    assert args.eval_iters == [7, 7]
+    assert args.eval_iters == [1, 1]
+
+
+def test_build_train_valid_test_data_loaders_rejects_partial_multiple_validation(monkeypatch):
+    real_tensor = torch.tensor
+    args = SimpleNamespace(
+        iteration=0,
+        train_samples=None,
+        train_iters=4,
+        eval_interval=2,
+        eval_iters=1,
+        global_batch_size=8,
+        consumed_train_samples=0,
+        consumed_valid_samples=0,
+        phase_transition_iterations=None,
+        perform_rl_step=False,
+        skip_train=False,
+        full_validation=False,
+        multiple_validation_sets=True,
+    )
+
+    def cpu_tensor(*items, **kwargs):
+        kwargs.pop("device", None)
+        return real_tensor(*items, **kwargs)
+
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "print_rank_0", lambda *items, **kwargs: None)
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(training.torch, "tensor", cpu_tensor)
+    monkeypatch.setattr(training.torch.distributed, "broadcast", lambda tensor, src: None)
+    monkeypatch.setattr(
+        training,
+        "build_pretraining_data_loader",
+        lambda dataset, consumed: (dataset, consumed),
+    )
+
+    with pytest.raises(NotImplementedError, match="multiple-validation-sets"):
+        build_train_valid_test_data_loaders(lambda samples: ("train", ["valid-a", "valid-b"], "test"))
 
 
 def test_build_train_valid_test_data_iterators_single_and_cyclic_modes(monkeypatch):
