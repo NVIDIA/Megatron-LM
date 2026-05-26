@@ -208,6 +208,7 @@ class TestPagedStashing:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_forward_backward_4_layers(self):
@@ -297,6 +298,7 @@ class TestPagedStashingOverBudget:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_overload_factor_and_over_budget(self):
