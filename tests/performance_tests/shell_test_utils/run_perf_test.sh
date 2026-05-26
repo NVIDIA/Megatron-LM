@@ -40,6 +40,7 @@ YQ=/usr/local/bin/yq
 mkdir -p "$RESULTS_ROOT"
 RESULTS_JSON="$RESULTS_ROOT/results.json"
 SERVER_LOG_DIR="$RESULTS_ROOT/server_logs"
+# launch_jet_workload.py retries unless torchrun's per-rank std*.log assets exist.
 ASSETS_ROOT="$(dirname "$RESULTS_ROOT")"
 TORCHRUN_LOG_DIR="$ASSETS_ROOT/logs/1"
 mkdir -p "$SERVER_LOG_DIR" "$TORCHRUN_LOG_DIR"
@@ -52,20 +53,30 @@ MODEL=$("$YQ" '.MODEL' "$CONFIG_PATH")
 TP=$("$YQ" '.TP // 1' "$CONFIG_PATH")
 PP=$("$YQ" '.PP // 1' "$CONFIG_PATH")
 DP=$("$YQ" '.DP // 1' "$CONFIG_PATH")
-NUM_INPUT_TOKENS=$("$YQ" '.NUM_INPUT_TOKENS' "$CONFIG_PATH")
+EP=$("$YQ" '.EP // 1' "$CONFIG_PATH")
+NUM_INPUT_TOKENS=$("$YQ" '.NUM_INPUT_TOKENS // 512' "$CONFIG_PATH")
 NUM_OUTPUT_TOKENS=$("$YQ" '.NUM_OUTPUT_TOKENS' "$CONFIG_PATH")
 NUM_WARMUP_ITERS=$("$YQ" '.NUM_WARMUP_ITERS // 2' "$CONFIG_PATH")
 NUM_TIMED_ITERS=$("$YQ" '.NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
+# Prompt source: 'synthetic' (default, fixed-length "hello "*N) or 'gsm8k'
+# (real prompts from the vendored client/data/gsm8k_prompts.jsonl). MoE and
+# hybrid models should use 'gsm8k' — synthetic input gives misleading
+# perf because every token is identical (uniform expert routing, hot KV).
+DATASET=$("$YQ" '.DATASET // "synthetic"' "$CONFIG_PATH")
 mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 
-WORLD_SIZE=$((TP * PP * DP))
+# For MoE configs, expert-parallelism is orthogonal to DP and reshapes the
+# world size when DP=1. Use the max so dense models keep WORLD_SIZE=TP*PP*DP
+# and MoE-with-DP=1 picks up EP correctly.
+GROUP_SIZE=$((DP > EP ? DP : EP))
+WORLD_SIZE=$((TP * PP * GROUP_SIZE))
 ARGS_FILE="$PERF_DIR/server/model_args/${MODEL}.args"
 if [[ ! -f "$ARGS_FILE" ]]; then
     echo "[run_perf_test] error: model args file $ARGS_FILE not found" >&2
     exit 2
 fi
 
-echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP  world_size=$WORLD_SIZE"
+echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP EP=$EP  world_size=$WORLD_SIZE  dataset=$DATASET"
 echo "[run_perf_test] ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
 echo "[run_perf_test] batch sizes: ${BATCH_SIZES[*]}"
 
@@ -87,19 +98,30 @@ MODEL_ARGS+=(--tensor-model-parallel-size "$TP" --pipeline-model-parallel-size "
 
 # ── Make image-bundled extras (mamba-ssm) visible to the cog venv ─────────────
 # cog's auto-managed venv uses `uv sync --extra dev --extra mlm` and inherits
-# from /usr/lib/python3.12/dist-packages — but mamba-ssm + causal-conv1d are
-# bundled in the image's prebuilt /opt/venv, NOT in system dist-packages.
-# For hybrid/mamba models, prepend /opt/venv's site-packages to PYTHONPATH so
-# the server can import mamba_ssm without re-installing.
+# from /usr/lib/python3.12/dist-packages — but mamba-ssm + causal-conv1d (and
+# their transitive deps) are bundled in the image's prebuilt /opt/venv.
+#
+# We can't add /opt/venv via PYTHONPATH: PYTHONPATH entries come *before* the
+# venv on sys.path, so we'd shadow newer cog-venv packages (e.g.
+# nvidia-resiliency-ext 0.6.0) with older /opt/venv copies (0.6.0.dev69).
+# Instead drop a `.pth` file into the venv that runs
+# `sys.path.append(...)` at import time — .pth files execute after the venv
+# is on sys.path, so /opt/venv ends up *last* and is only consulted for
+# packages not in the venv.
 
-EXTRA_PYTHONPATH=""
-if [[ "$MODEL" == hybrid_* || "$MODEL" == mamba_* ]]; then
+if [[ ( "$MODEL" == hybrid_* || "$MODEL" == mamba_* ) && -n "${VIRTUAL_ENV:-}" ]]; then
     OPT_VENV_SITE=/opt/venv/lib/python3.12/site-packages
-    if [[ -d "$OPT_VENV_SITE" ]]; then
-        echo "[run_perf_test] adding $OPT_VENV_SITE to PYTHONPATH (mamba-ssm shim)"
-        EXTRA_PYTHONPATH="$OPT_VENV_SITE"
+    # cog's VIRTUAL_ENV often points at a stale `.partial.<runid>` path that no
+    # longer exists at runtime (uv sync renames `.partial.<runid>` → real after
+    # finishing). Strip the `.partial.<hex>` segment to find the real venv.
+    REAL_VENV=$(echo "$VIRTUAL_ENV" | sed 's|\.partial\.[A-Za-z0-9]*||g')
+    [[ -d "$REAL_VENV/lib/python3.12/site-packages" ]] || REAL_VENV="$VIRTUAL_ENV"
+    PTH_FILE="$REAL_VENV/lib/python3.12/site-packages/_cog_perf_mamba_shim.pth"
+    if [[ -d "$OPT_VENV_SITE" ]] && [[ -d "$REAL_VENV/lib/python3.12/site-packages" ]]; then
+        echo "[run_perf_test] installing mamba-ssm shim .pth: $PTH_FILE -> $OPT_VENV_SITE"
+        echo "import sys; sys.path.append('$OPT_VENV_SITE')" > "$PTH_FILE"
     else
-        echo "[run_perf_test] warning: $OPT_VENV_SITE not present — hybrid model may fail to load" >&2
+        echo "[run_perf_test] warning: cannot install mamba shim (REAL_VENV=$REAL_VENV, OPT_VENV_SITE=$OPT_VENV_SITE)" >&2
     fi
 fi
 
@@ -127,9 +149,6 @@ SERVER_COMMON_ARGS=(
 
 (
     cd "$ROOT_DIR"
-    if [[ -n "$EXTRA_PYTHONPATH" ]]; then
-        export PYTHONPATH="$EXTRA_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
-    fi
     uv run --no-sync python -m torch.distributed.run \
         --nproc-per-node "$WORLD_SIZE" \
         --master_addr "$MASTER_ADDR" \
@@ -138,8 +157,8 @@ SERVER_COMMON_ARGS=(
         --tee "0:3" \
         --redirects "3" \
         -m tools.run_dynamic_text_generation_server \
-        "${MODEL_ARGS[@]}" \
         "${SERVER_COMMON_ARGS[@]}" \
+        "${MODEL_ARGS[@]}" \
         > "$SERVER_LOG" 2>&1
 ) &
 SERVER_PGID=$!
@@ -191,6 +210,7 @@ for BS in "${BATCH_SIZES[@]}"; do
         --server-url "http://localhost:$SERVER_PORT/v1" \
         --model "$MODEL" \
         --batch-size "$BS" \
+        --dataset "$DATASET" \
         --num-input-tokens "$NUM_INPUT_TOKENS" \
         --num-output-tokens "$NUM_OUTPUT_TOKENS" \
         --num-warmup-iters "$NUM_WARMUP_ITERS" \
