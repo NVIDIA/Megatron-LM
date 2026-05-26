@@ -417,12 +417,12 @@ def test_build_train_valid_test_data_loaders_regular_and_rl_paths(monkeypatch):
     real_tensor = torch.tensor
     args = SimpleNamespace(
         iteration=2,
-        train_samples=None,
+        train_samples=64,
         train_iters=4,
         eval_interval=2,
         eval_iters=1,
         global_batch_size=8,
-        consumed_train_samples=0,
+        consumed_train_samples=16,
         consumed_valid_samples=0,
         phase_transition_iterations=[1],
         perform_rl_step=False,
@@ -454,7 +454,7 @@ def test_build_train_valid_test_data_loaders_regular_and_rl_paths(monkeypatch):
 
     train_loader, valid_loaders, test_loader = build_train_valid_test_data_loaders(provider)
 
-    assert provider_calls == [(24, None, 8)]
+    assert provider_calls == [(56, None, 8)]
     assert train_loader == ("train", 8)
     assert valid_loaders == [("valid-a", 0), ("valid-b", 0)]
     assert test_loader == ("test", 0)
