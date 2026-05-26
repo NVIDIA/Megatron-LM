@@ -145,6 +145,7 @@ jobs:
       lightweight:    ${{ steps.configure.outputs.lightweight }}
       lts:            ${{ steps.configure.outputs.lts }}
       mbridge_suite:  ${{ steps.configure.outputs.mbridge_suite }}
+      run_mbridge:    ${{ steps.configure.outputs.run_mbridge }}
       dev:            ${{ steps.configure.outputs.dev }}
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
@@ -219,6 +220,19 @@ jobs:
             MBRIDGE_SUITE="unit-only"
           fi
 
+          # MBridge job gating: PR pushes skip the downstream MBridge trigger
+          # by default. The historical triggers (merge_group, schedule,
+          # workflow_dispatch) continue to run it, and PR authors can opt in
+          # by adding the `Run MBridge tests` label.
+          if [ "$HAS_MBRIDGE" == "true" ] \
+            || [ "$IS_MERGE_GROUP" == "true" ] \
+            || [ "$EVENT_NAME" == "schedule" ] \
+            || [ "$EVENT_NAME" == "workflow_dispatch" ]; then
+            RUN_MBRIDGE=true
+          else
+            RUN_MBRIDGE=false
+          fi
+
           # Cadence: trigger-driven test selection axis (see filter_by_cadence
           # in tests/test_utils/python_scripts/recipe_parser.py). PR labels
           # `Run tests` and `Run functional tests` bypass the cadence filter so
@@ -246,6 +260,7 @@ jobs:
           echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
           echo "lts=$HAS_LTS"                   | tee -a $GITHUB_OUTPUT
           echo "mbridge_suite=$MBRIDGE_SUITE"   | tee -a $GITHUB_OUTPUT
+          echo "run_mbridge=$RUN_MBRIDGE"       | tee -a $GITHUB_OUTPUT
           echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
@@ -272,6 +287,7 @@ jobs:
           | \`lightweight\` | \`$LIGHTWEIGHT\` |
           | \`lts\` | \`$HAS_LTS\` |
           | \`dev\` | \`$DEV\` |
+          | \`run_mbridge\` | \`$RUN_MBRIDGE\` |
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
@@ -308,6 +324,7 @@ jobs:
           - **\`lts\`**: uses the Long Term Support container base image instead of the latest dev image
           - **\`dev\`**: uses the latest development container base image (default)
           - **\`cadence\`**: per-test trigger filter (recipe \`cadence:\` field). Recipes default to \`[pr, nightly, mergegroup]\`.
+          - **\`run_mbridge\`**: whether to trigger the Megatron-Bridge downstream CI. Off for PR pushes by default; flip on by adding the _Run MBridge tests_ label.
           SUMMARY
 
   linting:
@@ -401,12 +418,18 @@ jobs:
       - configure
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
+    # skip downstream mbridge testing on PR pushes by
+    # default. They still run for merge_group and nightly (schedule /
+    # workflow_dispatch) triggers, and PR authors can opt in by adding the
+    # "Run MBridge tests" label — all three cases set
+    # configure.outputs.run_mbridge == 'true'.
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
       && vars.ENABLE_CICD_MBRIDGE_TESTING == 'true'
+      && needs.configure.outputs.run_mbridge == 'true'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -686,6 +709,7 @@ jobs:
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          sha: ${{ needs.configure.outputs.sha }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:
@@ -843,6 +867,7 @@ jobs:
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
           cadence: ${{ needs.configure.outputs.cadence }}
+          sha: ${{ needs.configure.outputs.sha }}
 
   cicd-parse-integration-tests-gb200:
     runs-on: ubuntu-latest
@@ -942,6 +967,7 @@ jobs:
           lightweight: ${{ needs.configure.outputs.lightweight }}
           platform: dgx_gb200
           cadence: ${{ needs.configure.outputs.cadence }}
+          sha: ${{ needs.configure.outputs.sha }}
 
   Nemo_CICD_Test:
     needs:
