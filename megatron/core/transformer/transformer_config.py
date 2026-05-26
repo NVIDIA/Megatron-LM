@@ -41,53 +41,6 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
-_FINE_GRAINED_OFFLOAD_MODULES = (
-    "attn_norm",
-    "qkv_linear",
-    "core_attn",
-    "attn_proj",
-    "mlp_norm",
-    "expert_fc1",
-    "moe_act",
-)
-_FINE_GRAINED_OFFLOAD_MODULE_SET = set(_FINE_GRAINED_OFFLOAD_MODULES)
-
-_LOCAL_CUDA_GRAPH_OFFLOAD_MODULES = {
-    CudaGraphModule.attn: {"attn_norm", "qkv_linear", "core_attn", "attn_proj"},
-    CudaGraphModule.mlp: {"mlp_norm"},
-    CudaGraphModule.moe: {"mlp_norm", "expert_fc1", "moe_act"},
-    CudaGraphModule.moe_router: {"mlp_norm"},
-    CudaGraphModule.moe_preprocess: {"mlp_norm"},
-}
-
-
-def _ordered_offload_modules(modules: set[str]) -> list[str]:
-    """Return offload module names in the user-facing order from the config docs."""
-    ordered = [module for module in _FINE_GRAINED_OFFLOAD_MODULES if module in modules]
-    ordered.extend(sorted(modules - _FINE_GRAINED_OFFLOAD_MODULE_SET))
-    return ordered
-
-
-def _local_cuda_graph_offload_overlaps(
-    cuda_graph_modules: list[CudaGraphModule], offload_modules: list[str]
-) -> set[str]:
-    """Return offload modules captured by local CUDA graph scopes.
-
-    Local CUDA graphs do not currently support fine-grained offload groups inside the graph.
-    Empty ``cuda_graph_modules`` means the whole layer is graphed, so every requested offload
-    module overlaps.
-    """
-    requested_offload_modules = set(offload_modules)
-    if not requested_offload_modules:
-        return set()
-    if not cuda_graph_modules:
-        return requested_offload_modules
-
-    graphed_offload_modules: set[str] = set()
-    for module in cuda_graph_modules:
-        graphed_offload_modules.update(_LOCAL_CUDA_GRAPH_OFFLOAD_MODULES.get(module, set()))
-    return requested_offload_modules & graphed_offload_modules
-
 try:
     from packaging.version import Version as PkgVersion
 
@@ -1709,7 +1662,15 @@ class TransformerConfig(ModelParallelConfig):
                 not self.cpu_offloading
             ), "fine_grained_activation_offloading cannot be enabled with cpu_offloading."
             assert self.offload_modules is not None and len(self.offload_modules) > 0
-            allowed_modules = _FINE_GRAINED_OFFLOAD_MODULE_SET
+            allowed_modules = {
+                "core_attn",
+                "attn_proj",
+                "expert_fc1",
+                "moe_act",
+                "attn_norm",
+                "mlp_norm",
+                "qkv_linear",
+            }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
                 f'Invalid choices for offload_modules: {invalid_modules}. '
@@ -2414,16 +2375,18 @@ class TransformerConfig(ModelParallelConfig):
                     "local, transformer_engine, or full_iteration CUDA graph implementations."
                 )
                 if self.cuda_graph_impl == "local":
-                    overlapping_offload_modules = _local_cuda_graph_offload_overlaps(
-                        self.cuda_graph_modules, self.offload_modules
+                    local_supported_offload_modules = {"expert_fc1", "moe_act"}
+                    unsupported_offload_modules = (
+                        set(self.offload_modules) - local_supported_offload_modules
                     )
-                    assert not overlapping_offload_modules, (
+                    assert not unsupported_offload_modules, (
                         "fine-grained activation offloading with cuda_graph_impl='local' "
-                        "is only supported when cuda_graph_modules and offload_modules do not "
-                        "overlap. Overlapping offload_modules: "
-                        f"{_ordered_offload_modules(overlapping_offload_modules)}. "
-                        "Use a non-overlapping local CUDA graph scope, or switch to "
-                        "cuda_graph_impl='transformer_engine' or 'full_iteration'."
+                        "only supports offload_modules 'expert_fc1' and 'moe_act'. "
+                        f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
+                    )
+                    assert self.cuda_graph_modules, (
+                        "fine-grained activation offloading with cuda_graph_impl='local' "
+                        "is not supported with whole-layer CUDA graph capture."
                     )
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
