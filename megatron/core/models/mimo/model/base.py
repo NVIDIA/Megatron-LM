@@ -469,9 +469,10 @@ class MimoModel(MegatronModule):
             )
 
             lm_output = self.language_model(
-                # Keep ids available even when decoder_input is pre-combined:
-                # models such as Qwen3-VL still need position_ids for mRoPE.
-                input_ids=input_ids,
+                # decoder_input replaces the embedding lookup, so input_ids is
+                # unused here; position_ids is still consumed by mRoPE in models
+                # such as Qwen3-VL.
+                input_ids=None,
                 position_ids=position_ids,
                 decoder_input=combined_embeddings,
                 labels=labels,
@@ -488,8 +489,9 @@ class MimoModel(MegatronModule):
                     underlying_lm.set_input_tensor(hidden_states)
 
             lm_output = self.language_model(
-                # Non-first PP stages may still need position_ids for RoPE.
-                input_ids=input_ids,
+                # Hidden states arrive via set_input_tensor; position_ids is
+                # still consumed by mRoPE on non-first PP stages.
+                input_ids=None,
                 position_ids=position_ids,
                 decoder_input=None,
                 labels=labels,
@@ -626,9 +628,10 @@ class MimoModel(MegatronModule):
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
-            # Keep ids available even when decoder_input is pre-combined:
-            # models such as Qwen3-VL still need position_ids for mRoPE.
-            input_ids=input_ids,
+            # decoder_input replaces the embedding lookup, so input_ids is
+            # unused here; position_ids is still consumed by mRoPE in models
+            # such as Qwen3-VL.
+            input_ids=None,
             position_ids=position_ids,
             decoder_input=combined_embeddings,
             labels=labels,

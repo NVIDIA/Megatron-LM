@@ -256,14 +256,15 @@ class TestMimoModel:
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
 
     def test_forward_threads_position_ids_to_language_model(self):
-        """``MimoModel.forward`` must thread ``input_ids`` and ``position_ids``
-        through to ``self.language_model``.
+        """``MimoModel.forward`` must thread ``position_ids`` through to
+        ``self.language_model`` so multimodal RoPE can compute its rotary
+        embeddings.
 
-        Multimodal RoPE (e.g. Qwen3-VL) relies on the language model receiving
-        the original ``input_ids`` and ``position_ids`` to compute its rotary
-        embeddings, even when the decoder input is pre-combined from text and
-        modality embeddings. Passing ``None`` here silently breaks parity with
-        the standard (non-MIMO) forward path.
+        Multimodal RoPE (e.g. Qwen3-VL) consumes ``position_ids`` even when
+        the language model receives a pre-combined ``decoder_input`` (which
+        replaces the embedding lookup). ``input_ids`` is therefore unused on
+        this path and must not be forwarded — its shape would not match the
+        expanded ``decoder_input`` sequence.
         """
         mimo_model = self._make_vlm()
         input_ids = self._make_input_ids()
@@ -274,18 +275,21 @@ class TestMimoModel:
         def capture_lm_forward(*args, **kwargs):
             captured['input_ids'] = kwargs.get('input_ids')
             captured['position_ids'] = kwargs.get('position_ids')
+            captured['decoder_input'] = kwargs.get('decoder_input')
             return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
 
         with patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward):
             mimo_model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
 
         assert (
-            captured['input_ids'] is not None
-        ), "MimoModel.forward must pass input_ids to the language model (got None)"
+            captured['decoder_input'] is not None
+        ), "MimoModel.forward must pass a pre-combined decoder_input to the language model"
+        assert (
+            captured['input_ids'] is None
+        ), "MimoModel.forward must not forward input_ids when decoder_input is pre-combined"
         assert (
             captured['position_ids'] is not None
         ), "MimoModel.forward must pass position_ids to the language model (got None)"
-        torch.testing.assert_close(captured['input_ids'], input_ids)
         torch.testing.assert_close(captured['position_ids'], position_ids)
 
     def test_forward_with_image_modality(self):
@@ -679,3 +683,44 @@ class TestMimoModelNonColocated:
         outputs, _ = model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
         assert isinstance(outputs, torch.Tensor)
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
+
+    def test_forward_language_module_non_first_stage_drops_input_ids(self):
+        """Non-first PP stage in ``_forward_language_module`` must call the LM
+        with ``input_ids=None`` (hidden states arrive via ``set_input_tensor``)
+        while still threading ``position_ids`` through for mRoPE.
+        """
+        model = MimoModel(self._make_config(encoder_in_grid=False, language_in_grid=True))
+        model = model.to(self.device)
+
+        input_ids = torch.randint(
+            0, self.vocab_size, (self.batch_size, self.seq_len), device=self.device
+        )
+        position_ids = (
+            torch.arange(self.seq_len, device=self.device).unsqueeze(0).expand(self.batch_size, -1)
+        )
+        hidden_states = torch.randn(
+            self.seq_len, self.batch_size, self.hidden_size, device=self.device
+        )
+
+        captured = {}
+
+        def capture_lm_forward(*args, **kwargs):
+            captured.update(kwargs)
+            return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
+
+        with (
+            patch.object(model.role, 'is_first_stage', return_value=False),
+            patch.object(model.role, 'is_last_stage', return_value=True),
+            patch.object(model.language_model, 'forward', side_effect=capture_lm_forward),
+        ):
+            model._forward_language_module(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                labels=None,
+                input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
+            )
+
+        assert captured['input_ids'] is None
+        assert captured['decoder_input'] is None
+        torch.testing.assert_close(captured['position_ids'], position_ids)
