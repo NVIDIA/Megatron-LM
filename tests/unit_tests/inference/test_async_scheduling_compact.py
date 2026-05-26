@@ -22,7 +22,7 @@ from megatron.core.inference.text_generation_controllers import (
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 
 
 class _RecordingEPCommunicator:
@@ -449,7 +449,7 @@ def _make_async_gate_controller(active_request_count=2):
     controller._async_step_barrier_reason = None
     controller._enable_cuda_graph = True
     controller.model_config = SimpleNamespace(
-        cuda_graph_scope=[CudaGraphScope.full_iteration_inference]
+        inference_cuda_graph_scope=InferenceCudaGraphScope.block
     )
     controller.model_is_pipeline_parallel = False
     controller.num_speculative_tokens = 0
@@ -477,7 +477,8 @@ def _make_async_gate_controller(active_request_count=2):
         ("disabled", "disabled"),
         ("step_barrier", "logging step"),
         ("no_cuda_graph", "requires local cuda graphs"),
-        ("no_full_iteration_graph", "requires full-iteration inference cuda graphs"),
+        ("scope_none", "requires block-scope inference cuda graphs"),
+        ("scope_layer", "requires block-scope inference cuda graphs"),
         ("pipeline_parallel", "pipeline parallel is unsupported"),
         ("mtp_presampling", "mtp pre-sampling graph is unsupported"),
         ("mtp_depth_mismatch", "not enough mtp heads"),
@@ -498,8 +499,10 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
         controller._async_step_barrier_reason = "logging step"
     elif case == "no_cuda_graph":
         controller._enable_cuda_graph = False
-    elif case == "no_full_iteration_graph":
-        controller.model_config.cuda_graph_scope = []
+    elif case == "scope_none":
+        controller.model_config.inference_cuda_graph_scope = InferenceCudaGraphScope.none
+    elif case == "scope_layer":
+        controller.model_config.inference_cuda_graph_scope = InferenceCudaGraphScope.layer
     elif case == "pipeline_parallel":
         controller.model_is_pipeline_parallel = True
     elif case == "mtp_presampling":
