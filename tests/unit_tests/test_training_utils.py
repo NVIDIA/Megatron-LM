@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.training import checkpointing
 from megatron.training import utils
 
 
@@ -224,6 +225,199 @@ def test_report_memory_uses_cuda_stats_and_data_parallel_rank(monkeypatch, capsy
     assert "[Rank 7]" in output
     assert "allocated: 1.00" in output
     assert "total device memory used: 5.00" in output
+
+
+def test_calc_params_l2_norm_handles_dense_moe_and_sharded_params(monkeypatch):
+    calls = []
+    real_tensor = torch.tensor
+    real_zeros = torch.zeros
+    real_zeros_like = torch.zeros_like
+
+    def cpu_tensor(*items, **kwargs):
+        kwargs.pop("device", None)
+        return real_tensor(*items, **kwargs)
+
+    def cpu_zeros(*items, **kwargs):
+        kwargs.pop("device", None)
+        return real_zeros(*items, **kwargs)
+
+    class FakeModel:
+        def parameters(self):
+            dense = SimpleNamespace(
+                data=torch.tensor([1.0, 2.0]),
+                allreduce=True,
+                main_param=torch.tensor([1.0, 2.0]),
+                main_param_sharded=False,
+            )
+            moe = SimpleNamespace(
+                data=torch.tensor([3.0]),
+                allreduce=False,
+                main_param=torch.tensor([3.0]),
+                main_param_sharded=False,
+            )
+            sharded = SimpleNamespace(
+                data=torch.tensor([4.0]),
+                allreduce=True,
+                main_param=torch.tensor([4.0]),
+                main_param_sharded=True,
+            )
+            return [dense, moe, sharded]
+
+    monkeypatch.setattr(utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=False, bf16=True))
+    monkeypatch.setattr(utils, "param_is_not_tensor_parallel_duplicate", lambda param: True)
+    monkeypatch.setattr(utils, "param_is_not_shared", lambda param: True)
+    monkeypatch.setattr(utils, "to_local_if_dtensor", lambda param: param)
+    monkeypatch.setattr(utils, "get_data_parallel_group_if_dtensor", lambda param, group: "dtensor-dp")
+    monkeypatch.setattr(utils.torch, "tensor", cpu_tensor)
+    monkeypatch.setattr(utils.torch, "zeros", cpu_zeros)
+    monkeypatch.setattr(utils.torch, "zeros_like", lambda tensor: real_zeros_like(tensor))
+    monkeypatch.setattr(
+        utils,
+        "multi_tensor_applier",
+        lambda func, overflow, tensors, per_param: calls.append(("norm", len(tensors[0]))) or (torch.tensor([2.0]), None),
+    )
+    monkeypatch.setattr(utils.mpu, "get_data_parallel_group", lambda with_context_parallel=False: "dp-cp")
+    monkeypatch.setattr(utils.mpu, "get_model_parallel_group", lambda: "dense")
+    monkeypatch.setattr(utils.mpu, "get_expert_tensor_model_pipeline_parallel_group", lambda: "expert")
+    monkeypatch.setattr(utils.torch.distributed, "get_process_group_ranks", lambda group: [0, 1])
+    monkeypatch.setattr(
+        utils.torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: calls.append(("all-reduce", group)),
+    )
+
+    norm = utils.calc_params_l2_norm(FakeModel())
+
+    assert norm == pytest.approx(12.0 ** 0.5)
+    assert calls.count(("norm", 1)) == 3
+    assert ("all-reduce", "dtensor-dp") in calls
+    assert ("all-reduce", "dp-cp") in calls
+    assert ("all-reduce", "dense") in calls
+
+
+def test_calc_params_l2_norm_requires_dtensors_for_megatron_fsdp(monkeypatch):
+    class FakeFSDPModel:
+        def stop_communication(self):
+            pass
+
+        def named_parameters(self):
+            return [("not_dtensor", SimpleNamespace())]
+
+    monkeypatch.setattr(utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=True))
+
+    with pytest.raises(RuntimeError, match="not a DTensor"):
+        utils.calc_params_l2_norm(FakeFSDPModel())
+
+
+def test_loss_and_stat_reductions_use_expected_distributed_groups(monkeypatch):
+    calls = []
+
+    class FakeGroup:
+        def size(self):
+            return 2
+
+    fake_group = FakeGroup()
+    monkeypatch.setattr(utils.mpu, "get_data_parallel_group", lambda: fake_group)
+    monkeypatch.setattr(utils.mpu, "get_model_parallel_group", lambda: "mp-group")
+    monkeypatch.setattr(utils.torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(
+        utils.torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: calls.append((tensor.clone(), op, group)),
+    )
+
+    averaged = utils.average_losses_across_data_parallel_group(
+        [torch.tensor(2.0), torch.tensor(4.0)]
+    )
+    reduced = utils.reduce_max_stat_across_model_parallel_group(7.5)
+    missing = utils.reduce_max_stat_across_model_parallel_group(None)
+    logical_true = utils.logical_and_across_model_parallel_group(True)
+    logical_false = utils.logical_and_across_model_parallel_group(False)
+
+    assert averaged.tolist() == [1.0, 2.0]
+    assert reduced == 7.5
+    assert missing is None
+    assert logical_true is True
+    assert logical_false is False
+    assert any(call[2] is fake_group for call in calls)
+    assert any(call[2] == "mp-group" for call in calls)
+
+
+def test_print_params_min_max_norm_emits_parameter_statistics(monkeypatch, capsys):
+    param = SimpleNamespace(data=torch.tensor([1.0, -2.0, 3.0]), tensor_model_parallel=True)
+    optimizer = SimpleNamespace(
+        optimizer=SimpleNamespace(param_groups=[{"params": [param]}])
+    )
+    monkeypatch.setattr(utils.torch.distributed, "get_rank", lambda: 5)
+
+    utils.print_params_min_max_norm(optimizer, iteration=9)
+
+    output = capsys.readouterr().out
+    assert "iteration, rank, index" in output
+    assert "      9,    5,    1" in output
+    assert "-2.000000E+00" in output
+
+
+def test_check_adlr_autoresume_termination_saves_and_exits(monkeypatch):
+    calls = []
+    autoresume = SimpleNamespace(
+        termination_requested=lambda: True,
+        request_resume=lambda: calls.append("resume"),
+    )
+    monkeypatch.setattr(utils, "get_args", lambda: SimpleNamespace(save="/tmp/checkpoints"))
+    monkeypatch.setattr(utils, "get_adlr_autoresume", lambda: autoresume)
+    monkeypatch.setattr(utils.torch.distributed, "barrier", lambda: calls.append("barrier"))
+    monkeypatch.setattr(utils.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(utils, "print_rank_0", lambda message: calls.append(("print", message)))
+    monkeypatch.setattr(
+        checkpointing,
+        "save_checkpoint",
+        lambda iteration, model, optimizer, scheduler: calls.append(("save", iteration)),
+    )
+
+    with pytest.raises(SystemExit):
+        utils.check_adlr_autoresume_termination(11, "model", "optimizer", "scheduler")
+
+    assert calls[0] == "barrier"
+    assert ("save", 11) in calls
+    assert "resume" in calls
+    assert any(item == ("print", ">>> training terminated. Returning") for item in calls)
+
+
+def test_check_adlr_autoresume_termination_noops_without_signal(monkeypatch):
+    calls = []
+    autoresume = SimpleNamespace(termination_requested=lambda: False)
+    monkeypatch.setattr(utils, "get_args", lambda: SimpleNamespace(save=None))
+    monkeypatch.setattr(utils, "get_adlr_autoresume", lambda: autoresume)
+    monkeypatch.setattr(utils.torch.distributed, "barrier", lambda: calls.append("barrier"))
+
+    utils.check_adlr_autoresume_termination(1, None, None, None)
+
+    assert calls == ["barrier"]
+
+
+def test_pipeline_stage_helper_uses_rank_flags(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        utils.mpu,
+        "is_pipeline_first_stage",
+        lambda ignore_virtual=False, vp_stage=None: seen.append(("first", ignore_virtual, vp_stage)) or False,
+    )
+    monkeypatch.setattr(
+        utils.mpu,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual=False, vp_stage=None: seen.append(("last", ignore_virtual, vp_stage)) or True,
+    )
+
+    assert utils.is_first_or_last_pipeline_stage(vp_stage=None) is True
+    assert ("first", True, None) in seen
+
+    monkeypatch.setattr(
+        utils.mpu,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual=False, vp_stage=None: False,
+    )
+    assert utils.is_first_or_last_pipeline_stage(vp_stage=2) is False
 
 
 def test_get_nvtx_range_uses_nvtx_and_optional_timers(monkeypatch):

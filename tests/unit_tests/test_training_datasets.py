@@ -1,12 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import sys
+import types
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
-from megatron.training.datasets.sft_dataset import IGNORE_INDEX, SFTDataset
+from megatron.training.datasets.sft_dataset import IGNORE_INDEX, SFTDataset, SFTLowLevelDataset
 
 
 class _TinyConversationTokenizer:
@@ -72,6 +74,23 @@ def test_sft_dataset_context_parallel_padding_keeps_pack_aligned():
     assert sample["tokens"].shape == (10,)
     assert sample["cu_seqlens"][-1].item() == 10
     assert sample["loss_mask"][-1].item() == 0.0
+
+
+def test_sft_low_level_dataset_helpers_load_json_messages(monkeypatch):
+    loaded = [{"messages": [{"role": "system", "content": "s"}]}]
+    fake_datasets = types.ModuleType("datasets")
+    fake_datasets.load_dataset = lambda *items, **kwargs: loaded
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        fake_datasets,
+    )
+
+    low_level = SFTDataset.build_low_level_dataset("train.jsonl", config=None)
+
+    assert isinstance(low_level, SFTLowLevelDataset)
+    assert SFTDataset.numel_low_level_dataset(low_level) == 1
+    assert low_level[0] == [{"role": "system", "content": "s"}]
 
 
 class _TinyFimTokenizer:
@@ -197,3 +216,53 @@ def test_fim_split_and_permute_sequence_handles_fragments():
     result = dataset._fim_split_and_permute_sequence(sequence)
 
     assert result.tolist() == sequence.tolist()
+
+
+def test_fim_query_document_sample_shuffle_indices_single_and_multi_doc(monkeypatch):
+    class TinyIndexedDataset:
+        def __init__(self):
+            self.calls = []
+            self.docs = {
+                10: np.array([1, 2, 104, 3], dtype=np.int64),
+                20: np.array([4, 5], dtype=np.int64),
+                30: np.array([6, 7, 8], dtype=np.int64),
+            }
+
+        def get(self, doc_id, offset=0, length=None):
+            self.calls.append((doc_id, offset, length))
+            values = self.docs[doc_id][offset:]
+            if length is not None:
+                values = values[:length]
+            return values
+
+    dataset = _build_fim_dataset(binomial_results=(0,))
+    dataset.dataset = TinyIndexedDataset()
+    dataset.shuffle_index = np.array([0, 1], dtype=np.int64)
+    dataset.document_index = np.array([10, 20, 30], dtype=np.int64)
+    dataset.sample_index = np.array(
+        [
+            [0, 0],
+            [0, 3],
+            [2, 2],
+        ],
+        dtype=np.int64,
+    )
+    monkeypatch.setattr(
+        dataset,
+        "_fim_split_and_permute_sequence",
+        lambda sequence: np.asarray(sequence, dtype=np.int64) + 10,
+    )
+
+    sample, document_ids = dataset._query_document_sample_shuffle_indices(0)
+    assert document_ids.tolist() == [10]
+    assert sample.tolist() == [11, 12, 104, 13]
+    assert dataset.dataset.calls[-1] == (10, 0, 4)
+
+    sample, document_ids = dataset._query_document_sample_shuffle_indices(1)
+    assert document_ids.tolist() == [10, 20, 30]
+    assert sample.shape[0] == 6
+    assert dataset.dataset.calls[-3:] == [
+        (10, 3, None),
+        (20, 0, None),
+        (30, 0, 3),
+    ]

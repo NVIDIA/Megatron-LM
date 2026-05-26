@@ -12,15 +12,20 @@ from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
 from megatron.training import training
 from megatron.training.training import (
+    build_train_valid_test_data_loaders,
     build_train_valid_test_data_iterators,
     checkpoint_and_decide_exit,
+    compute_throughputs_and_append_to_progress_log,
     get_model,
     get_start_time_from_progress_log,
+    get_train_valid_test_num_samples,
     get_megatron_optimizer_config,
     get_optimizer_param_scheduler,
+    dummy_train_step,
     num_floating_point_operations,
     post_training_step_callbacks,
     preprocess_common_state_dict,
+    should_disable_forward_pre_hook,
     setup_model_and_optimizer,
     training_log,
     update_train_iters,
@@ -219,6 +224,84 @@ def test_preprocess_common_state_dict_strips_rank_and_sorts_optimizer_groups():
     assert "rank" in vars(common_state["args"])
 
 
+def test_preprocess_common_state_dict_handles_chained_optimizers():
+    optimizer_state = {
+        0: {
+            "param_state": {},
+            "optimizer": {
+                "param_groups": [
+                    {
+                        "wd_mult": 2.0,
+                        "lr_mult": 1.0,
+                        "is_expert_parallel": False,
+                        "is_decoupled_lr": False,
+                        "is_vision_model_param": False,
+                        "is_engram_parallel": False,
+                    },
+                    {
+                        "wd_mult": 1.0,
+                        "lr_mult": 1.0,
+                        "is_expert_parallel": False,
+                        "is_decoupled_lr": False,
+                        "is_vision_model_param": False,
+                        "is_engram_parallel": False,
+                    },
+                ]
+            },
+        },
+        2: {"optimizer": {"param_groups": []}},
+    }
+    common_state = {
+        "args": SimpleNamespace(use_distributed_optimizer=True, rank=7),
+        "optimizer": optimizer_state,
+    }
+
+    processed = preprocess_common_state_dict(common_state)
+
+    assert "rank" not in processed["args"]
+    assert "param_state" not in processed["optimizer"][0]
+    assert [group["wd_mult"] for group in processed["optimizer"][0]["optimizer"]["param_groups"]] == [
+        1.0,
+        2.0,
+    ]
+
+
+def test_get_train_valid_test_num_samples_iteration_sample_and_phase_paths(monkeypatch):
+    args = SimpleNamespace(
+        train_samples=None,
+        train_iters=9,
+        global_batch_size=4,
+        full_validation=False,
+        skip_train=False,
+        eval_interval=3,
+        eval_iters=2,
+        phase_transition_iterations=None,
+        iteration=0,
+    )
+    monkeypatch.setattr(training, "get_args", lambda: args)
+
+    assert get_train_valid_test_num_samples() == (36, 16, 8)
+
+    args.train_samples = 100
+    args.full_validation = True
+    assert get_train_valid_test_num_samples() == (100, None, 8)
+
+    args.full_validation = False
+    args.skip_train = True
+    assert get_train_valid_test_num_samples() == (100, 8, 8)
+
+    args.skip_train = False
+    args.phase_transition_iterations = [3, 6]
+    args.iteration = 4
+    assert get_train_valid_test_num_samples()[0] == 12
+
+
+def test_cyclic_iter_restarts_after_exhausting_iterable():
+    iterator = training.cyclic_iter([1, 2])
+
+    assert [next(iterator), next(iterator), next(iterator), next(iterator)] == [1, 2, 1, 2]
+
+
 def test_update_train_iters_constant_and_rampup(monkeypatch):
     constant = SimpleNamespace(
         train_iters=None,
@@ -267,6 +350,233 @@ def test_checkpoint_and_decide_exit_save_and_iteration_paths(monkeypatch):
     args.exit_interval = 3
     assert checkpoint_and_decide_exit(None, None, None, 6, 0.0, {}, None) is True
     assert ("print", ("exiting program at iteration 6",)) in calls
+
+
+def test_checkpoint_and_decide_exit_signal_and_non_persistent_paths(monkeypatch):
+    calls = []
+    args = SimpleNamespace(
+        exit_signal_handler=True,
+        save="/tmp/checkpoints",
+        save_interval=None,
+        non_persistent_save_interval=4,
+        exit_duration_in_mins=None,
+        exit_interval=None,
+        phase_transition_iterations=None,
+    )
+    signal_handler = SimpleNamespace(signals_received=lambda: [15])
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", lambda: object())
+    monkeypatch.setattr(training, "get_signal_handler", lambda: signal_handler)
+    monkeypatch.setattr(training, "save_checkpoint_and_time", lambda *items, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(training, "print_datetime", lambda *items, **kwargs: calls.append(("print", items)))
+
+    assert checkpoint_and_decide_exit("m", "o", "s", 4, 123.0, {"ctx": True}, "iter") is True
+    assert calls[0] == {"train_data_iterator": "iter"}
+    assert ("print", ("exiting program after receiving SIGTERM.",)) in calls
+
+    calls.clear()
+    args.exit_signal_handler = False
+    assert checkpoint_and_decide_exit("m", "o", "s", 8, 123.0, {}, "iter") is False
+    assert calls == [{"non_persistent_ckpt": True, "train_data_iterator": "iter"}]
+
+
+def test_compute_throughputs_and_append_to_progress_log_formats_checkpoint_line(monkeypatch):
+    calls = []
+    args = SimpleNamespace(
+        save="/tmp/checkpoints",
+        num_floating_point_operations_so_far=1.0e12,
+        world_size=2,
+        consumed_train_samples=500,
+        seq_length=1024,
+        async_save=True,
+    )
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "_TRAIN_START_TIME", 90.0)
+    monkeypatch.setattr(training.time, "time", lambda: 100.0)
+    monkeypatch.setattr(
+        training,
+        "get_start_time_from_progress_log",
+        lambda: (training.datetime.fromtimestamp(80), 0.5e12),
+    )
+    monkeypatch.setattr(training, "append_to_progress_log", lambda message: calls.append(message))
+
+    compute_throughputs_and_append_to_progress_log(7, 3.0e12)
+
+    assert len(calls) == 1
+    assert calls[0].startswith("Saving async checkpoint\tIteration: 7")
+    assert "Floating-point operations: 3.00e+12" in calls[0]
+    assert "Tokens (in billions): 0.00" in calls[0]
+
+    args.save = None
+    calls.clear()
+    compute_throughputs_and_append_to_progress_log(8, 4.0e12)
+    assert calls == []
+
+
+def test_build_train_valid_test_data_loaders_regular_and_rl_paths(monkeypatch):
+    real_tensor = torch.tensor
+    args = SimpleNamespace(
+        iteration=2,
+        train_samples=None,
+        train_iters=4,
+        eval_interval=2,
+        eval_iters=1,
+        global_batch_size=8,
+        consumed_train_samples=0,
+        consumed_valid_samples=0,
+        phase_transition_iterations=[1],
+        perform_rl_step=False,
+        skip_train=False,
+        full_validation=True,
+        multiple_validation_sets=True,
+    )
+    loader_calls = []
+    provider_calls = []
+
+    def cpu_tensor(*items, **kwargs):
+        kwargs.pop("device", None)
+        return real_tensor(*items, **kwargs)
+
+    def provider(samples):
+        provider_calls.append(samples)
+        return "train", ["valid-a", "valid-b"], "test"
+
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "print_rank_0", lambda *items, **kwargs: None)
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(training.torch, "tensor", cpu_tensor)
+    monkeypatch.setattr(training.torch.distributed, "broadcast", lambda tensor, src: None)
+    monkeypatch.setattr(
+        training,
+        "build_pretraining_data_loader",
+        lambda dataset, consumed: loader_calls.append((dataset, consumed)) or (dataset, consumed),
+    )
+
+    train_loader, valid_loaders, test_loader = build_train_valid_test_data_loaders(provider)
+
+    assert provider_calls == [(24, None, 8)]
+    assert train_loader == ("train", 8)
+    assert valid_loaders == [("valid-a", 0), ("valid-b", 0)]
+    assert test_loader == ("test", 0)
+    assert args.do_train and args.do_valid and args.do_test
+
+    args.perform_rl_step = True
+    args.train_iters = 0
+    args.eval_iters = 0
+    args.full_validation = False
+    args.do_train = args.do_valid = args.do_test = False
+    train_loader, valid_loaders, test_loader = build_train_valid_test_data_loaders(provider)
+    assert (train_loader, valid_loaders, test_loader) == (None, None, None)
+    assert not args.do_train and not args.do_valid and not args.do_test
+
+
+def test_build_train_valid_test_data_iterators_wraps_multiple_validation_loaders(monkeypatch):
+    args = SimpleNamespace(
+        dataloader_type="external",
+        full_validation=True,
+        multiple_validation_sets=True,
+        eval_iters=1,
+    )
+    wrapped = []
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(
+        training,
+        "build_train_valid_test_data_loaders",
+        lambda provider: ("train-loader", ["valid-a", "valid-b"], "test-loader"),
+    )
+    monkeypatch.setattr(training, "RerunDataIterator", lambda iterator: wrapped.append(iterator) or ("wrapped", iterator))
+
+    train_iter, valid_iters, test_iter = build_train_valid_test_data_iterators(lambda _: None)
+
+    assert train_iter == ("wrapped", "train-loader")
+    assert valid_iters == [("wrapped", "valid-a"), ("wrapped", "valid-b")]
+    assert test_iter == ("wrapped", "test-loader")
+    assert args.eval_iters == [7, 7]
+
+
+def test_build_train_valid_test_data_iterators_single_and_cyclic_modes(monkeypatch):
+    wrapped = []
+    args = SimpleNamespace(
+        dataloader_type="single",
+        full_validation=False,
+        multiple_validation_sets=False,
+        eval_iters=1,
+    )
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(
+        training,
+        "build_train_valid_test_data_loaders",
+        lambda provider: ([1], [[2]], [3]),
+    )
+    monkeypatch.setattr(training, "RerunDataIterator", lambda iterator: wrapped.append(iterator) or iterator)
+
+    train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(lambda _: None)
+
+    assert next(train_iter) == 1
+    assert next(valid_iter) == 2
+    assert next(test_iter) == 3
+
+    args.dataloader_type = "cyclic"
+    train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(lambda _: None)
+    assert [next(train_iter), next(train_iter)] == [1, 1]
+    assert [next(valid_iter), next(valid_iter)] == [2, 2]
+    assert [next(test_iter), next(test_iter)] == [3, 3]
+
+
+def test_should_disable_forward_pre_hook_requires_dist_optimizer_and_overlap():
+    args = SimpleNamespace(
+        use_megatron_fsdp=False,
+        use_distributed_optimizer=True,
+        optimizer="adam",
+        overlap_param_gather=True,
+    )
+    assert should_disable_forward_pre_hook(args) is True
+
+    args.use_megatron_fsdp = True
+    assert should_disable_forward_pre_hook(args) is False
+
+    args.use_megatron_fsdp = False
+    args.use_distributed_optimizer = False
+    args.optimizer = "adam"
+    assert should_disable_forward_pre_hook(args) is False
+
+    args.optimizer = "distributed_adam"
+    args.overlap_param_gather = False
+    assert should_disable_forward_pre_hook(args) is False
+
+
+def test_dummy_train_step_consumes_microbatches_until_rerun_stops(monkeypatch):
+    calls = []
+
+    class FakeRerunStateMachine:
+        def __init__(self):
+            self.remaining = 2
+
+        def should_run_forward_backward(self, data_iterator):
+            self.remaining -= 1
+            return self.remaining >= 0
+
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 2)
+    monkeypatch.setattr(training, "get_rerun_state_machine", lambda: FakeRerunStateMachine())
+    monkeypatch.setattr(
+        training,
+        "get_batch_on_this_tp_rank",
+        lambda iterator: calls.append(("tp", iterator)) or "batch",
+    )
+    monkeypatch.setattr(
+        training,
+        "get_batch_on_this_cp_rank",
+        lambda batch: calls.append(("cp", batch)) or "cp-batch",
+    )
+
+    dummy_train_step("iterator")
+
+    assert calls == [
+        ("tp", "iterator"),
+        ("cp", "batch"),
+        ("tp", "iterator"),
+        ("cp", "batch"),
+    ]
 
 
 def test_training_log_updates_accumulators_and_writers(monkeypatch):
