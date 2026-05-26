@@ -98,7 +98,7 @@ dev = [
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend==1.24.0",
+    "nvidia-cudnn-frontend",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0

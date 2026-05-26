@@ -1548,6 +1548,11 @@ def _skip_if_real_kernels_unavailable(*, sm_min: int = 9, need_flash_mla: bool =
     if sm_major < sm_min:
         pytest.skip(f"requires SM{sm_min}+, found SM{sm_major}")
     cudnn = pytest.importorskip("cudnn")
+    cudnn_frontend = pytest.importorskip("cudnn_frontend")
+    from packaging.version import Version
+
+    if Version(cudnn_frontend.__version__) < Version("1.24.0"):
+        pytest.skip(f"requires cudnn_frontend>=1.24.0, found {cudnn_frontend.__version__}")
     if not hasattr(cudnn, 'DSA'):
         pytest.skip("cudnn.DSA namespace not available")
     if need_flash_mla:

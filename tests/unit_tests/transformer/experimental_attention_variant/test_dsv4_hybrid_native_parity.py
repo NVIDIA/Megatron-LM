@@ -676,6 +676,26 @@ def _copy_real_params_to_native(real_layer: nn.Module, native_layer: nn.Module):
     return real_params
 
 
+def _skip_if_real_kernels_unavailable(*, sm_min: int = 9):
+    """Pytest-side gate for real-kernel tests. Raises ``pytest.skip`` if
+    any of the runtime dependencies are missing.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    sm_major = torch.cuda.get_device_capability()[0]
+    if sm_major < sm_min:
+        pytest.skip(f"requires SM{sm_min}+, found SM{sm_major}")
+    cudnn = pytest.importorskip("cudnn")
+    cudnn_frontend = pytest.importorskip("cudnn_frontend")
+    from packaging.version import Version
+
+    if Version(cudnn_frontend.__version__) < Version("1.24.0"):
+        pytest.skip(f"requires cudnn_frontend>=1.24.0, found {cudnn_frontend.__version__}")
+    if not hasattr(cudnn, 'DSA'):
+        pytest.skip("cudnn.DSA namespace not available")
+    pytest.importorskip("flash_mla")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
 @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
@@ -691,12 +711,11 @@ def test_dsv4_hybrid_attention_matches_native_reference(
     apply_dsa_kernel_fusion: bool,
     calculate_per_token_loss: bool,
 ):
+    if apply_dsa_kernel_fusion:
+        _skip_if_real_kernels_unavailable(sm_min=10)
     major, _ = torch.cuda.get_device_capability()
-    if major < 10:
-        if apply_dsa_kernel_fusion:
-            pytest.skip("fused DSA kernels require SM100+ GPU now")
-        if seqlen > 4096:
-            pytest.skip("seqlen > 4096 may OOM on Hopper")
+    if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
+        pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 
     DSAIndexerLossAutoScaler.main_loss_backward_scale = None
 
