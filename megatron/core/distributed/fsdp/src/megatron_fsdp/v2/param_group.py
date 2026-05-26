@@ -277,14 +277,17 @@ class ParameterGroup:
                 and not self.model_weight_buffer.is_distributed
             )
 
-    def reduce_grad(self):
+    def reduce_scatter_grad(self):
         """
-        Reduce gradients across DP ranks.
+        Reduce-scatter gradients across DP ranks.
 
-        For distributed buffers: reduce-scatter the full gradient
-        For non-distributed buffers: all-reduce in-place
+        ZeRO-2/3 reduce-scatter sharded grad buffers during backward.
+        ZeRO-1 keeps grads replicated during backward and reduce-scatters
+        the replicated buffer once when the optimizer syncs.
         """
-        self.main_grad_buffer.reduce_grad(grad_comm_dtype=self.mp_policy.grad_comm_dtype)
+        self.main_grad_buffer.reduce_scatter_grad(
+            grad_comm_dtype=self.mp_policy.grad_comm_dtype
+        )
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
@@ -304,7 +307,7 @@ class ParameterGroup:
         Creates DTensor views of model weights and gradients based on sharding strategy:
         - "optim_grads_params": weights and grads sharded, full ZeRO-3
         - "optim_grads": grads sharded, weights replicated (ZeRO-2)
-        - "optim": optimizer state sharding only, weights and grads replicated (ZeRO-1)
+        - "optim": grads accumulate replicated, optimizer consumes reduced shards
         - "no_shard": replicated, no sharding (DDP-equivalent)
         """
         self.dist_params = []

@@ -537,12 +537,13 @@ class DataParallelBuffer:
         return self._unsharded_buffer
 
     @torch.no_grad()
-    def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
-        """Reduce gradients across the data-parallel group.
+    def reduce_scatter_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
+        """Reduce-scatter gradients into the optimizer-facing local shard.
 
-        For distributed buffers: reduce-scatter the full gradient into each
-        rank's shard, then accumulate into self.data.
-        For non-distributed buffers: all-reduce in-place.
+        For distributed buffers, this reduce-scatters a temporary full gradient
+        and accumulates the result into the persistent local shard. For
+        replicated buffers, this reduce-scatters the full accumulation buffer
+        once into this rank's virtual shard for ZeRO-1 optimizer consumption.
         If grad_comm_dtype differs from self.dtype, communicate with a temporary
         casted tensor and cast the reduced result back before accumulation.
         """
@@ -558,34 +559,44 @@ class DataParallelBuffer:
             op = torch.distributed.ReduceOp.SUM
             prescale = True
 
-        if not self.is_distributed:
-            comm_data = (
-                self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
-            )
-            if prescale:
-                comm_data.mul_(self.gradient_scaling_factor)
-            torch.distributed.all_reduce(comm_data, group=self.dp_group, op=op)
-            if comm_data is not self.data:
-                self.data.copy_(comm_data.to(self.dtype))
-            return
-
-        full_grad = self.fetch_unsharded_buffer()
-        comm_input = full_grad if grad_comm_dtype == self.dtype else full_grad.to(grad_comm_dtype)
-        if full_grad.is_cuda:
-            # Keep temporary reduce-scatter buffers tied to the stream that uses them.
-            full_grad.record_stream(torch.cuda.current_stream())
-        if prescale:
-            comm_input.mul_(self.gradient_scaling_factor)
-
         sm = self.buffer_index.shard_meta
         local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
-        reduced_grad_shard = comm_input[sm.bucket_data_index : sm.bucket_data_index + sm.size]
+
+        if self.is_distributed:
+            # ZeRO-2/3 (optim_grads/optim_grads_params): ``self.data`` is the
+            # persistent local grad shard. The full grad buffer is temporary,
+            # assembled only for this reduce-scatter, and the RS result is
+            # accumulated into ``local_grad_shard`` for gradient accumulation.
+            input_buffer = self.fetch_unsharded_buffer()
+            output_offset = sm.bucket_data_index
+            accumulate_output = True
+            if input_buffer.is_cuda:
+                # Keep temporary reduce-scatter buffers tied to the stream that uses them.
+                input_buffer.record_stream(torch.cuda.current_stream())
+        else:
+            # ZeRO-1 (optim): ``self.data`` is the replicated full grad
+            # accumulation buffer. The optimizer consumes only this rank's
+            # virtual shard, so the one delayed RS writes directly into that
+            # slice instead of accumulating into a separate shard buffer.
+            input_buffer = self.data
+            output_offset = sm.local_data_index
+            accumulate_output = False
+
+        comm_input = (
+            input_buffer if grad_comm_dtype == self.dtype else input_buffer.to(grad_comm_dtype)
+        )
+        if prescale:
+            comm_input.mul_(self.gradient_scaling_factor)
+        reduced_grad_shard = comm_input[output_offset : output_offset + sm.size]
 
         torch.distributed.reduce_scatter_tensor(
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
-        local_grad_shard += reduced_grad_shard
+        if accumulate_output:
+            local_grad_shard += reduced_grad_shard
+        elif grad_comm_dtype != self.dtype:
+            local_grad_shard.copy_(reduced_grad_shard.to(self.dtype))
 
 
 def check_all_fsdp_buffers(module) -> bool:

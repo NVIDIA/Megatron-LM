@@ -359,15 +359,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.start_param_sync = noop
         self.start_grad_sync = noop
 
-        def finish_grad_sync(force_all_reduce: Optional[bool] = False):
-            ctx = self.module._fsdp_root_context
-            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
-
         def synchronize_param_gather():
             ctx = self.module._fsdp_root_context
             torch.cuda.current_stream().wait_stream(ctx.ag_stream)
 
-        self.finish_grad_sync = finish_grad_sync
+        self.finish_grad_sync = self.module.finish_grad_sync
         self.scale_gradients = self.module._scale_gradients
         self.zero_grad_buffer = self.module._zero_grad_buffer
         self.log_per_param_norms = self.module._log_per_param_norms

@@ -139,7 +139,7 @@ def _register_backward_hook(module: FSDPModule):
     Register backward hook using autograd Function.
 
     This inserts a RegisterFSDPBackwardFunction in the backward pass
-    that triggers reshard and reduce_grad after gradients are computed.
+    that triggers reshard and reduce_scatter_grad after gradients are computed.
     """
 
     def post_backward(module: FSDPModule):
@@ -148,7 +148,10 @@ def _register_backward_hook(module: FSDPModule):
         ctx.backward_done_modules.add(id(module))
         ctx._advance_backward_module()
         module.reshard()
-        module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        module.reduce_scatter_grad(
+            async_op=ctx.enable_async_reduce_grad,
+            allowed_sharding_strategies=("optim_grads", "optim_grads_params"),
+        )
         module.post_backward_issued = True
 
     @torch.compiler.disable
@@ -225,8 +228,11 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
             if getattr(module, "post_backward_issued", False):
                 continue
             module.reshard()
-            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
-        for buckets in ctx.reduce_grad_buckets.values():
+            module.reduce_scatter_grad(
+                async_op=ctx.enable_async_reduce_grad,
+                allowed_sharding_strategies=("optim_grads", "optim_grads_params"),
+            )
+        for buckets in ctx.reduce_scatter_grad_buckets.values():
             while len(buckets) > 0:
                 event, param_group = buckets.pop()
                 event.wait()
