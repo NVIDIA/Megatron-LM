@@ -29,7 +29,7 @@ MODEL_ARGS:
   --clip-grad: 1.0
   --lr-warmup-fraction: .01
   --transformer-impl: transformer_engine
-  --tensor-model-parallel-size: 2
+  --tensor-model-parallel-size: 4
   --pipeline-model-parallel-size: 1
   --expert-model-parallel-size: 2
   --expert-tensor-parallel-size: 2
@@ -76,8 +76,10 @@ MODEL_ARGS:
   --save-interval: 50
   --eval-interval: 1000
   --eval-iters: 10
-  --mock-data: true
-  --tokenizer-type: NullTokenizer
+  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --ckpt-fully-parallel-load: true
@@ -85,7 +87,6 @@ MODEL_ARGS:
   --ckpt-assume-constant-structure: true
   --async-save: true
   --use-persistent-ckpt-worker: true
-  --exit-interval: 100
 TEST_TYPE: ckpt-resume
 METRICS:
   # - "iteration-time"
