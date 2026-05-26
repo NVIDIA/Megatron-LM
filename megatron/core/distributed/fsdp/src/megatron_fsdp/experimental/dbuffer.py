@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Distributed flat buffers for Megatron-FSDP."""
+"""Distributed tensor buffers for Megatron-FSDP."""
 
 import dataclasses
 import math
@@ -25,6 +25,7 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 MeshAxis = int | str
+Shape = torch.Size | Iterable[int]
 
 
 class Placement:
@@ -50,7 +51,7 @@ class Flat(Placement):
 
 @dataclasses.dataclass(frozen=True)
 class GlobalLayout:
-    """Global flat-buffer layout in element coordinates."""
+    """Global tensor layout in element coordinates."""
 
     tensor_shapes: tuple[torch.Size, ...]
     tensor_to_offset: tuple[int, ...]
@@ -114,12 +115,15 @@ def _validate_placements(placements: Iterable[Placement]) -> None:
             )
 
 
-def _compute_layout(shapes: Iterable[torch.Size], dp_size: int) -> GlobalLayout:
-    """Compute flat-buffer element offsets and globally padded size.
+def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
+    """Compute global tensor element offsets and padded size.
+
+    The computed layout is compatible with Flat, TensorAtomic, and BlockAtomic,
+    even though the latter two are not implemented.
 
     Args:
         shapes: Logical tensor shapes in tensor-id order.
-        dp_size: Data-parallel shard count for this flat buffer layout.
+        dp_size: Data-parallel shard count for this global layout.
 
     Returns:
         Global layout with element offsets and size padded to a multiple of
@@ -211,13 +215,17 @@ def _compute_layout(shapes: Iterable[torch.Size], dp_size: int) -> GlobalLayout:
 
 
 class DBuffer:
-    """A flat distributed buffer holding a group of logical tensors.
+    """A distributed buffer holding a group of logical tensors.
 
-    DBuffer stores one flat local tensor and enough metadata to return per-tensor
+    DBuffer is analogous to DTensor, but manages a group of logical tensors in
+    one local storage tensor. It stores enough metadata to return per-tensor
     views, redistribute the buffer across mesh axes, and materialize per-tensor
     DTensors for optimizer state or distributed checkpointing.
     """
 
+    # DBuffer owns only the data-parallel sub-mesh. Higher-level callers, such as
+    # ParameterGroup, should extend returned DTensors with tensor-parallel mesh axes
+    # because TP sharding metadata lives on nn.Parameter in MCore/TransformerEngine.
     mesh: DeviceMesh
     placements: tuple[Placement, ...]
     layout: GlobalLayout
@@ -228,18 +236,18 @@ class DBuffer:
         self,
         mesh: DeviceMesh,
         placements: Iterable[Placement],
-        tensor_shapes: Iterable[torch.Size],
+        tensor_shapes: Iterable[Shape],
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
-        """Create a DBuffer and allocate its local flat buffer.
+        """Create a DBuffer and allocate its local buffer.
 
         Args:
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             tensor_shapes: Global shapes for each logical tensor in this buffer.
-            dtype: Dtype for the local flat buffer.
-            device: Device for the local flat buffer.
+            dtype: Dtype for the local buffer.
+            device: Device for the local buffer.
         """
         placements = tuple(placements)
         if len(placements) != mesh.ndim:
@@ -259,7 +267,7 @@ class DBuffer:
 
     @property
     def dtype(self) -> torch.dtype:
-        """Dtype of the local flat buffer."""
+        """Dtype of the local buffer."""
         return self.local_buffer.dtype
 
     @classmethod
@@ -268,12 +276,12 @@ class DBuffer:
         local_buffer: torch.Tensor,
         mesh: DeviceMesh,
         placements: Iterable[Placement],
-        tensor_shapes: Iterable[torch.Size],
+        tensor_shapes: Iterable[Shape],
     ) -> "DBuffer":
-        """Create a DBuffer from an existing local flat buffer.
+        """Create a DBuffer from an existing local buffer.
 
         Args:
-            local_buffer: Local flat tensor storage for this rank.
+            local_buffer: Local tensor storage for this rank.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             tensor_shapes: Global shapes for each logical tensor in this buffer.
@@ -534,9 +542,7 @@ class DBuffer:
             raise RuntimeError("scatter() destination is not contained in the source local buffer.")
         local_slice = self.local_buffer.narrow(0, local_buffer_offset, destination_numel)
         if out is None:
-            return DBuffer.from_local(
-                local_slice, self.mesh, placements, self.layout.tensor_shapes
-            )
+            return DBuffer.from_local(local_slice, self.mesh, placements, self.layout.tensor_shapes)
 
         destination.local_buffer.copy_(local_slice)
         return destination
@@ -559,9 +565,7 @@ class DBuffer:
         row_size = _non_leading_numel(shape)
         if overlap_end <= overlap_start:
             empty_shape = torch.Size((0, *shape[1:]))
-            return torch.empty(
-                empty_shape, dtype=self.dtype, device=self.local_buffer.device
-            )
+            return torch.empty(empty_shape, dtype=self.dtype, device=self.local_buffer.device)
 
         local_numel = overlap_end - overlap_start
         local_buffer_offset = overlap_start - self.offset

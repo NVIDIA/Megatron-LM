@@ -445,7 +445,9 @@ def test_2d_mesh_shards_across_all_ranks(setup: DistributedSetup):
         + mesh.get_local_rank("dp_outer") * expected_local_numel
     )
     assert fully_sharded_buffer.offset == expected_offset
-    assert fully_sharded_buffer.local_buffer.numel() == fully_sharded_buffer.layout.size // mesh.size()
+    assert (
+        fully_sharded_buffer.local_buffer.numel() == fully_sharded_buffer.layout.size // mesh.size()
+    )
     for index, _ in enumerate(tensors):
         assert fully_sharded_buffer.get_tensor(index).is_contiguous()
 
@@ -477,7 +479,10 @@ def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(setup: DistributedSetu
         + mesh.get_local_rank("dp_outer") * expected_local_numel
     )
     assert fully_sharded_buffer.offset == expected_offset
-    assert fully_sharded_buffer.local_buffer.numel() == partial_sharded_buffer.local_buffer.numel() // 2
+    assert (
+        fully_sharded_buffer.local_buffer.numel()
+        == partial_sharded_buffer.local_buffer.numel() // 2
+    )
 
     outer_scale_sum = float(mesh.size(0) * (mesh.size(0) + 1) // 2)
     expected = [
@@ -510,5 +515,8 @@ def test_2d_mesh_replicate_flat_scatter_to_flat_flat(setup: DistributedSetup):
         + mesh.get_local_rank("dp_outer") * expected_local_numel
     )
     assert fully_sharded_buffer.offset == expected_offset
-    assert fully_sharded_buffer.local_buffer.numel() == replicated_sharded_buffer.local_buffer.numel() // 2
+    assert (
+        fully_sharded_buffer.local_buffer.numel()
+        == replicated_sharded_buffer.local_buffer.numel() // 2
+    )
     _assert_dbuffer_contains_tensors(replicated_buffer, tensors)
