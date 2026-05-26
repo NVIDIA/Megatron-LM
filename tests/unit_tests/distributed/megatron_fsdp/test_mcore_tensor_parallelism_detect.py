@@ -88,12 +88,12 @@ def test_safe_get_rank_should_fall_back_to_rank_env_if_distributed_is_not_initia
     assert safe_get_rank() == 7
 
 
-def test_safe_get_rank_should_warn_and_return_zero_if_rank_env_is_invalid(monkeypatch):
+def test_safe_get_rank_should_raise_value_error_if_rank_env_is_invalid(monkeypatch):
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setenv("RANK", "not-an-int")
 
-    with pytest.warns(UserWarning, match="Invalid RANK environment variable value"):
-        assert safe_get_rank() == 0
+    with pytest.raises(ValueError):
+        safe_get_rank()
 
 
 class DummyConfig:

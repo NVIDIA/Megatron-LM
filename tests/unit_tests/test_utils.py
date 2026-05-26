@@ -538,12 +538,12 @@ class TestGetRankSafe:
 
     @patch("torch.distributed.is_initialized")
     @patch.dict(os.environ, {"RANK": "invalid"})
-    def test_invalid_rank_env_var_should_warn_and_return_zero(self, mock_is_initialized):
+    def test_invalid_rank_env_var_should_raise_value_error(self, mock_is_initialized):
         """Test safe_get_rank with invalid RANK environment variable."""
         mock_is_initialized.return_value = False
 
-        with pytest.warns(UserWarning, match="Invalid RANK environment variable value"):
-            assert safe_get_rank() == 0
+        with pytest.raises(ValueError):
+            safe_get_rank()
 
 
 class TestGetLocalRankPreinit:
