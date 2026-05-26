@@ -1760,6 +1760,26 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def _is_param_gather_pre_hook_enabled(model_chunk):
+    """Return whether param all-gather pre-forward hooks can zero the shared grad buffer."""
+    forward_pre_hook_handles = getattr(model_chunk, "remove_forward_pre_hook_handles", None)
+    if forward_pre_hook_handles is not None:
+        return len(forward_pre_hook_handles) > 0
+
+    return False
+
+
+def _iter_param_buffer_distributed_optimizers(optimizer):
+    """Yield DistributedOptimizer instances with DDP-style param buffers."""
+    for optim_instance in getattr(optimizer, "chained_optimizers", [optimizer]):
+        if (
+            isinstance(optim_instance, DistributedOptimizer)
+            and hasattr(optim_instance, "shard_fp32_from_float16_groups")
+            and hasattr(optim_instance, "model_float16_groups")
+        ):
+            yield optim_instance
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -1800,11 +1820,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         #    so the main grads will be polluted by the main params.
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
-            forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
+            forward_pre_hook_enabled = _is_param_gather_pre_hook_enabled(model[0])
             if forward_pre_hook_enabled:
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance._copy_main_params_to_param_buffer()
+                for optim_instance in _iter_param_buffer_distributed_optimizers(optimizer):
+                    optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
         if save_dgrads_in_this_iteration:

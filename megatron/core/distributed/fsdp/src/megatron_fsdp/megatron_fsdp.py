@@ -923,6 +923,10 @@ class MegatronFSDP(torch.nn.Module):
         def _pre_forward_param_unshard(
             module: nn.Module, *unused, force_disable_prefetch: bool = False
         ):
+            # Fine-grained schedules may call inner modules directly and bypass
+            # MegatronFSDP.forward(), so restore raw module params here too.
+            self._replace_param_with_raw_if_needed()
+
             # Unshard the parameters before the forward pass.
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
@@ -1564,11 +1568,19 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_params = dict(pg_buffer.optimizer_named_parameters)
         for name, _ in self.module.named_parameters():
             assert name in fsdp_params, f"Parameter {name} not found in FSDP parameters."
+            raw_param = self.raw_param[name]
             dist_param = fsdp_params[name]
             # Set the __fsdp_param__ attribute to True to indicate that this
             # DTensor parameter is managed by Megatron FSDP.
             if not hasattr(dist_param, "__fsdp_param__"):
                 dist_param.__fsdp_param__ = True
+            self.param_to_name[dist_param] = self.param_to_name[raw_param]
+            if raw_param in pg_buffer.param_to_name:
+                pg_buffer.param_to_name[dist_param] = pg_buffer.param_to_name[raw_param]
+            if raw_param in pg_buffer.param_to_param_group:
+                pg_buffer.param_to_param_group[dist_param] = pg_buffer.param_to_param_group[
+                    raw_param
+                ]
             _replace_module_parameter(self.module, name, dist_param)
 
         # Handle shared weights
