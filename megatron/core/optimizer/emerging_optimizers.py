@@ -230,6 +230,58 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
+    def _get_muon_split_shapes(self, p: torch.Tensor) -> tuple[int, ...] | None:
+        """Return per-parameter Muon split shapes, if this parameter should be split."""
+        split_shapes = getattr(p, "qkv_split_shapes", None)
+        if split_shapes is None:
+            if self.is_qkv_fn is None or not self.is_qkv_fn(p):
+                return None
+            split_shapes = self.qkv_split_shapes
+            if split_shapes is None:
+                raise ValueError(
+                    "Muon QKV split was requested for a parameter, but `qkv_split_shapes` is not "
+                    "set."
+                )
+
+        split_shapes = tuple(int(shape) for shape in split_shapes)
+        if not split_shapes or any(shape <= 0 for shape in split_shapes):
+            raise ValueError(f"Muon split shapes must be positive integers, got {split_shapes}.")
+        return split_shapes
+
+    def _orthogonalize_split_grad(
+        self,
+        grad: torch.Tensor,
+        split_shapes: tuple[int, ...],
+        tp_group: torch.distributed.ProcessGroup | None,
+        partition_dim: int | None,
+    ) -> torch.Tensor:
+        """Orthogonalize a fused projection gradient by splitting its row layout first."""
+        grad_shape = grad.shape
+        split_size = sum(split_shapes)
+        if grad_shape[0] % split_size != 0:
+            raise ValueError(
+                f"Muon split parameter has incompatible grad shape `{tuple(grad_shape)}` "
+                f"for split shapes `{split_shapes}`: `grad.shape[0]` must be divisible by "
+                f"`sum(split_shapes)={split_size}`."
+            )
+
+        log_single_rank(
+            logger,
+            logging.DEBUG,
+            f'muon split grad shape `{grad_shape}`, split shapes `{split_shapes}`',
+        )
+        num_groups = grad_shape[0] // split_size
+        split_grads = torch.split(grad.view(num_groups, split_size, -1), split_shapes, dim=1)
+        split_grads = [g.reshape(-1, grad_shape[-1]) for g in split_grads]
+
+        split_grads = [
+            self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
+                num_groups, -1, grad_shape[-1]
+            )
+            for g in split_grads
+        ]
+        return torch.cat(split_grads, dim=1).view(grad_shape)
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -255,37 +307,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if partition_dim == -1:
             partition_dim = None
 
-        if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
-            grad_shape = grad.shape
-            qkv_split_shapes = getattr(p, "qkv_split_shapes", None)
-            if qkv_split_shapes is None:
-                qkv_split_shapes = self.qkv_split_shapes
-            if qkv_split_shapes is None:
-                raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
-            qkv_split_dim = sum(qkv_split_shapes)
-            if grad_shape[0] % qkv_split_dim != 0:
-                raise RuntimeError(
-                    f"Muon QKV split shape mismatch: grad_shape={tuple(grad_shape)}, "
-                    f"split_shapes={qkv_split_shapes}"
-                )
-            log_single_rank(
-                logger,
-                logging.DEBUG,
-                f'qkv split grad shape {grad_shape}, split shapes {qkv_split_shapes}',
-            )
-            num_query_groups = grad_shape[0] // qkv_split_dim
-            qkv_grads = torch.split(
-                grad.view(num_query_groups, qkv_split_dim, -1), qkv_split_shapes, dim=1
-            )
-            qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
-
-            qkv_grads = [
-                self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
-                    num_query_groups, -1, grad_shape[-1]
-                )
-                for g in qkv_grads
-            ]
-            grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
+        split_shapes = self._get_muon_split_shapes(p) if self.split_qkv else None
+        if split_shapes is not None:
+            grad = self._orthogonalize_split_grad(grad, split_shapes, tp_group, partition_dim)
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
