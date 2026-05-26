@@ -696,6 +696,101 @@ def test_muon_optimizer_qkv_split():
     ), "Weights should be different between split_qkv=True and split_qkv=False"
 
 
+def test_muon_optimizer_qkv_split_uses_legacy_is_qkv_metadata():
+    """Test that legacy is_qkv + qkv_split_shapes still uses the split path."""
+    split_shapes = (3, 2, 1)
+    num_groups = 4
+    hidden_size = 5
+    param = torch.nn.Parameter(
+        torch.zeros(num_groups * sum(split_shapes), hidden_size, device='cuda')
+    )
+    param.is_qkv = True
+    optimizer = TensorParallelMuon(
+        params=[param],
+        lr=0.01,
+        split_qkv=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=split_shapes,
+        num_ns_steps=1,
+        pg_collection=None,
+        tp_mode="duplicated",
+    )
+
+    calls = []
+
+    def fake_orthogonalize(grad, tp_group, partition_dim):
+        calls.append(tuple(grad.shape))
+        return torch.full_like(grad, len(calls))
+
+    optimizer.scaled_orthogonalize_fn = fake_orthogonalize
+    result = optimizer.orthogonalize(param, torch.zeros_like(param))
+
+    assert calls == [
+        (num_groups * split_shapes[0], hidden_size),
+        (num_groups * split_shapes[1], hidden_size),
+        (num_groups * split_shapes[2], hidden_size),
+    ]
+    result = result.view(num_groups, sum(split_shapes), hidden_size)
+    assert torch.all(result[:, : split_shapes[0]] == 1).item()
+    assert torch.all(result[:, split_shapes[0] : split_shapes[0] + split_shapes[1]] == 2).item()
+    assert torch.all(result[:, -split_shapes[2] :] == 3).item()
+
+
+def test_muon_optimizer_mla_kv_split_uses_parameter_metadata():
+    """Test that MLA-style 2-way split metadata uses the split path."""
+    split_shapes = (3, 5)
+    num_heads = 4
+    hidden_size = 7
+    param = torch.nn.Parameter(
+        torch.zeros(num_heads * sum(split_shapes), hidden_size, device='cuda')
+    )
+    param.qkv_split_shapes = split_shapes
+    optimizer = TensorParallelMuon(
+        params=[param],
+        lr=0.01,
+        split_qkv=True,
+        num_ns_steps=1,
+        pg_collection=None,
+        tp_mode="duplicated",
+    )
+
+    calls = []
+
+    def fake_orthogonalize(grad, tp_group, partition_dim):
+        calls.append(tuple(grad.shape))
+        return torch.full_like(grad, len(calls))
+
+    optimizer.scaled_orthogonalize_fn = fake_orthogonalize
+    result = optimizer.orthogonalize(param, torch.zeros_like(param))
+
+    assert calls == [
+        (num_heads * split_shapes[0], hidden_size),
+        (num_heads * split_shapes[1], hidden_size),
+    ]
+    result = result.view(num_heads, sum(split_shapes), hidden_size)
+    assert torch.all(result[:, : split_shapes[0]] == 1).item()
+    assert torch.all(result[:, split_shapes[0] :] == 2).item()
+
+
+def test_muon_optimizer_mla_split_metadata_validates_grad_shape():
+    """Test that invalid MLA split metadata reports an incompatible layout."""
+    split_shapes = (3, 5)
+    hidden_size = 7
+    param = torch.nn.Parameter(torch.zeros(sum(split_shapes) + 1, hidden_size, device='cuda'))
+    param.qkv_split_shapes = split_shapes
+    optimizer = TensorParallelMuon(
+        params=[param],
+        lr=0.01,
+        split_qkv=True,
+        num_ns_steps=1,
+        pg_collection=None,
+        tp_mode="duplicated",
+    )
+
+    with pytest.raises(ValueError, match=r"grad\.shape\[0\].*sum\(split_shapes\)=8"):
+        optimizer.orthogonalize(param, torch.zeros_like(param))
+
+
 def test_muon_optimizer_extra_scale_factor():
     """Test TensorParallelMuon optimizer with different extra_scale_factor values."""
     model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')

@@ -722,6 +722,69 @@ def check_config_overrides_consistency(
     return True
 
 
+def _tag_muon_split_qkv_parameters(
+    config: OptimizerConfig, model_chunks: list[MegatronModule]
+) -> None:
+    """Tag standard QKV and MLA up-projection weights with Muon split metadata."""
+    split_qkv = getattr(config, 'muon_split_qkv', True)
+
+    def _is_muon_split_metadata_managed_param(name: str, is_mla: bool) -> bool:
+        """Return whether the parameter with the given name should be managed by Muon split tags.
+
+        E.g., standard QKV or MLA projection weights.
+        """
+        if 'linear_qkv.weight' in name:
+            return True
+        if not is_mla:
+            return False
+        return any(
+            f'{projection}.weight' in name
+            for projection in (
+                'linear_q_proj',
+                'linear_q_up_proj',
+                'linear_kv_up_proj',
+                'linear_q_down_proj',
+                'linear_kv_down_proj',
+                'linear_qkv_down_proj',
+            )
+        )
+
+    for model_chunk in model_chunks:
+        model_cfg = get_model_config(model_chunk)
+        is_mla = getattr(model_cfg, 'multi_latent_attention', False)
+        standard_qkv_split_shapes = None
+        mla_q_split_shapes = None
+        mla_kv_split_shapes = None
+        if is_mla:
+            mla_q_split_shapes = (model_cfg.qk_head_dim, model_cfg.qk_pos_emb_head_dim)
+            mla_kv_split_shapes = (model_cfg.qk_head_dim, model_cfg.v_head_dim)
+
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            is_managed_param = _is_muon_split_metadata_managed_param(name, is_mla)
+            if is_managed_param:
+                # Remove existing Muon split tags from a parameter.
+                for attr in ("is_qkv", "qkv_split_shapes"):
+                    if hasattr(param, attr):
+                        delattr(param, attr)
+            if not is_managed_param or not split_qkv or len(param.shape) != 2:
+                continue
+
+            if 'linear_qkv.weight' in name:
+                if standard_qkv_split_shapes is None:
+                    standard_qkv_split_shapes = tuple(_get_qkv_split_shapes(model_cfg))
+                param.qkv_split_shapes = standard_qkv_split_shapes
+                param.is_qkv = True
+            elif mla_q_split_shapes is not None and (
+                'linear_q_up_proj.weight' in name or 'linear_q_proj.weight' in name
+            ):
+                param.qkv_split_shapes = mla_q_split_shapes
+            elif mla_kv_split_shapes is not None and 'linear_kv_up_proj.weight' in name:
+                param.qkv_split_shapes = mla_kv_split_shapes
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -768,28 +831,15 @@ def _get_megatron_emerging_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    # Tag parameters with optimizer-specific attributes.
     for model_chunk in model_chunks:
-        qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
-            # TODO(deyuf): support MLA
-            if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                if qkv_split_shapes is None:
-                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
-                if param.shape[0] % sum(qkv_split_shapes) == 0:
-                    param.is_qkv = True
-                    param.qkv_split_shapes = qkv_split_shapes
-                else:
-                    log_single_rank(
-                        logger,
-                        logging.DEBUG,
-                        f"Emerging optimizer QKV split skipped for {name}: "
-                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
-                    )
+    if eopt_name in ('muon', 'adaptive_muon'):
+        _tag_muon_split_qkv_parameters(config, model_chunks)
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
     config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
