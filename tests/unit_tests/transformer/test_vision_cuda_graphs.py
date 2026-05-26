@@ -278,10 +278,19 @@ class TestVisionTECudaGraphHelper:
         self.micro_batch_size = 2
 
     def teardown_method(self, method):
+        destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
         gc.collect()
 
     def _make_helper(self, num_microbatches=1):
+        destroy_num_microbatches_calculator()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=self.micro_batch_size * num_microbatches,
+            micro_batch_size=self.micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
         return VisionTECudaGraphHelper(
             model=[self.llava_model],
             vision_config=self.vision_config,
@@ -358,8 +367,6 @@ class TestVisionTECudaGraphHelper:
         assert sample_kwargs_list == []
 
     # -- create_cudagraphs / delete_cuda_graphs lifecycle --
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
@@ -396,8 +403,6 @@ class TestVisionTECudaGraphHelper:
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
     )
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_create_cudagraphs_multi_microbatch(self):
         """Verify that graphs are created per-microbatch per-layer."""
         self.llava_model.cuda()
