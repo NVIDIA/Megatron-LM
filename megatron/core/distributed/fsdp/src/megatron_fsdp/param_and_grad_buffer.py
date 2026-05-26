@@ -1404,6 +1404,12 @@ def _get_parameter_groups(
 
     is_expert_parameter = lambda n, p: ".experts." in n
 
+    def _get_csf_base(group: ParameterGroup, param: torch.nn.Parameter) -> int:
+        shape = to_local_if_dtensor(param).shape
+        if group.is_expert_param and len(shape) > 1:
+            return shape[-1]
+        return shape[1:].numel()
+
     # Step 1: Group the parameters according to their execution order and attributes.
     # FSDP unit module parameters are split into multiple parameter sub-groups.
     # All parameters in the module are assigned a parameter group, even non-FSDP modules.
@@ -1494,26 +1500,25 @@ def _get_parameter_groups(
     # Step 3: Split parameter groups to meet communication segmentation requirements.
     new_bucket_groups = []
     for group in bucket_groups:
-        params = sorted(
-            group.params, key=lambda p: to_local_if_dtensor(p).shape[1:].numel(), reverse=True
-        )
+        params = sorted(group.params, key=lambda p: _get_csf_base(group, p), reverse=True)
         while len(params) > 0:
-            chunk_size_factor = to_local_if_dtensor(params[0]).shape[1:].numel()
+            chunk_size_factor = _get_csf_base(group, params[0])
             same_factor_params = []
             remaining_params = []
             for param in params:
                 param_shape = to_local_if_dtensor(param).shape
+                param_csf_base = _get_csf_base(group, param)
                 if (
-                    param_shape[1:].numel() == chunk_size_factor
+                    param_csf_base == chunk_size_factor
                     or (
-                        chunk_size_factor % param_shape[1:].numel() == 0
+                        chunk_size_factor % param_csf_base == 0
                         and param_shape.numel() % chunk_size_factor == 0
                     )
                     or (param_shape.numel() < chunk_size_factor)
                 ):
                     same_factor_params.append(param)
                 else:
-                    lcm_chunk_size_factor = math.lcm(chunk_size_factor, param_shape[1:].numel())
+                    lcm_chunk_size_factor = math.lcm(chunk_size_factor, param_csf_base)
                     chunk_size_factor = lcm_chunk_size_factor
                     same_factor_params.append(param)
             # Create a new parameter group with the same chunk size factor.
