@@ -11,6 +11,7 @@ spec:
   n_repeat: 1
   platforms: dgx_a100
   script_setup: |
+    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -33,6 +34,7 @@ spec:
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
+    set -euo pipefail
     ls
     cd /opt/megatron-lm
 
@@ -48,8 +50,8 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "INFERENCE_OUTPUT_PATH={assets_dir}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -71,6 +73,107 @@ products:
         scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_logitsmatch_decode_graphs_only]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_flashinfer]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_chunked_prefill]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_chunked_prefill]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_cuda_graphs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_chunked_prefill_cuda_graphs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  # ===== Round 2 (Tier 2) - parallelism x feature, 3-way combos, sampling, memory variants =====
+  - test_case: [gpt_dynamic_inference_tp2_pp2_583m_prefix_caching]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp8_pp1_583m_prefix_caching]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp8_583m_prefix_caching]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp2_pp2_583m_chunked_prefill]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp4_pp1_583m_flashinfer]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp2_pp2_583m_cuda_graphs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_chunked_prefill_cuda_graphs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp2_pp2_583m_prefix_caching_cuda_graphs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_chunked_prefill_flashinfer]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_top_p_sampling]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_stop_words]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_top_n_logprobs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_lru]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_uvm_level1]
     products:
       - environment: [dev]
         scope: [mr]

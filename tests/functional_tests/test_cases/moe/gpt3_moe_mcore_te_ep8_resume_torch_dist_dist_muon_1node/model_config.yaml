@@ -66,4 +66,5 @@ MODEL_ARGS:
   --dist-ckpt-use-dtensor-format: true
   --use-persistent-ckpt-worker: true
   --use-distributed-optimizer: true
+  --no-use-layer-wise-param-layout: true
 TEST_TYPE: ckpt-resume

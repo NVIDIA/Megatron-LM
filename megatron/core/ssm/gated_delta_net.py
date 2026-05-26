@@ -85,6 +85,7 @@ class GatedDeltaNet(MegatronModule):
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
+        name: str | None = None,
     ):
         """
         Args:
@@ -98,6 +99,7 @@ class GatedDeltaNet(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            name (str | None): module instance name passed top-down from its paranet module
         """
 
         if not HAVE_FLA:
@@ -158,6 +160,7 @@ class GatedDeltaNet(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            name=(name + ".in_proj") if name is not None else None,
         )
 
         # Conv1d for QKV
@@ -230,6 +233,7 @@ class GatedDeltaNet(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            name=(name + ".out_proj") if name is not None else None,
         )
 
         self.reset_parameters()

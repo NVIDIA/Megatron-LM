@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
@@ -36,6 +37,11 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
     skip_routed_expert_padding,
+)
+from megatron.core.transformer.moe.paged_stash import (
+    get_paged_stash_context,
+    paged_stash_group_commit,
+    paged_stash_group_start,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
@@ -102,6 +108,7 @@ class GroupedLinearFc1Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> GroupedLinearFc1Interface:
         """Builds a linear_fc1 layer for TEGroupedMLP."""
         ...
@@ -138,6 +145,7 @@ class GroupedLinearFc2Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> GroupedLinearFc2Interface:
         """Builds a linear_fc2 layer for TEGroupedMLP."""
         ...
@@ -173,7 +181,12 @@ class TEGroupedMLP(MegatronModule):
         config: TransformerConfig,
         submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
@@ -200,6 +213,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc1',
             pg_collection=pg_collection,
+            name=(name + ".linear_fc1") if name is not None else None,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -222,6 +236,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc2',
             pg_collection=pg_collection,
+            name=(name + ".linear_fc2") if name is not None else None,
         )
 
         self.offload_expert_fc1 = (
@@ -505,19 +520,40 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = torch.tensor(
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
+        # if the number of tokens is 0, pad the hidden states to 256
 
-        # Call fused impl
-        output = ops(
-            permuted_local_hidden_states,
-            tokens_per_expert,  # FC1
-            permuted_probs,  # Scaled SwiGLU
-            tokens_per_expert,  # FC2
-        )
-
+        if self.config.moe_paged_stash:
+            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+            max_num_tokens = permuted_local_hidden_states.shape[0]
+            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+            cap_factor = self.config.moe_expert_rank_capacity_factor
+            avg_num_tokens = (
+                int(max_num_tokens // cap_factor)
+                if cap_factor is not None and cap_factor > 0
+                else None
+            )
+            stash_context = get_paged_stash_context(
+                name="grouped_mlp",
+                max_num_tokens=max_num_tokens,
+                num_tokens_tensor=tokens_per_expert.sum(),
+                avg_num_tokens=avg_num_tokens,
+            )
+        else:
+            stash_context = nullcontext()
+        with stash_context:
+            # Call fused impl
+            output = ops(
+                permuted_local_hidden_states,
+                tokens_per_expert,  # FC1
+                permuted_probs,  # Scaled SwiGLU
+                tokens_per_expert,  # FC2
+            )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
-
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
 
     @staticmethod
@@ -790,6 +826,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         config: TransformerConfig,
         submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
         # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
         super().__init__(
@@ -797,6 +834,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             config=config,
             submodules=submodules,
             pg_collection=pg_collection,
+            name=name,
         )
 
         # Concatenated weights are built lazily on first forward to ensure
@@ -1052,6 +1090,7 @@ class SequentialMLP(MegatronModule):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
 
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
@@ -1071,13 +1110,14 @@ class SequentialMLP(MegatronModule):
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
         self.dp_group = pg_collection.expt_dp
 
-        for _ in range(self.num_local_experts):
+        for expert_idx in range(self.num_local_experts):
             expert = MLP(
                 self.config,
                 submodules,
                 ffn_hidden_size=self.config.moe_ffn_hidden_size,
                 is_expert=True,
                 tp_group=pg_collection.expt_tp,
+                name=(name + f".local_experts.{expert_idx}") if name is not None else None,
             )
             self.local_experts.append(expert)
 
