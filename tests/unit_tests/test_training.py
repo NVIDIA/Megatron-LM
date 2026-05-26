@@ -26,10 +26,13 @@ from megatron.training.training import (
     dummy_train_step,
     num_floating_point_operations,
     post_training_step_callbacks,
+    pretrain,
     preprocess_common_state_dict,
     save_checkpoint_and_time,
     should_disable_forward_pre_hook,
     setup_model_and_optimizer,
+    train,
+    train_step,
     training_log,
     update_train_iters,
 )
@@ -328,6 +331,101 @@ def test_update_train_iters_constant_and_rampup(monkeypatch):
 
     assert rampup.train_iters == 4
     assert calls == [0, 2, 4, 0]
+
+
+def test_pretrain_skip_train_runs_validation_test_and_shutdown(monkeypatch):
+    calls = []
+    real_tensor = torch.tensor
+    args = SimpleNamespace(
+        fine_grained_activation_offloading=False,
+        log_progress=False,
+        non_persistent_ckpt_type=None,
+        perform_rl_step=False,
+        virtual_pipeline_model_parallel_size=None,
+        skip_train=True,
+        iteration=4,
+        train_iters=None,
+        do_train=True,
+        do_valid=True,
+        do_test=True,
+        dataloader_type=None,
+        save=None,
+    )
+
+    def cpu_tensor(*items, **kwargs):
+        kwargs.pop("device", None)
+        return real_tensor(*items, **kwargs)
+
+    class FakeTimer:
+        def start(self, barrier=False):
+            calls.append(("timer-start", barrier))
+
+        def stop(self):
+            calls.append("timer-stop")
+
+        def set_elapsed(self, value):
+            calls.append(("timer-set", value))
+
+    class FakeTimers:
+        def __call__(self, name, log_level=None):
+            calls.append(("timer", name, log_level))
+            return FakeTimer()
+
+        def log(self, names, barrier=False):
+            calls.append(("timer-log", tuple(names), barrier))
+
+    class FakeWandb:
+        config = SimpleNamespace(update=lambda values: calls.append(("wandb-config", values)))
+
+        def finish(self):
+            calls.append("wandb-finish")
+
+    model = [SimpleNamespace()]
+    config = SimpleNamespace()
+    monkeypatch.setitem(training._STARTUP_TIMESTAMPS, "program_start", None)
+    monkeypatch.setitem(training._STARTUP_TIMESTAMPS, "main_entry", None)
+    monkeypatch.setitem(training._STARTUP_TIMESTAMPS, "pretrain_entry", None)
+    monkeypatch.setattr(training.torch, "tensor", cpu_tensor)
+    monkeypatch.setattr(training.torch.distributed, "all_reduce", lambda tensor, op=None: calls.append(("all-reduce", tensor.item())))
+    monkeypatch.setattr(training, "initialize_megatron", lambda **kwargs: calls.append(("init", kwargs["store"])))
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", lambda: FakeTimers())
+    monkeypatch.setattr(training, "set_jit_fusion_options", lambda: calls.append("jit"))
+    monkeypatch.setattr(training, "set_startup_timestamps", lambda **kwargs: calls.append(("startup", kwargs.get("program_start"))))
+    monkeypatch.setattr(training, "print_rank_0", lambda message: calls.append(("print0", message)))
+    monkeypatch.setattr(training, "print_datetime", lambda *items, **kwargs: calls.append(("datetime", items[0])))
+    monkeypatch.setattr(training.one_logger_utils, "get_timestamp_in_ms", lambda: 123)
+    monkeypatch.setattr(training.one_logger_utils, "on_pretrain_start", lambda: calls.append("pretrain-start"))
+    monkeypatch.setattr(training.one_logger_utils, "track_config_flags", lambda *items: calls.append(("flags", items)))
+    monkeypatch.setattr(training.one_logger_utils, "finish", lambda: calls.append("one-finish"))
+    monkeypatch.setattr(training, "setup_model_and_optimizer", lambda *items, **kwargs: (model, "optimizer", "scheduler"))
+    monkeypatch.setattr(training, "get_model_config", lambda model: config)
+    monkeypatch.setattr(training, "build_train_valid_test_data_iterators", lambda provider: ("train-iter", "valid-iter", "test-iter"))
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "get_wandb_writer", lambda: FakeWandb())
+    monkeypatch.setattr(training.ft_integration, "setup", lambda: calls.append("ft-setup"))
+    monkeypatch.setattr(training.ft_integration, "on_checkpointing_start", lambda: calls.append("ft-ckpt-start"))
+    monkeypatch.setattr(training.ft_integration, "on_checkpointing_end", lambda **kwargs: calls.append(("ft-ckpt-end", kwargs.get("is_async_finalization"))))
+    monkeypatch.setattr(training.ft_integration, "shutdown", lambda: calls.append("ft-shutdown"))
+    monkeypatch.setattr(training, "maybe_finalize_async_save", lambda **kwargs: calls.append(("finalize", kwargs)))
+    monkeypatch.setattr(training, "evaluate_and_print_results", lambda *items, **kwargs: calls.append(("eval-print", items[0], kwargs["write_to_tensorboard"])))
+
+    pretrain(
+        lambda samples: None,
+        lambda: None,
+        training.ModelType.encoder_or_decoder,
+        lambda *_: None,
+        store="store",
+    )
+
+    assert ("init", "store") in calls
+    assert "jit" in calls
+    assert ("flags", (None, True, True, True, True, None)) in calls
+    assert ("eval-print", "iteration 4 on validation set", False) in calls
+    assert ("eval-print", "iteration 4 on test set", False) in calls
+    assert "wandb-finish" in calls
+    assert "ft-shutdown" in calls
+    assert "one-finish" in calls
 
 
 def test_checkpoint_and_decide_exit_save_and_iteration_paths(monkeypatch):
@@ -1055,6 +1153,377 @@ def test_dummy_train_step_consumes_microbatches_until_rerun_stops(monkeypatch):
         ("tp", "iterator"),
         ("cp", "batch"),
     ]
+
+
+def test_train_step_success_path_averages_losses_and_steps_scheduler(monkeypatch):
+    calls = []
+    args = SimpleNamespace(
+        save_dgrads_interval=None,
+        save_wgrads_interval=None,
+        seq_length=8,
+        micro_batch_size=2,
+        decoder_seq_length=None,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
+        overlap_param_gather=False,
+        save=None,
+        empty_unused_memory_level=0,
+        vision_pretraining=False,
+        vision_pretraining_type=None,
+        barrier_with_L1_time=False,
+        qk_clip=False,
+        log_max_attention_logit=False,
+        log_num_zeros_in_grad=True,
+        curr_iteration=0,
+        data_parallel_size=2,
+    )
+
+    class FakeTimer:
+        def __init__(self, name):
+            self.name = name
+
+        def start(self, barrier=False):
+            calls.append(("timer-start", self.name, barrier))
+
+        def stop(self):
+            calls.append(("timer-stop", self.name))
+
+    class FakeTimers:
+        def __call__(self, name, log_level=None):
+            calls.append(("timer", name, log_level))
+            return FakeTimer(name)
+
+    class FakeRerunStateMachine:
+        def __init__(self):
+            self.runs = 0
+
+        def should_run_forward_backward(self, iterator):
+            self.runs += 1
+            return self.runs == 1
+
+        def should_checkpoint_and_exit(self):
+            return False, False, 0
+
+    class FakeModelChunk:
+        force_all_reduce = None
+
+        def zero_grad_buffer(self):
+            calls.append("zero-grad-buffer")
+
+    class FakeOptimizer:
+        def zero_grad(self):
+            calls.append("optimizer-zero-grad")
+
+        def step(self):
+            calls.append("optimizer-step")
+            return True, 1.5, 2
+
+    class FakeScheduler:
+        def step(self, increment):
+            calls.append(("scheduler-step", increment))
+
+    def fake_forward_backward(**kwargs):
+        calls.append(("forward-backward", kwargs["num_microbatches"], kwargs["force_all_reduce"]))
+        return [
+            {"lm loss": torch.tensor([2.0])},
+            {"lm loss": torch.tensor([4.0])},
+        ]
+
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", lambda: FakeTimers())
+    monkeypatch.setattr(training, "get_rerun_state_machine", lambda: FakeRerunStateMachine())
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 2)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "logical_and_across_model_parallel_group", lambda value: value)
+    monkeypatch.setattr(training, "reduce_max_stat_across_model_parallel_group", lambda value: value)
+    monkeypatch.setattr(training.mpu, "is_pipeline_last_stage", lambda ignore_virtual=True: True)
+
+    loss_dict, skipped, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros, max_logit = train_step(
+        lambda *_: None,
+        "data-iter",
+        [FakeModelChunk()],
+        FakeOptimizer(),
+        FakeScheduler(),
+        SimpleNamespace(),
+        fake_forward_backward,
+        iteration=0,
+    )
+
+    assert loss_dict["lm loss"].item() == pytest.approx(3.0)
+    assert skipped == 0
+    assert not should_checkpoint
+    assert not should_exit
+    assert exit_code == 0
+    assert grad_norm == 1.5
+    assert num_zeros == 2
+    assert max_logit == 0
+    assert "zero-grad-buffer" in calls
+    assert "optimizer-zero-grad" in calls
+    assert "optimizer-step" in calls
+    assert ("scheduler-step", 4) in calls
+    assert ("forward-backward", 2, False) in calls
+
+
+def test_train_single_iteration_control_flow(monkeypatch):
+    calls = []
+    args = SimpleNamespace(
+        perform_rl_step=False,
+        hybrid_context_parallel=False,
+        run_workload_inspector_server=False,
+        iteration=0,
+        consumed_train_samples=0,
+        train_samples=None,
+        train_iters=1,
+        save=None,
+        async_save=False,
+        log_throughput=True,
+        num_floating_point_operations_so_far=0.0,
+        seq_length=8,
+        overlap_grad_reduce=False,
+        align_grad_reduce=False,
+        overlap_param_gather=False,
+        align_param_gather=False,
+        log_energy=False,
+        manual_gc=False,
+        log_straggler=False,
+        cuda_graph_impl=None,
+        cuda_graph_scope=[],
+        cuda_graph_warmup_steps=0,
+        optimizer_cuda_graph=False,
+        profile=False,
+        profile_ranks=[],
+        use_pytorch_profiler=False,
+        check_weight_hash_across_dp_replicas_interval=None,
+        distributed_timeout_seconds_after_init=None,
+        rl_use_sequence_packing=False,
+        iterations_to_skip=[],
+        skip_train=False,
+        micro_batch_size=2,
+        decrease_batch_size_if_needed=False,
+        skipped_train_samples=0,
+        log_params_norm=False,
+        eval_interval=1,
+        do_valid=True,
+        manual_gc_eval=False,
+        num_experts=None,
+        save_interval=None,
+        exit_signal_handler=False,
+        non_persistent_save_interval=None,
+        exit_duration_in_mins=None,
+        exit_interval=None,
+        phase_transition_iterations=None,
+    )
+
+    class FakeTimer:
+        def __init__(self, name):
+            self.name = name
+
+        def start(self, barrier=False):
+            calls.append(("timer-start", self.name, barrier))
+
+        def stop(self):
+            calls.append(("timer-stop", self.name))
+
+        def elapsed(self):
+            calls.append(("timer-elapsed", self.name))
+            return 0.25
+
+        def active_time(self):
+            return 1.0
+
+    class FakeTimers:
+        def __call__(self, name, log_level=None):
+            return FakeTimer(name)
+
+    class FakeModel:
+        def train(self):
+            calls.append("model-train")
+
+    class FakeRerunStateMachine:
+        current_iteration = 0
+
+    class FakeOptimizer:
+        is_stub_optimizer = False
+        param_groups = [{"lr": 0.01}]
+
+        def scale_loss(self, loss):
+            return loss
+
+        def get_loss_scale(self):
+            return torch.tensor(1.0)
+
+    config = SimpleNamespace(
+        grad_scale_func=None,
+        timers=None,
+        no_sync_func=None,
+        param_sync_func="param-sync",
+        finalize_model_grads_func=None,
+    )
+
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", lambda: FakeTimers())
+    monkeypatch.setattr(training, "get_energy_monitor", lambda: SimpleNamespace())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "write_args_to_tensorboard", lambda: calls.append("write-args"))
+    monkeypatch.setattr(training, "get_attr_wrapped_model", lambda model, name: "pg")
+    monkeypatch.setattr(training, "get_rerun_state_machine", lambda: FakeRerunStateMachine())
+    monkeypatch.setattr(training.one_logger_utils, "on_train_start", lambda **kwargs: calls.append(("train-start", kwargs["train_iters"])))
+    monkeypatch.setattr(training.one_logger_utils, "track_e2e_metrics", lambda *items: calls.append(("e2e", items)))
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_forward_backward_func", lambda: "forward-backward")
+    monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda args: False)
+    monkeypatch.setattr(training, "update_num_microbatches", lambda *items, **kwargs: calls.append(("update-mbs", kwargs.get("consistency_check"))))
+    monkeypatch.setattr(training.ft_integration, "on_checkpointing_start", lambda: calls.append("ckpt-start"))
+    monkeypatch.setattr(training.ft_integration, "on_checkpointing_end", lambda **kwargs: calls.append(("ckpt-end", kwargs.get("is_async_finalization"))))
+    monkeypatch.setattr(training.ft_integration, "on_training_step_start", lambda: calls.append("step-start"))
+    monkeypatch.setattr(training.ft_integration, "on_training_step_end", lambda: calls.append("step-end"))
+    monkeypatch.setattr(training, "maybe_finalize_async_save", lambda **kwargs: calls.append(("finalize", kwargs)))
+    monkeypatch.setattr(
+        training,
+        "train_step",
+        lambda *items, **kwargs: ({"lm loss": torch.tensor([1.0])}, 0, False, False, 0, 1.0, 0, 2.0),
+    )
+    monkeypatch.setattr(training.mpu, "get_data_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 2)
+    monkeypatch.setattr(training, "get_current_running_global_batch_size", lambda: 2)
+    monkeypatch.setattr(training, "num_floating_point_operations", lambda args, batch_size: 100.0)
+    monkeypatch.setattr(training, "get_canonical_lr_for_logging", lambda param_groups: 0.01)
+    monkeypatch.setattr(training, "training_log", lambda *items, **kwargs: calls.append(("training-log", items[3])) or False)
+    monkeypatch.setattr(training, "evaluate_and_print_results", lambda *items, **kwargs: calls.append(("evaluate", items[0], items[4])))
+    monkeypatch.setattr(training, "post_training_step_callbacks", lambda *items, **kwargs: calls.append(("post", items[3])) or items[5])
+    monkeypatch.setattr(training, "checkpoint_and_decide_exit", lambda *items, **kwargs: calls.append(("checkpoint", items[3])) or False)
+    monkeypatch.setattr(training, "get_tensorboard_writer", lambda: SimpleNamespace(flush=lambda: calls.append("flush")))
+    monkeypatch.setattr(training, "print_datetime", lambda *items, **kwargs: calls.append(("print-datetime", items[0])))
+
+    iteration, flops = train(
+        lambda *_: None,
+        [FakeModel()],
+        FakeOptimizer(),
+        SimpleNamespace(step=lambda increment: calls.append(("scheduler-step", increment))),
+        "train-iter",
+        "valid-iter",
+        None,
+        config,
+        {},
+        None,
+    )
+
+    assert iteration == 1
+    assert flops == 100.0
+    assert "model-train" in calls
+    assert ("train-start", 1) in calls
+    assert ("training-log", 1) in calls
+    assert ("evaluate", "iteration 1", 1) in calls
+    assert ("checkpoint", 1) in calls
+    assert "flush" in calls
+
+
+def test_train_skip_iteration_and_exit_path(monkeypatch):
+    calls = []
+    args = SimpleNamespace(
+        perform_rl_step=False,
+        hybrid_context_parallel=False,
+        run_workload_inspector_server=False,
+        iteration=0,
+        consumed_train_samples=0,
+        train_samples=None,
+        train_iters=1,
+        save=None,
+        async_save=False,
+        log_throughput=False,
+        num_floating_point_operations_so_far=0.0,
+        seq_length=8,
+        overlap_grad_reduce=False,
+        align_grad_reduce=False,
+        overlap_param_gather=False,
+        align_param_gather=False,
+        log_energy=False,
+        manual_gc=False,
+        log_straggler=False,
+        cuda_graph_impl=None,
+        cuda_graph_scope=[],
+        cuda_graph_warmup_steps=0,
+        optimizer_cuda_graph=False,
+        profile=False,
+        profile_ranks=[],
+        use_pytorch_profiler=False,
+        check_weight_hash_across_dp_replicas_interval=None,
+        distributed_timeout_seconds_after_init=None,
+        rl_use_sequence_packing=False,
+        iterations_to_skip=[1],
+        skip_train=False,
+        micro_batch_size=2,
+        decrease_batch_size_if_needed=False,
+        skipped_train_samples=0,
+        log_params_norm=False,
+        eval_interval=None,
+        do_valid=False,
+        manual_gc_eval=False,
+        num_experts=None,
+        save_interval=None,
+        exit_signal_handler=False,
+        non_persistent_save_interval=None,
+        exit_duration_in_mins=None,
+        exit_interval=None,
+        phase_transition_iterations=None,
+    )
+
+    class FakeTimer:
+        def start(self, barrier=False):
+            pass
+
+        def stop(self):
+            pass
+
+        def active_time(self):
+            return 0.0
+
+    class FakeTimers:
+        def __call__(self, *items, **kwargs):
+            return FakeTimer()
+
+    class FakeModel:
+        def train(self):
+            calls.append("train-mode")
+
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", lambda: FakeTimers())
+    monkeypatch.setattr(training, "get_energy_monitor", lambda: SimpleNamespace())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "write_args_to_tensorboard", lambda: None)
+    monkeypatch.setattr(training, "get_attr_wrapped_model", lambda model, name: "pg")
+    monkeypatch.setattr(training, "get_rerun_state_machine", lambda: SimpleNamespace(current_iteration=0))
+    monkeypatch.setattr(training.one_logger_utils, "on_train_start", lambda **kwargs: None)
+    monkeypatch.setattr(training.one_logger_utils, "track_e2e_metrics", lambda *items: calls.append("e2e"))
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_forward_backward_func", lambda: "forward-backward")
+    monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda args: False)
+    monkeypatch.setattr(training, "update_num_microbatches", lambda *items, **kwargs: None)
+    monkeypatch.setattr(training.ft_integration, "on_checkpointing_start", lambda: None)
+    monkeypatch.setattr(training.ft_integration, "on_checkpointing_end", lambda **kwargs: None)
+    monkeypatch.setattr(training, "maybe_finalize_async_save", lambda **kwargs: None)
+    monkeypatch.setattr(training, "dummy_train_step", lambda iterator: calls.append(("dummy", iterator)))
+    monkeypatch.setattr(training.mpu, "get_data_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(training, "get_tensorboard_writer", lambda: None)
+    monkeypatch.setattr(training, "print_datetime", lambda *items, **kwargs: None)
+
+    iteration, flops = train(
+        lambda *_: None,
+        [FakeModel()],
+        None,
+        None,
+        "train-iter",
+        None,
+        None,
+        SimpleNamespace(grad_scale_func=None, timers=None, no_sync_func=None, param_sync_func=None, finalize_model_grads_func=None),
+        {},
+        None,
+    )
+
+    assert iteration == 1
+    assert flops == 0.0
+    assert args.consumed_train_samples == 2
+    assert args.skipped_train_samples == 2
+    assert ("dummy", "train-iter") in calls
 
 
 def test_training_log_updates_accumulators_and_writers(monkeypatch):

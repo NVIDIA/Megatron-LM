@@ -358,6 +358,91 @@ def test_print_params_min_max_norm_emits_parameter_statistics(monkeypatch, capsy
     assert "-2.000000E+00" in output
 
 
+def test_get_batch_on_this_tp_rank_broadcasts_rank_zero_batch(monkeypatch):
+    calls = []
+    args = SimpleNamespace(
+        hybrid_context_parallel=True,
+        pipeline_model_parallel_size=1,
+    )
+
+    class FakeCudaTensor:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def cuda(self, non_blocking=False):
+            calls.append(("cuda", tuple(self.tensor.shape), non_blocking))
+            return self.tensor
+
+    batch = {
+        "tokens": FakeCudaTensor(torch.ones((3, 2), dtype=torch.long)),
+        "labels": FakeCudaTensor(torch.full((3, 2), 2, dtype=torch.long)),
+        "loss_mask": FakeCudaTensor(torch.ones((3, 2), dtype=torch.float32)),
+        "attention_mask": FakeCudaTensor(torch.ones((1, 1, 3, 3), dtype=torch.bool)),
+        "position_ids": FakeCudaTensor(torch.arange(6, dtype=torch.long).view(3, 2)),
+        "max_seqlen": FakeCudaTensor(torch.tensor([3], dtype=torch.int32)),
+        "local_cp_size": FakeCudaTensor(torch.tensor([1], dtype=torch.int32)),
+    }
+
+    monkeypatch.setattr(utils, "get_args", lambda: args)
+    monkeypatch.setattr(utils.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(utils.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(utils.mpu, "get_tensor_model_parallel_group", lambda: "tp-group")
+    monkeypatch.setattr(utils.torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(
+        utils.torch.distributed,
+        "broadcast",
+        lambda item, src, group=None: calls.append((tuple(item.shape), item.dtype, src, group)),
+    )
+
+    result = utils.get_batch_on_this_tp_rank(iter([batch]))
+
+    assert result["tokens"].shape == (3, 2)
+    assert result["labels"].tolist() == [[2, 2], [2, 2], [2, 2]]
+    assert result["cu_seqlens"] is None
+    assert ((3, 2), torch.int64, 0, "tp-group") in calls
+    assert ((), torch.int64, 0, "tp-group") in calls
+    assert ((0,), torch.int32, 0, "tp-group") in calls
+    assert ((1,), torch.int32, 0, "tp-group") in calls
+
+
+def test_get_batch_on_this_tp_rank_receives_nonzero_rank_batch(monkeypatch):
+    calls = []
+    args = SimpleNamespace(
+        hybrid_context_parallel=False,
+        pipeline_model_parallel_size=1,
+        micro_batch_size=2,
+        seq_length=3,
+        create_attention_mask_in_dataloader=True,
+        sft=True,
+    )
+
+    def fake_broadcast(item, src, group=None):
+        calls.append((tuple(item.shape), item.dtype, src, group))
+        if item.shape == () and item.dtype == torch.int64:
+            item.fill_(0)
+
+    monkeypatch.setattr(utils, "get_args", lambda: args)
+    monkeypatch.setattr(utils.mpu, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(utils.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(utils.mpu, "get_tensor_model_parallel_group", lambda: "tp-group")
+    monkeypatch.setattr(utils.torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(utils.torch.distributed, "broadcast", fake_broadcast)
+
+    result = utils.get_batch_on_this_tp_rank(iter([]))
+
+    assert result["tokens"].shape == (2, 3)
+    assert result["labels"].shape == (2, 3)
+    assert result["loss_mask"].shape == (2, 3)
+    assert result["attention_mask"].shape == (2, 1, 3, 3)
+    assert result["position_ids"].shape == (2, 3)
+    assert result["cu_seqlens"] is None
+    assert result["max_seqlen"].shape == (1,)
+    assert result["local_cp_size"] is None
+    assert ((2, 3), torch.int64, 0, "tp-group") in calls
+    assert ((2, 1, 3, 3), torch.bool, 0, "tp-group") in calls
+    assert ((0,), torch.int32, 0, "tp-group") in calls
+
+
 def test_check_adlr_autoresume_termination_saves_and_exits(monkeypatch):
     calls = []
     autoresume = SimpleNamespace(
