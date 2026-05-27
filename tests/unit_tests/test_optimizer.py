@@ -23,10 +23,7 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
-from megatron.core.optimizer.optimizer import (
-    MegatronOptimizer,
-    get_param_group_identifier_tuple,
-)
+from megatron.core.optimizer.optimizer import MegatronOptimizer, get_param_group_identifier_tuple
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -141,9 +138,7 @@ def test_param_group_matching_normalizes_legacy_missing_identifier_fields():
         "is_decoupled_lr": False,
         "params": [0],
     }
-    legacy_checkpoint_group = {
-        "params": [7],
-    }
+    legacy_checkpoint_group = {"params": [7]}
 
     assert get_param_group_identifier_tuple(current_group) == get_param_group_identifier_tuple(
         legacy_checkpoint_group
