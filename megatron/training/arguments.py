@@ -1285,6 +1285,12 @@ def validate_args(args, defaults={}):
         args.fsdp_manual_registration = True
         warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
 
+        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+            raise ValueError(
+                "Meta device initialization (init_model_with_meta_device=True) is not "
+                "supported or necessary for the 'no_shard' / 0 sharding strategy."
+            )
+
     if args.fsdp_manual_registration:
         assert (
             args.use_megatron_fsdp
@@ -2489,6 +2495,7 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        "apply_dsa_kernel_fusion",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -4523,6 +4530,13 @@ def _add_experimental_attention_variant_args(parser):
         'Each value is the compression ratio for the corresponding '
         'transformer layer (valid values: 0, 4, 128). '
         'The list length must equal num_layers.',
+    )
+    group.add_argument(
+        '--no-dsa-kernel-fusion',
+        action='store_false',
+        help='Disable fused DSA sparse-attention kernels (FlashMLA + cuDNN DSA) '
+        'and fall back to unfused PyTorch implementations.',
+        dest='apply_dsa_kernel_fusion',
     )
     return parser
 
