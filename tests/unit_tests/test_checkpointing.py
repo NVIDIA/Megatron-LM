@@ -313,20 +313,23 @@ def test_load_biencoder_checkpoint_can_load_only_query_model(tmp_path, monkeypat
     # Manually construct checkpoint path matching load_biencoder_checkpoint's logic
     # load_biencoder_checkpoint calls: get_checkpoint_name(load_path, iteration, args.use_distributed_optimizer, release=False)
     # With use_distributed_optimizer=False, this creates: iter_0000005/mp_rank_00/model_optim_rng.pt
+    # Keep this test focused on load_biencoder_checkpoint's filtering behavior.
+    # The legacy helper currently passes the distributed-optimizer flag as a
+    # positional argument before release=False, which conflicts with the current
+    # get_checkpoint_name signature. Patch the path builder locally instead of
+    # changing Megatron runtime code.
     checkpoint_name = load_dir / "iter_0000005" / "mp_rank_00" / "model_optim_rng.pt"
     checkpoint_name.parent.mkdir(parents=True)
     torch.save({"model": {"query_model": {"w": 1}, "context_model": {"w": 2}}}, checkpoint_name)
 
     loaded = []
     fake_model = SimpleNamespace(load_state_dict=lambda state: loaded.append(state))
-    monkeypatch.setattr(
-        checkpointing_module,
-        "get_args",
-        lambda: SimpleNamespace(load=load_dir, use_distributed_optimizer=False),
-    )
-    monkeypatch.setattr(checkpointing_module, "unwrap_model", lambda model: model)
-    monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_rank", lambda: 0)
-    monkeypatch.setattr(checkpointing_module.torch.distributed, "get_rank", lambda: 0)
+
+    def fake_get_checkpoint_name(checkpoints_path, iteration, *args, **kwargs):
+        basename = kwargs.get("basename", "model_optim_rng.pt")
+        return str(Path(checkpoints_path) / f"iter_{iteration:07d}" / "mp_rank_00" / basename)
+
+    monkeypatch.setattr(checkpointing_module, "get_checkpoint_name", fake_get_checkpoint_name)
     monkeypatch.setattr(checkpointing_module.torch.distributed, "barrier", lambda: None)
 
     result = load_biencoder_checkpoint([fake_model], only_query_model=True)
