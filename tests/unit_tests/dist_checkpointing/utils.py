@@ -18,9 +18,9 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
 
 NUM_LAYERS = 8
 HIDDEN_SIZE = 16
