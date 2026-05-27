@@ -17,9 +17,10 @@ name: Nightly Sync Main to Dev
 on:
   workflow_dispatch:
   schedule:
-    # 21:00 UTC = 2 PM PDT (1 PM PST during winter — GitHub Actions cron
-    # is UTC-only and does not follow DST).
-    - cron: '0 21 * * *'
+    # Twice-weekly cadence: Monday and Thursday at 15:00 UTC.
+    # 15:00 UTC = 8 AM PDT (7 AM PST during winter — GitHub Actions cron
+    # is UTC-only and does not follow DST). Days-of-week: 1=Mon, 4=Thu.
+    - cron: '0 15 * * 1,4'
 
 concurrency:
   group: nightly-sync-main-to-dev
@@ -55,8 +56,10 @@ jobs:
 
   sync-main-to-dev:
     if: github.event_name == 'workflow_dispatch' && github.repository == 'NVIDIA/Megatron-LM'
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # GitHub-hosted runners are capped at 6h; use an NVIDIA runner so the
+    # sync bot can wait through long CI queues and retries.
+    runs-on: linux-amd64-cpu16
+    timeout-minutes: 720
     env:
       GH_TOKEN: ${{ secrets.PAT }}
     steps:
@@ -108,6 +111,76 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install pre-push merge guard
+        if: steps.check-sync.outputs.skip != 'true'
+        run: |
+          cat > .git/hooks/pre-push <<'HOOK'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "=== nightly-sync pre-push guard ==="
+
+          merge_commit=$(git rev-list --min-parents=2 --max-count=1 HEAD || true)
+          if [ -n "$merge_commit" ]; then
+            dev_ref="${merge_commit}^1"
+            main_ref="${merge_commit}^2"
+          else
+            dev_ref="origin/dev"
+            main_ref="origin/main"
+          fi
+
+          if ! git diff --quiet "$dev_ref" HEAD -- .github/CODEOWNERS; then
+            echo "ABORT: .github/CODEOWNERS differs from dev. Restore it before pushing."
+            exit 1
+          fi
+
+          for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
+            if ! git diff --quiet "$dev_ref" HEAD -- "$f"; then
+              echo "WARNING: $f differs from dev"
+            fi
+          done
+
+          if [ -z "$merge_commit" ]; then
+            echo "No merge commit found in HEAD history; skipping dev-feature audit."
+            exit 0
+          fi
+
+          intentional_override_regex='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
+          skip_regex='^(pyproject\.toml|uv\.lock|docker/Dockerfile\.ci\.dev|\.github/CODEOWNERS)$'
+
+          violations=0
+          while IFS= read -r f; do
+            [[ "$f" =~ $skip_regex ]] && continue
+            [[ "$f" =~ $intentional_override_regex ]] && continue
+            git cat-file -e "HEAD:$f" 2>/dev/null || continue
+
+            missing=$(comm -23 \
+                        <(git show "$dev_ref:$f" 2>/dev/null | sort -u) \
+                        <(git show "$main_ref:$f" 2>/dev/null | sort -u) \
+                      | comm -23 - <(git show "HEAD:$f" 2>/dev/null | sort -u) \
+                      | grep -E '[[:alnum:]_]' \
+                      || true)
+
+            if [ -n "$missing" ]; then
+              echo "=== $f ==="
+              printf '%s\n' "$missing"
+              violations=$((violations + $(printf '%s\n' "$missing" | grep -c .)))
+            fi
+          done < <(git diff --name-only "$dev_ref"..HEAD \
+                    -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
+                       '*.sh' '*.cpp' '*.cu' '*.h' \
+                    | sort -u)
+
+          if [ "$violations" -gt 0 ]; then
+            echo "ABORT: $violations dev-only line(s) were dropped by the merge."
+            echo "Restore the dev-only code, or document the exact main commit that intentionally removed it."
+            exit 1
+          fi
+
+          echo "nightly-sync pre-push guard passed"
+          HOOK
+          chmod +x .git/hooks/pre-push
+
       - name: Run Claude Code to merge, fix, and iterate
         if: steps.check-sync.outputs.skip != 'true'
         uses: anthropics/claude-code-action@v1
@@ -158,6 +231,21 @@ jobs:
             state). Do NOT break a long wait into many short polls with
             conversation in between — that wastes `--max-turns` and
             creates windows where the agent could forget the loop.
+
+            **Pre-push guard:** The workflow installs a local git pre-push
+            hook that enforces CODEOWNERS, dependency-triple, and dev-feature
+            preservation checks. You MUST NOT bypass it with `--no-verify`.
+            If a push fails, read the hook output, restore the dropped dev
+            code unless main explicitly removed it, and push again only after
+            the hook passes.
+
+            **Merge strategy:** Start from `origin/dev` and run
+            `git merge origin/main --no-edit`. Do NOT use global
+            `git merge -X theirs`. Main's version may be taken wholesale only
+            for files explicitly listed in the nightly-sync skill's
+            "Files to Override from Main" section. For other conflicts,
+            preserve recent dev-only additions and combine them with main's
+            incoming changes.
 
             **Source of truth for CI status:**
             `gh pr view <PR_NUMBER> --repo $REPO --json statusCheckRollup`
