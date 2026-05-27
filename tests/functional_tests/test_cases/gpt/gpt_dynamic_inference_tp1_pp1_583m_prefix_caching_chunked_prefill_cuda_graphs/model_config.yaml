@@ -19,12 +19,13 @@ MODEL_ARGS:
   --no-load-optim: true
   --no-use-tokenizer-model-from-checkpoint-args: true
   --timing-log-level: 0
-  --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
+  --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1
   --distributed-backend: nccl
   --log-interval: 1
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
+  --deterministic-mode: true
   --ckpt-format: torch_dist
   --bf16: true
   --log-memory-to-tensorboard: true
@@ -38,22 +39,20 @@ MODEL_ARGS:
   --seq-length: 1024
   --temperature: 1.0
   --top_k: 1
-  --seed: 42
   --return-log-probs: true
-  --num-tokens-from-file: true
+  --num-tokens-to-generate: 30
   --inference-dynamic-batching-buffer-size-gb: 20
-  --cuda-graph-impl: local
-  --cuda-graph-scope: full
-  --disable-chunked-prefill: true
+  --inference-dynamic-batching-max-tokens: 64
+  --inference-dynamic-batching-max-requests: 64
+  --enable-chunked-prefill: true
+  --enable-cuda-graph: true
+  --inference-dynamic-batching-prefix-caching: true
   --dist-ckpt-strictness: log_unexpected
-  --inference-ckpt-non-strict: true # To handle the extra_state errors
+  --inference-ckpt-non-strict: true
   --output-path: ${INFERENCE_OUTPUT_PATH}
-  --output-every-n-results: 32
-  --prompt-file: ${DATA_PATH}/text/sharegpt-vicuna/filtered/processed.jsonl
-  --prompt-file-num-truncate: 1024
-  --incoming-requests-per-step: 128
-  --use-flashinfer-fused-rope: true
-  --throughput-check-only: true
+  --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
+  --incoming-requests-per-sec: -1
+  --inference-repeat-n: 8
   --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"

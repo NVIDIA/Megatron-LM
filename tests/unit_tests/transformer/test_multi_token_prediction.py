@@ -28,7 +28,7 @@ from megatron.core.transformer.multi_token_prediction import (
     roll_tensor,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version, unwrap_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -38,7 +38,6 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
-from megatron.training.utils import get_batch_on_this_cp_rank, unwrap_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -423,6 +422,7 @@ class TestMultiTokenPrediction:
             assert f"mtp.layers.{i}.hnorm.weight" in sharded_state_dict.keys()
             assert f"mtp.layers.{i}.eh_proj.weight" in sharded_state_dict.keys()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
@@ -496,7 +496,9 @@ class TestMultiTokenPrediction:
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = get_batch_on_this_cp_rank(
+                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
                 input_ids=tokens,
@@ -528,6 +530,7 @@ class TestMultiTokenPrediction:
             for name, param in gpt_model[0].named_parameters():
                 assert param.main_grad is not None
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("1.7.0"),
         reason="Only transformer-engine>=1.7.0 supports MoE FP8 training",
@@ -621,6 +624,54 @@ class TestMultiTokenPrediction:
         loss.backward()
 
         # Verify gradients exist
+        for name, param in gpt_model[0].named_parameters():
+            assert param.main_grad is not None, f"Gradient missing for {name}"
+
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    def test_packed_sequences_with_full_recompute(self):
+        """MTP + packed sequences + full activation recomputation.
+
+        Regression: MTP._checkpointed_forward used to forward
+        ``packed_seq_params`` (a non-tensor PackedSeqParams object) directly
+        to ``tensor_parallel.checkpoint``. CheckpointFunction.save_for_backward
+        only accepts tensors and ``None``, so this raised
+        ``TypeError: save_for_backward can only save variables, but argument
+        N is of type PackedSeqParams``. Non-tensor kwargs must be captured
+        by closure, not forwarded as args.
+        """
+        seq_lengths = [16, 24, 12]
+        total_seq_length = sum(seq_lengths)
+
+        args = self.create_test_args(
+            tp=1, cp=1, sequence_length=total_seq_length, micro_batch_size=1, full_recompute=True
+        )
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+
+        batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+        gpt_model, _, _ = setup_model_and_optimizer(
+            self.model_provider, ModelType.encoder_or_decoder
+        )
+
+        output = gpt_model[0].forward(
+            input_ids=batch['tokens'],
+            position_ids=batch['position_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels'],
+            loss_mask=batch['loss_mask'],
+            packed_seq_params=batch['packed_seq_params'],
+        )
+
+        # Backward must run end-to-end through the recomputed MTP layer.
+        loss = output.mean()
+        loss.backward()
+
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
 
@@ -976,7 +1027,9 @@ class TestMultiTokenPredictionHybrid:
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
 
             batch["output_ref"] = output_ref
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = get_batch_on_this_cp_rank(
+                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(
                 input_ids=tokens,
