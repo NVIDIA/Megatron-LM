@@ -344,6 +344,7 @@ def test_pretrain_skip_train_runs_validation_test_and_shutdown(monkeypatch):
         virtual_pipeline_model_parallel_size=None,
         skip_train=True,
         iteration=4,
+        world_size=1,
         train_iters=None,
         do_train=True,
         do_valid=True,
@@ -375,7 +376,10 @@ def test_pretrain_skip_train_runs_validation_test_and_shutdown(monkeypatch):
             calls.append(("timer-log", tuple(names), barrier))
 
     class FakeWandb:
-        config = SimpleNamespace(update=lambda values: calls.append(("wandb-config", values)))
+        def __init__(self):
+            self.config = SimpleNamespace(
+                update=lambda values: calls.append(("wandb-config", values))
+            )
 
         def finish(self):
             calls.append("wandb-finish")
@@ -1270,6 +1274,7 @@ def test_train_single_iteration_control_flow(monkeypatch):
         hybrid_context_parallel=False,
         run_workload_inspector_server=False,
         iteration=0,
+        world_size=1,
         consumed_train_samples=0,
         train_samples=None,
         train_iters=1,
@@ -1425,6 +1430,7 @@ def test_train_skip_iteration_and_exit_path(monkeypatch):
         hybrid_context_parallel=False,
         run_workload_inspector_server=False,
         iteration=0,
+        world_size=1,
         consumed_train_samples=0,
         train_samples=None,
         train_iters=1,

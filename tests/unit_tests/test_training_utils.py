@@ -418,7 +418,7 @@ def test_get_batch_on_this_tp_rank_receives_nonzero_rank_batch(monkeypatch):
 
     def fake_broadcast(item, src, group=None):
         calls.append((tuple(item.shape), item.dtype, src, group))
-        if item.shape == () and item.dtype == torch.int64:
+        if item.dim() == 0 and item.dtype == torch.int64:
             item.fill_(0)
 
     monkeypatch.setattr(utils, "get_args", lambda: args)
