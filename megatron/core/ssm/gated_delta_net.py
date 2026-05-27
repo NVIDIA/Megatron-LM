@@ -366,13 +366,9 @@ class GatedDeltaNet(MegatronModule):
 
         # CP All to All: CP to HP
         if self.cp_size > 1:
+            # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
             qkvzba = qkvzba.index_select(-1, self._thd_head_perm)
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            # Batched: one a2a on the full local THD tensor, then two local
-            # permutations -- one on the head dim (so a single fused no-split
-            # a2a still produces the per-channel scatter layout) and one on
-            # the seq dim (rank-grouped -> per-seq natural order, also folds
-            # in `_undo_attention_load_balancing`).
             qkvzba = tensor_a2a_cp2hp(
                 qkvzba,
                 seq_dim=0,
@@ -381,6 +377,9 @@ class GatedDeltaNet(MegatronModule):
                 undo_attention_load_balancing=False,
             )
             if self.cp_size > 1:
+                # Permute at the seq dim so that a single unsectioned a2a
+                # is equivalent to per-sequence a2a.
+                # This also folds the ``_undo_attention_load_balancing`` step.
                 thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
                     cu_seqlens_q, self.cp_size, seq_len
                 )
