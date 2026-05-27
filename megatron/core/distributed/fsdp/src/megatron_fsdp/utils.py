@@ -22,13 +22,6 @@ from importlib.metadata import version
 from typing import Callable, Optional, Sequence, Union
 
 try:
-    import megatron.core.parallel_state as parallel_state
-
-    HAVE_MEGATRON_CORE = True
-except (ImportError, ModuleNotFoundError):
-    HAVE_MEGATRON_CORE = False
-
-try:
     import einops
 
     HAVE_EINOPS = True
@@ -96,6 +89,23 @@ def is_submodule(module, parent_module, strict=True):
         if m is module:
             return True
     return False
+
+
+def find_megatron_fsdp(model):
+    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+    # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
+    # this module during its own initialization, so a top-level import of
+    # MegatronFSDP here would fail with a partially-initialized module error.
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
+    except (ImportError, ModuleNotFoundError):
+        return None
+    m = model
+    while m is not None:
+        if isinstance(m, MegatronFSDP):
+            return m
+        m = getattr(m, 'module', None)
+    return None
 
 
 def get_mesh_names(
@@ -481,6 +491,8 @@ class FSDPDistributedIndex:
         hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
         hsdp_outer_dp_shard: bool = False,
         expt_device_mesh: Optional[DeviceMesh] = None,
+        fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+        expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -502,6 +514,13 @@ class FSDPDistributedIndex:
                 just sharding across dp_shard ranks and replicating across dp_outer ranks.
             expt_device_mesh (Optional[DeviceMesh]): The expert parallel device mesh
                 to use for the DistributedIndex.
+            fsdp_group_ag (Optional[torch.distributed.ProcessGroup]): Independent all-gather
+                process group for overlapping all-gather and reduce-scatter operations.
+                When provided, enables AG/RS overlap optimization for regular (non-expert)
+                parameters.
+            expt_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]): Independent all-gather
+                process group for expert parameters in MoE models. When provided, enables AG/RS
+                overlap optimization for expert parameters.
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
@@ -514,10 +533,6 @@ class FSDPDistributedIndex:
         self.hsdp_outer_dp_shard = hsdp_outer_dp_shard
         self.expt_device_mesh = expt_device_mesh
 
-        # Handling the situation where M-Core MoE EP=1
-        if self.expt_device_mesh is None:
-            self.expt_device_mesh = device_mesh
-
         # Hybrid FSDP Process Groups
         # Retrieve the FSDP process group from the DeviceMesh.
         self.fsdp_group = (
@@ -525,13 +540,9 @@ class FSDPDistributedIndex:
             if contains_submesh(self.device_mesh, self.dp_shard_dim)
             else None
         )
-        # AG group comes from parallel_state, not the mesh
-        # the purpose of this independent group is to overlap all-gather and gradient reduction.
-        self.fsdp_group_ag = None
-        if HAVE_MEGATRON_CORE and parallel_state.has_separate_all_gather_group():
-            self.fsdp_group_ag = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, independent_all_gather=True
-            )
+        # AG groups: supplied via ProcessGroupCollection (Megatron-FSDP entrypoint).
+        self.fsdp_group_ag = fsdp_group_ag
+        self.expt_fsdp_group_ag = expt_fsdp_group_ag
         # Retrieve the outer-FSDP process group from the DeviceMesh.
         self.outer_fsdp_group = (
             self.device_mesh[self.dp_outer_dim].get_group()
@@ -676,6 +687,8 @@ class FSDPDistributedIndex:
     ) -> ProcessGroup:
         """Get the FSDP process group."""
         if is_expert_parallel:
+            if independent_all_gather:
+                return self.expt_fsdp_group_ag
             return self.expt_fsdp_group
         if independent_all_gather:
             return self.fsdp_group_ag
@@ -826,6 +839,10 @@ def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int
             return 0
         elif param._tensor_parallel_mode == "row":
             return 1
+    if getattr(param, "tensor_model_parallel", False):
+        partition_dim = getattr(param, "partition_dim", None)
+        if partition_dim is not None and partition_dim >= 0:
+            return int(partition_dim)
     return None
 
 

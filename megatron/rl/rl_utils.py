@@ -57,6 +57,10 @@ from megatron.rl.sequence_packing_utils import (
     get_sequence_packing_tensorboard_metrics,
     get_sequence_packing_log_info,
     get_default_packed_seq_params,
+    get_packing_actual_tokens,
+    get_packing_compute_tokens,
+    get_packing_efficiency,
+    get_packing_avg_seq_length,
     update_microbatch_calculator,
 )
 from megatron.rl.agent.api import (
@@ -301,11 +305,26 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
+        # Per-GPU variants are available via methods that divide by world_size.
+        self.world_size = None
+        # batch_size * seq_length / time: nominal throughput based on batch configuration
+        self.tokens_per_sec = None
+        # Total tokens in packed bins across all DP ranks / time: what the GPU actually processes.
+        self.compute_tokens_per_sec = None
+        # Real non-padding tokens across all DP ranks / time: true useful throughput.
+        self.actual_tokens_per_sec = None
+        # Fraction of bin capacity filled with real tokens (actual / total capacity)
+        self.packing_efficiency = None
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
         self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
+        self.tokens_per_sec = None
+        self.compute_tokens_per_sec = None
+        self.actual_tokens_per_sec = None
+        self.packing_efficiency = None
 
     def increment_sequences(self, count):
         """Increment the sequence counter."""
@@ -320,6 +339,99 @@ _rl_runtime_state = RLRuntimeState()
 def get_rl_runtime_state():
     """Get the global RL runtime state."""
     return _rl_runtime_state
+
+
+def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer):
+    """Compute, log, and store RL token throughput metrics.
+
+    Returns a string fragment to append to the training log line.
+    Also logs metrics to wandb and stores them on RLRuntimeState for
+    downstream consumers (e.g. RLProfiler).
+    """
+    log_string = ''
+    tokens_per_sec = None
+    tokens_per_sec_per_gpu = None
+    compute_tokens_per_sec = None
+    compute_tokens_per_sec_per_gpu = None
+    actual_tokens_per_sec = None
+    actual_tokens_per_sec_per_gpu = None
+    packing_efficiency = None
+
+    if args.seq_length > 0:
+        tokens_per_iteration = batch_size * args.seq_length
+        tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
+        tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+
+        # For sequence packing, break down into compute vs actual tokens
+        if args.rl_use_sequence_packing:
+            runtime_state = get_rl_runtime_state()
+            if runtime_state.packing_context is not None:
+                dp_world_size = mpu.get_data_parallel_world_size()
+
+                compute_tokens = get_packing_compute_tokens(runtime_state.packing_context)
+                all_ranks_compute_tokens = compute_tokens * dp_world_size
+                compute_tokens_per_sec = all_ranks_compute_tokens / elapsed_time_per_iteration
+                compute_tokens_per_sec_per_gpu = compute_tokens_per_sec / args.world_size
+
+                actual_tokens = get_packing_actual_tokens(runtime_state.packing_context)
+                all_ranks_actual_tokens = actual_tokens * dp_world_size
+                actual_tokens_per_sec = all_ranks_actual_tokens / elapsed_time_per_iteration
+                actual_tokens_per_sec_per_gpu = actual_tokens_per_sec / args.world_size
+
+                packing_efficiency = get_packing_efficiency(runtime_state.packing_context)
+
+        # Add tokens/sec to log string
+        log_string += f' toks/s: {tokens_per_sec:.0f} |'
+        log_string += f' toks/s/gpu: {tokens_per_sec_per_gpu:.0f} |'
+        if compute_tokens_per_sec is not None:
+            log_string += f' compute_toks/s: {compute_tokens_per_sec:.0f} |'
+            log_string += f' compute_toks/s/gpu: {compute_tokens_per_sec_per_gpu:.0f} |'
+        if actual_tokens_per_sec is not None:
+            log_string += f' actual_toks/s: {actual_tokens_per_sec:.0f} |'
+            log_string += f' actual_toks/s/gpu: {actual_tokens_per_sec_per_gpu:.0f} |'
+            log_string += f' packing_eff: {packing_efficiency:.1%} |'
+
+    # Log throughput metrics to wandb
+    if wandb_writer is not None:
+        if tokens_per_sec is not None:
+            wandb_writer.log({
+                'throughput/tokens_per_sec': tokens_per_sec,
+                'throughput/tokens_per_sec_per_gpu': tokens_per_sec_per_gpu,
+            }, iteration)
+        if compute_tokens_per_sec is not None:
+            wandb_writer.log({
+                'throughput/compute_tokens_per_sec': compute_tokens_per_sec,
+                'throughput/compute_tokens_per_sec_per_gpu': compute_tokens_per_sec_per_gpu,
+            }, iteration)
+        if actual_tokens_per_sec is not None:
+            wandb_writer.log({
+                'throughput/actual_tokens_per_sec': actual_tokens_per_sec,
+                'throughput/actual_tokens_per_sec_per_gpu': actual_tokens_per_sec_per_gpu,
+                'throughput/packing_efficiency': packing_efficiency,
+            }, iteration)
+
+    # Store derived throughput metrics on RLRuntimeState so that
+    # downstream consumers (e.g. RLProfiler) can read them.
+    # Per-GPU values are derived via methods on RLRuntimeState.
+    runtime_state = get_rl_runtime_state()
+    runtime_state.world_size = args.world_size
+    runtime_state.tokens_per_sec = tokens_per_sec
+    runtime_state.compute_tokens_per_sec = compute_tokens_per_sec
+    runtime_state.actual_tokens_per_sec = actual_tokens_per_sec
+    runtime_state.packing_efficiency = packing_efficiency
+
+    # Log average sequence length. With packing this shows real sequence
+    # lengths; without packing it equals seq_length as a baseline.
+    packing_ctx = runtime_state.packing_context
+    if args.rl_use_sequence_packing and packing_ctx is not None:
+        avg_seq_length = get_packing_avg_seq_length(packing_ctx)
+        log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
+        if wandb_writer is not None:
+            wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
+    elif args.log_throughput:
+        log_string += f' avg_seq_len: {args.seq_length} |'
+
+    return log_string
 
 
 def update_inference_logprobs_group_stats(
@@ -460,7 +572,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         request = GroupedRolloutRequest(
-            num_groups=args.rl_generation_batch_size,
+            num_groups=args.rl_generation_batch_size if streaming else n_prompts,
             streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
@@ -576,13 +688,6 @@ def get_environment_rollouts(
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
-
-    if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("rl/restore-optimizer-after-inference", time=True):
-            with nvtx_range("rl/restore/grad-buffers", time=True):
-                model[0].restore_grad_buffers()
-            with nvtx_range("rl/restore/optimizer-state", time=True):
-                optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -801,8 +906,8 @@ def compute_group_stats(
             group_traj_lengths.append(sum(roll_turn_lens))
             assert rollout.policy_epoch, "Rollout has no policy_epoch data"
             assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
-            group_policy_epoch.append(min(turn[0][1] for turn in rollout.policy_epoch))
-            group_kv_epoch.append(min(turn[0][1] for turn in rollout.kv_cache_epoch))
+            group_policy_epoch.append([epoch for turn in rollout.policy_epoch for _, epoch in turn])
+            group_kv_epoch.append([epoch for turn in rollout.kv_cache_epoch for _, epoch in turn])
             group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
         all_policy_epoch.append(group_policy_epoch)
@@ -852,8 +957,8 @@ def prep_wandb_metrics(
         rewards: List[List[float]],
         num_turns: List[List[int]],
         advantages: List[float],
-        policy_epoch: List[List[int]],
-        kv_cache_epoch: List[List[int]],
+        policy_epoch: List[List[List[int]]],
+        kv_cache_epoch: List[List[List[int]]],
         completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
         current_iteration: int,
@@ -870,8 +975,8 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
-        policy_epoch: Grouped list of per-rollout min policy epoch stamps.
-        kv_cache_epoch: Grouped list of per-rollout min KV cache epoch stamps.
+        policy_epoch: Grouped list of per-token policy epoch stamps.
+        kv_cache_epoch: Grouped list of per-token KV cache epoch stamps.
         completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
         current_iteration: Current training iteration.
@@ -884,8 +989,15 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    true_policy_staleness = [current_iteration - s for g in policy_epoch for s in g]
-    true_kv_staleness = [current_iteration - s for g in kv_cache_epoch for s in g]
+    # Per-rollout staleness (oldest token)
+    rollout_policy_staleness = [current_iteration - r[0] for g in policy_epoch for r in g]
+    rollout_kv_staleness = [current_iteration - r[0] for g in kv_cache_epoch for r in g]
+    # Per-rollout staleness (newest token)
+    rollout_policy_last_token_staleness = [current_iteration - r[-1] for g in policy_epoch for r in g]
+    rollout_kv_last_token_staleness = [current_iteration - r[-1] for g in kv_cache_epoch for r in g]
+    # Per-token staleness
+    per_token_policy_staleness = [current_iteration - e for g in policy_epoch for r in g for e in r]
+    per_token_kv_staleness = [current_iteration - e for g in kv_cache_epoch for r in g for e in r]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -907,12 +1019,25 @@ def prep_wandb_metrics(
                 'advantages', 'Advantages'
             ),
             'rollout_table': wandb_writer.Table(
-                columns=['reward', 'traj_length', 'num_evictions'],
+                columns=[
+                    'reward', 'traj_length', 'num_evictions',
+                    'policy_staleness', 'kv_staleness',
+                    'policy_last_token_staleness', 'kv_last_token_staleness',
+                ],
                 data=list(zip(
                     [r for g in rewards for r in g],
                     [l for g in traj_lens for l in g],
                     [e for g in num_evictions for e in g],
+                    rollout_policy_staleness,
+                    rollout_kv_staleness,
+                    rollout_policy_last_token_staleness,
+                    rollout_kv_last_token_staleness,
                 )),
+            ),
+            # NOTE: This table can get very large (one row per token across all rollouts).
+            'per_token_table': wandb_writer.Table(
+                columns=['policy_staleness', 'kv_staleness'],
+                data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
             ),
             'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
             'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
@@ -929,15 +1054,29 @@ def prep_wandb_metrics(
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
-            'mean_policy_staleness': np.mean(true_policy_staleness),
-            'max_policy_staleness': max(true_policy_staleness),
-            'min_policy_staleness': min(true_policy_staleness),
-            'mean_kv_cache_staleness': np.mean(true_kv_staleness),
-            'max_kv_cache_staleness': max(true_kv_staleness),
-            'min_kv_cache_staleness': min(true_kv_staleness),
+            'mean_policy_staleness': np.mean(rollout_policy_staleness),
+            'max_policy_staleness': max(rollout_policy_staleness),
+            'min_policy_staleness': min(rollout_policy_staleness),
+            'mean_kv_cache_staleness': np.mean(rollout_kv_staleness),
+            'max_kv_cache_staleness': max(rollout_kv_staleness),
+            'min_kv_cache_staleness': min(rollout_kv_staleness),
+            'mean_policy_last_token_staleness': np.mean(rollout_policy_last_token_staleness),
+            'max_policy_last_token_staleness': max(rollout_policy_last_token_staleness),
+            'min_policy_last_token_staleness': min(rollout_policy_last_token_staleness),
+            'mean_kv_cache_last_token_staleness': np.mean(rollout_kv_last_token_staleness),
+            'max_kv_cache_last_token_staleness': max(rollout_kv_last_token_staleness),
+            'min_kv_cache_last_token_staleness': min(rollout_kv_last_token_staleness),
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
+            'per_token_policy_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
+                'staleness', 'Per-Token Policy Staleness'
+            ),
+            'per_token_kv_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
+                'staleness', 'Per-Token KV Cache Staleness'
+            ),
     }
     if example_group:
         if tokenizer is None:
@@ -1467,9 +1606,8 @@ def prepare_data_for_update(
                     samples_ratio_per_step=samples_ratio_per_step,
                     num_bins_this_rank = len(packing_context.packed_trajs),
                     bin_seq_indices = packing_context.packing_info.bin_seq_indices,
-                    global_batch_size=args.global_batch_size, 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=args.global_batch_size,
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                )
                 loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
@@ -1494,9 +1632,8 @@ def prepare_data_for_update(
 
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled), 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled),
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
@@ -1516,14 +1653,6 @@ def prepare_data_for_update(
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
-        with nvtx_range("rl/log-wandb-tb", time=True):
-            maybe_log_training_metrics(
-                group_stats=group_stats,
-                current_iteration=args.curr_iteration,
-                tokenizer=tokenizer,
-                example_groups=example_groups,
-            )
-
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
 
@@ -1540,6 +1669,7 @@ def get_grpo_data_iterator(
     sequence_packing: bool,
     is_correction: bool,
     buffered_rollouts: RerunDataIterator | None = None,
+    optimizer_is_on_cpu: bool = False,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -1559,6 +1689,7 @@ def get_grpo_data_iterator(
         sequence_packing: Use sequence packing if True.
         is_correction: Use IS correction if True.
         buffered_rollouts: Previously collected rollouts (if any)
+        optimizer_is_on_cpu: If True, the optimizer was offloaded to CPU and must be restored.
 
     Returns:
         RerunDataIterator for the current training step
@@ -1585,6 +1716,13 @@ def get_grpo_data_iterator(
             sequence_packing=sequence_packing,
             is_correction=is_correction,
         )
+        if optimizer_is_on_cpu:
+            nvtx_range = get_nvtx_range()
+            with nvtx_range("rl/restore-optimizer-after-inference", time=True):
+                with nvtx_range("rl/restore/grad-buffers", time=True):
+                    model[0].restore_grad_buffers()
+                with nvtx_range("rl/restore/optimizer-state", time=True):
+                    optimizer.restore_from_cpu()
         runtime_state.group_stats = group_stats
         runtime_state.example_groups = example_groups
         runtime_state.reset_iteration_counters(iteration)
@@ -1835,8 +1973,8 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
-    # Change cudagraph scope for inference (empty list = full-layer capture)
-    model[0].config.cuda_graph_scope = []
+    # Set cudagraph scope for inference.
+    model[0].config.cuda_graph_scope = args.cuda_graph_scope
     model[0].config.cuda_graph_impl = "local"
 
     # If we get a lower precision wrapper, we go one object deeper.
@@ -1893,13 +2031,18 @@ def megatron_rl_inference_mode(
         # Reset drop_and_pad leaked from inference decode
         set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
 
-        # Restore partial capture cudagraph scope for training if this is MoE
+        # Restore cudagraph scope for training.
+        # MoE partial capture requires specific scopes that aren't user-facing.
         if args.num_experts is not None:
             model[0].config.cuda_graph_scope = [
                 CudaGraphScope.mamba,
                 CudaGraphScope.attn,
                 CudaGraphScope.moe_router,
                 CudaGraphScope.moe_preprocess,
+            ]
+        else:
+            model[0].config.cuda_graph_scope = [
+                s for s in args.cuda_graph_scope if s != CudaGraphScope.full_iteration_inference
             ]
 
         # Switch MoE layers to partial CUDA graph capture for training

@@ -252,9 +252,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
     def ids_to_text(self, ids: List[int], remove_special_tokens: Optional[bool] = None) -> str:
         """Converts list of ids to text.
 
-        When remove_special_tokens is None, uses not self.include_special_tokens so that
-        --tokenizer-hf-include-special-tokens keeps EOS (and other special tokens) in
-        detokenized output (e.g. for RL trajectory consistency).
+        When remove_special_tokens is None, uses not self.include_special_tokens.
         """
         if remove_special_tokens is None:
             remove_special_tokens = not self.include_special_tokens

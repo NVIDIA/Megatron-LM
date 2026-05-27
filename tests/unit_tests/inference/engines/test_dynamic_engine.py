@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import gc
@@ -46,15 +46,15 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 try:
     from torch_memory_saver import torch_memory_saver  # noqa: F401
@@ -65,7 +65,7 @@ except ImportError:
 
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
-    if model_provider == "mamba":
+    if model_provider == "hybrid":
         sequence_packing_available, reason_for_no_sequence_packing = (
             _check_mamba_sequence_packing_support()
         )
@@ -121,6 +121,7 @@ class DynamicEngineTestConfig:
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
     use_cuda_graphs_for_non_decode_steps: bool = True
+    cuda_graph_all_prefills: bool = False
     fp8: bool = False
     model_provider: str = "gpt"
     return_log_probs: bool = False
@@ -133,6 +134,7 @@ class DynamicEngineTestConfig:
     )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
+    inference_moe_token_dispatcher_type: str = "nccl"
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -145,6 +147,7 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
+    sampling_backend: str = 'torch'
 
     def __post_init__(self):
 
@@ -178,7 +181,7 @@ class DynamicEngineTestEnv:
     )
 
 
-class TestDynamicInferenceEngine:
+class DynamicInferenceEngineTestBase:
 
     @classmethod
     def _build_requests(cls, test_config: DynamicEngineTestConfig) -> List[DynamicInferenceRequest]:
@@ -254,7 +257,10 @@ class TestDynamicInferenceEngine:
             inference_config=InferenceConfig(
                 max_sequence_length=test_config.max_sequence_length,
                 num_cuda_graphs=test_config.num_cuda_graphs,
-                use_cuda_graphs_for_non_decode_steps=True,
+                use_cuda_graphs_for_non_decode_steps=(
+                    test_config.use_cuda_graphs_for_non_decode_steps
+                ),
+                cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
                 buffer_size_gb=test_config.context_buffer_size_gb,
                 paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
                 block_size_tokens=test_config.context_block_size_tokens,
@@ -273,6 +279,7 @@ class TestDynamicInferenceEngine:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
+                sampling_backend=test_config.sampling_backend,
             ),
         )
 
@@ -281,11 +288,7 @@ class TestDynamicInferenceEngine:
     @classmethod
     @torch.inference_mode()
     def _build_test_env(cls, test_config):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=test_config.tensor_model_parallel_size,
-            pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
-        )
-
+        clear_nvte_env_vars()
         set_rounder(4)
 
         # Random state.
@@ -334,6 +337,9 @@ class TestDynamicInferenceEngine:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                inference_moe_token_dispatcher_type=(
+                    test_config.inference_moe_token_dispatcher_type
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -368,7 +374,7 @@ class TestDynamicInferenceEngine:
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type=test_config.position_embedding_type,
             ).cuda()
-        elif test_config.model_provider == "mamba":
+        elif test_config.model_provider == "hybrid":
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
             transformer_config = TransformerConfig(
@@ -398,16 +404,25 @@ class TestDynamicInferenceEngine:
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
-                add_bias_linear=test_config.expert_model_parallel_size == 1,
+                add_bias_linear=test_config.expert_model_parallel_size == 1
+                and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                inference_moe_token_dispatcher_type=(
+                    test_config.inference_moe_token_dispatcher_type
+                ),
+                normalization=(
+                    "RMSNorm"
+                    if test_config.transformer_impl == "inference_optimized"
+                    else "LayerNorm"
+                ),
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
-            # Mamba model.
+            # Hybrid model.
             # When speculative tokens are configured, append MTP depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
             mtp_suffix = "/M" * test_config.num_speculative_tokens
@@ -415,9 +430,9 @@ class TestDynamicInferenceEngine:
                 mamba_pattern = "M*-" + mtp_suffix
             else:
                 mamba_pattern = "M*-|M*-" + mtp_suffix
-            model = MambaModel(
+            model = HybridModel(
                 config=transformer_config,
-                mamba_stack_spec=mamba_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
@@ -459,10 +474,7 @@ class TestDynamicInferenceEngine:
             ),
         )
 
-        # Reset global cuda graph state.
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
 
         # Inference engine.
         engine = DynamicInferenceEngine(text_generation_controller, inference_context)
@@ -565,8 +577,21 @@ class TestDynamicInferenceEngine:
 
         return env
 
+
+class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
     @classmethod
     def teardown_class(cls):
+        delete_cuda_graphs()
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -574,7 +599,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4, -1])
     @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration_inference]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
@@ -583,6 +608,7 @@ class TestDynamicInferenceEngine:
         num_tokens_to_generate = 16
 
         # Run test.
+        # Force decode-only CG capture: capturing mixed graphs across the full range will OOM.
         env = self._run_test(
             num_tokens_to_generate=num_tokens_to_generate,
             model_provider=model_provider,
@@ -590,6 +616,7 @@ class TestDynamicInferenceEngine:
             cuda_graph_scope=cuda_graph_scope,
             force_build_cuda_graphs=True,
             context_max_requests=128,
+            use_cuda_graphs_for_non_decode_steps=False,
         )
 
         # Validate max_requests, max_tokens.
@@ -600,8 +627,11 @@ class TestDynamicInferenceEngine:
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
             if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
-                # check if cudagraph runners are created at the decoder level
-                assert model.decoder.cudagraph_manager.cudagraph_runners
+                # hybrid models attach cudagraph_manager to the model; others attach to the decoder
+                if model_provider == "hybrid":
+                    assert model.cudagraph_manager.cudagraph_runners
+                else:
+                    assert model.decoder.cudagraph_manager.cudagraph_runners
             else:
                 # check if cudagraph runners are created at the layer level
                 for layer in model.decoder.layers:
@@ -632,7 +662,7 @@ class TestDynamicInferenceEngine:
 
         if model_provider == "gpt":
             expected_generated_tokens_list = gpt_expected_generated_tokens
-        elif model_provider == "mamba":
+        elif model_provider == "hybrid":
             expected_generated_tokens_list = mamba_expected_generated_tokens
         else:
             raise ValueError(f"Invalid model_provider {model_provider}")
@@ -693,7 +723,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_block_overflow(self, model_provider: str) -> None:
         """Test block overflow."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -739,7 +769,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -749,7 +779,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_fixed_output_lengths(self, model_provider: str) -> None:
         """Test generating a fixed number of output tokens."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -759,11 +789,11 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_cuda_graph_token_counts(self) -> None:
+    @pytest.mark.parametrize("use_non_decode", [False, True])
+    def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
         """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
-        # Test num_cuda_graphs.
-        for num_cuda_graphs, expected_cuda_graph_token_counts in [
+        decode_only_cases = [
             (0, [80]),
             (1, [80]),
             (2, [80, 40]),
@@ -771,28 +801,46 @@ class TestDynamicInferenceEngine:
             (8, [80, 64, 48, 32, 16]),
             (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
             (32, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-        ]:
+        ]
+        non_decode_cases = [
+            (0, [80]),
+            (1, [80]),
+            (2, [80, 40]),
+            (4, [80, 72, 48, 24]),
+            (8, [80, 64, 48, 32, 16]),
+            (16, [1024, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (32, [1024, 512, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+        ]
+        cases = non_decode_cases if use_non_decode else decode_only_cases
+
+        for num_cuda_graphs, expected_cuda_graph_token_counts in cases:
 
             # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(
-                    context_buffer_size_gb=0.01, num_cuda_graphs=num_cuda_graphs
+                    context_buffer_size_gb=0.01,
+                    num_cuda_graphs=num_cuda_graphs,
+                    use_cuda_graphs_for_non_decode_steps=use_non_decode,
+                    cuda_graph_all_prefills=use_non_decode,
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
-            assert (
-                actual_cuda_graph_token_counts == expected_cuda_graph_token_counts
-            ), "num_cuda_graphs %d ... cuda_graph_token_counts: expected %s, found %s." % (
-                num_cuda_graphs,
-                expected_cuda_graph_token_counts,
-                actual_cuda_graph_token_counts,
+            assert actual_cuda_graph_token_counts == expected_cuda_graph_token_counts, (
+                "num_cuda_graphs %d use_non_decode=%s ... cuda_graph_token_counts: "
+                "expected %s, found %s."
+                % (
+                    num_cuda_graphs,
+                    use_non_decode,
+                    expected_cuda_graph_token_counts,
+                    actual_cuda_graph_token_counts,
+                )
             )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @torch.inference_mode()
     def test_generate_function(self, model_provider: str) -> None:
         """Test the generate function that processes multiple prompts at once."""
@@ -886,7 +934,7 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_fp8_inference(self, model_provider: str):
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
@@ -1087,88 +1135,6 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
-    @pytest.mark.parametrize("sequence_parallel", [False, True])
-    @pytest.mark.parametrize("ep_size", [1, 2])
-    @pytest.mark.parametrize("pp_size", [1, 2])
-    @pytest.mark.parametrize("tp_size", [1, 2])
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
-    @torch.inference_mode()
-    def test_parallel_inference(
-        self,
-        model_provider,
-        tp_size,
-        pp_size,
-        ep_size,
-        sequence_parallel,
-        materialize_only_last_token_logits,
-        transformer_impl,
-    ):
-        skip_if_mamba_sequence_packing_not_available(model_provider)
-
-        if tp_size == 1 and pp_size == 1 and ep_size == 1:
-            pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
-        elif not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
-        world_size = torch.distributed.get_world_size()
-        min_world_size = tp_size * pp_size * ep_size
-        if world_size < min_world_size:
-            pytest.skip(f"Test requires at least {min_world_size} GPUs")
-        elif tp_size == 1 and sequence_parallel:
-            pytest.skip(reason="Sequence parallelism requires tp_size > 1")
-        elif tp_size > 1 and ep_size > 1 and not sequence_parallel:
-            pytest.skip(reason="Sequence parallelism must be used with tp_size > 1 and ep_size > 1")
-        elif transformer_impl == "inference_optimized":
-            if ep_size > 1:
-                pytest.skip(
-                    reason="MoE models are not supported with the inference optimized transformer."
-                )
-            if tp_size > 1 and not sequence_parallel:
-                pytest.skip(
-                    reason=(
-                        "The inference optimized transformer requires sequence parallelism "
-                        "when tp_size > 1."
-                    )
-                )
-            if model_provider == "mamba":
-                pytest.skip(
-                    reason="Mamba model is not supported with the inference optimized transformer."
-                )
-
-        env = self._run_test(
-            model_provider=model_provider,
-            tensor_model_parallel_size=tp_size,
-            pipeline_model_parallel_size=pp_size,
-            expert_model_parallel_size=ep_size,
-            sequence_parallel=sequence_parallel,
-            materialize_only_last_token_logits=materialize_only_last_token_logits,
-            transformer_impl=transformer_impl,
-        )
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
-    def test_sequence_parallel_fp8_inference(self, materialize_only_last_token_logits: bool):
-        fp8_available, reason_for_no_fp8 = check_fp8_support()
-        if not fp8_available:
-            pytest.skip(reason_for_no_fp8)
-
-        self._run_test(
-            min_prompt_length=19,
-            max_prompt_length=19,
-            tensor_model_parallel_size=4,
-            sequence_parallel=True,
-            materialize_only_last_token_logits=True,
-            fp8=True,
-        )
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
     def test_num_tokens_total(self):
         """Simple test, but using num_tokens_total instead of num_tokens_to_generate."""
         # Run test.
@@ -1299,11 +1265,11 @@ class TestDynamicInferenceEngine:
         """
         Test chunked prefill with a Mamba model.
         """
-        skip_if_mamba_sequence_packing_not_available("mamba")
+        skip_if_mamba_sequence_packing_not_available("hybrid")
 
         # Context max tokens = 50.
         test_config = DynamicEngineTestConfig(
-            model_provider="mamba",
+            model_provider="hybrid",
             num_requests=0,
             num_tokens_to_generate=None,
             num_tokens_total=200,
@@ -2321,9 +2287,15 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_decoding_with_early_termination(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_decoding_with_early_termination(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that speculative decoding handles premature request termination safely
         (e.g. hitting max_sequence_length mid-speculative-batch)."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         # Set max_sequence_length tight so it terminates during a speculative step
         test_config = DynamicEngineTestConfig(
@@ -2334,7 +2306,8 @@ class TestDynamicInferenceEngine:
             max_sequence_length=7,  # Will force termination after 3 tokens
             model_provider="gpt",
             num_speculative_tokens=3,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+            sampling_backend=sampling_backend,
         )
 
         env = self._build_test_env(test_config)
@@ -2359,9 +2332,13 @@ class TestDynamicInferenceEngine:
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -2393,12 +2370,18 @@ class TestDynamicInferenceEngine:
 
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_speculative_block_boundary_crossing(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_block_boundary_crossing(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test to verify KV cache block boundary crossing logic.
 
         When a request fills exactly one block and speculative decoding generates
         multiple tokens, the first new token shouldn't incorrectly overwrite the old block.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         test_config = DynamicEngineTestConfig(
             num_requests=1,
             min_prompt_length=256,
@@ -2408,8 +2391,9 @@ class TestDynamicInferenceEngine:
             context_block_size_tokens=256,  # Exactly matches prompt length
             context_max_requests=16,
             model_provider="gpt",
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             use_fixed_output_lengths=True,
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2449,9 +2433,13 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_stop_word_hit(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_stop_word_hit(self, materialize_only_last_token_logits, sampling_backend):
         """Test that if an accepted speculative token completes a stop word,
         the request correctly triggers the stop logic without crashing."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,  # We will manually add our request cleanly
@@ -2459,8 +2447,9 @@ class TestDynamicInferenceEngine:
             max_prompt_length=4,
             num_tokens_to_generate=10,
             num_speculative_tokens=2,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2482,9 +2471,13 @@ class TestDynamicInferenceEngine:
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2533,9 +2526,15 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_long_stop_word_hit(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_long_stop_word_hit(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that if an accepted speculative token completes a long stop word
         (length > num_speculative_tokens), it is correctly detected."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,
@@ -2543,8 +2542,9 @@ class TestDynamicInferenceEngine:
             max_prompt_length=4,
             num_tokens_to_generate=10,
             num_speculative_tokens=2,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2566,9 +2566,13 @@ class TestDynamicInferenceEngine:
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2613,7 +2617,11 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_stop_word_truncates_trailing_tokens(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_stop_word_truncates_trailing_tokens(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that when a stop word lands in the middle of speculative tokens,
         the extra tokens generated after the stop word are removed.
 
@@ -2621,6 +2629,8 @@ class TestDynamicInferenceEngine:
         (1 base + 2 speculative). If the stop word is [6] and the engine
         generates [5, 6, 7] in one step, token 7 must be truncated so the
         output ends with the stop word [6]."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,
@@ -2628,8 +2638,9 @@ class TestDynamicInferenceEngine:
             max_prompt_length=4,
             num_tokens_to_generate=10,
             num_speculative_tokens=2,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2651,9 +2662,13 @@ class TestDynamicInferenceEngine:
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2729,9 +2744,16 @@ class TestDynamicInferenceEngine:
             "non_divisible_boundary",
         ],
     )
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @torch.inference_mode()
     def test_speculative_tokens_exceed_max_sequence_length(
-        self, prompt_length, num_tokens_to_generate, num_speculative_tokens
+        self,
+        prompt_length,
+        num_tokens_to_generate,
+        num_speculative_tokens,
+        materialize_only_last_token_logits,
+        sampling_backend,
     ):
         """Test that speculative decoding correctly trims output when speculative
         tokens would push the sequence beyond max_sequence_length.
@@ -2741,6 +2763,8 @@ class TestDynamicInferenceEngine:
         speculative tokens are accepted and the boundary trimming logic is
         actually exercised.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         max_sequence_length = prompt_length + num_tokens_to_generate
 
         test_config = DynamicEngineTestConfig(
@@ -2750,11 +2774,12 @@ class TestDynamicInferenceEngine:
             num_tokens_to_generate=num_tokens_to_generate,
             max_sequence_length=max_sequence_length,
             num_speculative_tokens=num_speculative_tokens,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
             # Disable positional embeddings so speculative position IDs
             # beyond max_sequence_length don't cause out-of-bounds lookups.
             position_embedding_type="none",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2776,8 +2801,12 @@ class TestDynamicInferenceEngine:
         # Wrap the real MTP step similarly.
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def deterministic_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             logits[..., 0] = 100.0
             return hidden_states, logits
@@ -2853,8 +2882,12 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize(
         "acceptance_mode", ["all_rejected", "all_accepted"], ids=["all_rejected", "all_accepted"]
     )
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @torch.inference_mode()
-    def test_speculative_sequence_length_double_counting(self, acceptance_mode):
+    def test_speculative_sequence_length_double_counting(
+        self, acceptance_mode, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test to verify active_sequence_lengths is not double-counted.
 
         If active sequence length is double-counted during speculative decoding,
@@ -2866,6 +2899,8 @@ class TestDynamicInferenceEngine:
         a faulty formula that adds accepted_tokens on top of the KV length will
         over-count by 2 per step, finishing the request after only 4 of 6 tokens.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         test_config = DynamicEngineTestConfig(
             num_requests=0,
             min_prompt_length=4,
@@ -2875,10 +2910,11 @@ class TestDynamicInferenceEngine:
             context_max_requests=16,
             num_speculative_tokens=2,
             model_provider="gpt",
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             use_fixed_output_lengths=False,
             context_max_tokens=512,
             position_embedding_type="none",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2902,6 +2938,8 @@ class TestDynamicInferenceEngine:
                 model._decoder_hidden_states_cache = torch.zeros(
                     s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
                 )
+                if test_config.materialize_only_last_token_logits:
+                    base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
                 return base_logits
 
             def mock_compute_mtp(*args_mtp, **kwargs_mtp):
@@ -2930,8 +2968,17 @@ class TestDynamicInferenceEngine:
 
             real_mtp = model.compute_mtp_single_step
 
-            def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-                hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+            def deterministic_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+            ):
+                hidden_states, logits = real_mtp(
+                    hidden_states,
+                    next_token_ids,
+                    position_ids,
+                    depth,
+                    eager=eager,
+                    cache_key=cache_key,
+                )
                 logits.zero_()
                 logits[..., 0] = 100.0
                 return hidden_states, logits
@@ -2964,12 +3011,18 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_decoding_with_eviction_and_swapping(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_decoding_with_eviction_and_swapping(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that speculative decoding works correctly when requests are paused and evicted.
 
         This exercises the `_swap_book_keeping_tensors` logic with the 2D `new_speculative_tokens`
         tensor, ensuring no dimensional mismatch or index errors occur during tensor swapping.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         # Very constrained memory environment to force pausing and eviction
         test_config = DynamicEngineTestConfig(
             num_requests=3,
@@ -2981,8 +3034,9 @@ class TestDynamicInferenceEngine:
             context_buffer_size_gb=0.00064,  # 640 KB
             context_paused_buffer_size_gb=0.0,  # 0 paused buffer forces immediate eviction
             model_provider="gpt",
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             use_fixed_output_lengths=True,
+            sampling_backend=sampling_backend,
         )
 
         env = self._build_test_env(test_config)
@@ -3005,9 +3059,13 @@ class TestDynamicInferenceEngine:
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3220,7 +3278,9 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3340,7 +3400,9 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3470,7 +3532,9 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3723,7 +3787,9 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_wrong(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_wrong(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             wrong_toks = (next_token_ids + 5).clamp(max=test_config.vocab_size - 1)
             logits = torch.zeros(
@@ -3819,7 +3885,9 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             n = hidden_states.size(0)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
             logits = torch.zeros(
@@ -3931,8 +3999,12 @@ class TestDynamicInferenceEngine:
 
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def deterministic_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             logits[..., 0] = 100.0
             return hidden_states, logits
@@ -4040,8 +4112,12 @@ class TestDynamicInferenceEngine:
         # Deterministic MTP: also predict token 0 → all speculative tokens accepted.
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def deterministic_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             logits[..., 0] = 100.0
             return hidden_states, logits
@@ -4112,8 +4188,12 @@ class TestDynamicInferenceEngine:
         # During prefill, no MTP runs, so request 2 is unaffected.
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def heterogeneous_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def heterogeneous_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             n = logits.size(0)
             logits.zero_()
             if n >= 2:
@@ -4211,8 +4291,12 @@ class TestDynamicInferenceEngine:
 
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+        def deterministic_mtp(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             logits[..., 0] = 100.0
             return hidden_states, logits
@@ -4261,40 +4345,6 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @torch.inference_mode()
-    def test_speculative_decoding_pipeline_parallel(self):
-        """Test speculative decoding with pipeline parallelism (pp_size=2).
-
-        Verifies that MTP logit broadcasts across pipeline stages don't hang
-        or produce incorrect results. Each PP stage must participate in the
-        same number of MTP broadcast rounds.
-        """
-        if not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
-        world_size = torch.distributed.get_world_size()
-        pp_size = 2
-        if world_size < pp_size:
-            pytest.skip(f"Test requires at least {pp_size} GPUs")
-
-        env = self._run_test(
-            model_provider="gpt",
-            pipeline_model_parallel_size=pp_size,
-            num_speculative_tokens=2,
-            num_tokens_to_generate=6,
-            materialize_only_last_token_logits=False,
-        )
-
-        for request in env.requests:
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Request {request.request_id}: status={request.status}"
-            num_expected = request.sampling_params.num_tokens_to_generate
-            assert len(request.generated_tokens) <= num_expected
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
     @pytest.mark.parametrize(
         "rejection_mode",
         ["all_accepted", "all_rejected", "partial"],
@@ -4319,7 +4369,7 @@ class TestDynamicInferenceEngine:
         Two requests run simultaneously to exercise batched rewind indexing
         where mamba_metadata.request_to_mamba_state_idx differs per request.
         """
-        skip_if_mamba_sequence_packing_not_available("mamba")
+        skip_if_mamba_sequence_packing_not_available("hybrid")
 
         num_tokens_to_generate = 8
         test_config = DynamicEngineTestConfig(
@@ -4329,7 +4379,7 @@ class TestDynamicInferenceEngine:
             num_tokens_to_generate=num_tokens_to_generate,
             num_speculative_tokens=2,
             materialize_only_last_token_logits=False,
-            model_provider="mamba",
+            model_provider="hybrid",
         )
         env = self._build_test_env(test_config)
 
@@ -4348,9 +4398,13 @@ class TestDynamicInferenceEngine:
 
         real_mtp = unwrapped_model.compute_mtp_single_step
 
-        def mtp_with_rejection(hidden_states, next_token_ids, position_ids, depth):
+        def mtp_with_rejection(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
             # Run real MTP to exercise Mamba intermediate state saving.
-            hidden_states, logits = real_mtp(hidden_states, next_token_ids, position_ids, depth)
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+            )
             logits.zero_()
             if rejection_mode == "all_accepted":
                 # Predict token 0 (same as base) → accepted.
@@ -4410,6 +4464,137 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.total_request_count == 0
 
 
+class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
+    """Tests that require non-default parallel configs (tp>1, pp>1, or ep>1).
+
+    Each test initializes its own parallel state and tears it down afterward,
+    so these are separated from TestDynamicInferenceEngine to avoid accumulating
+    NCCL communicator memory from repeated init/destroy cycles.
+    """
+
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    @classmethod
+    @torch.inference_mode()
+    def _build_test_env(cls, test_config):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=test_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
+            expert_model_parallel_size=test_config.expert_model_parallel_size,
+            expert_tensor_parallel_size=1,
+        )
+        return super()._build_test_env(test_config)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
+    @torch.inference_mode()
+    def test_parallel_inference(
+        self,
+        model_provider,
+        tp_size,
+        pp_size,
+        ep_size,
+        sequence_parallel,
+        materialize_only_last_token_logits,
+        transformer_impl,
+    ):
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+
+        if tp_size == 1 and pp_size == 1 and ep_size == 1:
+            pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
+        elif not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+        world_size = torch.distributed.get_world_size()
+        min_world_size = tp_size * pp_size * ep_size
+        if world_size < min_world_size:
+            pytest.skip(f"Test requires at least {min_world_size} GPUs")
+        elif tp_size == 1 and sequence_parallel:
+            pytest.skip(reason="Sequence parallelism requires tp_size > 1")
+        elif tp_size > 1 and ep_size > 1 and not sequence_parallel:
+            pytest.skip(reason="Sequence parallelism must be used with tp_size > 1 and ep_size > 1")
+        elif transformer_impl == "inference_optimized":
+            if ep_size > 1:
+                pytest.skip(
+                    reason="MoE models are not supported with the inference optimized transformer."
+                )
+            if tp_size > 1 and not sequence_parallel:
+                pytest.skip(
+                    reason=(
+                        "The inference optimized transformer requires sequence parallelism "
+                        "when tp_size > 1."
+                    )
+                )
+
+        env = self._run_test(
+            model_provider=model_provider,
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            expert_model_parallel_size=ep_size,
+            sequence_parallel=sequence_parallel,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+            transformer_impl=transformer_impl,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
+    def test_sequence_parallel_fp8_inference(self, materialize_only_last_token_logits: bool):
+        fp8_available, reason_for_no_fp8 = check_fp8_support()
+        if not fp8_available:
+            pytest.skip(reason_for_no_fp8)
+
+        self._run_test(
+            min_prompt_length=19,
+            max_prompt_length=19,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            materialize_only_last_token_logits=True,
+            fp8=True,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_pipeline_parallel(self):
+        """Test speculative decoding with pipeline parallelism (pp_size=2)."""
+        if not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+        world_size = torch.distributed.get_world_size()
+        pp_size = 2
+        if world_size < pp_size:
+            pytest.skip(f"Test requires at least {pp_size} GPUs")
+
+        env = self._run_test(
+            model_provider="gpt",
+            pipeline_model_parallel_size=pp_size,
+            num_speculative_tokens=2,
+            num_tokens_to_generate=6,
+            materialize_only_last_token_logits=False,
+        )
+
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+            num_expected = request.sampling_params.num_tokens_to_generate
+            assert len(request.generated_tokens) <= num_expected
+
+
 CHUNKED_CG_BLOCK_SIZE = 256
 CHUNKED_CG_VOCAB_SIZE = 10000
 CHUNKED_CG_MAX_SEQ_LEN = 2048
@@ -4430,6 +4615,7 @@ class TestChunkedPrefillCudaGraphs:
 
     @classmethod
     def teardown_class(cls):
+        delete_cuda_graphs()
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -4460,7 +4646,7 @@ class TestChunkedPrefillCudaGraphs:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
-        elif model_provider == "mamba":
+        elif model_provider == "hybrid":
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=3,
@@ -4476,9 +4662,9 @@ class TestChunkedPrefillCudaGraphs:
                 add_bias_linear=True,
                 is_hybrid_model=True,
             )
-            model = MambaModel(
+            model = HybridModel(
                 config=config,
-                mamba_stack_spec=mamba_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=CHUNKED_CG_VOCAB_SIZE,
                 max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
                 parallel_output=True,
@@ -4493,17 +4679,6 @@ class TestChunkedPrefillCudaGraphs:
             param.data = param.data.to(config.params_dtype)
         model.eval()
         return model
-
-    def _reset_cuda_graph_state(self, model):
-        """Reset all CUDA graph global and per-module state."""
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
-        CudaGraphManager.global_mempool = None
-        for module in model.modules():
-            if isinstance(module, CudaGraphManager):
-                module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
 
     def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
         """Build an engine with the given chunked prefill / CUDA graph config."""
@@ -4521,6 +4696,7 @@ class TestChunkedPrefillCudaGraphs:
             enable_chunked_prefill=enable_chunked_prefill,
             max_tokens=context_max_tokens,
             max_requests=128,
+            sampling_backend='torch',
         )
         if mamba_config is not None:
             inference_config_kwargs.update(mamba_inference_state_config=mamba_config)
@@ -4537,7 +4713,7 @@ class TestChunkedPrefillCudaGraphs:
                 vocab_size=CHUNKED_CG_VOCAB_SIZE, detokenize=lambda tokens: "tokenized_prompt"
             ),
         )
-        self._reset_cuda_graph_state(model)
+        delete_cuda_graphs()
         return DynamicInferenceEngine(controller, context)
 
     def _run_to_completion(self, engine, prompts, num_tokens_to_generate):
@@ -4564,7 +4740,7 @@ class TestChunkedPrefillCudaGraphs:
 
         return finished, step_count
 
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @pytest.mark.parametrize("chunked_prefill", [False, True])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @torch.inference_mode()
@@ -4572,10 +4748,7 @@ class TestChunkedPrefillCudaGraphs:
         """Verify generated tokens match across chunked prefill and CUDA graph configs."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
-        # Clear NVTE env vars set by conftest set_env fixture.
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        clear_nvte_env_vars()
 
         random.seed(123)
         torch.manual_seed(123)

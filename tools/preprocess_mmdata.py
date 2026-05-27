@@ -101,9 +101,9 @@ def get_args():
                        help='Language to use for NLTK-powered sentence splitting.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='sentencepeice tokenizer model.')
-    group.add_argument('--tokenizer-metadata', type=str, default=None,
+    group.add_argument('--metadata-path', type=str, default=None,
                        help='Path to tokenizer metadata in json format.')
-    group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
+    group.add_argument('--special-tokens', type=str, nargs='+', default=None,
                        help='List of special tokens. For TikTokenizer needs to have '
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
     group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,

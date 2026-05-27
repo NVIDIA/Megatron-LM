@@ -902,9 +902,9 @@ class TestRLUtils:
         rewards = [[1, 1], [-1, 2]]
         num_turns = [[42, 2], [10, 8]]
         advantages = [0, 1]
-        # Per-rollout min iteration stamps (2 rollouts in group 1, 2 in group 2)
-        policy_epoch = [[4, 2], [5, 0]]
-        kv_cache_epoch = [[4, 3], [5, 1]]
+        # Per-token epoch stamps, grouped by group then rollout
+        policy_epoch = [[[4, 5], [2, 3]], [[5], [0, 1]]]
+        kv_cache_epoch = [[[4, 5], [3, 4]], [[5], [1, 2]]]
         # Per-turn max epoch stamps (when each turn completed)
         completed_epochs = [[5, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
@@ -944,6 +944,14 @@ class TestRLUtils:
         assert metrics["mean_kv_cache_staleness"] == np.mean([2, 3, 1, 5])
         assert metrics["max_kv_cache_staleness"] == 5
         assert metrics["min_kv_cache_staleness"] == 1
+        # last_token (max epoch per rollout): policy=[5, 3, 5, 1] -> staleness=[1, 3, 1, 5]
+        assert metrics["mean_policy_last_token_staleness"] == np.mean([1, 3, 1, 5])
+        assert metrics["max_policy_last_token_staleness"] == 5
+        assert metrics["min_policy_last_token_staleness"] == 1
+        # last_token (max epoch per rollout): kv=[5, 4, 5, 2] -> staleness=[1, 2, 1, 4]
+        assert metrics["mean_kv_cache_last_token_staleness"] == np.mean([1, 2, 1, 4])
+        assert metrics["max_kv_cache_last_token_staleness"] == 4
+        assert metrics["min_kv_cache_last_token_staleness"] == 1
         assert metrics["total_eviction_count"] == 1
         assert metrics["max_num_evictions"] == 1
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5

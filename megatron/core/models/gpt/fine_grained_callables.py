@@ -23,7 +23,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 
 def weak_method(method):
@@ -228,6 +228,8 @@ class PostProcessNode(ScheduleNode):
             sequence_len_offset=self.chunk_state.sequence_len_offset,
             runtime_gather_output=self.chunk_state.runtime_gather_output,
             extra_block_kwargs=self.chunk_state.extra_block_kwargs,
+            output_processor=self.chunk_state.output_processor,
+            output_processor_context=self.chunk_state.output_processor_context,
         )
 
         # For now, 1f1b only supports fp16 module
@@ -265,13 +267,16 @@ class TransformerLayerNode(ScheduleNode):
             bwd_dw_callables (list): List of weight gradient functions for the layer.
             extra_args (dict): Extra arguments for the node: is_moe, config.
         """
-        # determine whether to free input memory
+        # Determine whether to free input memory
         config = extra_args.get("config", None)
         assert config is not None, "model config must be passed to TransformerLayerNode."
         is_moe = extra_args.get("is_moe", False)
         num_local_experts = extra_args.get("num_local_experts", None)
         free_input = should_free_input(name, is_moe, config, num_local_experts)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
+
+        self.is_layer_first_node = None
+        self.is_layer_last_node = None
 
         super().__init__(
             weak_method(self.forward_impl),
@@ -287,6 +292,7 @@ class TransformerLayerNode(ScheduleNode):
         self.detached = tuple()
         self.before_detached = tuple()
         self.is_mtp = extra_args.get("is_mtp", False)
+        self.post_wgrad_grad_acc_hooks = None
 
         # Create flags to indicate first and last layer
         self.is_first_layer = extra_args.get("is_first_layer", False)
@@ -316,14 +322,22 @@ class TransformerLayerNode(ScheduleNode):
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
         self.default_backward_func(outputs + self.before_detached, grads)
-        # release the output grad memory after backward finishes,
-        # except when delay_wgrad_comptue is enabled, the grad should be
-        # kept until all modules' backward_dw has been invoked.
-        if self.delay_wgrad_compute:
-            self.output_grads = grads
-            self.delay_grads_release = len(self.bwd_dw_callables) > 0
 
         # return grads for record stream
+        return grads
+
+    def forward(self, *inputs):
+        """Execute forward pass and corresponding hooks."""
+        output = super().forward(*inputs)
+        if self.is_layer_last_node:
+            self._post_forward_hook()
+        return output
+
+    def backward(self, *output_grad):
+        """Execute backward pass and corresponding hooks."""
+        grads = super().backward(*output_grad)
+        if not self.delay_wgrad_compute and self.is_layer_first_node:
+            self._post_backward_hook()
         return grads
 
     def backward_dw(self):
@@ -333,19 +347,50 @@ class TransformerLayerNode(ScheduleNode):
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
         with torch.cuda.stream(self.stream):
-            torch.cuda.nvtx.range_push(f"{self.name} wgrad")
+            nvtx_msg = f"{self.name} wgrad"
+            nvtx_range_push(nvtx_msg)
             for module in self.bwd_dw_callables:
                 module.backward_dw()
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop(nvtx_msg)
 
-        # the output grad memory is last used in wgrad compute, should be safe to release.
-        assert self.delay_grads_release, "output grad memory should be valid before wgrad."
-        if self.manual_release_grads:
-            for tensor in self.output_grads:
-                tensor.untyped_storage().resize_(0)
-        self.output_grads = None
+        # Collecting gradient acc hooks if there is `post_wgrad_grad_acc_hook`
+        # attribute attached to param, o.w. the wgrad hook wouldn't be fired.
+        if self.post_wgrad_grad_acc_hooks is None:
+            self.post_wgrad_grad_acc_hooks = []
+            for module in self.bwd_dw_callables:
+                for param in module.parameters():
+                    # Collect hook only if the gradient is generated in current
+                    # TransformerLayerNode, because the grad_acc hook needs
+                    # to be executed right after `backward_dw` finishes.
+                    # For example: Shared expert's hook should be collected in
+                    # `attn` Node, even if the param belongs to `mlp` Node.
+                    if (
+                        getattr(param, "post_wgrad_grad_acc_hook", False)
+                        and param.requires_grad
+                        and param.grad is not None
+                    ):
+                        self.post_wgrad_grad_acc_hooks.append(param.post_wgrad_grad_acc_hook)
 
+        # Execute gradient accumulation hooks after wgrad compute.
+        if self.post_wgrad_grad_acc_hooks:
+            with torch.cuda.stream(self.stream):
+                for hook in self.post_wgrad_grad_acc_hooks:
+                    hook()
+
+        # Execute TransformerLayer backward hook.
+        if self.is_layer_first_node:
+            self._post_backward_hook()
         self.bwd_dw_callables = None
+
+    def set_post_forward_hook(self, hook):
+        """Register post_forward_hook at TransformerLayer level."""
+        self.is_layer_last_node = True
+        self._post_forward_hook = hook
+
+    def set_post_backward_hook(self, hook):
+        """Register post_backward_hook at TransformerLayer level."""
+        self.is_layer_first_node = True
+        self._post_backward_hook = hook
 
     def __del__(self):
         # Release reference as early as possible, this helps avoid memory leak.
@@ -379,10 +424,13 @@ class _BackwardDWWrapper:
         self.layer = layer
         self.graphed_backward_dw_callable = None
         self.attn_dw_callable = layer.self_attention.backward_dw
+        self.submodules = [layer.self_attention]
         if layer.is_moe_layer:
             self.shared_expert_dw_callable = partial(
                 layer.mlp.backward_dw, routed_experts=False, shared_experts=True
             )
+            if layer.mlp.use_shared_expert:
+                self.submodules.append(layer.mlp.shared_experts)
         else:
             self.shared_expert_dw_callable = None
         self.cuda_graph_scope = layer.config.cuda_graph_scope
@@ -403,6 +451,17 @@ class _BackwardDWWrapper:
     def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
         """Store the CUDA graphed backward weight gradient callable."""
         self.graphed_backward_dw_callable = graphed_backward_dw_callable
+
+    def parameters(self):
+        """Returns an iterator over module parameters.
+
+        This method mimics the behavior of torch.nn.Module.parameters() by yielding
+        all parameters from the submodules managed by this wrapper. It is used to
+        collect parameters that require gradient computation during the backward pass.
+        """
+        for module in self.submodules:
+            for param in module.parameters():
+                yield param
 
 
 def build_transformer_layer_callables(layer: TransformerLayer):
@@ -668,14 +727,17 @@ def build_mtp_layer_callables(layer):
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
             hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
-        input_ids, position_ids, decoder_input, hidden_states = layer._get_embeddings(
+        input_ids, position_ids, padding_mask, decoder_input, hidden_states = layer._get_embeddings(
             input_ids=node.chunk_state.input_ids,
             position_ids=node.chunk_state.position_ids,
             embedding=node.chunk_state.model.embedding,
             hidden_states=hidden_states,
+            packed_seq_params=node.chunk_state.packed_seq_params,
+            padding_mask=node.chunk_state.padding_mask,
         )
         node.chunk_state.input_ids = input_ids
         node.chunk_state.position_ids = position_ids
+        node.chunk_state.padding_mask = padding_mask
 
         # MTP Layer Preprocess
         # norm, linear projection and transformer

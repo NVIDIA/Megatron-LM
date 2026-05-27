@@ -15,7 +15,7 @@ from contextlib import nullcontext
 import torch
 
 from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -40,6 +40,7 @@ sys.path.append(
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 
 
@@ -113,7 +114,7 @@ def add_text_generate_args(parser):
 @torch.inference_mode()
 def main(model_type: str = "gpt"):
     """Runs the text generation server with the specified model type."""
-    initialize_megatron(
+    parse_and_validate_args(
         extra_args_provider=add_text_generate_args,
         args_defaults={
             'no_load_rng': True,
@@ -121,6 +122,7 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
+    initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -138,8 +140,16 @@ def main(model_type: str = "gpt"):
         # Set up model and load checkpoint
         if model_type == "gpt":
             model_builder = gpt_builder
-        elif model_type == "mamba":
-            model_builder = mamba_builder
+        elif model_type in ("hybrid", "mamba"):
+            if model_type == "mamba":
+                import warnings
+
+                warnings.warn(
+                    'model_type="mamba" is deprecated. Use model_type="hybrid" instead.',
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            model_builder = hybrid_builder
         else:
             raise ValueError(f"Invalid model provider {model_type}")
         model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
