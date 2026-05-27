@@ -494,7 +494,6 @@ jobs:
     # Skipped/cancelled runs are intentionally not announced.
     if: |
       always()
-      && github.repository == 'NVIDIA/Megatron-LM'
       && (needs.cicd-mbridge-testing.result == 'success' || needs.cicd-mbridge-testing.result == 'failure')
     steps:
       - name: Send Slack alert
