@@ -328,7 +328,7 @@ class ProcessGroupCollection:
                 partial_expert_data_parallel=True, with_gtp=True
             )
             intra_expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(
-                with_gtp=True
+                with_gtp=True, partial_expert_data_parallel=True
             )
             expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(
                 with_gtp=True
@@ -340,12 +340,22 @@ class ProcessGroupCollection:
                 intra_dp_cp_group_gloo = parallel_state.get_data_parallel_group_gloo(
                     with_context_parallel=True, partial_data_parallel=True
                 )
+                intra_dp_cp_with_gtp_group_gloo = parallel_state.get_data_parallel_group_gloo(
+                    with_context_parallel=True, with_gtp=True, partial_data_parallel=True
+                )
                 intra_expt_dp_group_gloo = parallel_state.get_expert_data_parallel_group_gloo(
                     partial_expert_data_parallel=True
                 )
+                intra_expt_dp_with_egtp_group_gloo = (
+                    parallel_state.get_expert_data_parallel_group_gloo(
+                        with_gtp=True, partial_expert_data_parallel=True
+                    )
+                )
             else:
                 intra_dp_cp_group_gloo = None
+                intra_dp_cp_with_gtp_group_gloo = None
                 intra_expt_dp_group_gloo = None
+                intra_expt_dp_with_egtp_group_gloo = None
 
             # Model communication groups
             mp_group = parallel_state.get_model_parallel_group()
@@ -454,17 +464,27 @@ class ProcessGroupCollection:
                 )
             expt_tp_pp_group = pg_collection.tp_ep_pp
 
-            # 6. GTP with_gtp group (fallback to intra_dp_cp if not provided)
+            # 6. GTP with_gtp groups — partial (per-distopt-instance) and full
+            #    (cross-instance). Fall back to the non-GTP variants when not provided.
             if hasattr(pg_collection, 'intra_dp_cp_with_gtp'):
                 intra_dp_cp_with_gtp_group = pg_collection.intra_dp_cp_with_gtp
             else:
                 intra_dp_cp_with_gtp_group = intra_dp_cp_group
+            if hasattr(pg_collection, 'dp_cp_with_gtp'):
+                dp_cp_with_gtp_group = pg_collection.dp_cp_with_gtp
+            else:
+                dp_cp_with_gtp_group = dp_cp_group
 
-            # 7. EGTP group (fallback to intra_expt_dp if not provided)
+            # 7. EGTP groups — partial (per-distopt-instance) and full
+            #    (cross-instance). Fall back to the non-EGTP variants when not provided.
             if hasattr(pg_collection, 'intra_expt_dp_with_egtp'):
                 intra_expt_dp_with_egtp_group = pg_collection.intra_expt_dp_with_egtp
             else:
                 intra_expt_dp_with_egtp_group = intra_expt_dp_group
+            if hasattr(pg_collection, 'expt_dp_with_egtp'):
+                expt_dp_with_egtp_group = pg_collection.expt_dp_with_egtp
+            else:
+                expt_dp_with_egtp_group = expt_dp_group
 
             # Gloo groups - not supported when pg_collection is provided
             if use_gloo_process_groups:
@@ -473,7 +493,9 @@ class ProcessGroupCollection:
                     "provided. Please set use_gloo_process_groups to False."
                 )
             intra_dp_cp_group_gloo = None
+            intra_dp_cp_with_gtp_group_gloo = None
             intra_expt_dp_group_gloo = None
+            intra_expt_dp_with_egtp_group_gloo = None
 
         return {
             'dp_group': dp_group,
@@ -490,6 +512,8 @@ class ProcessGroupCollection:
             'inter_dist_opt_group': inter_dist_opt_group,
             'intra_dist_opt_group': intra_dist_opt_group,
             'intra_dp_cp_group_gloo': intra_dp_cp_group_gloo,
+            'intra_dp_cp_with_gtp_group_gloo': intra_dp_cp_with_gtp_group_gloo,
+            'intra_expt_dp_with_egtp_group_gloo': intra_expt_dp_with_egtp_group_gloo,
             'intra_expt_dp_group_gloo': intra_expt_dp_group_gloo,
         }
 
@@ -530,8 +554,14 @@ class ProcessGroupCollection:
                     with_context_parallel=True, partial_data_parallel=True
                 ),
                 'expt_dp_group': parallel_state.get_expert_data_parallel_group(),
+                'expt_dp_with_egtp_group': parallel_state.get_expert_data_parallel_group(
+                    with_gtp=True
+                ),
                 'intra_expt_dp_group': parallel_state.get_expert_data_parallel_group(
                     partial_expert_data_parallel=True
+                ),
+                'intra_expt_dp_with_egtp_group': parallel_state.get_expert_data_parallel_group(
+                    with_gtp=True, partial_expert_data_parallel=True
                 ),
                 'tp_group': parallel_state.get_tensor_model_parallel_group(),
                 'pp_group': parallel_state.get_pipeline_model_parallel_group(),
@@ -551,12 +581,6 @@ class ProcessGroupCollection:
                 ),
                 'dp_cp_with_gtp_group': parallel_state.get_data_parallel_group(
                     with_context_parallel=True, with_gtp=True
-                ),
-                'intra_expt_dp_with_egtp_group': parallel_state.get_expert_data_parallel_group(
-                    with_gtp=True
-                ),
-                'expt_dp_with_egtp_group': parallel_state.get_expert_data_parallel_group(
-                    with_gtp=True
                 ),
             }
         else:
@@ -633,6 +657,12 @@ class ProcessGroupCollection:
             result['pp_group'] = pg_collection.pp
             result['ep_group'] = pg_collection.ep
 
+            # GTP group (fallback to intra_dp_cp if not provided)
+            if hasattr(pg_collection, 'intra_dp_cp_with_gtp'):
+                result['intra_dp_cp_with_gtp_group'] = pg_collection.intra_dp_cp_with_gtp
+            else:
+                result['intra_dp_cp_with_gtp_group'] = result['intra_dp_cp_group']
+
             # EGTP group (fallback to intra_expt_dp if not provided)
             if hasattr(pg_collection, 'intra_expt_dp_with_egtp'):
                 result['intra_expt_dp_with_egtp_group'] = pg_collection.intra_expt_dp_with_egtp
@@ -641,15 +671,15 @@ class ProcessGroupCollection:
 
             # Full (cross-instance) with-GTP-excluded variants for callers that need to
             # reach ALL true weight replicas (e.g., broadcast_params at init). Fall back
-            # to the partial variants when the full attributes aren't on pg_collection.
+            # to the corresponding non-GTP-excluded full group when not provided.
             if hasattr(pg_collection, 'dp_cp_with_gtp'):
                 result['dp_cp_with_gtp_group'] = pg_collection.dp_cp_with_gtp
             else:
-                result['dp_cp_with_gtp_group'] = result['intra_dp_cp_with_gtp_group']
+                result['dp_cp_with_gtp_group'] = result['dp_cp_group']
             if hasattr(pg_collection, 'expt_dp_with_egtp'):
                 result['expt_dp_with_egtp_group'] = pg_collection.expt_dp_with_egtp
             else:
-                result['expt_dp_with_egtp_group'] = result['intra_expt_dp_with_egtp_group']
+                result['expt_dp_with_egtp_group'] = result['expt_dp_group']
 
             return result
 

@@ -1032,6 +1032,8 @@ def get_megatron_optimizer(
     mp_group = process_groups_dict['mp_group']
     expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
+    intra_dp_cp_with_gtp_group_gloo = process_groups_dict['intra_dp_cp_with_gtp_group_gloo']
+    intra_expt_dp_with_egtp_group_gloo = process_groups_dict['intra_expt_dp_with_egtp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
@@ -1169,7 +1171,7 @@ def get_megatron_optimizer(
                 per_model_buffers=gtp_buffers,
                 model_parallel_group=mp_group,
                 data_parallel_group=intra_dp_cp_with_gtp_group,
-                data_parallel_group_gloo=None,
+                data_parallel_group_gloo=intra_dp_cp_with_gtp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
@@ -1195,7 +1197,7 @@ def get_megatron_optimizer(
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
         # Pass Gloo process groups into optimizer only if needed.
         if use_gloo_process_groups:
-            expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
+            expt_data_parallel_group_gloo = intra_expt_dp_with_egtp_group_gloo
         else:
             expt_data_parallel_group_gloo = None
         optimizers.append(

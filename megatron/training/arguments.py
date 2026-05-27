@@ -1462,14 +1462,6 @@ def validate_args(args, defaults={}):
                 "force setting NCCL_PROTO=Simple might introduce bad perf."
             )
 
-        # Under GTP+no-TP the optimal bwd schedule would be wgrad-before-dgrad
-        # on _Linear / _LayerNormLinear (so the GTP wgrad reduce-scatter
-        # overlaps with the dgrad GEMM and the prev_w AG prefetch overlaps
-        # with the wgrad GEMM). TE-side support for this ordering is deferred
-        # to a follow-up MR; until then, flag any attempt to activate it.
-        if args.tensor_model_parallel_size == 1:
-            raise NotImplementedError("Wgrad->Dgrad schedule to be supported later")
-
         # Propagate --fp8-param-gather into GTPConfig: enables optimizer-side
         # FP32->FP8 cast for GTP shards, so the forward skips BF16->FP8.
         if getattr(args, 'fp8_param_gather', False):

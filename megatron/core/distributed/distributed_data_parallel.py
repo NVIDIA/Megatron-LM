@@ -129,6 +129,7 @@ class DistributedDataParallel(_BaseDataParallel):
         self.params_with_grad = []
         all_params = []
         gtp_params = []
+        egtp_params = []
         for name, param in self.module.named_parameters():
             if not param.requires_grad:
                 continue
@@ -139,25 +140,33 @@ class DistributedDataParallel(_BaseDataParallel):
 
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
-            # Only dense GTP params (allreduce=True) carve out into their own bucket
-            # (they need the GTP-peer-excluded RS group). Routed-expert GTP params
-            # have allreduce=False and ride the expert path, which uses its own
-            # EGTP-peer-excluded group; non-GTP params fall through to all_params.
-            is_dense_gtp = (
-                isinstance(param, GTPShardedParam)
-                and getattr(param, 'allreduce', True)
-            )
-            if is_dense_gtp:
+            # GTPShardedParam comes in two flavors. Both need the GTP-peer-excluded RS
+            # group because GTP's bwd already RS'd over the (E)GTP axis:
+            #   - dense GTP   (allreduce=True ) → gtp_params  → intra_dp_cp_with_gtp_group
+            #   - expert GTP  (allreduce=False) → egtp_params → intra_expt_dp_with_egtp_group
+            # Non-GTP expert params (biases, LayerNorms inside experts, etc.) are
+            # REPLICATED across EGTP peers and stay in all_params — their expert branch
+            # reduces over the FULL intra_expt_dp_group at line 263.
+            is_gtp_shard = isinstance(param, GTPShardedParam)
+            is_expert = not getattr(param, 'allreduce', True)
+            if is_gtp_shard and not is_expert:
                 gtp_params.append(param)
+            elif is_gtp_shard and is_expert:
+                egtp_params.append(param)
             else:
                 all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). GTP params
-        # are grouped into a separate set of buffers (RS group is chosen at line 328).
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). (E)GTP
+        # params are grouped into separate buffer sets (RS groups chosen below).
         buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
         gtp_buffer_groups = (
             group_params_for_buffers(gtp_params, self.ddp_config.grad_reduce_in_fp32)
             if gtp_params
+            else {}
+        )
+        egtp_buffer_groups = (
+            group_params_for_buffers(egtp_params, self.ddp_config.grad_reduce_in_fp32)
+            if egtp_params
             else {}
         )
 
@@ -211,6 +220,7 @@ class DistributedDataParallel(_BaseDataParallel):
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
             gtp_gradient_scaling_factor = 1.0
+            egtp_gradient_scaling_factor = 1.0
         else:
             # The goal is to scale reduced gradients by 1/dp_size.
             # This can be achieved in two ways:
@@ -235,11 +245,14 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
-                # GTP pre-scale = (collective_size) / dp_cp_size so post-collective grad
-                # lands at 1/dp_cp_size. Divisor must reference the same group the RS
-                # fires on (line 328) — works for any collective_size.
+                # (E)GTP pre-scale = (collective_size) / dp_cp_size so post-collective
+                # grad lands at 1/dp_cp_size. Each divisor must reference the same group
+                # the RS fires on (lines 341 for GTP, 372 for EGTP).
                 gtp_gradient_scaling_factor = (
                     self.intra_dp_cp_with_gtp_group.size() / self.dp_cp_group.size()
+                )
+                egtp_gradient_scaling_factor = (
+                    self.intra_expt_dp_with_egtp_group.size() / self.dp_cp_group.size()
                 )
             else:
                 data_parallel_world_size = self.dp_cp_group.size()
@@ -247,11 +260,13 @@ class DistributedDataParallel(_BaseDataParallel):
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
                 gtp_gradient_scaling_factor = 1.0 / data_parallel_world_size
+                egtp_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate buffers for each group.
         self.buffers = []
         self.expert_parallel_buffers = []
         self.gtp_buffers = []
+        self.egtp_buffers = []
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
         # Grad RS for every buffer (expert / dense non-GTP here, dense GTP at line 328)
         # uses a per-distopt-instance partial group. Cross-instance sync runs separately
@@ -259,9 +274,11 @@ class DistributedDataParallel(_BaseDataParallel):
         # here would mix independent data slices.
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
-                # Expert branch needs the EGTP-peer filter (routed experts already
-                # RS'd over the EGTP axis); reduces to intra_expt_dp_group when EGTP=1.
-                data_parallel_group = self.intra_expt_dp_with_egtp_group
+                # Non-GTP expert params (biases, expert-scoped LayerNorms, etc.) are
+                # replicated across EGTP peers, so reduce over the FULL intra_expt_dp
+                # group (includes EGTP peers). EGTP-sharded routed experts are carved
+                # into egtp_buffer_groups below and use the EGTP-peer-excluded group.
+                data_parallel_group = self.intra_expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
                 data_parallel_group = self.intra_dp_cp_group
@@ -337,6 +354,29 @@ class DistributedDataParallel(_BaseDataParallel):
             )
             self.gtp_buffers.append(buffer)
 
+        # EGTP-sharded routed experts: same story as dense GTP but on the expert side —
+        # their grads were RS'd over the EGTP axis by GTP, so the DP reduction here must
+        # exclude EGTP peers (intra_expt_dp_with_egtp_group) and use the matching
+        # egtp_gradient_scaling_factor (numerator = collective size). Non-GTP expert
+        # params took the full intra_expt_dp_group branch above.
+        for buffer_key, (params, param_indices) in egtp_buffer_groups.items():
+            params_with_names = [(p, param_to_name[p]) for p in params]
+            buffer = _ParamAndGradBuffer(
+                self.ddp_config,
+                buffer_key.param_dtype,
+                buffer_key.grad_dtype,
+                params_with_names,
+                self.intra_expt_dp_with_egtp_group,
+                self.bucket_size,
+                param_to_name,
+                egtp_gradient_scaling_factor,
+                param_indices,
+                self.ddp_config.nccl_ub,
+                pg_collection,
+                param_layout=None,
+            )
+            self.egtp_buffers.append(buffer)
+
         # In some scenarios, we want to put buckets from different buffers into a group so that
         # their communication can be aggregated. For example, when there are both fp8 buffers
         # and bf16 buffers in the model and vpp is enabled, each model chunk will have an fp8
@@ -367,13 +407,28 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.reduce_scatter_with_fp32_accumulation
             ),
         )
-        # Flat view across all three bucket-group lists; used wherever
+        self.egtp_bucket_groups = partition_buckets(
+            self.egtp_buffers,
+            force_single_bucket_group=disable_bucketing,
+            reduce_scatter_with_fp32_accumulation=(
+                self.ddp_config.reduce_scatter_with_fp32_accumulation
+            ),
+        )
+        # Flat view across all four bucket-group lists; used wherever
         # callers need to iterate every bucket group regardless of dense /
-        # expert-parallel / GTP category. The per-category lists above are
+        # expert-parallel / GTP / EGTP category. The per-category lists above are
         # kept for code paths that need per-category state (e.g. one
         # communication_stream per category).
         self.all_bucket_groups = (
-            self.bucket_groups + self.expert_parallel_bucket_groups + self.gtp_bucket_groups
+            self.bucket_groups
+            + self.expert_parallel_bucket_groups
+            + self.gtp_bucket_groups
+            + self.egtp_bucket_groups
+        )
+        # Same flat-view convenience for the underlying buffers (lifecycle ops
+        # like reset/offload/reload iterate over every buffer once).
+        self.all_buffers = (
+            self.buffers + self.expert_parallel_buffers + self.gtp_buffers + self.egtp_buffers
         )
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
@@ -384,6 +439,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.bucket_groups,
                 self.expert_parallel_bucket_groups,
                 self.gtp_bucket_groups,
+                self.egtp_bucket_groups,
             ]:
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
@@ -402,6 +458,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.bucket_groups,
                 self.expert_parallel_bucket_groups,
                 self.gtp_bucket_groups,
+                self.egtp_bucket_groups,
             ]:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
@@ -651,7 +708,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
-        for buffer in self.buffers + self.expert_parallel_buffers + self.gtp_buffers:
+        for buffer in self.all_buffers:
             buffer.scale_gradients(scaling_factor)
 
     def zero_grad_buffer(self):
@@ -665,7 +722,7 @@ class DistributedDataParallel(_BaseDataParallel):
             # to True, and there will be a double-GA.
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        for buffer in self.buffers + self.expert_parallel_buffers + self.gtp_buffers:
+        for buffer in self.all_buffers:
             buffer.reset()
         for bucket_group in self.all_bucket_groups:
             bucket_group.reset()
@@ -710,7 +767,7 @@ class DistributedDataParallel(_BaseDataParallel):
         if synchronize:
             torch.cuda.synchronize()
 
-        for buffer in self.buffers + self.expert_parallel_buffers + self.gtp_buffers:
+        for buffer in self.all_buffers:
             buffer.offload_to_cpu(move_params=False, move_grads=True)
 
         if empty_cache:
@@ -727,7 +784,7 @@ class DistributedDataParallel(_BaseDataParallel):
         Args:
             synchronize: Whether to call torch.cuda.synchronize() after allocation.
         """
-        for buffer in self.buffers + self.expert_parallel_buffers + self.gtp_buffers:
+        for buffer in self.all_buffers:
             buffer.reload_from_cpu(move_params=False, move_grads=True)
 
         if synchronize:

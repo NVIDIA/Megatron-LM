@@ -2283,14 +2283,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 super().backward_dw()
 
         def __repr__(self):
+            gtp_str = f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else ""
             return (
                 f"{type(self).__name__}(per expert(["
                 f"in={self.in_features}, out={self.out_features}]) "
                 f"X num_gemms={self.num_gemms}, "
-                f"bias={self.use_bias}, TP={self.tp_size}, "
-                f"GTP={self.gtp_size})"
-                if hasattr(self, "gtp_size")
-                else ")"
+                f"bias={self.use_bias}, TP={self.tp_size}"
+                f"{gtp_str})"
             )
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):

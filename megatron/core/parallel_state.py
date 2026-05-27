@@ -71,6 +71,11 @@ _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
+# Partial expert DP group with EGTP peers excluded — per-distopt-instance slice
+# of true expert-weight replicas. Mirrors _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
+# on the dense side.
+_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = None
+_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = None
 # Parallel state values changed on the fly
 _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_MODEL_PARALLEL_RANK = None
@@ -1511,6 +1516,8 @@ def initialize_model_parallel(
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
     # Build expert DP group with expert generalized tensor parallel accounted for.
     global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO
     if expert_generalized_tensor_parallel_size > 1:
         # Build rank→expert_gtp_rank mapping.
         rank_to_expert_gtp_rank = {}
@@ -1532,8 +1539,57 @@ def initialize_model_parallel(
                 )
                 if rank in edp_gtp_ranks:
                     _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = group
+
+                if num_distributed_optimizer_instances > 1:
+                    assert (
+                        len(edp_gtp_ranks) % num_distributed_optimizer_instances == 0
+                    ), (
+                        f"Expert DP minus EGTP peers size ({len(edp_gtp_ranks)}) must be "
+                        f"divisible by num_distributed_optimizer_instances "
+                        f"({num_distributed_optimizer_instances})"
+                    )
+                    intra_partial_size = (
+                        len(edp_gtp_ranks) // num_distributed_optimizer_instances
+                    )
+                    for i in range(num_distributed_optimizer_instances):
+                        chunk = edp_gtp_ranks[
+                            i * intra_partial_size : (i + 1) * intra_partial_size
+                        ]
+                        intra_group = create_group(
+                            chunk,
+                            timeout=timeout,
+                            pg_options=get_nccl_options("intra_ep_dp_gtp", nccl_comm_cfgs),
+                            group_desc="INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP",
+                        )
+                        if create_gloo_process_groups:
+                            intra_group_gloo = create_group(
+                                chunk,
+                                timeout=timeout,
+                                backend="gloo",
+                                group_desc=(
+                                    "INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO"
+                                ),
+                            )
+                        else:
+                            intra_group_gloo = None
+                        if rank in chunk:
+                            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = intra_group
+                            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = (
+                                intra_group_gloo
+                            )
+        if num_distributed_optimizer_instances == 1:
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = (
+                _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
+            )
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = None
     else:
         _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = _EXPERT_DATA_PARALLEL_GROUP
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = (
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+        )
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = (
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
+        )
 
     ### End of expert related parallel groups initialization
 
@@ -1769,8 +1825,25 @@ def get_data_parallel_group(
         return _DATA_PARALLEL_GROUP
 
 
-def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
+def get_data_parallel_group_gloo(
+    with_context_parallel=False, with_gtp=False, partial_data_parallel=False
+):
     """Get the Gloo data-parallel group the caller rank belongs to."""
+    if with_gtp:
+        assert with_context_parallel, "Gloo with_gtp variants only exist with CP"
+        if partial_data_parallel:
+            assert _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO is not None, (
+                "Intra partial data parallel group with context parallel and "
+                "generalized tensor parallel (gloo) is not initialized"
+            )
+            return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO
+        # Full (non-partial) Gloo variant of with_gtp is not built; callers needing
+        # cross-instance Gloo over the GTP-excluded set can use the non-GTP variant
+        # since broadcasts are init-time only.
+        assert _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None, (
+            "data parallel group-gloo with context parallel combined is not initialized"
+        )
+        return _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     if with_context_parallel:
         if partial_data_parallel:
             assert (
@@ -2317,6 +2390,13 @@ def get_expert_data_parallel_group(
 ):
     """Get expert data parallel group."""
     if with_gtp:
+        if partial_expert_data_parallel:
+            if check_initialized:
+                assert _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP is not None, (
+                    "Intra partial expert data parallel group with generalized tensor "
+                    "parallel is not initialized"
+                )
+            return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
         if check_initialized:
             assert (
                 _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP is not None
@@ -2336,8 +2416,17 @@ def get_expert_data_parallel_group(
         return _EXPERT_DATA_PARALLEL_GROUP
 
 
-def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
+def get_expert_data_parallel_group_gloo(with_gtp=False, partial_expert_data_parallel=False):
     """Get expert data parallel group-gloo."""
+    if with_gtp:
+        assert partial_expert_data_parallel, (
+            "Gloo with_gtp variant is only built for the partial (per-distopt-instance) group"
+        )
+        assert _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO is not None, (
+            "Intra partial expert data parallel group with generalized tensor parallel "
+            "(gloo) is not initialized"
+        )
+        return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO
     if partial_expert_data_parallel:
         assert (
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
@@ -2564,6 +2653,12 @@ def destroy_model_parallel():
 
     global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
     _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = None
+
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
+    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = None
+
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO
+    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = None
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     if (

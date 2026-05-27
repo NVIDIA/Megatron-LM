@@ -222,6 +222,11 @@ def count_zeros_fp32(
         use_decoupled_grad (bool, optional): If True, reads from the 
             '.decoupled_grad' attribute instead of the standard '.grad'. 
             Defaults to False.
+        tp_group (ProcessGroup, optional): TP group for the TP-duplicate filter.
+            Defaults to the default TP group.
+        use_distributed_optimizer (bool, optional): True when params are per-rank
+            sharded slices (skip GTP dedup); False when replicated (keep dedup,
+            else zeros get counted gtp_size times). Defaults to False.
 
     Returns:
         float: The total number of zeros in the gradients across the process group.
