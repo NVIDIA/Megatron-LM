@@ -43,13 +43,13 @@ Forward (``_triton_pre_gated_delta_rule_forward``)
       ``beta = sigmoid(beta_raw)``.
 
 Backward (``_triton_pre_gated_delta_rule_backward``)
-    Five Triton kernels + one delegated C++ call, also fanned out on side
+    Four Triton kernels + one delegated C++ call, also fanned out on side
     streams:
 
-    * ``_l2norm_repeat_backward_kernel`` (2 launches: Q on s_q, K on s_k).
-      Reduces REPEAT v-heads of d_normed back to one per qk-head, then
-      applies the l2norm backward against the saved ``silu_bf16`` to
-      produce d_silu_conv.
+    * ``_qk_l2norm_repeat_backward_kernel`` (1 launch on s_q).
+      Reduces REPEAT v-heads of Q and K d_normed back to one per qk-head,
+      then applies the l2norm backward against the saved ``silu_bf16`` to
+      produce d_silu_conv for both Q and K.
 
     * ``_v_layout_to_conv_kernel`` (s_v). Streams ``dv`` straight into
       the V channel slice of d_silu_conv with a coalesced read/write —
@@ -773,6 +773,112 @@ def _l2norm_repeat_backward_kernel(
     tl.store(d_silu_ptrs, d_silu.to(d_silu_bf16_ptr.dtype.element_ty), mask=s_mask[:, None])
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_S": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_S": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_S": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_S": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_S": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_S": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_S": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_S": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_S": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["seq_len", "HEAD_DIM", "REPEAT"],
+)
+@triton.jit
+def _qk_l2norm_repeat_backward_kernel(
+    dq_ptr,
+    dk_ptr,
+    silu_bf16_ptr,
+    d_silu_bf16_ptr,
+    seq_len,
+    num_qk_heads,
+    qk_channels,
+    eps,
+    dq_b_stride,
+    dq_s_stride,
+    dq_h_stride,
+    dk_b_stride,
+    dk_s_stride,
+    dk_h_stride,
+    silu_b_stride,
+    silu_c_stride,
+    silu_s_stride,
+    d_silu_b_stride,
+    d_silu_c_stride,
+    d_silu_s_stride,
+    HEAD_DIM: tl.constexpr,
+    REPEAT: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """Merged Q/K l2norm + REPEAT-way head broadcast backward."""
+
+    pid_bgh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    heads_per_batch = num_qk_heads * 2
+    batch_id = pid_bgh // heads_per_batch
+    local_bgh = pid_bgh - batch_id * heads_per_batch
+    group_id = local_bgh // num_qk_heads
+    head_id = local_bgh - group_id * num_qk_heads
+    is_query = group_id == 0
+    is_key = group_id == 1
+
+    chan_off = tl.arange(0, HEAD_DIM)
+    chan = group_id * qk_channels + head_id * HEAD_DIM + chan_off
+
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    s_mask = s_offs < seq_len
+
+    d_normed = tl.zeros([BLOCK_S, HEAD_DIM], dtype=tl.float32)
+    for r in tl.static_range(REPEAT):
+        v_head = head_id * REPEAT + r
+        dq_ptrs = (
+            dq_ptr
+            + batch_id * dq_b_stride
+            + s_offs[:, None] * dq_s_stride
+            + v_head * dq_h_stride
+            + chan_off[None, :]
+        )
+        dk_ptrs = (
+            dk_ptr
+            + batch_id * dk_b_stride
+            + s_offs[:, None] * dk_s_stride
+            + v_head * dk_h_stride
+            + chan_off[None, :]
+        )
+        d_normed += tl.load(
+            dq_ptrs, mask=s_mask[:, None] & is_query, other=0.0
+        ).to(tl.float32)
+        d_normed += tl.load(
+            dk_ptrs, mask=s_mask[:, None] & is_key, other=0.0
+        ).to(tl.float32)
+
+    silu_ptrs = (
+        silu_bf16_ptr
+        + batch_id * silu_b_stride
+        + chan[None, :] * silu_c_stride
+        + s_offs[:, None] * silu_s_stride
+    )
+    silu_bf16 = tl.load(silu_ptrs, mask=s_mask[:, None], other=0.0).to(tl.float32)
+
+    norm_sq = tl.sum(silu_bf16 * silu_bf16, axis=1)
+    rstd = 1.0 / tl.sqrt(norm_sq + eps)
+    s_row = tl.sum(d_normed * silu_bf16, axis=1)
+    rstd3 = rstd * rstd * rstd
+    d_silu = rstd[:, None] * d_normed - rstd3[:, None] * silu_bf16 * s_row[:, None]
+
+    d_silu_ptrs = (
+        d_silu_bf16_ptr
+        + batch_id * d_silu_b_stride
+        + chan[None, :] * d_silu_c_stride
+        + s_offs[:, None] * d_silu_s_stride
+    )
+    tl.store(d_silu_ptrs, d_silu.to(d_silu_bf16_ptr.dtype.element_ty), mask=s_mask[:, None])
+
+
 @triton.jit
 def _v_layout_to_conv_kernel(
     dv_ptr,                # (b, s, num_v_heads, value_head_dim)
@@ -1115,6 +1221,66 @@ def _triton_l2norm_repeat_backward(
             d_qk_out.stride(0),
             d_qk_out.stride(1),
             d_qk_out.stride(2),
+            silu_bf16.stride(0),
+            silu_bf16.stride(1),
+            silu_bf16.stride(2),
+            d_silu_bf16.stride(0),
+            d_silu_bf16.stride(1),
+            d_silu_bf16.stride(2),
+            HEAD_DIM=key_head_dim,
+            REPEAT=repeat,
+        )
+
+    return d_silu_bf16
+
+
+def _triton_qk_l2norm_repeat_backward(
+    dq: Tensor,
+    dk: Tensor,
+    silu_bf16: Tensor,
+    d_silu_bf16: Tensor,
+    *,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    eps: float = 1e-6,
+    stream: Optional["torch.cuda.Stream"] = None,
+) -> Tensor:
+    """Merged Q/K l2norm + REPEAT backward launch."""
+
+    batch = dq.shape[0]
+    seq_len = dq.shape[1]
+    qk_channels = num_key_heads * key_head_dim
+    repeat = num_value_heads // num_key_heads
+    device = dq.device
+
+    grid = lambda meta: (
+        batch * 2 * num_key_heads,
+        triton.cdiv(seq_len, meta["BLOCK_S"]),
+    )
+
+    if stream is not None:
+        stream.wait_stream(torch.cuda.current_stream(device))
+
+    launch_context = (
+        torch.cuda.stream(stream) if stream is not None else _NullContext()
+    )
+    with launch_context:
+        _qk_l2norm_repeat_backward_kernel[grid](
+            dq,
+            dk,
+            silu_bf16,
+            d_silu_bf16,
+            seq_len,
+            num_key_heads,
+            qk_channels,
+            eps,
+            dq.stride(0),
+            dq.stride(1),
+            dq.stride(2),
+            dk.stride(0),
+            dk.stride(1),
+            dk.stride(2),
             silu_bf16.stride(0),
             silu_bf16.stride(1),
             silu_bf16.stride(2),
@@ -1609,25 +1775,15 @@ def _triton_pre_gated_delta_rule_backward(
     s_z = _get_side_stream(device, slot=4)
 
     # Q + K: l2norm + REPEAT backward writes into d_silu_conv's Q/K slices.
-    _triton_l2norm_repeat_backward(
+    _triton_qk_l2norm_repeat_backward(
         dq,
+        dk,
         silu_conv,
         d_silu_conv,
-        is_query=True,
         num_key_heads=num_key_heads,
         num_value_heads=num_value_heads,
         key_head_dim=key_head_dim,
         stream=s_q,
-    )
-    _triton_l2norm_repeat_backward(
-        dk,
-        silu_conv,
-        d_silu_conv,
-        is_query=False,
-        num_key_heads=num_key_heads,
-        num_value_heads=num_value_heads,
-        key_head_dim=key_head_dim,
-        stream=s_k,
     )
 
     # V: no l2norm and no REPEAT in forward, so d_silu_conv's V slice is
