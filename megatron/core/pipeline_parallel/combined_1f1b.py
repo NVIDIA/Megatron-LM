@@ -27,7 +27,7 @@ def _release_tensor_storage(tensors):
         return
 
     for tensor in tensors:
-        if isinstance(tensor, torch.Tensor):
+        if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
             tensor.record_stream(torch.cuda.current_stream())
             tensor.untyped_storage().resize_(0)
 
