@@ -1405,7 +1405,7 @@ def _triton_g_beta_backward(
     Returns:
         ``(d_qkvzba_out, d_A_log, d_dt_bias)``. ``d_qkvzba_out`` only has its
         alpha and beta slices filled in; the caller is expected to allocate
-        and zero the buffer (the other backward kernels fill the rest).
+        the buffer while the other backward kernels fill the rest.
         ``d_A_log`` and ``d_dt_bias`` are fp32 and need to be cast back to
         the parameter dtype by the caller.
     """
@@ -1433,8 +1433,10 @@ def _triton_g_beta_backward(
         torch.cuda.stream(stream) if stream is not None else _NullContext()
     )
     with launch_context:
-        d_A_log = torch.zeros(num_value_heads, dtype=torch.float32, device=device)
-        d_dt_bias = torch.zeros(num_value_heads, dtype=torch.float32, device=device)
+        d_param_grads = torch.empty((2, num_value_heads), dtype=torch.float32, device=device)
+        d_param_grads.zero_()
+        d_A_log = d_param_grads[0]
+        d_dt_bias = d_param_grads[1]
         _g_beta_backward_kernel[gb_grid](
             qkvzba,
             A_log,
@@ -1766,10 +1768,9 @@ def _triton_pre_gated_delta_rule_backward(
         (batch, seq_len, conv_dim), dtype=qkvzba.dtype, device=device
     ).permute(0, 2, 1)
 
-    # Side streams: Q=0, K=1, V=2, gb=3, z=4 — same slots as the forward
-    # so the physical CUDA streams stay warm across forward / backward.
+    # Side streams: QK=0, V=2, gb=3, z=4 — same slots as the forward so the
+    # physical CUDA streams stay warm across forward / backward.
     s_q = _get_side_stream(device, slot=0)
-    s_k = _get_side_stream(device, slot=1)
     s_v = _get_side_stream(device, slot=2)
     s_gbeta = _get_side_stream(device, slot=3)
     s_z = _get_side_stream(device, slot=4)
@@ -1799,12 +1800,10 @@ def _triton_pre_gated_delta_rule_backward(
         stream=s_v,
     )
 
-    # g + beta backward fills d_qkvzba's alpha + beta slices in place via
-    # atomic_add, plus per-head d_A_log / d_dt_bias. The conv slice and
-    # z slice are overwritten by other kernels below, so only the alpha
-    # and beta channel range needs to be zero-initialised.
+    # g + beta backward fully stores d_qkvzba's alpha + beta slices, plus
+    # per-head d_A_log / d_dt_bias. Conv and z slices are filled by the
+    # causal-conv and z kernels, so d_qkvzba does not need a pre-zero.
     d_qkvzba = torch.empty_like(qkvzba)
-    d_qkvzba[..., 2 * qk_channels + 2 * v_channels :].zero_()
     _, d_A_log_fp32, d_dt_bias_fp32 = _triton_g_beta_backward(
         qkvzba,
         A_log,
@@ -1832,10 +1831,10 @@ def _triton_pre_gated_delta_rule_backward(
         stream=s_z,
     )
 
-    # Join all the streams that wrote into d_silu_conv before we feed it
-    # to causal_conv1d_bwd_function (which runs on the default stream).
+    # Join only streams that wrote into d_silu_conv before causal_conv1d_bwd_function.
+    # g/beta and z write disjoint outputs and can continue overlapping with conv bwd.
     default_stream = torch.cuda.current_stream(device)
-    for s in (s_q, s_k, s_v, s_gbeta, s_z):
+    for s in (s_q, s_v):
         default_stream.wait_stream(s)
 
     # Pre-allocate d_x_conv as a strided view INTO d_qkvzba's conv slice.
@@ -1868,8 +1867,10 @@ def _triton_pre_gated_delta_rule_backward(
     )
 
     d_weight = d_weight_fp32.view(*conv1d_weight.shape).to(conv1d_weight.dtype)
+    default_stream.wait_stream(s_gbeta)
     d_A_log = d_A_log_fp32.to(A_log.dtype)
     d_dt_bias = d_dt_bias_fp32.to(dt_bias.dtype)
+    default_stream.wait_stream(s_z)
 
     return d_qkvzba, d_weight, d_A_log, d_dt_bias
 
