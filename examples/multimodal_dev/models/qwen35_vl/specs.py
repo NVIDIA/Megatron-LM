@@ -17,6 +17,7 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
@@ -25,35 +26,55 @@ def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=Non
     Mirrors ``Qwen3VLSelfAttention.apply_rotary_pos_emb_absolute`` in Megatron-Bridge
     with ``apply_rotary_pos_emb_in_fp32=True``.
     """
-    from megatron.core import parallel_state
-    from megatron.core.models.common.embeddings.rope_utils import (
-        _apply_rotary_pos_emb_bshd,
-        _apply_rotary_pos_emb_thd,
-    )
+    from megatron.core.models.common.embeddings import rope_utils
+    from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
     orig_dtype = t.dtype
-    t_fp32 = t.float()
-
-    if cu_seqlens is None:
-        out = _apply_rotary_pos_emb_bshd(
-            t_fp32,
-            freqs,
-            rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=getattr(config, 'multi_latent_attention', False),
-            mscale=mscale,
-        )
-    else:
-        if cp_group is None:
-            cp_group = parallel_state.get_context_parallel_group()
-        out = _apply_rotary_pos_emb_thd(
-            t_fp32,
+    if (
+        cu_seqlens is not None
+        and getattr(config, "apply_rope_fusion", False)
+        and getattr(config, "mrope_section", None) is not None
+        and getattr(config, "rotary_interleaved", False) is False
+        and getattr(config, "multi_latent_attention", False) is False
+        and mscale == 1.0
+        and t.dim() == 3
+        and freqs.dim() == 4
+        and freqs.shape[0] == 3
+        and cp_group is not None
+        and rope_utils.fused_apply_mrope_thd is not None
+        and rope_utils.get_fused_mrope_thd_unavailable_reason is not None
+    ):
+        unavailable_reason = rope_utils.get_fused_mrope_thd_unavailable_reason(
+            t,
             cu_seqlens,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=getattr(config, 'multi_latent_attention', False),
-            mscale=mscale,
-            cp_group=cp_group,
+            cp_size=cp_group.size(),
+            cp_rank=cp_group.rank(),
         )
+        if unavailable_reason is None:
+            return rope_utils.fused_apply_mrope_thd(
+                t,
+                cu_seqlens,
+                freqs,
+                config.mrope_section,
+                interleaved_mrope=config.mrope_interleaved,
+                rotary_interleaved=config.rotary_interleaved,
+                cp_size=cp_group.size(),
+                cp_rank=cp_group.rank(),
+                fp32_compute=True,
+            )
+
+    t_fp32 = t.float()
+    out = apply_rotary_pos_emb(
+        t_fp32,
+        freqs,
+        config=config,
+        cu_seqlens=cu_seqlens,
+        mscale=mscale,
+        cp_group=cp_group,
+        mla_rotary_interleaved=getattr(config, 'multi_latent_attention', False),
+    )
     return out.to(orig_dtype)
 
 
@@ -65,9 +86,19 @@ def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_gro
     incorrectly split the vision seqlens.  This wrapper substitutes a
     trivial group so the vision RoPE sees the full packed sequence.
     """
-    return _apply_rope_fp32(
-        t, freqs, config, cu_seqlens, mscale, cp_group=_NO_CP_GROUP,
-    )
+    range_name = "qwen35_vl.vision_encoder.rope_apply"
+    nvtx_range_push(range_name)
+    try:
+        return _apply_rope_fp32(
+            t,
+            freqs,
+            config,
+            cu_seqlens,
+            mscale,
+            cp_group=_NO_CP_GROUP,
+        )
+    finally:
+        nvtx_range_pop(range_name)
 
 
 class Qwen35VLVisionSelfAttention(SelfAttention):

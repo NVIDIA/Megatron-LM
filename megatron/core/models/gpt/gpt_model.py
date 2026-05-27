@@ -402,10 +402,28 @@ class GPTModel(LanguageModule):
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
+                packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                use_fused_mrope = False
+                use_raw_mrope_freqs = (
+                    self.config.apply_rope_fusion and not self.config.rotary_interleaved
+                )
+                # Dynamic inference indexes rotary_pos_emb as seq-major materialized embeddings.
+                # Raw mRoPE freqs are axis-major and are only safe for the normal decoder path.
+                if in_inference_mode and inference_context.is_dynamic_batching():
+                    use_raw_mrope_freqs = False
+                if use_raw_mrope_freqs:
+                    try:
+                        from megatron.core.fusions.fused_mrope import is_fused_mrope_available
+
+                        use_fused_mrope = is_fused_mrope_available()
+                    except ImportError:
+                        use_fused_mrope = False
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    return_raw_freqs=use_fused_mrope,
+                    packed_seq=packed_seq,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE

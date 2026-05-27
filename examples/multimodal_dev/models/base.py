@@ -45,10 +45,8 @@ def _cp_split_tensor(tensor, seq_dim, cp_size, cp_rank):
 
 
 class _NoCPGroup:
-    """Dummy size-1 process group used to bypass MRoPE's BSHD-style
-    zigzag of pre-computed THD freqs (Megatron-Core gap:
-    ``MultimodalRotaryEmbedding.forward`` lacks the ``not packed_seq``
-    skip that plain ``RotaryEmbedding`` has).
+    """Dummy size-1 process group used to bypass BSHD-style CP slicing
+    for THD MRoPE call sites that do not pass ``packed_seq=True``.
     """
 
     def size(self):

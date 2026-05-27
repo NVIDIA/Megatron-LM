@@ -16,6 +16,7 @@ from torch import Tensor
 from megatron.core import parallel_state
 
 logger = logging.getLogger(__name__)
+_ROPE_FUSION_FALLBACK_WARNINGS: set[str] = set()
 
 try:
     from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
@@ -30,6 +31,28 @@ except ImportError:
 
 
 try:
+    from megatron.core.fusions.fused_mrope import (
+        can_launch_fused_mrope,
+        can_launch_fused_mrope_thd,
+        fused_apply_mrope,
+        fused_apply_mrope_thd,
+        get_fused_mrope_thd_unavailable_reason,
+        get_fused_mrope_unavailable_reason,
+        is_fused_mrope_available,
+        mrope_freqs_to_rotary_emb,
+    )
+except ImportError:
+    can_launch_fused_mrope = None
+    can_launch_fused_mrope_thd = None
+    fused_apply_mrope = None
+    fused_apply_mrope_thd = None
+    get_fused_mrope_thd_unavailable_reason = None
+    get_fused_mrope_unavailable_reason = None
+    is_fused_mrope_available = None
+    mrope_freqs_to_rotary_emb = None
+
+
+try:
     from flash_attn.layers.rotary import apply_rotary_emb as apply_rotary_emb_flash
 except ImportError:
     apply_rotary_emb_flash = None
@@ -41,8 +64,99 @@ __all__ = [
     'apply_rotary_pos_emb_with_cos_sin',
     'fused_apply_rotary_pos_emb',
     'fused_apply_rotary_pos_emb_thd',
+    'can_launch_fused_mrope',
+    'can_launch_fused_mrope_thd',
+    'fused_apply_mrope',
+    'fused_apply_mrope_thd',
+    'get_fused_mrope_thd_unavailable_reason',
+    'get_fused_mrope_unavailable_reason',
+    'is_fused_mrope_available',
+    'mrope_freqs_to_rotary_emb',
     'get_pos_emb_on_this_cp_rank',
 ]
+
+
+def _is_raw_mrope_freqs(t: Tensor, freqs: Tensor, config: TransformerConfig) -> bool:
+    """Return whether freqs is the raw 3-axis mRoPE tensor for fused apply."""
+    if config.mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
+        return False
+    if sum(config.mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
+        return False
+    if t.dim() == 4:
+        return freqs.shape[1] == t.shape[1] and freqs.shape[2] == t.shape[0]
+    if t.dim() == 3:
+        return freqs.shape[1] == 1
+    return False
+
+
+def _is_raw_mrope_freqs_thd(
+    t: Tensor,
+    freqs: Tensor,
+    cu_seqlens: Tensor,
+    config: TransformerConfig,
+    cp_size: int,
+) -> bool:
+    """Return whether freqs is raw mRoPE for THD layout, or fail on raw-like bad shapes."""
+    if config.mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
+        return False
+    if t.dim() != 3:
+        raise ValueError(
+            f"raw mRoPE THD expects t with shape [tokens, heads, head_dim], got {tuple(t.shape)}"
+        )
+    if sum(config.mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
+        return False
+
+    if freqs.shape[1] != 1:
+        raise ValueError(
+            "raw mRoPE THD freqs must have singleton batch dimension with shape "
+            f"[3, 1, total_seqlen, rotary_dim / 2], got {tuple(freqs.shape)}"
+        )
+    expected_total_seqlen = t.shape[0] * cp_size
+    if freqs.shape[2] != expected_total_seqlen:
+        raise ValueError(
+            "raw mRoPE THD freqs sequence length must match local tokens times cp_size, "
+            f"got freqs.shape[2]={freqs.shape[2]}, tokens={t.shape[0]}, cp_size={cp_size}"
+        )
+    if cu_seqlens.dim() != 1:
+        raise ValueError(f"raw mRoPE THD cu_seqlens must be 1D, got {tuple(cu_seqlens.shape)}")
+    return True
+
+
+def _raw_mrope_freqs_to_emb(freqs: Tensor, config: TransformerConfig) -> Tensor:
+    assert mrope_freqs_to_rotary_emb is not None, "mRoPE frequency conversion is unavailable."
+    return mrope_freqs_to_rotary_emb(
+        freqs,
+        config.mrope_section,
+        interleaved_mrope=config.mrope_interleaved,
+        rotary_interleaved=config.rotary_interleaved,
+    )
+
+
+def _warn_rope_fusion_fallback_once(key: str, message: str) -> None:
+    if key in _ROPE_FUSION_FALLBACK_WARNINGS:
+        return
+    _ROPE_FUSION_FALLBACK_WARNINGS.add(key)
+    warnings.warn(message, stacklevel=2)
+
+
+def _fused_mrope_unavailable_warning_key(reason: str, thd: bool = False) -> str:
+    prefix = "triton-mrope-thd-unavailable" if thd else "triton-mrope-unavailable"
+    reason_lower = reason.lower()
+    if "triton is not available" in reason_lower:
+        category = "import"
+    elif "cuda tensors" in reason_lower or "same device" in reason_lower:
+        category = "device"
+    elif "dtype" in reason_lower or "float32" in reason_lower:
+        category = "dtype"
+    elif "stride" in reason_lower or "contiguous" in reason_lower:
+        category = "stride"
+    elif "capability" in reason_lower:
+        category = "capability"
+    elif "rotary_interleaved" in reason_lower:
+        category = "rotary-interleaved"
+    else:
+        category = "other"
+    return f"{prefix}-{category}"
 
 
 def get_pos_emb_on_this_cp_rank(
@@ -205,6 +319,68 @@ def _get_thd_freqs_on_this_cp_rank(
         return freqs[offset : offset + x.size(0)]
 
 
+def _get_thd_raw_mrope_freqs_on_this_cp_rank(
+    cp_rank: int, cp_size: int, x: Tensor, freqs: Tensor, offset: int = 0
+) -> Tensor:
+    """Get raw mRoPE frequency slices for this CP rank in THD layout."""
+    if cp_size > 1:
+        cp_seg = x.size(0) // 2
+        full_seqlen = cp_size * x.size(0)
+        return torch.cat(
+            [
+                freqs[:, :, offset + cp_rank * cp_seg : offset + (cp_rank + 1) * cp_seg],
+                freqs[
+                    :,
+                    :,
+                    offset
+                    + full_seqlen
+                    - (cp_rank + 1) * cp_seg : offset
+                    + full_seqlen
+                    - cp_rank * cp_seg,
+                ],
+            ],
+            dim=2,
+        )
+    else:
+        return freqs[:, :, offset : offset + x.size(0)]
+
+
+def _pack_thd_raw_mrope_freqs(
+    t: Tensor,
+    cu_seqlens: Tensor,
+    freqs: Tensor,
+    cp_group: torch.distributed.ProcessGroup,
+    total_seqlen: Optional[int] = None,
+) -> Tensor:
+    """Pack raw mRoPE freqs into the same local token order as THD tensor ``t``."""
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
+    seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
+    sequence_splits = torch.split(t, seqlens)
+    if total_seqlen is None:
+        total_seqlen = int(cu_seqlens[-1].item())
+        assert freqs.size(2) == total_seqlen, (
+            f"raw mRoPE THD freqs sequence length {freqs.size(2)} must match "
+            f"cu_seqlens[-1] = {total_seqlen}"
+        )
+
+    freq_slices = []
+    for i, x in enumerate(sequence_splits):
+        seq_start_offset = int(cu_seqlens[i].item())
+        freq_slices.append(
+            _get_thd_raw_mrope_freqs_on_this_cp_rank(
+                cp_rank, cp_size, x, freqs, seq_start_offset
+            )
+        )
+
+    packed_freqs = torch.cat(freq_slices, dim=2)
+    assert packed_freqs.shape[2] == t.shape[0], (
+        f"packed raw mRoPE freqs sequence length {packed_freqs.shape[2]} "
+        f"does not match THD tensor length {t.shape[0]}"
+    )
+    return packed_freqs.contiguous()
+
+
 def _apply_rotary_pos_emb_thd(
     t: Tensor,
     cu_seqlens: Tensor,
@@ -311,40 +487,259 @@ def apply_rotary_pos_emb(
     if cp_group is None:
         cp_group = parallel_state.get_context_parallel_group()
 
+    is_raw_mrope_freqs = (
+        _is_raw_mrope_freqs(t, freqs, config)
+        if cu_seqlens is None
+        else _is_raw_mrope_freqs_thd(t, freqs, cu_seqlens, config, cp_group.size())
+    )
+
     if config.apply_rope_fusion:
         if cu_seqlens is None:
+            force_unfused_mrope = False
+            if is_raw_mrope_freqs:
+                unavailable_reason = None
+                if (
+                    get_fused_mrope_unavailable_reason is not None
+                    and not mla_rotary_interleaved
+                    and not inverse
+                    and mscale == 1.0
+                ):
+                    unavailable_reason = get_fused_mrope_unavailable_reason(
+                        t, freqs, config.rotary_interleaved
+                    )
+                use_fused_mrope = (
+                    fused_apply_mrope is not None
+                    and can_launch_fused_mrope is not None
+                    and can_launch_fused_mrope(t, freqs, config.rotary_interleaved)
+                    and mscale == 1.0
+                    and not mla_rotary_interleaved
+                    and not inverse
+                )
+                if use_fused_mrope:
+                    return fused_apply_mrope(
+                        t,
+                        freqs,
+                        config.mrope_section,
+                        interleaved_mrope=config.mrope_interleaved,
+                        rotary_interleaved=config.rotary_interleaved,
+                    )
+
+                if unavailable_reason is not None:
+                    _warn_rope_fusion_fallback_once(
+                        _fused_mrope_unavailable_warning_key(unavailable_reason),
+                        f"Triton fused mRoPE is unavailable: {unavailable_reason}. "
+                        "Using unfused implementation.",
+                    )
+                    force_unfused_mrope = True
+                unavailable_is_rotary_interleaved = (
+                    unavailable_reason is not None
+                    and "rotary_interleaved" in unavailable_reason.lower()
+                )
+                if mscale != 1.0:
+                    _warn_rope_fusion_fallback_once(
+                        "triton-mrope-mscale",
+                        f"mscale={mscale} is not supported by Triton fused mRoPE. "
+                        "Using unfused implementation.",
+                    )
+                    force_unfused_mrope = True
+                if mla_rotary_interleaved:
+                    _warn_rope_fusion_fallback_once(
+                        "triton-mrope-mla-rotary-interleaved",
+                        "Triton fused mRoPE does not support MLA-style interleaving in RoPE. "
+                        "Using unfused implementation.",
+                    )
+                    force_unfused_mrope = True
+                if inverse:
+                    _warn_rope_fusion_fallback_once(
+                        "triton-mrope-inverse",
+                        "inverse RoPE is not supported by Triton fused mRoPE. "
+                        "Using unfused implementation.",
+                    )
+                    force_unfused_mrope = True
+                if config.rotary_interleaved and not unavailable_is_rotary_interleaved:
+                    _warn_rope_fusion_fallback_once(
+                        "triton-mrope-rotary-interleaved",
+                        "Triton fused mRoPE currently supports rotary_interleaved=False. "
+                        "Using unfused implementation.",
+                    )
+                    force_unfused_mrope = True
+                freqs = _raw_mrope_freqs_to_emb(freqs, config)
+                is_raw_mrope_freqs = False
+                if force_unfused_mrope:
+                    return _apply_rotary_pos_emb_bshd(
+                        t,
+                        freqs,
+                        rotary_interleaved=config.rotary_interleaved,
+                        mla_rotary_interleaved=mla_rotary_interleaved,
+                        mscale=mscale,
+                        inverse=inverse,
+                        mla_output_remove_interleaving=mla_output_remove_interleaving,
+                    )
+
             # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
             use_unfused = False
             if config.mrope_section is not None and freqs.shape[1] > 1:
                 # TODO: Add a check in TransformerConfig and remove this unfused implementation.
-                warnings.warn(
-                    "apply_rope_fusion does not support mRoPE in bshd format when bs > 1. "
-                    "Please set apply_rope_fusion to false. This will become an error in v0.16."
+                _warn_rope_fusion_fallback_once(
+                    "te-mrope-bshd-batch",
+                    "Transformer Engine fused RoPE does not support mRoPE in bshd format when "
+                    "bs > 1 without raw mRoPE freqs. Using unfused implementation.",
                 )
                 use_unfused = True
             if mscale != 1.0:
-                warnings.warn(
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-mscale",
                     f"mscale={mscale} is not supported by TE's fused RoPE. "
-                    "Using unfused implementation."
+                    "Using unfused implementation.",
                 )
                 use_unfused = True
             if mla_rotary_interleaved:
-                warnings.warn(
-                    "apply_rope_fusion does not support MLA-style interleaving in RoPE."
-                    "Using unfused implementation."
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-mla-rotary-interleaved",
+                    "apply_rope_fusion does not support MLA-style interleaving in RoPE. "
+                    "Using unfused implementation.",
                 )
                 use_unfused = True
             if inverse:
-                warnings.warn(
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-inverse",
                     "inverse RoPE is not supported by TE's fused RoPE. "
-                    "Using unfused implementation."
+                    "Using unfused implementation.",
+                )
+                use_unfused = True
+            if fused_apply_rotary_pos_emb is None:
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-unavailable",
+                    "Transformer Engine fused RoPE is unavailable. Using unfused implementation.",
                 )
                 use_unfused = True
             if not use_unfused:
-                assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
-            assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
+            if is_raw_mrope_freqs:
+                use_fused_mrope_thd = (
+                    fused_apply_mrope_thd is not None
+                    and can_launch_fused_mrope_thd is not None
+                    and get_fused_mrope_thd_unavailable_reason is not None
+                    and mscale == 1.0
+                    and not mla_rotary_interleaved
+                    and not inverse
+                    and not config.rotary_interleaved
+                )
+                if use_fused_mrope_thd:
+                    unavailable_reason = get_fused_mrope_thd_unavailable_reason(
+                        t,
+                        cu_seqlens,
+                        freqs,
+                        rotary_interleaved=config.rotary_interleaved,
+                        cp_size=cp_group.size(),
+                        cp_rank=cp_group.rank(),
+                    )
+                    if unavailable_reason is None:
+                        return fused_apply_mrope_thd(
+                            t,
+                            cu_seqlens,
+                            freqs,
+                            config.mrope_section,
+                            interleaved_mrope=config.mrope_interleaved,
+                            rotary_interleaved=config.rotary_interleaved,
+                            cp_size=cp_group.size(),
+                            cp_rank=cp_group.rank(),
+                        )
+                    _warn_rope_fusion_fallback_once(
+                        _fused_mrope_unavailable_warning_key(unavailable_reason, thd=True),
+                        f"Triton fused mRoPE for THD layout is unavailable: "
+                        f"{unavailable_reason}. Using unfused implementation.",
+                    )
+                else:
+                    has_unsupported_option = False
+                    if mscale != 1.0:
+                        _warn_rope_fusion_fallback_once(
+                            "triton-mrope-thd-mscale",
+                            f"mscale={mscale} is not supported by Triton fused mRoPE for THD "
+                            "layout. Using unfused implementation.",
+                        )
+                        has_unsupported_option = True
+                    if mla_rotary_interleaved:
+                        _warn_rope_fusion_fallback_once(
+                            "triton-mrope-thd-mla-rotary-interleaved",
+                            "Triton fused mRoPE for THD layout does not support MLA-style "
+                            "interleaving in RoPE. Using unfused implementation.",
+                        )
+                        has_unsupported_option = True
+                    if inverse:
+                        _warn_rope_fusion_fallback_once(
+                            "triton-mrope-thd-inverse",
+                            "inverse RoPE is not supported by Triton fused mRoPE for THD layout. "
+                            "Using unfused implementation.",
+                        )
+                        has_unsupported_option = True
+                    if config.rotary_interleaved:
+                        _warn_rope_fusion_fallback_once(
+                            "triton-mrope-thd-rotary-interleaved",
+                            "Triton fused mRoPE for THD layout currently supports "
+                            "rotary_interleaved=False. Using unfused implementation.",
+                        )
+                        has_unsupported_option = True
+                    if not has_unsupported_option:
+                        _warn_rope_fusion_fallback_once(
+                            "triton-mrope-thd-unavailable",
+                            "Triton fused mRoPE for THD layout is unavailable. "
+                            "Using unfused implementation.",
+                        )
+                freqs = _raw_mrope_freqs_to_emb(freqs, config)
+                return _apply_rotary_pos_emb_thd(
+                    t,
+                    cu_seqlens,
+                    freqs,
+                    rotary_interleaved=config.rotary_interleaved,
+                    mla_rotary_interleaved=mla_rotary_interleaved,
+                    mscale=mscale,
+                    cp_group=cp_group,
+                    inverse=inverse,
+                    mla_output_remove_interleaving=mla_output_remove_interleaving,
+                )
+            use_unfused_thd = False
+            if mscale != 1.0:
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-thd-mscale",
+                    f"mscale={mscale} is not supported by TE's fused RoPE for THD layout. "
+                    "Using unfused implementation.",
+                )
+                use_unfused_thd = True
+            if mla_rotary_interleaved:
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-thd-mla-rotary-interleaved",
+                    "TE fused RoPE for THD layout does not support MLA-style interleaving "
+                    "in RoPE. Using unfused implementation.",
+                )
+                use_unfused_thd = True
+            if inverse:
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-thd-inverse",
+                    "inverse RoPE is not supported by TE's fused RoPE for THD layout. "
+                    "Using unfused implementation.",
+                )
+                use_unfused_thd = True
+            if fused_apply_rotary_pos_emb_thd is None:
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-thd-unavailable",
+                    "Transformer Engine fused RoPE for THD layout is unavailable. "
+                    "Using unfused implementation.",
+                )
+                use_unfused_thd = True
+            if use_unfused_thd:
+                return _apply_rotary_pos_emb_thd(
+                    t,
+                    cu_seqlens,
+                    freqs,
+                    rotary_interleaved=config.rotary_interleaved,
+                    mla_rotary_interleaved=mla_rotary_interleaved,
+                    mscale=mscale,
+                    cp_group=cp_group,
+                    inverse=inverse,
+                    mla_output_remove_interleaving=mla_output_remove_interleaving,
+                )
             return fused_apply_rotary_pos_emb_thd(
                 t,
                 cu_seqlens,
@@ -354,6 +749,9 @@ def apply_rotary_pos_emb(
                 interleaved=config.rotary_interleaved,
             )
     # use unfused implementation
+    if is_raw_mrope_freqs:
+        freqs = _raw_mrope_freqs_to_emb(freqs, config)
+
     if cu_seqlens is None:
         return _apply_rotary_pos_emb_bshd(
             t,
