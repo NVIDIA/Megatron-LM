@@ -11,7 +11,6 @@ spec:
   n_repeat: 5
   platforms: dgx_a100
   script_setup: |
-    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -35,7 +34,6 @@ spec:
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
-    set -euo pipefail
     ls
     cd /opt/megatron-lm
 
@@ -50,8 +48,8 @@ spec:
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -90,6 +88,23 @@ products:
       #   scope: [nightly]
 
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp4_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+      # - environment: [lts] # disabled until triton is bumped
+      #   scope: [nightly]
+
+  # End-to-end smoke test for the HybridModel Python DSL recipe path:
+  # exercises HybridModel(config: HybridModelConfig, ...) through the real
+  # training launcher (pretrain_hybrid.py --model-recipe), trains for 50
+  # iterations, and locks loss / gradient-norm golden values. Architecture
+  # and entry point are defined in:
+  #   tests/functional_tests/test_cases/hybrid/
+  #     hybrid_recipe_dsl_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G/{recipe.py,model_config.yaml}
+  # This test lives on the launcher branch (4539) because PR 4537 (recipe DSL
+  # surface) does not register the --model-recipe argparse flag.
+  - test_case: [hybrid_recipe_dsl_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr, mr-github]

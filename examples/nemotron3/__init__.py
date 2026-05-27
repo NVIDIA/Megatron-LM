@@ -1,1 +1,3 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Nemotron-3 example recipes and launchers."""
