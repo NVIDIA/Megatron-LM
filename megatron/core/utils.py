@@ -1972,6 +1972,295 @@ def is_submodule(module, parent_module, strict=True):
 
 
 ########################
+###### sft utils #######
+########################
+
+
+def pad_thd_sequences_for_cp(
+    tensors_with_pad_values: List[Tuple[torch.Tensor, Union[int, float]]],
+    cu_seqlens: torch.Tensor,
+    divisibility_factor: int,
+) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """Round every sub-sequence of one or more THD-packed tensors up to a length
+    that is a multiple of ``divisibility_factor``.
+
+    This rounding is required for context-parallel sequence sharding, which
+    splits each segment evenly across ``2 * cp_size`` chunks (and an additional
+    factor of ``tp_size`` when sequence parallelism is enabled).
+
+    All input tensors share the same segment layout described by ``cu_seqlens``
+    and are padded together so the returned ``cu_seqlens_padded`` is the single
+    authoritative segment layout for every output tensor.
+
+    Args:
+        tensors_with_pad_values: List of ``(tensor, pad_value)`` pairs. Each
+            tensor must be 1-D ``(N,)`` or 2-D ``(1, N)`` (a leading batch dim
+            of 1 is squeezed). Every tensor must share the same length ``N``,
+            which has to equal ``cu_seqlens[-1]``. ``pad_value`` is cast to the
+            tensor's dtype (e.g. ``padding_token_id`` for ``input_ids``, ``-100``
+            for ``labels``, ``0`` for ``loss_mask``).
+        cu_seqlens: 1-D cumulative segment lengths starting at 0 with
+            ``cu_seqlens[-1] == N``.
+        divisibility_factor: Round each segment length up to the next multiple
+            of this value.
+
+    Returns:
+        - ``padded_tensors``: List of padded 1-D tensors in the same order as
+          the input. Each has shape ``(N_padded,)`` where ``N_padded`` is the
+          sum of the rounded-up segment lengths.
+        - ``cu_seqlens_padded``: 1-D tensor of cumulative padded segment
+          lengths. Same length and dtype as ``cu_seqlens``.
+    """
+    # Squeeze the optional leading batch dim once per tensor.
+    flat_tensors = [
+        (t.squeeze(0) if t.dim() == 2 else t, pad) for t, pad in tensors_with_pad_values
+    ]
+
+    # Per-segment original and padded lengths (preserve cu_seqlens dtype throughout).
+    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+    padded_lengths = (
+        (seqlens + divisibility_factor - 1) // divisibility_factor
+    ) * divisibility_factor
+    pad_amounts = (padded_lengths - seqlens).tolist()
+
+    starts = cu_seqlens[:-1].tolist()
+    ends = cu_seqlens[1:].tolist()
+
+    padded_tensors: List[torch.Tensor] = []
+    for tensor, pad_value in flat_tensors:
+        pieces: List[torch.Tensor] = []
+        for start, end, pad in zip(starts, ends, pad_amounts):
+            pieces.append(tensor[start:end])
+            if pad > 0:
+                pieces.append(tensor.new_full((pad,), pad_value))
+        padded_tensors.append(torch.cat(pieces))
+
+    # `torch.cumsum` promotes int32 to int64 by default; write directly into a
+    # buffer of the right dtype so cu_seqlens_padded matches cu_seqlens.
+    cu_seqlens_padded = torch.empty_like(cu_seqlens)
+    cu_seqlens_padded[0] = 0
+    torch.cumsum(padded_lengths, dim=0, out=cu_seqlens_padded[1:])
+
+    return padded_tensors, cu_seqlens_padded
+
+
+def pad_or_truncate_thd_tensors(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    loss_mask: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    sequence_length: int,
+    padding_token_id: int,
+    padding_label_id: int,
+):
+    """Pad or truncate THD-format (Token-Head-Dim packed) tensors to a fixed sequence length.
+
+    For SFT with packed sequences, the total number of tokens across all sub-sequences
+    in a sample may not match the target sequence length. This function either:
+      - Truncates: clips input_ids, labels, loss_mask, and cu_seqlens/cu_seqlens_padded
+        so that the total token count equals ``sequence_length``. Sub-sequences that
+        extend beyond the boundary are dropped, and a final cumulative length entry is
+        appended.
+      - Pads: extends input_ids, labels, and loss_mask with padding values to reach
+        ``sequence_length``, and updates the last entry of cu_seqlens (and
+        cu_seqlens_padded if present) accordingly.
+
+    All input tensors are expected to be 1-D (no batch dimension).
+
+    Args:
+        input_ids (torch.Tensor): 1-D token IDs for the packed sample.
+        labels (torch.Tensor): 1-D label IDs for the packed sample.
+        loss_mask (torch.Tensor): 1-D loss mask for the packed sample (1 = train, 0 = mask).
+        cu_seqlens (torch.Tensor): 1-D cumulative sequence lengths (int32), starting
+            at 0 and ending at the total token count.
+        cu_seqlens_padded (torch.Tensor | None): 1-D cumulative sequence lengths after
+            CP padding (from ``pad_thd_sequences_for_cp``), or None when CP is disabled.
+        sequence_length (int): Target total token count (i.e., ``max_seq_len``).
+        padding_token_id (int): Token ID used for padding input_ids.
+        padding_label_id (int): Label ID used for padding labels (typically -100 or similar
+            ignore index).
+
+    Returns:
+        Tuple of (input_ids, labels, loss_mask, cu_seqlens, cu_seqlens_padded), all
+        adjusted to ``sequence_length``.
+    """
+    if input_ids.shape[0] > sequence_length:  # Truncate
+        input_ids = input_ids[:sequence_length]
+        labels = labels[:sequence_length]
+        loss_mask = loss_mask[:sequence_length]
+        if cu_seqlens_padded is not None:
+            # NOTE(asolergi-nv): When CP padding is active, cu_seqlens_padded
+            # determines the actual token layout. Because padded entries are
+            # always >= original entries, cu_seqlens_padded hits
+            # sequence_length first. Truncate BOTH at the same segment
+            # boundary so they always have the same number of entries.
+            idx = (cu_seqlens_padded < sequence_length).nonzero(as_tuple=True)[0]
+            num_keep = idx[-1] + 1
+            cu_seqlens = torch.cat(
+                [cu_seqlens[:num_keep], cu_seqlens.new_tensor([sequence_length])]
+            )
+            cu_seqlens_padded = torch.cat(
+                [cu_seqlens_padded[:num_keep], cu_seqlens_padded.new_tensor([sequence_length])]
+            )
+        else:
+            # NOTE(asolergi-nv): Truncate cu_seqlens
+            # Find the largest index such that cu_seqlens[index] < sequence_length
+            idx = (cu_seqlens < sequence_length).nonzero(as_tuple=True)[0]
+            cu_seqlens = torch.cat(
+                [cu_seqlens[: idx[-1] + 1], cu_seqlens.new_tensor([sequence_length])]
+            )
+    else:  # Pad
+        input_ids = torch.cat(
+            [
+                input_ids,
+                torch.full(
+                    (sequence_length - input_ids.shape[0],),
+                    padding_token_id,
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                ),
+            ]
+        )
+        labels = torch.cat(
+            [
+                labels,
+                torch.full(
+                    (sequence_length - labels.shape[0],),
+                    padding_label_id,
+                    dtype=labels.dtype,
+                    device=labels.device,
+                ),
+            ]
+        )
+        loss_mask = torch.cat(
+            [
+                loss_mask,
+                torch.zeros(
+                    sequence_length - loss_mask.shape[0],
+                    dtype=loss_mask.dtype,
+                    device=loss_mask.device,
+                ),
+            ]
+        )
+        cu_seqlens = torch.cat([cu_seqlens[:-1], cu_seqlens.new_tensor([sequence_length])])
+        # NOTE(asolergi-nv): Pad cu_seqlens_padded if CP
+        if cu_seqlens_padded is not None:
+            cu_seqlens_padded = torch.cat(
+                [cu_seqlens_padded[:-1], cu_seqlens_padded.new_tensor([sequence_length])]
+            )
+
+    return input_ids, labels, loss_mask, cu_seqlens, cu_seqlens_padded
+
+
+def preprocess_sft_batch(
+    batch: Dict[str, Any],
+    tp_rank: int,
+    cp_size: int,
+    tp_size: int,
+    sp: bool,
+    padding_token_id: int,
+    padding_label_id: int,
+    max_seq_len: int,
+):
+    """Preprocess an SFT batch on TP rank 0 before broadcasting to other TP ranks.
+
+    Performs the following preprocessing steps (only on ``tp_rank == 0``):
+      1. Pads individual sub-sequences for CP divisibility via
+         ``pad_thd_sequences_for_cp`` (when ``cp_size > 1``), producing
+         ``cu_seqlens_padded``.
+      2. Pads or truncates the packed sample to exactly ``max_seq_len`` tokens.
+      3. Creates a loss mask that zeros out padding tokens and prompt tokens.
+      4. Computes per-segment position IDs from cumulative sequence lengths.
+      5. Computes ``max_seqlen`` (the length of the longest sub-sequence).
+
+    After this function, all sequence tensors have shape ``[1, max_seq_len]``
+    (with a batch dimension). ``cu_seqlens`` and ``cu_seqlens_padded`` carry the
+    same leading batch dim (shape ``[1, n]``) so they round-trip through
+    ``get_batch_on_this_tp_rank``'s length-prefixed broadcast. ``max_seqlen``
+    remains 1-D with a single element.
+
+    Args:
+        batch (Dict[str, Any]): Raw batch from the dataloader containing at minimum
+            'tokens', 'labels', and 'cu_seqlens' (each with a leading batch dim of 1).
+        tp_rank (int): Tensor-parallel rank. Preprocessing is only done on rank 0.
+        cp_size (int): Context-parallel world size.
+        tp_size (int): Tensor-parallel world size.
+        sp (bool): Whether sequence parallelism is enabled.
+        padding_token_id (int): Token ID used for input padding.
+        padding_label_id (int): Label ID used for prompt/padding masking (e.g., -100).
+        max_seq_len (int): Target sequence length for the batch.
+
+    Returns:
+        Dict[str, Any]: Preprocessed batch dict with keys 'tokens', 'labels',
+        'loss_mask', 'position_ids', 'cu_seqlens', 'cu_seqlens_padded', and
+        'max_seqlen'.
+    """
+    if tp_rank == 0:
+        tokens, labels, loss_mask, cu_seqlens = (
+            batch["tokens"].squeeze(0),
+            batch["labels"].squeeze(0),
+            batch["loss_mask"].squeeze(0),
+            batch["cu_seqlens"].squeeze(0),
+        )  # NOTE(asolergi-nv): PyTorch DataLoader `default_collate` adds batch dimension,
+        # so we need to remove it since TE expects cu_seqlens to be 1D
+
+        if cp_size > 1:
+            divisibility_factor = cp_size * 2
+            if tp_size > 1 and sp:
+                divisibility_factor *= tp_size
+
+            (tokens, labels, loss_mask), cu_seqlens_padded = pad_thd_sequences_for_cp(
+                [(tokens, padding_token_id), (labels, padding_label_id), (loss_mask, 0)],
+                cu_seqlens,
+                divisibility_factor,
+            )
+        else:
+            cu_seqlens_padded = None
+
+        tokens, labels, loss_mask, cu_seqlens, cu_seqlens_padded = pad_or_truncate_thd_tensors(
+            tokens,
+            labels,
+            loss_mask,
+            cu_seqlens,
+            cu_seqlens_padded,
+            max_seq_len,
+            padding_token_id,
+            padding_label_id,
+        )
+
+        # Position ids.
+        seg_lengths = (
+            cu_seqlens[1:] - cu_seqlens[:-1]
+            if cu_seqlens_padded is None
+            else cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+        )
+        position_ids = torch.cat([torch.arange(length) for length in seg_lengths])
+
+        seq_lens = (
+            cu_seqlens[1:] - cu_seqlens[:-1]
+            if cu_seqlens_padded is None
+            else cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+        )
+        max_seqlen = torch.tensor([seq_lens.max().item()], dtype=torch.int32)
+
+        batch = {
+            'tokens': tokens.unsqueeze(0),  # NOTE(asolergi-nv): Add back batch dimension
+            'labels': labels.unsqueeze(0),  # NOTE(asolergi-nv): Add back batch dimension
+            'loss_mask': loss_mask.unsqueeze(0),  # NOTE(asolergi-nv): Add batch dimension
+            'position_ids': position_ids.unsqueeze(0),  # NOTE(asolergi-nv): Add batch dimension
+            # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n)
+            # through get_batch_on_this_tp_rank's length-prefixed broadcast.
+            'cu_seqlens': cu_seqlens.unsqueeze(0),
+            'cu_seqlens_padded': (
+                cu_seqlens_padded.unsqueeze(0) if cu_seqlens_padded is not None else None
+            ),
+            'max_seqlen': max_seqlen,
+        }
+    return batch
+
+
+########################
 ### tensor parallel ####
 ########################
 

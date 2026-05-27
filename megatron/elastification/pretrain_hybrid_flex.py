@@ -10,6 +10,7 @@ import torch
 from megatron.core import mpu, parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.sft_dataset import SFTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -42,7 +43,6 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
