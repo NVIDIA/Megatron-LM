@@ -351,51 +351,66 @@ class MTPLossLoggingHelper:
 
     @staticmethod
     def save_loss_to_tracker(
-        loss: torch.Tensor,
+        loss_sum: torch.Tensor,
+        num_tokens: torch.Tensor,
         layer_number: int,
         num_layers: int,
         reduce_group: Optional[torch.distributed.ProcessGroup] = None,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        """Save the mtp loss for logging.
+        """Save the mtp loss sum and token count for logging.
+
+        Stores raw sums so that the global per-token loss can be computed
+        correctly after all-reduce, even when token counts differ across
+        ranks (e.g. Dynamic CP) or microbatches.
+
         Args:
-            loss (torch.Tensor): The loss tensor.
+            loss_sum (torch.Tensor): Sum of per-element losses on this rank.
+            num_tokens (torch.Tensor): Number of valid tokens on this rank.
             layer_number (int): Layer index of the loss.
             num_layers (int): The number of total layers.
-            reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
-            mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+            reduce_group (torch.distributed.ProcessGroup): The group for sum-reducing losses.
+            avg_group (torch.distributed.ProcessGroup): The group for sum-reducing before averaging.
         """
-        # Skip mtp loss logging if layer_number is None.
         if layer_number is None:
             return
 
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
-        tracker["values"][layer_number] += loss.detach()
+        if "loss_sums" not in tracker:
+            tracker["loss_sums"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["num_tokens"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        tracker["loss_sums"][layer_number] += loss_sum.detach()
+        tracker["num_tokens"][layer_number] += num_tokens.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
     def clean_loss_in_tracker():
         """Clear the mtp losses."""
         tracker = MTPLossLoggingHelper.tracker
-        tracker["values"].zero_()
+        if "loss_sums" in tracker:
+            tracker["loss_sums"].zero_()
+            tracker["num_tokens"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
     def reduce_loss_in_tracker():
-        """Collect and reduce the mtp losses across ranks."""
+        """Collect and reduce the mtp losses across ranks.
+
+        Packs loss sums and token counts into a single tensor for one
+        all-reduce, then computes per-token loss.  This produces correct
+        weighted-average results even when ranks hold different numbers
+        of tokens (e.g. Dynamic CP with variable CP sizes).
+        """
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if "loss_sums" not in tracker:
             return
-        values = tracker["values"]
-        # Reduce mtp losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+        packed = torch.cat([tracker["loss_sums"], tracker["num_tokens"]])
+        for group_key in ('reduce_group', 'avg_group'):
+            group = tracker.get(group_key)
+            if group is not None:
+                torch.distributed.all_reduce(packed, group=group)
+        loss_sums, num_tokens = packed.chunk(2)
+        tracker["values"] = loss_sums / num_tokens.clamp(min=1)
 
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
@@ -736,12 +751,9 @@ def process_mtp_loss(
             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
-            # Safe divide without sync: mask numerator when num_tokens==0, divide by clamp(min=1)
-            mtp_loss_for_log = (
-                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
-            ) / num_tokens.clamp(min=1)
             MTPLossLoggingHelper.save_loss_to_tracker(
-                mtp_loss_for_log,
+                torch.sum(mtp_loss),
+                num_tokens,
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
