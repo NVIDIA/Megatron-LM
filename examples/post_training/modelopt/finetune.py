@@ -18,6 +18,7 @@ from utils import get_hf_tokenizer
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.parallel_state import get_context_parallel_group
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -452,7 +453,9 @@ def get_batch(data_iterator):
         batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[: args.seq_length]
 
     # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch)
+    batch = get_batch_on_this_cp_rank(
+        batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+    )
 
     return batch
 
@@ -507,13 +510,15 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 if __name__ == "__main__":
+    from megatron.training.argument_utils import pretrain_cfg_container_from_args
     from megatron.training.arguments import parse_and_validate_args
 
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
     )
     pretrain(
+        pretrain_cfg_container_from_args(args),
         train_valid_test_sft_datasets_provider,
         partial(model_provider, modelopt_gpt_hybrid_builder),
         ModelType.encoder_or_decoder,

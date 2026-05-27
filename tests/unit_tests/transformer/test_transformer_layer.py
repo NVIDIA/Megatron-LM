@@ -9,6 +9,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -161,17 +162,18 @@ class TestParallelTransformerLayer:
                 max_batch_size=micro_batch_size, max_sequence_length=sequence_length
             )
             outputs = {}
-            for mlp_chunks_for_prefill in [1, 4]:
-                transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
-                hidden_states, context = parallel_transformer_layer(
-                    hidden_states=input_hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                )
-                assert hidden_states.shape[0] == sequence_length
-                assert hidden_states.shape[1] == micro_batch_size
-                assert hidden_states.shape[2] == hidden_size
-                outputs[mlp_chunks_for_prefill] = (hidden_states, context)
+            with InferenceMode.active():
+                for mlp_chunks_for_prefill in [1, 4]:
+                    transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
+                    hidden_states, context = parallel_transformer_layer(
+                        hidden_states=input_hidden_states,
+                        attention_mask=attention_mask,
+                        inference_context=inference_context,
+                    )
+                    assert hidden_states.shape[0] == sequence_length
+                    assert hidden_states.shape[1] == micro_batch_size
+                    assert hidden_states.shape[2] == hidden_size
+                    outputs[mlp_chunks_for_prefill] = (hidden_states, context)
 
             assert torch.equal(outputs[1][0], outputs[4][0])
 
@@ -1160,6 +1162,34 @@ class TestMHCWithOffloading:
             f"Gradients differ: max diff = "
             f"{(grad_no_offload - grad_offload).abs().max().item()}"
         )
+
+
+def _make_cuda_graph_gpt_block(**config_kwargs):
+    cfg = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        **config_kwargs,
+    )
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    return TransformerBlock(cfg, get_gpt_layer_with_transformer_engine_spec())
+
+
+def _reset_cudagraph_state():
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
+    CudaGraphManager.global_mempool = None
+    torch.cuda.synchronize()
+
+
+def _all_layers_have_manager(block) -> bool:
+    return all(hasattr(layer, 'cudagraph_manager') for layer in block.layers)
+
+
+def _no_layers_have_manager(block) -> bool:
+    return all(not hasattr(layer, 'cudagraph_manager') for layer in block.layers)
 
 
 @pytest.mark.skipif(

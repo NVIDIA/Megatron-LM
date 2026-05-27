@@ -383,7 +383,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         cls._is_distopt_quantized_param(model_param)
                         and config.fp8_recipe != "delayed"
                     ) or is_nvfp4tensor(model_param):
-                        # MXFP8Tensor, BlockwiseQTensor, NVFP4Tensor don't support view(-1)
+                        # MXFP8Tensor, BlockwiseQTensor, grouped quantized tensors, and NVFP4Tensor
+                        # don't support view(-1).
                         shard_model_param = None
                     else:
                         shard_model_param = model_param.detach().view(-1)[
@@ -2732,36 +2733,39 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
 
-        if self.ddp_config.fp4_param_gather:
+        if self.ddp_config.fp8_param_gather:
+            # Grouped quantized tensors expose one logical parameter backed by multiple TE
+            # quantized members. Expand them so quantize_param_shard receives member-aligned
+            # master shards instead of a shard over the grouped wrapper.
+            fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
+                self._get_fp8_params_and_shard_fp32_from_fp8()
+            )
+            expanded_fp8_params = []
+            expanded_shard_fp32_from_fp8 = []
+            expanded_shard_offsets_in_fp8 = []
+            for model_param, shard_main_param, start_offset in zip(
+                fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
+            ):
+                sub_model_params, sub_shard_main_params, sub_start_offsets = (
+                    self._expand_quantized_param_shard_for_cast(
+                        model_param, shard_main_param, start_offset
+                    )
+                )
+                expanded_fp8_params.extend(sub_model_params)
+                expanded_shard_fp32_from_fp8.extend(sub_shard_main_params)
+                expanded_shard_offsets_in_fp8.extend(sub_start_offsets)
+
+            quantize_param_shard(
+                expanded_fp8_params,
+                expanded_shard_fp32_from_fp8,
+                expanded_shard_offsets_in_fp8,
+                self.data_parallel_group,
+            )
+        elif self.ddp_config.fp4_param_gather:
             # Quantize FP32 master shards back to NVFP4 model params (rowwise only)
             quantize_nvfp4_param_shard(
                 *self._get_nvfp4_params_and_shard_fp32_from_nvfp4(), self.data_parallel_group
             )
-
-        fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
-            self._get_fp8_params_and_shard_fp32_from_fp8()
-        )
-        expanded_fp8_params = []
-        expanded_shard_fp32_from_fp8 = []
-        expanded_shard_offsets_in_fp8 = []
-        for model_param, shard_main_param, start_offset in zip(
-            fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
-        ):
-            sub_model_params, sub_shard_main_params, sub_start_offsets = (
-                self._expand_quantized_param_shard_for_cast(
-                    model_param, shard_main_param, start_offset
-                )
-            )
-            expanded_fp8_params.extend(sub_model_params)
-            expanded_shard_fp32_from_fp8.extend(sub_shard_main_params)
-            expanded_shard_offsets_in_fp8.extend(sub_start_offsets)
-
-        quantize_param_shard(
-            expanded_fp8_params,
-            expanded_shard_fp32_from_fp8,
-            expanded_shard_offsets_in_fp8,
-            self.data_parallel_group,
-        )
 
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
@@ -2780,8 +2784,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         world_range.start : world_range.end
                     ]
 
-                    if self._is_distopt_quantized_param(model_param) or is_nvfp4tensor(model_param):
-                        # Quantized params are handled above.
+                    if self._is_distopt_quantized_param(model_param):
+                        # FP8 params are quantized in the above "quantize_param_shard" function.
+                        continue
+                    elif is_nvfp4tensor(model_param):
+                        # NVFP4 params are quantized in the above "quantize_nvfp4_param_shard"
+                        # function.
                         continue
                     else:
                         shard_model_param.data.copy_(shard_main_param)
@@ -2998,6 +3006,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
+    def start_param_sync_for_bucket_group_subset(self) -> None:
+        """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
+
+        Walks each model chunk's DDP bucket groups and skips those tagged
+        ``is_managed_by_layer_wise_optimizer=True`` (so a sibling
+        :class:`LayerWiseDistributedOptimizer` does not double-sync the same
+        buckets). When no LayerWise tagging is present every bucket group is
+        included — matching the previous ``model_chunk.start_param_sync()``
+        behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
+        so FP8 post-all-gather processing (and MXFP8 copy) still runs.
+        """
+        # Deferred import: layer_wise_optimizer's compute_full_param_layout
+        # lazily imports DistributedOptimizer, so importing the helper at
+        # module load here would create a cycle.
+        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
+
+        for model_chunk in self.model_chunks:
+            for bucket_group in (
+                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            ):
+                if not bucket_group.buckets:
+                    continue
+                if _bucket_is_managed_by_layer_wise_optimizer(
+                    bucket_group.buckets[0], default_for_untagged=False
+                ):
+                    continue
+                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful.
@@ -3025,8 +3061,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
             # call and subsequent all-gathers are launched in the forward pre-hook.
             if should_sync_params:
-                for model_chunk in self.model_chunks:
-                    model_chunk.start_param_sync()
+                # Only sync DistOpt-managed bucket groups so a sibling
+                # LayerWiseDistributedOptimizer's own ``start_param_sync`` call
+                # is not duplicated for the same buckets.
+                self.start_param_sync_for_bucket_group_subset()
         if timers is not None and (self.ddp_config.use_megatron_fsdp or should_sync_params):
             timers('params-all-gather').stop()
 

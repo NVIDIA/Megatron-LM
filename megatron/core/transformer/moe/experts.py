@@ -22,6 +22,7 @@ from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_qui
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -107,6 +108,7 @@ class GroupedLinearFc1Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> GroupedLinearFc1Interface:
         """Builds a linear_fc1 layer for TEGroupedMLP."""
         ...
@@ -143,6 +145,7 @@ class GroupedLinearFc2Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> GroupedLinearFc2Interface:
         """Builds a linear_fc2 layer for TEGroupedMLP."""
         ...
@@ -178,7 +181,12 @@ class TEGroupedMLP(MegatronModule):
         config: TransformerConfig,
         submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
@@ -205,6 +213,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc1',
             pg_collection=pg_collection,
+            name=(name + ".linear_fc1") if name is not None else None,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -227,6 +236,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc2',
             pg_collection=pg_collection,
+            name=(name + ".linear_fc2") if name is not None else None,
         )
 
         self.offload_expert_fc1 = (
@@ -372,6 +382,8 @@ class TEGroupedMLP(MegatronModule):
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
 
+        assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
+
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
 
@@ -391,18 +403,26 @@ class TEGroupedMLP(MegatronModule):
         fc1_single_grouped_bias = self.linear_fc1.single_grouped_bias
         fc2_single_grouped_bias = self.linear_fc2.single_grouped_bias
 
-        # TODO:ksivamani: Why meta device?
+        # Mirror the wrapper's combined delay-wgrad mode (config.delay_wgrad_compute OR
+        # config.overlap_dispatch_backward_with_experts_wgrad) — see TEGroupedLinear.__init__.
+        # Using config.delay_wgrad_compute alone would silently drop the overlap optimization
+        # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
+        fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
+        fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
+
+        # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
+        # Using meta avoids allocating duplicate weights for the fused wrapper.
         op = te.pytorch.ops.GroupedLinear(
             self.linear_fc1.num_gemms,
             self.linear_fc1.in_features,
             self.linear_fc1.out_features,
             bias=self.linear_fc1.use_bias,
-            device=torch.cuda.current_device(),
+            device="meta",
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
             single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
-            delay_wgrad_compute=self.config.delay_wgrad_compute,
+            delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -418,7 +438,7 @@ class TEGroupedMLP(MegatronModule):
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU or clamped quick-GEGL)
+        # Activation and post-multiply probs (SwiGLU or clamped quick-GeGLU)
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         if self.config.activation_func == F.silu and self.config.gated_linear_unit:
             op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
@@ -443,12 +463,12 @@ class TEGroupedMLP(MegatronModule):
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,
             bias=self.linear_fc2.use_bias,
-            device=torch.cuda.current_device(),
+            device="meta",
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
             single_grouped_weight=fc2_single_grouped_weight,
             single_grouped_bias=fc2_single_grouped_bias,
-            delay_wgrad_compute=self.config.delay_wgrad_compute,
+            delay_wgrad_compute=fc2_delay_wgrad_compute,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -564,6 +584,15 @@ class TEGroupedMLP(MegatronModule):
             output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
 
+    @staticmethod
+    def _remove_glu_interleaving(x: torch.Tensor, interleave_size: int) -> torch.Tensor:
+        """Reorder interleaved GLU blocks so gate and linear halves are contiguous."""
+        shape = x.size()
+        x = x.reshape(-1, shape[-1] // (2 * interleave_size), 2, interleave_size)
+        x = x.transpose(1, 2).contiguous()
+        x = x.view(shape)
+        return x
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -636,25 +665,13 @@ class TEGroupedMLP(MegatronModule):
                 and self.config.moe_mlp_glu_interleave_size is not None
             )
 
-            def remove_glu_interleaving(x: torch.Tensor) -> torch.Tensor:
-                """Reorder tensor so gate and linear units are contiguous.
-
-                Should only be applied if the activation function is
-                an interleaved GLU.
-
-                """
-                shape = x.size()
-                interleave_size = self.config.moe_mlp_glu_interleave_size
-                x = x.reshape(-1, shape[-1] // (2 * interleave_size), 2, interleave_size)
-                x = x.transpose(1, 2).contiguous()
-                x = x.view(shape)
-                return x
-
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
                 if with_glu_interleaving:
-                    intermediate_parallel = remove_glu_interleaving(intermediate_parallel)
+                    intermediate_parallel = self._remove_glu_interleaving(
+                        intermediate_parallel, self.config.moe_mlp_glu_interleave_size
+                    )
                 intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
                     original_dtype = intermediate_parallel.dtype
@@ -686,7 +703,9 @@ class TEGroupedMLP(MegatronModule):
             elif (
                 self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
             ):
-                assert bias_parallel is None
+                assert (
+                    bias_parallel is None
+                ), "Bias is not supported with fused weighted squared relu."
                 intermediate_parallel = weighted_squared_relu_impl(
                     intermediate_parallel, permuted_probs
                 )
@@ -695,7 +714,9 @@ class TEGroupedMLP(MegatronModule):
 
                     def glu(x):
                         if with_glu_interleaving:
-                            x = remove_glu_interleaving(x)
+                            x = self._remove_glu_interleaving(
+                                x, self.config.moe_mlp_glu_interleave_size
+                            )
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
@@ -712,17 +733,15 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with moe_act_manager as fc1_output:
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
-            with moe_act_manager as fc1_output:
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
-
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
@@ -792,7 +811,11 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
-        if self._with_fused_impl and self.config.delay_wgrad_compute:
+        # Match the wrapper's combined delay-wgrad mode used in _make_fused_ops so that
+        # `overlap_dispatch_backward_with_experts_wgrad`-driven runs invoke the deferred
+        # wgrad pass through the fused children instead of falling through to no-op
+        # backward_dw() on linear_fc{1,2} (whose forward never ran in the fused path).
+        if self._with_fused_impl and self.linear_fc1.delay_wgrad_compute:
             if self._fused_ops is not None:
                 (seq,) = self._fused_ops
                 fused_children = list(seq.children())
@@ -833,6 +856,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         config: TransformerConfig,
         submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
         # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
         super().__init__(
@@ -840,6 +864,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             config=config,
             submodules=submodules,
             pg_collection=pg_collection,
+            name=name,
         )
 
         # Concatenated weights are built lazily on first forward to ensure
@@ -1049,7 +1074,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 Required for the FlashInfer CUDA-graphed path, None otherwise.
         """
 
-        if self.training:
+        if not InferenceMode.is_active():
             assert (
                 not self.config.fp8_recipe == "mxfp8"
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
@@ -1091,10 +1116,11 @@ class SequentialMLP(MegatronModule):
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
     def __init__(
         self,
-        num_local_experts,
+        num_local_experts: int,
         config: TransformerConfig,
         submodules: MLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
 
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
@@ -1114,13 +1140,14 @@ class SequentialMLP(MegatronModule):
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
         self.dp_group = pg_collection.expt_dp
 
-        for _ in range(self.num_local_experts):
+        for expert_idx in range(self.num_local_experts):
             expert = MLP(
                 self.config,
                 submodules,
                 ffn_hidden_size=self.config.moe_ffn_hidden_size,
                 is_expert=True,
                 tp_group=pg_collection.expt_tp,
+                name=(name + f".local_experts.{expert_idx}") if name is not None else None,
             )
             self.local_experts.append(expert)
 

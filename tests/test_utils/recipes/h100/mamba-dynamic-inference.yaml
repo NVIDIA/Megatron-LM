@@ -11,6 +11,7 @@ spec:
   n_repeat: 1
   platforms: dgx_a100
   script_setup: |
+    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -33,6 +34,7 @@ spec:
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
+    set -euo pipefail
     ls
     cd /opt/megatron-lm
 
@@ -48,8 +50,8 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "INFERENCE_OUTPUT_PATH={assets_dir}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -66,6 +68,11 @@ products:
         scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m_flashinfer]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m_mamba_bf16_states]
     products:
       - environment: [dev]
         scope: [mr, mr-github]

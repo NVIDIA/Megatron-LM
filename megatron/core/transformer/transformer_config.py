@@ -514,6 +514,10 @@ class TransformerConfig(ModelParallelConfig):
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
+    use_transformer_engine_op_fuser: bool = False
+    """If True, submodules may use Transformer Engine's operation fuser
+    API to enable advanced fusions."""
+
     ####################
     # activation recomputation
     ####################
@@ -807,7 +811,7 @@ class TransformerConfig(ModelParallelConfig):
     """Padded actual vocabulary size. Required when moe_n_hash_layers > 0 for the
     tid2eid lookup buffer in hash-based MoE routing."""
 
-    dense_grouped_gemm: bool = False
+    use_grouped_gemm_for_dense_mlp: bool = False
     """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
     ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
@@ -939,6 +943,11 @@ class TransformerConfig(ModelParallelConfig):
     interpreted as alternating blocks of gates and linear units.
     This data format is experimental and primarily intended to enable
     advanced fused kernels."""
+
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens
+    exceeding this budget will be dropped. None means no token will be dropped.
+    The default is None."""
 
     ##################
     # Context Parallel
@@ -1077,14 +1086,14 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_recompute_layer_num: Optional[int] = None
     """Number of layers per MHC recompute block.
-    
+
     When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
     in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
     layer in the transformer block) will:
     - NOT checkpoint its final MLP BDA
     - Register the unified recompute hook on its MLP BDA output
     - A new CheckpointManager is created for subsequent layers
-    
+
     If None, all layers in the transformer block share a single recompute block.
 
     Must be a positive integer when set."""
@@ -1644,6 +1653,18 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_single_grouped_weight and moe_single_grouped_bias require "
                     f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
                 )
+        if self.moe_single_grouped_weight:
+            # The dist-optimizer's quantized-param shard path on the single-grouped-weight
+            # storage is only validated for fp8 mode with the mxfp8 recipe today; other
+            # combinations have a known numerical issue tracked in upstream PR
+            # NVIDIA/Megatron-LM#4621. Reject at construction time so users don't silently
+            # train on a broken numerical path. (moe_single_grouped_bias is not gated:
+            # biases aren't quantized, so they don't enter the buggy code path.)
+            if self.fp4 or not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "moe_single_grouped_weight is currently supported only with fp8 mode "
+                    "and fp8_recipe='mxfp8'."
+                )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
 
@@ -1985,17 +2006,20 @@ class TransformerConfig(ModelParallelConfig):
                     self.fine_grained_offloading_max_inflight_offloads >= 0
                 ), "fine_grained_offloading_max_inflight_offloads must be non-negative when set."
         if self.moe_paged_stash:
-            assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
-            assert self.moe_expert_rank_capacity_factor is not None, (
-                "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
-                "there is no need to use paged stashing without it."
-            )
+            if self.cpu_offloading:
+                raise ValueError("moe_paged_stash cannot be enabled with cpu_offloading.")
+            if self.moe_expert_rank_capacity_factor is None:
+                raise ValueError(
+                    "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
+                    "there is no need to use paged stashing without it."
+                )
             moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
-            assert not moe_offload_conflict, (
-                "When moe_paged_stash is enabled, offload_modules must not include "
-                f"expert_fc1 or moe_act (paged stash covers those activations). "
-                f"Remove: {moe_offload_conflict}"
-            )
+            if moe_offload_conflict:
+                raise ValueError(
+                    "When moe_paged_stash is enabled, offload_modules must not include "
+                    f"expert_fc1 or moe_act (paged stash covers those activations). "
+                    f"Remove: {moe_offload_conflict}"
+                )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -2712,9 +2736,13 @@ class TransformerConfig(ModelParallelConfig):
                     "fine-grained activation offloading."
                 )
                 if self.cuda_graph_impl == "full_iteration":
-                    assert self.fine_grained_offloading_max_inflight_offloads is not None, (
-                        "fine_grained_offloading_max_inflight_offloads must be set when using "
-                        "fine-grained activation offloading with full-iteration CUDA graphs "
+                    assert (
+                        self.fine_grained_offloading_max_inflight_offloads is not None
+                        and self.fine_grained_offloading_max_inflight_offloads >= 0
+                    ), (
+                        "fine_grained_offloading_max_inflight_offloads must be a non-negative "
+                        "integer when using fine-grained activation offloading with "
+                        "full-iteration CUDA graphs"
                     )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
@@ -2789,8 +2817,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.cuda_graph_impl != "none":
                 if self.cuda_graph_impl == "transformer_engine":
                     assert (
-                        self.cuda_graph_impl == "transformer_engine"
-                        and CudaGraphModule.moe not in self.cuda_graph_modules
+                        CudaGraphModule.moe not in self.cuda_graph_modules
                         and CudaGraphModule.mlp not in self.cuda_graph_modules
                     ), (
                         'CUDA graph scope on moe and mlp is not '

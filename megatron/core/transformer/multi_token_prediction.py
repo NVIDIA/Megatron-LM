@@ -16,6 +16,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
@@ -61,6 +62,8 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 else:
     TESpecProvider = None
+
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 
 def tie_word_embeddings_state_dict(
@@ -497,13 +500,16 @@ def get_mtp_layer_spec_for_backend(
 
 
 def mtp_on_this_rank(
-    config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
+    layout: PipelineParallelLayerLayout = None,
+    mtp_num_layers: Optional[int] = None,
+    ignore_virtual: Optional[bool] = True,
+    vp_stage: Optional[int] = None,
 ) -> bool:
     """
     Check if there is MTP on the current rank.
 
     Behavior:
-        - If a custom pipeline model parallel layout is provided in the config:
+        - If a custom pipeline model parallel layout is provided:
             - If virtual pipeline parallelism is enabled (and `ignore_virtual` is False), checks
               whether any MTP layers are present on this (pp_rank, vp_stage) pair.
             - Otherwise, checks all virtual pipeline ranks of the current pipeline rank. Returns
@@ -513,25 +519,24 @@ def mtp_on_this_rank(
     """
     mtp_on_this_rank = False
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    if config.pipeline_model_parallel_layout is not None:
+    if layout is not None:
         # with custom PP layout, we support put MTP layers on any pipeline stage
-        layout = config.pipeline_model_parallel_layout.layout
         if (
             not ignore_virtual
             and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
         ):
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
-            num_layers_to_build = layout[pp_rank][vp_stage].count(LayerType.mtp)
+            num_layers_to_build = layout.layout[pp_rank][vp_stage].count(LayerType.mtp)
             mtp_on_this_rank = num_layers_to_build > 0
         else:
-            for vpp_rank in range(len(layout[pp_rank])):
-                num_layers_to_build = layout[pp_rank][vpp_rank].count(LayerType.mtp)
+            for vpp_rank in range(len(layout.layout[pp_rank])):
+                num_layers_to_build = layout.layout[pp_rank][vpp_rank].count(LayerType.mtp)
                 if num_layers_to_build > 0:
                     mtp_on_this_rank = True
                     break
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
-        if config.mtp_num_layers is not None:
+        if mtp_num_layers is not None:
             mtp_on_this_rank = parallel_state.is_pipeline_last_stage(
                 ignore_virtual=ignore_virtual, vp_stage=vp_stage
             )
@@ -782,7 +787,12 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
@@ -862,6 +872,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 is_expert=False,
                 tp_comm_buffer_name="mtp_e_proj",
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                name=(name + ".e_proj") if name is not None else None,
             )
             self.h_proj = build_module(
                 self.submodules.h_proj,
@@ -875,6 +886,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 is_expert=False,
                 tp_comm_buffer_name="mtp_h_proj",
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                name=(name + ".h_proj") if name is not None else None,
             )
             self.eh_proj = None
         else:
@@ -895,6 +907,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 is_expert=False,
                 tp_comm_buffer_name="mtp_eh_proj",
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                name=(name + ".eh_proj") if name is not None else None,
             )
             self.e_proj = None
             self.h_proj = None
@@ -916,6 +929,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
@@ -929,6 +943,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
                 pg_collection=pg_collection,
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
 
         self.final_layernorm = self.submodules.layer_norm(
@@ -958,6 +973,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         embedding: Callable,
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -989,12 +1005,20 @@ class MultiTokenPredictionLayer(MegatronModule):
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
         )
+        if padding_mask is not None:
+            padding_mask, _ = roll_tensor(
+                padding_mask,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
-        return input_ids, position_ids, decoder_input, hidden_states
+        return input_ids, position_ids, padding_mask, decoder_input, hidden_states
 
     def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
         """
@@ -1020,7 +1044,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             h_out, _ = self.h_proj(hs_streams)
             s, b, n, _ = h_out.shape
             hidden_states = e_out.unsqueeze(2) + h_out
-            if not self.training:
+            if InferenceMode.is_active():
                 hidden_states = inference_all_gather_from_tensor_model_parallel_region(
                     hidden_states, self.tp_group, self.config
                 )
@@ -1046,7 +1070,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states, _ = self.eh_proj(hidden_states)
             # For tensor parallel we need to gather the tensor across the model-parallel
             # ranks after the linear projection.
-            if not self.training:
+            if InferenceMode.is_active():
                 hidden_states = inference_all_gather_from_tensor_model_parallel_region(
                     hidden_states, self.tp_group, self.config
                 )
@@ -1066,6 +1090,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states: Tensor,
         decoder_input: Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
@@ -1106,6 +1131,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
+                        padding_mask=padding_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
@@ -1124,6 +1150,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_params=inference_params,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
+                        padding_mask=padding_mask,
                     )
 
         if not self.mhc_enabled:
@@ -1363,6 +1390,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
+        padding_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -1400,9 +1428,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         _orig_cp_group = self.cp_group
         if packed_seq_params is not None and packed_seq_params.cp_group is not None:
             self.cp_group = packed_seq_params.cp_group
-        input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
+        input_ids, position_ids, padding_mask, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
+            padding_mask=padding_mask,
             embedding=embedding,
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
@@ -1413,6 +1442,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1428,6 +1458,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1440,7 +1471,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
 
         self.cp_group = _orig_cp_group
-        return hidden_states, input_ids, position_ids
+        return hidden_states, input_ids, position_ids, padding_mask
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -1551,7 +1582,12 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
@@ -1572,6 +1608,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.mtp_num_depths = mtp_num_depths
         self.hybrid_submodules = hybrid_submodules
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
+        self.name = name
 
         vp_size = config.virtual_pipeline_model_parallel_size
         assert is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size), (
@@ -1614,6 +1651,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=self.mtp_layer_pattern,
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
@@ -1631,6 +1669,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     hybrid_submodules=hybrid_submodules,
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
@@ -1687,6 +1726,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
+        padding_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -1726,11 +1766,12 @@ class MultiTokenPredictionBlock(MegatronModule):
             hidden_states = hidden_states_list[offset]
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            (hidden_states, input_ids, position_ids) = self.layers[layer_idx](
+            (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
