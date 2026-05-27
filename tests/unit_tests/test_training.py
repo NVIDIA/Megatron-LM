@@ -1302,6 +1302,7 @@ def test_train_single_iteration_control_flow(monkeypatch):
         skipped_train_samples=0,
         log_params_norm=False,
         eval_interval=1,
+        eval_iters=1,
         do_valid=True,
         manual_gc_eval=False,
         num_experts=None,
