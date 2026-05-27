@@ -564,64 +564,6 @@ class TEGroupedMLP(MegatronModule):
             output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
 
-    def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
-        """
-        Applies bias and activation function to the output of linear_fc1.
-        """
-        if self.config.use_te_activation_func:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
-            if permuted_probs is not None:
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * permuted_probs
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
-        elif self.config.bias_activation_fusion:
-            if self.activation_func == F.silu and self.config.gated_linear_unit:
-                # dtype is handled inside the fused kernel
-                intermediate_parallel = weighted_bias_swiglu_impl(
-                    intermediate_parallel,
-                    bias_parallel,
-                    permuted_probs,
-                    self.config.activation_func_fp8_input_store,
-                    self.config.activation_func_clamp_value,
-                )
-            elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
-                intermediate_parallel = weighted_bias_quick_geglu_impl(
-                    intermediate_parallel,
-                    bias_parallel,
-                    permuted_probs,
-                    self.config.activation_func_fp8_input_store,
-                    self.config.glu_linear_offset,
-                    self.config.activation_func_clamp_value,
-                )
-            else:
-                raise ValueError("Only support fusion of swiglu and quick_gelu in TEGroupedMLP.")
-        elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
-            assert bias_parallel is None, "Bias is not supported with fused weighted squared relu."
-            intermediate_parallel = weighted_squared_relu_impl(
-                intermediate_parallel, permuted_probs
-            )
-        else:
-            if self.config.gated_linear_unit:
-
-                def glu(x):
-                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                    if (val := self.config.activation_func_clamp_value) is not None:
-                        x_glu = x_glu.clamp(min=None, max=val)
-                        x_linear = x_linear.clamp(min=-val, max=val)
-                    return self.config.activation_func(x_glu) * (
-                        x_linear + self.config.glu_linear_offset
-                    )
-
-                intermediate_parallel = glu(intermediate_parallel)
-            else:
-                intermediate_parallel = self.activation_func(intermediate_parallel)
-            original_dtype = intermediate_parallel.dtype
-            intermediate_parallel = intermediate_parallel * permuted_probs
-            intermediate_parallel = intermediate_parallel.to(original_dtype)
-        return intermediate_parallel
-
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -775,7 +717,7 @@ class TEGroupedMLP(MegatronModule):
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with moe_act_manager as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
-                    self.bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
             with moe_act_manager as fc1_output:
