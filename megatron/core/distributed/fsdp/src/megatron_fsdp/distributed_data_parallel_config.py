@@ -38,7 +38,11 @@ class DistributedDataParallelConfig:
 
     fp8_param_gather: bool = False
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
-       perform the param all-gather in fp8."""
+        perform the param all-gather in fp8."""
+
+    fp4_param_gather: bool = False
+    """If true, keep the compute param in fp4 (do not use any other intermediate dtype) and
+        perform the param all-gather in fp4."""
 
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
@@ -194,6 +198,9 @@ class DistributedDataParallelConfig:
     parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
     user buffer registration and CUDA graph replay for models with asymmetrical
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+
+    use_megatron_fsdp_v2: bool = False
+    """If true, use the `fully_shard` API for FSDP sharding the model.
     """
 
     def __post_init__(self):

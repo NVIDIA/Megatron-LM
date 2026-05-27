@@ -266,6 +266,9 @@ class DistributedDataParallelConfig:
     parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
     user buffer registration and CUDA graph replay for models with asymmetrical
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+
+    use_megatron_fsdp_v2: bool = False
+    """If true, use the `fully_shard` API for FSDP sharding the model.
     """
 
     def __post_init__(self):
