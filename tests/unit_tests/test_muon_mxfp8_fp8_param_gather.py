@@ -22,20 +22,20 @@ perturbing numerics relative to OFF — which is the bug class addressed by
 import gc
 import os
 import sys
-from contextlib import contextmanager
+import copy
 
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
-from megatron.core import config
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.utils import get_device_arch_version, is_te_min_version
+from megatron.core.utils import is_te_min_version
+from megatron.training.utils import get_device_arch_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -43,75 +43,157 @@ from megatron.training.global_vars import (
     set_args,
     set_global_variables,
 )
-from megatron.training.initialize import _set_random_seed
 from megatron.training.training import setup_model_and_optimizer
+from tests.unit_tests.a2a_overlap.utils import deterministic_mode
 from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
 fp8_available, reason_for_no_fp8 = check_fp8_support()
 
 
-@contextmanager
-def deterministic_mode():
-    """Enable deterministic CUDA/CUBLAS/NCCL/TE kernels for bitwise comparison.
+def _clone_optimizer_state_value(value):
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: _clone_optimizer_state_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_optimizer_state_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_optimizer_state_value(v) for v in value)
+    return copy.deepcopy(value)
 
-    Mirrors ``tests/unit_tests/a2a_overlap/utils.py::deterministic_mode`` —
-    same env-var sweep + ``_set_random_seed`` invocation. Restores prior env
-    on exit.
+
+def _iter_leaf_optimizers(optimizer):
+    for child in getattr(optimizer, 'chained_optimizers', []):
+        yield from _iter_leaf_optimizers(child)
+    if not hasattr(optimizer, 'chained_optimizers'):
+        yield optimizer
+
+
+def _snapshot_masters(model):
+    """Collect fp32 masters keyed by model parameter name.
+
+    Optimizer-internal group layouts can legitimately differ between
+    fp8_param_gather ON / OFF, especially for MXFP8 tensors that may be split
+    into internal quantized members. The model parameter name is the stable
+    identity we want to compare.
     """
-    config.ENABLE_EXPERIMENTAL = True
-    envs = {
-        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-        "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
-        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "NCCL_NVLS_ENABLE": "0",
-        "NVTE_FUSED_ATTN": "0",
-        "NCCL_ALGO": "^NVLS",
-        "NVTE_FWD_LAYERNORM_SM_MARGIN": "8",
-        "NVTE_BWD_LAYERNORM_SM_MARGIN": "8",
-    }
-    origin_envs = {}
-    for k, v in envs.items():
-        origin_envs[k] = os.environ.get(k)
-        os.environ[k] = v
-    _set_random_seed(seed_=_SEED, data_parallel_random_init=False)
-    try:
-        yield
-    finally:
-        for k in envs:
-            if origin_envs[k] is not None:
-                os.environ[k] = origin_envs[k]
-            elif k in os.environ:
-                del os.environ[k]
-
-
-def _snapshot_masters(optimizer):
-    """Collect fp32 masters from every Float16-wrapped inner optimizer in the
-    chain, keyed by stable (chain-position, group, index) tuple so the same
-    parameter lands under the same key across ON / OFF runs."""
     snapshot = {}
-    for outer_idx, child in enumerate(optimizer.chained_optimizers):
-        if isinstance(child, LayerWiseDistributedOptimizer):
-            for inner_idx, inner in enumerate(child.chained_optimizers):
-                main_groups = getattr(inner, 'fp32_from_float16_groups', None)
-                if main_groups is None:
-                    continue
-                for grp_idx, group in enumerate(main_groups):
-                    for p_idx, p in enumerate(group):
-                        key = f"lw[{outer_idx}][{inner_idx}][{grp_idx}][{p_idx}]"
-                        snapshot[key] = p.detach().clone()
+    for name, param in model.named_parameters():
+        main_param = getattr(param, 'main_param', None)
+        if main_param is None:
             continue
-        main_groups = getattr(child, 'shard_fp32_from_float16_groups', None)
-        if main_groups is None:
-            main_groups = getattr(child, 'fp32_from_float16_groups', None)
-        if main_groups is None:
-            continue
-        for grp_idx, group in enumerate(main_groups):
-            for p_idx, p in enumerate(group):
-                key = f"do[{outer_idx}][{grp_idx}][{p_idx}]"
-                snapshot[key] = p.detach().clone()
+        snapshot[name] = main_param.detach().clone()
     return snapshot
+
+
+def _snapshot_model_params(model):
+    return {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if not _is_quantized_param(param)
+    }
+
+
+def _is_quantized_param(param):
+    return hasattr(param, 'dequantize') or hasattr(param.data, 'dequantize')
+
+
+def _assert_tensor_equal(actual, expected, message):
+    if torch.equal(actual, expected):
+        return
+    diff = (actual.float() - expected.float()).abs()
+    max_index = int(diff.argmax().item()) if diff.numel() > 0 else 0
+    actual_flat = actual.detach().reshape(-1)
+    expected_flat = expected.detach().reshape(-1)
+    raise AssertionError(
+        f"{message}: max_diff={diff.max().item()}, "
+        f"max_index={max_index}, "
+        f"actual_at_max={actual_flat[max_index].item() if actual_flat.numel() else None}, "
+        f"expected_at_max={expected_flat[max_index].item() if expected_flat.numel() else None}, "
+        f"actual_dtype={actual.dtype}, expected_dtype={expected.dtype}, "
+        f"actual={actual}, expected={expected}"
+    )
+
+
+def _snapshot_optimizer_states(model, optimizer):
+    param_to_name = {param: name for name, param in model.named_parameters()}
+    states = {}
+    for leaf_optimizer in _iter_leaf_optimizers(optimizer):
+        torch_optimizer = getattr(leaf_optimizer, 'optimizer', None)
+        if torch_optimizer is None:
+            continue
+        for name, param in model.named_parameters():
+            main_param = getattr(param, 'main_param', None)
+            if main_param is None or main_param not in torch_optimizer.state:
+                continue
+            states[name] = _clone_optimizer_state_value(torch_optimizer.state[main_param])
+
+        for model_group, main_group in zip(
+            getattr(leaf_optimizer, 'model_float16_groups', []),
+            getattr(leaf_optimizer, 'shard_fp32_from_float16_groups', []),
+        ):
+            for model_param, main_param in zip(model_group, main_group):
+                name = param_to_name.get(model_param)
+                if name is None or main_param is None or main_param not in torch_optimizer.state:
+                    continue
+                states[name] = _clone_optimizer_state_value(torch_optimizer.state[main_param])
+    return states
+
+
+def _snapshot_initial_state(model, optimizer):
+    return {
+        'model_params': {
+            name: param.detach().clone() for name, param in model.named_parameters()
+        },
+        'masters': _snapshot_masters(model),
+        'optimizer_states': _snapshot_optimizer_states(model, optimizer),
+    }
+
+
+def _restore_optimizer_states(model, optimizer, optimizer_states):
+    param_to_name = {param: name for name, param in model.named_parameters()}
+    for leaf_optimizer in _iter_leaf_optimizers(optimizer):
+        torch_optimizer = getattr(leaf_optimizer, 'optimizer', None)
+        if torch_optimizer is None:
+            continue
+        for name, param in model.named_parameters():
+            main_param = getattr(param, 'main_param', None)
+            if main_param is None or name not in optimizer_states:
+                continue
+            torch_optimizer.state[main_param] = _clone_optimizer_state_value(optimizer_states[name])
+
+        for model_group, main_group in zip(
+            getattr(leaf_optimizer, 'model_float16_groups', []),
+            getattr(leaf_optimizer, 'shard_fp32_from_float16_groups', []),
+        ):
+            for model_param, main_param in zip(model_group, main_group):
+                name = param_to_name.get(model_param)
+                if name is None or main_param is None or name not in optimizer_states:
+                    continue
+                torch_optimizer.state[main_param] = _clone_optimizer_state_value(
+                    optimizer_states[name]
+                )
+
+
+@torch.no_grad()
+def _restore_initial_state(model, optimizer, initial_state):
+    source_model_params = initial_state['model_params']
+    source_masters = initial_state['masters']
+
+    for name, param in model.named_parameters():
+        if name not in source_model_params:
+            continue
+        param.data.copy_(source_model_params[name].to(device=param.device))
+
+    optimizer.reload_model_params()
+
+    for name, param in model.named_parameters():
+        main_param = getattr(param, 'main_param', None)
+        if main_param is not None and name in source_masters:
+            main_param.data.copy_(source_masters[name].to(device=main_param.device))
+
+    _restore_optimizer_states(model, optimizer, initial_state['optimizer_states'])
 
 
 class TestMuonMXFP8FP8ParamGather:
@@ -121,6 +203,11 @@ class TestMuonMXFP8FP8ParamGather:
         self.seq_length = 128
         self.micro_batch_size = 1
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -128,7 +215,7 @@ class TestMuonMXFP8FP8ParamGather:
         destroy_num_microbatches_calculator()
         gc.collect()
 
-    def model_provider(self, pre_process=True, post_process=True):
+    def model_provider(self, pre_process=True, post_process=True, **config_kwargs):
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
         transformer_config = core_transformer_config_from_args(args)
@@ -145,6 +232,8 @@ class TestMuonMXFP8FP8ParamGather:
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            pg_collection=config_kwargs.get("pg_collection"),
+            vp_stage=config_kwargs.get("vp_stage"),
         )
 
     def _create_args(self, fp8_param_gather):
@@ -154,7 +243,8 @@ class TestMuonMXFP8FP8ParamGather:
         args = parse_args()
         args.num_layers = 2
         args.vocal_size = 128
-        args.hidden_size = 64
+        args.hidden_size = 128
+        args.ffn_hidden_size = 256
         args.num_attention_heads = 4
         args.max_position_embeddings = self.seq_length
         args.micro_batch_size = self.micro_batch_size
@@ -166,9 +256,13 @@ class TestMuonMXFP8FP8ParamGather:
         args.context_parallel_size = 1
         args.train_iters = 10
         args.lr = 3e-5
+        args.clip_grad = 0.0
         args.bf16 = True
         args.add_bias_linear = False
         args.swiglu = True
+        args.hidden_dropout = 0.0
+        args.attention_dropout = 0.0
+        args.attention_backend = "unfused"
         # ``--optimizer muon --use-distributed-optimizer`` auto-flips to the
         # LayerWiseDistributedOptimizer path in ``arguments.py``.
         args.optimizer = 'muon'
@@ -210,17 +304,11 @@ class TestMuonMXFP8FP8ParamGather:
         loss_mask = torch.ones(self.seq_length).repeat((self.micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def _run_steps(self, fp8_param_gather, num_steps):
-        """Build model + LayerWise optimizer, run ``num_steps`` deterministic
-        training steps, and return per-step snapshots of loss, forward output,
-        per-parameter ``main_grad`` (before step), and per-parameter fp32
-        master (after step)."""
+    def _build_model_and_optimizer(self, fp8_param_gather):
         args = self._create_args(fp8_param_gather=fp8_param_gather)
         set_args(args)
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
 
-        input_ids, labels, position_ids, attention_mask, loss_mask = self._build_batch()
         gpt_model, optimizer, _ = setup_model_and_optimizer(
             self.model_provider, ModelType.encoder_or_decoder
         )
@@ -231,8 +319,15 @@ class TestMuonMXFP8FP8ParamGather:
             "LayerWiseDistributedOptimizer; got "
             f"{type(optimizer.chained_optimizers[0]).__name__}"
         )
+        return args, gpt_model, optimizer
 
-        losses, outputs, grads_per_step, masters_per_step = [], [], [], []
+    def _run_steps(self, args, gpt_model, optimizer, num_steps):
+        """Run ``num_steps`` deterministic training steps and return per-step
+        snapshots of loss, forward output, per-parameter ``main_grad`` (before
+        step), and per-parameter fp32 master (after step)."""
+        input_ids, labels, position_ids, attention_mask, loss_mask = self._build_batch()
+
+        losses, outputs, grads_per_step, masters_per_step, params_per_step = [], [], [], [], []
 
         for _ in range(num_steps):
             gpt_model[0].zero_grad_buffer()
@@ -260,12 +355,13 @@ class TestMuonMXFP8FP8ParamGather:
             update_successful, _, _ = optimizer.step()
             assert update_successful
 
-            masters_per_step.append(_snapshot_masters(optimizer))
+            params_per_step.append(_snapshot_model_params(gpt_model[0]))
+            masters_per_step.append(_snapshot_masters(gpt_model[0]))
             grads_per_step.append(grad_snapshot)
             losses.append(loss.detach().clone())
             outputs.append(output.detach().clone())
 
-        return losses, outputs, grads_per_step, masters_per_step
+        return losses, outputs, grads_per_step, masters_per_step, params_per_step
 
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 requires Blackwell architecture or newer"
@@ -281,29 +377,49 @@ class TestMuonMXFP8FP8ParamGather:
         num_steps = 5
 
         with deterministic_mode():
-            losses_off, outputs_off, grads_off, masters_off = self._run_steps(
-                fp8_param_gather=False, num_steps=num_steps
+            off_args, off_model, off_optimizer = self._build_model_and_optimizer(
+                fp8_param_gather=False
             )
-            losses_on, outputs_on, grads_on, masters_on = self._run_steps(
-                fp8_param_gather=True, num_steps=num_steps
+            initial_state = _snapshot_initial_state(off_model[0], off_optimizer)
+            on_args, on_model, on_optimizer = self._build_model_and_optimizer(
+                fp8_param_gather=True
             )
+            _restore_initial_state(on_model[0], on_optimizer, initial_state)
+
+            losses_off, outputs_off, grads_off, masters_off, params_off = [], [], [], [], []
+            losses_on, outputs_on, grads_on, masters_on, params_on = [], [], [], [], []
+
+            for _ in range(num_steps):
+                off_step = self._run_steps(off_args, off_model, off_optimizer, 1)
+                on_step = self._run_steps(on_args, on_model, on_optimizer, 1)
+
+                for dst, src in zip(
+                    (losses_off, outputs_off, grads_off, masters_off, params_off),
+                    off_step,
+                ):
+                    dst.extend(src)
+                for dst, src in zip(
+                    (losses_on, outputs_on, grads_on, masters_on, params_on),
+                    on_step,
+                ):
+                    dst.extend(src)
+
+            del off_model, on_model, off_optimizer, on_optimizer
+            gc.collect()
+            torch.cuda.empty_cache()
 
         assert len(losses_on) == len(losses_off) == num_steps
 
         for step in range(num_steps):
-            torch.testing.assert_close(
+            _assert_tensor_equal(
                 losses_on[step],
                 losses_off[step],
-                atol=0,
-                rtol=0,
-                msg=lambda m, s=step: f"loss mismatch at step {s}: {m}",
+                f"loss mismatch at step {step}",
             )
-            torch.testing.assert_close(
+            _assert_tensor_equal(
                 outputs_on[step],
                 outputs_off[step],
-                atol=0,
-                rtol=0,
-                msg=lambda m, s=step: f"output mismatch at step {s}: {m}",
+                f"output mismatch at step {step}",
             )
 
             assert set(grads_on[step].keys()) == set(grads_off[step].keys()), (
@@ -312,24 +428,33 @@ class TestMuonMXFP8FP8ParamGather:
                 f"off={sorted(grads_off[step].keys())}"
             )
             for name in grads_on[step]:
-                torch.testing.assert_close(
+                _assert_tensor_equal(
                     grads_on[step][name],
                     grads_off[step][name],
-                    atol=0,
-                    rtol=0,
-                    msg=lambda m, s=step, n=name: f"grad mismatch at step {s} for {n}: {m}",
+                    f"grad mismatch at step {step} for {name}",
                 )
 
-            assert set(masters_on[step].keys()) == set(masters_off[step].keys()), (
-                f"master parameter set mismatch at step {step}: "
+            assert set(params_on[step].keys()) == set(params_off[step].keys()), (
+                f"model parameter set mismatch at step {step}: "
+                f"on={sorted(params_on[step].keys())} "
+                f"off={sorted(params_off[step].keys())}"
+            )
+            for name in params_on[step]:
+                _assert_tensor_equal(
+                    params_on[step][name],
+                    params_off[step][name],
+                    f"model parameter mismatch after step {step} for {name}",
+                )
+
+            common_master_names = set(masters_on[step].keys()) & set(masters_off[step].keys())
+            assert common_master_names, (
+                f"no common local fp32 masters to compare at step {step}: "
                 f"on={sorted(masters_on[step].keys())} "
                 f"off={sorted(masters_off[step].keys())}"
             )
-            for name in masters_on[step]:
-                torch.testing.assert_close(
+            for name in common_master_names:
+                _assert_tensor_equal(
                     masters_on[step][name],
                     masters_off[step][name],
-                    atol=0,
-                    rtol=0,
-                    msg=lambda m, s=step, n=name: f"master mismatch at step {s} for {n}: {m}",
+                    f"master mismatch at step {step} for {name}",
                 )

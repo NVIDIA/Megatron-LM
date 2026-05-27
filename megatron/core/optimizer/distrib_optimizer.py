@@ -3003,11 +3003,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             ):
                 if not bucket_group.buckets:
                     continue
-                if _bucket_is_managed_by_layer_wise_optimizer(
-                    bucket_group.buckets[0], default_for_untagged=False
-                ):
+                distopt_buckets = [
+                    bucket
+                    for bucket in bucket_group.buckets
+                    if not _bucket_is_managed_by_layer_wise_optimizer(
+                        bucket, default_for_untagged=False
+                    )
+                ]
+                if not distopt_buckets:
                     continue
-                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+
+                if len(distopt_buckets) == len(bucket_group.buckets):
+                    model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+                else:
+                    distopt_bucket_group = type(a ra m)(
+                        distopt_buckets,
+                        bucket_group.ddp_config,
+                        bucket_group.intra_distributed_optimizer_instance_group,
+                        bucket_group.intra_distributed_optimizer_instance_size,
+                    )
+                    model_chunk._start_bucket_group_param_sync(
+                        distopt_bucket_group, force_sync=False
+                    )
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
