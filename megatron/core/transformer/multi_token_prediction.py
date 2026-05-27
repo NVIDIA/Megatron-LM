@@ -1006,18 +1006,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
 
         input_ids, _ = roll_tensor(
-            input_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
+            input_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
+            position_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)

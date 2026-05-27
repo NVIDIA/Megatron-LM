@@ -150,12 +150,14 @@ class GatedDeltaNet(MegatronModule):
         num_key_heads_per_tp = self.num_key_heads // self.tp_size
         num_value_heads_per_tp = self.num_value_heads // self.tp_size
         assert num_key_heads_per_tp % self.cp_size == 0, (
-            f"GDN head-parallel CP requires cp_size ({self.cp_size}) to evenly divide "
-            f"num_key_heads per TP rank ({num_key_heads_per_tp})."
+            f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+            f"to evenly divide num_key_heads per TP rank ({num_key_heads_per_tp}); "
+            f"all runtime dynamic cp_size values divide the static one and so will also divide."
         )
         assert num_value_heads_per_tp % self.cp_size == 0, (
-            f"GDN head-parallel CP requires cp_size ({self.cp_size}) to evenly divide "
-            f"num_value_heads per TP rank ({num_value_heads_per_tp})."
+            f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+            f"to evenly divide num_value_heads per TP rank ({num_value_heads_per_tp}); "
+            f"all runtime dynamic cp_size values divide the static one and so will also divide."
         )
 
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
@@ -425,10 +427,7 @@ class GatedDeltaNet(MegatronModule):
             self.v_dim_local_tp,
         ]
         conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=cp_group,
-            split_sections=qkv_channels_split_sections,
+            self.conv1d.weight, dim=0, cp_group=cp_group, split_sections=qkv_channels_split_sections
         )
         conv1d_bias = (
             get_parameter_local_cp(
@@ -456,13 +455,16 @@ class GatedDeltaNet(MegatronModule):
         else:
             assert self.activation in ["silu", "swish"]
             _orig_seq = qkv.shape[1]
-            _pad_n = (-_orig_seq % _CONV_PAD_ALIGNMENT)
+            _pad_n = -_orig_seq % _CONV_PAD_ALIGNMENT
             _conv_input = qkv
             _conv_cu_seqlens = cu_seqlens_q
             if _pad_n > 0:
                 _conv_input = torch.nn.functional.pad(qkv, (0, 0, 0, _pad_n))
-                _conv_cu_seqlens = cu_seqlens_q.clone()
-                _conv_cu_seqlens[-1] += _pad_n
+                # cu_seqlens_q is None in non-packed-sequence mode; only the
+                # last-segment offset needs to grow to cover the padding tail.
+                if cu_seqlens_q is not None:
+                    _conv_cu_seqlens = cu_seqlens_q.clone()
+                    _conv_cu_seqlens[-1] += _pad_n
             qkv, _ = causal_conv1d(
                 x=_conv_input,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
@@ -519,15 +521,11 @@ class GatedDeltaNet(MegatronModule):
             unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
             outputs = []
             for norm_out_i in unpacked_norm_out:
-                norm_out_i = tensor_a2a_hp2cp(
-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=cp_group
-                )
+                norm_out_i = tensor_a2a_hp2cp(norm_out_i, seq_dim=0, head_dim=-1, cp_group=cp_group)
                 outputs.append(norm_out_i)
             norm_out = torch.cat(outputs, dim=0)
         else:
-            norm_out = tensor_a2a_hp2cp(
-                norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group
-            )
+            norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group)
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
@@ -556,9 +554,7 @@ class GatedDeltaNet(MegatronModule):
         """
         # Split qkv into query_key and value
         query_key, value = torch.split(
-            qkv,
-            [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size],
-            dim=-1,
+            qkv, [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size], dim=-1
         )
 
         # Reshape query_key and value
@@ -985,9 +981,9 @@ def torch_chunk_gated_delta_rule(
     Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
     '''
 
-    assert cu_seqlens is None, (
-        "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
-    )
+    assert (
+        cu_seqlens is None
+    ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
 
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:

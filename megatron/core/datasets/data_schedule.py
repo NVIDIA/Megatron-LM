@@ -257,6 +257,10 @@ class DpBalancedScheduler(BasePackingScheduler):
             # Step 3: Strip data fields not needed by this PP stage to avoid
             # unnecessary all-to-all communication. First PP needs tokens/position_ids,
             # last PP needs labels/loss_mask. MTP stages need all four.
+            # NOTE: this assumes _unpack_batch produces only the six keys below
+            # (tokens, position_ids, labels, loss_mask, original_seq_len,
+            # padded_seq_len). Any custom dataset metadata key outside this set
+            # would be silently dropped here; extend keys_to_keep if needed.
             keys_to_keep = {'original_seq_len', 'padded_seq_len'}
             if is_first_pp or mtp_on_this_pp:
                 keys_to_keep.update(['tokens', 'position_ids'])
@@ -561,7 +565,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     if is_first_or_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             # Use whichever data field is available (first stage has tokens, last has labels)
-            _data_field = batch.get('tokens', batch.get('labels'))
+            _data_field = batch.get('tokens') or batch.get('labels')
             total_tokens = torch.tensor(_data_field.size(0), dtype=torch.int32, device=dev)
         else:
             total_tokens = torch.empty(1, dtype=torch.int32, device=dev)

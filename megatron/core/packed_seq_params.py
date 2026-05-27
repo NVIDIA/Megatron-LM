@@ -67,8 +67,7 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: dist.ProcessGroup,
-    packed_seq_params: PackedSeqParams = None,
+    static_cp_group: dist.ProcessGroup, packed_seq_params: PackedSeqParams = None
 ) -> dist.ProcessGroup:
     """Return the dynamic CP group from packed_seq_params when available, else the static one.
 
