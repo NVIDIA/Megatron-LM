@@ -430,15 +430,8 @@ def test_pretrain_batch(
         assert loss_mask is not None
         assert position_ids is not None
         assert cu_seqlens is None
-        if cp_size > 1:
-            assert cu_seqlens_padded is not None
-            assert cu_seqlens_padded.dim() == 2
-            assert cu_seqlens_padded.shape[0] == 1
-            assert cu_seqlens_padded.dtype == torch.int32
-            assert cu_seqlens_padded[0, 0].item() == 0
-            assert cu_seqlens_padded[0, -1].item() == seq_length
-        else:
-            assert cu_seqlens_padded is None
+
+        assert cu_seqlens_padded is None
         assert max_seqlen is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
@@ -486,15 +479,7 @@ def test_pretrain_batch(
         assert labels is None
         assert loss_mask is None
         assert cu_seqlens is None
-        if cp_size > 1:
-            assert cu_seqlens_padded is not None
-            assert cu_seqlens_padded.dim() == 2
-            assert cu_seqlens_padded.shape[0] == 1
-            assert cu_seqlens_padded.dtype == torch.int32
-            assert cu_seqlens_padded[0, 0].item() == 0
-            assert cu_seqlens_padded[0, -1].item() == seq_length
-        else:
-            assert cu_seqlens_padded is None
+        assert cu_seqlens_padded is None
         assert max_seqlen is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
@@ -530,15 +515,7 @@ def test_pretrain_batch(
         assert tokens is None
         assert position_ids is None
         assert cu_seqlens is None
-        if cp_size > 1:
-            assert cu_seqlens_padded is not None
-            assert cu_seqlens_padded.dim() == 2
-            assert cu_seqlens_padded.shape[0] == 1
-            assert cu_seqlens_padded.dtype == torch.int32
-            assert cu_seqlens_padded[0, 0].item() == 0
-            assert cu_seqlens_padded[0, -1].item() == seq_length
-        else:
-            assert cu_seqlens_padded is None
+        assert cu_seqlens_padded is None
         assert max_seqlen is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
@@ -577,15 +554,7 @@ def test_pretrain_batch(
         assert position_ids is None
         assert attention_mask is None
         assert cu_seqlens is None
-        if cp_size > 1:
-            assert cu_seqlens_padded is not None
-            assert cu_seqlens_padded.dim() == 2
-            assert cu_seqlens_padded.shape[0] == 1
-            assert cu_seqlens_padded.dtype == torch.int32
-            assert cu_seqlens_padded[0, 0].item() == 0
-            assert cu_seqlens_padded[0, -1].item() == seq_length
-        else:
-            assert cu_seqlens_padded is None
+        assert cu_seqlens_padded is None
         assert max_seqlen is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
