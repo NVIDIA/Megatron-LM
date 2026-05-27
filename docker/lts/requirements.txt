@@ -20,3 +20,4 @@ onnxscript==0.7.0
 fastapi==0.136.3                       # was: fastapi~=0.50 (forces compat with pydantic 2.0)
 datasets==4.8.5
 emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0
+nvidia-resiliency-ext==0.6.0
