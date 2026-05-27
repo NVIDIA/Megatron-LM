@@ -22,6 +22,7 @@ the per-iteration loss / grad_norm lines. They must be exactly equal.
 import os
 import re
 import subprocess
+from pathlib import Path
 
 import pytest
 import torch
@@ -224,14 +225,8 @@ class TestDecomposeReconstruct:
 #    metric strings are byte-identical between the two runs.
 # =============================================================================
 
-# Common args shared across both models (matches test_moonlight_qwen3_bitwise.sh).
-_MEGATRON_DIR = os.environ.get(
-    'MEGATRON_DIR', '/lustre/fsw/coreai_devtech_all/haocheny/migrate_to_TE_0415/Megatron-LM'
-)
-_MOONLIGHT_LOAD = os.environ.get(
-    'MOONLIGHT_CKPT',
-    '/lustre/fsw/coreai_devtech_all/haocheny/mcore_models/Moonlight-16B-A3B-Instruct',
-)
+# Common args shared across both models.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _SFT_JSON = (
     '{"mode":"distribution","type":"lognormal",'
@@ -365,10 +360,6 @@ _MOONLIGHT_ARGS = _COMMON_ARGS + [
     "50000",
     "--vocab-size",
     "163840",
-    "--load",
-    _MOONLIGHT_LOAD,
-    "--no-load-optim",
-    "--no-load-rng",
 ]
 
 _QWEN3_ARGS = _COMMON_ARGS + [
@@ -402,7 +393,7 @@ _QWEN3_ARGS = _COMMON_ARGS + [
 def _run_pretrain(model_args, cuda_graph_args, master_port):
     """Subprocess-launch `torchrun pretrain_gpt.py` once and capture stdout."""
     env = os.environ.copy()
-    env["PYTHONPATH"] = _MEGATRON_DIR + ":" + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(_REPO_ROOT) + ":" + env.get("PYTHONPATH", "")
     env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
     env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -445,7 +436,7 @@ def _run_pretrain(model_args, cuda_graph_args, master_port):
     )
 
     result = subprocess.run(
-        cmd, cwd=_MEGATRON_DIR, env=env, capture_output=True, text=True, timeout=900
+        cmd, cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=900
     )
     return result
 
@@ -491,8 +482,8 @@ class TestE2EBitwise:
     """End-to-end bitwise comparison: pretrain_gpt.py noGraph vs cudaGraph.
 
     Each test launches `torchrun pretrain_gpt.py` twice -- once without CUDA
-    graphs and once with `cuda_graph_impl=transformer_engine cuda_graph_scope=attn`
-    -- using the exact same args as test_moonlight_qwen3_bitwise.sh.
+    graphs and once with `cuda_graph_impl=transformer_engine cuda_graph_modules=attn`
+    -- using the same model/test settings as test_moonlight_qwen3_bitwise.sh.
     Asserts the per-iteration `lm loss / load_balancing_loss / grad norm`
     lines are byte-identical.
 
@@ -520,7 +511,7 @@ class TestE2EBitwise:
             cuda_graph_args=[
                 "--cuda-graph-impl",
                 "transformer_engine",
-                "--cuda-graph-scope",
+                "--cuda-graph-modules",
                 "attn",
             ],
             master_port=base_port + 1,
