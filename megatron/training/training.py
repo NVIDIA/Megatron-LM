@@ -1925,7 +1925,7 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
             # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
             # operations (such as pointer dereferencing) that can break CUDA graph replay.
             kwargs["megatron_fsdp_cuda_graph_mode"] = True
-            if CudaGraphScope.full_iteration in args.cuda_graph_scope:
+            if args.cuda_graph_impl == "full_iteration":
                 # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
                 # during start_param_sync(), which is called during the DistOpt.step(). This
                 # causes an error when we wait() on a CUDA kernel launched in a stream beyond
@@ -3292,7 +3292,7 @@ def train(
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=args.cuda_graph_use_single_mempool,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
@@ -3308,7 +3308,7 @@ def train(
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=args.cuda_graph_use_single_mempool,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
         )
 
     def get_e2e_base_metrics():
@@ -3857,7 +3857,7 @@ def evaluate(
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=args.cuda_graph_use_single_mempool,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:

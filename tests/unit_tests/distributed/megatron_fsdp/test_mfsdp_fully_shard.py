@@ -738,7 +738,9 @@ class TestMegatronFsdpFullyShard:
         ``capturable=True`` for graph-safe step math.
         """
         # Construct (DP-Outer=2, DP-Inner=4) DeviceMesh.
-        device_mesh = build_distributed_environment((2, 4, 1, 1))
+        device_mesh = build_distributed_environment(
+            (2, torch.distributed.get_world_size() // 2, 1, 1)
+        )
 
         # Construct toy Megatron-FSDP model.
         toy_model, fsdp_unit_modules = build_toy_model(

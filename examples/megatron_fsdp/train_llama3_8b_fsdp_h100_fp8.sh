@@ -134,8 +134,7 @@ if [ "${USE_MEGATRON_FSDP}" = 1 ]; then
         # To use decoupled (mixed-precision) gradients...
         # --use-precision-aware-optimizer
         # To use full-iteration CUDA graphs with Megatron-FSDP...
-        # --cuda-graph-impl local
-        # --cuda-graph-scope full_iteration
+        # --cuda-graph-impl full_iteration
     )
 fi
 
