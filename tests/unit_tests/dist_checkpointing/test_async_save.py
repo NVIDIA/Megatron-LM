@@ -150,7 +150,7 @@ class TestHasNvrxAsyncSupport:
             assert has_nvrx_async_support() is True
 
     def test_version_check_fails(self):
-        """Raises AssertionError when all NVRx symbols are present but version is too old."""
+        """Returns False when all NVRx symbols are present but version is too old."""
         with (
             mock.patch(
                 'megatron.core.dist_checkpointing.strategies.nvrx.import_module',
@@ -161,5 +161,4 @@ class TestHasNvrxAsyncSupport:
                 return_value=False,
             ),
         ):
-            with pytest.raises(AssertionError, match="Minimum required nvidia-resiliency-ext"):
-                has_nvrx_async_support()
+            assert has_nvrx_async_support() is False

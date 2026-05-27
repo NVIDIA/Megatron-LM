@@ -1,10 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.training.utils.common_utils import (
     average_losses_across_data_parallel_group,
     calc_dtensor_params_l2_norm,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
+    get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     get_device_arch_version,
     get_ltor_masks_and_position_ids,

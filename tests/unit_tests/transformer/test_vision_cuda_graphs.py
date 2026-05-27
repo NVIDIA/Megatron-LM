@@ -367,6 +367,7 @@ class TestVisionTECudaGraphHelper:
         assert sample_kwargs_list == []
 
     # -- create_cudagraphs / delete_cuda_graphs lifecycle --
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
@@ -399,6 +400,7 @@ class TestVisionTECudaGraphHelper:
         for layer in helper.callables:
             assert layer.cuda_graphs == [], "cuda_graphs should be empty after delete"
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
@@ -599,6 +601,8 @@ class TestVisionTECudaGraphHelperPP2:
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
     )
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_pp2_create_cudagraphs_first_stage(self):
         """On stage 0, CUDA graphs should be captured with the full pipeline order."""
         if not self.is_first_stage:

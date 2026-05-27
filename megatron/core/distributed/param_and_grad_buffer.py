@@ -313,38 +313,6 @@ class _ParamAndGradBucketGroup:
         if len(quantized_params) > 0:
             post_all_gather_processing(quantized_params)
 
-    def _post_param_sync(self):
-        """Run post-processing after param all-gather completes."""
-        if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-            for bucket in self.buckets:
-                is_bf16_weight_bucket = False
-                for param in bucket.params:
-                    # Skip copying since bf16 weights in the mxfp8 model
-                    # are already mapped to param.data.
-                    if not is_float8tensor(param):
-                        is_bf16_weight_bucket = True
-                        break
-                    param_start, param_end = bucket.param_to_index[param]
-                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    param.data.copy_(param_slice.view(param.data.shape))
-                if is_bf16_weight_bucket:
-                    continue
-                # All-gathered params are not needed after being copied to param.data.
-                # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                # We cannot zero out the entire grad buffer because one grad buffer may
-                # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                # it would clear the data of those param buffers that have not yet completed AG.
-                bucket.param_data.zero_()
-            return
-
-        quantized_params = []
-        for bucket in self.buckets:
-            for param in bucket.params:
-                if is_float8tensor(param) or is_nvfp4tensor(param):
-                    quantized_params.append(param)
-        if len(quantized_params) > 0:
-            post_all_gather_processing(quantized_params)
-
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
         Make sure norm of grads in bucket are not NaN prior to data-parallel

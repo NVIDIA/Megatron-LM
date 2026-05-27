@@ -105,8 +105,13 @@ html_theme_options = {
 }
 html_extra_path = ["project.json", "versions1.json"]
 
-# Github links are now getting rate limited from the Github Actions
-linkcheck_ignore = [".*github\\.com.*", ".*githubusercontent\\.com.*", "http://localhost.*"]
+# GitHub and Hugging Face links are now getting rate limited from GitHub Actions.
+linkcheck_ignore = [
+    ".*github\\.com.*",
+    ".*githubusercontent\\.com.*",
+    ".*huggingface\\.co.*",
+    "http://localhost.*",
+]
 
 # PyTorch docs use a JS-rendered frontend; anchor IDs are injected at runtime
 # and are not present in the static HTML that linkcheck fetches.

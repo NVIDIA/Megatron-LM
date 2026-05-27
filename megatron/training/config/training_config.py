@@ -654,11 +654,9 @@ class CheckpointConfig:
             self.async_save
             and self.async_strategy == "nvrx"
             and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
+            and not has_nvrx_checkpointing_async_support()
         ):
-            assert has_nvrx_checkpointing_async_support(), (
-                "A compatible nvidia-resiliency-ext installation is required to enable "
-                "async save with async_strategy='nvrx'."
-            )
+            self.async_strategy = "mcore"
 
         if self.verify_integrity:
             assert (

@@ -694,7 +694,10 @@ class TestHashRouting:
         submodules = get_gpt_layer_local_submodules(
             num_experts=config.num_moe_experts, moe_grouped_gemm=False
         )
-        moe_layer = MoELayer(config, submodules.mlp.submodules, layer_number=1).cuda()
+        # `submodules.mlp` is a ``functools.partial`` wrapper around ``MoELayer`` since
+        # main switched MoE specs to ``MlpBuilder`` partials; extract its MoESubmodules.
+        moe_submodules = submodules.mlp.keywords["submodules"]
+        moe_layer = MoELayer(config, moe_submodules, layer_number=1).cuda()
 
         hidden_states = torch.randn(8, 2, 16, device="cuda", requires_grad=True)
         input_ids = torch.randint(0, 128, (2, 8), device="cuda")

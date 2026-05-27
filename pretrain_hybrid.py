@@ -32,7 +32,12 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_rank, get_context_parallel_world_size
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import StragglerDetector, get_attr_wrapped_model, is_te_min_version
+from megatron.core.utils import (
+    StragglerDetector,
+    get_attr_wrapped_model,
+    get_batch_on_this_cp_rank,
+    is_te_min_version,
+)
 from megatron.training import (
     get_args,
     get_timers,
@@ -45,7 +50,6 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,

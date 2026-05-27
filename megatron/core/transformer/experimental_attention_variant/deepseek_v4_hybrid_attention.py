@@ -70,6 +70,7 @@ class DSv4HybridAttention(Attention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ) -> None:
 
         super().__init__(
@@ -80,6 +81,7 @@ class DSv4HybridAttention(Attention):
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
+            name=name,
         )
         self.config: MLATransformerConfig
 
@@ -403,6 +405,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -416,6 +419,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
+            name=name,
         )
 
         q_down_proj_kwargs = {}

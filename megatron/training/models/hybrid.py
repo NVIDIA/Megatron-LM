@@ -6,9 +6,7 @@ from typing import Any, Callable, ClassVar, Literal, override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
-from megatron.core.models.hybrid.hybrid_layer_specs import (
-    hybrid_inference_stack_spec,
-)
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
 )

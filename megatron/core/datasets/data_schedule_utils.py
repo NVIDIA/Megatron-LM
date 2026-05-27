@@ -89,8 +89,20 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
     """
     # Collect the number of subsamples from all ranks
     num_local_subsamples = subsample_seqlens.shape[0]
-    local_len = torch.tensor([num_local_subsamples], dtype=torch.int32).cuda()
-    dp_subsample_count = [torch.zeros_like(local_len) for _ in range(dp_group.size())]
+    dp_size = dp_group.size()
+    if dp_size == 1:
+        seqlens_gathered = subsample_seqlens.cpu().tolist()
+        offsets = torch.tensor([0, num_local_subsamples], dtype=torch.int32)
+        global_ids_this_rank = torch.arange(
+            num_local_subsamples, dtype=torch.int32, device=subsample_seqlens.device
+        )
+        global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(num_local_subsamples)]
+        return global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
+
+    local_len = torch.tensor(
+        [num_local_subsamples], dtype=torch.int32, device=subsample_seqlens.device
+    )
+    dp_subsample_count = [torch.zeros_like(local_len) for _ in range(dp_size)]
     torch.distributed.all_gather(dp_subsample_count, local_len, group=dp_group)
 
     # Find the max number of subsamples across all ranks and pad subsample_seqlens to max length
@@ -101,7 +113,11 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
         subsample_seqlens_padded = torch.cat(
             [
                 subsample_seqlens,
-                torch.zeros(max_sub_samples - num_local_subsamples, dtype=torch.int32).cuda(),
+                torch.zeros(
+                    max_sub_samples - num_local_subsamples,
+                    dtype=torch.int32,
+                    device=subsample_seqlens.device,
+                ),
             ],
             dim=0,
         )
@@ -109,7 +125,7 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
         subsample_seqlens_padded = subsample_seqlens
 
     # Gather the subsample_seqlens from all ranks
-    seqlens_gathered = [torch.empty_like(subsample_seqlens_padded) for _ in range(dp_group.size())]
+    seqlens_gathered = [torch.empty_like(subsample_seqlens_padded) for _ in range(dp_size)]
     torch.distributed.all_gather(seqlens_gathered, subsample_seqlens_padded, group=dp_group)
 
     # Trim each seqlens_gathered to the length of the correct sample
@@ -125,7 +141,9 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
 
     # Calculate global ID for each subsample
     dp_rank = dp_group.rank()
-    global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32).cuda()
+    global_ids = torch.arange(
+        len(seqlens_gathered), dtype=torch.int32, device=subsample_seqlens.device
+    )
 
     # Create a list of (global_id, seqlen) tuples for scheduling
     global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]

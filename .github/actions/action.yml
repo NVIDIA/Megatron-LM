@@ -192,6 +192,20 @@ runs:
       id: timeout_in_seconds
       run: echo "main=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
 
+    - name: Prepare AWS Docker config
+      if: ${{ contains(inputs.container-image, '.dkr.ecr.') }}
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        mkdir -p "$RUNNER_TEMP/.docker"
+        printf '{}\n' > "$RUNNER_TEMP/.docker/config.json"
+        echo "DOCKER_CONFIG=$RUNNER_TEMP/.docker" | tee -a "$GITHUB_ENV"
+
+    - name: Login to AWS ECR
+      if: ${{ contains(inputs.container-image, '.dkr.ecr.') }}
+      uses: aws-actions/amazon-ecr-login@v2
+      env:
+        AWS_REGION: us-east-1
+
     - name: Pull container
       shell: bash -x -e -u -o pipefail {0}
       run: |

@@ -37,6 +37,7 @@ from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_
 from megatron.core.utils import (
     StragglerDetector,
     get_attr_wrapped_model,
+    get_batch_on_this_cp_rank,
     get_thd_batch_on_this_cp_rank,
 )
 from megatron.training import (
@@ -52,7 +53,6 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
@@ -127,7 +127,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
-            mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+            mtp_on_this_rank=mtp_on_this_rank(
+                layout=config.pipeline_model_parallel_layout,
+                mtp_num_layers=config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=vp_stage,
+            ),
             vp_stage=vp_stage,
             dynamic_cp=args.dynamic_context_parallel,
         )
@@ -137,14 +142,28 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
-        and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
+        and (
+            (
+                not mtp_on_this_rank(
+                    layout=config.pipeline_model_parallel_layout,
+                    mtp_num_layers=config.mtp_num_layers,
+                    ignore_virtual=False,
+                    vp_stage=vp_stage,
+                )
+            )
+        )
     ):
         return None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
         data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+        mtp_on_this_rank=mtp_on_this_rank(
+            layout=config.pipeline_model_parallel_layout,
+            mtp_num_layers=config.mtp_num_layers,
+            ignore_virtual=False,
+            vp_stage=vp_stage,
+        ),
     )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
@@ -307,7 +326,10 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     elif is_packed_sequence:
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
-        config, ignore_virtual=False, vp_stage=vp_stage
+        layout=config.pipeline_model_parallel_layout,
+        mtp_num_layers=config.mtp_num_layers,
+        ignore_virtual=False,
+        vp_stage=vp_stage,
     )
 
 

@@ -102,6 +102,7 @@ dev = [
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
+    "pydantic<2.14",
     "datasets",
     "emerging_optimizers; python_version >= '3.12'",
     "quart",
@@ -124,6 +125,7 @@ lts = [
     "wget",
     "onnxscript",
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
+    "pydantic<2.14",
     "datasets",
     "emerging_optimizers; python_version >= '3.12'",
 ]
@@ -139,7 +141,7 @@ test = [
     "pytest-random-order",
     "pytest-asyncio",
     "pygithub",
-    "pydantic",
+    "pydantic<2.14",
     "tensorboard",
     "pyyaml",
     "nemo-run",

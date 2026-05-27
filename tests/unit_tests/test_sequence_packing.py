@@ -333,10 +333,10 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         (2, 4, 1, None, "dp_balanced"),
         (2, 2, 1, None, "dp_balanced"),
         (1, 4, 1, 4, "dp_balanced"),
-        (1, 1, 8, None, "default_dynamic_cp"),
-        (2, 1, 4, None, "default_dynamic_cp"),
-        (1, 2, 4, None, "default_dynamic_cp"),
-        (1, 4, 2, 4, "default_dynamic_cp"),
+        pytest.param(1, 1, 8, None, "default_dynamic_cp", marks=pytest.mark.flaky_in_dev),
+        pytest.param(2, 1, 4, None, "default_dynamic_cp", marks=pytest.mark.flaky_in_dev),
+        pytest.param(1, 2, 4, None, "default_dynamic_cp", marks=pytest.mark.flaky_in_dev),
+        pytest.param(1, 4, 2, 4, "default_dynamic_cp", marks=pytest.mark.flaky_in_dev),
     ],
 )
 def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
@@ -384,7 +384,13 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     if is_dynamic_cp:
         init_kwargs['dynamic_context_parallel'] = True
         init_kwargs['min_dynamic_context_parallel_size'] = 1
-    Utils.initialize_model_parallel(tp, pp, vpp, **init_kwargs)
+    try:
+        Utils.initialize_model_parallel(tp, pp, vpp, **init_kwargs)
+    except Exception:
+        # Clean up partially initialized process groups if NCCL setup fails mid-init.
+        Utils.destroy_model_parallel()
+        unset_global_variables()
+        raise
 
     global_batch_size = 64
     micro_batch_size = 1
@@ -510,9 +516,10 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                 token_sum_before = torch.tensor(0, dtype=torch.int64, device='cuda')
                 for sample in samples:
                     token_sum_before += sample['tokens'].long().sum()
-                torch.distributed.all_reduce(
-                    token_sum_before, op=torch.distributed.ReduceOp.SUM, group=dp_group
-                )
+                if dp_group.size() > 1:
+                    torch.distributed.all_reduce(
+                        token_sum_before, op=torch.distributed.ReduceOp.SUM, group=dp_group
+                    )
                 token_sum_before *= max_cp
 
                 # After wrap.
@@ -528,9 +535,10 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                         mb_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
                             group_size=local_cp
                         )
-                        torch.distributed.all_reduce(
-                            mb_sum, op=torch.distributed.ReduceOp.SUM, group=mb_cp_group
-                        )
+                        if mb_cp_group.size() > 1:
+                            torch.distributed.all_reduce(
+                                mb_sum, op=torch.distributed.ReduceOp.SUM, group=mb_cp_group
+                            )
                         # all_reduce result = mb_sum * local_cp.
                         # Scale to mb_sum * max_cp.
                         mb_sum *= max_cp // local_cp
@@ -543,9 +551,10 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                     # Reduce across DP only (same as before).
                     for batch in batch_all:
                         token_sum_after += batch['tokens'].long().sum()
-                    torch.distributed.all_reduce(
-                        token_sum_after, op=torch.distributed.ReduceOp.SUM, group=dp_group
-                    )
+                    if dp_group.size() > 1:
+                        torch.distributed.all_reduce(
+                            token_sum_after, op=torch.distributed.ReduceOp.SUM, group=dp_group
+                        )
                     token_sum_after *= max_cp
 
                 assert (

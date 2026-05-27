@@ -266,12 +266,12 @@ def _normalize_cuda_graph_modules_args(args):
         args.cuda_graph_modules
     )
     validate_deprecated_cuda_graph_modules_migration_inputs(
-        deprecated_scopes,
-        args.cuda_graph_impl,
-        args.inference_cuda_graph_scope,
+        deprecated_scopes, args.cuda_graph_impl, args.inference_cuda_graph_scope
     )
     if used_full_scope:
-        warn_rank_0('full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.')
+        warn_rank_0(
+            'full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.'
+        )
 
     for scope, attr, value in deprecated_scopes:
         migration = get_deprecated_cuda_graph_modules_migration(
@@ -676,12 +676,10 @@ def validate_args(args, defaults={}):
             del args.external_cuda_graph
 
     if getattr(args, 'cuda_graph_scope_deprecated', None) is not None:
-        assert not args.cuda_graph_modules, (
-            "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
-        )
-        warn_rank_0(
-            '--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.'
-        )
+        assert (
+            not args.cuda_graph_modules
+        ), "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
+        warn_rank_0('--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.')
         args.cuda_graph_modules = args.cuda_graph_scope_deprecated
     del args.cuda_graph_scope_deprecated
 
@@ -689,10 +687,7 @@ def validate_args(args, defaults={}):
     # all subsequent validation sees fully-typed enum values.
     _normalize_cuda_graph_modules_args(args)
     _normalize_inference_cuda_graph_scope_arg(args)
-    assert (
-        args.inference_cuda_graph_scope
-        in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl]
-    ), (
+    assert args.inference_cuda_graph_scope in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl], (
         "Invalid inference CUDA graph scope "
         f"{args.inference_cuda_graph_scope.name!r} for "
         f"--cuda-graph-impl={args.cuda_graph_impl!r}."
@@ -2330,6 +2325,12 @@ def _add_inference_args(parser):
         help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.',
     )
     group.add_argument(
+        '--inference-cuda-graph-all-prefills',
+        action='store_true',
+        default=False,
+        help='Capture cuda graphs for all dynamic batching prefill steps.',
+    )
+    group.add_argument(
         '--inference-dynamic-batching-unified-memory-level',
         type=int,
         default=0,
@@ -3058,6 +3059,13 @@ def _add_regularization_args(parser):
         choices=['adam', 'lion'],
         help='Optimizer for scalar parameters (embeddings, biases, norms) '
         'when using muon. Defaults to adam.',
+    )
+    group.add_argument(
+        '--use-layer-wise-param-layout',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Use layer-wise shard-aligned DDP buffer layouts for emerging optimizers. '
+        'Disable with --no-use-layer-wise-param-layout to use the legacy layer-wise path.',
     )
     group.add_argument(
         '--lion-beta1',

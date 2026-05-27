@@ -316,8 +316,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
     "dynamic_context_parallel": False,
-    "min_dynamic_context_parallel_size": 1,
     "hybrid_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "max_seqlen_per_dp_cp_rank": None,
     "fallback_to_eager_attn": False,
     "inference_cuda_graph_scope": {
