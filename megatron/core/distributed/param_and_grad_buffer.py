@@ -200,6 +200,12 @@ class _ParamAndGradBucketGroup:
                 self.params.add(param)
 
         self.next_param_gather_bucket_group = None
+        # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
+        # points to the bucket group whose grad-reduce was dispatched immediately before mine in
+        # the backward pass. start_grad_sync drains this predecessor before dispatching its own
+        # collective, so the predecessor's intermediate all-to-all buffer is freed before the new
+        # one is allocated.
+        self.previous_grad_reduce_bucket_group = None
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
@@ -246,6 +252,10 @@ class _ParamAndGradBucketGroup:
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
+        # Per-iteration flag: True once finish_grad_sync has run this step. Lets a successor
+        # bucket group early-drain its predecessor without the end-of-step finalize loop
+        # double-waiting. Reset by `reset()`.
+        self.grad_reduce_finished = False
 
         # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
         # introduces some CPU overheads. We use these two lists to cache the created local
@@ -266,6 +276,7 @@ class _ParamAndGradBucketGroup:
             self.is_first_batch = False
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
+        self.grad_reduce_finished = False
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
@@ -556,6 +567,23 @@ class _ParamAndGradBucketGroup:
             # already been dispatched.
             return
 
+        # Drain the predecessor bucket group's reduce-scatter before allocating ours. Only
+        # linked under reduce_scatter_with_fp32_accumulation, which holds an intermediate
+        # all-to-all output tensor pinned until .wait() runs. We only drain when the
+        # predecessor has actually been dispatched this iteration (grad_reduce_handle set):
+        # backward param ordering does not always match bucket linkage order (e.g. NVFP4
+        # bucket layouts), so the predecessor may not have fired yet when we arrive here.
+        # In that case the predecessor will dispatch and drain on its own once its params
+        # become ready. The end-of-step finalize loop still catches any bucket that
+        # neither a successor nor itself drained.
+        if (
+            self.previous_grad_reduce_bucket_group is not None
+            and self.previous_grad_reduce_bucket_group.grad_reduce_handle is not None
+        ):
+            self.previous_grad_reduce_bucket_group.finish_grad_sync(
+                force_all_reduce=force_all_reduce
+            )
+
         assert (
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
@@ -701,12 +729,22 @@ class _ParamAndGradBucketGroup:
         When ddp_config.overlap_grad_reduce is set to True, waits for asynchronous
         communication call to complete. When ddp_config.overlap_grad_reduce is set to False,
         makes synchronous call.
+
+        When ddp_config.overlap_grad_reduce is set to True, this method is idempotent
+        within an iteration: a second call is a no-op. This lets a successor bucket
+        group early-drain its predecessor at dispatch time (see
+        `previous_grad_reduce_bucket_group`) while still allowing the end-of-step
+        finalize loop to call this on every bucket without double-waiting. The
+        non-overlap path preserves its original per-call dispatch+wait behaviour
+        because it has no predecessor draining.
         """
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
             self._copy_back_extra_main_grads()
+            return
+        if self.grad_reduce_finished:
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
@@ -718,6 +756,7 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.current_stream().wait_stream(self.communication_stream)
             self._copy_back_extra_main_grads()
+            self.grad_reduce_finished = True
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -727,6 +766,7 @@ class _ParamAndGradBucketGroup:
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
         self._copy_back_extra_main_grads()
+        self.grad_reduce_finished = True
 
     def free_overlap_buffers(self):
         """Free GPU buffers used by overlap param gather.
