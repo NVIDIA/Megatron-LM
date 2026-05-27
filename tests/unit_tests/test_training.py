@@ -1528,8 +1528,9 @@ def test_train_skip_iteration_and_exit_path(monkeypatch):
 
     assert iteration == 1
     assert flops == 0.0
-    assert args.consumed_train_samples == 2
-    assert args.skipped_train_samples == 2
+    expected_skipped_batch_size = 2 * args.micro_batch_size * 1
+    assert args.consumed_train_samples == expected_skipped_batch_size
+    assert args.skipped_train_samples == expected_skipped_batch_size
     assert ("dummy", "train-iter") in calls
 
 
