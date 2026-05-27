@@ -273,7 +273,7 @@ def test_maybe_save_dataloader_state_saves_only_first_pipeline_rank(tmp_path, mo
     monkeypatch.setattr(
         checkpointing_module,
         "get_checkpoint_name",
-        lambda save_dir, iteration, release=False, basename=None: str(tmp_path / (basename or f"iter_{iteration:07d}")),
+        lambda save_dir, iteration, release=False, basename=None, **kwargs: str(tmp_path / (basename or f"iter_{iteration:07d}")),
     )
     monkeypatch.setattr(
         checkpointing_module.torch.distributed,
@@ -310,7 +310,13 @@ def test_load_biencoder_checkpoint_can_load_only_query_model(tmp_path, monkeypat
     load_dir = tmp_path / "biencoder"
     load_dir.mkdir()
     Path(get_checkpoint_tracker_filename(load_dir)).write_text("5", encoding="utf-8")
-    checkpoint_name = Path(get_checkpoint_name(load_dir, 5, False, release=False))
+    # Use explicit keyword argument to avoid positional argument conflict
+    checkpoint_name = Path(get_checkpoint_name(load_dir, 5, release=False,
+                                              pipeline_parallel=False,
+                                              tensor_rank=0,
+                                              pipeline_rank=0,
+                                              expert_parallel=False,
+                                              expert_rank=0))
     checkpoint_name.parent.mkdir(parents=True)
     torch.save({"model": {"query_model": {"w": 1}, "context_model": {"w": 2}}}, checkpoint_name)
 
@@ -781,11 +787,11 @@ def test_maybe_save_dataloader_state_calls_supported_iterator(monkeypatch, tmp_p
     monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_rank", lambda: 0)
     monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_group", lambda: "dp")
     monkeypatch.setattr(checkpointing_module.torch.distributed, "barrier", lambda group=None: calls.append(("barrier", group)))
-    monkeypatch.setattr(checkpointing_module, "ensure_directory_exists", lambda path: calls.append(("mkdir", path)))
+    monkeypatch.setattr(checkpointing_module, "ensure_directory_exists", lambda filename, check_parent=True: calls.append(("mkdir", filename)))
     monkeypatch.setattr(
         checkpointing_module,
         "get_checkpoint_name",
-        lambda path, iteration, basename: str(tmp_path / basename),
+        lambda save_dir, iteration, release=False, basename=None, **kwargs: str(tmp_path / basename),
     )
     monkeypatch.setattr(checkpointing_module.torch, "save", lambda state, path: calls.append(("save", state, path)))
 
