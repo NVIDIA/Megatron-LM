@@ -365,7 +365,6 @@ class TestTransformerBlockWithProcessGroups:
                     default_param.main_grad is not None and custom_param.main_grad is not None
                 ), f"Gradient is None for parameter '{param_name}' at index {i}"
 
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
