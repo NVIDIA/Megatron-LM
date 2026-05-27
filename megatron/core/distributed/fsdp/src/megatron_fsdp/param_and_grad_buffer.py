@@ -2134,6 +2134,7 @@ class ParamAndGradBuffer:
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
+                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads",
@@ -3250,7 +3251,7 @@ class ParamAndGradBuffer:
         all_reduce_ops = []
         for g in self.parameter_groups:
             gbuf = g.main_grad_buffer
-            if gbuf is not None:
+            if gbuf is None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
             if self.ddp_config.check_for_nan_in_grad:
