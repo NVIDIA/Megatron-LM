@@ -30,6 +30,7 @@ from .package_info import (
     __version__,
 )
 from .utils import FSDPDistributedIndex
+from .v2 import FSDPModule, fully_shard
 
 __all__ = [
     "DistributedDataParallelConfig",
