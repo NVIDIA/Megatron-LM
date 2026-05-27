@@ -24,7 +24,9 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _get_non_persistent_iteration,
     _build_sharded_state_dict_metadata,
+    _get_checkpoint_format,
     _load_base_checkpoint,
+    _to_dtensor,
     _transpose_first_dim,
     checkpoint_exists,
     cleanup_old_non_persistent_checkpoint,
@@ -38,6 +40,7 @@ from megatron.training.checkpointing import (
     get_load_checkpoint_path_by_args,
     get_loaded_iteration,
     load_checkpoint,
+    load_biencoder_checkpoint,
     load_args_from_checkpoint,
     maybe_save_dataloader_state,
     read_metadata,
@@ -215,6 +218,116 @@ def test_load_base_checkpoint(
         expected_ckpt_type = CheckpointType.TORCH_DCP
 
     assert ckpt_type == expected_ckpt_type
+
+
+def test_get_checkpoint_format_detects_torch_dcp_and_fsdp(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        checkpointing_module.dist_checkpointing,
+        "check_is_distributed_checkpoint",
+        lambda path: False,
+    )
+    torch_dir = tmp_path / "torch"
+    torch_dir.mkdir()
+    (torch_dir / "mp_rank_00").mkdir()
+    dcp_dir = tmp_path / "dcp"
+    dcp_dir.mkdir()
+    (dcp_dir / ".metadata").write_text("metadata", encoding="utf-8")
+
+    assert _get_checkpoint_format(torch_dir, SimpleNamespace(use_megatron_fsdp=False)) == "torch"
+    assert _get_checkpoint_format(dcp_dir, SimpleNamespace(use_megatron_fsdp=False)) == "torch_dcp"
+    assert _get_checkpoint_format(dcp_dir, SimpleNamespace(use_megatron_fsdp=True)) == "fsdp_dtensor"
+
+    with pytest.raises(NotImplementedError, match="unknown checkpoint format"):
+        _get_checkpoint_format(tmp_path, SimpleNamespace(use_megatron_fsdp=False))
+
+
+def test_to_dtensor_preserves_extra_state_and_distributes_tensors(monkeypatch):
+    calls = []
+    tensor_api = SimpleNamespace(
+        distribute_tensor=lambda tensor, mesh: calls.append((tensor, mesh))
+        or ("dtensor", tensor, mesh)
+    )
+    monkeypatch.setattr(
+        checkpointing_module.torch.distributed,
+        "tensor",
+        tensor_api,
+        raising=False,
+    )
+
+    converted = _to_dtensor(
+        [SimpleNamespace(device_mesh="mesh")],
+        {
+            "layer.weight": torch.tensor([1.0]),
+            "layer._extra_state": {"fp8": True},
+        },
+    )
+
+    assert converted["layer.weight"][0] == "dtensor"
+    assert converted["layer.weight"][2] == "mesh"
+    assert converted["layer._extra_state"] == {"fp8": True}
+    assert len(calls) == 1
+
+
+def test_maybe_save_dataloader_state_saves_only_first_pipeline_rank(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeIterable:
+        def save_state(self):
+            calls.append("save-state")
+            return {"offset": 7}
+
+    monkeypatch.setattr(checkpointing_module.mpu, "is_pipeline_first_stage", lambda ignore_virtual=True: True)
+    monkeypatch.setattr(checkpointing_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_rank", lambda: 3)
+    monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_group", lambda: "dp")
+    monkeypatch.setattr(
+        checkpointing_module.torch.distributed,
+        "barrier",
+        lambda group=None: calls.append(("barrier", group)),
+    )
+    monkeypatch.setattr(
+        checkpointing_module.torch,
+        "save",
+        lambda state, path: calls.append(("save", state, Path(path).name)),
+    )
+
+    maybe_save_dataloader_state(SimpleNamespace(iterable=FakeIterable()), 12, tmp_path)
+
+    assert "save-state" in calls
+    assert ("barrier", "dp") in calls
+    assert any(call[0] == "save" and call[1]["dataloader_state_dict"] == {"offset": 7} for call in calls)
+    assert any(call[0] == "save" and "train_dataloader_dprank003.pt" in call[2] for call in calls)
+
+
+def test_maybe_save_dataloader_state_rejects_unsupported_iterator(tmp_path):
+    with pytest.raises(RuntimeError, match="Could not find a save_state"):
+        maybe_save_dataloader_state(SimpleNamespace(iterable=SimpleNamespace()), 1, tmp_path)
+
+
+def test_load_biencoder_checkpoint_can_load_only_query_model(tmp_path, monkeypatch):
+    load_dir = tmp_path / "biencoder"
+    load_dir.mkdir()
+    Path(get_checkpoint_tracker_filename(load_dir)).write_text("5", encoding="utf-8")
+    checkpoint_name = Path(get_checkpoint_name(load_dir, 5, False, release=False))
+    checkpoint_name.parent.mkdir(parents=True)
+    torch.save({"model": {"query_model": {"w": 1}, "context_model": {"w": 2}}}, checkpoint_name)
+
+    loaded = []
+    fake_model = SimpleNamespace(load_state_dict=lambda state: loaded.append(state))
+    monkeypatch.setattr(
+        checkpointing_module,
+        "get_args",
+        lambda: SimpleNamespace(load=load_dir, use_distributed_optimizer=False),
+    )
+    monkeypatch.setattr(checkpointing_module, "unwrap_model", lambda model: model)
+    monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(checkpointing_module.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(checkpointing_module.torch.distributed, "barrier", lambda: None)
+
+    result = load_biencoder_checkpoint([fake_model], only_query_model=True)
+
+    assert result == [fake_model]
+    assert loaded == [{"query_model": {"w": 1}}]
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])

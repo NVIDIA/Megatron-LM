@@ -252,6 +252,116 @@ def test_validate_args_updates_deprecated_cuda_graph_flag(monkeypatch):
     assert not hasattr(args, "enable_cuda_graph")
 
 
+def test_validate_args_resolves_rl_parallel_generation_alias(monkeypatch):
+    _patch_validate_environment(monkeypatch)
+    args = _parse_minimal_training_args(monkeypatch, ["--global-batch-size", "6"])
+    args.perform_rl_step = True
+    args.grpo_group_size = 3
+    args.grpo_prompts_per_step = 2
+    args.grpo_iterations = 1
+    args.rl_parallel_generation_tasks = 2
+    args.rl_num_parallel_generations = None
+    args.rl_num_parallel_generation_batches = None
+    args.rl_generation_batch_size = None
+    args.rl_partial_rollouts = True
+    args.rl_use_sequence_packing = False
+
+    arguments.validate_args(args)
+
+    assert args.rl_num_parallel_generations == 6
+    assert args.rl_parallel_generation_tasks == 2
+    assert args.rl_generation_batch_size == 1
+    assert args.grpo_samples_per_iteration == 6
+    assert not args.rl_enforce_generation_order
+
+
+def test_validate_args_resolves_rl_generation_batches(monkeypatch):
+    _patch_validate_environment(monkeypatch)
+    args = _parse_minimal_training_args(monkeypatch, ["--global-batch-size", "4"])
+    args.perform_rl_step = True
+    args.grpo_group_size = 2
+    args.grpo_prompts_per_step = 2
+    args.grpo_iterations = 1
+    args.rl_parallel_generation_tasks = None
+    args.rl_num_parallel_generations = None
+    args.rl_num_parallel_generation_batches = 2
+    args.rl_generation_batch_size = None
+    args.rl_partial_rollouts = True
+    args.rl_use_sequence_packing = False
+
+    arguments.validate_args(args)
+
+    assert args.rl_generation_batch_size == 2
+    assert args.rl_parallel_generation_tasks == 4
+    assert args.rl_enforce_generation_order
+    assert args.grpo_samples_per_iteration == 4
+
+
+def test_validate_args_moe_deprecated_and_tokenizer_paths(monkeypatch):
+    _patch_validate_environment(monkeypatch)
+    args = _parse_minimal_training_args(monkeypatch)
+    args.num_experts = 2
+    args.moe_ffn_hidden_size = None
+    args.moe_router_load_balancing_type = ["aux_loss"]
+    args.moe_aux_loss_coeff = [0.1]
+    args.no_weight_decay_cond_type = "apply_wd_to_qk_layernorm"
+    args.apply_wd_to_qk_layernorm = False
+    args.tiktoken_special_tokens = {"<extra>": 1}
+    args.tokenizer_special_tokens = None
+    args.tokenizer_hf_use_fast = True
+    args.tokenizer_hf_include_special_tokens = True
+
+    arguments.validate_args(args)
+
+    assert args.moe_ffn_hidden_size == args.ffn_hidden_size
+    assert args.moe_router_load_balancing_type == "aux_loss"
+    assert args.moe_aux_loss_coeff == 0.1
+    assert args.apply_wd_to_qk_layernorm
+    assert args.no_weight_decay_cond_type is None
+    assert args.tokenizer_special_tokens == {"<extra>": 1}
+
+
+def test_validate_args_skip_train_and_async_save_paths(monkeypatch):
+    _patch_validate_environment(monkeypatch)
+    args = _parse_minimal_training_args(monkeypatch, ["--ckpt-format", "torch_dist"])
+    args.skip_train = True
+    args.perform_rl_step = False
+    args.no_load_optim = False
+    args.async_save = True
+    args.use_persistent_ckpt_worker = False
+
+    arguments.validate_args(args)
+
+    assert args.no_load_optim
+    assert not args.async_save
+
+
+def test_validate_args_dtype_and_precision_guard_paths(monkeypatch):
+    _patch_validate_environment(monkeypatch)
+    args = _parse_minimal_training_args(monkeypatch)
+    args.sequence_parallel = True
+    args.tensor_model_parallel_size = 1
+    args.main_params_dtype = "bf16"
+    args.exp_avg_dtype = "fp32"
+    args.exp_avg_sq_dtype = "fp16"
+    args.mamba_inference_conv_states_dtype = "auto"
+    args.mamba_inference_ssm_states_dtype = None
+    args.grad_reduce_in_bf16 = True
+    args.add_bias_linear = False
+    args.add_qkv_bias = False
+    args.bias_gelu_fusion = True
+
+    arguments.validate_args(args)
+
+    assert args.sequence_parallel is False
+    assert args.main_params_dtype is torch.bfloat16
+    assert args.exp_avg_dtype is torch.float32
+    assert args.exp_avg_sq_dtype is torch.float16
+    assert args.mamba_inference_conv_states_dtype is None
+    assert args.accumulate_allreduce_grads_in_fp32 is False
+    assert args.bias_gelu_fusion is False
+
+
 def test_validate_model_config_args_from_heterogeneous_config_accepts_matching_args():
     config = {
         "hidden_act": "silu",

@@ -1,9 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from types import SimpleNamespace
+import dataclasses
 
 import pytest
 import yaml
+import torch
 
 from megatron.training import yaml_arguments
 
@@ -137,3 +139,113 @@ def test_validate_yaml_basic_iteration_config(monkeypatch):
     assert args.language_model.kv_channels == 4
     assert args.accumulate_allreduce_grads_in_fp32
     assert validated.num_experts is None
+
+
+@dataclasses.dataclass
+class _TinyYamlConfig:
+    hidden_size: int = 0
+    num_attention_heads: int = 0
+    params_dtype: object = None
+    overlap_p2p_comm: bool = False
+    activation_func: object = None
+    init_method: object = None
+    embedding_init_method: object = None
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def _yaml_config_args(activation_func="gelu", **language_overrides):
+    language_model = SimpleNamespace(
+        hidden_size=16,
+        num_attention_heads=4,
+        params_dtype=torch.bfloat16,
+        overlap_p2p_comm=False,
+        activation_func=activation_func,
+        bias_swiglu_fusion=True,
+        add_bias_linear=False,
+        bias_activation_fusion=True,
+        init_method="xavier_uniform",
+        embedding_init_method="xavier_uniform",
+        multi_latent_attention=False,
+    )
+    for key, value in language_overrides.items():
+        setattr(language_model, key, value)
+    return SimpleNamespace(
+        language_model=language_model,
+        model_parallel=SimpleNamespace(
+            params_dtype=torch.bfloat16,
+            overlap_p2p_comm=False,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("activation", "expected_func", "expected_gated", "expected_bias_fusion"),
+    [
+        ("swiglu", torch.nn.functional.silu, True, True),
+        ("gelu", torch.nn.functional.gelu, False, True),
+    ],
+)
+def test_core_transformer_config_from_yaml_activation_paths(
+    monkeypatch, activation, expected_func, expected_gated, expected_bias_fusion
+):
+    monkeypatch.setattr(yaml_arguments, "TransformerConfig", _TinyYamlConfig)
+
+    config = yaml_arguments.core_transformer_config_from_yaml(_yaml_config_args(activation))
+
+    assert config.kwargs["pipeline_dtype"] is torch.bfloat16
+    assert config.kwargs["batch_p2p_comm"] is True
+    assert config.kwargs["deallocate_pipeline_outputs"] is True
+    assert config.kwargs["activation_func"] is expected_func
+    assert config.kwargs.get("gated_linear_unit", False) is expected_gated
+    assert config.kwargs["bias_activation_fusion"] is expected_bias_fusion
+    assert config.kwargs["init_method"] is torch.nn.init.xavier_uniform_
+    assert config.kwargs["embedding_init_method"] is torch.nn.init.xavier_uniform_
+
+
+def test_core_transformer_config_from_yaml_squared_relu_and_mla(monkeypatch):
+    monkeypatch.setattr(yaml_arguments, "TransformerConfig", _TinyYamlConfig)
+    monkeypatch.setattr(yaml_arguments, "MLATransformerConfig", _TinyYamlConfig)
+
+    config = yaml_arguments.core_transformer_config_from_yaml(
+        _yaml_config_args("squaredrelu", multi_latent_attention=True)
+    )
+
+    assert config.kwargs["activation_func"](torch.tensor([-2.0, 3.0])).tolist() == [0.0, 9.0]
+
+
+def test_core_transformer_config_from_yaml_rejects_unknown_activation(monkeypatch):
+    monkeypatch.setattr(yaml_arguments, "TransformerConfig", _TinyYamlConfig)
+
+    with pytest.raises(AssertionError, match="not a supported activation"):
+        yaml_arguments.core_transformer_config_from_yaml(_yaml_config_args("relu"))
+
+
+@dataclasses.dataclass
+class _RequiredYamlFields:
+    hidden_size: int
+    params_dtype: object
+
+
+def test_core_config_from_args_collects_required_fields_and_reports_missing():
+    args = SimpleNamespace(hidden_size=16, params_dtype=torch.float32)
+
+    assert yaml_arguments.core_config_from_args(args, _RequiredYamlFields) == {
+        "hidden_size": 16,
+        "params_dtype": torch.float32,
+    }
+
+    with pytest.raises(Exception, match="Missing argument params_dtype"):
+        yaml_arguments.core_config_from_args(SimpleNamespace(hidden_size=16), _RequiredYamlFields)
+
+
+def test_print_args_only_prints_on_rank_zero(capsys):
+    yaml_arguments._print_args("yaml", SimpleNamespace(rank=0, beta=2, alpha=1))
+    output = capsys.readouterr().out
+    assert "yaml" in output
+    assert "alpha" in output
+    assert "beta" in output
+
+    yaml_arguments._print_args("hidden", SimpleNamespace(rank=1, value=3))
+    assert capsys.readouterr().out == ""

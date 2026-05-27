@@ -16,6 +16,7 @@ from megatron.training.training import (
     build_train_valid_test_data_iterators,
     checkpoint_and_decide_exit,
     compute_throughputs_and_append_to_progress_log,
+    destroy_global_state,
     evaluate,
     evaluate_and_print_results,
     get_model,
@@ -29,6 +30,7 @@ from megatron.training.training import (
     pretrain,
     preprocess_common_state_dict,
     save_checkpoint_and_time,
+    set_startup_timestamps,
     should_disable_forward_pre_hook,
     setup_model_and_optimizer,
     train,
@@ -157,6 +159,43 @@ def test_num_floating_point_operations_validates_attention_patterns():
             ),
             1,
         )
+
+
+def test_startup_timestamp_and_datetime_helpers(monkeypatch):
+    calls = []
+    monkeypatch.setattr(training, "_TRAIN_START_TIME", training._TRAIN_START_TIME)
+    monkeypatch.setattr(training, "_STARTUP_TIMESTAMPS", dict(training._STARTUP_TIMESTAMPS))
+    monkeypatch.setattr(training.torch.distributed, "barrier", lambda: calls.append("barrier"))
+    monkeypatch.setattr(training, "print_rank_0", lambda message: calls.append(("print", message)))
+
+    set_startup_timestamps(program_start=10.0, main_entry=11.0)
+    training.print_datetime("fixed", override_timestamp=0)
+
+    assert training._STARTUP_TIMESTAMPS["program_start"] == 10.0
+    assert training._STARTUP_TIMESTAMPS["main_entry"] == 11.0
+    assert "barrier" in calls
+    assert any("fixed" in item[1] and "1970" in item[1] for item in calls if isinstance(item, tuple))
+
+
+def test_destroy_global_state_delegates_to_subsystems(monkeypatch):
+    calls = []
+    monkeypatch.setattr(training, "destroy_global_vars", lambda: calls.append("global-vars"))
+    monkeypatch.setattr(training, "destroy_num_microbatches_calculator", lambda: calls.append("microbatches"))
+    monkeypatch.setattr(training, "destroy_global_memory_buffer", lambda: calls.append("memory-buffer"))
+    monkeypatch.setattr(training.SymmetricMemoryManager, "destroy", lambda: calls.append("symmetric-memory"))
+    monkeypatch.setattr(training, "destroy_model_parallel", lambda: calls.append("model-parallel"))
+    monkeypatch.setattr(training, "destroy_rerun_state_machine", lambda: calls.append("rerun"))
+
+    destroy_global_state()
+
+    assert calls == [
+        "global-vars",
+        "microbatches",
+        "memory-buffer",
+        "symmetric-memory",
+        "model-parallel",
+        "rerun",
+    ]
 
 
 def test_get_start_time_from_progress_log_handles_async_and_world_size_reset(monkeypatch, tmp_path):
