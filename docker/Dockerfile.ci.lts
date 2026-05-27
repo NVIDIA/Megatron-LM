@@ -7,12 +7,8 @@
 # floating dev tag. Its Python dependency set is therefore pinned directly in
 # this Dockerfile (rather than in pyproject.toml) so the pyproject can host
 # meaningful module-level extras (inference, RL, MoE, ...) without colliding
-# with the LTS pin set. See AUT-479 for background.
+# with the LTS pin set.
 #
-# To bump the LTS dependency set:
-#   1. Update the LTS_REQUIREMENTS list below.
-#   2. Rebuild and run the LTS CI lane.
-#   3. (Optional) Bump docker/.ngc_version.lts if also moving the base image.
 
 ARG FROM_IMAGE_NAME
 FROM ${FROM_IMAGE_NAME} as main
@@ -75,24 +71,13 @@ EOF
 # LTS-specific Python dependencies.
 #
 # These used to live in `[project.optional-dependencies].lts` in pyproject.toml,
-# but were moved here (AUT-479) so pyproject.toml can host meaningful per-module
-# extras. Pins are reviewed at LTS bump time only.
+# but were moved out so pyproject.toml can host meaningful per-module
+# extras. The pinned set lives in `docker/lts/requirements.txt` and is reviewed
+# at LTS bump time only.
+COPY docker/lts/requirements.txt /workspace/docker/lts/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
-    uv pip install \
-        "tqdm" \
-        "einops~=0.8" \
-        "tensorstore~=0.1,!=0.1.46,!=0.1.72" \
-        "multi-storage-client~=0.27" \
-        "opentelemetry-api~=1.33.1" \
-        "megatron-energon[av_decode]~=6.0" \
-        "av" \
-        "flashinfer-python>=0.5.0,<0.7.0" \
-        "wget" \
-        "onnxscript" \
-        "fastapi~=0.50" \
-        "datasets" \
-        "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0"
+    uv pip install -r /workspace/docker/lts/requirements.txt
 EOF
 
 # Install DeepEP

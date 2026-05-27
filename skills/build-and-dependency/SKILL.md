@@ -35,13 +35,13 @@ Two image variants exist, each with its own Dockerfile, selected by the
 | Variant | Base image pin | Dockerfile | Where deps live | When used |
 |---------|---------------|------------|-----------------|-----------|
 | **`dev`** | `docker/.ngc_version.dev` | `docker/Dockerfile.ci.dev` | `pyproject.toml` `dev` extra (uv-resolved) | Default — CI, local development, most PRs |
-| **`lts`** | `docker/.ngc_version.lts` | `docker/Dockerfile.ci.lts` | Inline `uv pip install` list at the top of `Dockerfile.ci.lts` | Stability testing; excludes ModelOpt and other bleeding-edge extras |
+| **`lts`** | `docker/.ngc_version.lts` | `docker/Dockerfile.ci.lts` | `docker/lts/requirements.txt` (pinned, sourced from main's `uv.lock` at AUT-479) | Stability testing; excludes ModelOpt and other bleeding-edge extras |
 
 > LTS deps used to live in `[project.optional-dependencies].lts` in
-> `pyproject.toml`. They were moved into `Dockerfile.ci.lts` so
+> `pyproject.toml`. They were moved into `docker/lts/requirements.txt` so
 > `pyproject.toml` can host meaningful module-level extras without colliding
-> with the LTS pin set. To bump an LTS dependency, edit the `uv pip install`
-> block in `docker/Dockerfile.ci.lts`.
+> with the LTS pin set. To bump an LTS dependency, edit the version in
+> `docker/lts/requirements.txt` and rebuild `docker/Dockerfile.ci.lts`.
 
 **Use `dev` for everything unless you have a specific reason to test `lts`.**
 CI runs `dev` by default; attach `container::lts` to a PR only when verifying
@@ -156,7 +156,7 @@ inside the container (already on `PATH`).
 | `build` | Cython, pybind11, nvidia-mathdx |
 
 > The previous `lts` extra has been emptied. LTS deps are pinned in
-> `docker/Dockerfile.ci.lts` rather than `pyproject.toml`. Do not add new
+> `docker/lts/requirements.txt` rather than `pyproject.toml`. Do not add new
 > packages under `[project.optional-dependencies].lts`.
 
 Install commands (inside the container):
@@ -171,7 +171,8 @@ uv sync --locked --only-group linting
 
 The LTS environment is reproduced by building `docker/Dockerfile.ci.lts`
 end-to-end; there is no `uv sync`-only equivalent because the LTS deps no
-longer live in `pyproject.toml`.
+longer live in `pyproject.toml`. The LTS top-level pin set is in
+`docker/lts/requirements.txt`; bump versions there and rebuild the image.
 
 Several dependencies are sourced directly from git (TransformerEngine, nemo-run,
 FlashMLA, Emerging-Optimizers, nvidia-resiliency-ext). The locked `uv.lock` file
