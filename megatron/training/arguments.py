@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -1100,6 +1100,22 @@ def validate_args(args, defaults={}):
                 '--reuse-grad-buf-for-mxfp8-param-ag: the bf16 staging buffer '
                 'for the MXFP8 param all-gather is the idle grad buffer; the '
                 'two features must be co-enabled.'
+            )
+
+        # Only MXFP8 is supported by the LayerWise FP8 param-gather path
+        # today; the bf16-staging + post-AG quantize round-trip is wired up
+        # exclusively for MXFP8's ``_rowwise_data`` / ``_columnwise_data``
+        # storage. Block other FP8 recipes (e.g. blockwise) explicitly so
+        # the configuration fails fast instead of silently using stale
+        # storage at all-gather time.
+        if will_use_layer_wise_distributed_optimizer and args.fp8_recipe != 'mxfp8':
+            raise AssertionError(
+                f'--fp8-param-gather with --fp8-recipe={args.fp8_recipe} is not '
+                'supported by the layer-wise distributed optimizer '
+                '(auto-selected for non-adam/sgd optimizers when '
+                '--use-distributed-optimizer is set); only --fp8-recipe=mxfp8 '
+                'is supported. Disable --fp8-param-gather or switch to '
+                '--fp8-recipe=mxfp8.'
             )
 
     # FP4 and FP8 are mutually exclusive

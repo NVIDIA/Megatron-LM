@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron optimizer."""
 
@@ -1363,6 +1363,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def _disable_deferred_mxfp8_param_sync(self) -> None:
         """Disable deferred DistOpt param sync."""
+
         def iter_optimizers(optimizer):
             yield optimizer
             for child in getattr(optimizer, 'chained_optimizers', []):

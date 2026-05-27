@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron distributed optimizer."""
 
@@ -3016,7 +3016,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if len(distopt_buckets) == len(bucket_group.buckets):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
                 else:
-                    distopt_bucket_group = type(a ra m)(
+                    distopt_bucket_group = type(bucket_group)(
                         distopt_buckets,
                         bucket_group.ddp_config,
                         bucket_group.intra_distributed_optimizer_instance_group,

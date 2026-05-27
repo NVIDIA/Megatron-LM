@@ -19,10 +19,10 @@ perturbing numerics relative to OFF — which is the bug class addressed by
 ``_restore_high_precision_init_val`` in ``layer_wise_optimizer.py``.
 """
 
+import copy
 import gc
 import os
 import sys
-import copy
 
 import pytest
 import torch
@@ -35,7 +35,6 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
-from megatron.training.utils import get_device_arch_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -44,6 +43,7 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import setup_model_and_optimizer
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.a2a_overlap.utils import deterministic_mode
 from tests.unit_tests.test_utilities import Utils
 
@@ -143,9 +143,7 @@ def _snapshot_optimizer_states(model, optimizer):
 
 def _snapshot_initial_state(model, optimizer):
     return {
-        'model_params': {
-            name: param.detach().clone() for name, param in model.named_parameters()
-        },
+        'model_params': {name: param.detach().clone() for name, param in model.named_parameters()},
         'masters': _snapshot_masters(model),
         'optimizer_states': _snapshot_optimizer_states(model, optimizer),
     }
@@ -236,7 +234,7 @@ class TestMuonMXFP8FP8ParamGather:
             vp_stage=config_kwargs.get("vp_stage"),
         )
 
-    def _create_args(self, fp8_param_gather):
+    def _create_args(self, fp8_param_gather, fp8_recipe="mxfp8"):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         sys.argv = ['test_muon_mxfp8_fp8_param_gather.py']
@@ -280,11 +278,14 @@ class TestMuonMXFP8FP8ParamGather:
         # ``_post_param_sync`` in ``param_and_grad_buffer.py``).
         args.overlap_param_gather = False
         args.overlap_grad_reduce = False
-        # MXFP8 + fp8_param_gather config.
+        # FP8 + fp8_param_gather config. Only ``mxfp8`` is wired through the
+        # LayerWise bf16-staging + post-AG quantize round-trip; other recipes
+        # are blocked by ``arguments.py`` and the parametrized test skips
+        # them explicitly.
         args.fp8 = "e4m3"
-        args.fp8_recipe = "mxfp8"
+        args.fp8_recipe = fp8_recipe
         args.fp8_param_gather = fp8_param_gather
-        if fp8_param_gather:
+        if fp8_param_gather and fp8_recipe == "mxfp8":
             args.reuse_grad_buf_for_mxfp8_param_ag = True
         args.ddp_bucket_size = 1024
         validate_args(args)
@@ -304,8 +305,8 @@ class TestMuonMXFP8FP8ParamGather:
         loss_mask = torch.ones(self.seq_length).repeat((self.micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def _build_model_and_optimizer(self, fp8_param_gather):
-        args = self._create_args(fp8_param_gather=fp8_param_gather)
+    def _build_model_and_optimizer(self, fp8_param_gather, fp8_recipe="mxfp8"):
+        args = self._create_args(fp8_param_gather=fp8_param_gather, fp8_recipe=fp8_recipe)
         set_args(args)
         torch.manual_seed(_SEED)
 
@@ -363,6 +364,7 @@ class TestMuonMXFP8FP8ParamGather:
 
         return losses, outputs, grads_per_step, masters_per_step, params_per_step
 
+    @pytest.mark.parametrize("fp8_recipe", ["mxfp8", "blockwise"])
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 requires Blackwell architecture or newer"
     )
@@ -370,19 +372,29 @@ class TestMuonMXFP8FP8ParamGather:
     @pytest.mark.skipif(
         not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required for MXFP8"
     )
-    def test_on_vs_off_bitwise_identical(self):
+    def test_on_vs_off_bitwise_identical(self, fp8_recipe):
         """fp8_param_gather=ON must produce bitwise-identical loss, forward
         output, per-parameter gradient, and per-parameter fp32 master vs
-        fp8_param_gather=OFF for muon + mxfp8 over multiple training steps."""
+        fp8_param_gather=OFF for muon + mxfp8 over multiple training steps.
+
+        Only mxfp8 is wired up for the LayerWise FP8 param-gather path;
+        other recipes (e.g. blockwise) are blocked by ``arguments.py`` and
+        skipped here so the test surface reflects what is supported.
+        """
+        if fp8_recipe != "mxfp8":
+            pytest.skip(
+                f"--fp8-recipe={fp8_recipe} is not supported with the LayerWise "
+                "FP8 param-gather path; only mxfp8 is wired up."
+            )
         num_steps = 5
 
         with deterministic_mode():
             off_args, off_model, off_optimizer = self._build_model_and_optimizer(
-                fp8_param_gather=False
+                fp8_param_gather=False, fp8_recipe=fp8_recipe
             )
             initial_state = _snapshot_initial_state(off_model[0], off_optimizer)
             on_args, on_model, on_optimizer = self._build_model_and_optimizer(
-                fp8_param_gather=True
+                fp8_param_gather=True, fp8_recipe=fp8_recipe
             )
             _restore_initial_state(on_model[0], on_optimizer, initial_state)
 
@@ -394,13 +406,11 @@ class TestMuonMXFP8FP8ParamGather:
                 on_step = self._run_steps(on_args, on_model, on_optimizer, 1)
 
                 for dst, src in zip(
-                    (losses_off, outputs_off, grads_off, masters_off, params_off),
-                    off_step,
+                    (losses_off, outputs_off, grads_off, masters_off, params_off), off_step
                 ):
                     dst.extend(src)
                 for dst, src in zip(
-                    (losses_on, outputs_on, grads_on, masters_on, params_on),
-                    on_step,
+                    (losses_on, outputs_on, grads_on, masters_on, params_on), on_step
                 ):
                     dst.extend(src)
 
@@ -411,15 +421,9 @@ class TestMuonMXFP8FP8ParamGather:
         assert len(losses_on) == len(losses_off) == num_steps
 
         for step in range(num_steps):
+            _assert_tensor_equal(losses_on[step], losses_off[step], f"loss mismatch at step {step}")
             _assert_tensor_equal(
-                losses_on[step],
-                losses_off[step],
-                f"loss mismatch at step {step}",
-            )
-            _assert_tensor_equal(
-                outputs_on[step],
-                outputs_off[step],
-                f"output mismatch at step {step}",
+                outputs_on[step], outputs_off[step], f"output mismatch at step {step}"
             )
 
             assert set(grads_on[step].keys()) == set(grads_off[step].keys()), (

@@ -47,10 +47,10 @@ def _skip_mxfp8_in_copy_main_to_model(inner_opt: 'Float16OptimizerWithFloat16Par
     ``inner_config.reuse_grad_buf_for_mxfp8_param_ag=False``) would do
     ``model.data.copy_(main.data fp32)`` for each MXFP8 model param, triggering
     ``QuantizedTensor.__torch_dispatch__`` ⇒ ``dst.quantize_(fp32)`` — a wasted
-    second quantization that the post-AG ``quantize_(bf16)`` later overwrites,
-    but which empirically perturbed muon convergence (~0.27 nats lag by iter 10
-    on the 100-iter OCI-HSG test). Standard ``DistributedOptimizer`` avoids
-    this by branching to ``_copy_main_params_to_param_buffer`` in its
+    second quantization that the post-AG ``quantize_(bf16)`` later overwrites
+    — and which perturbs muon convergence relative to the
+    ``fp8_param_gather=False`` baseline. Standard ``DistributedOptimizer``
+    avoids this by branching to ``_copy_main_params_to_param_buffer`` in its
     ``reuse_grad_buf`` step path and never invoking the model-copy at all on
     MXFP8 params. This patch matches that behavior for the LayerWise inner.
 
@@ -509,12 +509,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # model params (which would otherwise trigger an extra
                 # ``QuantizedTensor.__torch_dispatch__`` ⇒ ``dst.quantize_(fp32)``
                 # that then gets overwritten by the post-AG ``quantize_(bf16)``).
-                # The wasted double-quantization left a small mismatch between
-                # ON and OFF on muon experiments (~0.27 nats by iter 10 that
-                # shrank but didn't vanish by iter 100); distopt's flow avoids
-                # this by routing through ``_copy_main_params_to_param_buffer``
-                # in the ``reuse_grad_buf`` branch and never touching MXFP8
-                # storage at the inner step. Replicate that exactly here.
+                # The wasted double-quantization perturbs muon convergence
+                # vs the ``fp8_param_gather=False`` baseline. distopt's flow
+                # avoids this by routing through
+                # ``_copy_main_params_to_param_buffer`` in the
+                # ``reuse_grad_buf`` branch and never touching MXFP8 storage
+                # at the inner step. Replicate that exactly here.
                 if config.reuse_grad_buf_for_mxfp8_param_ag:
                     _skip_mxfp8_in_copy_main_to_model(inner_opt)
                 # Mirror DistributedOptimizer's master-init fix-up: when the
@@ -526,11 +526,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # CPU via ``_high_precision_init_val``; DistOpt reads them back
                 # at master construction (see ``distrib_optimizer.py`` lines
                 # 405-416). Without this, ON masters disagree with OFF masters
-                # by ~FP8 precision, the subsequent bf16⇒MXFP8 round-trip
-                # amplifies the residual, and muon's NS step produces slightly
-                # different updates each iter — observed as a small loss lag
-                # vs the fp8_param_gather=False baseline that doesn't fully
-                # close even by iter 100.
+                # by ~FP8 precision and muon's NS step diverges from the
+                # ``fp8_param_gather=False`` baseline.
                 _restore_high_precision_init_val(inner_opt)
                 optimizers[i] = inner_opt
 
@@ -873,9 +870,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         refresh deterministic for muon's LayerWise path regardless of what TE
         toggled during the previous fwd/bwd. Without this, a stale
         ``columnwise_data`` survives across iterations and the next bwd's
-        dgrad GEMM uses out-of-date weights, producing a slow loss-curve
-        divergence vs the ``fp8_param_gather=False`` baseline (observed
-        ~0.27 nats lag by iter 10 that doesn't fully close by iter 100).
+        dgrad GEMM uses out-of-date weights, producing a loss-curve
+        divergence vs the ``fp8_param_gather=False`` baseline.
         """
         for param in bucket.params:
             if not is_mxfp8tensor(param):
