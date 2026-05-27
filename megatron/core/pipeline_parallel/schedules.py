@@ -325,10 +325,11 @@ def forward_step_calc_loss(
             DSAIndexerLossAutoScaler,
         )
 
+        device = get_tensor_device(output_tensor)
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device)
         )
         if config.calculate_per_token_loss:
             DSAIndexerLossAutoScaler.set_loss_scale(loss_scale)

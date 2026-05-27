@@ -117,6 +117,37 @@ def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
     assert DSAIndexerLossAutoScaler.main_loss_backward_scale == expected_scale
 
 
+def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+
+    config = SimpleNamespace(
+        calculate_per_token_loss=True,
+        experimental_attention_variant='dsa',
+        grad_scale_func=lambda tensor: tensor * 5.0,
+        num_moe_experts=None,
+        mtp_num_layers=None,
+        timers=None,
+    )
+
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor={'loss': torch.tensor(8.0)},
+        loss_func=None,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=[],
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    assert DSAIndexerLossAutoScaler.main_loss_backward_scale == 5.0
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize(
