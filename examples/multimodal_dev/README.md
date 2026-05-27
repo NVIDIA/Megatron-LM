@@ -34,6 +34,66 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
     ... # other Megatron args (--num-layers, --hidden-size, etc.)
 ```
 
+## Checkpoint Conversion (HF → Megatron-FSDP DTensor)
+
+Convert a HuggingFace release to a Megatron-FSDP DTensor checkpoint via
+[Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) before
+pretraining from pretrained weights.
+
+### Setup
+
+Clone Bridge and pin its `3rdparty/Megatron-LM` submodule to this branch:
+
+```bash
+git clone --recurse-submodules https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+cd Megatron-Bridge/3rdparty/Megatron-LM
+git remote add wplf https://github.com/wplf/Megatron-LM.git
+git fetch wplf feat/qwen35-vl-example
+git checkout feat/qwen35-vl-example
+cd ../..
+```
+
+### Convert
+
+Single 8×GPU node, EP=8 / TP=CP=1; substitute any Qwen3.5 variant for
+`--hf-model`:
+
+```bash
+PYTHONPATH=./src:./3rdparty/Megatron-LM/ \
+  torchrun --nproc_per_node=8 \
+  examples/conversion/mfsdp/convert_checkpoints_fsdp.py import \
+  --hf-model Qwen/Qwen3.5-35B-A3B \
+  --megatron-path ${WORKSPACE}/models/Qwen/Qwen3.5-35B-A3B-fsdp \
+  --ckpt-format fsdp_dtensor \
+  --ep 8
+```
+
+HF weights are auto-fetched on first run via `huggingface_hub`. Adjust
+`--tp` / `--cp` / `--ep` to match the training topology (must satisfy
+`WORLD_SIZE % (TP*CP*EP) == 0`).
+
+### Output
+
+```
+${WORKSPACE}/models/Qwen/Qwen3.5-35B-A3B-fsdp/
+├── iter_0000000/
+│   ├── __0_0.distcp .. __7_0.distcp   # FSDP DTensor shards, one per rank (~18 GB each for 35B-A3B)
+│   ├── .metadata
+│   ├── run_config.yaml
+│   └── train_state.pt
+├── latest_checkpointed_iteration.txt
+└── latest_train_state.pt
+```
+
+### Bridge dependency
+
+Requires
+[NVIDIA-NeMo/Megatron-Bridge#3987](https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/3987)
+(skip tokenizer save). Without that fix the checkpoint is still written
+correctly but the script exits non-zero after save with
+`AttributeError: 'TokenizerConfig' object has no attribute 'make_vocab_size_divisible_by'`
+against this branch's `megatron.core.tokenizers.utils.build_tokenizer`.
+
 ## Architecture
 
 `pretrain_multimodal.py` is **model-agnostic**. All model-specific logic
