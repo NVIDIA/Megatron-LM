@@ -26,7 +26,7 @@ import sys
 
 import pytest
 import torch
-from transformer_engine.pytorch.fp8 import check_fp8_support
+from transformer_engine.pytorch.fp8 import check_fp8_support, check_mxfp8_support
 
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -49,6 +49,7 @@ from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
 fp8_available, reason_for_no_fp8 = check_fp8_support()
+mxfp8_available, reason_for_no_mxfp8 = check_mxfp8_support()
 
 
 def _clone_optimizer_state_value(value):
@@ -365,6 +366,7 @@ class TestMuonMXFP8FP8ParamGather:
         return losses, outputs, grads_per_step, masters_per_step, params_per_step
 
     @pytest.mark.parametrize("fp8_recipe", ["mxfp8", "blockwise"])
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 requires Blackwell architecture or newer"
     )
