@@ -7,10 +7,10 @@
 | File | Role in overlap |
 |---|---|
 | `fully_shard.py` | Public `fully_shard()` API and allocator selection |
-| `fsdp_module.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, `unshard()`, `reshard()`, `reduce_grad()` |
+| `fsdp_module.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, `unshard()`, `reshard()`, `reduce_scatter_grad()` |
 | `hooks.py` | Forward/backward hook registration and final callback |
-| `param_group.py` | `ParameterGroup.unshard(async_op)`, `reduce_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
-| `dp_buffer.py` | `DataParallelBuffer.unshard(async_op)` (all-gather + `p.data` rebind), `reduce_grad()` (reduce-scatter + shard accumulation) |
+| `param_group.py` | `ParameterGroup.unshard(async_op)`, `reduce_scatter_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
+| `dp_buffer.py` | `DataParallelBuffer.unshard(async_op)` (all-gather + `p.data` rebind), `reduce_scatter_grad()` (reduce-scatter + shard accumulation) |
 | `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
 | `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
 
@@ -46,8 +46,8 @@ class _FSDPRootContext:
     # module_id -> Event: signals when that module's all-gather is complete.
     # None means "not yet launched" or "already consumed by a wait".
 
-    # --- Reduce-grad overlap tracking ---
-    reduce_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, ParameterGroup]]]
+    # --- Reduce-scatter grad overlap tracking ---
+    reduce_scatter_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, ParameterGroup]]]
     # module_id -> [(event, param_group), ...]
     # Each entry: event signals RS complete; param_group holds the grad buffer.
 
@@ -93,7 +93,7 @@ root_context = _FSDPRootContext(
     rs_stream=torch.cuda.Stream() if enable_async_reduce_grad else torch.cuda.current_stream(),
     bucket_allocator=bucket_allocator,
     forward_order=forward_order,
-    reduce_grad_buckets={id(m): [] for m in forward_order},
+    reduce_scatter_grad_buckets={id(m): [] for m in forward_order},
     unshard_done_events={id(m): None for m in forward_order},
     enable_unshard_prefetch=enable_unshard_prefetch,
     enable_async_reduce_grad=enable_async_reduce_grad,
@@ -114,7 +114,7 @@ dynamic recording phase.
 **Safety constraint.** `_init_fsdp_state()` must be called **before** any forward/backward pass
 runs.  The method includes a runtime guard that rejects re-initialization if any child
 FSDPModule is still unsharded (`unshard_done_events` live) or has pending reduce-scatter
-operations (`reduce_grad_buckets` non-empty).  Violating this constraint would overwrite a
+operations (`reduce_scatter_grad_buckets` non-empty).  Violating this constraint would overwrite a
 running module's `_fsdp_root_context` while its hooks are still firing, causing undefined
 behavior.
 
@@ -194,8 +194,8 @@ previous forward, or tensor-parallel slice updates) are fully visible to the all
 kernel. Without this barrier, stale or partially-written parameter shards may be read by
 the NCCL collective, causing convergence divergence.
 
-**NVTX profiling.** `unshard()`, `reshard()`, and `reduce_grad()` each push/pop a
-`torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
+**NVTX profiling.** `unshard()`, `reshard()`, and `reduce_scatter_grad()` each push/pop a
+`torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_scatter_grad"`)
 for profiling visibility in tools like Nsight Systems.
 
 Prefetched modules' data also becomes valid when their own pre-hook later calls `event.wait()`
@@ -226,7 +226,7 @@ ctx.unshard_done_events[id(self)] = None    # reset so next iteration can prefet
 
 ---
 
-## Feature 2: Reduce-Grad Overlap
+## Feature 2: Reduce-Scatter Grad Overlap
 
 ### Hook entry point
 
@@ -234,11 +234,11 @@ Inside the `post_backward` closure registered by `_register_backward_hook`:
 
 ```python
 module.reshard()
-module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+module.reduce_scatter_grad(async_op=ctx.enable_async_reduce_grad)
 module.post_backward_issued = True
 ```
 
-### `FSDPModule.reduce_grad(async_op)`
+### `FSDPModule.reduce_scatter_grad(async_op)`
 
 ```python
 stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
@@ -248,7 +248,7 @@ if async_op:
     backward_order = list(reversed(ctx.forward_order))
     for i, module in enumerate(backward_order):
         if i - 2 >= 0:
-            for event, param_group in drain(ctx.reduce_grad_buckets[id(backward_order[i-2])]):
+            for event, param_group in drain(ctx.reduce_scatter_grad_buckets[id(backward_order[i-2])]):
                 event.wait()
                 param_group.release_grad_buffer()
                 #   → deletes param.main_grad views (prevents TE grad-accum-fusion leak)
@@ -272,16 +272,16 @@ for param_names, param_group in self._named_param_groups:
     if async_op:
         stream.wait_stream(torch.cuda.current_stream())    # ensure .grad copy is visible to rs_stream
         with torch.cuda.stream(stream):
-            param_group.reduce_grad()
-            #   → DataParallelBuffer.reduce_grad() (synchronous within this stream):
+            param_group.reduce_scatter_grad()
+            #   → DataParallelBuffer.reduce_scatter_grad() (synchronous within this stream):
             #       fetch_unsharded_buffer() allocates full grad buffer
             #       reduce_scatter_tensor(output=grad_shard, input=full_grad)
             #       self.data[local_idx:...] += grad_shard
         event = stream.record_event()
-        ctx.reduce_grad_buckets[id(self)].append((event, param_group))
+        ctx.reduce_scatter_grad_buckets[id(self)].append((event, param_group))
         # param_group.release_grad_buffer() is NOT called here; deferred until drain/final CB
     else:
-        param_group.reduce_grad()
+        param_group.reduce_scatter_grad()
         param_group.release_grad_buffer()
 
     # --- Step 4: Install dist_grad on dist_param (runs in stream context) ---
@@ -294,7 +294,7 @@ for param_names, param_group in self._named_param_groups:
             setattr(dist_param, "grad", dist_grad)          # Python ref, no GPU dependency
 ```
 
-**Key design point — `DataParallelBuffer.reduce_grad()` has no `async_op` parameter.**
+**Key design point — `DataParallelBuffer.reduce_scatter_grad()` has no `async_op` parameter.**
 The operation is inherently synchronous *within whatever stream is current* when called. The
 "async" behavior is achieved entirely by the caller dispatching into `rs_stream` via
 `with torch.cuda.stream(stream)`. This avoids any API changes to `DataParallelBuffer`.
@@ -304,7 +304,7 @@ When TransformerEngine's `gradient_accumulation_fusion` is active, the backward 
 directly into `param.main_grad` (bypassing `.grad`). Two flags coordinate this:
 
 - **`grad_added_to_main_grad`**: Set to `False` in `pre_backward_hook` before each backward
-  pass; the kernel sets it to `True` after writing. In `reduce_grad`, the `zero_()` call is
+  pass; the kernel sets it to `True` after writing. In `reduce_scatter_grad`, the `zero_()` call is
   skipped when `True` to preserve the fused-gradient value.
 
 - **`overwrite_main_grad`**: Set to `True` in `pre_backward_hook` for sharded parameters
@@ -347,10 +347,10 @@ def _post_backward_final_callback(root_state, root_module):
         if module.post_backward_issued:
             continue
         module.reshard()
-        module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        module.reduce_scatter_grad(async_op=ctx.enable_async_reduce_grad)
 
     # Drain ALL remaining buckets (anything not drained by the sliding rule above)
-    for buckets in ctx.reduce_grad_buckets.values():
+    for buckets in ctx.reduce_scatter_grad_buckets.values():
         while buckets:
             event, param_group = buckets.pop()
             event.wait()
@@ -586,26 +586,32 @@ final_callback:
 
 ---
 
-## `DataParallelBuffer.reduce_grad()` — Implementation Note
+## `DataParallelBuffer.reduce_scatter_grad()` — Implementation Note
 
 No `async_op` parameter is needed. The method is purely synchronous within the calling stream:
 
 ```python
-def reduce_grad(self):
-    if not self.is_distributed:
-        torch.distributed.all_reduce(self.data, group=self.dp_group)
-        return
-    full_grad = self.fetch_unsharded_buffer()  # allocates bucket if not present
     sm = self.buffer_index.shard_meta
-    grad_shard = full_grad[sm.bucket_data_index : sm.bucket_data_index + sm.size]
+    local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
+    if self.is_distributed:
+        full_grad = self.fetch_unsharded_buffer()  # temporary full grad buffer
+        input_buffer = full_grad
+        output_offset = sm.bucket_data_index
+        accumulate_output = True
+    else:
+        input_buffer = self.data  # ZeRO-1 replicated accumulation buffer
+        output_offset = sm.local_data_index
+        accumulate_output = False
+    grad_shard = input_buffer[output_offset : output_offset + sm.size]
     torch.distributed.reduce_scatter_tensor(
-        output=grad_shard, input=full_grad, group=self.dp_group
+        output=grad_shard, input=input_buffer, group=self.dp_group
     )
-    # Accumulate into persistent shard — supports multi-micro-batch grad accumulation
-    self.data[sm.local_data_index : sm.local_data_index + sm.size] += grad_shard
+    if accumulate_output:
+        # ZeRO-2/3 accumulate into persistent shard for micro-batch grad accumulation.
+        local_grad_shard += grad_shard
 ```
 
-The caller (`FSDPModule.reduce_grad`) provides the stream context; `DataParallelBuffer`
+The caller (`FSDPModule.reduce_scatter_grad`) provides the stream context; `DataParallelBuffer`
 just does the collective. This clean separation means `DataParallelBuffer` requires no
 modifications for the overlap feature.
 
