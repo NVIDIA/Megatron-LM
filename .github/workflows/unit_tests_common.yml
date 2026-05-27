@@ -42,31 +42,6 @@ jobs:
           - name: core
             path: "tests/unit_tests/test_*.py"
             description: "Core unit tests"
-          - name: models
-            path: "tests/unit_tests/models/"
-            description: "Model tests"
-          - name: distributed
-            path: "tests/unit_tests/distributed/"
-            description: "Distributed tests"
-          - name: dist_checkpointing
-            path: "tests/unit_tests/dist_checkpointing/"
-            description: "Distributed checkpointing tests"
-          - name: tensor_parallel
-            path: "tests/unit_tests/tensor_parallel/"
-            description: "Tensor parallel tests"
-          - name: pipeline_parallel
-            path: "tests/unit_tests/pipeline_parallel/"
-            description: "Pipeline parallel tests"
-          - name: data
-            path: "tests/unit_tests/data/"
-            description: "Data tests"
-          - name: fusions
-            path: "tests/unit_tests/fusions/"
-            description: "Fusion tests"
-          - name: others
-            path: "tests/unit_tests/export/ tests/unit_tests/post_training/ tests/unit_tests/tokenizers/ tests/unit_tests/utils/"
-            description: "Other tests (a2a_overlap, export, post_training, tokenizers, utils)"
-    if: matrix.test_group.name == 'core'
     name: unit-${{ inputs.device }}-${{ matrix.test_group.name }}
     container:
       image: ${{ inputs.image }}
