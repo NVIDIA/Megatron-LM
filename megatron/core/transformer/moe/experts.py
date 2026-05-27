@@ -413,9 +413,9 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
-        fused_activation_offloading = self.offload_expert_fc1 or self.offload_moe_act
-        if fused_activation_offloading:
-            op.activation_offloading = self.offload_expert_fc1
+        fine_grained_activation_offloading = self.offload_expert_fc1 or self.offload_moe_act
+        if fine_grained_activation_offloading:
+            op.fine_grained_activation_offloading = self.offload_expert_fc1
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
         if fc1_single_grouped_weight:
@@ -490,8 +490,8 @@ class TEGroupedMLP(MegatronModule):
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
-        if fused_activation_offloading:
-            op.activation_offloading = self.offload_moe_act
+        if fine_grained_activation_offloading:
+            op.fine_grained_activation_offloading = self.offload_moe_act
         ops.append(op)
 
         # FC2
@@ -606,7 +606,7 @@ class TEGroupedMLP(MegatronModule):
             )
         else:
             stash_context = nullcontext()
-        fused_activation_offloading = self.offload_expert_fc1 or self.offload_moe_act
+        fine_grained_activation_offloading = self.offload_expert_fc1 or self.offload_moe_act
         offload_name = "_".join(
             name
             for name, enabled in (
@@ -616,7 +616,7 @@ class TEGroupedMLP(MegatronModule):
             if enabled
         )
         with off_interface(
-            fused_activation_offloading, permuted_local_hidden_states, offload_name
+            fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
         ) as permuted_local_hidden_states:
             forced_released_tensors = (
                 [permuted_local_hidden_states] if self.offload_expert_fc1 else []
@@ -629,7 +629,7 @@ class TEGroupedMLP(MegatronModule):
                     permuted_probs,  # Scaled activation
                     tokens_per_expert,  # FC2
                 )
-        if fused_activation_offloading:
+        if fine_grained_activation_offloading:
             output = off_interface.group_commit(
                 output, name=offload_name, forced_released_tensors=forced_released_tensors
             )
