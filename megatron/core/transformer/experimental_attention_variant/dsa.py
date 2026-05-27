@@ -527,10 +527,10 @@ def _normalize_query_valid_rows(
         if query_valid_rows.shape == (1, sq):
             return query_valid_rows.expand(b, sq)
         if query_valid_rows.shape != (b, sq):
+            expected_shape = (b, sq)
             raise ValueError(
-                f"query_valid_rows shape mismatch: expected {
-                    (b, sq)
-                    }, got {tuple(query_valid_rows.shape)}"
+                f"query_valid_rows shape mismatch: expected {expected_shape}, "
+                f"got {tuple(query_valid_rows.shape)}"
             )
         return query_valid_rows
     raise ValueError(f"query_valid_rows should be 1D or 2D tensor, got {query_valid_rows.ndim}D.")

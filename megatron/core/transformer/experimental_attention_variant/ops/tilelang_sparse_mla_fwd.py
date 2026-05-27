@@ -126,7 +126,7 @@ def sparse_mla_fwd(
     assert tail_dim == tilelang.math.next_power_of_2(
         tail_dim
     ), f"haven't check padding correctness yet, dim={tail_dim}"
-    assert is_causal == True, "non-casual is not supported"
+    assert is_causal == True, "non-causal is not supported"
     assert (
         topk % block_I == 0
     ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -285,7 +285,7 @@ def sparse_mla_fwd_interface(
     kv = kv.unsqueeze(0)
     indices = indices.unsqueeze(0)
 
-    is_casual = True
+    is_causal = True
     assert return_p_sum == False, "This kernel file is for fwd only"
     assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
     batch, seq_len, heads, dim_plus_tail_dim = q.shape
@@ -342,7 +342,7 @@ def sparse_mla_fwd_interface(
         topk=topk_bucketed,
         kv_group=kv_group,
         sm_scale=sm_scale,
-        is_causal=is_casual,
+        is_causal=is_causal,
         block_I=block_I,
         num_stages=num_stages,
         threads=threads,
