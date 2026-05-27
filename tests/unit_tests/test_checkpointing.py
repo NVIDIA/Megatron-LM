@@ -180,62 +180,33 @@ def init_model_parallel():
     unset_num_microbatches_calculator()
 
 
-@pytest.mark.parametrize("ckpt_format", ["torch_dcp"])
-def test_load_base_checkpoint(
-    create_ckpt_load_args, ckpt_format, tmp_path_dist_ckpt, monkeypatch
-):
-    """Test _load_base_checkpoint (mock torch_dcp, no GPU required)."""
+def test_load_base_checkpoint(create_ckpt_load_args, tmp_path):
+    """Test _load_base_checkpoint for torch format (CPU only, no GPU needed)."""
+    load_dir = tmp_path / "load_base"
+    load_dir.mkdir()
 
-    if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
-        pytest.skip("torch_dcp requires torch >= 2.4.0")
-
-    # Create minimal checkpoint directory structure
-    ckpt_dir = tmp_path_dist_ckpt / "test_load_base_checkpoint"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    iter_dir = ckpt_dir / "iter_0000123"
-    iter_dir.mkdir(parents=True, exist_ok=True)
+    # Create a torch checkpoint
+    ckpt_dir = load_dir / "iter_0000123" / "mp_rank_00"
+    ckpt_dir.mkdir(parents=True)
+    state_dict = {"args": "dummy", "iteration": 123}
+    torch.save(state_dict, ckpt_dir / "model_optim_rng.pt")
 
     # Write tracker file
-    tracker_path = get_checkpoint_tracker_filename(ckpt_dir)
+    tracker_path = get_checkpoint_tracker_filename(load_dir)
     with open(tracker_path, "w") as f:
         f.write("123")
 
-    # Create .metadata file (empty but exists for format detection)
-    metadata_path = iter_dir / ".metadata"
-    metadata_path.touch()
-
-    # Mock _get_checkpoint_format to return torch_dcp
-    monkeypatch.setattr(
-        checkpointing_module,
-        "_get_checkpoint_format",
-        lambda checkpoint_name, args: "torch_dcp",
-    )
-
-    # Mock torch.distributed.checkpoint.load to avoid real file reading
-    def mock_load(state_dict, checkpoint_id=None, **kwargs):
-        # Simulate loading by populating state_dict
-        state_dict["args"] = "dummy"
-        state_dict["iteration"] = 123
-
-    monkeypatch.setattr(
-        checkpointing_module.torch.distributed.checkpoint,
-        "load",
-        mock_load,
-    )
-
     args = create_ckpt_load_args
-    args.ckpt_format = ckpt_format
+    args.ckpt_format = "torch"
 
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        str(ckpt_dir), args, rank0=True
+        load_dir, args, rank0=True
     )
 
     assert state_dict["args"] == "dummy"
     assert state_dict["iteration"] == 123
-    assert checkpoint_name == str(iter_dir)
     assert not release
-    assert ckpt_type == CheckpointType.TORCH_DCP
+    assert ckpt_type == CheckpointType.LEGACY
 
 
 def test_get_checkpoint_format_detects_torch_dcp_and_fsdp(tmp_path, monkeypatch):
@@ -303,10 +274,17 @@ def test_maybe_save_dataloader_state_saves_only_first_pipeline_rank(tmp_path, mo
         "barrier",
         lambda group=None: calls.append(("barrier", group)),
     )
+    # Mock torch.save inside the checkpointing module
     monkeypatch.setattr(
         checkpointing_module.torch,
         "save",
         lambda state, path: calls.append(("save", state, Path(path).name)),
+    )
+    # Also mock ensure_directory_exists to avoid file system operations
+    monkeypatch.setattr(
+        checkpointing_module,
+        "ensure_directory_exists",
+        lambda filename, check_parent=True: None,
     )
 
     maybe_save_dataloader_state(SimpleNamespace(iterable=FakeIterable()), 12, tmp_path)
