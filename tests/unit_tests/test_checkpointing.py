@@ -269,6 +269,12 @@ def test_maybe_save_dataloader_state_saves_only_first_pipeline_rank(tmp_path, mo
     monkeypatch.setattr(checkpointing_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_rank", lambda: 3)
     monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_group", lambda: "dp")
+    # Mock get_checkpoint_name to return a simple path
+    monkeypatch.setattr(
+        checkpointing_module,
+        "get_checkpoint_name",
+        lambda save_dir, iteration, release=False, basename=None: str(tmp_path / (basename or f"iter_{iteration:07d}")),
+    )
     monkeypatch.setattr(
         checkpointing_module.torch.distributed,
         "barrier",
