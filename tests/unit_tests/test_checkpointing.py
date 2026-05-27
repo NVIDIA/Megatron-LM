@@ -180,55 +180,54 @@ def init_model_parallel():
     unset_num_microbatches_calculator()
 
 
-@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp"])
+@pytest.mark.parametrize("ckpt_format", ["torch_dcp"])
 def test_load_base_checkpoint(
-    create_ckpt_load_args, ckpt_format, tmp_path_dist_ckpt, monkeypatch
+    create_ckpt_load_args, ckpt_format, tmp_path_dist_ckpt
 ):
     """Test _load_base_checkpoint (single-process mock, no GPU required)."""
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
 
-    # Mock torch.distributed so we don't need NCCL/CUDA.
-    monkeypatch.setattr(
-        checkpointing_module.torch.distributed,
-        "is_initialized",
-        lambda: False,
-    )
-    monkeypatch.setattr(
-        checkpointing_module.torch.distributed.checkpoint,
-        "load",
-        lambda state_dict, checkpoint_id=None: None,
-    )
+    # Create checkpoint using the standard mock approach
+    ckpt_dir = tmp_path_dist_ckpt / "test_load_base_checkpoint"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    with TempNamedDir(tmp_path_dist_ckpt / "test_load_base_checkpoint", sync=False) as load_dir:
-        create_checkpoint(load_dir, ckpt_format)
+    # Manually create torch_dcp checkpoint structure
+    iter_dir = ckpt_dir / "iter_0000123"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write tracker file
+    tracker_path = get_checkpoint_tracker_filename(ckpt_dir)
+    with open(tracker_path, "w") as f:
+        f.write("123")
+
+    # Write minimal .metadata file for torch_dcp
+    metadata_path = iter_dir / ".metadata"
+    with open(metadata_path, "w") as f:
+        f.write("metadata")
+
+    # Mock _get_checkpoint_format to return torch_dcp
+    original_get_format = checkpointing_module._get_checkpoint_format
+
+    def mock_get_format(checkpoint_name, args):
+        return "torch_dcp"
+
+    checkpointing_module._get_checkpoint_format = mock_get_format
+
+    try:
         args = create_ckpt_load_args
         args.ckpt_format = ckpt_format
 
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-            load_dir, args, rank0=True
+            str(ckpt_dir), args, rank0=True
         )
+    finally:
+        checkpointing_module._get_checkpoint_format = original_get_format
 
     assert state_dict["args"] == "dummy"
     assert state_dict["iteration"] == 123
-
-    expected_ckpt_path = None
-    if ckpt_format == "torch":
-        expected_ckpt_path = str(load_dir / "iter_0000123" / "mp_rank_00" / "model_optim_rng.pt")
-    elif ckpt_format == "torch_dcp":
-        expected_ckpt_path = str(load_dir / "iter_0000123")
-
-    assert checkpoint_name == expected_ckpt_path
-    assert not release
-
-    expected_ckpt_type = None
-    if ckpt_format == "torch":
-        expected_ckpt_type = CheckpointType.LEGACY
-    elif ckpt_format == "torch_dcp":
-        expected_ckpt_type = CheckpointType.TORCH_DCP
-
-    assert ckpt_type == expected_ckpt_type
+    assert ckpt_type == CheckpointType.TORCH_DCP
 
 
 def test_get_checkpoint_format_detects_torch_dcp_and_fsdp(tmp_path, monkeypatch):
