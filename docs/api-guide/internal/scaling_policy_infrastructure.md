@@ -12,14 +12,14 @@
 This internal policy layer centralizes Megatron's existing parameterization hooks
 without adding a new user-facing recipe surface.
 
-The current policy resolves the legacy `use_mup` fields into model-side and
+The current scaling context resolves the legacy `use_mup` fields into model-side and
 optimizer-side decisions. Standard Megatron behavior is represented as the
 identity policy, so code paths can call the same hooks whether or not MuP is
 active.
 
 ## Model Policy
 
-Model code should route scaling-sensitive decisions through the resolved model
+Model code should route scaling-sensitive decisions through the model scaling
 policy instead of reading `use_mup` at each call site. The policy currently
 covers:
 
@@ -35,7 +35,7 @@ For non-MuP configs, every hook returns the current Megatron default.
 ## Training Policy
 
 Optimizer code should route per-parameter hyperparameter multipliers through the
-resolved training policy. The policy currently preserves the existing MuP rules:
+training scaling policy. The policy currently preserves the existing MuP rules:
 
 - Adam-family hidden matrix parameters use `lr / mup_width_mult`;
 - Adam-family hidden matrix parameters use `eps / mup_width_mult`;

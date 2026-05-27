@@ -15,14 +15,14 @@ from megatron.core.utils import (
     scaled_init_method_normal,
 )
 
-from .spec import ResolvedScalingContext, build_resolved_scaling_context
+from .spec import ScalingContext, build_scaling_context
 
 
 @dataclass(frozen=True)
-class ResolvedModelPolicy:
+class ModelScalingPolicy:
     """Model-side policy for existing Megatron scaling behavior."""
 
-    context: ResolvedScalingContext
+    context: ScalingContext
 
     @property
     def enabled(self) -> bool:
@@ -112,5 +112,5 @@ class ResolvedModelPolicy:
         return output_with_bias
 
 
-def build_resolved_model_policy(config) -> ResolvedModelPolicy:
-    return ResolvedModelPolicy(build_resolved_scaling_context(config))
+def build_model_scaling_policy(config) -> ModelScalingPolicy:
+    return ModelScalingPolicy(build_scaling_context(config))

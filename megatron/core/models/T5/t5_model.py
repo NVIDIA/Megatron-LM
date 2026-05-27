@@ -15,7 +15,7 @@ from megatron.core.models.common.embeddings.relative_pos_embedding import Relati
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parameterization import build_resolved_model_policy
+from megatron.core.parameterization import build_model_scaling_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
@@ -57,7 +57,7 @@ class T5LMHead(MegatronModule):
             config.hidden_size,
             vocab_size,
             config=config,
-            init_method=build_resolved_model_policy(config).output_layer_init_method(
+            init_method=build_model_scaling_policy(config).output_layer_init_method(
                 share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                 default_init_method=config.init_method,
                 embedding_init_method=config.embedding_init_method,

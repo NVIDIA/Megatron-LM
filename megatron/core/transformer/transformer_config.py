@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
-from megatron.core.parameterization import build_resolved_model_policy
+from megatron.core.parameterization import build_model_scaling_policy
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -1978,7 +1978,7 @@ class TransformerConfig(ModelParallelConfig):
                     UserWarning,
                 )
 
-        model_scaling_policy = build_resolved_model_policy(self)
+        model_scaling_policy = build_model_scaling_policy(self)
         self.softmax_scale = model_scaling_policy.resolve_attention_softmax_scale(
             softmax_scale=self.softmax_scale, kv_channels=self.kv_channels
         )

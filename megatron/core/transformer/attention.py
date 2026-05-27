@@ -28,7 +28,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.parameterization import build_resolved_model_policy
+from megatron.core.parameterization import build_model_scaling_policy
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -392,7 +392,7 @@ class Attention(MegatronModule, ABC):
         )
 
         # Output.
-        model_scaling_policy = build_resolved_model_policy(self.config)
+        model_scaling_policy = build_model_scaling_policy(self.config)
         self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
             self.config.hidden_size,

@@ -7,8 +7,8 @@ from typing import Any, Optional
 
 
 @dataclass(frozen=True)
-class ResolvedScalingContext:
-    """Resolved internal scaling context for existing Megatron parameterization knobs.
+class ScalingContext:
+    """Internal scaling context for existing Megatron parameterization knobs.
 
     This infrastructure intentionally does not add a new public recipe surface. It
     wraps the existing ``use_mup`` fields so model and optimizer code can route through
@@ -31,8 +31,8 @@ class ResolvedScalingContext:
         return self.use_mup
 
 
-def build_resolved_scaling_context(config: Any) -> ResolvedScalingContext:
-    return ResolvedScalingContext(
+def build_scaling_context(config: Any) -> ScalingContext:
+    return ScalingContext(
         use_mup=bool(getattr(config, 'use_mup', False)),
         width_mult=getattr(config, 'mup_width_mult', 1.0),
         embedding_mult=getattr(config, 'mup_embedding_mult', 1.0),

@@ -12,7 +12,7 @@ from megatron.core.parameterization import (
     ROLE_EMBEDDING,
     ROLE_OUTPUT,
     ROLE_SHARED_EMBEDDING_OUTPUT,
-    build_resolved_model_policy,
+    build_model_scaling_policy,
     set_parameterization_metadata,
 )
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
@@ -53,7 +53,7 @@ class LanguageModule(MegatronModule):
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         super().__init__(config=config)
-        self.model_scaling_policy = build_resolved_model_policy(config)
+        self.model_scaling_policy = build_model_scaling_policy(config)
         self._set_attention_backend()
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -353,7 +353,7 @@ class LanguageModule(MegatronModule):
             Tensor: Scaled logits if MuP is enabled and mup_output_mult != 1.0,
                     otherwise unchanged logits.
         """
-        return build_resolved_model_policy(self.config).scale_output_logits(logits)
+        return build_model_scaling_policy(self.config).scale_output_logits(logits)
 
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True

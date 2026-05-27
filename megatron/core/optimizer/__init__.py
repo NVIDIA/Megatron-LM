@@ -55,7 +55,7 @@ from megatron.core.optimizer_param_scheduler import (
     param_group_override_to_tuple,
 )
 from megatron.core.parameterization import (
-    ResolvedTrainingPolicy,
+    TrainingScalingPolicy,
     build_legacy_mup_training_policy,
     is_embedding_class_parameter,
     is_embedding_or_output_parameter,
@@ -146,9 +146,9 @@ def get_mup_config_overrides(
 
 
 def get_scaling_config_overrides(
-    config: OptimizerConfig, scaling_policy: ResolvedTrainingPolicy
+    config: OptimizerConfig, scaling_policy: TrainingScalingPolicy
 ) -> Dict[ParamKey, ParamGroupOverride]:
-    """Get optimizer overrides from a resolved internal scaling policy.
+    """Get optimizer overrides from an internal training scaling policy.
 
     This compatibility path keeps the public MuP surface unchanged and factors the
     existing per-parameter MuP LR/epsilon behavior through this policy seam.

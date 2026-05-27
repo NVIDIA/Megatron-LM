@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .spec import ResolvedScalingContext
+from .spec import ScalingContext
 
 
 @dataclass(frozen=True)
-class ResolvedTrainingPolicy:
+class TrainingScalingPolicy:
     """Optimizer-side policy for existing Megatron MuP hyperparameter multipliers."""
 
-    context: ResolvedScalingContext
+    context: ScalingContext
     optimizer_type: str = 'adam'
 
     @property
@@ -65,8 +65,8 @@ class ResolvedTrainingPolicy:
 
 def build_legacy_mup_training_policy(
     *, mup_width_mult: float, optimizer_type: str = 'adam'
-) -> ResolvedTrainingPolicy:
-    return ResolvedTrainingPolicy(
-        context=ResolvedScalingContext(use_mup=True, width_mult=mup_width_mult),
+) -> TrainingScalingPolicy:
+    return TrainingScalingPolicy(
+        context=ScalingContext(use_mup=True, width_mult=mup_width_mult),
         optimizer_type=optimizer_type,
     )

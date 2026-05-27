@@ -23,7 +23,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
-from megatron.core.parameterization import build_resolved_model_policy
+from megatron.core.parameterization import build_model_scaling_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -234,7 +234,7 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        model_scaling_policy = build_resolved_model_policy(self.config)
+        model_scaling_policy = build_model_scaling_policy(self.config)
         self.linear_fc2 = submodules.linear_fc2(
             not_none(self.config.ffn_hidden_size),
             not_none(

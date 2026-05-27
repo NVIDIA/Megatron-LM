@@ -17,7 +17,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parameterization import build_resolved_model_policy
+from megatron.core.parameterization import build_model_scaling_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
@@ -336,7 +336,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
-        self.model_scaling_policy = build_resolved_model_policy(config)
+        self.model_scaling_policy = build_model_scaling_policy(config)
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm

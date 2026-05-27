@@ -25,7 +25,7 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
 from megatron.core.parameterization import (
     build_legacy_mup_training_policy,
-    build_resolved_model_policy,
+    build_model_scaling_policy,
 )
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -203,7 +203,7 @@ class TestMuPWarnings:
 class TestMuPLRScaling:
     """Tests for MuP learning rate and Adam epsilon scaling."""
 
-    def test_mup_overrides_route_through_resolved_training_policy(self):
+    def test_mup_overrides_route_through_training_scaling_policy(self):
         """The new policy seam preserves the legacy MuP override surface."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
         width_mult = 4.0
@@ -377,7 +377,7 @@ class TestMuPLRScaling:
 class TestMuPConfigIntegration:
     """Integration tests for MuP config with init methods."""
 
-    def test_resolved_model_policy_matches_legacy_config_fields(self):
+    def test_model_scaling_policy_matches_legacy_config_fields(self):
         """Model policy exposes the same effective MuP values as TransformerConfig."""
         config = TransformerConfig(
             hidden_size=1024,
@@ -387,7 +387,7 @@ class TestMuPConfigIntegration:
             mup_base_hidden_size=256,
             mup_embedding_mult=3.0,
         )
-        policy = build_resolved_model_policy(config)
+        policy = build_model_scaling_policy(config)
 
         assert policy.enabled is True
         assert policy.context.width_mult == pytest.approx(config.mup_width_mult)
@@ -399,7 +399,7 @@ class TestMuPConfigIntegration:
             )
         )
 
-    def test_resolved_model_policy_tracks_post_init_multiplier_mutations(self):
+    def test_model_scaling_policy_tracks_post_init_multiplier_mutations(self):
         """Policy resolution should preserve legacy live reads of mutable config fields."""
         config = TransformerConfig(
             hidden_size=1024,
@@ -413,7 +413,7 @@ class TestMuPConfigIntegration:
 
         config.mup_output_mult = 0.25
         config.mup_embedding_mult = 3.0
-        policy = build_resolved_model_policy(config)
+        policy = build_model_scaling_policy(config)
 
         assert torch.equal(policy.scale_output_logits(logits), logits * 0.25)
         assert torch.equal(policy.scale_embedding_activations(embeddings), embeddings * 3.0)

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from .model_policy import ResolvedModelPolicy, build_resolved_model_policy
+from .model_policy import ModelScalingPolicy, build_model_scaling_policy
 from .roles import (
     IS_OUTPUT_PARAMETER_ATTR,
     PARAMETERIZATION_ROLE_ATTR,
@@ -21,8 +21,8 @@ from .roles import (
     is_vector_like_parameter,
     set_parameterization_metadata,
 )
-from .spec import ResolvedScalingContext, build_resolved_scaling_context
-from .training_policy import ResolvedTrainingPolicy, build_legacy_mup_training_policy
+from .spec import ScalingContext, build_scaling_context
+from .training_policy import TrainingScalingPolicy, build_legacy_mup_training_policy
 
 __all__ = [
     'IS_OUTPUT_PARAMETER_ATTR',
@@ -35,12 +35,12 @@ __all__ = [
     'ROLE_MUON_MANAGED_MATRIX',
     'ROLE_OUTPUT',
     'ROLE_SHARED_EMBEDDING_OUTPUT',
-    'ResolvedModelPolicy',
-    'ResolvedScalingContext',
-    'ResolvedTrainingPolicy',
+    'ModelScalingPolicy',
+    'ScalingContext',
+    'TrainingScalingPolicy',
     'build_legacy_mup_training_policy',
-    'build_resolved_model_policy',
-    'build_resolved_scaling_context',
+    'build_model_scaling_policy',
+    'build_scaling_context',
     'get_parameterization_role',
     'is_embedding_class_parameter',
     'is_embedding_or_output_parameter',
