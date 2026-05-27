@@ -196,6 +196,7 @@ def compute_dsa_indexer_loss(
     sparse_loss: bool,
     pg_collection: ProcessGroupCollection,
     causal_mask_override: Optional[torch.Tensor] = None,
+    calculate_per_token_loss: bool = False,
 ) -> torch.Tensor:
     """
     Compute KL divergence loss between index_scores and true attention_scores.
@@ -216,6 +217,10 @@ def compute_dsa_indexer_loss(
         sparse_loss: bool, whether to use sparse indexer loss. If True, only the topk
             indices will be used to compute the loss.
         pg_collection: Process group collection, must have TP process group.
+        causal_mask_override: Optional mask used by compressed KV paths.
+        calculate_per_token_loss: If True, return a raw local sum so the global
+            token divisor can be applied by finalize_model_grads. If False, keep
+            the historical local BSHD average over ``batch * seqlen`` rows.
 
     Returns:
         index_loss: KL divergence loss (scalar).
@@ -308,7 +313,11 @@ def compute_dsa_indexer_loss(
 
     # [b, sq, sk] -> [b, sq] -> [1]
     # Each token has same weight in the loss.
-    kl_div = kl_per_element.sum(dim=-1).mean()
+    kl_per_row = kl_per_element.sum(dim=-1)
+    if calculate_per_token_loss:
+        kl_div = kl_per_row.sum()
+    else:
+        kl_div = kl_per_row.mean()
 
     # Scale by coefficient.
     indexer_loss = kl_div * loss_coeff
@@ -388,7 +397,18 @@ def fused_qk_topk_naive(
 
 
 def fwd_fused_indexer_loss_naive(
-    q, weights, k, query, key, topk, softmax_scale, loss_coeff, mask, sparse_loss, pg_collection
+    q,
+    weights,
+    k,
+    query,
+    key,
+    topk,
+    softmax_scale,
+    loss_coeff,
+    mask,
+    sparse_loss,
+    pg_collection,
+    calculate_per_token_loss,
 ):
     """Naive implementation of forward pass for indexer loss."""
     index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, topk, mask)
@@ -403,6 +423,7 @@ def fwd_fused_indexer_loss_naive(
         sparse_loss,
         pg_collection,
         causal_mask_override=mask,
+        calculate_per_token_loss=calculate_per_token_loss,
     )
 
     return topk_indices, indexer_loss
@@ -421,6 +442,7 @@ def bwd_fused_indexer_loss_naive(
     grad_loss,
     pg_collection,
     causal_mask_override=None,
+    calculate_per_token_loss=False,
 ):
     """Naive implementation of backward pass for indexer loss."""
     index_scores = _compute_index_scores(q, weights, k)  # [B, Sq, Sk]
@@ -520,11 +542,15 @@ def bwd_fused_indexer_loss_naive(
     del attention_scores_sum
 
     # Backward through loss = kl_div * loss_coeff
-    # where kl_div = kl_per_element.sum(dim=-1).mean()
+    # where kl_div is either kl_per_element.sum(dim=-1).mean() or the raw
+    # local sum when calculate_per_token_loss=True.
     grad_kl_div = grad_loss * loss_coeff  # scalar
 
-    # Backward through mean: distribute gradient equally
-    grad_kl_per_row = grad_kl_div / (b * sq)  # scalar value for each row
+    if calculate_per_token_loss:
+        grad_kl_per_row = grad_kl_div
+    else:
+        # Backward through mean: distribute gradient equally
+        grad_kl_per_row = grad_kl_div / (b * sq)  # scalar value for each row
 
     # Backward through sum(dim=-1): broadcast back to [b, sq, sk]
     # Each element in a row contributes to the sum, so gradient is same for all
@@ -630,6 +656,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         mask,
         sparse_loss,
         pg_collection,
+        calculate_per_token_loss,
     ):
         """
         Fused forward: index_scores never materialized in full.
@@ -646,6 +673,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             mask,
             sparse_loss,
             pg_collection,
+            calculate_per_token_loss,
         )
 
         # Save for backward (recomputation strategy)
@@ -654,6 +682,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         ctx.loss_coeff = loss_coeff
         ctx.sparse_loss = sparse_loss
         ctx.pg_collection = pg_collection
+        ctx.calculate_per_token_loss = calculate_per_token_loss
 
         return topk_indices, loss
 
@@ -677,10 +706,11 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             grad_loss,
             ctx.pg_collection,
             causal_mask_override=mask,
+            calculate_per_token_loss=ctx.calculate_per_token_loss,
         )
 
         # query and key are detached in forward, so return None for their gradients
-        return grad_q, grad_weights, grad_k, None, None, None, None, None, None, None, None
+        return grad_q, grad_weights, grad_k, None, None, None, None, None, None, None, None, None
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
@@ -1201,6 +1231,7 @@ class DSAttention(MegatronModule):
                 float_mask,
                 getattr(self.config, "dsa_indexer_use_sparse_loss", False),
                 self.indexer.pg_collection,
+                self.config.calculate_per_token_loss,
             )
             # Save indexer loss for logging
             if indexer_loss_coeff > 0:

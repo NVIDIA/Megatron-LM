@@ -5,7 +5,7 @@ ENV_VARS:
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   ENABLE_LIGHTWEIGHT_MODE: true
 MODEL_ARGS:
-  --num-layers: 4
+  --num-layers: 6
   --hidden-size: 512
   --num-attention-heads: 8
   --multi-latent-attention: true
@@ -21,15 +21,10 @@ MODEL_ARGS:
   --dsa-indexer-loss-coeff: 0.01
   --dsa-indexer-use-sparse-loss: true
   --csa-window-size: 128
-  --csa-compress-ratios: ([0,4,128,4,0])
+  --csa-compress-ratios: ([0,4,128,4,128,4])
   --csa-compress-rotary-base: 40000
   --attention-backend: fused
-  --enable-hyper-connections: true
-  --num-residual-streams: 4
-  --mhc-sinkhorn-iterations: 20
-  --mtp-num-layers: 1
-  --mtp-loss-scaling-factor: 0.1
-  --pipeline-model-parallel-layout: "Et|t|t|tmL"
+  --pipeline-model-parallel-layout: "Et|tt|tt|tL"
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true

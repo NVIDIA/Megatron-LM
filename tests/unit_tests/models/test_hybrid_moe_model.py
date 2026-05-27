@@ -36,6 +36,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "actual_vocab_size": 131072,
     "add_bias_linear": False,
     "add_qkv_bias": False,
+    "apply_dsa_kernel_fusion": True,
     "apply_query_key_layer_scaling": False,
     "apply_residual_connection_post_layernorm": False,
     "apply_rope_fusion": False,
