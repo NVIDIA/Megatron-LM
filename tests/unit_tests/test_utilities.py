@@ -65,6 +65,9 @@ class Utils:
                 backend='nccl', world_size=Utils.world_size, rank=Utils.rank, store=store
             )
 
+            # Free cached CUDA memory before NCCL communicator creation
+            torch.cuda.empty_cache()
+
             torch.distributed.barrier()
         Utils.inited = True
 

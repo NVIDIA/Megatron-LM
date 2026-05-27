@@ -180,17 +180,28 @@ def init_model_parallel():
     unset_num_microbatches_calculator()
 
 
-@pytest.mark.parametrize("ckpt_format", ["torch_dcp"])
+@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp"])
 def test_load_base_checkpoint(
-    init_model_parallel, create_ckpt_load_args, ckpt_format, tmp_path_dist_ckpt
+    create_ckpt_load_args, ckpt_format, tmp_path_dist_ckpt, monkeypatch
 ):
-    """Test _load_base_checkpoint."""
+    """Test _load_base_checkpoint (single-process mock, no GPU required)."""
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
 
-    # TempNamedDir uses the same directory for all ranks in a multi-GPU setup. Cleanup is handled.
-    with TempNamedDir(tmp_path_dist_ckpt / "test_load_base_checkpoint", sync=True) as load_dir:
+    # Mock torch.distributed so we don't need NCCL/CUDA.
+    monkeypatch.setattr(
+        checkpointing_module.torch.distributed,
+        "is_initialized",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        checkpointing_module.torch.distributed.checkpoint,
+        "load",
+        lambda state_dict, checkpoint_id=None: None,
+    )
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_load_base_checkpoint", sync=False) as load_dir:
         create_checkpoint(load_dir, ckpt_format)
         args = create_ckpt_load_args
         args.ckpt_format = ckpt_format
