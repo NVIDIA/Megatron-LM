@@ -21,7 +21,6 @@ from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNet,
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
-    _unpack_sequence,
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
 )
@@ -50,6 +49,18 @@ try:
     HAVE_FLA = True
 except ImportError:
     HAVE_FLA = False
+
+
+def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[torch.Tensor]:
+    unpacked_x = []
+    cu_seqlens_list = cu_seqlens.tolist()
+    num_seqs = len(cu_seqlens_list) - 1
+    for i in range(num_seqs):
+        idx_start = cu_seqlens_list[i]
+        idx_end = cu_seqlens_list[i + 1]
+        chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
+        unpacked_x.append(x[tuple(chunked_index)])
+    return unpacked_x
 
 
 @pytest.mark.parametrize(

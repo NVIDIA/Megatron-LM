@@ -721,19 +721,6 @@ class GatedDeltaNet(MegatronModule):
         self.out_proj.backward_dw()
 
 
-# Used by tests/unit_tests/ssm/test_gated_delta_net.py
-def _unpack_sequence(x, cu_seqlens, dim=1) -> list[torch.Tensor]:
-    unpacked_x = []
-    cu_seqlens_list = cu_seqlens.tolist()
-    num_seqs = len(cu_seqlens_list) - 1
-    for i in range(num_seqs):
-        idx_start = cu_seqlens_list[i]
-        idx_end = cu_seqlens_list[i + 1]
-        chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
-        unpacked_x.append(x[tuple(chunked_index)])
-    return unpacked_x
-
-
 def _build_thd_cp_a2a_perm(
     cu_seqlens: torch.Tensor, cp_size: int, t_global: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
