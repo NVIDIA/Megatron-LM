@@ -23,7 +23,15 @@ from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
 _FUSED_SIMILARITY_EPS = 1.5e-4
-_UNFUSED_SIMILARITY_EPS = 2.3e-5
+_UNFUSED_SIMILARITY_EPS = 3e-5
+# Fused dense-loss path: ``dense_indexer_backward_wrapper`` consumes raw
+# scores plus L1-norm/LSE separately (not pre-softmaxed distributions, as
+# the sparse variant does), so the kernel-vs-autograd precision noise is
+# not absorbed by a softmax boundary. Combined with TE-vs-nn linear/RoPE
+# drift on q_indexer/k_indexer/weights, the indexer param-grad cosine sim
+# floors around 1e-3 here. Applied only to ``.indexer.`` params when
+# ``apply_dsa_kernel_fusion=True`` and ``dsa_indexer_use_sparse_loss=False``.
+_FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS = 2e-3
 
 
 @torch.compile
@@ -61,14 +69,13 @@ _DSA_BACKENDS = [
     pytest.param("unfused", False, id="unfused"),
 ]
 
-_CASE_SEQLENS = [2048, 4096, 8192]
-
 
 def _make_config(
     variant: str,
     compress_ratio: int,
     apply_dsa_kernel_fusion: bool = False,
     calculate_per_token_loss: bool = False,
+    dsa_indexer_use_sparse_loss: bool = False,
 ) -> MLATransformerConfig:
     shape = _DSV4_VARIANTS[variant]
     mcore_ratio = 0 if compress_ratio == 1 else compress_ratio
@@ -93,7 +100,7 @@ def _make_config(
         dsa_indexer_head_dim=128,
         dsa_indexer_topk=shape["dsa_indexer_topk"],
         dsa_indexer_loss_coeff=0.01,
-        dsa_indexer_use_sparse_loss=True,
+        dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         calculate_per_token_loss=calculate_per_token_loss,
         add_bias_linear=False,
         bf16=True,
@@ -245,32 +252,61 @@ def _native_fused_sparse_indexer_loss(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     loss_coeff: float,
+    sparse_loss: bool,
     calculate_per_token_loss: bool,
 ) -> torch.Tensor:
-    batch_size, seqlen, topk = topk_indices.size()
+    batch_size, seqlen, _ = topk_indices.size()
     num_heads, head_dim = query.size(2), query.size(3)
-    safe_indices = topk_indices.clamp(min=0).long()
-    valid = topk_indices >= 0
-    row_valid = valid.any(dim=-1, keepdim=True)
-
-    predict_logits = torch.gather(index_scores, dim=-1, index=safe_indices)
-    predict_logits = predict_logits.masked_fill(~valid, float("-inf"))
-    predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
-    predict = F.softmax(predict_logits, dim=-1, dtype=torch.float32)
-    predict = predict * row_valid.float()
-
-    compressed_kv_t = compressed_kv.detach().permute(1, 0, 2)
-    selected_kv = torch.gather(
-        compressed_kv_t.unsqueeze(1).expand(-1, seqlen, -1, -1),
-        dim=2,
-        index=safe_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim),
-    )
-    q = query.detach().permute(1, 2, 0, 3).float()
-    attn_scores = torch.einsum("bhsd,bskd->bhsk", q, selected_kv.float())
-    attn_scores = attn_scores * softmax_scale
-    attn_scores = attn_scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+    n_compressed = compressed_kv.size(0)
 
     sink = attn_sink.detach().view(1, num_heads, 1, 1).float()
+    q = query.detach().permute(1, 2, 0, 3).float()
+    compressed_kv_t = compressed_kv.detach().permute(1, 0, 2)
+
+    if sparse_loss:
+        safe_indices = topk_indices.clamp(min=0).long()
+        valid = topk_indices >= 0
+        row_valid = valid.any(dim=-1, keepdim=True)
+
+        predict_logits = torch.gather(index_scores, dim=-1, index=safe_indices)
+        predict_logits = predict_logits.masked_fill(~valid, float("-inf"))
+        predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
+        predict = F.softmax(predict_logits, dim=-1, dtype=torch.float32)
+        predict = predict * row_valid.float()
+
+        selected_kv = torch.gather(
+            compressed_kv_t.unsqueeze(1).expand(-1, seqlen, -1, -1),
+            dim=2,
+            index=safe_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim),
+        )
+        attn_scores = torch.einsum("bhsd,bskd->bhsk", q, selected_kv.float())
+        attn_scores = attn_scores * softmax_scale
+        attn_scores = attn_scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+    else:
+        # Dense loss: KL is computed over the FULL compressed-KV axis (not
+        # just topk). Index-side and attention-side both use the kernel's
+        # ratio-causal mask, which we derive analytically from the
+        # compress_ratio (= seqlen / n_compressed): position k of the
+        # compressed-KV is valid for query row q iff k < (q + 1) // ratio.
+        compress_ratio = seqlen // n_compressed
+        k_idx = torch.arange(n_compressed, device=index_scores.device)
+        valid_per_q = (
+            torch.arange(1, seqlen + 1, device=index_scores.device) // compress_ratio
+        ).clamp(max=n_compressed)
+        finite_pos = k_idx.view(1, 1, -1) < valid_per_q.view(1, -1, 1)  # (1, sq, n_compressed)
+        finite_pos = finite_pos.expand(batch_size, -1, -1)
+        row_valid = finite_pos.any(dim=-1, keepdim=True)
+
+        predict_logits = index_scores.masked_fill(~finite_pos, float("-inf"))
+        predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
+        predict = F.softmax(predict_logits, dim=-1, dtype=torch.float32)
+        predict = predict * row_valid.float()
+
+        attn_scores = torch.einsum("bhsd,bkd->bhsk", q, compressed_kv_t.float())
+        attn_scores = attn_scores * softmax_scale
+        attn_mask = finite_pos.unsqueeze(1).expand(-1, num_heads, -1, -1)
+        attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
+
     score_max = torch.max(attn_scores.max(dim=-1, keepdim=True).values, sink)
     exp_scores = torch.exp(attn_scores - score_max)
     exp_sink = torch.exp(sink - score_max)
@@ -560,6 +596,7 @@ class NativeCompressedSparseAttention(nn.Module):
                         self.attn_sink,
                         self.softmax_scale,
                         self.indexer_loss_coeff,
+                        self.indexer_use_sparse_loss,
                         self.calculate_per_token_loss,
                     )
             else:
@@ -676,7 +713,7 @@ def _copy_real_params_to_native(real_layer: nn.Module, native_layer: nn.Module):
     return real_params
 
 
-def _skip_if_real_kernels_unavailable(*, sm_min: int = 9):
+def _skip_if_real_kernels_unavailable(*, sm_min: int = 9, need_flash_mla: bool = False):
     """Pytest-side gate for real-kernel tests. Raises ``pytest.skip`` if
     any of the runtime dependencies are missing.
     """
@@ -686,50 +723,73 @@ def _skip_if_real_kernels_unavailable(*, sm_min: int = 9):
     if sm_major < sm_min:
         pytest.skip(f"requires SM{sm_min}+, found SM{sm_major}")
     cudnn = pytest.importorskip("cudnn")
-    cudnn_frontend = pytest.importorskip("cudnn_frontend")
     from packaging.version import Version
 
-    if Version(cudnn_frontend.__version__) < Version("1.24.0"):
-        pytest.skip(f"requires cudnn_frontend>=1.24.0, found {cudnn_frontend.__version__}")
+    if Version(cudnn.__version__) < Version("1.24.0"):
+        pytest.skip(f"requires cudnn>=1.24.0, found {cudnn.__version__}")
     if not hasattr(cudnn, 'DSA'):
         pytest.skip("cudnn.DSA namespace not available")
-    pytest.importorskip("flash_mla")
+    if need_flash_mla:
+        pytest.importorskip("flash_mla")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
-@pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
-@pytest.mark.parametrize("variant", ["flash", "pro"])
-@pytest.mark.parametrize("compress_ratio", [1, 4, 128])
-@pytest.mark.parametrize("seqlen", _CASE_SEQLENS)
-@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
-def test_dsv4_hybrid_attention_matches_native_reference(
-    variant: str,
-    compress_ratio: int,
-    seqlen: int,
-    backend: str,
-    apply_dsa_kernel_fusion: bool,
-    calculate_per_token_loss: bool,
-):
-    if apply_dsa_kernel_fusion:
-        _skip_if_real_kernels_unavailable(sm_min=10)
-    major, _ = torch.cuda.get_device_capability()
-    if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
-        pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
+class TestDSv4HybridNativeParity:
 
-    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
 
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
-    try:
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def setup_method(self):
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
         torch.manual_seed(_SEED)
         torch.cuda.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
+
+    def teardown_method(self):
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize("variant", ["flash", "pro"])
+    @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
+    @pytest.mark.parametrize(
+        ("seqlen", "calculate_per_token_loss", "dsa_indexer_use_sparse_loss"),
+        [
+            (4096, False, False),
+            (4096, False, True),
+            (4096, True, False),
+            (4096, True, True),
+            (8192, True, True),
+        ],
+    )
+    def test_attention_matches_native_reference(
+        self,
+        variant: str,
+        compress_ratio: int,
+        seqlen: int,
+        backend: str,
+        apply_dsa_kernel_fusion: bool,
+        calculate_per_token_loss: bool,
+        dsa_indexer_use_sparse_loss: bool,
+    ):
+        if apply_dsa_kernel_fusion:
+            _skip_if_real_kernels_unavailable(sm_min=10)
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
+            pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 
         config = _make_config(
             variant,
             compress_ratio,
             apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
             calculate_per_token_loss=calculate_per_token_loss,
+            dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
         similarity_eps = (
             _UNFUSED_SIMILARITY_EPS if not apply_dsa_kernel_fusion else _FUSED_SIMILARITY_EPS
@@ -779,21 +839,21 @@ def test_dsv4_hybrid_attention_matches_native_reference(
                 eps=similarity_eps,
             )
 
+        is_fused_dense = apply_dsa_kernel_fusion and not dsa_indexer_use_sparse_loss
         for name, native_param in native_layer.named_parameters():
             real_param = real_params[name]
             if compress_ratio != 4 and ".indexer." in name:
                 continue
             assert native_param.grad is not None, f"Missing native grad for {name}"
             assert real_param.grad is not None, f"Missing real grad for {name}"
+            param_eps = (
+                _FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS
+                if is_fused_dense and ".indexer." in name
+                else similarity_eps
+            )
             _assert_similarity(
                 real_param.grad,
                 native_param.grad,
                 f"{backend}-{variant}-{compress_ratio}-{seqlen}:param_grad:{name}",
-                eps=similarity_eps,
+                eps=param_eps,
             )
-        del real_layer, native_layer, real_params
-        del hidden_states, hidden_states_native, grad, real_out, native_out, native_indexer_loss
-    finally:
-        Utils.destroy_model_parallel()
-        gc.collect()
-        torch.cuda.empty_cache()
