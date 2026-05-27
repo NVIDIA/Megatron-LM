@@ -842,7 +842,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             The constructed model
 
         Note:
-            Virtual pipeline model parallelism is not supported for Hybrid models.
+            The Python recipe path does not support virtual pipeline model parallelism.
         """
         transformer_config = self._model_config.get_transformer_config()
         hybrid_stack_spec = self._model_config.hybrid_stack_spec
@@ -858,6 +858,13 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
                 hybrid_stack_spec = default_hybrid_stack_spec
 
         if self._model_config.is_recipe_config:
+            if (
+                transformer_config.virtual_pipeline_model_parallel_size is not None
+                or vp_stage is not None
+            ):
+                raise NotImplementedError(
+                    "The HybridModel recipe path does not support virtual pipeline parallelism."
+                )
             pre_process = pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
             post_process = post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
             return HybridModel(
