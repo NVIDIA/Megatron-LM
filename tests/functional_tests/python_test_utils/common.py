@@ -208,9 +208,8 @@ def pipeline(
                 ]
 
                 if metric_name == "iteration-time":
-                    # Restrict iter-time aggregation to the steady-state window
-                    # (steps 30-45) so the warmup step does not dominate the median.
-                    steady_window = range(30, 46)
+                    max_golden_step = max(golden_value.values.keys()) if golden_value.values else 0
+                    steady_window = range(5, 21) if max_golden_step <= 25 else range(30, 46)
                     actual_value_list = [
                         value
                         for value_step, value in actual_values[metric_name].values.items()
