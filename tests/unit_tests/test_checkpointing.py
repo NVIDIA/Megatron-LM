@@ -49,6 +49,7 @@ from megatron.training.checkpointing import (
     set_loaded_iteration,
 )
 from megatron.training import checkpointing as checkpointing_module
+from megatron.training import global_vars as global_vars_module
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -67,6 +68,13 @@ class MockModel(MegatronModule):
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+@pytest.fixture
+def restore_global_args():
+    original_args = global_vars_module._GLOBAL_ARGS
+    yield
+    global_vars_module._GLOBAL_ARGS = original_args
 
 
 class MockState:
@@ -306,7 +314,7 @@ def test_maybe_save_dataloader_state_rejects_unsupported_iterator(tmp_path):
         maybe_save_dataloader_state(SimpleNamespace(iterable=SimpleNamespace()), 1, tmp_path)
 
 
-def test_load_biencoder_checkpoint_can_load_only_query_model(tmp_path, monkeypatch):
+def test_load_biencoder_checkpoint_can_load_only_query_model(tmp_path, monkeypatch, restore_global_args):
     load_dir = tmp_path / "biencoder"
     load_dir.mkdir()
     Path(get_checkpoint_tracker_filename(load_dir)).write_text("5", encoding="utf-8")
@@ -324,12 +332,16 @@ def test_load_biencoder_checkpoint_can_load_only_query_model(tmp_path, monkeypat
 
     loaded = []
     fake_model = SimpleNamespace(load_state_dict=lambda state: loaded.append(state))
+    set_args(SimpleNamespace(load=load_dir, use_distributed_optimizer=False))
 
     def fake_get_checkpoint_name(checkpoints_path, iteration, *args, **kwargs):
         basename = kwargs.get("basename", "model_optim_rng.pt")
         return str(Path(checkpoints_path) / f"iter_{iteration:07d}" / "mp_rank_00" / basename)
 
+    monkeypatch.setattr(checkpointing_module, "unwrap_model", lambda model: model)
     monkeypatch.setattr(checkpointing_module, "get_checkpoint_name", fake_get_checkpoint_name)
+    monkeypatch.setattr(checkpointing_module.mpu, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(checkpointing_module.torch.distributed, "get_rank", lambda: 0)
     monkeypatch.setattr(checkpointing_module.torch.distributed, "barrier", lambda: None)
 
     result = load_biencoder_checkpoint([fake_model], only_query_model=True)
