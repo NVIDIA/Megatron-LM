@@ -7,6 +7,10 @@ from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+    HAVE_TE_NVFP4,
+    HAVE_TE_NVFP4_RECIPE,
+)
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.distributed.megatron_fsdp.utils import (
     make_gpt_mock_data_iterator,
@@ -67,17 +71,17 @@ class TestMegatronFSDPE2E:
             ValueError: If batch-size arithmetic or other setup assumptions (e.g., divisibility) are violated.
         """
         # Configuration parameters with defaults
-        VOCAB_SIZE = kwargs.get("vocab_size", 100)
-        MAX_SEQ_LEN = kwargs.get("seq_length", 128)
-        MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
-        GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
-        NUM_TRAINING_STEPS = kwargs.get("train_iters", 20)
-        TP = kwargs.get("TP", 1)
-        PP = kwargs.get("PP", 1)
-        VPP = kwargs.get("VPP", None)
-        EP = kwargs.get("EP", 1)
-        ETP = kwargs.get("ETP", 1)
-        OUTER_DP = kwargs.get("OUTER_DP", 1)
+        VOCAB_SIZE = kwargs.pop("vocab_size", 100)
+        MAX_SEQ_LEN = kwargs.pop("seq_length", 128)
+        MICRO_BATCH_SIZE = kwargs.pop("micro_batch_size", 2)
+        GLOBAL_BATCH_SIZE = kwargs.pop("global_batch_size", 32)
+        NUM_TRAINING_STEPS = kwargs.pop("train_iters", 20)
+        TP = kwargs.pop("TP", 1)
+        PP = kwargs.pop("PP", 1)
+        VPP = kwargs.pop("VPP", None)
+        EP = kwargs.pop("EP", 1)
+        ETP = kwargs.pop("ETP", 1)
+        OUTER_DP = kwargs.pop("OUTER_DP", 1)
 
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
@@ -171,17 +175,27 @@ class TestMegatronFSDPE2E:
                     fp8="e4m3",
                     fp8_param_gather=True,
                     fp8_recipe="mxfp8",
-                    main_grads_dtype="fp32",
-                    main_params_dtype="fp32",
-                    exp_avg_dtype="bf16",
-                    exp_avg_sq_dtype="bf16",
                     moe_grouped_gemm=True,
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
                     use_megatron_fsdp_v2=True,
-                    use_precision_aware_optimizer=True,
                 ),
-                id="optim_grads_params_mxfp8_param_gather_pao",
+                id="optim_grads_params_mxfp8_param_gather",
+            ),
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fp4="e2m1",
+                    fp4_recipe="nvfp4",
+                    fp4_param_gather=True,
+                    main_grads_dtype="fp32",
+                    main_params_dtype="fp32",
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
+                    use_megatron_fsdp_v2=True,
+                ),
+                id="optim_grads_params_nvfp4_param_gather",
             ),
         ],
     )
@@ -193,7 +207,21 @@ class TestMegatronFSDPE2E:
         ):
             pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
 
-        reference_kind = "fsdp_v1" if spec_configs.get("fp8_param_gather") else "distopt"
+        if spec_configs.get("fp4_param_gather"):
+            if not torch.cuda.is_available():
+                pytest.skip("CUDA is required for NVFP4")
+            if not (HAVE_TE_NVFP4 and HAVE_TE_NVFP4_RECIPE):
+                pytest.skip("NVFP4 requires Transformer Engine >= 2.7.0.dev0")
+            try:
+                from transformer_engine.pytorch.fp8 import check_nvfp4_support
+
+                is_nvfp4_available, reason = check_nvfp4_support()
+                if not is_nvfp4_available:
+                    pytest.skip("NVFP4 not available: " + reason)
+            except ImportError:
+                pytest.skip("NVFP4 support check requires Transformer Engine >= 2.7.0.dev0")
+
+        reference_kind = "distopt"
         ref_cache_key = (
             reference_kind,
             tuple(sorted(nd_topology.items())),
@@ -201,21 +229,12 @@ class TestMegatronFSDPE2E:
         )
         if ref_cache_key not in ref_cache:
             reference_spec_configs = copy.deepcopy(spec_configs)
-            if reference_kind == "fsdp_v1":
-                reference_spec_configs["use_megatron_fsdp_v2"] = False
-                reference_spec_configs.setdefault("gradient_accumulation_fusion", False)
-                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_megatron_fsdp=True,
-                    init_model_with_meta_device=True,
-                    ckpt_format="fsdp_dtensor",
-                    **nd_topology,
-                    **reference_spec_configs,
-                )
-            else:
-                reference_spec_configs["fp8_param_gather"] = False
-                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
-                )
+            reference_spec_configs["use_megatron_fsdp_v2"] = False
+            reference_spec_configs["gradient_accumulation_fusion"] = False
+            reference_spec_configs["fp8_param_gather"] = False
+            ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
+                use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
+            )
 
         fsdp_spec_configs = copy.deepcopy(spec_configs)
         fsdp_spec_configs.setdefault("gradient_accumulation_fusion", False)

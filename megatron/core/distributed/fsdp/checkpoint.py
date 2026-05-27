@@ -27,13 +27,14 @@ Provides:
 
 import logging
 import re
+from collections.abc import Mapping
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import set_state_dict as _set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 import megatron.core.parallel_state as mpu
 from megatron.core import dist_checkpointing
@@ -44,6 +45,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     make_uneven_dtensor,
     preprocess_state_dict_for_uneven_dtensor,
+    redistribute_uneven_dtensor_to_replicated,
     split_dtensor,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -111,8 +113,7 @@ class MegatronFSDPStateful(Stateful):
             state_dict["optimizer"] = optim_sd
 
         if self.args is not None:
-            _apply_mcore_postprocess(state_dict, self.args, self.model)
-
+            state_dict = _apply_mcore_postprocess(state_dict, self.args, self.model)
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -452,10 +453,12 @@ def _find_param_in_map(key: str, param_map: dict) -> Optional[DTensor]:
     param = param_map.get(key)
     if param is not None:
         return param
-    stripped = key[len(_MODULE_PREFIX) :] if key.startswith(_MODULE_PREFIX) else key
-    param = param_map.get(stripped)
-    if param is not None:
-        return param
+    stripped = key
+    while stripped.startswith(_MODULE_PREFIX):
+        stripped = stripped[len(_MODULE_PREFIX) :]
+        param = param_map.get(stripped)
+        if param is not None:
+            return param
     return param_map.get(f"{_MODULE_PREFIX}{key}")
 
 
@@ -518,7 +521,33 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
                 optim_sd["param_to_group_meta"], num_experts
             )
 
+    flattened_sd = flatten_state_dict_keys(state_dict)
+    for key, value in flattened_sd.items():
+        if isinstance(value, DTensor):
+            assert hasattr(value._local_tensor, "__create_chunk_list__"), (
+                f"DTensor for key '{key}' is missing chunk metadata. This may cause issues"
+                f" with checkpointing. Ensure that the model parameters have chunk metadata"
+                f" and that it is properly propagated."
+            )
+
     return state_dict
+
+
+def flatten_state_dict_keys(state_dict, parent_key="", sep="."):
+    """
+    Recursively flatten nested mappings inside a state_dict.
+
+    Returns a dict: { "flat.key": value }
+    """
+    items = {}
+    for k, v in state_dict.items():
+        new_key = parent_key + sep + k if parent_key else k
+        if isinstance(v, Mapping):
+            # Recurse into nested dicts (e.g., when you saved extra metadata)
+            items.update(flatten_state_dict_keys(v, new_key, sep=sep))
+        else:
+            items[new_key] = v
+    return items
 
 
 # ------------------------------------------------------------------
@@ -631,16 +660,19 @@ def _maybe_wrap_as_uneven_dtensor(tensor, dist_param: DTensor):
     DTensors.  Returns the original tensor unchanged if it is already a DTensor
     or its shape does not match the parameter's local shard.
     """
-    if isinstance(tensor, DTensor) or not isinstance(tensor, torch.Tensor):
-        return tensor
-    if tensor.shape != dist_param._local_tensor.shape:
-        return tensor
-    dt = make_uneven_dtensor(
-        tensor,
-        shape=dist_param.size(),
-        dp_mesh=dist_param.device_mesh,
-        placements=dist_param.placements,
-    )
+    if isinstance(tensor, DTensor):
+        dt = tensor
+    else:
+        if isinstance(tensor, DTensor) or not isinstance(tensor, torch.Tensor):
+            return tensor
+        if tensor.shape != dist_param._local_tensor.shape:
+            return tensor
+        dt = make_uneven_dtensor(
+            tensor,
+            shape=dist_param.size(),
+            dp_mesh=dist_param.device_mesh,
+            placements=dist_param.placements,
+        )
     copy_chunk_metadata(dist_param, dt)
     return dt
 
@@ -703,6 +735,13 @@ def _preprocess_and_verify_v2_state_dict(v2_state_dict):
     v2_model = v2_state_dict["model"]
     v2_optim_state_raw = v2_state_dict.get("optimizer", {}).get("state", {})
 
+    # ---- Propagate chunk metadata from model to state dict DTensors ----
+    model = v2_state_dict.get("_model")
+    if model is not None:
+        if isinstance(model, (list, tuple)):
+            model = model[0]
+        _propagate_chunk_metadata_to_state_dict(model, v2_model)
+
     # ---- Strip ``module.`` prefix from optimizer state keys ----
     # Copy inner dicts so DTensor wrapping below does not mutate
     # the original state dict (optimizer.load_state_dict needs plain tensors).
@@ -746,8 +785,18 @@ def _preprocess_and_verify_v2_state_dict(v2_state_dict):
             )
 
     # ---- Verify optimizer state DTensors have chunk metadata ----
+    # Also propagate metadata for states that are already DTensors
+    # (_maybe_wrap_as_uneven_dtensor only copies metadata when wrapping
+    # plain tensors, not for pre-existing DTensors).
     for param_name, states in v2_optim_state.items():
+        dist_param = param_map.get(param_name)
         for sk, sv in states.items():
+            if (
+                isinstance(sv, DTensor)
+                and dist_param is not None
+                and hasattr(dist_param._local_tensor, "__create_chunk_list__")
+            ):
+                copy_chunk_metadata(dist_param, sv)
             if hasattr(sv, "_local_tensor"):
                 lt = sv._local_tensor
                 assert hasattr(lt, "__create_chunk_list__"), (
@@ -793,211 +842,301 @@ def reverse_normalize_torch_dist_key(key: str) -> str:
 # ------------------------------------------------------------------
 
 
+# Regex patterns for detecting fused vs per-layer/per-expert keys.
+# Torch_dist fuses across layers: <prefix>.layers.{field}  (no layer index)
+# v2 has per-layer:               <prefix>.layers.{N}.{field}
+# Torch_dist fuses experts:       <prefix>.layers.{field}.mlp.experts.experts.{fc}.weight
+# v2 has per-expert:              <prefix>.layers.{N}.{field}.mlp.experts.{fc}.weight{M}
+_LAYERED_KEY_RE = re.compile(r'^(.+\.)?layers\.(\d+)\.(.+)$')
+_EXPERT_V2_KEY_RE = re.compile(r'(.+\.)?mlp\.experts\.linear_fc([12])\.weight(\d+)$')
+_SEQ_EXPERT_FIELD_RE = re.compile(
+    r'(?:.+\.)?mlp\.experts\.local_experts\.(\d+)\.(linear_fc[12])\.weight$'
+)
+
+
+def _strip_module_prefix(key: str) -> str:
+    """Strip leading 'module.' from a key string."""
+    return key[len("module.") :] if key.startswith("module.") else key
+
+
 def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
-    """Build a map from torch_dist checkpoint keys to Megatron FSDP v2 DTensors.
+    """Build maps from torch_dist checkpoint keys to Megatron FSDP v2 DTensors.
 
-    Iterates through the torch_dist metadata and matches each key to the
-    corresponding v2 model or optimizer state entry, categorizing entries
-    as regular model weights, high-precision (``param``) copies, or
-    optimizer state tensors (``exp_avg``, ``exp_avg_sq``).
-
-    Args:
-        metadata: torch_dist checkpoint metadata dict.
-        v2_by_canonical: ``{canonical_name: model_DTensor}`` from
-            :func:`_preprocess_and_verify_v2_state_dict`.
-        v2_optim_state: ``{canonical_name: {state_key: DTensor}}`` from
-            :func:`_preprocess_and_verify_v2_state_dict`.
+    Automatically handles fused layer tensors by matching
+    ``decoder.layers.{N}.{field}`` (v2) against
+    ``decoder.layers.{field}`` (torch_dist) — no hardcoded field paths.
 
     Returns:
-        regular_model: ``{torch_dist_key: v2_DTensor}`` for regular model weights.
-        hi_prec_model: ``{torch_dist_param_name: v2_DTensor}`` for high-precision
-            model param copies.
-        optim_keys: ``{torch_dist_key: v2_state_DTensor}`` for optimizer states.
+        regular_model: ``{td_key: v2_DTensor}`` for 1:1 params.
+        fused_layer_groups: ``{td_key: [(v2_key, v2_val, layer_idx), ...]}``
+            for fused layer params to be loaded/sliced in Phase 4.
+        hi_prec_model: ``{td_param_name: v2_DTensor}`` for high-precision copies.
+        optim_keys: ``{td_key: v2_state_DTensor}`` for 1:1 optimizer states.
         optim_matched: ``set`` of canonical param names with matched optimizer states.
     """
     regular_model = {}
+    fused_layer_groups = {}
     hi_prec_td_keys = set()
     hi_prec_model = {}
     optim_keys = {}
     optim_matched = set()
 
-    for td_key in metadata:
-        if td_key.startswith("optimizer.state."):
-            rest = td_key[len("optimizer.state.") :]
-            parts = rest.split(".", 1)
-            if rest.startswith("param."):
-                param_name_td = rest[len("param.") :]
-                param_canonical = _canonicalize_td_key(param_name_td, strip_model_prefix=False)
-                while param_canonical.startswith("module."):
-                    param_canonical = param_canonical[len("module.") :]
-                if param_canonical in v2_by_canonical:
-                    hi_prec_model[param_name_td] = v2_by_canonical[param_canonical]
-                    hi_prec_td_keys.add(param_canonical)
-            elif len(parts) == 2:
-                state_key, param_name_td = parts
-                param_canonical = _canonicalize_td_key(param_name_td, strip_model_prefix=False)
-                while param_canonical.startswith("module."):
-                    param_canonical = param_canonical[len("module.") :]
-                if (
-                    param_canonical in v2_optim_state
-                    and state_key in v2_optim_state[param_canonical]
-                ):
-                    optim_keys[td_key] = v2_optim_state[param_canonical][state_key]
-                    optim_matched.add(param_canonical)
-        else:
-            canonical = _canonicalize_td_key(td_key)
-            while canonical.startswith("module."):
-                canonical = canonical[len("module.") :]
-            if canonical in v2_by_canonical and canonical not in hi_prec_td_keys:
-                load_key = td_key[len("model.") :] if td_key.startswith("model.") else td_key
-                regular_model[load_key] = v2_by_canonical[canonical]
+    # ------------------------------------------------------------------
+    # Helper: given a v2 canonical key with layer index, derive the
+    # torch_dist fused key (if the fused key exists in metadata).
+    # ------------------------------------------------------------------
+    def _match_fused_key(v2_canonical, value=None):
+        """Return match info for a v2 key whose fused counterpart exists in metadata.
 
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "torch_dist → v2 mapping: %d metadata keys → %d regular model + "
-            "%d hi-prec params + %d optimizer keys matched (%d unique params)",
-            len(metadata),
-            len(regular_model),
-            len(hi_prec_model),
-            len(optim_keys),
-            len(optim_matched),
-        )
-    return regular_model, hi_prec_model, optim_keys, optim_matched
+        Returns:
+            ``(td_key, layer_idx)`` for regular fused-layer keys and GroupedMLP keys.
+            ``(td_key, local_expert_idx, "seq_mlp")`` for SequentialMLP expert keys.
+            ``None`` if no fused counterpart was found.
+        """
+        m = _LAYERED_KEY_RE.match(v2_canonical)
+        if not m:
+            return None
+        prefix = m.group(1) or ""  # e.g. "decoder." or ""
+        layer_idx = int(m.group(2))
+        field = m.group(3)
 
+        # ---- Check SequentialMLP expert format first ----
+        # v2:   ``{sub_layer}mlp.experts.local_experts.{N}.linear_fc{1|2}.weight``
+        #       (sub_layer may be empty or e.g. ``mtp_model_layer.`` for MTP)
+        # td:   ``{prefix}layers.{layer_idx}.{sub_layer}mlp.experts.experts.linear_fc{1|2}.weight``
+        seq_exp_m = _SEQ_EXPERT_FIELD_RE.match(field)
+        if seq_exp_m:
+            local_expert_idx = int(seq_exp_m.group(1))
+            fc_type = seq_exp_m.group(2)
+            # Extract sub-layer prefix (if any) before ``mlp.experts.local_experts``
+            sub_layer_prefix = ""
+            if not field.startswith("mlp.experts.local_experts."):
+                idx = field.find("mlp.experts.local_experts.")
+                if idx > 0:
+                    sub_layer_prefix = field[:idx]  # e.g. "mtp_model_layer."
+            td_base = (
+                f"{prefix}layers.{layer_idx}."
+                f"{sub_layer_prefix}mlp.experts.experts.{fc_type}.weight"
+            )
+            td_base = reverse_normalize_torch_dist_key(td_base)
+            candidates = [td_base]
+            candidates.append(f"model.{td_base}")
+            candidates.append(f"module.{td_base}")
+            candidates.append(f"model.module.{td_base}")
+            for c in candidates:
+                if c in metadata:
+                    return c, local_expert_idx, "seq_mlp"
+            return None
 
-# ------------------------------------------------------------------
-# Expert parameter loading (torch_dist flattened → v2 individual)
-# ------------------------------------------------------------------
+        # ---- Build fused key (strip layer index) ----
+        # v2:   ``{prefix}layers.{N}.{field}``
+        # td:   ``{prefix}layers.{field}`` (no layer index)
+        fused_base = f"{prefix}layers.{field}"
 
+        candidates = [fused_base]
+        # Torch_dist metadata may have "model." prefix
+        candidates.append(f"model.{fused_base}")
+        candidates.append(f"module.{fused_base}")
+        candidates.append(f"model.module.{fused_base}")
 
-_EXPERT_KEY_RE = re.compile(r'^(.+)\.mlp\.experts\.local_experts\.(\d+)\.(linear_fc[12])\.weight$')
-_SHARD_SUFFIX_RE = re.compile(r'/shard_\d+_\d+$')
+        # For GroupedMLP expert params: v2 uses "experts.linear_fc1.weight{N}"
+        # torch_dist uses "experts.experts.linear_fc1.weight"
+        exp_m = _EXPERT_V2_KEY_RE.search(field)
+        if exp_m:
+            fc_type = exp_m.group(2)
+            field_exp = (
+                _EXPERT_V2_KEY_RE.sub(rf"mlp.experts.experts.linear_fc\2.weight", field).rstrip(
+                    ".weight"
+                )
+                + ".weight"
+            )
+            fused_exp = f"{prefix}layers.{field_exp}"
+            candidates.append(fused_exp)
+            candidates.append(f"model.{fused_exp}")
 
+        for c in candidates:
+            if c in metadata:
+                return c, layer_idx
 
-def _load_expert_params_from_torch_dist(
-    checkpoint_name, v2_state_dict, v2_optim_state, mapped_sd, metadata, optim_matched=None
-):
-    """Load MoE expert params from torch_dist flattened format into v2 DTensors.
+        # Debug: log first failure per unique field
+        if not hasattr(_match_fused_key, '_logged'):
+            _match_fused_key._logged = set()
+        if field not in _match_fused_key._logged:
+            _match_fused_key._logged.add(field)
+            if not v2_canonical.endswith("._extra_state"):
+                logger.warning(
+                    "Fused key not found in metadata for v2_key='%s' (field='%s'). "
+                    "Tried candidates: %s",
+                    v2_canonical,
+                    field,
+                    candidates,
+                )
+        return None
 
-    In torch_dist checkpoints, expert parameters are stored as a single
-    flattened tensor (e.g. ``experts.experts.linear_fc1.weight`` with
-    shape ``(num_global_experts, H, W)``, EP-sharded).  FSDP v2 stores
-    each local expert as its own DTensor
-    (``local_experts.0.linear_fc1.weight``, shape ``(H, W)``).
+    # ------------------------------------------------------------------
+    # Phase A: Model weights
+    # ------------------------------------------------------------------
+    # Debug: log sample metadata keys on first call
+    _sample_keys = sorted(k for k in metadata if not k.startswith("optimizer."))
+    logger.debug(
+        "DCP metadata has %d non-optimizer keys. Sample: %s", len(_sample_keys), _sample_keys[:10]
+    )
 
-    Handles both model weights and optimizer state tensors
-    (``exp_avg``, ``exp_avg_sq``) for expert parameters.  Loads the
-    flattened tensor into a temporary buffer and then uses each
-    DTensor's chunk metadata (``__create_chunk_list__``) to copy the
-    correct slice.
-    """
-    loaded = mapped_sd.get("model", {})
-    v2_model = v2_state_dict["model"]
-
-    # Collect expert entries from model weights and optimizer states.
-    # Each entry is (base, local_idx, fc_type, v2_key, v2_dtensor).
-    model_experts = []
-    optim_experts = []  # (base, local_idx, fc_type, state_key, param_name, v2_dtensor)
-    for v2_key, v2_val in v2_model.items():
-        m = _EXPERT_KEY_RE.match(v2_key)
-        if not m or v2_key in loaded:
+    for v2_key, v2_val in v2_by_canonical.items():
+        result = _match_fused_key(v2_key, v2_val)
+        if result:
+            if len(result) == 3 and result[2] == "seq_mlp":
+                # SequentialMLP: (td_key, local_expert_idx, "seq_mlp")
+                td_key, local_expert_idx, _ = result
+                fused_layer_groups.setdefault(td_key, []).append(
+                    (v2_key, v2_val, local_expert_idx, "seq_mlp")
+                )
+            else:
+                # Fused layer or GroupedMLP: (td_key, layer_idx)
+                td_key, layer_idx = result
+                exp_m = _EXPERT_V2_KEY_RE.match(v2_key)
+                if exp_m:
+                    expert_idx = int(exp_m.group(3))
+                    fused_layer_groups.setdefault(td_key, []).append(
+                        (v2_key, v2_val, layer_idx, expert_idx)
+                    )
+                else:
+                    fused_layer_groups.setdefault(td_key, []).append((v2_key, v2_val, layer_idx))
             continue
-        base = m.group(1)
-        idx = int(m.group(2))
-        fc_type = m.group(3)
-        model_experts.append((base, idx, fc_type, v2_key, v2_val))
+        # Not fused — check 1:1
+        if v2_key in metadata:
+            regular_model[v2_key] = v2_val
+            continue
+        m_key = f"module.{v2_key}"
+        if m_key in metadata:
+            regular_model[m_key] = v2_val
+            continue
 
+    # ------------------------------------------------------------------
+    # Phase B: Optimizer states (exp_avg / exp_avg_sq) & hi-prec (param)
+    # ------------------------------------------------------------------
+
+    # Phase B1: Build fused_layer_groups for optimizer state params
+    # that have fused counterparts in the torch_dist checkpoint.
+    # Handles three formats: regular fused layer, GroupedMLP, SequentialMLP.
     for param_name, states in v2_optim_state.items():
-        m = _EXPERT_KEY_RE.match(param_name)
+        m = _LAYERED_KEY_RE.match(param_name)
         if not m:
             continue
-        base = m.group(1)
-        idx = int(m.group(2))
-        fc_type = m.group(3)
-        for sk in ("exp_avg", "exp_avg_sq"):
-            if sk in states:
-                optim_experts.append((base, idx, fc_type, sk, param_name, states[sk]))
+        prefix = m.group(1) or ""
+        layer_idx = int(m.group(2))
+        field = m.group(3)
 
-    if not model_experts and not optim_experts:
-        return
+        # Check SequentialMLP expert format first
+        seq_exp_m = _SEQ_EXPERT_FIELD_RE.match(field)
+        if seq_exp_m:
+            local_expert_idx = int(seq_exp_m.group(1))
+            fc_type = seq_exp_m.group(2)
+            # Extract sub-layer prefix (if any) before ``mlp.experts.local_experts``
+            sub_layer_prefix = ""
+            if not field.startswith("mlp.experts.local_experts."):
+                idx = field.find("mlp.experts.local_experts.")
+                if idx > 0:
+                    sub_layer_prefix = field[:idx]  # e.g. "mtp_model_layer."
+            for sk, sv in states.items():
+                if sk not in ("exp_avg", "exp_avg_sq"):
+                    continue
+                fused_base = (
+                    f"optimizer.state.{sk}."
+                    f"{prefix}layers.{layer_idx}."
+                    f"{sub_layer_prefix}mlp.experts.experts.{fc_type}.weight"
+                )
+                fused_base = reverse_normalize_torch_dist_key(fused_base)
+                td_opt_key = None
+                for candidate in [fused_base, f"model.{fused_base}"]:
+                    if candidate in metadata:
+                        td_opt_key = candidate
+                        break
+                if td_opt_key is None:
+                    continue
+                fused_layer_groups.setdefault(td_opt_key, []).append(
+                    (param_name, sv, local_expert_idx, "seq_mlp")
+                )
+                optim_matched.add(param_name)
+            continue
 
-    import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+        # Check GroupedMLP expert format
+        fused_base = f"{prefix}layers.{field}"
+        exp_m = _EXPERT_V2_KEY_RE.search(field)
+        if exp_m:
+            fc_type = exp_m.group(2)
+            field_exp = (
+                _EXPERT_V2_KEY_RE.sub(rf"mlp.experts.experts.linear_fc\2.weight", field).rstrip(
+                    ".weight"
+                )
+                + ".weight"
+            )
+            fused_base = f"{prefix}layers.{field_exp}"
+            expert_idx = int(exp_m.group(3))
+        else:
+            expert_idx = None
 
-    def _group_and_load(expert_entries, is_optim_state=False):
-        """Group expert entries by (base, fc_type) and load via DCP."""
-        groups = {}
-        for entry in expert_entries:
-            if is_optim_state:
-                base, idx, fc_type, state_key, param_name, v2_val = entry
-                key = (base, fc_type, state_key)
-            else:
-                base, idx, fc_type, v2_key, v2_val = entry
-                key = (base, fc_type)
-            groups.setdefault(key, []).append(entry)
-
-        for key, entries in groups.items():
-            entries.sort(key=lambda x: x[1])  # sort by local_idx
-            num_local = len(entries)
-            if is_optim_state:
-                base, fc_type, state_key = key
-                example_dt = entries[0][5]  # v2_val at index 5
-                td_flat_key = (
-                    f"optimizer.state.{state_key}."
-                    f"{reverse_normalize_torch_dist_key(base).removeprefix('module.')}."
-                    f"mlp.experts.experts.{fc_type}.weight"
+        for sk, sv in states.items():
+            if sk not in ("exp_avg", "exp_avg_sq"):
+                continue
+            td_opt_key = None
+            for candidate in [
+                f"optimizer.state.{sk}.{fused_base}",
+                f"optimizer.state.{sk}.model.{fused_base}",
+            ]:
+                if candidate in metadata:
+                    td_opt_key = candidate
+                    break
+            if td_opt_key is None:
+                continue
+            if expert_idx is not None:
+                fused_layer_groups.setdefault(td_opt_key, []).append(
+                    (param_name, sv, layer_idx, expert_idx)
                 )
             else:
-                base, fc_type = key
-                example_dt = entries[0][4]  # v2_val at index 4
-                td_flat_key = (
-                    f"{reverse_normalize_torch_dist_key(base).removeprefix('module.')}."
-                    f"mlp.experts.experts.{fc_type}.weight"
-                )
+                fused_layer_groups.setdefault(td_opt_key, []).append((param_name, sv, layer_idx))
+            optim_matched.add(param_name)
 
-            full_shape = example_dt.shape
-            td_meta = metadata.get(td_flat_key)
-            assert (
-                td_meta is not None
-            ), f"Metadata for {td_flat_key} not found in torch_dist checkpoint"
-            num_total_experts = td_meta.size[0]
+    # Phase B2: Handle remaining metadata entries (1:1 optimizer keys + hi-prec)
+    for td_key in metadata:
+        if not td_key.startswith("optimizer.state."):
+            continue
+        rest = td_key[len("optimizer.state.") :]
+        parts = rest.split(".", 1)
 
-            local_flat = torch.empty(
-                (num_total_experts,) + full_shape, dtype=example_dt.dtype, device=example_dt.device
-            )
-            dcp.load(
-                state_dict={td_flat_key: local_flat},
-                checkpoint_id=checkpoint_name,
-                planner=DefaultLoadPlanner(allow_partial_load=True),
-            )
+        if rest.startswith("param."):
+            param_name_td = rest[len("param.") :]
+            param_canonical = _canonicalize_td_key(param_name_td, strip_model_prefix=False)
+            param_canonical = _strip_module_prefix(param_canonical)
+            if param_canonical in v2_by_canonical:
+                hi_prec_model[param_name_td] = v2_by_canonical[param_canonical]
+                hi_prec_td_keys.add(param_canonical)
+            continue
 
-            ep_rank = mpu.get_expert_model_parallel_rank()
-            for i, entry in enumerate(entries):
-                if is_optim_state:
-                    _, local_idx, _, state_key, param_name, v2_val = entry
-                else:
-                    _, local_idx, _, v2_key, v2_val = entry
-                global_idx = ep_rank * num_local + local_idx
-                full_expert = local_flat[global_idx]
-                local_tensor = v2_val._local_tensor
+        if len(parts) != 2:
+            continue
+        state_key, param_name_td = parts
+        param_canonical = _canonicalize_td_key(param_name_td, strip_model_prefix=False)
+        param_canonical = _strip_module_prefix(param_canonical)
 
-                local_off = 0
-                for chunk in local_tensor.__create_chunk_list__():
-                    off = chunk.offsets
-                    sz = chunk.sizes
-                    src = full_expert[off[0] : off[0] + sz[0], off[1] : off[1] + sz[1]]
-                    local_tensor[local_off : local_off + sz[0], : sz[1]].copy_(src)
-                    local_off += sz[0]
-                if not is_optim_state:
-                    loaded[v2_key] = v2_val
-                elif optim_matched is not None:
-                    canonical_param = param_name
-                    while canonical_param.startswith("module."):
-                        canonical_param = canonical_param[len("module.") :]
-                    optim_matched.add(canonical_param)
+        # Try 1:1 match. Fused-layer matching is handled by Phase B1 above.
+        if param_canonical in v2_optim_state and state_key in v2_optim_state[param_canonical]:
+            optim_keys[td_key] = v2_optim_state[param_canonical][state_key]
+            optim_matched.add(param_canonical)
 
-    _group_and_load(model_experts, is_optim_state=False)
-    _group_and_load(optim_experts, is_optim_state=True)
+    if logger.isEnabledFor(logging.DEBUG):
+        total_fused = sum(len(v) for v in fused_layer_groups.values())
+        logger.debug(
+            "torch_dist → v2: %d metadata keys → %d regular + %d fused (%d groups) "
+            "+ %d hi-prec + %d optim matched",
+            len(metadata),
+            len(regular_model),
+            total_fused,
+            len(fused_layer_groups),
+            len(hi_prec_model),
+            len(optim_matched),
+        )
+    return regular_model, fused_layer_groups, hi_prec_model, optim_keys, optim_matched
 
 
 # ------------------------------------------------------------------
@@ -1034,7 +1173,6 @@ def _canonicalize_td_key(td_key, *, strip_model_prefix=True):
         key = td_key[len("model.") :]
     else:
         key = td_key
-    key = _SHARD_SUFFIX_RE.sub('', key)
     key = normalize_torch_dist_key(key)
     return key
 
@@ -1048,14 +1186,15 @@ def load_torch_dist_into_fsdp_v2(args, checkpoint_name, v2_state_dict, strict=Tr
 
     The conversion proceeds in five phases:
 
-    1. **Preprocess & verify** the v2 state dict: wrap optimizer states
-       as uneven DTensors and verify ``__create_chunk_list__`` /
-       ``__create_write_items__`` metadata.
-    2. **Build name mapping** between torch_dist keys and v2 DTensors.
-    3. **DCP load** the mapped state dict (regular weights + optimizer states).
-    4. **Expert params**: load separately because torch_dist stores experts
-       as concatenated tensors while v2 stores them individually.
-    5. **Verify**: when ``strict=True``, ensure every v2 model param and
+    1. **Preprocess & verify** — wrap optimizer states as uneven DTensors
+       and verify ``__create_chunk_list__`` / ``__create_write_items__`` metadata.
+    2. **Build name mapping** — match torch_dist metadata keys to v2 DTensors,
+       handling fused layers, GroupedMLP, and SequentialMLP expert formats.
+    3. **DCP load 1:1 entries** — load regular model weights and optimizer
+       states that have a direct 1:1 correspondence in the torch_dist checkpoint.
+    4. **Load fused entries** — load fused (multi-layer and/or multi-expert)
+       tensors and slice them into per-layer/per-expert v2 DTensors.
+    5. **Verify** — when ``strict=True``, ensure every v2 model param and
        optimizer state was loaded from the torch_dist checkpoint.  When
        ``strict=False``, unmatched entries are logged as warnings instead
        of raising errors.
@@ -1070,8 +1209,8 @@ def load_torch_dist_into_fsdp_v2(args, checkpoint_name, v2_state_dict, strict=Tr
     # ---- Phase 2: Read torch_dist metadata & build name mapping ----
     reader = FileSystemReader(checkpoint_name)
     metadata = reader.read_metadata().state_dict_metadata
-    regular_model, hi_prec_model, optim_keys, optim_matched = _build_torch_dist_to_v2_map(
-        metadata, v2_by_canonical, v2_optim_state
+    regular_model, fused_layer_groups, hi_prec_model, optim_keys, optim_matched = (
+        _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state)
     )
 
     # ---- Phase 3: Build & load mapped state dict via DCP ----
@@ -1099,17 +1238,95 @@ def load_torch_dist_into_fsdp_v2(args, checkpoint_name, v2_state_dict, strict=Tr
 
     # Merge hi-precision model params back so the model subtree is complete.
     if hi_prec_model:
-        mapped_sd.setdefault("model", {}).update(
-            {k: v for k, v in hi_prec_model.items() if k not in mapped_sd.get("model", {})}
+        mapped_sd.update({k: v for k, v in hi_prec_model.items() if k not in mapped_sd})
+
+    # ---- Phase 4: Load fused layer / expert params by slicing ----
+    # Handles three tensor formats:
+    #   Regular fused:  shape (num_layers, ...)            → flat[layer_idx]
+    #   GroupedMLP:     shape (num_layers, num_experts, ...) → flat[layer_idx, expert_idx]
+    #   SequentialMLP:  shape (num_global_experts, ...)     → flat[global_expert_idx]
+    #
+    # Entry types by tag:
+    #   (v2_key, v2_val, layer_idx)                      → regular fused layer
+    #   (v2_key, v2_val, layer_idx, expert_idx)           → GroupedMLP expert
+    #   (v2_key_or_param_name, v2_val, local_expert_idx, "seq_mlp") → SequentialMLP expert
+    for td_key, entries in fused_layer_groups.items():
+        td_meta = metadata.get(td_key)
+        assert td_meta is not None, f"Missing metadata for fused key '{td_key}'"
+        first_entry = entries[0]
+        is_seq_mlp = len(first_entry) >= 4 and first_entry[-1] == "seq_mlp"
+        is_grouped_mlp = len(first_entry) >= 4 and not is_seq_mlp
+
+        entries.sort(key=lambda x: x[2])  # sort by layer_idx / local_expert_idx
+        example_val = entries[0][1]  # v2_val (model) or optimizer state tensor
+
+        # Build the full fused tensor shape and compute slicing
+        fused_shape = list(example_val.shape)
+        if is_seq_mlp:
+            num_total_experts = td_meta.size[0]
+            fused_shape.insert(0, num_total_experts)
+            num_local = len(entries)
+            ep_rank = mpu.get_expert_model_parallel_rank()
+        elif is_grouped_mlp:
+            num_layers = td_meta.size[0]
+            num_experts = td_meta.size[1]
+            fused_shape.insert(0, num_experts)
+            fused_shape.insert(0, num_layers)
+        else:
+            num_layers = td_meta.size[0]
+            fused_shape.insert(0, num_layers)
+
+        # Use a Shard(0) DTensor so the large fused tensor is distributed
+        # across DP ranks during DCP load, avoiding OOM on a single rank
+        # (e.g. for GroupedMLP with many layers × experts).
+        device_mesh = example_val.device_mesh if isinstance(example_val, DTensor) else None
+        if device_mesh is not None:
+            flat = torch.distributed.tensor.empty(
+                fused_shape, dtype=example_val.dtype, device_mesh=device_mesh, placements=[Shard(0)]
+            )
+        else:
+            flat = torch.empty(fused_shape, dtype=example_val.dtype, device=example_val.device)
+
+        dcp.load(
+            state_dict={td_key: flat},
+            checkpoint_id=checkpoint_name,
+            planner=DefaultLoadPlanner(allow_partial_load=True),
         )
 
-    # ---- Phase 4: Load expert params separately ----
-    _load_expert_params_from_torch_dist(
-        checkpoint_name, v2_state_dict, v2_optim_state, mapped_sd, metadata, optim_matched
-    )
+        # Gather shards back into a full local tensor for per-layer slicing.
+        if device_mesh is not None and isinstance(flat, DTensor):
+            flat = redistribute_uneven_dtensor_to_replicated(flat).to_local()
+
+        for i, entry in enumerate(entries):
+            if is_seq_mlp:
+                v2_key_or_param, v2_val, local_expert_idx = entry[:3]
+                chunk = flat[ep_rank * num_local + local_expert_idx]
+            elif is_grouped_mlp:
+                v2_key_or_param, v2_val, layer_idx, expert_idx = entry[:4]
+                chunk = flat[layer_idx, expert_idx]
+            else:
+                v2_key_or_param, v2_val, layer_idx = entry[:3]
+                chunk = flat[layer_idx]
+            if isinstance(v2_val, DTensor):
+                lt = v2_val._local_tensor
+                if lt.numel() != 0:
+                    local_off = 0
+                    for c in lt.__create_chunk_list__():
+                        off = c.offsets
+                        sz = c.sizes
+                        src_idx = tuple(slice(o, o + s) for o, s in zip(off, sz))
+                        src = chunk[src_idx]
+                        dst_idx = (slice(local_off, local_off + sz[0]),) + tuple(
+                            slice(0, s) for s in sz[1:]
+                        )
+                        lt[dst_idx].copy_(src)
+                        local_off += sz[0]
+            else:
+                v2_val.copy_(chunk)
+            mapped_sd[v2_key_or_param] = v2_val
 
     # ---- Phase 5: Verify all v2 params & optimizer states were loaded ----
-    loaded = set(_canonicalize_td_key(k) for k in mapped_sd.get("model", {}).keys())
+    loaded = set(_canonicalize_td_key(k) for k in mapped_sd)
     all_v2 = set(v2_by_canonical.keys())
     unloaded = all_v2 - loaded - {k for k in all_v2 if k.endswith("._extra_state")}
 
@@ -1120,6 +1337,7 @@ def load_torch_dist_into_fsdp_v2(args, checkpoint_name, v2_state_dict, strict=Tr
             raise RuntimeError(
                 f"{len(unloaded)} v2 model parameters were not loaded from the "
                 f"torch_dist checkpoint. Unloaded params: {sorted(unloaded)}"
+                f" loaded: {sorted(loaded)}"
             )
         if v2_optim_unmatched:
             raise RuntimeError(

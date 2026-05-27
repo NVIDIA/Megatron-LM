@@ -55,6 +55,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
         FullyShardFP8Policy,
         FullyShardMixedPrecisionPolicy,
+        FullyShardNVFP4Policy,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -258,6 +259,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 enabled=ddp_config.fp8_param_gather,
                 recipe=config.fp8_recipe,
                 keep_transpose_cache=ddp_config.keep_fp8_transpose_cache,
+            ),
+            nvfp4=FullyShardNVFP4Policy(
+                enabled=ddp_config.fp4_param_gather, recipe=config.fp4_recipe
             ),
         )
         kwargs = {
