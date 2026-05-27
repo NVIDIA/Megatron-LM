@@ -329,8 +329,6 @@ class TEGroupedMLP(MegatronModule):
         # Check for unsupported features
         if self.tp_group.size() > 1:
             return False  # Tensor parallelism is not supported
-        if self.offload_expert_fc1 or self.offload_moe_act:
-            return False  # Fine-grained activation offloading is not supported
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
 
@@ -415,6 +413,9 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
+        fused_activation_offloading = self.offload_expert_fc1 or self.offload_moe_act
+        if fused_activation_offloading:
+            op.activation_offloading = self.offload_expert_fc1
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
         if fc1_single_grouped_weight:
@@ -489,6 +490,8 @@ class TEGroupedMLP(MegatronModule):
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
+        if fused_activation_offloading:
+            op.activation_offloading = self.offload_moe_act
         ops.append(op)
 
         # FC2
@@ -603,13 +606,32 @@ class TEGroupedMLP(MegatronModule):
             )
         else:
             stash_context = nullcontext()
-        with stash_context:
-            # Call fused impl
-            output = ops(
-                permuted_local_hidden_states,
-                tokens_per_expert,  # FC1
-                permuted_probs,  # Scaled SwiGLU
-                tokens_per_expert,  # FC2
+        fused_activation_offloading = self.offload_expert_fc1 or self.offload_moe_act
+        offload_name = "_".join(
+            name
+            for name, enabled in (
+                ("expert_fc1", self.offload_expert_fc1),
+                ("moe_act", self.offload_moe_act),
+            )
+            if enabled
+        )
+        with off_interface(
+            fused_activation_offloading, permuted_local_hidden_states, offload_name
+        ) as permuted_local_hidden_states:
+            forced_released_tensors = (
+                [permuted_local_hidden_states] if self.offload_expert_fc1 else []
+            )
+            with stash_context:
+                # Call fused impl
+                output = ops(
+                    permuted_local_hidden_states,
+                    tokens_per_expert,  # FC1
+                    permuted_probs,  # Scaled activation
+                    tokens_per_expert,  # FC2
+                )
+        if fused_activation_offloading:
+            output = off_interface.group_commit(
+                output, name=offload_name, forced_released_tensors=forced_released_tensors
             )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
