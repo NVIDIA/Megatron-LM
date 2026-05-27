@@ -857,14 +857,6 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             else:
                 hybrid_stack_spec = default_hybrid_stack_spec
 
-        assert (
-            getattr(transformer_config, "virtual_pipeline_model_parallel_size", None) is None
-            and vp_stage is None
-        ), (
-            "Virtual pipeline model parallelism is temporarily unsupported in Hybrid "
-            "models due to upstream MCore HybridModel API dependency"
-        )
-
         if self._model_config.is_recipe_config:
             pre_process = pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
             post_process = post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)

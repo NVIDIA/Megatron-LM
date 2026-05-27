@@ -64,6 +64,12 @@ class HybridStack(MegatronModule):
         layer_type_list (list, optional): pre-computed list of layer type symbols for
             this pipeline segment. When provided (by HybridModel), pipeline stage
             selection has already been done via '|' separators in the pattern.
+        layer_config_list (list[TransformerConfig], optional): per-layer
+            :class:`TransformerConfig` instances, parallel to ``layer_type_list``.
+            When provided (by HybridModel built via the Python layer-pattern DSL),
+            each layer is constructed with its own per-layer config instead of the
+            stack-level ``config``. When ``None``, every layer uses ``config``,
+            preserving the legacy string-pattern path byte-for-byte.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
             segment. Defaults to 0.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -83,6 +89,7 @@ class HybridStack(MegatronModule):
         submodules: HybridStackSubmodules,
         pre_process: bool = True,
         layer_type_list: Optional[list[str]] = None,
+        layer_config_list: Optional[list[TransformerConfig]] = None,
         pp_layer_offset: int = 0,
         post_layer_norm: bool = True,
         post_process: bool = True,
@@ -117,6 +124,13 @@ class HybridStack(MegatronModule):
         )
         self.layer_type_list = layer_type_list
 
+        if layer_config_list is not None and len(layer_config_list) != len(layer_type_list):
+            raise ValueError(
+                f"layer_config_list length ({len(layer_config_list)}) must match "
+                f"layer_type_list length ({len(layer_type_list)})."
+            )
+        self.layer_config_list = layer_config_list
+
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
 
@@ -124,6 +138,11 @@ class HybridStack(MegatronModule):
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
             layer_number = i + 1 + pp_layer_offset
+            # Per-layer config from the Python DSL when provided; otherwise
+            # every layer uses the stack-level config (legacy string-pattern path).
+            per_layer_config = (
+                layer_config_list[i] if layer_config_list is not None else self.config
+            )
             if self.config.fp8:
                 quant_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
             elif self.config.fp4:
@@ -134,7 +153,7 @@ class HybridStack(MegatronModule):
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
-                        config=self.config,
+                        config=per_layer_config,
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
@@ -143,7 +162,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
                         submodules.attention_layer,
-                        config=self.config,
+                        config=per_layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -154,7 +173,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
                         submodules.dsa_layer,
-                        config=self.config,
+                        config=per_layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -175,7 +194,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.MLP:
                     layer = build_module(
                         submodules.mlp_layer,
-                        config=self.config,
+                        config=per_layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
@@ -184,7 +203,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
                         submodules.moe_layer,
-                        config=self.config,
+                        config=per_layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
@@ -193,7 +212,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.GDN:
                     layer = build_module(
                         submodules.gdn_layer,
-                        config=self.config,
+                        config=per_layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
