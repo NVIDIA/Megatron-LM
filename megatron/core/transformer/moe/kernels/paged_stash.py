@@ -6,9 +6,11 @@ import triton.language as tl
 
 GLOBAL_BLOCK_SIZE = 1024
 
+__all__ = ["GLOBAL_BLOCK_SIZE", "paged_stash_copy_kernel", "paged_stash_pop_kernel"]
+
 
 @triton.jit
-def _paged_stash_copy_kernel(
+def paged_stash_copy_kernel(
     src_ptr,
     cuda_dst_ptr,
     host_dst_ptr,
@@ -142,7 +144,7 @@ def _paged_stash_copy_kernel(
 
 
 @triton.jit
-def _paged_stash_pop_kernel(
+def paged_stash_pop_kernel(
     cuda_src_ptr,
     host_src_ptr,
     dst_ptr,
@@ -161,7 +163,7 @@ def _paged_stash_pop_kernel(
 ):
     """Restore variable-length MoE activations from a paged buffer (CUDA, or pinned host).
 
-    Inverse of _paged_stash_copy_kernel. Uses a custom Triton kernel for the same
+    Inverse of paged_stash_copy_kernel. Uses a custom Triton kernel for the same
     reasons: runtime token count and stash metadata live on device, so the reload,
     page_record lookup, and freelist recycle must fuse on-GPU without host sync.
 

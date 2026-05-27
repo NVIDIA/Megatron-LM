@@ -11,8 +11,8 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.moe.kernels.paged_stash import (
     GLOBAL_BLOCK_SIZE,
-    _paged_stash_copy_kernel,
-    _paged_stash_pop_kernel,
+    paged_stash_copy_kernel,
+    paged_stash_pop_kernel,
 )
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -219,7 +219,7 @@ class PagedTensor:
             else paged_stash_buffer.cuda_buffer
         )
 
-        _paged_stash_copy_kernel[grid](
+        paged_stash_copy_kernel[grid](
             tensor_to_copy.view(paged_stash_buffer.cuda_buffer.dtype),
             paged_stash_buffer.cuda_buffer,
             host_dst,
@@ -272,7 +272,7 @@ class PagedTensor:
             if paged_stash_buffer.host_buffer is not None
             else paged_stash_buffer.cuda_buffer
         )
-        _paged_stash_pop_kernel[grid](
+        paged_stash_pop_kernel[grid](
             paged_stash_buffer.cuda_buffer,
             host_src,
             self._tensor.view(paged_stash_buffer.cuda_buffer.dtype),
