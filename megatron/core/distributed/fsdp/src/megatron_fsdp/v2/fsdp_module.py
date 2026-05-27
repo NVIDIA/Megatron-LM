@@ -590,6 +590,16 @@ class FSDPModule(nn.Module):
 
         ctx = self._fsdp_root_context
         torch.cuda.current_stream().wait_stream(ctx.rs_stream)
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for param_group in child._fsdp_param_groups:
+                for param, dist_grad in zip(param_group.params, param_group.dist_grads):
+                    if param.requires_grad:
+                        # v1 replaces module params with optimizer-facing distributed
+                        # params after grad sync. v2 keeps compute params in the module,
+                        # so mirror the reduced grad for shared finalizers.
+                        param.main_grad = dist_grad
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):

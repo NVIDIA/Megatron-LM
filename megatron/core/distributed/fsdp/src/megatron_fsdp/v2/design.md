@@ -364,6 +364,61 @@ def _post_backward_final_callback(root_state, root_module):
 
 ---
 
+## ZeRO-1 and ZeRO-2 Workflow
+
+`optim` and `optim_grads` keep compute weights replicated but still expose
+optimizer-facing DTensor shards through `dist_params`.
+
+### ZeRO-1 (`optim`)
+
+1. Forward and backward read replicated `model_weight_buffer`; no parameter
+   all-gather is needed in the steady state.
+2. Backward writes local gradients into the replicated `main_grad_buffer`.
+   Post-backward reduce-scatter skips `optim` groups, so gradients remain full
+   replicas across local gradient accumulation.
+3. `finish_grad_sync()` performs one delayed reduce-scatter for each `optim`
+   grad buffer. The reduce-scatter output is written into this rank's virtual
+   shard, which is what the optimizer consumes through `dist_grads`.
+4. The optimizer updates this rank's sharded `main_weight_buffer` view. After
+   `copy_main_weights_to_model_weights()`, the next forward refreshes the
+   replicated compute weights from those updated shards.
+
+### ZeRO-2 (`optim_grads`)
+
+1. Forward and backward also read replicated `model_weight_buffer`; no parameter
+   all-gather is needed in the steady state.
+2. Backward writes gradients into a temporary full grad buffer returned by
+   `main_grad_buffer.fetch_unsharded_buffer()`.
+3. The post-backward hook reduce-scatters that temporary full buffer and
+   accumulates the result into the persistent sharded `main_grad_buffer.data`.
+   With overlap enabled, this reduce-scatter is launched on `ctx.rs_stream` and
+   the normal sliding drain/final callback releases the temporary buffer after
+   its event completes.
+4. `finish_grad_sync()` only waits for outstanding `rs_stream` work for
+   `optim_grads`; it does not launch another reduce-scatter.
+5. The optimizer updates this rank's sharded `main_weight_buffer` view. The next
+   forward refreshes replicated compute weights the same way as ZeRO-1.
+
+### Replicated Weight Refresh
+
+For ZeRO-1/2, `copy_main_weights_to_model_weights()` marks a parameter group
+stale when `main_weight_buffer` is sharded and `model_weight_buffer` is
+replicated. The next forward `unshard(bwd_pass=False)` calls
+`sync_replicated_buffer_from_shard()` before compute:
+
+1. Non-FP8 weights copy this rank's updated main-weight shard into the matching
+   slice of the replicated model-weight buffer when the buffer dtypes differ.
+2. FP8 weights quantize the local FP32 main-weight shard into the local FP8
+   model-weight shard first; MXFP8 refreshes the transpose buffer as well.
+3. `all_gather_into_tensor` gathers the updated shards into the full replicated
+   compute buffer on every rank.
+
+Backward unshard does not refresh replicated weights. Refresh is tied to the
+next forward so a completed optimizer step is visible before compute reads the
+replica.
+
+---
+
 ## Feature 3: Activation Recomputation (Gradient Checkpointing)
 
 ### Problem
