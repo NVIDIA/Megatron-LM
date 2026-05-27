@@ -208,6 +208,19 @@ def pipeline(
                 ]
 
                 if metric_name == "iteration-time":
+                    # Restrict iter-time aggregation to the steady-state window
+                    # (steps 30-45) so the warmup step does not dominate the median.
+                    steady_window = range(30, 46)
+                    actual_value_list = [
+                        value
+                        for value_step, value in actual_values[metric_name].values.items()
+                        if value_step in golden_value.values.keys() and value_step in steady_window
+                    ]
+                    golden_value_list = [
+                        value
+                        for value_step, value in golden_value.values.items()
+                        if value_step in steady_window
+                    ]
                     actual_value_list = [
                         np.median([np.inf if type(v) is str else v for v in actual_value_list])
                     ]
