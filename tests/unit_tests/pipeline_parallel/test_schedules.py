@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -76,6 +77,44 @@ def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)
     assert out.nelement() == 6
+
+
+@pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 6.0), (True, 3.0)])
+def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
+    calculate_per_token_loss, expected_scale
+):
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+
+    config = SimpleNamespace(
+        calculate_per_token_loss=calculate_per_token_loss,
+        experimental_attention_variant='dsa',
+        grad_scale_func=lambda tensor: tensor * 3.0,
+        num_moe_experts=None,
+        mtp_num_layers=None,
+        timers=None,
+    )
+    forward_data_store = []
+
+    def loss_func(output_tensor):
+        return output_tensor.clone(), torch.tensor(4), {'loss_reduced': output_tensor.detach()}
+
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor=torch.tensor(8.0),
+        loss_func=loss_func,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=forward_data_store,
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    assert DSAIndexerLossAutoScaler.main_loss_backward_scale == expected_scale
 
 
 @pytest.mark.internal

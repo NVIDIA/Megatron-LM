@@ -88,6 +88,55 @@ def _normalize_cp_comm_type(cp_comm_type: Optional[str]) -> str:
     return cp_comm_type.replace("_", "").lower()
 
 
+def _build_zigzag_cp_local_positions(
+    seq_len: int, cp_size: int, cp_rank: int, device: torch.device
+) -> torch.Tensor:
+    """Build this CP rank's token positions under MCore zigzag sequence sharding."""
+    if cp_size <= 1:
+        return torch.arange(seq_len, device=device, dtype=torch.int64)
+    if seq_len % (2 * cp_size) != 0:
+        raise ValueError(
+            "Zigzag CP expects the global sequence length to be divisible by 2 * cp_size, got "
+            f"seq_len={seq_len}, cp_size={cp_size}"
+        )
+
+    chunk_len = seq_len // (2 * cp_size)
+    front_chunk = cp_rank
+    back_chunk = 2 * cp_size - cp_rank - 1
+    return torch.cat(
+        (
+            torch.arange(
+                front_chunk * chunk_len,
+                (front_chunk + 1) * chunk_len,
+                device=device,
+                dtype=torch.int64,
+            ),
+            torch.arange(
+                back_chunk * chunk_len,
+                (back_chunk + 1) * chunk_len,
+                device=device,
+                dtype=torch.int64,
+            ),
+        ),
+        dim=0,
+    )
+
+
+def _build_zigzag_allgather_cp_key_reorder(
+    sq: int, cp_size: int, device: torch.device
+) -> torch.Tensor:
+    """Build gathered-KV reorder index for non-packed zigzag allgather CP."""
+    global_seq_len = sq * cp_size
+    gathered_key_positions = torch.cat(
+        [
+            _build_zigzag_cp_local_positions(global_seq_len, cp_size, rank, device)
+            for rank in range(cp_size)
+        ],
+        dim=0,
+    )
+    return torch.argsort(gathered_key_positions)
+
+
 def _get_cp_positions_from_layout(
     sq: int,
     skv: int,
@@ -97,11 +146,7 @@ def _get_cp_positions_from_layout(
     device: torch.device,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Infer query/key global token positions under CP layout.
-
-    This helper currently supports allgather CP layout, where each rank owns a
-    contiguous query chunk and sees gathered keys in global order.
-    """
+    """Infer query/key global token positions under CP allgather layout."""
     if cp_size <= 1:
         query_pos = torch.arange(sq, device=device, dtype=torch.int64)
         key_pos = torch.arange(skv, device=device, dtype=torch.int64)
@@ -112,8 +157,13 @@ def _get_cp_positions_from_layout(
             "DSAttention context parallelism currently supports cp_comm_type=allgather only."
         )
 
-    # Avoid assuming uniform per-rank query lengths (cp_rank * sq). When available,
-    # gather local lengths to build the true global offset for this CP rank.
+    if skv == sq * cp_size:
+        query_pos = _build_zigzag_cp_local_positions(skv, cp_size, cp_rank, device)
+        key_pos = torch.arange(skv, device=device, dtype=torch.int64)
+        return query_pos, key_pos
+
+    # Fallback for callers that pass uneven per-rank lengths. The non-packed MCore
+    # dataloader uses zigzag layout, so the uniform case above is the expected path.
     query_offset = cp_rank * sq
     if (
         cp_group is not None
@@ -124,10 +174,7 @@ def _get_cp_positions_from_layout(
         local_len = torch.tensor([sq], device=device, dtype=torch.int64)
         all_lens = [torch.empty_like(local_len) for _ in range(cp_size)]
         torch.distributed.all_gather(all_lens, local_len, group=cp_group)
-        if cp_rank > 0:
-            query_offset = int(torch.stack(all_lens[:cp_rank]).sum().item())
-        else:
-            query_offset = 0
+        query_offset = int(torch.stack(all_lens[:cp_rank]).sum().item()) if cp_rank > 0 else 0
 
     query_pos = torch.arange(sq, device=device, dtype=torch.int64) + query_offset
     key_pos = torch.arange(skv, device=device, dtype=torch.int64)
@@ -2717,18 +2764,13 @@ def unfused_dsa_fn(
                 idx_seq = idx_seq_raw.clamp(min=0, max=safe_k_max)
                 q_chunk = query_b[bi, h0:h1, s0:s1, :]  # [h_chunk, s_len, hn]
 
-                m = _get_scratch_buffer(
-                    "unfused_dsa_m", (h_chunk, s_len), torch.float32, query.device
+                # These tensors participate in autograd; reusing cached storage can
+                # invalidate saved tensors before backward runs.
+                m = torch.full(
+                    (h_chunk, s_len), float("-inf"), dtype=torch.float32, device=query.device
                 )
-                l = _get_scratch_buffer(
-                    "unfused_dsa_l", (h_chunk, s_len), torch.float32, query.device
-                )
-                acc = _get_scratch_buffer(
-                    "unfused_dsa_acc", (h_chunk, s_len, hnv), torch.float32, query.device
-                )
-                m.fill_(float("-inf"))
-                l.zero_()
-                acc.zero_()
+                l = torch.zeros((h_chunk, s_len), dtype=torch.float32, device=query.device)
+                acc = torch.zeros((h_chunk, s_len, hnv), dtype=torch.float32, device=query.device)
 
                 for t0 in range(0, idx_seq.size(-1), topk_chunk_size):
                     t1 = min(t0 + topk_chunk_size, idx_seq.size(-1))
@@ -2912,10 +2954,10 @@ class DSAttention(MegatronModule):
         cp_rank = cp_group.rank() if cp_group is not None else 0
         packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         packed_query_positions = None
-        packed_kv_reorder_idx = None
+        kv_reorder_idx = None
         if packed_thd and cp_size > 1:
             cu_seqlens_q, cu_seqlens_kv = _get_packed_qk_cu_seqlens(packed_seq_params)
-            packed_query_positions, packed_kv_reorder_idx = (
+            packed_query_positions, kv_reorder_idx = (
                 _build_packed_allgather_cp_query_positions_and_key_reorder(
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_kv=cu_seqlens_kv,
@@ -2924,13 +2966,17 @@ class DSAttention(MegatronModule):
                     device=query.device,
                 )
             )
+        elif cp_size > 1:
+            kv_reorder_idx = _build_zigzag_allgather_cp_key_reorder(
+                sq=sq, cp_size=cp_size, device=query.device
+            )
 
         if cp_size > 1:
             assert (
                 self.cp_comm_type == "allgather"
             ), "DSAttention context parallelism currently supports cp_comm_type=allgather only."
             # For allgather CP, keys/values are expected in full-sequence order.
-            # Gather only if inputs are local-sequence tensors.
+            # Gather local-sequence tensors, then undo MCore's zigzag rank order.
             gathered_cp_key = False
             gathered_cp_value = False
             if key.size(0) == sq:
@@ -2939,23 +2985,21 @@ class DSAttention(MegatronModule):
             if value is not None and value.size(0) == sq:
                 value = gather_from_sequence_parallel_region(value, group=cp_group)
                 gathered_cp_value = True
-            if packed_kv_reorder_idx is not None:
+            if kv_reorder_idx is not None:
                 if gathered_cp_key:
-                    if key.size(0) != packed_kv_reorder_idx.numel():
+                    if key.size(0) != kv_reorder_idx.numel():
                         raise RuntimeError(
-                            "Packed DSA gathered key length mismatch: "
-                            f"key_seqlen={key.size(0)}, expected={packed_kv_reorder_idx.numel()}"
+                            "DSA gathered key length mismatch: "
+                            f"key_seqlen={key.size(0)}, expected={kv_reorder_idx.numel()}"
                         )
-                    key = key.index_select(0, packed_kv_reorder_idx)
+                    key = key.index_select(0, kv_reorder_idx)
                 if gathered_cp_value:
-                    if value.size(0) != packed_kv_reorder_idx.numel():
+                    if value.size(0) != kv_reorder_idx.numel():
                         raise RuntimeError(
-                            "Packed DSA gathered value length mismatch: "
-                            f"value_seqlen={
-                                value.size(0)
-                            }, expected={packed_kv_reorder_idx.numel()}"
+                            "DSA gathered value length mismatch: "
+                            f"value_seqlen={value.size(0)}, expected={kv_reorder_idx.numel()}"
                         )
-                    value = value.index_select(0, packed_kv_reorder_idx)
+                    value = value.index_select(0, kv_reorder_idx)
 
         skv = key.size(0)
 
@@ -2994,13 +3038,13 @@ class DSAttention(MegatronModule):
         q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
         if cp_size > 1 and k.size(0) == sq:
             k = gather_from_sequence_parallel_region(k, group=cp_group)
-            if packed_kv_reorder_idx is not None:
-                if k.size(0) != packed_kv_reorder_idx.numel():
+            if kv_reorder_idx is not None:
+                if k.size(0) != kv_reorder_idx.numel():
                     raise RuntimeError(
-                        "Packed DSA gathered indexer-key length mismatch: "
-                        f"k_seqlen={k.size(0)}, expected={packed_kv_reorder_idx.numel()}"
+                        "DSA gathered indexer-key length mismatch: "
+                        f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                     )
-                k = k.index_select(0, packed_kv_reorder_idx)
+                k = k.index_select(0, kv_reorder_idx)
         fused_bounds = _build_fused_indexer_varlen_bounds(
             sq=sq,
             skv=skv,

@@ -24,6 +24,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     _build_causal_mask_from_positions,
     _build_fused_indexer_varlen_bounds,
     _build_packed_allgather_cp_query_positions_and_key_reorder,
+    _build_zigzag_allgather_cp_key_reorder,
     _compute_index_scores,
     _fused_qk_topk_lighting,
     _fused_qk_topk_lighting_with_streaming_sparse_kl,
@@ -86,13 +87,16 @@ def _fake_lighting_indexer_for_test(
     ends: torch.Tensor,
     index_topk: int,
     topk_indices: torch.Tensor | None = None,
+    use_relu: bool = True,
 ):
     """Reference fake indexer for testing fused batched loop plumbing."""
     del topk_indices
 
     # [sq, h, d] @ [sk, d]^T -> [sq, h, sk]
     logits = torch.einsum("qhd,kd->qhk", index_q.float(), index_k.float())
-    logits = torch.relu(logits) * index_w.float().unsqueeze(-1)
+    if use_relu:
+        logits = torch.relu(logits)
+    logits = logits * index_w.float().unsqueeze(-1)
     logits = logits.sum(dim=1)  # [sq, sk]
 
     key_pos = torch.arange(index_k.size(0), dtype=torch.int64, device=logits.device)
@@ -116,12 +120,15 @@ def _fake_lighting_indexer_without_invalid_slot_mask_for_test(
     ends: torch.Tensor,
     index_topk: int,
     topk_indices: torch.Tensor | None = None,
+    use_relu: bool = True,
 ):
     """Fake fused indexer that leaves invalid top-k slots unmasked."""
     del topk_indices
 
     logits = torch.einsum("qhd,kd->qhk", index_q.float(), index_k.float())
-    logits = torch.relu(logits) * index_w.float().unsqueeze(-1)
+    if use_relu:
+        logits = torch.relu(logits)
+    logits = logits * index_w.float().unsqueeze(-1)
     logits = logits.sum(dim=1)
 
     key_pos = torch.arange(index_k.size(0), dtype=torch.int64, device=logits.device)
@@ -209,12 +216,27 @@ class TestDSACPPositionHelpers:
     """Test helper utilities used for DSAttention context-parallel masking."""
 
     def test_allgather_layout_positions(self):
-        """Allgather CP layout should map to contiguous query and global key positions."""
+        """Allgather CP layout should map to zigzag query and global key positions."""
         query_pos, key_pos = _get_cp_positions_from_layout(
             sq=4, skv=8, cp_size=2, cp_rank=1, cp_comm_type="allgather", device=torch.device("cpu")
         )
-        assert query_pos.tolist() == [4, 5, 6, 7]
+        assert query_pos.tolist() == [2, 3, 4, 5]
         assert key_pos.tolist() == list(range(8))
+
+    def test_nonpacked_allgather_cp_layout_reorders_gathered_kv_to_global_order(self):
+        """Non-packed allgather-CP helper should mirror MCore zigzag local order."""
+        query_pos, _ = _get_cp_positions_from_layout(
+            sq=4, skv=8, cp_size=2, cp_rank=0, cp_comm_type="allgather", device=torch.device("cpu")
+        )
+        key_reorder_idx = _build_zigzag_allgather_cp_key_reorder(
+            sq=4, cp_size=2, device=torch.device("cpu")
+        )
+
+        assert query_pos.tolist() == [0, 1, 6, 7]
+
+        gathered_key_pos = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int64)
+        restored = gathered_key_pos.index_select(0, key_reorder_idx)
+        assert restored.tolist() == list(range(8))
 
     def test_position_based_causal_mask(self):
         """Position-based causal mask should mask keys with strictly larger positions."""
@@ -481,6 +503,26 @@ class TestDSACPPositionHelpers:
         )
 
         torch.testing.assert_close(out_varlen, out_dense, rtol=0, atol=0)
+
+    def test_unfused_dsa_allows_delayed_backward_after_same_shape_reuse(self):
+        """Unfused DSA should not mutate tensors saved by earlier forward graphs."""
+        torch.manual_seed(123)
+        sq, bsz, nheads, dim, vdim = 4, 1, 2, 3, 2
+        topk_indices = (
+            torch.arange(sq, dtype=torch.int64).view(1, 1, sq).expand(bsz, sq, sq).contiguous()
+        )
+
+        query = torch.randn(sq, bsz, nheads, dim, dtype=torch.float32, requires_grad=True)
+        key = torch.randn(sq, bsz, nheads, dim, dtype=torch.float32, requires_grad=True)
+        value = torch.randn(sq, bsz, nheads, vdim, dtype=torch.float32, requires_grad=True)
+
+        out1 = unfused_dsa_fn(query, key, value, topk_indices, dim**-0.5)
+        out2 = unfused_dsa_fn(query, key, value, topk_indices, dim**-0.5)
+        (out1.square().sum() + out2.square().sum()).backward()
+
+        assert query.grad is not None and torch.isfinite(query.grad).all()
+        assert key.grad is not None and torch.isfinite(key.grad).all()
+        assert value.grad is not None and torch.isfinite(value.grad).all()
 
     def test_fused_topk_batched_loop_matches_reference(self):
         """Fused batched/chunked top-k loop should match per-batch reference outputs."""
