@@ -500,18 +500,16 @@ def finalize_model_grads(
         or config.expert_generalized_tensor_parallel_size > 1
     ):
         from megatron.experimental.gtp import (
-            HAVE_GTP,
             get_all_ag_streams,
             get_all_rs_streams,
             wait_async_comms,
         )
 
-        if HAVE_GTP:
-            wait_async_comms()
-            for s in get_all_ag_streams():
-                torch.cuda.current_stream().wait_stream(s)
-            for s in get_all_rs_streams():
-                torch.cuda.current_stream().wait_stream(s)
+        wait_async_comms()
+        for s in get_all_ag_streams():
+            torch.cuda.current_stream().wait_stream(s)
+        for s in get_all_rs_streams():
+            torch.cuda.current_stream().wait_stream(s)
 
     # Wait for captured bwd Phase 2 (main_grad.add_) on each CG runner's
     # stream.  bwd_completion_event only covers Phase 1; Phase 2 runs after

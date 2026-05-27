@@ -1474,15 +1474,14 @@ def validate_args(args, defaults={}):
         # FP32->FP8 cast for GTP shards, so the forward skips BF16->FP8.
         if getattr(args, 'fp8_param_gather', False):
             assert False, 'GTP+fp8-param-gather not supported yet!'
-            from megatron.experimental.gtp import HAVE_GTP, update_gtp_config
-            if HAVE_GTP:
-                update_gtp_config(fp8_param_gather=True)
-                warn_rank_0(
-                    "GTP + --fp8-param-gather: setting "
-                    "GTPConfig.fp8_param_gather=True (optimizer step "
-                    "pre-quantizes GTP shards, skipping the per-forward "
-                    "BF16->FP8 cast)."
-                )
+            from megatron.experimental.gtp import update_gtp_config
+            update_gtp_config(fp8_param_gather=True)
+            warn_rank_0(
+                "GTP + --fp8-param-gather: setting "
+                "GTPConfig.fp8_param_gather=True (optimizer step "
+                "pre-quantizes GTP shards, skipping the per-forward "
+                "BF16->FP8 cast)."
+            )
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:

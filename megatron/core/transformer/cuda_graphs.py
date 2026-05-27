@@ -60,7 +60,6 @@ except:
 
 from megatron.experimental.gtp import (
     GTP_CONFIG,
-    HAVE_GTP,
     GTPChain,
     GTPShardedParam,
     get_ag_stream,
@@ -441,11 +440,6 @@ class _CudagraphGlobalRecord:
                 )
 
         if any(r[0].generalized_tensor_parallel for r in cls.cudagraph_record):
-            assert HAVE_GTP, (
-                "generalized_tensor_parallel_size > 1 requires megatron.experimental.gtp to import "
-                "successfully (it pulls in low-precision tensor primitives from "
-                "transformer_engine)."
-            )
             reallocate_gtp_cache_to_mempool(
                 torch.cuda.current_device(), CudaGraphManager.global_mempool
             )
@@ -946,8 +940,6 @@ class _CudaGraphRunner(torch.nn.Module):
             wait was captured in the producer's Phase 2, but the add lives
             here regardless, bridged by external rs_event.)
         """
-        if not HAVE_GTP or GTPShardedParam is None:
-            return []
         finalized = {}  # id → param
         for p in self.params_to_backprop:
             if not isinstance(p, GTPShardedParam):
@@ -1270,7 +1262,7 @@ class _CudaGraphRunner(torch.nn.Module):
         # cascade and wait_async_comms to split the captured RS wait/add across
         # producer and consumer graphs (avoids cross-capture cudaStreamWaitEvent
         # on c10d Work.postEvent).
-        if self.generalized_tensor_parallel and HAVE_GTP and GTPShardedParam is not None:
+        if self.generalized_tensor_parallel:
             pset = {id(p) for p in self.params_to_backprop}
             for p in self.params_to_backprop:
                 if not isinstance(p, GTPShardedParam):

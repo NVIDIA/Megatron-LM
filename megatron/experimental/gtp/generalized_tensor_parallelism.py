@@ -276,7 +276,7 @@ class GTPConfig:
     # Stub field, reserved for a follow-up MR that will land the wgrad-before-dgrad
     # schedule on the TE side (_Linear / _LayerNormLinear backward run wgrad GEMM
     # before dgrad GEMM, so the GTP wgrad reduce-scatter overlaps with dgrad GEMM).
-    # Setting this to True via update_config() currently raises NotImplementedError.
+    # Setting this to True via update_gtp_config() currently raises NotImplementedError.
     wgrad_before_dgrad: bool = False
     # GTP companion to Megatron --fp8-param-gather: optimizer casts FP32 master
     # directly into GTPShardedParam.quantized; forward's _quantize_if_needed
@@ -285,7 +285,7 @@ class GTPConfig:
     # Stub field, reserved for a follow-up MR that will re-land the coalesced
     # NVFP4 amax allreduce across the GTP group (single NCCL call across all
     # batched per-expert amax tensors, plus the TE split-phase compute_amax /
-    # quantize_cast primitives). Setting this to True via update_config()
+    # quantize_cast primitives). Setting this to True via update_gtp_config()
     # currently logs an info message and falls back to the per-weight path.
     coalesce_amax_allreduce: bool = False
 
@@ -293,7 +293,7 @@ class GTPConfig:
 GTP_CONFIG = GTPConfig()
 
 
-def update_config(**kwargs):
+def update_gtp_config(**kwargs):
     """Update the global GTP configuration."""
     if kwargs.get("wgrad_before_dgrad"):
         raise NotImplementedError("Wgrad->Dgrad schedule to be supported later")
@@ -784,7 +784,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # 2. Prepare: quantize, set usage direction.
         # NOTE: The coalesced amax allreduce path (gated by
         # GTPConfig.coalesce_amax_allreduce) is deferred to a follow-up MR;
-        # always use the per-weight quantize path here. update_config() logs
+        # always use the per-weight quantize path here. update_gtp_config() logs
         # an info message when a caller tries to enable the deferred knob.
         fp8_pg_hit = GTP_CONFIG.fp8_param_gather and self.did_cast_to_low_precision
 

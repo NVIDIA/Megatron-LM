@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-from megatron.experimental.gtp import HAVE_GTP, GTPShardedParam
+from megatron.experimental.gtp import GTPShardedParam
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..optimizer.param_layout import FullParamLayout
@@ -139,8 +139,7 @@ class DistributedDataParallel(_BaseDataParallel):
             # through to all_params where group_params_for_buffers splits them
             # via is_expert_parallel.
             is_dense_gtp = (
-                HAVE_GTP
-                and isinstance(param, GTPShardedParam)
+                isinstance(param, GTPShardedParam)
                 and getattr(param, 'allreduce', True)
             )
             if is_dense_gtp:
@@ -291,7 +290,6 @@ class DistributedDataParallel(_BaseDataParallel):
                 else None
             )
             params_with_names = [(p, param_to_name[p]) for p in params]
-
             buffer = _ParamAndGradBuffer(
                 self.ddp_config,
                 buffer_key.param_dtype,
@@ -545,7 +543,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     # wgrad_reduce_scatter returns None for async RS and writes
                     # the wgrad straight into param.main_grad. Skip the assertion
                     # for GTPShardedParam — otherwise it fires every iter.
-                    if not (HAVE_GTP and isinstance(param, GTPShardedParam)):
+                    if not isinstance(param, GTPShardedParam):
                         assert (
                             param.grad is not None
                         ), 'param.grad being None is not safe when overlap_grad_reduce is True'

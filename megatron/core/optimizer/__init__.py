@@ -56,7 +56,7 @@ from megatron.core.optimizer_param_scheduler import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
-from megatron.experimental.gtp import HAVE_GTP, GTPShardedParam
+from megatron.experimental.gtp import GTPShardedParam
 
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
@@ -347,7 +347,7 @@ def _get_param_groups(
                 param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
-            is_gtp = HAVE_GTP and isinstance(param, GTPShardedParam)
+            is_gtp = isinstance(param, GTPShardedParam)
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
