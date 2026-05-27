@@ -310,13 +310,10 @@ def test_load_biencoder_checkpoint_can_load_only_query_model(tmp_path, monkeypat
     load_dir = tmp_path / "biencoder"
     load_dir.mkdir()
     Path(get_checkpoint_tracker_filename(load_dir)).write_text("5", encoding="utf-8")
-    # Use explicit keyword argument to avoid positional argument conflict
-    checkpoint_name = Path(get_checkpoint_name(load_dir, 5, release=False,
-                                              pipeline_parallel=False,
-                                              tensor_rank=0,
-                                              pipeline_rank=0,
-                                              expert_parallel=False,
-                                              expert_rank=0))
+    # Manually construct checkpoint path matching load_biencoder_checkpoint's logic
+    # load_biencoder_checkpoint calls: get_checkpoint_name(load_path, iteration, args.use_distributed_optimizer, release=False)
+    # With use_distributed_optimizer=False, this creates: iter_0000005/mp_rank_00/model_optim_rng.pt
+    checkpoint_name = load_dir / "iter_0000005" / "mp_rank_00" / "model_optim_rng.pt"
     checkpoint_name.parent.mkdir(parents=True)
     torch.save({"model": {"query_model": {"w": 1}, "context_model": {"w": 2}}}, checkpoint_name)
 
