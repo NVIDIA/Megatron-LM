@@ -1399,7 +1399,7 @@ def pretrain(
         print_datetime('after training is done')
 
         # Flush any remaining buffered logits data before final checkpoint.
-        from megatron.training.logits_saver import get_logits_saver
+        from megatron.training.distillation import get_logits_saver
         if (logits_saver := get_logits_saver()) is not None:
             logits_saver.shutdown()
 
@@ -1966,7 +1966,7 @@ def setup_model_and_optimizer(
     unwrapped_model = unwrap_model(model)
 
     if args.logits_save_top_k:
-        from megatron.training.logits_saver import LogitsSaverHooks
+        from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
             save_dir=args.logits_save_dir,
@@ -2858,11 +2858,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
-    
+
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
     timers(timer_key).stop(barrier=True)
     save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
-    
+
     if should_report_memory:
         # Track memory after checkpoint save.
         report_memory(f"(after save_checkpoint for iteration {iteration})")
@@ -3433,7 +3433,7 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
-        if (args.profile 
+        if (args.profile
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
             # Enable NVTX range when profiling starts and nvtx_ranges is set.

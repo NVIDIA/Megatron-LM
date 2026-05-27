@@ -526,7 +526,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Start draining buffered logits now so the sidecar write can overlap with
     # async checkpoint I/O. Async checkpoints wait on the returned dependency.
-    from megatron.training.logits_saver import get_logits_saver
+    from megatron.training.distillation import get_logits_saver
     logits_saver = get_logits_saver()
     logits_flush_future = None
     if logits_saver is not None:

@@ -132,12 +132,11 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             the data parallel ranks
     """
     args = get_args()
-    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
-        loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
-    elif args.logits_load_dir is not None:
+    if args.logits_load_dir is not None:
+        # Offline knowledge distillation loss using cached teacher log-probabilities.
         global loss_func_cached_logits
         if loss_func_cached_logits is None:
-            from megatron.training.cached_logits_loss import LossFuncCallable
+            from megatron.training.distillation import LossFuncCallable
             loss_func_cached_logits = LossFuncCallable(
                 logprobs_dir=args.logits_load_dir,
                 decode_threads=args.logits_load_decode_threads,
@@ -147,6 +146,8 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
                 ignore_errors=args.logits_load_ignore_errors,
             )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
+    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+        loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
         loss_mask = loss_mask.view(-1).float()

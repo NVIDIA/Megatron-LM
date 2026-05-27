@@ -44,7 +44,7 @@ Usage example
 -------------
 ::
 
-    from megatron.training.cached_logits_loss import LossFuncCallable
+    from megatron.training.distillation import LossFuncCallable
 
     # Instantiate once at the start of training
     loss_func = LossFuncCallable(
@@ -69,7 +69,7 @@ import torch.utils.data
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.training.utils import print_rank_0
-from megatron.training.utils_logits import (
+from megatron.training.distillation.utils_logits import (
   BATCHED_TAR_RE,
   LogprobsTarEntry,
   TarShardPrefetcher,

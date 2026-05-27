@@ -42,7 +42,7 @@ from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
 from megatron.training.utils import print_rank_0
-from megatron.training.utils_logits import (
+from megatron.training.distillation.utils_logits import (
     LOGPROBS_TAR_MEMBER_SUFFIX,
     META_TAR_MEMBER,
     batched_tar_filename,
