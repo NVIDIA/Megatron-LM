@@ -443,8 +443,16 @@ class TopKRouter(Router):
             fused=self.config.moe_router_fusion,
         )
 
-        # `global_aux_loss` uses DP-aggregated tokens_per_expert, while router probs remain
-        # local to each rank. Scale only by DP so the coefficient matches aux_loss semantics.
+        # Compensate for DP dilution so global_aux_loss_coeff produces the same router
+        # gradient as aux_loss_coeff under identical input.
+        # global_aux_loss reduces tokens_per_expert/total_num_tokens over tp_dp_cp_group, but
+        # `probs` in switch_load_balancing_loss_func stays local to each rank (autograd cannot
+        # cross DP). The result is that for the same input, global_aux_loss is dp_size smaller
+        # than aux_loss, and so is its backward gradient. Subsequent DDP gradient averaging
+        # over dp_cp_group does not recover this factor. Multiply by dp_size here so the
+        # gradient strength matches the aux_loss baseline; the same dp_size is propagated to
+        # `normalize_scale` below so the logged value (aux_loss / normalize_scale) is
+        # unchanged and dashboards stay comparable across this fix.
         dp_size = self.tp_dp_cp_group.size() // self.tp_cp_group.size()
         global_aux_loss = global_aux_loss * dp_size
 
@@ -473,8 +481,12 @@ class TopKRouter(Router):
 
         Args:
             activation (torch.Tensor): Activation tensor to attach the aux loss to.
-            normalize_scale (float): Scale factor to normalize aux_loss for logging.
-                The logged value is `aux_loss / normalize_scale`.
+            normalize_scale (float): Divisor applied to aux_loss before logging so that the
+                recorded metric stays on the coefficient-free scale. Callers must pass
+                `aux_loss_coeff` multiplied by any external scaling already applied to
+                `aux_loss` (e.g. the dp_size compensation in `_apply_global_aux_loss`), so
+                that `aux_loss / normalize_scale` reproduces the unit-coefficient loss
+                regardless of how the gradient strength was rescaled.
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
             reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
@@ -515,8 +527,15 @@ class TopKRouter(Router):
             needs_dp_avg=needs_dp_avg,
         )
         if self.calculate_per_token_loss:
-            # Match the non-per-token aux_loss baseline by converting the local mean-style
-            # aux loss to the TP/CP-wide token sum before final per-token normalization.
+            # Align with the non-per-token baseline gradient scale.
+            # In per-token mode, `MoEAuxLossAutoScaler` is seeded with `loss_scale` only
+            # (schedules.py drops the `cp / num_microbatches` factor), and finalize_model_grads
+            # divides every gradient by the global token count, all-reduced over dp_cp_group.
+            # That global divisor does not include the TP/CP factor that splits the local
+            # sequence (CP slices tokens directly; SP slices via `activation.shape[0]`), so
+            # attaching just `local_num_tokens` leaves the aux gradient 1/tp_cp_size smaller
+            # than the non-per-token baseline. Multiply by tp_cp_group.size() here to cancel
+            # that factor. The same correction applies to z_loss in `apply_z_loss`.
             num_tokens = valid_token_count if valid_token_count is not None else activation.shape[0]
             num_tokens = num_tokens * self.tp_cp_group.size()
             activation = MoEAuxLossAutoScaler.apply(activation, aux_loss * num_tokens)
@@ -542,7 +561,10 @@ class TopKRouter(Router):
             moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
             z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
             if self.calculate_per_token_loss:
-                # Keep z_loss on the same scale as the non-per-token baseline.
+                # Mirror the per-token attach scaling in `attach_and_log_load_balancing_loss`:
+                # finalize_model_grads divides by global token count reduced over dp_cp_group,
+                # which omits the TP/CP factor that splits the local sequence. Multiply by
+                # tp_cp_group.size() so the z_loss gradient stays on the non-per-token baseline.
                 num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
                 num_tokens = num_tokens * self.tp_cp_group.size()
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
