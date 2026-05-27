@@ -10,9 +10,9 @@ from typing import Any, Optional
 class ResolvedScalingContext:
     """Resolved internal scaling context for existing Megatron parameterization knobs.
 
-    PR1 intentionally does not add a new public recipe surface. It wraps the existing
-    ``use_mup`` fields so model and optimizer code can route through a shared policy seam
-    while preserving current behavior.
+    This infrastructure intentionally does not add a new public recipe surface. It
+    wraps the existing ``use_mup`` fields so model and optimizer code can route through
+    a shared policy seam while preserving current behavior.
     """
 
     use_mup: bool

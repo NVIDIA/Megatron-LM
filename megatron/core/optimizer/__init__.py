@@ -150,8 +150,8 @@ def get_scaling_config_overrides(
 ) -> Dict[ParamKey, ParamGroupOverride]:
     """Get optimizer overrides from a resolved internal scaling policy.
 
-    PR1 keeps the public MuP surface unchanged and factors the existing per-parameter
-    MuP LR/epsilon behavior through this policy seam.
+    This compatibility path keeps the public MuP surface unchanged and factors the
+    existing per-parameter MuP LR/epsilon behavior through this policy seam.
     """
     if not scaling_policy.enabled:
         return {}

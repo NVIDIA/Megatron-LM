@@ -61,4 +61,4 @@ Distributed optimizer resume uses a shared helper for the existing stable
 parameter-group identity: `wd_mult`, `lr_mult`, `is_expert_parallel`, and
 `is_decoupled_lr`. The helper tolerates NeMo-style `pre_` field names and missing
 legacy fields without adding newer optional fields such as `eps`, `max_lr`,
-`min_lr`, or per-group `optimizer` to the PR1 resume identity.
+`min_lr`, or per-group `optimizer` to the stable resume identity.
