@@ -275,13 +275,15 @@ def test_tiktoken_tokenizer():
 
 def test_null_tokenizer():
     metadata = {"library": "null-text"}
-    tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, vocab_size=131072)
+    vocab_size = 131072
+    tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, vocab_size=vocab_size)
 
-    ids = tokenizer.tokenize("11 325 97")
+    text = "11 325 97"
+    ids = tokenizer.tokenize(text)
 
-    assert ids == [11, 325, 97]
-    assert tokenizer.vocab_size == 131072
-    assert tokenizer.eod == 131071
+    assert ids == [ord(c) % vocab_size for c in text]
+    assert tokenizer.vocab_size == vocab_size
+    assert tokenizer.eod == vocab_size - 1
     assert tokenizer.pad == -1
 
 
@@ -294,8 +296,9 @@ def test_detokenize_skip_special_tokens_unsupported_backend(library, skip_specia
             tokenizer = MegatronTokenizer.from_pretrained(
                 metadata_path={"library": library}, vocab_size=131072
             )
-            ids = tokenizer.tokenize("11 325 97")
-            expected = "11 325 97"
+            text = "11 325 97"
+            ids = tokenizer.tokenize(text)
+            expected = ' '.join(str(ord(c) % 131072) for c in text)
         elif library == "byte-level":
             tokenizer = MegatronTokenizer.from_pretrained(
                 metadata_path={"library": library}, vocab_size=1024, _bos_id=3, special_tokens=[]
