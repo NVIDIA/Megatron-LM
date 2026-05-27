@@ -166,11 +166,12 @@ class HyperConnectionHybridLayer(MegatronModule):
         # Sanity check: this contract requires the inner layer to preserve shape;
         # any mismatch indicates a future layer type is breaking the residual
         # assumption and would silently corrupt the n-stream state.
-        assert layer_output.shape == aggregated.shape, (
-            "HyperConnectionHybridLayer requires inner layers to preserve "
-            f"hidden-state shape. Got {tuple(layer_output.shape)} from inner layer "
-            f"vs {tuple(aggregated.shape)} input — layer must add its own residual."
-        )
+        if layer_output.shape != aggregated.shape:
+            raise RuntimeError(
+                "HyperConnectionHybridLayer requires inner layers to preserve "
+                f"hidden-state shape. Got {tuple(layer_output.shape)} from inner layer "
+                f"vs {tuple(aggregated.shape)} input; layer must add its own residual."
+            )
         # `fp32_residual_connection=True` may cause some inner layers (e.g.,
         # MambaLayer) to return `layer_output` in fp32 while `aggregated` is in
         # compute dtype; explicitly upcast `aggregated` so the subtraction stays
