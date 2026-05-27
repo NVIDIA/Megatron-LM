@@ -1404,11 +1404,28 @@ def _get_parameter_groups(
 
     is_expert_parameter = lambda n, p: ".experts." in n
 
-    def _get_csf_base(group: ParameterGroup, param: torch.nn.Parameter) -> int:
-        shape = to_local_if_dtensor(param).shape
-        if group.is_expert_param and len(shape) > 1:
-            return shape[-1]
-        return shape[1:].numel()
+    def _should_split_from_grouped_expert_bucket(
+        is_expert_param: bool,
+        param: torch.nn.Parameter,
+        param_chunk_size_factor: int,
+        chunk_size_factor: int,
+        same_factor_params: List[torch.nn.Parameter],
+    ) -> bool:
+        """
+        Split grouped expert (>=3D) tensors with heterogeneous chunk size
+        factors into separate buckets to avoid LCM-inflated bucket alignment
+        padding.
+        """
+        # Non-expert groups keep the original LCM/fragment merge.
+        if not is_expert_param:
+            return False
+        # Param already aligns with bucket chunk size factor (always true for
+        # the first param after sort); no split needed.
+        if param_chunk_size_factor == chunk_size_factor:
+            return False
+        return to_local_if_dtensor(param).dim() >= 3 or any(
+            to_local_if_dtensor(p).dim() >= 3 for p in same_factor_params
+        )
 
     # Step 1: Group the parameters according to their execution order and attributes.
     # FSDP unit module parameters are split into multiple parameter sub-groups.
@@ -1500,25 +1517,36 @@ def _get_parameter_groups(
     # Step 3: Split parameter groups to meet communication segmentation requirements.
     new_bucket_groups = []
     for group in bucket_groups:
-        params = sorted(group.params, key=lambda p: _get_csf_base(group, p), reverse=True)
+        params = sorted(
+            group.params, key=lambda p: to_local_if_dtensor(p).shape[1:].numel(), reverse=True
+        )
         while len(params) > 0:
-            chunk_size_factor = _get_csf_base(group, params[0])
+            chunk_size_factor = to_local_if_dtensor(params[0]).shape[1:].numel()
             same_factor_params = []
             remaining_params = []
             for param in params:
                 param_shape = to_local_if_dtensor(param).shape
-                param_csf_base = _get_csf_base(group, param)
+                param_chunk_size_factor = param_shape[1:].numel()
+                if _should_split_from_grouped_expert_bucket(
+                    group.is_expert_param,
+                    param,
+                    param_chunk_size_factor,
+                    chunk_size_factor,
+                    same_factor_params,
+                ):
+                    remaining_params.append(param)
+                    continue
                 if (
-                    param_csf_base == chunk_size_factor
+                    param_chunk_size_factor == chunk_size_factor
                     or (
-                        chunk_size_factor % param_csf_base == 0
+                        chunk_size_factor % param_chunk_size_factor == 0
                         and param_shape.numel() % chunk_size_factor == 0
                     )
                     or (param_shape.numel() < chunk_size_factor)
                 ):
                     same_factor_params.append(param)
                 else:
-                    lcm_chunk_size_factor = math.lcm(chunk_size_factor, param_csf_base)
+                    lcm_chunk_size_factor = math.lcm(chunk_size_factor, param_chunk_size_factor)
                     chunk_size_factor = lcm_chunk_size_factor
                     same_factor_params.append(param)
             # Create a new parameter group with the same chunk size factor.
