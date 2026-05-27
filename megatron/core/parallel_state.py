@@ -138,6 +138,11 @@ _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
+# Partial Data parallel group information with context parallel combined and GTP peers
+# excluded. Reaches only true weight-replica ranks within one distributed-optimizer instance.
+_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = None
+_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = None
+
 # combined parallel group of TP and CP
 _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
 
@@ -1001,6 +1006,8 @@ def initialize_model_parallel(
     # with_gtp DP = only ranks that share the same GTP-rank (true weight replicas).
     global _DATA_PARALLEL_GROUP_WITH_GTP
     global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO
     if generalized_tensor_parallel_size > 1:
         # Build rank→gtp_rank mapping.
         rank_to_gtp_rank = {}
@@ -1018,27 +1025,78 @@ def initialize_model_parallel(
                 group = create_group(
                     dp_gtp_ranks,
                     timeout=timeout,
-                    pg_options=get_nccl_options("dp_ps", nccl_comm_cfgs),
+                    pg_options=get_nccl_options("dp_gtp", nccl_comm_cfgs),
                     group_desc="DATA_PARALLEL_GROUP_WITH_GTP",
                 )
                 if rank in dp_gtp_ranks:
                     _DATA_PARALLEL_GROUP_WITH_GTP = group
 
-        # DP-CP with GTP
+        # DP-CP with GTP. Also build the partial (per-distopt-instance) split when
+        # multi-instance distopt is enabled, so callers can hold one slice of the
+        # GTP-excluded DP-CP set without the GTP peers leaking in.
         for dp_cp_ranks in decoder_rank_generator.get_ranks('dp-cp'):
             for gtp_rank_val in range(generalized_tensor_parallel_size):
                 dp_cp_gtp_ranks = [r for r in dp_cp_ranks if rank_to_gtp_rank[r] == gtp_rank_val]
                 group = create_group(
                     dp_cp_gtp_ranks,
                     timeout=timeout,
-                    pg_options=get_nccl_options("dp_cp_ps", nccl_comm_cfgs),
+                    pg_options=get_nccl_options("dp_cp_gtp", nccl_comm_cfgs),
                     group_desc="DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP",
                 )
                 if rank in dp_cp_gtp_ranks:
                     _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = group
+
+                if num_distributed_optimizer_instances > 1:
+                    assert (
+                        len(dp_cp_gtp_ranks) % num_distributed_optimizer_instances == 0
+                    ), (
+                        f"DP-CP minus GTP peers size ({len(dp_cp_gtp_ranks)}) must be "
+                        f"divisible by num_distributed_optimizer_instances "
+                        f"({num_distributed_optimizer_instances})"
+                    )
+                    intra_partial_size = (
+                        len(dp_cp_gtp_ranks) // num_distributed_optimizer_instances
+                    )
+                    for i in range(num_distributed_optimizer_instances):
+                        chunk = dp_cp_gtp_ranks[
+                            i * intra_partial_size : (i + 1) * intra_partial_size
+                        ]
+                        intra_group = create_group(
+                            chunk,
+                            timeout=timeout,
+                            pg_options=get_nccl_options("intra_dp_cp_gtp", nccl_comm_cfgs),
+                            group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP",
+                        )
+                        if create_gloo_process_groups:
+                            intra_group_gloo = create_group(
+                                chunk,
+                                timeout=timeout,
+                                backend="gloo",
+                                group_desc=(
+                                    "INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO"
+                                ),
+                            )
+                        else:
+                            intra_group_gloo = None
+                        if rank in chunk:
+                            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = intra_group
+                            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = (
+                                intra_group_gloo
+                            )
+        if num_distributed_optimizer_instances == 1:
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = (
+                _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
+            )
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = None
     else:
         _DATA_PARALLEL_GROUP_WITH_GTP = _DATA_PARALLEL_GROUP
         _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = _DATA_PARALLEL_GROUP_WITH_CP
+        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = (
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+        )
+        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = (
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+        )
 
     # Build the context-parallel groups.
     global _CONTEXT_PARALLEL_GROUP
@@ -1469,7 +1527,7 @@ def initialize_model_parallel(
                 group = create_group(
                     edp_gtp_ranks,
                     timeout=timeout,
-                    pg_options=get_nccl_options("ep_dp_ps", nccl_comm_cfgs),
+                    pg_options=get_nccl_options("ep_dp_gtp", nccl_comm_cfgs),
                     group_desc="EXPERT_DATA_PARALLEL_GROUP_WITH_GTP",
                 )
                 if rank in edp_gtp_ranks:
@@ -1680,11 +1738,17 @@ def get_data_parallel_group(
     """
     if with_gtp:
         if with_context_parallel:
+            if partial_data_parallel:
+                assert (
+                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP is not None
+                ), "Intra partial data parallel group with CP and GTP is not initialized"
+                return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
             assert (
                 _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP is not None
-            ), "data parallel group with context parallel and generalized tensor parallel is not initialized"
+            ), "data parallel group with CP and GTP is not initialized"
             return _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
         else:
+            assert partial_data_parallel is False, "Partial DP for Optimizer needs to include CP"
             assert (
                 _DATA_PARALLEL_GROUP_WITH_GTP is not None
             ), "data parallel group with generalized tensor parallel is not initialized"
@@ -2392,6 +2456,12 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
     _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = None
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = None
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None

@@ -86,10 +86,17 @@ class DistributedDataParallel(_BaseDataParallel):
         self.intra_dp_cp_group = process_group_dict['intra_dp_cp_group']
         self.expt_dp_group = process_group_dict['expt_dp_group']
         self.intra_expt_dp_group = process_group_dict['intra_expt_dp_group']
-        # GTP-aware DP subgroups. Fall back to the corresponding non-GTP group when
-        # the caller didn't configure GTP, so non-GTP runs work unchanged.
+        # GTP-aware DP subgroups (fall back to non-GTP variants when GTP is off):
+        #   *_with_gtp_group         : full cross-instance, GTP peers excluded (broadcast)
+        #   intra_*_with_gtp_group   : per-distopt-instance partial, GTP peers excluded (grad RS)
+        self.dp_cp_with_gtp_group = process_group_dict.get(
+            'dp_cp_with_gtp_group', self.dp_cp_group
+        )
         self.intra_dp_cp_with_gtp_group = process_group_dict.get(
             'intra_dp_cp_with_gtp_group', self.intra_dp_cp_group
+        )
+        self.expt_dp_with_egtp_group = process_group_dict.get(
+            'expt_dp_with_egtp_group', self.expt_dp_group
         )
         self.intra_expt_dp_with_egtp_group = process_group_dict.get(
             'intra_expt_dp_with_egtp_group', self.intra_expt_dp_group
@@ -132,12 +139,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
-            # Carve out DENSE GTPShardedParam (mamba/attn, allreduce=True) only —
-            # they need intra_dp_cp_with_gtp_group. Routed-expert GTPShardedParam
-            # has allreduce=False and goes through main's expert path (which uses
-            # intra_expt_dp_with_egtp_group); non-GTP dense + expert both fall
-            # through to all_params where group_params_for_buffers splits them
-            # via is_expert_parallel.
+            # Only dense GTP params (allreduce=True) carve out into their own bucket
+            # (they need the GTP-peer-excluded RS group). Routed-expert GTP params
+            # have allreduce=False and ride the expert path, which uses its own
+            # EGTP-peer-excluded group; non-GTP params fall through to all_params.
             is_dense_gtp = (
                 isinstance(param, GTPShardedParam)
                 and getattr(param, 'allreduce', True)
@@ -147,10 +152,9 @@ class DistributedDataParallel(_BaseDataParallel):
             else:
                 all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). GTP params
+        # are grouped into a separate set of buffers (RS group is chosen at line 328).
         buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
-        # GTP params are grouped separately — they will be routed through
-        # intra_dp_cp_with_gtp_group because GTP's RS already reduced over the GTP axis.
         gtp_buffer_groups = (
             group_params_for_buffers(gtp_params, self.ddp_config.grad_reduce_in_fp32)
             if gtp_params
@@ -231,9 +235,9 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
-                # GTP: collective averages over with_gtp group (size = dp_cp_size / gtp_size).
-                # GTP RS already summed over gtp_size ranks. To total 1/dp_cp_size scaling:
-                # pre_scale * (1/with_gtp_size) = 1/dp_cp_size  =>  pre_scale = with_gtp_size / dp_cp_size.
+                # GTP pre-scale = (collective_size) / dp_cp_size so post-collective grad
+                # lands at 1/dp_cp_size. Divisor must reference the same group the RS
+                # fires on (line 328) — works for any collective_size.
                 gtp_gradient_scaling_factor = (
                     self.intra_dp_cp_with_gtp_group.size() / self.dp_cp_group.size()
                 )
@@ -249,11 +253,14 @@ class DistributedDataParallel(_BaseDataParallel):
         self.expert_parallel_buffers = []
         self.gtp_buffers = []
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
+        # Grad RS for every buffer (expert / dense non-GTP here, dense GTP at line 328)
+        # uses a per-distopt-instance partial group. Cross-instance sync runs separately
+        # via inter_dist_opt_group during optim.step(); reducing cross-instance grads
+        # here would mix independent data slices.
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
-                # Use the with_egtp group so EGTP-sharded routed experts (whose grads
-                # are already RS'd over the expert-GTP axis) only DP-reduce over true
-                # weight replicas. Falls back to intra_expt_dp_group when GTP is off.
+                # Expert branch needs the EGTP-peer filter (routed experts already
+                # RS'd over the EGTP axis); reduces to intra_expt_dp_group when EGTP=1.
                 data_parallel_group = self.intra_expt_dp_with_egtp_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
@@ -309,9 +316,9 @@ class DistributedDataParallel(_BaseDataParallel):
             else:
                 self.buffers.append(buffer)
 
-        # Allocate GTP buffers separately, routed through intra_dp_cp_with_gtp_group.
-        # GTP's RS already reduced over the GTP axis, so DDP must NOT re-reduce over GTP.
-        # full_param_layout is not applied to GTP buffers (GTP manages its own sharding).
+        # GTP-sharded params have already been RS'd over the GTP axis by GTP itself,
+        # so DDP must use the GTP-peer-excluded group here. full_param_layout is not
+        # applied to GTP buffers (GTP manages its own sharding).
         for buffer_key, (params, param_indices) in gtp_buffer_groups.items():
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
@@ -669,11 +676,19 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for param in self.module.parameters():
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_gtp = isinstance(param, GTPShardedParam)
 
+            # GTPShardedParam holds a unique 1/N shard per (E)GTP peer; broadcast must
+            # exclude those peers and reach the FULL cross-instance group (one-shot
+            # init/load sync, unlike the per-instance grad-RS groups above).
             if is_expert_parallel:
-                data_parallel_group = self.expt_dp_group
+                data_parallel_group = (
+                    self.expt_dp_with_egtp_group if is_gtp else self.expt_dp_group
+                )
             else:
-                data_parallel_group = self.dp_cp_group
+                data_parallel_group = (
+                    self.dp_cp_with_gtp_group if is_gtp else self.dp_cp_group
+                )
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),

@@ -318,6 +318,9 @@ class ProcessGroupCollection:
                 with_context_parallel=True, partial_data_parallel=True
             )
             intra_dp_cp_with_gtp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, with_gtp=True, partial_data_parallel=True
+            )
+            dp_cp_with_gtp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=True, with_gtp=True
             )
             expt_dp_group = parallel_state.get_expert_data_parallel_group()
@@ -325,6 +328,9 @@ class ProcessGroupCollection:
                 partial_expert_data_parallel=True, with_gtp=True
             )
             intra_expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(
+                with_gtp=True
+            )
+            expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(
                 with_gtp=True
             )
             intra_dist_opt_group = parallel_state.get_intra_distributed_optimizer_instance_group()
@@ -472,9 +478,11 @@ class ProcessGroupCollection:
         return {
             'dp_group': dp_group,
             'dp_cp_group': dp_cp_group,
+            'dp_cp_with_gtp_group': dp_cp_with_gtp_group,
             'intra_dp_cp_group': intra_dp_cp_group,
             'intra_dp_cp_with_gtp_group': intra_dp_cp_with_gtp_group,
             'expt_dp_group': expt_dp_group,
+            'expt_dp_with_egtp_group': expt_dp_with_egtp_group,
             'intra_expt_dp_group': intra_expt_dp_group,
             'intra_expt_dp_with_egtp_group': intra_expt_dp_with_egtp_group,
             'mp_group': mp_group,
@@ -539,9 +547,15 @@ class ProcessGroupCollection:
                     else None
                 ),
                 'intra_dp_cp_with_gtp_group': parallel_state.get_data_parallel_group(
+                    with_context_parallel=True, with_gtp=True, partial_data_parallel=True
+                ),
+                'dp_cp_with_gtp_group': parallel_state.get_data_parallel_group(
                     with_context_parallel=True, with_gtp=True
                 ),
                 'intra_expt_dp_with_egtp_group': parallel_state.get_expert_data_parallel_group(
+                    with_gtp=True
+                ),
+                'expt_dp_with_egtp_group': parallel_state.get_expert_data_parallel_group(
                     with_gtp=True
                 ),
             }
@@ -624,6 +638,18 @@ class ProcessGroupCollection:
                 result['intra_expt_dp_with_egtp_group'] = pg_collection.intra_expt_dp_with_egtp
             else:
                 result['intra_expt_dp_with_egtp_group'] = result['intra_expt_dp_group']
+
+            # Full (cross-instance) with-GTP-excluded variants for callers that need to
+            # reach ALL true weight replicas (e.g., broadcast_params at init). Fall back
+            # to the partial variants when the full attributes aren't on pg_collection.
+            if hasattr(pg_collection, 'dp_cp_with_gtp'):
+                result['dp_cp_with_gtp_group'] = pg_collection.dp_cp_with_gtp
+            else:
+                result['dp_cp_with_gtp_group'] = result['intra_dp_cp_with_gtp_group']
+            if hasattr(pg_collection, 'expt_dp_with_egtp'):
+                result['expt_dp_with_egtp_group'] = pg_collection.expt_dp_with_egtp
+            else:
+                result['expt_dp_with_egtp_group'] = result['intra_expt_dp_with_egtp_group']
 
             return result
 
