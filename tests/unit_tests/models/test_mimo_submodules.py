@@ -165,6 +165,57 @@ class TestBaseSubmodule:
         assert projection.in_features == self.vision_config.hidden_size
         assert projection.out_features == self.vision_config.hidden_size
 
+    def test_encode_unwraps_tuple_encoder_output(self):
+        """Base ``encode`` must unwrap encoders that return ``(embeddings, aux)``.
+
+        Some HF vision towers (e.g. Qwen3-VL) return a tuple from forward.
+        ``ModalitySubmodules.encode`` consumes the primary embedding tensor;
+        the tuple-unwrap branch is bypassed for encoders that return a plain
+        tensor.
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        hidden_size = self.vision_config.hidden_size
+        batch_size, num_tokens = 2, 4
+
+        class TupleEncoder(nn.Module):
+            def __init__(self, hidden_size):
+                super().__init__()
+                self.hidden_size = hidden_size
+
+            def forward(self, *, x):
+                emb = torch.zeros(x.shape[0], num_tokens, self.hidden_size, device=x.device)
+                aux = torch.zeros(x.shape[0], 1, device=x.device)
+                return emb, aux
+
+        class PlainEncoder(nn.Module):
+            def __init__(self, hidden_size):
+                super().__init__()
+                self.hidden_size = hidden_size
+
+            def forward(self, *, x):
+                return torch.zeros(x.shape[0], num_tokens, self.hidden_size, device=x.device)
+
+        # Tuple-returning encoder: base.encode must pick the first element and
+        # reshape from [B, T, H] to [B*T, H].
+        submodule_tuple = MockModalitySubmodule(
+            encoders={"tuple_enc": TupleEncoder(hidden_size).to(device)}, input_projections=[]
+        )
+        out_tuple = ModalitySubmodules.encode(
+            submodule_tuple, {"tuple_enc": {"x": torch.zeros(batch_size, 1, device=device)}}
+        )
+        assert len(out_tuple) == 1
+        assert out_tuple[0].shape == (batch_size * num_tokens, hidden_size)
+
+        # Plain tensor encoder: same downstream shape, no regression.
+        submodule_plain = MockModalitySubmodule(
+            encoders={"plain_enc": PlainEncoder(hidden_size).to(device)}, input_projections=[]
+        )
+        out_plain = ModalitySubmodules.encode(
+            submodule_plain, {"plain_enc": {"x": torch.zeros(batch_size, 1, device=device)}}
+        )
+        assert len(out_plain) == 1
+        assert out_plain[0].shape == (batch_size * num_tokens, hidden_size)
+
 
 @pytest.mark.experimental
 class TestVisionSubmodule:
