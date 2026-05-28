@@ -11,7 +11,7 @@ To add a new emerging optimizer:
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional, get_args
+from typing import Any, Callable, Dict, Literal, Optional, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -130,7 +130,7 @@ def _is_nonlinear_or_embedding(param):
     return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
 
 
-def _get_qkv_split_shapes(model_cfg) -> List[int]:
+def _get_qkv_split_shapes(model_cfg) -> list[int]:
     """Compute QKV split shapes from model config."""
     query_projection_size = (
         model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels
@@ -170,7 +170,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
-        qkv_split_shapes: List[int] | None = None,
+        qkv_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -257,15 +257,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             grad_shape = grad.shape
-            qkv_split_shapes = getattr(p, "qkv_split_shapes", self.qkv_split_shapes)
+            qkv_split_shapes = getattr(p, "qkv_split_shapes", None)
+            if qkv_split_shapes is None:
+                qkv_split_shapes = self.qkv_split_shapes
             if qkv_split_shapes is None:
                 raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
             qkv_split_dim = sum(qkv_split_shapes)
             if grad_shape[0] % qkv_split_dim != 0:
-                param_name = getattr(p, "muon_param_name", "<unknown>")
                 raise RuntimeError(
-                    f"Muon QKV split shape mismatch for {param_name}: "
-                    f"grad_shape={tuple(grad_shape)}, split_shapes={qkv_split_shapes}"
+                    f"Muon QKV split shape mismatch: grad_shape={tuple(grad_shape)}, "
+                    f"split_shapes={qkv_split_shapes}"
                 )
             log_single_rank(
                 logger,
@@ -331,7 +332,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
-        qkv_split_shapes: List[int] | None = None,
+        qkv_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,

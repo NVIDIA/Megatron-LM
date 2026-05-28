@@ -90,15 +90,13 @@ class TestTPAttributesWithoutInitialization:
         assert hasattr(w, "partition_stride") and w.partition_stride == 1
 
 
-def test_copy_tensor_model_parallel_attributes_preserves_muon_metadata():
+def test_copy_tensor_model_parallel_attributes_preserves_qkv_split_shapes():
     source = torch.empty(4, 4)
     destination = torch.empty_like(source)
     source.is_qkv = True
     source.qkv_split_shapes = [256, 64, 64]
-    source.muon_param_name = "decoder.layers.0.self_attention.linear_qkv.weight"
 
     copy_tensor_model_parallel_attributes(destination, source)
 
     assert destination.is_qkv is True
     assert destination.qkv_split_shapes == source.qkv_split_shapes
-    assert destination.muon_param_name == source.muon_param_name

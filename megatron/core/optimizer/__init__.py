@@ -783,7 +783,6 @@ def _get_megatron_emerging_optimizer(
                 if param.shape[0] % sum(qkv_split_shapes) == 0:
                     param.is_qkv = True
                     param.qkv_split_shapes = qkv_split_shapes
-                    param.muon_param_name = name
                 else:
                     log_single_rank(
                         logger,
