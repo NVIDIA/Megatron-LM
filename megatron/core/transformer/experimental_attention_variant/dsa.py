@@ -82,9 +82,7 @@ class DSAIndexerLossLoggingHelper:
             tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
         elif tracker["values"].shape[0] < needed:
             grown = torch.zeros(
-                needed,
-                device=tracker["values"].device,
-                dtype=tracker["values"].dtype,
+                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
