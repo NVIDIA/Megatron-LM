@@ -257,9 +257,8 @@ if _CUTILE_AVAILABLE:
             x_2d = ct.reshape(x_tile, (1, TILE_C))
             out_2d = hp_2d * x_2d
             for j in range(N):
-                out_2d += ct.extract(hr_2d, (0, j), shape=(N, 1)) * ct.extract(
-                    orig_2d, (j, 0), shape=(1, TILE_C)
-                )
+                hr_col = ct.extract(hr_2d, (j, 0), shape=(1, N)).reshape((N, 1))
+                out_2d += hr_col * ct.extract(orig_2d, (j, 0), shape=(1, TILE_C))
             ct.store(
                 out,
                 index=(pid, 0, ct_idx),
@@ -288,9 +287,8 @@ if _CUTILE_AVAILABLE:
             xb_2d = ct.reshape(x_tile, (1, TILE_C)) + ct.reshape(bias_tile, (1, TILE_C))
             out_2d = hp_2d * xb_2d
             for j in range(N):
-                out_2d += ct.extract(hr_2d, (0, j), shape=(N, 1)) * ct.extract(
-                    orig_2d, (j, 0), shape=(1, TILE_C)
-                )
+                hr_col = ct.extract(hr_2d, (j, 0), shape=(1, N)).reshape((N, 1))
+                out_2d += hr_col * ct.extract(orig_2d, (j, 0), shape=(1, TILE_C))
             ct.store(
                 out,
                 index=(pid, 0, ct_idx),
@@ -339,12 +337,12 @@ if _CUTILE_AVAILABLE:
                 g_x_2d += ct.extract(hp_2d, (0, j), shape=(1, 1)).item() * ct.extract(
                     go_2d, (j, 0), shape=(1, TILE_C)
                 )
-                g_orig_2d += ct.extract(hr_2d, (j, 0), shape=(1, N)).reshape((N, 1)) * ct.extract(
+                g_orig_2d += ct.extract(hr_2d, (0, j), shape=(N, 1)) * ct.extract(
                     go_2d, (j, 0), shape=(1, TILE_C)
                 )
             acc_g_hp_2d += ct.sum(go_2d * x_2d, axis=1, keepdims=True)
             acc_g_hr_2d += ct.sum(
-                ct.expand_dims(go_2d, axis=1) * ct.expand_dims(orig_2d, axis=0), axis=2
+                ct.expand_dims(orig_2d, axis=1) * ct.expand_dims(go_2d, axis=0), axis=2
             )
             ct.store(
                 g_x,
@@ -409,12 +407,12 @@ if _CUTILE_AVAILABLE:
                 g_x_2d += ct.extract(hp_2d, (0, j), shape=(1, 1)).item() * ct.extract(
                     go_2d, (j, 0), shape=(1, TILE_C)
                 )
-                g_orig_2d += ct.extract(hr_2d, (j, 0), shape=(1, N)).reshape((N, 1)) * ct.extract(
+                g_orig_2d += ct.extract(hr_2d, (0, j), shape=(N, 1)) * ct.extract(
                     go_2d, (j, 0), shape=(1, TILE_C)
                 )
             acc_g_hp_2d += ct.sum(go_2d * xb_2d, axis=1, keepdims=True)
             acc_g_hr_2d += ct.sum(
-                ct.expand_dims(go_2d, axis=1) * ct.expand_dims(orig_2d, axis=0), axis=2
+                ct.expand_dims(orig_2d, axis=1) * ct.expand_dims(go_2d, axis=0), axis=2
             )
             ct.store(
                 g_x,
@@ -935,7 +933,7 @@ else:
     def fused_h_post_bda(
         h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
     ) -> Tensor:
-        """Fused H_res @ residual + H_post * (x + bias).
+        """Fused H_res.T @ residual + H_post * (x + bias).
 
         Args:
             h_res: [s, b, n, n] residual mixing matrix
@@ -947,6 +945,9 @@ else:
         Returns:
             [s, b, n, C] fused output
         """
+        dtype = original_residual.dtype
+        h_res = h_res.to(dtype)
+        h_post = h_post.to(dtype)
         return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
 
     def fused_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
