@@ -91,6 +91,12 @@ export GITLAB_TOKEN=glpat-<your-token>
 
 **Usage:**
 
+**Warning:** `tools/trigger_internal_ci.py` force-pushes the current branch to
+the target remote ref, overwriting any existing history at
+`pull-request/<branch>`. Run with `--dry-run` first, verify the destination, and
+only target your own pull-request branch. Do not use this flow for shared or
+protected branches.
+
 ```bash
 python tools/trigger_internal_ci.py \
   --gitlab-origin gitlab \

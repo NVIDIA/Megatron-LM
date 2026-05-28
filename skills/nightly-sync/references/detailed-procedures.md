@@ -4,6 +4,71 @@ Load this reference only when executing the nightly sync workflow. Keep the
 main `SKILL.md` focused on workflow decisions; this file holds copyable shell
 templates and historical regression examples.
 
+## Merge Conflict Examples
+
+Squash-merge chains can go in either direction. Sometimes main is ahead because
+it squash-merged dev work plus follow-up changes; sometimes dev is ahead because
+it contains PR2/PR3 work that main does not have yet. Always diff both ways.
+
+Examples:
+
+- `emerging_optimizers.py`: main's version was more complete because it
+  squash-merged dev PRs and added more. Taking main for that section was
+  correct.
+- `distrib_optimizer.py`: main overwrote dev's `GroupedQuantizedTensor` support.
+  Restore `_is_distopt_quantized_param` and the expanded quantized-shard loop
+  while keeping main's NVFP4 additions.
+- `transformer_engine.py`: main had unrelated `TEFusedMLP` refactors while dev
+  had `TEFusedDenseMLP`. Restore the dev class and `gpt_layer_specs.py`
+  selection while preserving main's `TEFusedMLP.as_mlp_submodule` refactor.
+
+## Dependency Reconciliation
+
+Examples from prior syncs:
+
+- `nvidia-resiliency-ext`: main's `torch.py` imported
+  `get_write_results_queue`, which only existed in main's pinned git revision.
+  Add main's git source to dev's `pyproject.toml`.
+- `nemo-run`: dev's pinned revision had a TOML parse error with uv 0.7.2.
+  Swap to main's revision.
+
+After any intentional `pyproject.toml` change, regenerate `uv.lock` inside a
+CUDA container:
+
+```bash
+docker run --rm -v $(pwd):/workspace nvcr.io/nvidia/pytorch:26.02-py3 \
+  bash -c "pip install uv==0.7.2 && cd /workspace && \
+  uv venv .venv --system-site-packages && uv sync --only-group build && uv lock"
+docker run --rm -v $(pwd):/workspace nvcr.io/nvidia/pytorch:26.02-py3 \
+  bash -c "rm -rf /workspace/.venv"
+```
+
+## API Mismatch Examples
+
+Examples from prior syncs:
+
+- `multi_latent_attention.py` called `off_interface.group_commit()` but dev's
+  interface only had `group_offload()`.
+- `mamba_model.py` called `init_chunk_handler(3 params)` but dev's interface
+  required 6 params.
+- `mamba_model.py` called `mark_not_offloadable()` but dev had
+  `mark_not_offload()`.
+- `bulk_offload()` did `.remove()` after `bulk_offload_group()` already
+  `.pop()`d the same item.
+
+## File-Specific Lessons
+
+- `gated_delta_net.py`: if the merge creates code calling non-existent helpers
+  such as `_resolve_cu_seqlens`, take dev's version wholesale.
+- `model_chunk_schedule_plan.py`: watch for missing imports such as
+  `CudaGraphScope` silently dropped during conflict resolution.
+- `fine_grained_activation_offload.py`: critical interface file used by many
+  callers. If main and dev diverge on method names or signatures, prefer dev's
+  implementation and patch main-originated callers to match.
+- `distrib_optimizer.py`: dev may have broader type abstractions covering both
+  FP8 and `GroupedQuantizedTensor`; restore those abstractions when main
+  simplifies to explicit type checks.
+
 ## Pre-push Invariant Checks
 
 Run before every `git push` in the nightly sync workflow, including the initial
@@ -167,3 +232,19 @@ fi
 
 Use `--force-with-lease`, not `--force`; if a human pushed onto the branch,
 fetch and decide how to proceed instead of clobbering their work.
+
+## CI Anti-Patterns
+
+- Do not classify queued or in-progress jobs as infrastructure-blocked. Wait for
+  them to reach a terminal state.
+- Do not mark ready while any required check is pending, queued, or in progress
+  on the HEAD SHA.
+- Do not declare an untested job pre-existing. Pre-existing means the test ran
+  to completion and failed the same way on recent dev CI.
+- Do not use `gh api .../actions/runs/.../jobs` alone as the gate signal.
+  External GitLab and bot status contexts do not appear there.
+- Do not start background processes. The GitHub Actions step owns the shell, and
+  background processes die when the step exits.
+- Do not push directly to `pull-request/<PR_NUMBER>` branches; the community bot
+  manages those refs.
+- Do not forget `Run functional tests` and `Run MBridge tests` labels.

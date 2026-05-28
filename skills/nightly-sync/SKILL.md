@@ -13,7 +13,8 @@ conflicts, iterating on CI, and shipping the PR.
 
 Detailed shell templates and historical regression examples live in
 [detailed procedures](references/detailed-procedures.md). Read that reference
-when running pre-push invariant checks or the Phase 3 CI polling loop.
+when resolving non-trivial merge conflicts, running pre-push invariant checks,
+or executing the Phase 3 CI polling loop.
 
 ---
 
@@ -44,37 +45,12 @@ builds on the last. When PR1 is squash-merged to main, git sees main's squashed
 version and dev's original commits as unrelated changes. A conflict resolution
 that blindly picks main can silently discard PR2/PR3's improvements on dev.
 
-After the merge, check for this pattern:
-
-1. For each conflicted file, run `git log --oneline origin/dev -- <file>` to
-   see if dev has commits that came AFTER the code main is bringing in.
-2. If dev has follow-up commits (bug fixes, refactors, extensions), **favor
-   dev's version** for those sections.
-3. If the conflict is just main bringing in a clean copy of what dev already
-   has (no follow-ups), main's version is fine.
-
-Practical check: run `git diff origin/dev -- <file>` on conflicted files. If
-dev's code was removed or reverted, investigate whether dev's version is the
-more evolved one.
-
-Real examples from PR #4291:
-- `emerging_optimizers.py`: Main's version was MORE complete — it squash-merged
-  dev's PRs plus added more. Taking main for that section was correct.
-- `distrib_optimizer.py`: Main overwrote dev's `GroupedQuantizedTensor` support.
-  Had to restore `_is_distopt_quantized_param` and the expanded
-  `_expand_quantized_param_shard_for_cast` loop while keeping main's NVFP4
-  additions. This required a surgical merge combining sections from both.
-
-Key insight: squash-merge chains can go in EITHER direction. Sometimes main
-is ahead (it squash-merged dev's work + more), sometimes dev is ahead (it has
-follow-up PRs). Always diff both ways before deciding which version to favor.
-
-Real example from PR #4882 / PR #4318:
-- `transformer_engine.py`: main had unrelated `TEFusedMLP` refactors, while dev
-  had the new `TEFusedDenseMLP` class. The sync kept the config flag and test
-  but dropped the class and `gpt_layer_specs.py` selection. That is a merge
-  accident: restore the dev class and selection while preserving main's
-  `TEFusedMLP.as_mlp_submodule` refactor.
+For conflicted files, compare `git log --oneline origin/dev -- <file>` and
+`git diff origin/dev -- <file>` before choosing either side. Favor the version
+that contains later follow-up work, or combine both sides when each branch added
+distinct behavior. See
+[merge conflict examples](references/detailed-procedures.md#merge-conflict-examples)
+for known recurring cases.
 
 ### Files to Override from Main
 
@@ -133,24 +109,9 @@ merged code may import from packages only available at specific git revisions.
 3. For sources in both but at different revisions, check whether dev's revision
    works. If dev's revision is broken (TOML parse errors, missing classes main's
    code imports), take main's revision instead.
-
-Real examples from PR #4291:
-- `nvidia-resiliency-ext`: Main's `torch.py` imports `get_write_results_queue`
-  which only existed in main's pinned git revision, not on PyPI. Had to add
-  main's git source to dev's pyproject.toml.
-- `nemo-run`: Dev's pinned revision had a TOML parse error with uv 0.7.2.
-  Had to swap to main's revision.
-
-After any changes to `pyproject.toml`, regenerate `uv.lock` inside a CUDA
-container:
-```bash
-docker run --rm -v $(pwd):/workspace nvcr.io/nvidia/pytorch:26.02-py3 \
-  bash -c "pip install uv==0.7.2 && cd /workspace && \
-  uv venv .venv --system-site-packages && uv sync --only-group build && uv lock"
-# Clean up root-owned .venv:
-docker run --rm -v $(pwd):/workspace nvcr.io/nvidia/pytorch:26.02-py3 \
-  bash -c "rm -rf /workspace/.venv"
-```
+4. If `pyproject.toml` changes, regenerate `uv.lock` inside a CUDA container.
+   Use the exact command in
+   [dependency reconciliation](references/detailed-procedures.md#dependency-reconciliation).
 
 ### API Mismatch Detection (Post-Merge Audit)
 
@@ -170,38 +131,17 @@ After the merge, audit cross-boundary call sites:
    — if main and dev evolved the interface differently, every caller and
    implementer must agree
 
-Real examples from PR #4291:
-- `multi_latent_attention.py` (main) called `off_interface.group_commit()`
-  but dev's interface only had `group_offload()` — method renamed
-- `mamba_model.py` (main) called `init_chunk_handler(3 params)` but dev's
-  interface required 6 params — signature expanded on dev
-- `mamba_model.py` called `mark_not_offloadable()` but dev had
-  `mark_not_offload()` — method renamed
-- `bulk_offload()` did `.remove()` after `bulk_offload_group()` already
-  `.pop()`d the same item — double-removal from a list
-
-Practical detection:
-```bash
-# For each file taken from main, find what it imports and calls
-grep -rn "from <module> import\|<module>\." megatron/
-# Cross-reference with the actual implementations in the merged tree
-```
+Practical detection: for each file taken from main, find imported symbols and
+method calls, then compare them with implementations in the merged tree.
+Recurring examples are listed in
+[API mismatch examples](references/detailed-procedures.md#api-mismatch-examples).
 
 ### File-Specific Merge Lessons
 
-These lessons were learned from PR #4291. They may recur if the same files
-continue to diverge:
-
-- `gated_delta_net.py`: If the merge creates code calling non-existent helper
-  methods (e.g. `_resolve_cu_seqlens`), take dev's version wholesale.
-- `model_chunk_schedule_plan.py`: Watch for missing imports (e.g.
-  `CudaGraphScope`) silently dropped during conflict resolution.
-- `fine_grained_activation_offload.py`: Critical interface file used by many
-  callers. If main and dev have divergent method names/signatures, prefer
-  dev's implementation and patch main-originated callers to match.
-- `distrib_optimizer.py`: Dev may have broader type abstractions (e.g.
-  `_is_distopt_quantized_param` covering both FP8 and GroupedQuantizedTensor).
-  Main may simplify to explicit type checks. Restore dev's abstractions.
+Known recurring conflict patterns are maintained in
+[file-specific lessons](references/detailed-procedures.md#file-specific-lessons).
+Load them before resolving conflicts in optimizer, offload, schedule, or
+TransformerEngine files.
 
 ### Special Handling: data_schedule.py
 
@@ -282,7 +222,7 @@ Phase 3 step 4 and the two-commit policy in Rules).
          }'
      ```
 
-     Include the exact line (e.g. `Python lines: +1234 / -567 across 42 files`)
+     Include the exact output line in the PR body
      in the PR body so reviewers see it at a glance.
   3. List of files where main's version was taken over the merge
   4. List of files that were deleted in dev but restored (and why)
@@ -346,31 +286,10 @@ commit. If it reports `RESULT=GREEN`, proceed to Phase 4.
 
 ### Anti-Patterns (what went wrong on run 24800621116)
 
-- **Do NOT classify a queued/in-progress job as "infrastructure-
-  blocked" and ship.** A stuck queue drains eventually — wait. If the
-  job eventually passes, great; if it fails, go fix it.
-- **Do NOT mark ready while any required check is `PENDING` /
-  `QUEUED` / `IN_PROGRESS` on the HEAD SHA.** A push is not a pass;
-  only a `COMPLETED` + green status is.
-- **Do NOT declare an untested job "pre-existing."** Pre-existing
-  means the test ran to completion and failed the same way on recent
-  dev CI. A job that never ran on your PR cannot be pre-existing.
-- **Do NOT use `gh api .../actions/runs/.../jobs` alone** as the gate
-  signal. External status contexts (GitLab CI pipelines, copy-pr-bot
-  status, etc.) do NOT appear there. Use `statusCheckRollup`.
-- **Do NOT start any background process.** No `&`, no `nohup`, no
-  `run_in_background: true`, no `ScheduleWakeup`. The GitHub Actions
-  step owns your shell; when the step ends, every background process
-  is killed and cannot resume.
-- **Do NOT push directly to `pull-request/<PR_NUMBER>` branches.**
-  The community bot manages those branches when it processes
-  `/ok to test`. Pushing to them directly breaks the CI trigger
-  mechanism. Always push to your own sync branch (e.g.
-  `main2dev/<DATE>`) instead.
-- **Do NOT forget the `Run functional tests` and `Run MBridge tests`
-  labels.** Without `Run functional tests`, the internal GitLab
-  functional tests do not run; without `Run MBridge tests`, the
-  MBridge test suite does not run.
+Read [CI anti-patterns](references/detailed-procedures.md#ci-anti-patterns).
+Key rules: wait for queued/in-progress jobs, gate on `statusCheckRollup`, never
+push to `pull-request/<PR_NUMBER>` branches, and do not mark ready until every
+non-exempt required check is completed green or documented as pre-existing.
 
 ### Failure Investigation
 
@@ -422,9 +341,6 @@ H100/GB200 hardware that may reveal issues GitHub CI does not catch.
 These surface in `statusCheckRollup` as external status contexts (the
 bash template already handles them via the `__typename == "StatusContext"`
 branch).
-
-- Fine-grained activation offloading failures, for example, only showed
-  up in GitLab functional tests during PR #4291
 - If GitHub CI passes but a reviewer reports GitLab failures,
   investigate with the same rigor as GitHub CI failures
 - The sync PR should ideally pass both GitHub and GitLab CI before
