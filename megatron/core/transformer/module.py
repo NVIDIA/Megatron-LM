@@ -340,11 +340,11 @@ class GraphableMegatronModule(MegatronModule):
 
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
-            from megatron.core.transformer.cuda_graphs import is_cuda_graph_bypass
+            from megatron.core.transformer.cuda_graphs import is_cuda_graph_skipped
 
-            if not is_cuda_graph_bypass():
+            if not is_cuda_graph_skipped():
                 return self.cudagraph_manager(self, args, kwargs)
-            # Bypass active: fall through to the eager super().__call__ below.
+            # Skip cudagraphs this step: fall through to the eager call below.
         elif self._should_call_te_cudagraph(*args, **kwargs):
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.

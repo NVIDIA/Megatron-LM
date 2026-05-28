@@ -185,6 +185,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
     args = get_args()
+    config = core_transformer_config_from_args(args)
     timers = get_timers()
 
     # Get the batch.
@@ -206,7 +207,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         ) = get_batch(data_iterator, vp_stage)
 
     packed_seq_params = None
-    cuda_graph_bypass = False
+    cuda_graph_skipped_this_step = False
     if cu_seqlens is not None:
         # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
         # PackedSeqParams (and TE attention) expect 1-D, so squeeze before use.
@@ -226,7 +227,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             max_seqs = config.cuda_graph_max_packed_seqs
             padded_for_params = pad_cu_seqlens_for_cuda_graph(cu_seqlens_for_params, max_seqs)
             if padded_for_params is None:
-                cuda_graph_bypass = True
+                cuda_graph_skipped_this_step = True
             else:
                 cu_seqlens_for_params = padded_for_params
                 if cu_seqlens_padded is not None:
@@ -248,7 +249,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     timers('batch-generator').stop()
 
-    cuda_graph_ctx = disable_cuda_graphs_this_step() if cuda_graph_bypass else contextlib.nullcontext()
+    cuda_graph_ctx = disable_cuda_graphs_this_step() if cuda_graph_skipped_this_step else contextlib.nullcontext()
     with stimer, cuda_graph_ctx:
         if return_schedule_plan:
             assert args.overlap_moe_expert_parallel_comm, \

@@ -116,41 +116,38 @@ def _set_warmup_end():
     _IS_GRAPH_WARMUP = False
 
 
-_CUDA_GRAPH_BYPASS = False
+_CUDA_GRAPH_SKIPPED = False
 
 
-def is_cuda_graph_bypass():
+def is_cuda_graph_skipped():
     """Query whether CUDA graph dispatch is currently bypassed for the calling step.
 
-    Used by ``MegatronModule.__call__`` to fall through to an eager forward pass when
-    the caller has wrapped a microbatch in ``disable_cuda_graphs_this_step``. This is
-    how the packed-sequence overflow fallback works: when a microbatch contains more
-    documents than ``cuda_graph_max_packed_seqs``, that step bypasses graph replay so
-    cu_seqlens shape mismatches do not crash capture.
+    Used by MegatronModule.__call__ to fall through to an eager forward pass when the caller has
+    wrapped a microbatch in disable_cuda_graphs_this_step. This enables the packed-sequence overflow
+    fallback: when a microbatch contains more documents than `cuda_graph_max_packed_seqs`, that step
+    bypasses graph replay so cu_seqlens shape mismatches do not crash capture.
     """
-    return _CUDA_GRAPH_BYPASS
+    return _CUDA_GRAPH_SKIPPED
 
 
 @contextlib.contextmanager
 def disable_cuda_graphs_this_step():
     """Bypass MCore-local CUDA graph dispatch for the duration of the context.
 
-    Mirrors the ``is_checkpointing()`` precedent: a thread-unsafe module-level flag
-    that the dispatch site in ``MegatronModule.__call__`` consults. Intended for
-    per-microbatch opt-outs (e.g. when a packed-sequence batch exceeds the configured
+    Intended for per-microbatch opt-outs (e.g. when a packed-sequence batch exceeds the configured
     cap and must run eagerly).
 
-    Note: during the recording phase of pipeline-parallel training, bypassing a
-    microbatch desynchronizes the per-microbatch runner store. Callers under
-    ``pipeline_model_parallel_size > 1`` should raise the cap rather than rely on this.
+    Note: during the recording phase of pipeline-parallel training, bypassing a microbatch
+    desynchronizes the per-microbatch runner store. Callers using
+    pipeline_model_parallel_size > 1 should raise the cap rather than rely on this fallback.
     """
-    global _CUDA_GRAPH_BYPASS
-    prev = _CUDA_GRAPH_BYPASS
-    _CUDA_GRAPH_BYPASS = True
+    global _CUDA_GRAPH_SKIPPED
+    prev = _CUDA_GRAPH_SKIPPED
+    _CUDA_GRAPH_SKIPPED = True
     try:
         yield
     finally:
-        _CUDA_GRAPH_BYPASS = prev
+        _CUDA_GRAPH_SKIPPED = prev
 
 
 @dataclass

@@ -906,15 +906,13 @@ class TransformerConfig(ModelParallelConfig):
     """Number of warmup steps for CUDA graphs"""
 
     cuda_graph_max_packed_seqs: int = 0
-    """Maximum number of packed sequences per microbatch supported by CUDA graph capture
-    for packed-sequence (THD / variable-length) training. When > 0, cu_seqlens tensors
-    are padded to ``cuda_graph_max_packed_seqs + 1`` entries before being placed on
-    PackedSeqParams, so that the cudagraph input signature is stable across steps.
-    Microbatches that contain more than ``cuda_graph_max_packed_seqs`` documents fall
-    back to an eager (non-graphed) forward pass for that step. ``0`` (default) disables
-    padding entirely (the entire feature is off by default). The CLI flag
-    ``--cuda-graph-max-packed-seqs`` accepts no value to opt in with a default cap of
-    50, or an explicit value for fine-grained control. Only applies to
+    """Maximum number of packed sequences per microbatch supported by CUDA graph capture for 
+    packed-sequence (THD / variable-length) training. When > 0, cu_seqlens tensors are padded to 
+    `cuda_graph_max_packed_seqs + 1` entries before being placed on PackedSeqParams so that the 
+    cudagraph input signature is stable across steps. Microbatches that contain more than 
+    `cuda_graph_max_packed_seqs` documents fall back to an eager forward pass for that step. 
+    `0` disables padding entirely and the entire feature is off. If no value is passed then 
+    `--cuda-graph-max-packed-seqs` uses a default cap of 50. Only applies to
     cuda_graph_impl="local"."""
 
     external_cuda_graph: bool = False
