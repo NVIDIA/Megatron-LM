@@ -191,3 +191,4 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 | Test passes locally but fails in CI | Different environment or data path | Check `DATA_PATH`, `DATA_CACHE_PATH`, and the `environment` tag (`dev` vs `lts`) |
 | Golden value mismatch after a code change | Numerical regression | Download new golden values via `download_golden_values.py` after a clean run |
 | `cicd-integration-tests-gb200` not triggered | GB200 jobs require maintainer status | Ask a maintainer to trigger, or add the `Run functional tests` label |
+<!-- End of skill. -->

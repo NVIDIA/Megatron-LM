@@ -207,3 +207,4 @@ Triage rules of thumb:
 - Some artifacts have a literal string `"nan"` in step 1 of `iteration-time`; the comparison script filters those out, so other steps for that metric still contribute. Don't flag `iteration-time` as a correctness problem unless something else also moved.
 - The script's filename is `compare_golden_values_kl.py` for legacy reasons; it no longer computes KL divergence. The function and CSV column names reflect what it actually does (`avg_rel_diff`).
 - Never commit `GITHUB_TOKEN`, `RO_API_TOKEN`, or any value derived from `gh auth token`. If the user wants you to commit, only stage golden-value files and the optional CSV — not the env or the venv.
+<!-- End of skill. -->
