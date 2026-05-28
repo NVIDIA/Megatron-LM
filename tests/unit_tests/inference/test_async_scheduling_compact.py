@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from megatron.core import utils as core_utils
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.ep_async_protocol import (
     EPAsyncHandoffDecision,
     EPAsyncPhase,
@@ -299,7 +301,6 @@ def _make_controller_with_rows(pending_ids, current_ids):
         None if pending_ids is None else torch.tensor(pending_ids, dtype=torch.int64)
     )
     controller._async_discarded_forward_count = 0
-    controller._async_row_mapped_forward_count = 0
     controller.inference_wrapped_model = SimpleNamespace(
         inference_context=SimpleNamespace(
             request_ids=torch.tensor(current_ids, dtype=torch.int64),
@@ -311,13 +312,12 @@ def _make_controller_with_rows(pending_ids, current_ids):
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
 @pytest.mark.parametrize(
     ("pending_ids", "current_ids", "expected_status", "expected_resolve", "expected_rows"),
     [
         (None, [10, 11], (True, False), (True, False), None),
         ([10, 11], [10, 11], (True, False), (True, False), None),
-        ([10, 11, 12], [12, 10], (True, True), (True, True), [2, 0]),
+        ([10, 11, 12], [12, 10], (False, False), (False, False), None),
         ([10, 11], [10, 12], (False, False), (False, False), None),
         ([10, 11], [], (False, False), (False, False), None),
     ],
@@ -336,7 +336,6 @@ def test_pending_async_forward_rows_reuse_map_or_discard(
     else:
         assert row_indices.tolist() == expected_rows
     assert controller._async_discarded_forward_count == int(not expected_resolve[0])
-    assert controller._async_row_mapped_forward_count == int(expected_resolve[1])
     assert controller._async_pending_forward_request_ids is None
 
 
@@ -455,7 +454,6 @@ def _make_async_gate_controller(active_request_count=2):
     controller.num_speculative_tokens = 0
     controller._num_mtp_depths = 0
     controller._sampling_backend = "torch"
-    controller._async_admission_barrier_requested = False
     context = SimpleNamespace(
         total_request_count=active_request_count,
         paused_request_count=0,
@@ -486,7 +484,6 @@ def _make_async_gate_controller(active_request_count=2):
         ("prefill", "not decode-only"),
         ("eager_step", "not using cuda graph"),
         ("empty", "no active requests"),
-        ("admission_barrier", "waiting request admission deferred"),
         ("stride_mismatch", "cuda graph shape does not match decode stride"),
     ],
 )
@@ -521,16 +518,49 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
     elif case == "empty":
         context.total_request_count = 0
         context.padded_batch_dimensions = InferenceBatchDimensions(0, 0, 0)
-    elif case == "admission_barrier":
-        controller._async_admission_barrier_requested = True
     elif case == "stride_mismatch":
         controller.num_speculative_tokens = 1
         controller._num_mtp_depths = 1
         allow_mtp = True
 
     assert controller._async_scheduling_disabled_reason(allow_mtp=allow_mtp) == expected
-    if case == "admission_barrier":
-        assert not controller._async_admission_barrier_requested
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("waiting_ids", "has_pending", "availability", "expected_discard"),
+    [
+        ([], True, (True, True, True), False),
+        ([7], False, (True, True, True), False),
+        ([7], True, (False, True, True), False),
+        ([7], True, (True, False, True), False),
+        ([7], True, (True, True, False), False),
+        ([7], True, (True, True, True), True),
+    ],
+)
+def test_waiting_request_admission_discards_reusable_async_forward(
+    waiting_ids, has_pending, availability, expected_discard
+):
+    engine = object.__new__(DynamicInferenceEngine)
+    discard_calls = []
+    checked_requests = []
+    request = SimpleNamespace(request_id=7)
+
+    engine.waiting_request_ids = deque(waiting_ids)
+    engine.get_request = lambda request_id: request
+    engine.context = SimpleNamespace(
+        check_availability=lambda req: checked_requests.append(req) or availability
+    )
+    engine.controller = SimpleNamespace(
+        has_pending_async_forward=lambda: has_pending,
+        discard_pending_async_forward=lambda: discard_calls.append("discard"),
+    )
+
+    discarded = engine._discard_pending_async_forward_for_waiting_admission()
+
+    assert discarded is expected_discard
+    assert discard_calls == (["discard"] if expected_discard else [])
+    assert checked_requests == ([request] if waiting_ids and has_pending else [])
 
 
 @pytest.mark.internal
@@ -1151,6 +1181,68 @@ def test_row_mapped_full_logits_sampling_uses_pending_decode_rows():
     result = controller._dynamic_step_required_token_logits(row_indices=torch.tensor([2, 0]))
 
     assert torch.equal(result, source_logits.squeeze(0).index_select(0, torch.tensor([2, 0])))
+
+
+@pytest.mark.internal
+def test_decode_full_logits_sampling_uses_current_rows_after_async_prepare_without_row_map():
+    controller = object.__new__(TextGenerationController)
+    source_logits = torch.arange(4 * 5, dtype=torch.float32).view(1, 4, 5)
+
+    def _fail_last_token_logits(_logits):
+        pytest.fail("decode-only full logits should not use mutated last-token metadata")
+
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        is_decode_only=lambda: True,
+        last_token_logits=_fail_last_token_logits,
+    )
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._all_logits_cuda = source_logits
+
+    result = controller._dynamic_step_required_token_logits()
+
+    assert torch.equal(result, source_logits.squeeze(0)[:2])
+
+
+@pytest.mark.internal
+def test_decode_full_logits_sampling_kernel_uses_contiguous_rows_after_async_prepare():
+    controller = object.__new__(TextGenerationController)
+    source_logits = torch.arange(4 * 5, dtype=torch.float32).view(1, 4, 5)
+    captures = {}
+
+    class _Sampling:
+        def sample_kernel(self, logits, n, context, gather_indices=None, eager=True, cache_key=None):
+            captures["logits"] = logits
+            captures["n"] = n
+            captures["gather_indices"] = gather_indices
+            captures["eager"] = eager
+            captures["cache_key"] = cache_key
+            return torch.tensor([4, 3, 2, 1])
+
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        padded_active_request_count=4,
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        is_decode_only=lambda: True,
+        using_cuda_graph_this_step=lambda: True,
+        gpu_view=SimpleNamespace(active_request_last_token_idxs=torch.tensor([3, 2, 1, 0])),
+    )
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._all_logits_cuda = source_logits
+    controller._sampled_tokens_cuda = torch.empty(2, dtype=torch.long)
+    controller._sampling = _Sampling()
+    controller._sampling_backend = "flashinfer"
+    controller._enable_cuda_graph = True
+
+    controller._dynamic_step_sample_logits()
+
+    assert captures["gather_indices"] is None
+    assert captures["n"] == 4
+    assert captures["cache_key"] == ("sample", 4)
+    assert torch.equal(controller._sampled_tokens_cuda, torch.tensor([4, 3]))
 
 
 @pytest.mark.internal

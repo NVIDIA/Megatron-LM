@@ -180,11 +180,8 @@ class TextGenerationController:
         self._async_pending_forward_request_ids = None
         self._dummy_context_h2d_done_event = None
         self._async_step_barrier_reason = None
-        self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
-        self._async_row_mapped_forward_count = 0
         self._async_discarded_forward_count = 0
-        self._async_add_deferral_count = 0
         self._async_finish_boundary_count = 0
         self._async_mtp_finish_boundary_count = 0
         self._async_pause_boundary_count = 0
@@ -1469,7 +1466,7 @@ class TextGenerationController:
         # last-token positions. Row-mapped reuse remaps those gather indices.
         if context.config.materialize_only_last_token_logits:
             gather_indices = row_indices
-        elif row_indices is not None and context.is_decode_only():
+        elif context.is_decode_only():
             gather_indices = row_indices
         else:
             gather_indices = context.gpu_view.active_request_last_token_idxs
@@ -1494,11 +1491,6 @@ class TextGenerationController:
     def set_ep_async_protocol(self, protocol) -> None:
         """Attach the EP async protocol used by coordinator-driven EP decoding."""
         self._ep_async_protocol = protocol
-
-    def request_async_admission_barrier(self) -> None:
-        """Stop chaining async forwards once so waiting requests can be admitted."""
-        self._async_add_deferral_count += 1
-        self._async_admission_barrier_requested = True
 
     def set_async_step_barrier(self, reason: str) -> None:
         """Prevent async launches for the current engine step."""
@@ -1597,22 +1589,18 @@ class TextGenerationController:
         if torch.equal(pending_request_ids, current_request_ids):
             return True, False
 
-        pending_row_by_request_id = {
-            int(request_id): row for row, request_id in enumerate(pending_request_ids.tolist())
-        }
-        for request_id in current_request_ids.tolist():
-            if int(request_id) not in pending_row_by_request_id:
-                return False, False
-
-        return True, True
+        return False, False
 
     def _resolve_pending_async_forward_rows(self) -> tuple[bool, Optional[Tensor], bool]:
-        """Map current active rows back to the pending speculative forward rows.
+        """Resolve whether a pending speculative forward can be reused.
+
+        A pending forward is only reused when the active request rows still match
+        exactly.  If rows changed because requests finished, paused, or were
+        evicted, discard the forward and run the current step normally.
 
         Returns:
             tuple[bool, Optional[Tensor], bool]: ``(usable, row_indices, row_mapped)``.
-            ``row_indices`` is ``None`` when the pending forward already matches
-            current active row order.
+            ``row_indices`` is currently always ``None``.
         """
         pending_request_ids = self._async_pending_forward_request_ids
         self._async_pending_forward_request_ids = None
@@ -1626,22 +1614,8 @@ class TextGenerationController:
         if torch.equal(pending_request_ids, current_request_ids):
             return True, None, False
 
-        pending_row_by_request_id = {
-            int(request_id): row for row, request_id in enumerate(pending_request_ids.tolist())
-        }
-        mapped_rows = []
-        for request_id in current_request_ids.tolist():
-            row = pending_row_by_request_id.get(int(request_id))
-            if row is None:
-                self._async_discarded_forward_count += 1
-                return False, None, False
-            mapped_rows.append(row)
-
-        row_indices = torch.tensor(
-            mapped_rows, dtype=torch.long, device=torch.cuda.current_device()
-        )
-        self._async_row_mapped_forward_count += 1
-        return True, row_indices, True
+        self._async_discarded_forward_count += 1
+        return False, None, False
 
     def _discard_pending_async_forward(self) -> None:
         """Discard a pending async forward and release resources reserved for it."""
@@ -1652,6 +1626,10 @@ class TextGenerationController:
             self._async_pending_cuda_graph_request_count = None
             self._async_pending_forward_request_ids = None
             self._async_discarded_forward_count += 1
+
+    def discard_pending_async_forward(self) -> None:
+        """Discard a speculative async forward that cannot be reused safely."""
+        self._discard_pending_async_forward()
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
         """Synchronize pending async state at the beginning of an EP work step."""
@@ -1753,11 +1731,13 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         if (
-            row_indices is not None
-            and not context.config.materialize_only_last_token_logits
+            not context.config.materialize_only_last_token_logits
             and context.is_decode_only()
         ):
-            return self._all_logits_cuda.squeeze(0).index_select(0, row_indices)
+            required_token_logits = self._all_logits_cuda.squeeze(0)
+            if row_indices is None:
+                return required_token_logits[:active_request_count, :]
+            return required_token_logits.index_select(0, row_indices)
         if context.config.materialize_only_last_token_logits:
             required_token_logits = self._all_logits_cuda.squeeze(0)
             if row_indices is None:
@@ -1979,10 +1959,6 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         if active_request_count <= 0:
             return "no active requests"
-        if self._async_admission_barrier_requested:
-            self._async_admission_barrier_requested = False
-            return "waiting request admission deferred"
-
         tokens_per_request = self.num_speculative_tokens + 1
         if (
             context.padded_batch_dimensions.token_count
