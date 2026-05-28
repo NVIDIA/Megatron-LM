@@ -220,6 +220,30 @@ class TestMimoModel:
         )
         assert text_embeddings.shape == (self.batch_size * self.seq_len, self.hidden_size)
 
+    def test_get_text_embeddings_handles_3d_position_ids(self):
+        """3D mRoPE position_ids ``[rope_dim, B, S]`` must produce the same text
+        embeddings as the 2D ``[B, S]`` baseline.
+
+        Multimodal RoPE (e.g. Qwen3-VL) carries multiple positional channels.
+        ``get_text_embeddings`` should slice the first channel for the absolute
+        text-position lookup; otherwise the indexed positions correspond to
+        the wrong axis and the language model receives garbage text embeddings.
+        ``eval()`` disables embedding dropout so the two calls are
+        bit-comparable.
+        """
+        mimo_model = self._make_avlm().eval()
+        input_ids = self._make_input_ids()
+        position_ids_2d = self._make_position_ids()
+        # Build [rope_dim=3, B, S] by tiling the 2D ids along a new leading
+        # axis. Only channel 0 is consumed by the text lookup, so the result
+        # must match the 2D baseline exactly.
+        position_ids_3d = position_ids_2d.unsqueeze(0).expand(3, -1, -1).contiguous()
+
+        emb_2d = mimo_model.get_text_embeddings(input_ids, position_ids_2d, self.special_token_ids)
+        emb_3d = mimo_model.get_text_embeddings(input_ids, position_ids_3d, self.special_token_ids)
+        assert emb_3d.shape == emb_2d.shape
+        torch.testing.assert_close(emb_3d, emb_2d)
+
     def test_forward_text_only(self):
         """Test forward pass with only text input."""
         mimo_model = self._make_vlm()
@@ -230,6 +254,43 @@ class TestMimoModel:
             input_ids=input_ids, position_ids=position_ids, modality_inputs=None
         )
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
+
+    def test_forward_threads_position_ids_to_language_model(self):
+        """``MimoModel.forward`` must thread ``position_ids`` through to
+        ``self.language_model`` so multimodal RoPE can compute its rotary
+        embeddings.
+
+        Multimodal RoPE (e.g. Qwen3-VL) consumes ``position_ids`` even when
+        the language model receives a pre-combined ``decoder_input`` (which
+        replaces the embedding lookup). ``input_ids`` is therefore unused on
+        this path and must not be forwarded — its shape would not match the
+        expanded ``decoder_input`` sequence.
+        """
+        mimo_model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        position_ids = self._make_position_ids()
+
+        captured = {}
+
+        def capture_lm_forward(*args, **kwargs):
+            captured['input_ids'] = kwargs.get('input_ids')
+            captured['position_ids'] = kwargs.get('position_ids')
+            captured['decoder_input'] = kwargs.get('decoder_input')
+            return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
+
+        with patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward):
+            mimo_model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
+
+        assert (
+            captured['decoder_input'] is not None
+        ), "MimoModel.forward must pass a pre-combined decoder_input to the language model"
+        assert (
+            captured['input_ids'] is None
+        ), "MimoModel.forward must not forward input_ids when decoder_input is pre-combined"
+        assert (
+            captured['position_ids'] is not None
+        ), "MimoModel.forward must pass position_ids to the language model (got None)"
+        torch.testing.assert_close(captured['position_ids'], position_ids)
 
     def test_forward_with_image_modality(self):
         """Test forward pass with text and image input."""
@@ -622,3 +683,44 @@ class TestMimoModelNonColocated:
         outputs, _ = model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
         assert isinstance(outputs, torch.Tensor)
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
+
+    def test_forward_language_module_non_first_stage_drops_input_ids(self):
+        """Non-first PP stage in ``_forward_language_module`` must call the LM
+        with ``input_ids=None`` (hidden states arrive via ``set_input_tensor``)
+        while still threading ``position_ids`` through for mRoPE.
+        """
+        model = MimoModel(self._make_config(encoder_in_grid=False, language_in_grid=True))
+        model = model.to(self.device)
+
+        input_ids = torch.randint(
+            0, self.vocab_size, (self.batch_size, self.seq_len), device=self.device
+        )
+        position_ids = (
+            torch.arange(self.seq_len, device=self.device).unsqueeze(0).expand(self.batch_size, -1)
+        )
+        hidden_states = torch.randn(
+            self.seq_len, self.batch_size, self.hidden_size, device=self.device
+        )
+
+        captured = {}
+
+        def capture_lm_forward(*args, **kwargs):
+            captured.update(kwargs)
+            return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
+
+        with (
+            patch.object(model.role, 'is_first_stage', return_value=False),
+            patch.object(model.role, 'is_last_stage', return_value=True),
+            patch.object(model.language_model, 'forward', side_effect=capture_lm_forward),
+        ):
+            model._forward_language_module(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                labels=None,
+                input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
+            )
+
+        assert captured['input_ids'] is None
+        assert captured['decoder_input'] is None
+        torch.testing.assert_close(captured['position_ids'], position_ids)
