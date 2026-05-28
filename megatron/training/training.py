@@ -1318,6 +1318,25 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+
+    # Enable CUDA memory event recording BEFORE model/optimizer init, so the
+    # snapshot at dump time contains full allocation event traces (frames +
+    # device_traces), not just segment state. Gated on the existing
+    # `--record-memory-history` flag.
+    if args.record_memory_history and (
+        is_last_rank() or torch.distributed.get_backend() == 'fake'
+    ):
+        try:
+            torch.cuda.memory._record_memory_history(
+                enabled='all',
+                context='all',
+                stacks='python',
+                max_entries=100000,
+            )
+            print_rank_0("[memory_snapshot] enabled torch.cuda.memory event recording (mode=all)")
+        except Exception as _e:  # noqa: BLE001
+            print_rank_0(f"[memory_snapshot] _record_memory_history failed: {_e}")
+
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
