@@ -504,6 +504,7 @@ jobs:
             ${{ needs.cicd-mbridge-testing.result == 'success' && ':white_check_mark: *MBridge downstream tests passed*' || ':rotating_light: *MBridge downstream tests failed*' }}
             • Trigger: `${{ github.event_name }}` on `${{ github.ref_name }}`
             • Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run #${{ github.run_id }}>
+            ${{ needs.cicd-mbridge-testing.result == 'failure' && format('cc <!subteam^{0}>', secrets.SLACK_NEMO_MB_CODEOWNERS_GROUP_ID) || '' }}
 
   cicd-compute-build-matrix:
     runs-on: ubuntu-latest
