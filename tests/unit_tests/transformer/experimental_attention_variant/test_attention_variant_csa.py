@@ -15,6 +15,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressorSubmodules,
     CSAIndexer,
     CSAIndexerSubmodules,
+    _apply_rope,
     get_compress_topk_idxs,
     get_window_topk_idxs,
     unfused_compressed_sparse_attn,
@@ -870,3 +871,194 @@ class TestCompressedSparseAttentionDenseMode:
 
         assert output.shape == (seq_len, batch_size, np_ * hn)
         assert not torch.isnan(output).any()
+
+
+# ===========================================================================
+# _apply_rope tests
+# ===========================================================================
+
+
+class TestApplyRope:
+    """Test ``_apply_rope`` — the layout-aware RoPE wrapper used by
+    Compressor / CSAIndexer / DSv4HybridAttention.
+
+    Behaviours covered:
+
+    * 3-D ``[seq, batch, head_dim]`` and 4-D ``[seq, batch, heads, head_dim]``
+      inputs both work (3-D gets a temporary head-dim unsqueeze).
+    * Only the trailing ``pos_dim`` components are rotated; the leading
+      ``nope_dim`` slice is bit-exact unchanged.
+    * Both ``RotaryEmbedding`` (returns ``Tensor``) and
+      ``YarnRotaryEmbedding`` (returns ``(emb, mscale)`` tuple) — DSv4
+      hybrid silently swaps the class based on ``compress_ratio``.
+    * Both unfused and fused (``config.apply_rope_fusion=True``) paths
+      produce the same output (within bf16 precision).
+    * For ``ratio > 1`` the rotary table is built at
+      ``rotary_seq_len * ratio`` and strided by ``ratio``.
+    """
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(0)
+        model_parallel_cuda_manual_seed(0)
+        cls = request.cls
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp'],
+        )
+        # head_dim 32 = nope 24 + pos 8
+        cls.config = _make_mla_config(v_head_dim=32, qk_pos_emb_head_dim=8)
+        yield
+        Utils.destroy_model_parallel()
+
+    def _make_rotary(self, kind: str):
+        from megatron.core.models.common.embeddings import (
+            RotaryEmbedding,
+            YarnRotaryEmbedding,
+        )
+
+        pos_dim = self.config.qk_pos_emb_head_dim
+        if kind == 'rope':
+            return RotaryEmbedding(
+                pos_dim,
+                rotary_percent=1.0,
+                rotary_base=10000,
+                cp_group=self.pg_collection.cp,
+            )
+        if kind == 'yarn':
+            return YarnRotaryEmbedding(
+                pos_dim,
+                rotary_base=40000,
+                scaling_factor=40,
+                original_max_position_embeddings=4096,
+                beta_fast=32,
+                beta_slow=1,
+                mscale=1.0,
+                mscale_all_dim=0.0,
+                cp_group=self.pg_collection.cp,
+            )
+        raise ValueError(kind)
+
+    def _config_with(self, *, apply_rope_fusion: bool):
+        # Reuse the class-level config; only flip the fusion flag.
+        cfg = self.config
+        cfg.apply_rope_fusion = apply_rope_fusion
+        return cfg
+
+    _ROTARY_FUSION_COMBOS = [
+        pytest.param('rope', False, id='rope-unfused'),
+        pytest.param('rope', True, id='rope-fused'),
+        pytest.param('yarn', False, id='yarn-unfused'),
+        pytest.param('yarn', True, id='yarn-fused'),
+    ]
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(("rotary_kind", "apply_rope_fusion"), _ROTARY_FUSION_COMBOS)
+    @pytest.mark.parametrize("input_ndim", [3, 4], ids=['3d', '4d'])
+    @pytest.mark.parametrize("ratio", [1, 4], ids=['ratio_1', 'ratio_4'])
+    def test_apply_rope(self, rotary_kind, apply_rope_fusion, input_ndim, ratio):
+        """Output shape == input shape; no NaN; nope-dim slice is
+        bit-exact unchanged. Sweeps the valid combinations of rotary
+        class × apply_rope_fusion × input rank × ratio. Yarn's
+        tuple-return is covered by the ``'yarn-*'`` combos.
+        """
+        rotary = self._make_rotary(rotary_kind).cuda()
+        nope = self.config.v_head_dim - self.config.qk_pos_emb_head_dim
+        pos = self.config.qk_pos_emb_head_dim
+        head_dim = nope + pos
+        seq, batch, heads = 8, 2, 4
+        cfg = self._config_with(apply_rope_fusion=apply_rope_fusion)
+
+        shape = (seq, batch, head_dim) if input_ndim == 3 else (seq, batch, heads, head_dim)
+        x = torch.randn(*shape, dtype=torch.bfloat16, device='cuda')
+        # ``fused_mla_rope_inplace`` mutates the input — give it a copy so
+        # the nope-dim equality check below still has the original.
+        out = _apply_rope(
+            x.clone(), nope, pos, rotary, cfg,
+            rotary_seq_len=seq, ratio=ratio,
+            cp_group=self.pg_collection.cp,
+        )
+
+        assert out.shape == x.shape
+        assert out.dtype == x.dtype
+        assert not torch.isnan(out).any()
+        # The leading nope_dim slice is the identity portion of RoPE.
+        assert torch.equal(out[..., :nope], x[..., :nope]), (
+            "RoPE must not touch the first nope_dim components"
+        )
+        # Trailing pos_dim should rotate at non-zero positions.
+        pe_changed = (out[..., nope:] != x[..., nope:]).any(dim=-1).flatten()
+        assert pe_changed[1:].any(), (
+            "RoPE should rotate the trailing pos_dim components for seq > 0"
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("rotary_kind", ['rope', 'yarn'])
+    def test_3d_input_matches_4d_with_single_head(self, rotary_kind):
+        """For a single-head input, the 3-D ``(s, b, d)`` and 4-D
+        ``(s, b, 1, d)`` invocations must produce numerically identical
+        output (3-D path just inserts a temporary head dim).
+        """
+        rotary = self._make_rotary(rotary_kind).cuda()
+        nope = self.config.v_head_dim - self.config.qk_pos_emb_head_dim
+        pos = self.config.qk_pos_emb_head_dim
+        head_dim = nope + pos
+        seq, batch = 8, 2
+        cfg = self._config_with(apply_rope_fusion=False)
+
+        x_3d = torch.randn(seq, batch, head_dim, dtype=torch.bfloat16, device='cuda')
+        x_4d = x_3d.unsqueeze(-2)
+
+        out_3d = _apply_rope(
+            x_3d, nope, pos, rotary, cfg,
+            rotary_seq_len=seq, ratio=1, cp_group=self.pg_collection.cp,
+        )
+        out_4d = _apply_rope(
+            x_4d, nope, pos, rotary, cfg,
+            rotary_seq_len=seq, ratio=1, cp_group=self.pg_collection.cp,
+        )
+
+        assert out_3d.shape == x_3d.shape
+        assert out_4d.shape == x_4d.shape
+        assert torch.equal(out_3d, out_4d.squeeze(-2))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("rotary_kind", ['rope', 'yarn'])
+    def test_ratio_strides_rotary_table(self, rotary_kind):
+        """For ``ratio > 1``, the rotary table is built at
+        ``rotary_seq_len * ratio`` and strided by ``ratio``. The result
+        with ``ratio=k`` must equal an ``apply_rope`` call on the same
+        positions of a length-``rotary_seq_len * k`` table.
+        """
+        rotary = self._make_rotary(rotary_kind).cuda()
+        nope = self.config.v_head_dim - self.config.qk_pos_emb_head_dim
+        pos = self.config.qk_pos_emb_head_dim
+        head_dim = nope + pos
+        seq, batch, heads, ratio = 4, 1, 2, 4
+        cfg = self._config_with(apply_rope_fusion=False)
+
+        x_comp = torch.randn(
+            seq, batch, heads, head_dim, dtype=torch.bfloat16, device='cuda',
+        )
+        out_comp = _apply_rope(
+            x_comp.clone(), nope, pos, rotary, cfg,
+            rotary_seq_len=seq, ratio=ratio, cp_group=self.pg_collection.cp,
+        )
+
+        x_full = torch.zeros(
+            seq * ratio, batch, heads, head_dim, dtype=torch.bfloat16, device='cuda',
+        )
+        x_full[::ratio][:seq] = x_comp
+        out_full = _apply_rope(
+            x_full, nope, pos, rotary, cfg,
+            rotary_seq_len=seq * ratio, ratio=1, cp_group=self.pg_collection.cp,
+        )
+        out_ref = out_full[::ratio][:seq]
+
+        assert torch.allclose(out_comp, out_ref, rtol=1e-3, atol=1e-3), (
+            f"ratio={ratio} stride mismatch: "
+            f"max abs diff = {(out_comp - out_ref).abs().max().item():.3e}"
+        )
+

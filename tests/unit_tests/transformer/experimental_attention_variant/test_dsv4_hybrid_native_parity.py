@@ -143,8 +143,47 @@ def _make_config(
     return config
 
 
-def _precompute_freqs_cis(dim: int, seqlen: int, device, base: float) -> torch.Tensor:
+def _precompute_freqs_cis(
+    dim: int,
+    seqlen: int,
+    device,
+    base: float,
+    *,
+    original_seq_len: int = 0,
+    factor: float = 1.0,
+    beta_fast: float = 32.0,
+    beta_slow: float = 1.0,
+) -> torch.Tensor:
+    """Precompute the [seq, 1, 1, dim] freqs table used by ``_apply_rotary_emb``.
+
+    Matches the golden DSv4 reference (``Megatron-LM/model.py:precompute_freqs_cis``)
+    and ``YarnRotaryEmbedding`` semantics:
+
+    * ``original_seq_len > 0`` enables YaRN frequency interpolation between
+      the ``beta_fast`` / ``beta_slow`` correction-range bounds. Frequencies
+      below the low boundary are divided by ``factor`` (interpolation); above
+      the high boundary, freqs pass through (extrapolation); a smooth linear
+      ramp blends the two in between.
+    * ``original_seq_len == 0`` reverts to plain RoPE with no scaling — the
+      window-only branch on the production side.
+    """
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+    if original_seq_len > 0:
+        def _correction_dim(num_rotations):
+            return (
+                dim * math.log(original_seq_len / (num_rotations * 2 * math.pi))
+            ) / (2 * math.log(base))
+
+        low = max(int(math.floor(_correction_dim(beta_fast))), 0)
+        high = min(int(math.ceil(_correction_dim(beta_slow))), dim - 1)
+        if low == high:
+            high += 1  # avoid div-by-zero in the ramp
+        ramp = (
+            torch.arange(dim // 2, dtype=torch.float32, device=device) - low
+        ) / (high - low)
+        smooth = 1.0 - torch.clamp(ramp, 0.0, 1.0)
+        freqs = freqs / factor * (1.0 - smooth) + freqs * smooth
+
     t = torch.arange(seqlen, device=device)
     freqs = torch.outer(t, freqs)
     return torch.cat((freqs, freqs), dim=-1)[:, None, None, :]
@@ -390,6 +429,17 @@ class NativeCompressor(nn.Module):
         self.rope_base = (
             config.csa_compress_rotary_base if compress_ratio > 1 else config.rotary_base
         )
+        # YaRN frequency interpolation is enabled only for compressed sequences
+        # (matches ``DSv4HybridAttention``'s ``use_compressed_yarn = ratio > 1``).
+        if compress_ratio > 1:
+            self._rope_yarn_kwargs = dict(
+                original_seq_len=config.original_max_position_embeddings,
+                factor=config.rotary_scaling_factor,
+                beta_fast=config.beta_fast,
+                beta_slow=config.beta_slow,
+            )
+        else:
+            self._rope_yarn_kwargs = dict()
 
         self.linear_wkv = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.linear_wgate = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
@@ -433,7 +483,8 @@ class NativeCompressor(nn.Module):
         pos_dim = self.qk_pos_emb_head_dim
         content, rotary = torch.split(kv, [self.head_dim - pos_dim, pos_dim], dim=-1)
         freqs_cis = _precompute_freqs_cis(
-            pos_dim, n_compressed * ratio, device=x.device, base=self.rope_base
+            pos_dim, n_compressed * ratio, device=x.device, base=self.rope_base,
+            **self._rope_yarn_kwargs,
         )
         freqs_cis = freqs_cis[: n_compressed * ratio : ratio][:n_compressed]
         rotary = _apply_rotary_emb(rotary, freqs_cis)
@@ -455,6 +506,14 @@ class NativeCSAIndexer(nn.Module):
         self.softmax_scale = self.index_head_dim**-0.5
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
         self.rope_base = config.csa_compress_rotary_base
+        # CSA indexer is only instantiated for ``compress_ratio == 4``, which is
+        # always the YaRN-enabled branch on the production side.
+        self._rope_yarn_kwargs = dict(
+            original_seq_len=config.original_max_position_embeddings,
+            factor=config.rotary_scaling_factor,
+            beta_fast=config.beta_fast,
+            beta_slow=config.beta_slow,
+        )
 
         self.linear_wq_b = nn.Linear(
             config.q_lora_rank, self.index_n_heads * self.index_head_dim, bias=False
@@ -471,7 +530,10 @@ class NativeCSAIndexer(nn.Module):
         q = self.linear_wq_b(qr).view(sq, batch_size, self.index_n_heads, self.index_head_dim)
         pos_dim = self.qk_pos_emb_head_dim
         q_content, q_rotary = torch.split(q, [self.index_head_dim - pos_dim, pos_dim], dim=-1)
-        freqs_cis = _precompute_freqs_cis(pos_dim, sq, device=x.device, base=self.rope_base)
+        freqs_cis = _precompute_freqs_cis(
+            pos_dim, sq, device=x.device, base=self.rope_base,
+            **self._rope_yarn_kwargs,
+        )
         q_rotary = _apply_rotary_emb(q_rotary, freqs_cis)
         q = _native_hadamard_transform(torch.cat([q_content, q_rotary], dim=-1))
 
@@ -626,6 +688,15 @@ class NativeDSv4HybridAttention(nn.Module):
         self.rope_base = (
             config.csa_compress_rotary_base if compress_ratio > 1 else config.rotary_base
         )
+        if compress_ratio > 1:
+            self._rope_yarn_kwargs = dict(
+                original_seq_len=config.original_max_position_embeddings,
+                factor=config.rotary_scaling_factor,
+                beta_fast=config.beta_fast,
+                beta_slow=config.beta_slow,
+            )
+        else:
+            self._rope_yarn_kwargs = dict()
 
         self.linear_q_down_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.layernorm_epsilon)
@@ -647,7 +718,10 @@ class NativeDSv4HybridAttention(nn.Module):
         self, hidden_states: torch.Tensor, pg_collection
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         sq, batch_size, _ = hidden_states.size()
-        freqs_cis = _precompute_freqs_cis(self.pos_dim, sq, hidden_states.device, self.rope_base)
+        freqs_cis = _precompute_freqs_cis(
+            self.pos_dim, sq, hidden_states.device, self.rope_base,
+            **self._rope_yarn_kwargs,
+        )
 
         qr = self.q_layernorm(self.linear_q_down_proj(hidden_states))
         query = self.linear_q_up_proj(qr).view(sq, batch_size, self.num_heads, self.head_dim)
