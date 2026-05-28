@@ -22,13 +22,15 @@ from megatron.training.models.dist_utils import (
 
 
 def _make_pg():
-    """Mock ProcessGroupCollection with dp, cp, tp, pp sub-groups."""
+    """Mock ProcessGroupCollection with dp, cp, tp, pp, dp_cp, expt_dp sub-groups."""
     pg = Mock()
     pg.dp.rank.return_value = 0
     pg.cp.rank.return_value = 0
     pg.tp.rank.return_value = 0
     pg.pp.rank.return_value = 0
     pg.pp.size.return_value = 1
+    pg.dp_cp.size.return_value = 1
+    pg.expt_dp.size.return_value = 1
     return pg
 
 
@@ -314,15 +316,6 @@ class TestDdpWrap:
         self.ddp_config.overlap_grad_reduce = True
         self.ddp_config.use_distributed_optimizer = False
         self.model = [_make_model_module(), _make_model_module()]
-        # Patch mpu so the default-bucket-size computation has integer return values.
-        self._mpu_patcher = patch("megatron.training.models.dist_utils.mpu")
-        mpu_mock = self._mpu_patcher.start()
-        mpu_mock.get_data_parallel_world_size.return_value = 1
-        mpu_mock.get_pipeline_model_parallel_rank.return_value = 0
-        mpu_mock.get_expert_data_parallel_world_size.return_value = 1
-
-    def teardown_method(self):
-        self._mpu_patcher.stop()
 
     @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
@@ -538,14 +531,6 @@ class TestDdpWrapBucketSize:
     def setup_method(self):
         self.pg = _make_pg()
         self.model = [_make_model_module()]
-        self._mpu_patcher = patch("megatron.training.models.dist_utils.mpu")
-        self._mpu = self._mpu_patcher.start()
-        self._mpu.get_data_parallel_world_size.return_value = 1
-        self._mpu.get_pipeline_model_parallel_rank.return_value = 0
-        self._mpu.get_expert_data_parallel_world_size.return_value = 1
-
-    def teardown_method(self):
-        self._mpu_patcher.stop()
 
     def _ddp_config(self, **overrides):
         cfg = Mock()
@@ -579,8 +564,8 @@ class TestDdpWrapBucketSize:
     @patch("torch.cuda.Stream")
     def test_bucket_size_default_uses_dp_world_size(self, *_):
         ddp_config = self._ddp_config()
-        # dp world size 100 → 1_000_000 * 100 = 100M, bigger than 40M floor
-        self._mpu.get_data_parallel_world_size.return_value = 100
+        # dp_cp size 100 → 1_000_000 * 100 = 100M, bigger than 40M floor
+        self.pg.dp_cp.size.return_value = 100
         _ddp_wrap(self.model, False, ddp_config, False, pg_collection=self.pg)
         assert ddp_config.bucket_size == 100_000_000
 
@@ -591,8 +576,8 @@ class TestDdpWrapBucketSize:
     @patch("torch.cuda.Stream")
     def test_bucket_size_default_minimum_floor(self, *_):
         ddp_config = self._ddp_config()
-        # dp world size 1 → 1M, floor at 40M wins
-        self._mpu.get_data_parallel_world_size.return_value = 1
+        # dp_cp size 1 → 1M, floor at 40M wins
+        self.pg.dp_cp.size.return_value = 1
         _ddp_wrap(self.model, False, ddp_config, False, pg_collection=self.pg)
         assert ddp_config.bucket_size == 40_000_000
 
@@ -628,17 +613,13 @@ class TestDdpWrapFullParamLayout:
 
     def setup_method(self):
         self.pg = _make_pg()
-        self._mpu_patcher = patch("megatron.training.models.dist_utils.mpu")
-        self._mpu = self._mpu_patcher.start()
-        self._mpu.get_data_parallel_world_size.return_value = 4
-        self._mpu.get_pipeline_model_parallel_rank.return_value = 0
-        self._mpu.get_expert_data_parallel_world_size.return_value = 2
+        self.pg.dp_cp.size.return_value = 4
+        self.pg.expt_dp.size.return_value = 2
         self._opt_patcher = patch("megatron.training.models.dist_utils.DistributedOptimizer")
         self._opt = self._opt_patcher.start()
         self._opt.compute_full_param_layout.return_value = "LAYOUT"
 
     def teardown_method(self):
-        self._mpu_patcher.stop()
         self._opt_patcher.stop()
 
     def _ddp_config(self, **overrides):
@@ -777,7 +758,7 @@ class TestDdpWrapFullParamLayout:
     ):
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
-        self._mpu.get_pipeline_model_parallel_rank.return_value = 1
+        self.pg.pp.rank.return_value = 1
         chunk, _ = self._make_chunk_with_params()
         ddp_config = self._ddp_config()
         _ddp_wrap([chunk], False, ddp_config, False, pg_collection=self.pg)
