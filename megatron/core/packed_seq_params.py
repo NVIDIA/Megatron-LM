@@ -20,9 +20,15 @@ def pad_cu_seqlens_for_cuda_graph(cu_seqlens: Tensor, target_num_seqs: int) -> O
     to `target_num_seqs + 1` entries by repeating the final cumulative value. The trailing
     repeated entries indicate zero-length segments which are handled by PackedSeqParams.
 
+    Any trailing padding-to-microbatch-size must already be folded into the last segment
+    of `cu_seqlens` before calling this helper. This is done in the SFT dataloader
+    (`megatron/training/datasets/sft_dataset.py` rewrites the last entry to `pack_length` when there
+    is trailing padding).
+
     Args:
         cu_seqlens: 1-D int32 cumulative sequence-length tensor of shape (K + 1,) where K is the
-            number of real documents.
+            number of real documents. `cu_seqlens[-1]` must equal the total token count of the
+            corresponding input tensor (see precondition above).
         target_num_seqs: Target document capacity (the value of --cuda-graph-max-packed-seqs).
 
     Returns:
