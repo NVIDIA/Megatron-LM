@@ -72,7 +72,12 @@ _hybrid_mtp_block_spec = ModuleSpec(
                 submodules=MultiTokenPredictionLayerSubmodules(
                     enorm=TENorm,
                     hnorm=TENorm,
+                    # Both projection forms are populated so the layer can switch on
+                    # `config.enable_hyper_connections` at runtime: mHC=True uses
+                    # `e_proj`+`h_proj` per-stream, mHC=False uses fused `eh_proj`.
                     eh_proj=TEColumnParallelLinear,
+                    e_proj=TEColumnParallelLinear,
+                    h_proj=TEColumnParallelLinear,
                     mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                     layer_norm=TENorm,
                 ),
@@ -291,7 +296,11 @@ hybrid_inference_stack_spec = ModuleSpec(
                         submodules=MultiTokenPredictionLayerSubmodules(
                             enorm=TENorm,
                             hnorm=TENorm,
+                            # Populate both projection forms so the layer can switch on
+                            # `config.enable_hyper_connections` at runtime.
                             eh_proj=InferenceColumnParallelLinear,
+                            e_proj=InferenceColumnParallelLinear,
+                            h_proj=InferenceColumnParallelLinear,
                             mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                             layer_norm=TENorm,
                         ),
