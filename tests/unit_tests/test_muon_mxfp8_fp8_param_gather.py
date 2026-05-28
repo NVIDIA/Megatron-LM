@@ -241,7 +241,7 @@ class TestMuonMXFP8FP8ParamGather:
         sys.argv = ['test_muon_mxfp8_fp8_param_gather.py']
         args = parse_args()
         args.num_layers = 2
-        args.vocal_size = 128
+        args.vocab_size = 128
         args.hidden_size = 128
         args.ffn_hidden_size = 256
         args.num_attention_heads = 4
