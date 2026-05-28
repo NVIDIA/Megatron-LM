@@ -117,18 +117,24 @@ def _apply_rope(
     rotary_pos_cos = None
     rotary_pos_sin = None
     if config.apply_rope_fusion:
+        # ``mscale=1.0`` keeps the cached cos/sin free of yarn's
+        # concentration factor so the fused kernel sees the same
+        # rotation as the unfused split-rotate path (DSv4 "pure
+        # rotation" contract).
         rotary_pos_cos, rotary_pos_sin = rotary_pos_emb_module.get_cached_cos_sin(
-            total_seq_len, dtype=x.dtype, packed_seq=False
+            total_seq_len, dtype=x.dtype, packed_seq=False, mscale=mscale
         )
         rotary_pos_emb = None
         assert (
             fused_mla_rope_inplace is not None
         ), "Fused MLA RoPE apply is not imported successfully"
     else:
-        # ``DSv4HybridAttention`` instantiates ``YarnRotaryEmbedding`` whenever
-        # ``compress_ratio > 1`` (regardless of ``config.rope_type``); its
-        # ``forward`` returns ``(emb, mscale)``. Base ``RotaryEmbedding``
-        # returns a single tensor. Unpack either form uniformly.
+        # ``DSv4HybridAttention`` instantiates ``YarnRotaryEmbedding``
+        # whenever ``compress_ratio > 1`` (regardless of ``config.rope_type``);
+        # its ``forward`` returns ``(emb, mscale)``. Base ``RotaryEmbedding``
+        # returns a single tensor. Unpack either form uniformly; the
+        # caller-side ``mscale=1.0`` keeps the yarn concentration factor
+        # out of the rotation.
         result = rotary_pos_emb_module(total_seq_len, packed_seq=False)
         if isinstance(result, tuple):
             rotary_pos_emb = result[0]

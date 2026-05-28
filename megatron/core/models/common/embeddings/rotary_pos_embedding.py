@@ -217,7 +217,13 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", emb.sin().to(dtype).contiguous(), persistent=False)
 
     def get_cached_cos_sin(
-        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq=False, cp_group=None
+        self,
+        seq_len,
+        offset=0,
+        dtype=torch.get_default_dtype(),
+        packed_seq=False,
+        cp_group=None,
+        mscale=None,
     ):
         """Get cached cos and sin values.
 
@@ -225,8 +231,11 @@ class RotaryEmbedding(nn.Module):
         beyond the cached length, or any of ``offset`` / ``dtype`` /
         ``packed_seq`` changes from the previous call.
         ``YarnRotaryEmbedding`` overrides this to also bake its
-        concentration factor into the cached cos/sin.
+        concentration factor into the cached cos/sin (controlled by
+        ``mscale``); for the base class without a concentration
+        factor the argument is accepted-and-ignored for API uniformity.
         """
+        del mscale  # base class has no concentration factor
         if (
             not hasattr(self, "max_seq_len_cached")
             or seq_len > self.max_seq_len_cached

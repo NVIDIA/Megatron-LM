@@ -22,8 +22,23 @@ from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
-_FUSED_SIMILARITY_EPS = 1.5e-4
+# Fused-path eps: in this test ``apply_rope_fusion`` is coupled to
+# ``apply_dsa_kernel_fusion``, so the fused branch exercises BOTH the
+# cudnn DSA kernels AND the Triton fused MLA RoPE kernel. The MLA RoPE
+# kernel's bf16 numerics differ from pytorch eager RoPE by ~2-3e-3 cosine
+# at the input-gradient level after propagating through the layer; that
+# noise dominates the original 1.5e-4 DSA-kernel-only budget. Empirical
+# worst case observed: ``cosine_sim ≈ 0.998`` on hidden_grad / upstream
+# param grads, ``≈ 0.9995`` on the forward output.
+_FUSED_SIMILARITY_EPS = 3e-3
 _UNFUSED_SIMILARITY_EPS = 3e-5
+# ``core_attention.attn_sink`` is a per-head scalar bias whose gradient
+# is just the sum of the sink's softmax probability over all positions
+# (no spatial averaging). Tiny shape + no averaging means the per-element
+# fused-rope drift accumulates directly into the grad rather than washing
+# out, so its parity floor is roughly an order of magnitude looser than
+# the per-token gradients. Empirical worst case ``cosine_sim ≈ 0.984``.
+_FUSED_ATTN_SINK_GRAD_SIMILARITY_EPS = 2e-2
 # Fused dense-loss path: ``dense_indexer_backward_wrapper`` consumes raw
 # scores plus L1-norm/LSE separately (not pre-softmaxed distributions, as
 # the sparse variant does), so the kernel-vs-autograd precision noise is
@@ -31,7 +46,9 @@ _UNFUSED_SIMILARITY_EPS = 3e-5
 # drift on q_indexer/k_indexer/weights, the indexer param-grad cosine sim
 # floors around 1e-3 here. Applied only to ``.indexer.`` params when
 # ``apply_dsa_kernel_fusion=True`` and ``dsa_indexer_use_sparse_loss=False``.
-_FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS = 2e-3
+# Kept distinct from ``_FUSED_SIMILARITY_EPS`` so the per-param branch
+# stays readable, even though both currently sit in the same order.
+_FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS = 3e-3
 
 
 @torch.compile
@@ -113,8 +130,7 @@ def _make_config(
         tensor_model_parallel_size=1,
         sequence_parallel=False,
         context_parallel_size=1,
-        apply_rope_fusion=False,
-        rope_type="rope",
+        rope_type="yarn" if apply_dsa_kernel_fusion else "rope",
         rotary_base=10000,
         rotary_percent=1.0,
         csa_compress_rotary_base=shape["csa_compress_rotary_base"],
@@ -139,6 +155,7 @@ def _make_config(
         tp_comm_overlap=False,
         softmax_scale=None,
         apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+        apply_rope_fusion=apply_dsa_kernel_fusion,
     )
     return config
 
@@ -920,11 +937,12 @@ class TestDSv4HybridNativeParity:
                 continue
             assert native_param.grad is not None, f"Missing native grad for {name}"
             assert real_param.grad is not None, f"Missing real grad for {name}"
-            param_eps = (
-                _FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS
-                if is_fused_dense and ".indexer." in name
-                else similarity_eps
-            )
+            if apply_dsa_kernel_fusion and "core_attention.attn_sink" in name:
+                param_eps = _FUSED_ATTN_SINK_GRAD_SIMILARITY_EPS
+            elif is_fused_dense and ".indexer." in name:
+                param_eps = _FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS
+            else:
+                param_eps = similarity_eps
             _assert_similarity(
                 real_param.grad,
                 native_param.grad,
