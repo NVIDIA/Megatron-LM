@@ -179,8 +179,8 @@ class MegatronFSDP(torch.nn.Module):
             which can improve performance when using MXFP8 parameters with activation recomputation.
         enable_fine_grained_param_gather_backward_hook (bool): Register pre-backward unshard hooks
             on each submodule (used by 1F1B EP overlap and similar schedules).
-        fine_grained_pre_backward_recurse_module_types (Optional[Tuple[Type[nn.Module], ...]]):
-            Module classes for which fine-grained pre-backward unshard uses
+        fine_grained_recurse_module_types (Optional[Tuple[Type[nn.Module], ...]]):
+            Module classes for which fine-grained pre-forward / pre-backward unshard uses
             ``parameters(recurse=True)`` (container modules whose sharded weights live on
             children). Checked with :func:`isinstance`. Defaults to empty (none).
         report_nan_in_param_grad (bool): Whether to enable precise NaN-checking for parameter wgrad.
@@ -223,9 +223,7 @@ class MegatronFSDP(torch.nn.Module):
         disable_symmetric_registration: bool = False,
         enable_fine_grained_param_gather_hook: bool = False,
         enable_fine_grained_param_gather_backward_hook: bool = False,
-        fine_grained_pre_backward_recurse_module_types: Optional[
-            Tuple[Type[nn.Module], ...]
-        ] = None,
+        fine_grained_recurse_module_types: Optional[Tuple[Type[nn.Module], ...]] = None,
         report_nan_in_param_grad: bool = False,
     ):
         super().__init__()
@@ -281,10 +279,8 @@ class MegatronFSDP(torch.nn.Module):
         self.enable_fine_grained_param_gather_backward_hook = (
             enable_fine_grained_param_gather_backward_hook
         )
-        recurse_types = fine_grained_pre_backward_recurse_module_types or ()
-        self.fine_grained_pre_backward_recurse_module_types: Tuple[
-            Type[nn.Module], ...
-        ] = recurse_types
+        recurse_types = fine_grained_recurse_module_types or ()
+        self.fine_grained_recurse_module_types: Tuple[Type[nn.Module], ...] = recurse_types
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
@@ -566,6 +562,25 @@ class MegatronFSDP(torch.nn.Module):
         """
         fsdp_unit_modules = self.fsdp_unit_modules
 
+        def _param_list_for_submodule_unshard(
+            module: nn.Module, *, for_backward: bool
+        ) -> List[nn.Parameter]:
+            """Build the parameter list for fine-grained or FSDP-unit unshard hooks."""
+            if isinstance(module, tuple(fsdp_unit_modules)):
+                return list(module.parameters())
+            fine_grained_enabled = (
+                self.enable_fine_grained_param_gather_backward_hook
+                if for_backward
+                else self.enable_fine_grained_param_gather_hook
+            )
+            if (
+                fine_grained_enabled
+                and self.fine_grained_recurse_module_types
+                and isinstance(module, self.fine_grained_recurse_module_types)
+            ):
+                return list(module.parameters(recurse=True))
+            return list(module.parameters(recurse=False))
+
         def release_module_parameters(module, bwd, lazy=False, *unused):
             """
             Release the parameters of a given module after completing the forward
@@ -760,16 +775,7 @@ class MegatronFSDP(torch.nn.Module):
             else:
                 module._training_state = TrainingState.FORWARD
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
-                param_list = list(module.parameters())
-            else:
-                # All-gather the shallow parameters in every forward pass for modules
-                # that are not FSDP units. Do not recurse unless absolutely necessary,
-                # to allocate as little memory as possible for this forward pass.
-                param_list = list(module.parameters(recurse=False))
-
-            if self.enable_fine_grained_param_gather_hook:
-                param_list = list(module.parameters(recurse=False))
+            param_list = _param_list_for_submodule_unshard(module, for_backward=False)
 
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
@@ -885,17 +891,7 @@ class MegatronFSDP(torch.nn.Module):
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.PRE_BACKWARD
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
-                param_list = list(module.parameters())
-            elif (
-                self.enable_fine_grained_param_gather_backward_hook
-                and self.fine_grained_pre_backward_recurse_module_types
-                and isinstance(module, self.fine_grained_pre_backward_recurse_module_types)
-            ):
-                # Container modules (e.g. TEGroupedMLP): sharded weights are on children.
-                param_list = list(module.parameters(recurse=True))
-            else:
-                param_list = list(module.parameters(recurse=False))
+            param_list = _param_list_for_submodule_unshard(module, for_backward=True)
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
