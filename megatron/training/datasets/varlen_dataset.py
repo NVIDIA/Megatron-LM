@@ -187,12 +187,32 @@ def _messages_passthrough(sample: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
+def _raw_text_loader(sample: Dict[str, Any]) -> str:
+    """Return the ``text`` column unchanged for pretrain-style packed runs.
+
+    Unlike the SFT schemas this returns a plain string (no messages list).
+    :class:`VarlenDataset.__getitem__` dispatches on the return type to pick
+    a tokenization path that skips chat templating and prompt masking.
+    """
+    text = sample.get("text") or ""
+    if not isinstance(text, str):
+        raise ValueError(
+            f"VarlenDataset (pretrain-text schema): 'text' must be a string, "
+            f"got {type(text).__name__}."
+        )
+    return text
+
+
 def _select_converter(
     column_names: List[str],
-) -> Tuple[Callable[[Dict[str, Any]], List[Dict[str, str]]], str]:
-    """Pick a sample->messages converter based on dataset column names.
+) -> Tuple[Callable[[Dict[str, Any]], Any], str]:
+    """Pick a sample converter based on dataset column names.
 
-    Priority: openai-messages > sharegpt > alpaca/dolly.
+    Priority (most explicit first): openai-messages > sharegpt > alpaca/dolly
+    > pretrain-text. ``pretrain-text`` is the fallback for datasets that
+    only carry a single ``text`` column (e.g. Dolma / OLMo midtraining
+    corpora) — long-context pretraining packed through the same THD path
+    as SFT.
     """
     cols = set(column_names)
     if "messages" in cols:
@@ -203,12 +223,15 @@ def _select_converter(
     has_out = any(f in cols for f in _OUTPUT_FIELDS)
     if has_instr and has_out:
         return _alpaca_to_messages, "alpaca"
+    if "text" in cols:
+        return _raw_text_loader, "pretrain-text"
     raise ValueError(
         "VarlenDataset cannot infer schema from columns "
         f"{sorted(cols)}. Supported schemas: "
         f"alpaca/dolly ({'|'.join(_INSTRUCTION_FIELDS)} + "
         f"{'|'.join(_OUTPUT_FIELDS)} [+ optional {'|'.join(_EXTRA_INPUT_FIELDS)}]), "
-        "sharegpt (conversations), openai-messages (messages)."
+        "sharegpt (conversations), openai-messages (messages), "
+        "pretrain-text (text)."
     )
 
 
@@ -320,22 +343,38 @@ class VarlenDataset(SFTDataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         tokenizer = self.config.tokenizer
         max_len = self.config.sequence_length
+        # HuggingFaceTokenizer returns None for ``pad`` when the underlying
+        # tokenizer has no explicit pad token (common for raw pretraining
+        # tokenizers like Qwen3). Fall back to eod for padding — irrelevant
+        # for loss because loss_mask zeros pad positions out.
         eod = tokenizer.eod
-        pad = tokenizer.pad
-
-        # 1. Pull a single conversation (the low-level dataset emits exactly
-        #    one messages list per index — see VarlenLowLevelDataset).
-        messages = self.dataset[int(self.indices[idx % len(self.indices)])]
-
-        # 2. Tokenize the conversation once; no multi-conv packing here.
-        tokens, targets = tokenizer.tokenize_conversation(
-            messages, return_target=True, add_generation_prompt=False
+        pad = tokenizer.pad if tokenizer.pad is not None else eod
+        assert eod is not None, (
+            "VarlenDataset requires the tokenizer to expose an EOD/EOS token id."
         )
+
+        # 1. Pull a single item from the low-level dataset. For SFT schemas
+        #    (alpaca / sharegpt / openai-messages) this is a messages list;
+        #    for the pretrain-text schema it is a raw string.
+        item = self.dataset[int(self.indices[idx % len(self.indices)])]
+
         assert not self.config.reset_position_ids
         assert not self.config.create_attention_mask and not self.config.reset_attention_mask
 
-        tokens_list = tokens.tolist()
-        targets_list = targets.tolist()
+        # 2. Tokenize. SFT schemas go through tokenize_conversation (chat
+        #    template + role-aware target masking); pretrain-text bypasses
+        #    chat templating and uses the plain ``tokenize`` interface,
+        #    treating every token as a target (no prompt masking).
+        if isinstance(item, str):
+            ids = list(tokenizer.tokenize(item))
+            tokens_list = ids
+            targets_list = list(ids)
+        else:
+            tokens, targets = tokenizer.tokenize_conversation(
+                item, return_target=True, add_generation_prompt=False
+            )
+            tokens_list = tokens.tolist()
+            targets_list = targets.tolist()
 
         # 3. Right-truncate to ``sequence_length + 1`` (we drop the last token
         #    after the input/label shift below). Keep an EOD at the end so a

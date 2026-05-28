@@ -22,6 +22,7 @@ from megatron.training.datasets.varlen_dataset import (
     _alpaca_to_messages,
     _looks_like_hf_id,
     _messages_passthrough,
+    _raw_text_loader,
     _select_converter,
     _sharegpt_to_messages,
 )
@@ -100,12 +101,7 @@ def test_dolly_instruction_context_response():
 
 def test_sharegpt_human_gpt():
     out = _sharegpt_to_messages(
-        {
-            "conversations": [
-                {"from": "human", "value": "hi"},
-                {"from": "gpt", "value": "hello"},
-            ]
-        }
+        {"conversations": [{"from": "human", "value": "hi"}, {"from": "gpt", "value": "hello"}]}
     )
     assert [m["role"] for m in out] == ["system", "user", "assistant"]
     assert out[1]["content"] == "hi"
@@ -147,12 +143,7 @@ def test_sharegpt_role_map(speaker, expected_role):
 
 def test_messages_passthrough_prepends_system_when_missing():
     out = _messages_passthrough(
-        {
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
-            ]
-        }
+        {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}
     )
     assert [m["role"] for m in out] == ["system", "user", "assistant"]
 
@@ -178,11 +169,7 @@ def test_messages_passthrough_strips_extra_keys():
         {
             "messages": [
                 {"role": "user", "content": "hi", "name": "alice"},
-                {
-                    "role": "assistant",
-                    "content": "hi alice",
-                    "tool_calls": [{"function": "foo"}],
-                },
+                {"role": "assistant", "content": "hi alice", "tool_calls": [{"function": "foo"}]},
             ]
         }
     )
@@ -198,11 +185,7 @@ def test_messages_passthrough_strips_extra_keys():
 def test_messages_rejects_list_content():
     with pytest.raises(ValueError, match="must be a string"):
         _messages_passthrough(
-            {
-                "messages": [
-                    {"role": "user", "content": [{"type": "image", "url": "x.png"}]},
-                ]
-            }
+            {"messages": [{"role": "user", "content": [{"type": "image", "url": "x.png"}]}]}
         )
 
 
@@ -213,9 +196,29 @@ def test_alpaca_rejects_non_string_field():
 
 def test_sharegpt_rejects_list_value():
     with pytest.raises(ValueError, match="must be a string"):
-        _sharegpt_to_messages(
-            {"conversations": [{"from": "human", "value": [1, 2, 3]}]}
-        )
+        _sharegpt_to_messages({"conversations": [{"from": "human", "value": [1, 2, 3]}]})
+
+
+# ----------------------------------------------------------------------------
+# Pretrain-text schema
+# ----------------------------------------------------------------------------
+
+
+def test_raw_text_loader_returns_string():
+    """``text``-column samples are returned as plain strings (not messages)."""
+    out = _raw_text_loader({"text": "Once upon a time...", "id": "doc-1"})
+    assert isinstance(out, str)
+    assert out == "Once upon a time..."
+
+
+def test_raw_text_loader_handles_empty():
+    assert _raw_text_loader({"text": None}) == ""
+    assert _raw_text_loader({}) == ""
+
+
+def test_raw_text_rejects_non_string():
+    with pytest.raises(ValueError, match="must be a string"):
+        _raw_text_loader({"text": [1, 2, 3]})
 
 
 # ----------------------------------------------------------------------------
@@ -269,6 +272,30 @@ def test_select_converter_alpaca_missing_output():
         _select_converter(["instruction", "category"])
 
 
+def test_select_converter_pretrain_text():
+    fn, name = _select_converter(["text", "id"])
+    assert name == "pretrain-text"
+    assert fn is _raw_text_loader
+
+
+def test_select_converter_pretrain_text_with_metadata():
+    """Real corpora (e.g. Dolma) have ``text`` + ``url`` + ``metadata``."""
+    fn, name = _select_converter(["text", "url", "metadata", "id"])
+    assert name == "pretrain-text"
+
+
+def test_select_converter_alpaca_beats_pretrain_text():
+    """When both ``instruction``/``output`` and ``text`` are present (rare),
+    the alpaca schema is more specific and should win."""
+    fn, name = _select_converter(["text", "instruction", "output"])
+    assert name == "alpaca"
+
+
+def test_select_converter_messages_beats_pretrain_text():
+    fn, name = _select_converter(["text", "messages"])
+    assert name == "openai-messages"
+
+
 # ----------------------------------------------------------------------------
 # VarlenLowLevelDataset on local jsonl (no HF Hub network needed)
 # ----------------------------------------------------------------------------
@@ -307,18 +334,8 @@ def test_low_level_loads_jsonl_sharegpt(tmp_path):
     path = _write_jsonl(
         tmp_path,
         [
-            {
-                "conversations": [
-                    {"from": "human", "value": "q1"},
-                    {"from": "gpt", "value": "a1"},
-                ]
-            },
-            {
-                "conversations": [
-                    {"from": "human", "value": "q2"},
-                    {"from": "gpt", "value": "a2"},
-                ]
-            },
+            {"conversations": [{"from": "human", "value": "q1"}, {"from": "gpt", "value": "a1"}]},
+            {"conversations": [{"from": "human", "value": "q2"}, {"from": "gpt", "value": "a2"}]},
         ],
     )
     ll = VarlenLowLevelDataset(path)
@@ -341,7 +358,7 @@ def test_low_level_loads_jsonl_messages(tmp_path):
                     {"role": "user", "content": "hi"},
                     {"role": "assistant", "content": "hello"},
                 ]
-            },
+            }
         ],
     )
     ll = VarlenLowLevelDataset(path)
@@ -372,3 +389,23 @@ def test_low_level_rejects_unknown_schema(tmp_path):
     path = _write_jsonl(tmp_path, [{"foo": "bar"}])
     with pytest.raises(ValueError, match="cannot infer schema"):
         VarlenLowLevelDataset(path)
+
+
+def test_low_level_loads_jsonl_pretrain_text(tmp_path):
+    """Pretrain-text corpora (Dolma / OLMo midtraining) typically have
+    ``text`` + extra fields like ``id`` / ``url`` / ``metadata``."""
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    path = _write_jsonl(
+        tmp_path,
+        [
+            {"text": "Doc one body...", "id": "1", "url": "https://x/1"},
+            {"text": "Doc two body...", "id": "2", "url": "https://x/2"},
+        ],
+    )
+    ll = VarlenLowLevelDataset(path)
+    assert ll.schema_name == "pretrain-text"
+    assert len(ll) == 2
+    # Each item is a raw string, NOT a messages list.
+    assert ll[0] == "Doc one body..."
+    assert ll[1] == "Doc two body..."
