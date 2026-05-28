@@ -533,6 +533,26 @@ class DataParallelInferenceCoordinator:
                 if header == Headers.STOP:
                     self.state = self.CoordinatorState.RUNNING
 
+            elif header == Headers.ENGINE_REPLY_PARTIAL:
+                # Per-step partial output for streaming requests. Frontend does detokenization
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                partials = deserialized_payload[1]
+                for partial in partials:
+                    fid = partial["request_id"]
+                    client_identity = self.request_id_to_client_id.get(fid)
+                    if client_identity is None:
+                        # Request already finalized or unknown — drop the partial.
+                        continue
+                    client_request_identity = self.request_id_to_client_request_id[fid]
+                    self.router_socket.send_multipart(
+                        [
+                            client_identity,
+                            msgpack.packb(
+                                [header.value, client_request_identity, partial], use_bin_type=True
+                            ),
+                        ]
+                    )
+
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks

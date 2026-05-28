@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import List, Optional, Union
+from typing import AsyncIterator, List, Optional, Union
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
@@ -83,6 +83,10 @@ class InferenceClient:
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
+        # Streaming requests: request_id -> asyncio.Queue of partial dicts. A
+        # final item of None terminates the iterator after the ENGINE_REPLY
+        # for that request_id has been delivered.
+        self.stream_queues: dict[int, asyncio.Queue] = {}
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -115,6 +119,47 @@ class InferenceClient:
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
+    def add_request_streaming(
+        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+    ) -> AsyncIterator[dict]:
+        """Submit a streaming inference request.
+
+        Returns an async iterator that yields one dict per engine step:
+
+        - ``{"partial": {"request_id": int, "new_tokens": list[int]}}`` for each
+          step that produced new tokens, in order.
+        - ``{"final": <full reply dict or DynamicInferenceRequest>}`` exactly once
+          at the end. The iterator then stops.
+
+        ``sampling_params.streaming`` is forced to True before submission so the
+        engine knows to emit ENGINE_REPLY_PARTIAL frames for this request.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters. ``streaming`` is set to True
+                in-place.
+
+        Returns:
+            AsyncIterator[dict]: Per-step partial and final reply frames.
+        """
+        sampling_params.streaming = True
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        queue: asyncio.Queue = asyncio.Queue()
+        self.stream_queues[request_id] = queue
+        self.request_submission_times[request_id] = time.perf_counter()
+
+        async def _iter():
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                yield item
+
+        return _iter()
+
     @trace_async_exceptions
     async def _recv_task(self):
         """
@@ -137,6 +182,17 @@ class InferenceClient:
                     reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
                         request_id
                     )
+                    # Streaming path: deliver final reply + sentinel and stop.
+                    if request_id in self.stream_queues:
+                        queue = self.stream_queues.pop(request_id)
+                        completed_request = (
+                            DynamicInferenceRequest.deserialize(reply)
+                            if self.deserialize
+                            else reply
+                        )
+                        queue.put_nowait({"final": completed_request})
+                        queue.put_nowait(None)
+                        continue
                     completion_future = self.completion_futures.pop(request_id)
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
@@ -145,6 +201,11 @@ class InferenceClient:
                         DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
                     )
                     completion_future.set_result(completed_request)
+                elif header == Headers.ENGINE_REPLY_PARTIAL:
+                    request_id, partial = data[1:]
+                    queue = self.stream_queues.get(request_id)
+                    if queue is not None:
+                        queue.put_nowait({"partial": partial})
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -253,5 +314,9 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
+        # Terminate any open streaming iterators.
+        for queue in self.stream_queues.values():
+            queue.put_nowait(None)
+        self.stream_queues.clear()
         self.socket.close(linger=0)
         self.context.term()

@@ -12,6 +12,7 @@ class Headers(Enum):
     CONNECT_ACK = auto()
     SUBMIT_REQUEST = auto()
     ENGINE_REPLY = auto()
+    ENGINE_REPLY_PARTIAL = auto()
     PAUSE = auto()
     UNPAUSE = auto()
     SUSPEND = auto()

@@ -30,12 +30,28 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
     )
+    parser.add_argument(
+        "--frontend",
+        type=str,
+        choices=["flask", "dynamo"],
+        default="flask",
+        help=(
+            "Which user-facing frontend to launch. 'flask' (default) starts the existing "
+            "REST server. 'dynamo' skips the Flask server and just runs the DP coordinator + "
+            "engine; downstream Dynamo workers connect to the coordinator address printed on "
+            "stdout as MEGATRON_COORDINATOR_ADDR=<addr>."
+        ),
+    )
     return parser
 
 
 @trace_async_exceptions
 async def run_text_generation_server(
-    engine: DynamicInferenceEngine, coordinator_port: int, server_port: int, hostname: str | None = None,
+    engine: DynamicInferenceEngine,
+    coordinator_port: int,
+    server_port: int,
+    hostname: str | None = None,
+    frontend: str = "flask",
 ):
     """
     Runs the text generation server from rank 0 and initializes the
@@ -45,6 +61,10 @@ async def run_text_generation_server(
         engine (DynamicInferenceEngine): The dynamic inference engine.
         coordinator_port (int): The network port for the dynamic inference DP coordinator.
         server_port (int): The network for port the frontend text generation server.
+        hostname (str | None): Bind hostname for the coordinator and Flask server.
+        frontend (str): One of "flask", "dynamo". Controls whether the
+            legacy Flask REST server is spawned and whether the coordinator
+            address is printed to stdout for Dynamo workers.
     """
 
     rank = torch.distributed.get_rank()
@@ -54,24 +74,32 @@ async def run_text_generation_server(
         hostname=hostname,
     )
 
+
+    launched_flask = False
     try:
         if rank == 0:
-            start_text_gen_server(
-                coordinator_addr=coordinator_addr,
-                tokenizer=engine.controller.tokenizer,
-                parsers=args.parsers,
-                rank=rank,
-                server_port=server_port,
-                verbose=args.inference_text_gen_server_logging,
-                hostname=hostname,
-            )
+            if frontend == "dynamo":
+                # Single-line, parseable advertisement for sbatch wrappers.
+                print(f"MEGATRON_COORDINATOR_ADDR={coordinator_addr}", flush=True)
+    
+            if frontend == "flask":
+                start_text_gen_server(
+                    coordinator_addr=coordinator_addr,
+                    tokenizer=engine.controller.tokenizer,
+                    parsers=args.parsers,
+                    rank=rank,
+                    server_port=server_port,
+                    verbose=args.inference_text_gen_server_logging,
+                    hostname=hostname,
+                )
+                launched_flask = True
 
         # Await the engine loop directly since the server is running in a separate process
         await engine.engine_loop_task
 
     finally:
         # Guarantee that the separate process is terminated when the engine loop stops or is interrupted
-        if rank == 0:
+        if rank == 0 and launched_flask:
             stop_text_gen_server()
 
 
@@ -101,7 +129,13 @@ if __name__ == "__main__":
 
         try:
             asyncio.run(
-                run_text_generation_server(engine, args.inference_coordinator_port, args.port, args.host)
+                run_text_generation_server(
+                    engine,
+                    args.inference_coordinator_port,
+                    args.port,
+                    args.host,
+                    frontend=args.frontend,
+                )
             )
         except KeyboardInterrupt:
             # Catching at the top level ensures clean stdout without spamming the traceback
