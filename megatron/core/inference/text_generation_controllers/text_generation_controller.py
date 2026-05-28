@@ -5,6 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
@@ -68,6 +69,21 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
+
+
+@dataclass(frozen=True)
+class _AsyncPendingForwardView:
+    """Request-row view for a pending speculative async forward."""
+
+    pending_request_ids: Tensor
+    cuda_graph_request_count: Optional[int]
+    current_request_ids: Optional[Tensor] = None
+    row_indices: Optional[Tensor] = None
+
+    @property
+    def row_mapped(self) -> bool:
+        """Whether current rows must gather from different pending-forward rows."""
+        return self.row_indices is not None
 
 
 # pylint: disable=line-too-long
@@ -177,11 +193,12 @@ class TextGenerationController:
         self._async_eligibility_check_count = 0
         self._async_eligibility_pass_count = 0
         self._async_disable_reason_counts: Dict[str, int] = {}
-        self._async_pending_forward_request_ids = None
+        self._async_pending_forward_view = None
         self._dummy_context_h2d_done_event = None
         self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
+        self._async_row_mapped_forward_count = 0
         self._async_discarded_forward_count = 0
         self._async_add_deferral_count = 0
         self._async_finish_boundary_count = 0
@@ -1573,56 +1590,117 @@ class TextGenerationController:
             context.paused_request_count : context.total_request_count
         ].clone()
 
-    def _record_async_pending_forward_requests(self) -> None:
+    def _record_async_pending_forward_requests(
+        self, cuda_graph_request_count: Optional[int]
+    ) -> None:
         """Remember the request-row order that a speculative forward is computing."""
-        self._async_pending_forward_request_ids = self._active_request_ids_cpu()
+        self._async_pending_forward_view = _AsyncPendingForwardView(
+            pending_request_ids=self._active_request_ids_cpu(),
+            cuda_graph_request_count=cuda_graph_request_count,
+        )
 
     def _pending_async_forward_matches_current_rows(self) -> bool:
         """Return whether a pending speculative forward still has current row order."""
-        pending_request_ids = self._async_pending_forward_request_ids
-        if pending_request_ids is None:
+        pending_view = self._async_pending_forward_view
+        if pending_view is None:
             return True
-        return torch.equal(pending_request_ids, self._active_request_ids_cpu())
+        return torch.equal(pending_view.pending_request_ids, self._active_request_ids_cpu())
+
+    def _map_pending_forward_to_current_rows(
+        self, pending_view: _AsyncPendingForwardView
+    ) -> Optional[_AsyncPendingForwardView]:
+        """Resolve current request rows against the pending forward's row layout."""
+        current_request_ids = self._active_request_ids_cpu()
+        if current_request_ids.numel() == 0:
+            return None
+        if not self._pending_forward_graph_shape_matches_current(pending_view):
+            return None
+
+        pending_request_ids = pending_view.pending_request_ids
+        if torch.equal(pending_request_ids, current_request_ids):
+            return _AsyncPendingForwardView(
+                pending_request_ids=pending_request_ids,
+                cuda_graph_request_count=pending_view.cuda_graph_request_count,
+                current_request_ids=current_request_ids,
+            )
+        if pending_request_ids.numel() != current_request_ids.numel():
+            return None
+
+        pending_row_by_request_id = {
+            int(request_id): row for row, request_id in enumerate(pending_request_ids.tolist())
+        }
+        mapped_rows = []
+        for request_id in current_request_ids.tolist():
+            row = pending_row_by_request_id.get(int(request_id))
+            if row is None:
+                return None
+            mapped_rows.append(row)
+
+        row_indices = torch.tensor(
+            mapped_rows, dtype=torch.long, device=torch.cuda.current_device()
+        )
+        return _AsyncPendingForwardView(
+            pending_request_ids=pending_request_ids,
+            cuda_graph_request_count=pending_view.cuda_graph_request_count,
+            current_request_ids=current_request_ids,
+            row_indices=row_indices,
+        )
+
+    def _pending_forward_graph_shape_matches_current(
+        self, pending_view: _AsyncPendingForwardView
+    ) -> bool:
+        """Return whether the pending forward used the graph shape current rows expect."""
+        context = self.inference_wrapped_model.inference_context
+        current_graph_request_count = (
+            context.padded_active_request_count
+            if context.using_cuda_graph_this_step()
+            else None
+        )
+        return pending_view.cuda_graph_request_count == current_graph_request_count
 
     def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
         """Return whether the pending forward is reusable and whether row mapping is needed."""
-        pending_request_ids = self._async_pending_forward_request_ids
-        if pending_request_ids is None:
+        pending_view = self._async_pending_forward_view
+        if pending_view is None:
             return True, False
 
         current_request_ids = self._active_request_ids_cpu()
         if current_request_ids.numel() == 0:
             return False, False
-        if torch.equal(pending_request_ids, current_request_ids):
+        if not self._pending_forward_graph_shape_matches_current(pending_view):
+            return False, False
+        if torch.equal(pending_view.pending_request_ids, current_request_ids):
             return True, False
+        if pending_view.pending_request_ids.numel() != current_request_ids.numel():
+            return False, False
 
-        return False, False
+        pending_request_ids = pending_view.pending_request_ids.tolist()
+        pending_request_id_set = set(int(request_id) for request_id in pending_request_ids)
+        for request_id in current_request_ids.tolist():
+            if int(request_id) not in pending_request_id_set:
+                return False, False
 
-    def _resolve_pending_async_forward_rows(self) -> tuple[bool, Optional[Tensor], bool]:
-        """Resolve whether a pending speculative forward can be reused.
+        return True, True
 
-        A pending forward is only reused when the active request rows still match
-        exactly.  If rows changed because requests finished, paused, or were
-        evicted, discard the forward and run the current step normally.
+    def _resolve_pending_async_forward_view(self) -> Optional[_AsyncPendingForwardView]:
+        """Resolve the pending speculative forward's row layout for current consumers.
 
-        Returns:
-            tuple[bool, Optional[Tensor], bool]: ``(usable, row_indices, row_mapped)``.
-            ``row_indices`` is currently always ``None``.
+        Returns ``None`` when a current request was not present in the pending
+        forward, meaning the pending forward cannot be safely reused.
         """
-        pending_request_ids = self._async_pending_forward_request_ids
-        self._async_pending_forward_request_ids = None
-        if pending_request_ids is None:
-            return True, None, False
+        pending_view = self._async_pending_forward_view
+        self._async_pending_forward_view = None
+        if pending_view is None:
+            return None
 
-        current_request_ids = self._active_request_ids_cpu()
-        if current_request_ids.numel() == 0:
-            self._async_discarded_forward_count += 1
-            return False, None, False
-        if torch.equal(pending_request_ids, current_request_ids):
-            return True, None, False
+        current_view = self._map_pending_forward_to_current_rows(pending_view)
+        if current_view is not None:
+            if current_view.row_mapped:
+                self._async_row_mapped_forward_count += 1
+            return current_view
 
         self._async_discarded_forward_count += 1
-        return False, None, False
+        return None
 
     def _discard_pending_async_forward(self) -> None:
         """Discard a pending async forward and release resources reserved for it."""
@@ -1631,7 +1709,7 @@ class TextGenerationController:
             context.release_deferred_async_kv_blocks()
             self._async_pending_forward = False
             self._async_pending_cuda_graph_request_count = None
-            self._async_pending_forward_request_ids = None
+            self._async_pending_forward_view = None
             self._async_discarded_forward_count += 1
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
@@ -2750,6 +2828,7 @@ class TextGenerationController:
         input_ids = None
         cuda_graph_request_count = None
         pending_forward_reused = False
+        pending_forward_view = None
         pending_forward_row_indices = None
         pending_forward_row_mapped = False
         ep_step_begin_decision = self._decide_ep_step_begin(has_real_work=True)
@@ -2761,11 +2840,14 @@ class TextGenerationController:
                 cuda_graph_request_count = self._async_pending_cuda_graph_request_count
                 self._async_pending_forward = False
                 self._async_pending_cuda_graph_request_count = None
-                (
-                    pending_forward_reused,
-                    pending_forward_row_indices,
-                    pending_forward_row_mapped,
-                ) = self._resolve_pending_async_forward_rows()
+                pending_forward_view = self._resolve_pending_async_forward_view()
+                pending_forward_reused = pending_forward_view is not None
+                pending_forward_row_indices = (
+                    pending_forward_view.row_indices if pending_forward_view is not None else None
+                )
+                pending_forward_row_mapped = (
+                    pending_forward_view.row_mapped if pending_forward_view is not None else False
+                )
                 pending_forward_row_mapped = (
                     pending_forward_row_mapped or ep_step_begin_decision.row_mapped_forward
                 )
@@ -2776,6 +2858,7 @@ class TextGenerationController:
                     and not context.is_decode_only()
                 ):
                     pending_forward_reused = False
+                    pending_forward_view = None
                     pending_forward_row_indices = None
                     pending_forward_row_mapped = False
                     self._async_discarded_forward_count += 1
@@ -2929,11 +3012,13 @@ class TextGenerationController:
                     self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
                     self._async_forward_launch_count += 1
                     self._async_pending_forward = True
-                    self._record_async_pending_forward_requests()
                     self._async_pending_cuda_graph_request_count = (
                         context.padded_active_request_count
                         if context.using_cuda_graph_this_step()
                         else None
+                    )
+                    self._record_async_pending_forward_requests(
+                        self._async_pending_cuda_graph_request_count
                     )
                     range_pop()
 
@@ -2978,7 +3063,7 @@ class TextGenerationController:
                     context.release_deferred_async_kv_blocks()
                     self._async_pending_forward = False
                     self._async_pending_cuda_graph_request_count = None
-                    self._async_pending_forward_request_ids = None
+                    self._async_pending_forward_view = None
 
             ret = {
                 "accepted_tokens": (

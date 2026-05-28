@@ -293,28 +293,41 @@ def test_ep_graph_shape_sync_can_use_zmq_without_protocol(monkeypatch):
     assert calls == [(8, 0, 0, 4)]
 
 
-def _make_controller_with_rows(pending_ids, current_ids):
+def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=None):
     controller = object.__new__(TextGenerationController)
-    controller._async_pending_forward_request_ids = (
-        None if pending_ids is None else torch.tensor(pending_ids, dtype=torch.int64)
+    pending_graph_count = None if pending_ids is None else len(pending_ids)
+    if current_graph_count is None:
+        current_graph_count = pending_graph_count if pending_graph_count is not None else len(current_ids)
+    controller._async_pending_forward_view = (
+        None
+        if pending_ids is None
+        else tgc_module._AsyncPendingForwardView(
+            pending_request_ids=torch.tensor(pending_ids, dtype=torch.int64),
+            cuda_graph_request_count=pending_graph_count,
+        )
     )
     controller._async_discarded_forward_count = 0
+    controller._async_row_mapped_forward_count = 0
     controller.inference_wrapped_model = SimpleNamespace(
         inference_context=SimpleNamespace(
             request_ids=torch.tensor(current_ids, dtype=torch.int64),
             paused_request_count=0,
             total_request_count=len(current_ids),
+            padded_active_request_count=current_graph_count,
+            using_cuda_graph_this_step=lambda: True,
         )
     )
     return controller
 
 
 @pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
 @pytest.mark.parametrize(
     ("pending_ids", "current_ids", "expected_status", "expected_resolve", "expected_rows"),
     [
-        (None, [10, 11], (True, False), (True, False), None),
+        (None, [10, 11], (True, False), (False, False), None),
         ([10, 11], [10, 11], (True, False), (True, False), None),
+        ([10, 11, 12], [12, 10, 11], (True, True), (True, True), [2, 0, 1]),
         ([10, 11, 12], [12, 10], (False, False), (False, False), None),
         ([10, 11], [10, 12], (False, False), (False, False), None),
         ([10, 11], [], (False, False), (False, False), None),
@@ -326,15 +339,32 @@ def test_pending_async_forward_rows_reuse_map_or_discard(
     controller = _make_controller_with_rows(pending_ids, current_ids)
 
     assert controller._pending_async_forward_row_status() == expected_status
-    usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+    pending_view = controller._resolve_pending_async_forward_view()
+    usable = pending_view is not None
+    row_indices = pending_view.row_indices if pending_view is not None else None
+    row_mapped = pending_view.row_mapped if pending_view is not None else False
 
     assert (usable, row_mapped) == expected_resolve
     if expected_rows is None:
         assert row_indices is None
     else:
         assert row_indices.tolist() == expected_rows
-    assert controller._async_discarded_forward_count == int(not expected_resolve[0])
-    assert controller._async_pending_forward_request_ids is None
+    expected_discards = 0 if pending_ids is None else int(not expected_resolve[0])
+    assert controller._async_discarded_forward_count == expected_discards
+    assert controller._async_row_mapped_forward_count == int(expected_resolve[1])
+    assert controller._async_pending_forward_view is None
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
+def test_pending_async_forward_rows_discard_when_graph_shape_changes():
+    controller = _make_controller_with_rows(
+        [10, 11, 12], [12, 10, 11], current_graph_count=4
+    )
+
+    assert controller._pending_async_forward_row_status() == (False, False)
+    assert controller._resolve_pending_async_forward_view() is None
+    assert controller._async_discarded_forward_count == 1
 
 
 @pytest.mark.internal
@@ -762,7 +792,9 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller._async_pending_forward = False
     controller._async_pending_cuda_graph_request_count = 3
-    controller._async_pending_forward_request_ids = torch.tensor([1, 2])
+    controller._async_pending_forward_view = tgc_module._AsyncPendingForwardView(
+        pending_request_ids=torch.tensor([1, 2]), cuda_graph_request_count=2
+    )
     controller._async_discarded_forward_count = 0
 
     controller._discard_pending_async_forward()
@@ -774,7 +806,7 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
     assert context.release_count == 1
     assert not controller._async_pending_forward
     assert controller._async_pending_cuda_graph_request_count is None
-    assert controller._async_pending_forward_request_ids is None
+    assert controller._async_pending_forward_view is None
     assert controller._async_discarded_forward_count == 1
 
 
