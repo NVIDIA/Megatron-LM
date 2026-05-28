@@ -18,9 +18,11 @@ BATCH_SIZES:
   - 32
   - 128
 TOLERANCE_PCT: 10
+# p99 omitted on purpose: with NUM_TIMED_ITERS=5 it is the max of 5 samples,
+# not a real percentile, so it produces flaky regressions even when throughput
+# / avg / p50 are stable. p99 is still recorded in results.json for visibility.
 METRICS:
   - throughput_tok_per_sec
   - avg_latency_ms
   - p50_latency_ms
-  - p99_latency_ms
   - tpot_ms_per_tok
