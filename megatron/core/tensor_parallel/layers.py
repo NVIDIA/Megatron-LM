@@ -29,7 +29,6 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
     prepare_input_tensors_for_wgrad_compute,
 )
-from megatron.experimental.gtp import GTPEmbeddingWeight, wrap_module_params_gtp
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
@@ -284,6 +283,8 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.gtp_size = 1
         if gtp_group is not None and gtp_group.size() > 1:
+            from megatron.experimental.gtp import wrap_module_params_gtp
+
             wrap_module_params_gtp(self, ["weight"], gtp_group)
             self.gtp_size = gtp_group.size()
             # Nothing prefetches embedding — it is head of the UNGRAPHED
@@ -308,6 +309,8 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         weight = self.weight
         if self.gtp_size > 1:
+            from megatron.experimental.gtp import GTPEmbeddingWeight
+
             weight = GTPEmbeddingWeight.apply(self.weight)
 
         # Get the embeddings.
@@ -964,6 +967,8 @@ class ColumnParallelLinear(torch.nn.Module):
 
         self.gtp_size = 1
         if gtp_group is not None and gtp_group.size() > 1:
+            from megatron.experimental.gtp import wrap_module_params_gtp
+
             wrap_module_params_gtp(self, ["weight"], gtp_group)
             self.gtp_size = gtp_group.size()
 
@@ -1319,6 +1324,8 @@ class RowParallelLinear(torch.nn.Module):
 
         self.gtp_size = 1
         if gtp_group is not None and gtp_group.size() > 1:
+            from megatron.experimental.gtp import wrap_module_params_gtp
+
             wrap_module_params_gtp(self, ["weight"], gtp_group)
             self.gtp_size = gtp_group.size()
 

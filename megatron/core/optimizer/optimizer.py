@@ -37,7 +37,6 @@ except ImportError:
         multi_tensor_applier = local_multi_tensor_applier
         multi_tensor_scale_impl = local_multi_tensor_scale
 
-from megatron.experimental.gtp import GTPShardedParam
 
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -189,7 +188,7 @@ class MegatronOptimizer(ABC):
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
 
-            is_gtp_param = getattr(param, 'is_gtp', False) or isinstance(param, GTPShardedParam)
+            is_gtp_param = getattr(param, 'is_gtp', False)
 
             # GTP params are always unique across TP ranks (tensor_model_parallel
             # attribute is lost during wrap_gtp_sharded_tensor), so skip TP filter.
@@ -772,7 +771,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             float16_params_this_group.append(param)
                             # Create a copy
                             main_param = param.detach().clone().float()
-                            main_param.is_gtp = isinstance(param, GTPShardedParam)
+                            main_param.is_gtp = getattr(param, 'is_gtp', False)
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):

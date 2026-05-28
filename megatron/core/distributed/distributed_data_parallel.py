@@ -6,8 +6,6 @@ from typing import Optional
 
 import torch
 
-from megatron.experimental.gtp import GTPShardedParam
-
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
@@ -145,7 +143,7 @@ class DistributedDataParallel(_BaseDataParallel):
             # Non-GTP expert params (biases, LayerNorms inside experts, etc.) are
             # REPLICATED across EGTP peers and stay in all_params — their expert branch
             # reduces over the FULL intra_expt_dp_group at line 263.
-            is_gtp_shard = isinstance(param, GTPShardedParam)
+            is_gtp_shard = getattr(param, 'is_gtp', False)
             is_expert = not getattr(param, 'allreduce', True)
             if is_gtp_shard and not is_expert:
                 gtp_params.append(param)
@@ -605,7 +603,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     # wgrad_reduce_scatter returns None for async RS and writes
                     # the wgrad straight into param.main_grad. Skip the assertion
                     # for GTPShardedParam — otherwise it fires every iter.
-                    if not isinstance(param, GTPShardedParam):
+                    if not getattr(param, 'is_gtp', False):
                         assert (
                             param.grad is not None
                         ), 'param.grad being None is not safe when overlap_grad_reduce is True'
@@ -731,7 +729,7 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for param in self.module.parameters():
             is_expert_parallel = not getattr(param, 'allreduce', True)
-            is_gtp = isinstance(param, GTPShardedParam)
+            is_gtp = getattr(param, 'is_gtp', False)
 
             # GTPShardedParam holds a unique 1/N shard per (E)GTP peer; broadcast must
             # exclude those peers and reach the FULL cross-instance group (one-shot

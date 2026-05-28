@@ -47,7 +47,6 @@ from megatron.core.utils import (
 
 from megatron.core.transformer.module import param_is_not_shared
 
-from megatron.experimental.gtp import GTPShardedParam
 
 
 def _compute_norm_2(params_list):
@@ -116,7 +115,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
     for model_chunk in model:
         for param in model_chunk.parameters():
-            is_gtp = isinstance(param, GTPShardedParam)
+            is_gtp = getattr(param, 'is_gtp', False)
 
             # Filter TP duplicates. GTP params are always unique across TP ranks
             # so skip this check for them.

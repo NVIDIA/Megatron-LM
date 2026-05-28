@@ -58,15 +58,17 @@ try:
 except:
     HAVE_TE_GRAPHS = False
 
-from megatron.experimental.gtp import (
-    GTP_CONFIG,
-    GTPChain,
-    GTPShardedParam,
-    get_ag_stream,
-    get_rs_stream,
-    reallocate_gtp_cache_to_mempool,
-    wait_async_comms,
-)
+from megatron.experimental.gtp import HAVE_GTP
+
+if HAVE_GTP:
+    from megatron.experimental.gtp import (
+        GTP_CONFIG,
+        GTPChain,
+        get_ag_stream,
+        get_rs_stream,
+        reallocate_gtp_cache_to_mempool,
+        wait_async_comms,
+    )
 
 try:
     from tqdm import tqdm
@@ -940,7 +942,7 @@ class _CudaGraphRunner(torch.nn.Module):
         """
         finalized = {}  # id → param
         for p in self.params_to_backprop:
-            if not isinstance(p, GTPShardedParam):
+            if not getattr(p, 'is_gtp', False):
                 continue
             if getattr(p, "prev_w", None) is None:
                 for w in getattr(p, "_weights", [p]):
@@ -1263,7 +1265,7 @@ class _CudaGraphRunner(torch.nn.Module):
         if self.gtp_remat:
             pset = {id(p) for p in self.params_to_backprop}
             for p in self.params_to_backprop:
-                if not isinstance(p, GTPShardedParam):
+                if not getattr(p, 'is_gtp', False):
                     continue
                 prev_w = getattr(p, "prev_w", None)
                 p._is_cross_graph_tail = prev_w is not None and id(prev_w) not in pset

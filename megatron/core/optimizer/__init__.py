@@ -56,7 +56,6 @@ from megatron.core.optimizer_param_scheduler import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
-from megatron.experimental.gtp import GTPShardedParam
 
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
@@ -347,7 +346,7 @@ def _get_param_groups(
                 param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
-            is_gtp = isinstance(param, GTPShardedParam)
+            is_gtp = getattr(param, 'is_gtp', False)
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
@@ -1179,36 +1178,79 @@ def get_megatron_optimizer(
             )
         )
 
-    moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
+    # Expert non-GTP params: reduce over the FULL intra_expt_dp_group (includes
+    # EGTP peers), because their wgrad has NOT been pre-reduced over the EGTP
+    # axis. Backed by expert_parallel_buffers in DDP.
+    expert_param_groups, expert_buffers = _get_param_groups_and_buffers(
         model_chunks,
         model_chunk_offset=0,
         config=config,
         config_overrides=config_overrides,
-        filter_fn=lambda g: g['is_expert_parallel'],
+        filter_fn=lambda g: g['is_expert_parallel'] and not g.get('is_gtp', False),
         buffer_name='expert_parallel_buffers',
     )
     if dump_param_to_param_group_map is not None:
-        for param_group in moe_param_groups:
+        for param_group in expert_param_groups:
             for param in param_group["params"]:
                 param_name = get_global_unique_param_name(model_chunks, param)
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
-    if len(moe_param_groups) > 0:
+    if len(expert_param_groups) > 0:
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
         # Pass Gloo process groups into optimizer only if needed.
         if use_gloo_process_groups:
-            expt_data_parallel_group_gloo = intra_expt_dp_with_egtp_group_gloo
+            expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
         else:
             expt_data_parallel_group_gloo = None
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config=config,
                 model_chunks=model_chunks,
-                param_groups=moe_param_groups,
-                per_model_buffers=moe_buffers,
+                param_groups=expert_param_groups,
+                per_model_buffers=expert_buffers,
+                model_parallel_group=expt_tp_pp_group,
+                data_parallel_group=intra_expt_dp_group,
+                data_parallel_group_gloo=expt_data_parallel_group_gloo,
+                data_parallel_group_idx=expt_model_parallel_rank,
+                intra_dist_opt_group=intra_dist_opt_group,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
+            )
+        )
+
+    # EGTP params: reduce over the with_egtp carve-out (excludes EGTP peers),
+    # because the EGTP wgrad RS has already reduced grads over the EGTP axis.
+    # Backed by egtp_buffers in DDP.
+    egtp_param_groups, egtp_buffers = _get_param_groups_and_buffers(
+        model_chunks,
+        model_chunk_offset=0,
+        config=config,
+        config_overrides=config_overrides,
+        filter_fn=lambda g: g.get('is_gtp', False) and g['is_expert_parallel'],
+        buffer_name='egtp_buffers',
+    )
+    if dump_param_to_param_group_map is not None:
+        for param_group in egtp_param_groups:
+            for param in param_group["params"]:
+                param_name = get_global_unique_param_name(model_chunks, param)
+                param_to_param_group[param_name] = param_group_id
+            param_group_id += 1
+    if len(egtp_param_groups) > 0:
+        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
+        # Pass Gloo process groups into optimizer only if needed.
+        if use_gloo_process_groups:
+            egtp_data_parallel_group_gloo = intra_expt_dp_with_egtp_group_gloo
+        else:
+            egtp_data_parallel_group_gloo = None
+        optimizers.append(
+            _get_megatron_optimizer_based_on_param_groups(
+                config=config,
+                model_chunks=model_chunks,
+                param_groups=egtp_param_groups,
+                per_model_buffers=egtp_buffers,
                 model_parallel_group=expt_tp_pp_group,
                 data_parallel_group=intra_expt_dp_with_egtp_group,
-                data_parallel_group_gloo=expt_data_parallel_group_gloo,
+                data_parallel_group_gloo=egtp_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,

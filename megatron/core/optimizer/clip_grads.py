@@ -47,8 +47,6 @@ except ImportError:
         multi_tensor_scale_tensor_impl = None
 
 
-from megatron.experimental.gtp import GTPShardedParam
-
 from .. import parallel_state
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
@@ -244,6 +242,7 @@ def count_zeros_fp32(
     data_parallel_group = None
     use_megatron_fsdp = False
     gtp_rank = parallel_state.get_generalized_tensor_parallel_remat_rank()
+    egtp_rank = parallel_state.get_expert_generalized_tensor_parallel_remat_rank()
     for param in parameters:
         if getattr(param, "__fsdp_param__", False) and param.grad is not None:
             # If the parameter is managed by Megatron FSDP, we need to handle it differently.
@@ -256,12 +255,23 @@ def count_zeros_fp32(
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
         grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
         is_not_shared = param_is_not_shared(param)
-        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
+
+        is_gtp_param = getattr(param, 'is_gtp', False)
+        is_expert = not getattr(param, 'allreduce', True)
+
+        # GTP params lose the tensor_model_parallel attribute during sharding,
+        # so they're always unique across TP ranks — skip the TP-duplicate filter.
+        is_not_tp_duplicate = is_gtp_param or param_is_not_tensor_parallel_duplicate(
+            param, tp_group=tp_group
+        )
+
+        # GTP-duplicate filter: only needed for non-distributed optimizer.
+        # Expert params are replicated across the EGTP axis (not the GTP axis),
+        # so use egtp_rank for expert dedup and gtp_rank for dense dedup.
         if use_distributed_optimizer:
             is_not_gtp_duplicate = True
         else:
-            is_gtp_param = getattr(param, 'is_gtp', False) or isinstance(param, GTPShardedParam)
-            is_not_gtp_duplicate = is_gtp_param or gtp_rank == 0
+            is_not_gtp_duplicate = is_gtp_param or (egtp_rank if is_expert else gtp_rank) == 0
         if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)

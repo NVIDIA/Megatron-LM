@@ -338,6 +338,18 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
+            if (
+                args.generalized_tensor_parallel_remat_size > 1
+                or args.expert_generalized_tensor_parallel_remat_size > 1
+            ):
+                from megatron.experimental.gtp import HAVE_GTP
+
+                assert HAVE_GTP, (
+                    "GTP requires TransformerEngine >= 2.15.0. "
+                    "Install TransformerEngine, or set both "
+                    "--generalized-tensor-parallel-remat-size and "
+                    "--expert-generalized-tensor-parallel-remat-size to 1."
+                )
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,

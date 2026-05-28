@@ -538,6 +538,10 @@ class GTPShardedParam(torch.nn.Parameter):
         del tensor, args, kwargs
         super().__init__()
 
+        # Canonical flag — also set on distopt's main_param copy so both kinds
+        # of param can be classified via a single attribute check.
+        self.is_gtp = True
+
         # all gather
         self.state = GTPWeightState.NONE
         self._ag_ticket_fwd = None
