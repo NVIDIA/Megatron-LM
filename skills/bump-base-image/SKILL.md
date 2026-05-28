@@ -11,7 +11,7 @@ End-to-end workflow for moving Megatron-LM's CI to a newer `nvcr.io/nvidia/pytor
 ## Inputs to gather from the user
 
 1. **Target tag**, e.g. `26.04-py3`. NVIDIA NGC PyTorch containers are released as `nvcr.io/nvidia/pytorch:YY.MM-py3`.
-2. **Scope** — usually `dev` only. The `lts` pin (`docker/.ngc_version.lts`, plus the `IMAGE_TYPE: lts` rows in GitLab) is bumped on a different cadence; only touch it if the user explicitly asks.
+2. **Scope** — usually `dev` only. The `lts` pin (`docker/.ngc_version.lts`, plus the `FILE: Dockerfile.ci.lts` rows in GitLab) is bumped on a different cadence; only touch it if the user explicitly asks.
 3. **Workflow run ID** (optional but typical) — after the first CI run, the user will provide a GitHub Actions run ID for golden-value refresh.
 
 ## Workflow
@@ -54,7 +54,7 @@ GitLab CI does **not** read `docker/.ngc_version.dev`. It hardcodes `BASE_IMAGE`
   PLATFORM: arm64
 ```
 
-Leave the `IMAGE_TYPE: lts` rows alone. Quick sanity check before commit:
+Leave the `FILE: Dockerfile.ci.lts` rows alone. Quick sanity check before commit:
 
 ```bash
 rg -n '^\s*BASE_IMAGE: nvcr\.io/nvidia/pytorch:' .gitlab/stages/01.build.yml
@@ -132,12 +132,12 @@ All three lines should show `nvcr.io/nvidia/pytorch:<YY.MM>-py3`. If they don't,
 | `.gitlab/stages/01.build.yml`                                                                 | Update both `IMAGE_TYPE: dev` `BASE_IMAGE:` rows (amd64 + arm64)                       |
 | `tests/functional_tests/test_cases/**/golden_values_dev_dgx_{h100,gb200}.json`                | Refresh via the `update-golden-values` skill                                           |
 | `tests/test_utils/recipes/<arch>/<suite>.yaml`                                                | Flip drifting / hanging cases to `mr-broken` / `mr-github-broken` with an issue link    |
-| `docker/.ngc_version.lts`, `.gitlab/stages/01.build.yml` `IMAGE_TYPE: lts` rows               | **Skip unless explicitly bumping LTS.** LTS has its own release cadence.                |
+| `docker/.ngc_version.lts`, `.gitlab/stages/01.build.yml` `FILE: Dockerfile.ci.lts` rows       | **Skip unless explicitly bumping LTS.** LTS has its own release cadence and its own Dockerfile (`docker/Dockerfile.ci.lts`); LTS Python deps are pinned in `docker/lts/requirements.txt`. |
 
 ## Gotchas
 
 - **GitHub vs GitLab pins are independent.** `docker/.ngc_version.dev` only drives GitHub CI's local container build via `Dockerfile.ci.dev`. GitLab CI has its own hardcoded `BASE_IMAGE:` matrix in `.gitlab/stages/01.build.yml`. PR #4688 existed solely because #4611 forgot the second one — don't repeat this.
-- **Don't bump LTS along with dev.** The `IMAGE_TYPE: lts` rows and `docker/.ngc_version.lts` are stability-pinned for the `container::lts` label path. Bump them in a dedicated PR with its own LTS validation.
+- **Don't bump LTS along with dev.** The `FILE: Dockerfile.ci.lts` rows, `docker/Dockerfile.ci.lts`, `docker/lts/requirements.txt`, and `docker/.ngc_version.lts` are stability-pinned for the `container::lts` label path. Bump them in a dedicated PR with its own LTS validation. LTS Python deps are pinned in `docker/lts/requirements.txt` (not in `pyproject.toml`) — edit that file when an LTS dependency needs to move.
 - **Don't fix golden-value drift by hand.** Use `tests/test_utils/python_scripts/download_golden_values.py` via the `update-golden-values` skill. Hand-editing the JSONs invites diff noise and relative-difference regressions on subsequent bumps.
 - **`mr-broken` is a real scope, not a comment marker.** It keeps the recipe wired into the matrix (so it stays discoverable and runnable on demand) without gating merges. Don't delete the test case from the recipe.
 - **`/ok to test` is per-commit.** A new force-push or fixup commit needs a fresh `/ok to test <sha>` comment to re-trigger NVIDIA-runner CI on a fork PR.

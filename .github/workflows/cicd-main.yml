@@ -598,10 +598,12 @@ jobs:
             NGC_VERSION=$(cat docker/.ngc_version.lts)
             echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
             echo "image_type=lts" | tee -a $GITHUB_OUTPUT
+            echo "dockerfile=./docker/Dockerfile.ci.lts" | tee -a $GITHUB_OUTPUT
           else
             NGC_VERSION=$(cat docker/.ngc_version.dev)
             echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
             echo "image_type=dev" | tee -a $GITHUB_OUTPUT
+            echo "dockerfile=./docker/Dockerfile.ci.dev" | tee -a $GITHUB_OUTPUT
           fi
 
       - name: Set up Docker Buildx
@@ -610,7 +612,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v7.1.0
         with:
-          file: ./docker/Dockerfile.ci.dev
+          file: ${{ steps.base-image.outputs.dockerfile }}
           push: true
           context: .
           target: main
