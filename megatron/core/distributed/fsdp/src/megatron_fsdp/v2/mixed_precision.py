@@ -397,6 +397,10 @@ class FullyShardMixedPrecisionPolicy:
 
         assert model_weight_buffer is not None, "main weights require a model-weight buffer"
 
+        dirty_replicated_buffer = (
+            main_weight_buffer.is_distributed and not model_weight_buffer.is_distributed
+        )
+
         if not self.is_fp8_param(params[0]):
             if model_weight_buffer.is_distributed and not main_weight_buffer.is_distributed:
                 raise RuntimeError(
@@ -417,6 +421,8 @@ class FullyShardMixedPrecisionPolicy:
                         + main_shard_meta.size
                     ]
                 )
+            if dirty_replicated_buffer:
+                model_weight_buffer._dirty = True
             return
 
         fp8_params = []
@@ -446,6 +452,10 @@ class FullyShardMixedPrecisionPolicy:
         quantize_main_weights_to_fp8(
             fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
         )
+        if dirty_replicated_buffer:
+            model_weight_buffer._dirty = True
+            if transpose_weight_buffer is not None:
+                transpose_weight_buffer._dirty = True
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:

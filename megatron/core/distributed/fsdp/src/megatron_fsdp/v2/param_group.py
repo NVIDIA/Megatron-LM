@@ -104,11 +104,6 @@ class ParameterGroup:
         self.hsdp_wbuf: Optional[DataParallelBuffer] = None
         self.hsdp_gbuf: Optional[DataParallelBuffer] = None
         self.hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
-        # For optim/optim_grads, optimizer updates sharded main weights while
-        # forward uses replicated model weights. After copying/quantizing, only
-        # this rank's virtual shard is valid until the next forward all-gather.
-        self._needs_inplace_weight_unshard = False
-
         # Initialize buffers and distributed parameters
         self._init_buffers()
 
@@ -213,26 +208,11 @@ class ParameterGroup:
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        # Each spec is (weight_buffer, inplace, bind_params):
-        # - inplace=True refreshes a replicated ZeRO-1/2 compute buffer in self.data.
-        # - bind_params=True binds params for the current forward/backward compute phase.
-        unshard_specs = []
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is not None:
-                unshard_specs.append((weight_buffer, False, True))
-
-        if not bwd_pass and self._needs_inplace_weight_unshard:
-            assert self.model_weight_buffer is not None
-            assert self.main_weight_buffer is not None
-            unshard_specs.append((self.model_weight_buffer, True, False))
-            if self.transpose_weight_buffer is not None:
-                unshard_specs.append((self.transpose_weight_buffer, True, False))
-            self._needs_inplace_weight_unshard = False
-
-        for weight_buffer, inplace, bind_params in unshard_specs:
-            weight_buffer.unshard(inplace=inplace, bind_params=bind_params)
+                weight_buffer.unshard(bind_params=True)
 
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
 
@@ -269,12 +249,6 @@ class ParameterGroup:
             self.main_weight_buffer,
             self.transpose_weight_buffer,
         )
-        self._needs_inplace_weight_unshard = False
-        if self.main_weight_buffer is not None:
-            self._needs_inplace_weight_unshard = (
-                self.main_weight_buffer.is_distributed
-                and not self.model_weight_buffer.is_distributed
-            )
 
     def reduce_grad(self):
         """

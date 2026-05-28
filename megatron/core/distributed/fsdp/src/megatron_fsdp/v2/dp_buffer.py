@@ -340,6 +340,8 @@ class DataParallelBuffer:
 
         self.data: Optional[torch.Tensor] = None
         self._unsharded_buffer: Optional[torch.Tensor] = None
+        # Set when a replicated buffer only has this rank's updated shard.
+        self._dirty = False
 
     # ------------------------------------------------------------------ #
     #  Public API
@@ -469,25 +471,26 @@ class DataParallelBuffer:
 
     def is_unsharded(self) -> bool:
         """Return whether this buffer currently has a full unsharded view."""
-        return not self.is_distributed or self._unsharded_buffer is not None
+        return not self._dirty and (
+            not self.is_distributed or self._unsharded_buffer is not None
+        )
 
     @torch.no_grad()
     def unshard(
         self,
-        inplace: bool = False,
         bind_params: bool = True,
     ) -> torch.Tensor:
         """All-gather the full buffer from all shards and bind parameter storage.
 
         For non-distributed buffers self.data is already full, so
-        self.data is returned directly. With ``inplace=True``, this rank's
-        virtual shard is all-gathered into self.data instead.
+        self.data is returned directly. If a replicated buffer only has this
+        rank's updated shard, the shard is all-gathered into self.data first.
         """
         assert self.data is not None
 
         shard_buffer = None
-        if inplace:
-            assert not self.is_distributed, "inplace unshard requires a replicated buffer"
+        if self._dirty:
+            assert not self.is_distributed, "dirty unshard requires a replicated buffer"
             full_buffer = self.data
             sm = self.buffer_index.shard_meta
             shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
@@ -512,10 +515,12 @@ class DataParallelBuffer:
                 input_tensor=shard_buffer,
                 group=self.dp_group,
             )
-            if full_buffer.is_cuda:
+            if self.is_distributed and full_buffer.is_cuda:
                 # Temporary all-gather buckets may be released from another stream before
                 # the collective finishes; record the producer stream for allocator safety.
                 full_buffer.record_stream(torch.cuda.current_stream())
+            if self._dirty:
+                self._dirty = False
 
         if bind_params:
             for p in self.params:

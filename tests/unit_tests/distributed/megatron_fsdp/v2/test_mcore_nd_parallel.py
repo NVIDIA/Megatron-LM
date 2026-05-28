@@ -81,8 +81,9 @@ class TestMegatronFSDPE2E:
                         or param_group.model_weight_buffer.is_distributed
                     ):
                         continue
-                    if param_group._needs_inplace_weight_unshard:
-                        param_group.unshard(bwd_pass=False)
+                    param_group.unshard(bwd_pass=False)
+                    if param_group.transpose_weight_buffer is not None:
+                        param_group.unshard(bwd_pass=True)
 
                     for buffer_name, buffer in (
                         ("model_weight_buffer", param_group.model_weight_buffer),

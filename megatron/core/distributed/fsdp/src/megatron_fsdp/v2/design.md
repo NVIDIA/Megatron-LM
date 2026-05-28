@@ -403,25 +403,24 @@ optimizer-facing DTensor shards through `dist_params`.
 
 ### Replicated Weight Refresh
 
-For ZeRO-1/2, `copy_main_weights_to_model_weights()` sets
-`_needs_inplace_weight_unshard` when `main_weight_buffer` is sharded and
-`model_weight_buffer` is replicated. The next forward
-`ParameterGroup.unshard(bwd_pass=False)` adds inplace refresh entries to its
-`unshard_specs` and refreshes the replica before compute:
+For ZeRO-1/2, `copy_main_weights_to_model_weights()` marks the replicated
+`DataParallelBuffer` dirty when `main_weight_buffer` is sharded and
+`model_weight_buffer` is replicated. The next normal unshard for that buffer
+calls `DataParallelBuffer.unshard()`, which refreshes any dirty replicated
+buffer before compute:
 
 1. Non-FP8 weights copy this rank's updated main-weight shard into the matching
    slice of the replicated model-weight buffer.
 2. FP8 weights quantize the local FP32 main-weight shard into the local FP8
-   model-weight shard first; MXFP8 refreshes the transpose buffer as well.
-3. `DataParallelBuffer.unshard(inplace=True, bind_params=...)` gathers the updated
-   shards directly into the full replicated compute buffer on every rank. The
-   same buffer may also have a normal `(inplace=False, bind_params=True)` spec;
-   that just binds params to `self.data`, and the inplace gather updates the same
-   storage afterward.
+   model-weight shard first; MXFP8 marks the transpose buffer dirty as well.
+3. `DataParallelBuffer.unshard(bind_params=...)` sees the dirty flag and gathers
+   the updated shards directly into the full replicated compute buffer on every
+   rank, then clears the flag. The same call can bind params to `self.data` for
+   the current compute phase.
 
-Backward unshard does not refresh replicated weights. Refresh is tied to the
-next forward so a completed optimizer step is visible before compute reads the
-replica.
+The rowwise/model buffer is refreshed on forward unshard. For MXFP8, the
+transpose buffer is refreshed on backward unshard, where
+`weight_buffers_for_unshard(..., bwd_pass=True)` selects it.
 
 ---
 
