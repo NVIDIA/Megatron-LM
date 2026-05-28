@@ -1712,13 +1712,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for module in model_module.modules():
                 if hasattr(module, "frozen_expert_bias"):
                     module.frozen_expert_bias = True
-    # Additional HACK: Ignore LM loss for speed
-    if args.logits_save_dir is not None:
-        from types import MethodType
-        def _compute_lm_loss(self, labels, logits):
-            return (logits * 0).sum(dim=-1).transpose(0, 1).contiguous()
-        for model_module in model:
-            model_module.compute_language_model_loss = MethodType(_compute_lm_loss, model_module)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -1976,15 +1969,13 @@ def setup_model_and_optimizer(
             flush_interval=args.logits_save_flush_interval,
             save_dtype=args.logits_save_dtype,
         )
-        logits_saver.attach_hooks(unwrapped_model[0].output_layer)
+        logits_saver.attach_hooks(unwrapped_model)
 
     if args.logits_load_dir is not None:
-        from megatron.training.cached_logits_loss import StudentLogitsCapture
+        from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
-        for model_chunk in unwrapped_model:
-            if hasattr(model_chunk, 'output_layer'):
-                student_logits_capture.attach_hooks(model_chunk.output_layer)
+        student_logits_capture.attach_hooks(unwrapped_model)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:

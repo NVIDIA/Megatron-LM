@@ -3,7 +3,6 @@
 """Megatron arguments."""
 
 import argparse
-import dataclasses
 import json
 import os
 from pathlib import Path
@@ -11,12 +10,9 @@ import re
 import types
 
 import torch
-import torch.nn.functional as F
-from packaging.version import Version as PkgVersion
 
-from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.rerun_state_machine import RerunStateMachine
-from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -26,18 +22,12 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
-from megatron.core.transformer.heterogeneous.heterogeneous_config import (
-    HeterogeneousTransformerConfig,
-    MLPConfig,
-)
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
@@ -47,12 +37,8 @@ from megatron.training.utils import (
 )
 from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.core.quantization.utils import (
-    kitchen_quantization_recipe_config,
-    load_quantization_recipe,
-)
+from megatron.training.argument_utils import ArgumentGroupFactory
 
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -1629,6 +1615,9 @@ def validate_args(args, defaults={}):
 
     if not args.async_save:
         args.async_strategy = "mcore"
+
+    if args.override_ckpt_iteration is not None:
+        assert not args.finetune, "Cannot override checkpoint iteration together with finetune flag."
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:

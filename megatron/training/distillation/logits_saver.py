@@ -32,6 +32,7 @@ import os
 import tarfile
 import threading
 from collections import OrderedDict
+from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -199,6 +200,7 @@ class LogitsSaverHooks:
         # Hook states – store already-processed top-K results (not full logits)
         self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self._hook_handles: List[Any] = []
+        self._loss_overrides: List[Tuple[torch.nn.Module, Any]] = []
 
         # Batched tar state.
         self._pending_writes: OrderedDict[int, bytes] = OrderedDict()
@@ -251,20 +253,34 @@ class LogitsSaverHooks:
         else:
             self._curr_mtp_passes += 1
 
-    def attach_hooks(self, module: torch.nn.Module) -> None:
-        """Convenience method to attach hooks to a module.
+    def attach_hooks(self, model_chunks: List[torch.nn.Module]) -> None:
+        """Attach logits-saving hooks and skip expensive LM loss computation.
 
         Args:
-            module: The module that outputs logits (e.g., the output layer)
+            model_chunks: Unwrapped model chunks to instrument.
         """
-        fwd_handle = module.register_forward_hook(self._forward_hook)
+        fwd_handle = model_chunks[0].output_layer.register_forward_hook(self._forward_hook)
         self._hook_handles.extend([fwd_handle])
+        for model_chunk in model_chunks:
+            self._override_language_model_loss(model_chunk)
+
+    def _override_language_model_loss(self, model_chunk: torch.nn.Module) -> None:
+        """Replace LM loss with a zero-valued tensor that preserves gradient edges."""
+        def _compute_zero_language_model_loss(_self, _labels, logits):
+            return (logits * 0).sum(dim=-1).transpose(0, 1).contiguous()
+
+        original_loss = model_chunk.compute_language_model_loss
+        self._loss_overrides.append((model_chunk, original_loss))
+        model_chunk.compute_language_model_loss = MethodType(_compute_zero_language_model_loss, model_chunk)
 
     def remove_hooks(self) -> None:
         """Remove all registered hooks."""
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
+        for model_chunk, original_loss in self._loss_overrides:
+            model_chunk.compute_language_model_loss = original_loss
+        self._loss_overrides.clear()
 
     def _save_accumulated_log_probs(self) -> None:
         """Move accumulated top-K results to CPU and save to disk.
