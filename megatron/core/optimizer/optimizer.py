@@ -165,8 +165,8 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         non_gtp_grads = []
         gtp_grads = []
-        gtp_rank = parallel_state.get_generalized_tensor_parallel_rank()
-        egtp_rank = parallel_state.get_expert_generalized_tensor_parallel_rank()
+        gtp_rank = parallel_state.get_generalized_tensor_parallel_remat_rank()
+        egtp_rank = parallel_state.get_expert_generalized_tensor_parallel_remat_rank()
         for param in params:
             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
                 # Megatron-FSDP always uses decoupled_grad with FusedAdam.
@@ -260,7 +260,7 @@ class MegatronOptimizer(ABC):
         # Check if this optimizer handles expert params that need EGTP reduction.
         # The model_parallel group for dense/GTP optimizers = TP×PP×GTP (includes GTP),
         # but for MoE optimizers = TP×EP×PP (does NOT include EGTP).
-        egtp_world_size = parallel_state.get_expert_generalized_tensor_parallel_world_size()
+        egtp_world_size = parallel_state.get_expert_generalized_tensor_parallel_remat_world_size()
         is_expert_optimizer = any(not getattr(p, 'allreduce', True) for p in self.get_parameters())
         needs_egtp_reduce = is_expert_optimizer and egtp_world_size > 1
 
@@ -278,7 +278,7 @@ class MegatronOptimizer(ABC):
         torch.distributed.all_reduce(
             gtp_norm_2,
             op=torch.distributed.ReduceOp.SUM,
-            group=parallel_state.get_expert_generalized_tensor_parallel_group(),
+            group=parallel_state.get_expert_generalized_tensor_parallel_remat_group(),
         )
         total_norm_2 = non_gtp_norm**2 + gtp_norm_2.item()
         return total_norm_2**0.5

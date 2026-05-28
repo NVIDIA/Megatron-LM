@@ -243,7 +243,7 @@ def count_zeros_fp32(
     total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
     data_parallel_group = None
     use_megatron_fsdp = False
-    gtp_rank = parallel_state.get_generalized_tensor_parallel_rank()
+    gtp_rank = parallel_state.get_generalized_tensor_parallel_remat_rank()
     for param in parameters:
         if getattr(param, "__fsdp_param__", False) and param.grad is not None:
             # If the parameter is managed by Megatron FSDP, we need to handle it differently.

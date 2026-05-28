@@ -89,9 +89,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # GTP-aware DP subgroups (fall back to non-GTP variants when GTP is off):
         #   *_with_gtp_group         : full cross-instance, GTP peers excluded (broadcast)
         #   intra_*_with_gtp_group   : per-distopt-instance partial, GTP peers excluded (grad RS)
-        self.dp_cp_with_gtp_group = process_group_dict.get(
-            'dp_cp_with_gtp_group', self.dp_cp_group
-        )
+        self.dp_cp_with_gtp_group = process_group_dict.get('dp_cp_with_gtp_group', self.dp_cp_group)
         self.intra_dp_cp_with_gtp_group = process_group_dict.get(
             'intra_dp_cp_with_gtp_group', self.intra_dp_cp_group
         )
@@ -739,13 +737,9 @@ class DistributedDataParallel(_BaseDataParallel):
             # exclude those peers and reach the FULL cross-instance group (one-shot
             # init/load sync, unlike the per-instance grad-RS groups above).
             if is_expert_parallel:
-                data_parallel_group = (
-                    self.expt_dp_with_egtp_group if is_gtp else self.expt_dp_group
-                )
+                data_parallel_group = self.expt_dp_with_egtp_group if is_gtp else self.expt_dp_group
             else:
-                data_parallel_group = (
-                    self.dp_cp_with_gtp_group if is_gtp else self.dp_cp_group
-                )
+                data_parallel_group = self.dp_cp_with_gtp_group if is_gtp else self.dp_cp_group
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),

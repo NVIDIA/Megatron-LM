@@ -111,8 +111,8 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     moe_gtp_params_data = []        # MoE-GTP, non-sharded
     moe_gtp_sharded_params_data = []  # MoE-GTP, sharded → reduce over expert_dp_with_gtp
 
-    gtp_rank = mpu.get_generalized_tensor_parallel_rank()
-    egtp_rank = mpu.get_expert_generalized_tensor_parallel_rank()
+    gtp_rank = mpu.get_generalized_tensor_parallel_remat_rank()
+    egtp_rank = mpu.get_expert_generalized_tensor_parallel_remat_rank()
 
     for model_chunk in model:
         for param in model_chunk.parameters():
@@ -181,7 +181,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # expert_model_parallel = TP×EP×PP (does NOT include EGTP), so we need
     # an explicit EGTP reduction for MoE-GTP before the model-parallel reduce.
     moe_gtp_combined_norm_2 = moe_gtp_norm_2 + moe_gtp_sharded_norm_2
-    _sum_reduce(moe_gtp_combined_norm_2, mpu.get_expert_generalized_tensor_parallel_group())
+    _sum_reduce(moe_gtp_combined_norm_2, mpu.get_expert_generalized_tensor_parallel_remat_group())
     moe_total_norm_2 = moe_norm_2 + moe_sharded_norm_2 + moe_gtp_combined_norm_2
 
     # --- Model-parallel reductions ---

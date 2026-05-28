@@ -496,8 +496,8 @@ def finalize_model_grads(
     # rs_stream may still be writing to main_grad when finish_grad_sync starts the DP
     # allreduce on main_stream.
     if (
-        config.generalized_tensor_parallel_size > 1
-        or config.expert_generalized_tensor_parallel_size > 1
+        config.generalized_tensor_parallel_remat_size > 1
+        or config.expert_generalized_tensor_parallel_remat_size > 1
     ):
         from megatron.experimental.gtp import (
             get_all_ag_streams,
@@ -514,7 +514,7 @@ def finalize_model_grads(
     # Wait for captured bwd Phase 2 (main_grad.add_) on each CG runner's
     # stream.  bwd_completion_event only covers Phase 1; Phase 2 runs after
     # it on runner.stream with no other sync to main_stream.
-    if config.generalized_tensor_parallel_size > 1:
+    if config.generalized_tensor_parallel_remat_size > 1:
         from megatron.core.transformer.cuda_graphs import get_gtp_phase2_completion_events
 
         for evt in get_gtp_phase2_completion_events():

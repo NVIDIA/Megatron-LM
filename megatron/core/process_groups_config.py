@@ -117,10 +117,10 @@ class ProcessGroupCollection:
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
 
-    # _GENERALIZED_TENSOR_PARALLEL_GROUP
+    # _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
     gtp: torch.distributed.ProcessGroup = field(init=False)
 
-    # _EXPERT_GENERALIZED_TENSOR_PARALLEL_GROUP
+    # _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
     expt_gtp: torch.distributed.ProcessGroup = field(init=False)
 
     # MoE layers need expt_dp group for sharded state dict
@@ -254,10 +254,11 @@ class ProcessGroupCollection:
                 with_context_parallel=True,
             ),
             'gtp': partial(
-                parallel_state.get_generalized_tensor_parallel_group, check_initialized=False
+                parallel_state.get_generalized_tensor_parallel_remat_group, check_initialized=False
             ),
             'expt_gtp': partial(
-                parallel_state.get_expert_generalized_tensor_parallel_group, check_initialized=False
+                parallel_state.get_expert_generalized_tensor_parallel_remat_group,
+                check_initialized=False,
             ),
         }
 
@@ -330,9 +331,7 @@ class ProcessGroupCollection:
             intra_expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(
                 with_gtp=True, partial_expert_data_parallel=True
             )
-            expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(
-                with_gtp=True
-            )
+            expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(with_gtp=True)
             intra_dist_opt_group = parallel_state.get_intra_distributed_optimizer_instance_group()
 
             # Gloo groups

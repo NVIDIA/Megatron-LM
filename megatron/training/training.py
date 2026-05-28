@@ -1654,8 +1654,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Configure GTP padding alignment based on quantization recipe before model construction.
     from megatron.experimental.gtp import update_gtp_config
     if (
-        getattr(args, 'generalized_tensor_parallel_size', 1) > 1
-        or getattr(args, 'expert_generalized_tensor_parallel_size', 1) > 1
+        getattr(args, 'generalized_tensor_parallel_remat_size', 1) > 1
+        or getattr(args, 'expert_generalized_tensor_parallel_remat_size', 1) > 1
     ):
         if getattr(args, 'fp4', None) is not None:
             update_gtp_config(pad_for_alignment=16)
@@ -1729,8 +1729,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         tag_gtp_params_with_names(model_module)
         classify_gtp_chains(model_module)
     if (
-        getattr(args, 'generalized_tensor_parallel_size', 1) > 1
-        or getattr(args, 'expert_generalized_tensor_parallel_size', 1) > 1
+        getattr(args, 'generalized_tensor_parallel_remat_size', 1) > 1
+        or getattr(args, 'expert_generalized_tensor_parallel_remat_size', 1) > 1
     ):
         print_rank_0(f"GTP enabled. {GTP_CONFIG}")
 

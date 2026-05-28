@@ -439,7 +439,7 @@ class _CudagraphGlobalRecord:
                     "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
                 )
 
-        if any(r[0].generalized_tensor_parallel for r in cls.cudagraph_record):
+        if any(r[0].gtp_remat for r in cls.cudagraph_record):
             reallocate_gtp_cache_to_mempool(
                 torch.cuda.current_device(), CudaGraphManager.global_mempool
             )
@@ -763,9 +763,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
         # defensive against future Phase 2 work on other sub-streams.
         # main_stream stays unblocked so the next runner can start in
         # parallel.
-        if runner.generalized_tensor_parallel and runner.finalized_during_bwd_capture:
+        if runner.gtp_remat and runner.finalized_during_bwd_capture:
             gtp_rs_stream = get_rs_stream(
-                GTPChain.GRAPHED.value, parallel_state.get_generalized_tensor_parallel_group()
+                GTPChain.GRAPHED.value, parallel_state.get_generalized_tensor_parallel_remat_group()
             )
             gtp_rs_stream.wait_event(runner.bwd_phase2_completion_event)
             with torch.cuda.stream(gtp_rs_stream):
@@ -830,7 +830,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.deallocate_pipeline_outputs = False
         self.num_warmup_steps = 0
         self.use_stream = False
-        self.generalized_tensor_parallel = False
+        self.gtp_remat = False
         self.fwd_side_streams = []
         self.bwd_side_streams = []
         # Populated by create_bwd_graph: GTP params whose main_grad.add_ was captured in THIS
@@ -861,16 +861,14 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
-            self.generalized_tensor_parallel = (
-                self.base_module.config.generalized_tensor_parallel_size > 1
-            )
+            self.gtp_remat = self.base_module.config.generalized_tensor_parallel_remat_size > 1
 
             # Ensure internal warmup (inside create_fwd_graph) has >= 2 steps
             # for GTP: 1st builds chain + tickets, 2nd exercises prefetch path.
-            if self.generalized_tensor_parallel:
+            if self.gtp_remat:
                 self.num_warmup_steps = max(self.num_warmup_steps, 2)
 
-            if self.generalized_tensor_parallel:
+            if self.gtp_remat:
                 self.use_stream = True
                 self.stream = torch.cuda.Stream()
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
@@ -879,9 +877,9 @@ class _CudaGraphRunner(torch.nn.Module):
                 # all sharded across PARAMETER_SHARDING_GROUP. Materialize that
                 # (chain, group) stream pair now so it is registered as a
                 # captured side stream before the first forward.
-                from megatron.core.parallel_state import get_generalized_tensor_parallel_group
+                from megatron.core.parallel_state import get_generalized_tensor_parallel_remat_group
 
-                gtp_group = get_generalized_tensor_parallel_group()
+                gtp_group = get_generalized_tensor_parallel_remat_group()
                 graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
                 graphed_rs = get_rs_stream(GTPChain.GRAPHED.value, gtp_group)
                 self._register_side_stream(self.fwd_side_streams, graphed_ag)
@@ -1151,7 +1149,7 @@ class _CudaGraphRunner(torch.nn.Module):
                         allow_unused=True,
                     )
 
-                if self.generalized_tensor_parallel:
+                if self.gtp_remat:
                     wait_async_comms(GTPChain.GRAPHED.value)
                     self._sync_against_side_streams(self.bwd_side_streams)
 
@@ -1182,7 +1180,7 @@ class _CudaGraphRunner(torch.nn.Module):
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                     )
 
-                    if self.generalized_tensor_parallel:
+                    if self.gtp_remat:
                         wait_async_comms(GTPChain.GRAPHED.value)
 
                     if self.fwd_side_streams:
@@ -1262,7 +1260,7 @@ class _CudaGraphRunner(torch.nn.Module):
         # cascade and wait_async_comms to split the captured RS wait/add across
         # producer and consumer graphs (avoids cross-capture cudaStreamWaitEvent
         # on c10d Work.postEvent).
-        if self.generalized_tensor_parallel:
+        if self.gtp_remat:
             pset = {id(p) for p in self.params_to_backprop}
             for p in self.params_to_backprop:
                 if not isinstance(p, GTPShardedParam):
@@ -1329,13 +1327,13 @@ class _CudaGraphRunner(torch.nn.Module):
             #             tails the wait is captured here, the add in the
             #             consumer's cascade; for within-graph tails both
             #             happen here (see wait_async_comms).
-            if self.generalized_tensor_parallel:
+            if self.gtp_remat:
                 # Phase 1: drain AG; fence runner_stream past ag_stream so
                 # bwd_completion_event records AFTER NCCL_AG completion.
                 wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
-                from megatron.core.parallel_state import get_generalized_tensor_parallel_group
+                from megatron.core.parallel_state import get_generalized_tensor_parallel_remat_group
 
-                gtp_group = get_generalized_tensor_parallel_group()
+                gtp_group = get_generalized_tensor_parallel_remat_group()
                 graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
                 self.bwd_ag_fence_event.record(graphed_ag)
                 torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
@@ -1351,12 +1349,12 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.bwd_side_streams:
                 self._wait_side_streams(self.bwd_side_streams)
 
-            if self.generalized_tensor_parallel:
+            if self.gtp_remat:
                 # Phase 2 + side-stream join done — record so
                 # finalize_model_grads can wait for main_grad.add_ completion.
                 self.bwd_phase2_completion_event.record()
 
-            if self.use_stream and not self.generalized_tensor_parallel:
+            if self.use_stream and not self.gtp_remat:
                 # Non-GTP path: record after the side-stream join.
                 self.bwd_completion_event.record()
 
@@ -1366,7 +1364,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         # See _compute_finalized_during_bwd_capture for what's in this set and why.
         self.finalized_during_bwd_capture = (
-            self._compute_finalized_during_bwd_capture() if self.generalized_tensor_parallel else []
+            self._compute_finalized_during_bwd_capture() if self.gtp_remat else []
         )
 
         # Constructs a tuple suitable for returning from Graphed.backward:
