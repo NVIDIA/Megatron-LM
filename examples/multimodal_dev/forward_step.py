@@ -370,8 +370,13 @@ def loss_func(loss_mask, output_tensor):
 # -------------------------------------------------------------------
 
 
-def forward_step(data_iterator, model):
-    """Forward step for multimodal_dev training."""
+def forward_step(data_iterator, model, return_schedule_plan: bool = False):
+    """Forward step for multimodal_dev training.
+
+    When ``return_schedule_plan=True`` (EP A2A overlap path via combined_1f1b),
+    delegate to ``model.build_schedule_plan(...)`` instead of running the
+    full forward — the inner schedule plan handles decoder layers.
+    """
     batch = get_batch(data_iterator)
 
     if batch is None:
@@ -384,6 +389,34 @@ def forward_step(data_iterator, model):
         and pixel_values.dtype == torch.float32
     ):
         pixel_values = pixel_values.bfloat16()
+
+    if return_schedule_plan:
+        from megatron.training import get_args as _get_args
+
+        _args = _get_args()
+        assert _args.overlap_moe_expert_parallel_comm, (
+            "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+        )
+        schedule_plan = model.build_schedule_plan(
+            input_ids=batch["input_ids"],
+            position_ids=batch.get("position_ids"),
+            attention_mask=batch.get("attention_mask", None),
+            labels=batch.get("labels", None),
+            loss_mask=batch.get("loss_mask", None),
+            pixel_values=pixel_values,
+            image_grid_thw=batch.get("image_grid_thw", None),
+            packed_seq_params=batch.get("packed_seq_params", None),
+        )
+
+        loss_mask = batch.get("loss_mask", None)
+        if loss_mask is None:
+            loss_mask = torch.ones_like(batch["input_ids"], dtype=torch.float)
+        from examples.multimodal_dev.models.base import MultimodalModel
+
+        loss_mask = MultimodalModel.cp_split_loss_mask(
+            loss_mask, batch.get("packed_seq_params", None)
+        )
+        return schedule_plan, partial(loss_func, loss_mask)
 
     # We don't provide position_ids, now. Let model handle it itself.
     output_tensor = model(

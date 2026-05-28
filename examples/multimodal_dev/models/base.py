@@ -145,6 +145,69 @@ class MultimodalModel(MegatronModule):
         assert len(input_tensor) == 1
         self.language_model.set_input_tensor(input_tensor[0])
 
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor = None,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        packed_seq_params=None,
+        **kwargs,
+    ):
+        """Build a schedule plan for EP A2A overlap on the decoder only.
+
+        Runs the vision encoder + embedding scatter eagerly (these stay on
+        the main path; not part of the overlap schedule), then delegates the
+        decoder transformer-layer schedule plan to the inner ``language_model``.
+
+        Vision encoder is intentionally NOT included in the overlap schedule —
+        per design, only decoder layers participate in the EP A2A overlap.
+        """
+        if position_ids is None:
+            position_ids = self.compute_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                packed_seq_params=packed_seq_params,
+            )
+
+        vision_embeddings = None
+        if self.vision_model is not None and pixel_values is not None:
+            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+
+        text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
+        if vision_embeddings is not None:
+            decoder_input = self._scatter_vision_embeddings(
+                input_ids, text_embeddings, vision_embeddings
+            )
+        else:
+            decoder_input = text_embeddings
+
+        (decoder_input, input_ids, labels, loss_mask, attention_mask, position_ids) = (
+            self._cp_split_for_forward(
+                decoder_input=decoder_input,
+                input_ids=input_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+            )
+        )
+
+        with self._thd_mrope_no_cp_override(packed_seq_params):
+            return self.language_model.build_schedule_plan(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                decoder_input=decoder_input,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+            )
+
     def _scatter_vision_embeddings(
         self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings: Tensor
     ) -> Tensor:

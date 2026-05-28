@@ -372,9 +372,21 @@ def combined_forward_backward_step(
             )
             from megatron.core.models.gpt.gpt_model import GPTModel
 
-            assert isinstance(unwrapped_model, GPTModel), (
-                "The final unwrapped model must be a GPTModel instance "
-                "since only GPTModel is supported for EP A2A overlapping."
+            # GPTModel is the canonical model class supporting EP A2A overlap.
+            # MultimodalModel wraps a GPTModel decoder and exposes its own
+            # build_schedule_plan that delegates decoder-layer scheduling to the
+            # inner GPTModel; vision encoder runs eagerly on the main path.
+            _allowed_for_a2a_overlap = (GPTModel,)
+            try:
+                from examples.multimodal_dev.models.base import MultimodalModel
+
+                _allowed_for_a2a_overlap = (GPTModel, MultimodalModel)
+            except ImportError:
+                pass
+            assert isinstance(unwrapped_model, _allowed_for_a2a_overlap), (
+                "The final unwrapped model must be a GPTModel or MultimodalModel "
+                "(decoder-only EP A2A overlap) instance. "
+                f"Got {type(unwrapped_model).__name__}."
             )
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True
