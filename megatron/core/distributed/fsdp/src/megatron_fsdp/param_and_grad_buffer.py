@@ -3942,19 +3942,15 @@ class AllGatherPipeline:
             while len(self.param_gather_event_map) > 0:
                 (bucket_id, bwd) = next(iter(self.param_gather_event_map))
                 self.wait_bucket_ready(bucket_id, bwd)
-        # Unit buckets follow the normal release path: mark can_be_released and let
-        # recycle_unused_buckets free the gather scratch. Preserved non-unit
-        # buckets keep their storage pinned per the release_bucket contract
-        # (cross-module readers such as fused kernels that bypass nn.Module.forward
-        # may dereference them), but the AG pipeline should not treat them as
-        # freshly gathered. If a later all-gather targets the bucket,
-        # async_bucket_gather refreshes wbuf.data in place from the current shard.
-        # TemporaryBucketAllocator.allocate() is idempotent for an already allocated
-        # bucket_id, so no new memory is allocated.
+
         for bucket_id in range(self.num_buckets):
             is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
             for bwd in [False, True]:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
+                # If preserve_non_fsdp_units is set, then do not release buckets
+                # associated with FSDP non-units. Instead, mark the bucket as PRESERVED
+                # (not NEW) so a later all-gather refreshes preserved non-unit bucket
+                # storage in place.
                 if preserve_non_fsdp_units and not is_unit_bucket:
                     self.bucket_status[bucket_key] = BucketStatus.PRESERVED
                 else:
