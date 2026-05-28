@@ -1,11 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Simple VLM dataset for multimodal_dev training.
+"""CORD-V2 VLM dataset for multimodal_dev training.
 
 Single-turn image-text dataset using a HuggingFace ``AutoProcessor`` for
-tokenization and image preprocessing.  Currently supports CORD-V2 (receipt
-OCR).  No multi-turn support — each sample is one image + question →
-answer pair.
+tokenization and image preprocessing.  This module is the reference
+implementation for the CORD-V2 receipt-OCR dataset.  No multi-turn support —
+each sample is one image + question → answer pair.
 
 Each image is preprocessed via ``qwen_vl_utils.process_vision_info`` and
 fed to the processor with Qwen-VL's recommended ``min_pixels`` /
@@ -20,6 +20,32 @@ Usage::
         --model-arch qwen35_vl --dataset-provider cord_v2 \\
         --hf-processor-path Qwen/Qwen3.5-397B-A17B \\
         --total-seq-length 4096 --use-vanilla-collate-fn
+
+Adding another VLM dataset
+--------------------------
+
+The dataset layer mirrors the model layer's registry pattern: each dataset
+ships its own module and a ``train_valid_test_datasets_provider`` factory,
+and the model's registry entry maps a ``--dataset-provider`` name to that
+factory's dotted path.  To add a new dataset (e.g. NLVR2):
+
+1. Create ``examples/multimodal_dev/data/<name>.py`` with::
+
+       def train_valid_test_datasets_provider(train_val_test_num_samples):
+           ...  # build datasets using args from get_args()
+           return train_ds, val_ds, test_ds
+
+2. Register it under the relevant model in
+   ``examples/multimodal_dev/models/__init__.py``::
+
+       MODEL_REGISTRY["qwen35_vl"]["dataset_providers"]["<name>"] = (
+           "examples.multimodal_dev.data.<name>"
+           ".train_valid_test_datasets_provider"
+       )
+
+3. Launch with ``--dataset-provider <name>``.
+
+No edits to ``pretrain_multimodal.py`` or ``forward_step.py`` are required.
 """
 
 import json

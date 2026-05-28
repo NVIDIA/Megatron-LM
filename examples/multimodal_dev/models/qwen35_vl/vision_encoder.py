@@ -249,8 +249,8 @@ class Qwen35VLPatchMerger(MegatronModule):
         hidden_states = self.patch_norm(hidden_states)
         merged = hidden_states.view(-1, self.merge_dim)
         merged, _ = self.linear_fc1(merged)
-        # NOTE: Official HuggingFace uses default approximate='none' in Qwen3VLVisionPatchMerger.
-        merged = torch.nn.functional.gelu(merged, approximate="tanh")
+        # Match official HuggingFace Qwen3VLVisionPatchMerger (default approximate='none').
+        merged = torch.nn.functional.gelu(merged, approximate="none")
         merged, _ = self.linear_fc2(merged)
         return merged
 

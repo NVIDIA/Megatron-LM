@@ -9,9 +9,12 @@
 #   MODEL_VARIANT: proxy (default), 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
 #   CKPT_LOAD: path to a pre-converted checkpoint to load (enables --load + --finetune)
 #   CKPT_FORMAT: checkpoint format override (e.g. torch_dist); auto-detected when empty
-#   TP, EP, PP: parallelism sizes
+#   TP, EP, PP: parallelism sizes (PP must stay 1; multimodal_dev does not
+#               support pipeline parallelism)
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   FORCE_LOAD_BALANCING: set to 1 to enable --moe-router-force-load-balancing
+#                         (perf / mock-data only; OFF for real finetuning)
 #   LAUNCHER: torchrun (default) or python
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
@@ -48,9 +51,15 @@ GBS=${GBS:-16}
 
 # Parallelism
 TP=${TP:-1}
-EP=${EP:-2}
+# EP defaults to 1; MoE variants override via the variant case block below.
+EP=${EP:-1}
 PP=${PP:-1}
 CP=${CP:-1}
+# Gate --moe-router-force-load-balancing behind an explicit opt-in. Useful for
+# perf / mock-data benchmarking (it disables the auxiliary load-balancing loss
+# coupling so router routes are perfectly uniform), but it must be off for any
+# real fine-tuning / convergence run because it freezes data-dependent routing.
+FORCE_LOAD_BALANCING=${FORCE_LOAD_BALANCING:-0}
 
 # Variant-aware architecture defaults.
 # The model provider builds configs from the variant dict in
@@ -168,6 +177,16 @@ case "$MODEL_VARIANT" in
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
 esac
+
+# Fail fast on inconsistent expert-parallelism configuration. Dense variants
+# (NUM_EXPERTS=0) do not emit any --num-experts / MoE args, so forwarding
+# --expert-model-parallel-size > 1 would trip Megatron's arg validation.
+if [ "${NUM_EXPERTS:-0}" -eq 0 ] && [ "$EP" -gt 1 ]; then
+    echo "ERROR: MODEL_VARIANT=$MODEL_VARIANT has NUM_EXPERTS=0 (dense) but EP=$EP." >&2
+    echo "       Set EP=1 for dense variants, or pick a MoE variant." >&2
+    exit 1
+fi
+
 SEQ_LEN=${SEQ_LEN:-4096}
 
 WANDB_PROJECT=${WANDB_PROJECT:-'qwen35-vl-0524'}
@@ -348,7 +367,6 @@ GPT_MODEL_ARGS=(
     --linear-num-key-heads 16
     --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS"
     --make-vocab-size-divisible-by 485
-    --moe-router-force-load-balancing
 )
 
 # --- Tied / untied embeddings ---
@@ -391,6 +409,11 @@ if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
         --moe-permute-fusion
         --moe-router-fusion
     )
+    # Perf / mock-data only: forces uniform router decisions; do NOT enable for
+    # real finetuning (it freezes data-dependent routing).
+    if [ "$FORCE_LOAD_BALANCING" -eq 1 ]; then
+        MOE_ARGS+=( --moe-router-force-load-balancing )
+    fi
 fi
 
 # --- Recompute ---

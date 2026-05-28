@@ -54,7 +54,7 @@ MODEL_REGISTRY = {
                 ".train_valid_test_datasets_provider"
             ),
             "cord_v2": (
-                "examples.multimodal_dev.data.vlm_dataset"
+                "examples.multimodal_dev.data.cord_v2"
                 ".train_valid_test_datasets_provider"
             ),
         },
