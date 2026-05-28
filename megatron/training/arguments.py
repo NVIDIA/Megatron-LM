@@ -1625,13 +1625,6 @@ def validate_args(args, defaults={}):
                 'Disabling --async-save.'
             )
             args.async_save = False
-    
-    if args.ckpt_format == "torch_dist" and getattr(args, "dist_ckpt_use_dtensor_format", False):
-        args.async_save = False
-        args.use_persistent_ckpt_worker = False
-    
-    if args.tokenizer_type == "TikTokenizer":
-        args.dist_ckpt_use_dtensor_format = False
 
     if not args.async_save:
         args.async_strategy = "mcore"

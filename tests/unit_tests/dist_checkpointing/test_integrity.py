@@ -59,29 +59,29 @@ class TestIntegrity:
 
         Utils.destroy_model_parallel()
 
-    # def test_save_verify_integrity_manifest_directly(self, init_model_parallel, tmp_path_dist_ckpt):
-    #     with TempNamedDir(
-    #         tmp_path_dist_ckpt / 'test_save_integrity_manifest_directly', sync=True
-    #     ) as ckpt_dir:
-    #         metadata_file = Path(ckpt_dir / "metadata.json")
-    #         with open(metadata_file, "w") as f:
-    #             data = {"test_metadata": 1}
-    #             json.dump(data, f)
+    def test_save_verify_integrity_manifest_directly(self, init_model_parallel, tmp_path_dist_ckpt):
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_save_integrity_manifest_directly', sync=True
+        ) as ckpt_dir:
+            metadata_file = Path(ckpt_dir / "metadata.json")
+            with open(metadata_file, "w") as f:
+                data = {"test_metadata": 1}
+                json.dump(data, f)
 
-    #         if torch.distributed.get_rank() == 0:
-    #             save_integrity_manifest(ckpt_dir)
-    #         torch.distributed.barrier()
-    #         integrity_file = Path(ckpt_dir / "integrity.json")
-    #         assert integrity_file.is_file(), "integrity.json doesn't exist."
+            if torch.distributed.get_rank() == 0:
+                save_integrity_manifest(ckpt_dir)
+            torch.distributed.barrier()
+            integrity_file = Path(ckpt_dir / "integrity.json")
+            assert integrity_file.is_file(), "integrity.json doesn't exist."
 
-    #         with open(integrity_file, "r") as f:
-    #             data = json.load(f)
-    #             files = list(data["files"].keys())
+            with open(integrity_file, "r") as f:
+                data = json.load(f)
+                files = list(data["files"].keys())
 
-    #         assert len(files) == 1
-    #         assert len(data["files"]["metadata.json"]) == 64
+            assert len(files) == 1
+            assert len(data["files"]["metadata.json"]) == 64
 
-    #         verify_integrity_manifest(ckpt_dir)
+            verify_integrity_manifest(ckpt_dir)
 
     def test_save_verify_integrity_manifest_error(self, init_model_parallel, tmp_path_dist_ckpt):
         with TempNamedDir(
